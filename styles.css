@@ -303,6 +303,70 @@
   padding: 0 6px;
 }
 
+/* Sort dropdown — mirrors the color-filter button/popover shape. The
+   .is-active variant adds a subtle accent so a non-Manual sort mode
+   reads at a glance in the header bar. */
+.stashpad-sort-btn {
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.stashpad-sort-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-sort-btn.is-active {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+.stashpad-sort-icon { display: inline-flex; align-items: center; }
+.stashpad-sort-icon .svg-icon { width: 14px; height: 14px; }
+.stashpad-sort-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-view.is-mobile .stashpad-sort-btn {
+  height: 28px;
+  padding: 0 6px;
+}
+
+.stashpad-sort-popover {
+  position: fixed;
+  z-index: var(--layer-popover, 30);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  padding: 4px 0;
+  font-size: var(--font-ui-small);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.stashpad-sort-popover-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.stashpad-sort-popover-row:hover { background: var(--background-modifier-hover); }
+.stashpad-sort-popover-row.is-active {
+  color: var(--interactive-accent);
+  font-weight: 600;
+}
+.stashpad-sort-popover-label { white-space: nowrap; }
+
 .stashpad-color-filter-popover {
   position: fixed;
   z-index: var(--layer-popover, 30);
