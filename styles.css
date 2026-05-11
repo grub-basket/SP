@@ -1,0 +1,1672 @@
+.stashpad-scroll-host {
+  overflow: hidden !important;
+  position: relative !important;
+  padding: 0 !important;
+  container-type: inline-size;
+}
+/* Hide the workspace tab back/forward arrows for Stashpad leaves only —
+   they navigate file history, which doesn't apply to our chat-style view. */
+.workspace-leaf-content[data-type="stashpad-view"] .view-header-nav-buttons,
+.workspace-leaf:has(> .workspace-leaf-content[data-type="stashpad-view"]) .view-header-nav-buttons {
+  display: none !important;
+}
+.stashpad-view {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px 0;
+  gap: 8px;
+  overflow: hidden;
+  outline: none;
+  box-sizing: border-box;
+}
+
+/* Time filter bar */
+.stashpad-time-filter-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-folder-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: var(--font-ui-smaller);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 50%;
+  overflow: hidden;
+}
+.stashpad-folder-btn .stashpad-btn-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.stashpad-folder-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-folder-btn.is-override {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+.stashpad-time-filter-btns {
+  display: flex;
+  gap: 4px;
+  flex-wrap: nowrap;
+  /* Sit immediately after the folder/tag/color cluster (left-aligned,
+     "under" the Stashpad name) instead of centering. Allow shrinking so
+     the cluster never pushes past the row's right edge into anything
+     that follows. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.stashpad-time-filter-btn {
+  /* Each button shrinks to its label width (e.g. "Today" / "Month")
+     instead of stretching to fill the row. */
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  font-size: var(--font-ui-smaller);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  min-width: 0;
+}
+.stashpad-time-filter-btn:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-time-filter-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+/* Calendar / rolling toggle — icon-only, slimmer than label buttons. */
+.stashpad-time-filter-cal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px;
+}
+.stashpad-time-filter-cal .svg-icon { width: 14px; height: 14px; }
+.stashpad-time-filter-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: none;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-tag-filter-select {
+  flex: 0 1 auto;
+  max-width: 14ch;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+  text-overflow: ellipsis;
+}
+.stashpad-tag-filter-select:disabled { opacity: 0.5; cursor: not-allowed; }
+.stashpad-view.is-mobile .stashpad-tag-filter-select {
+  max-width: 10ch;
+  height: 28px;
+  padding: 0 6px;
+}
+
+/* Settings: per-Stashpad color aliases. */
+.stashpad-color-aliases-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0 12px;
+}
+.stashpad-color-alias-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-color-alias-row:last-child { border-bottom: 0; }
+.stashpad-color-alias-swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  flex: 0 0 auto;
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-color-alias-meta {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-color-alias-hex {
+  font-family: var(--font-monospace);
+  color: var(--text-normal);
+}
+.stashpad-color-alias-count { color: var(--text-faint); }
+.stashpad-color-alias-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.stashpad-color-alias-swatch { cursor: pointer; }
+.stashpad-color-alias-del {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+.stashpad-color-alias-del:hover {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+.stashpad-color-alias-row.is-unused .stashpad-color-alias-hex,
+.stashpad-color-alias-row.is-unused .stashpad-color-alias-count {
+  color: var(--text-faint);
+}
+
+/* Settings: per-Stashpad note templates. */
+.stashpad-note-templates-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 0 12px;
+}
+.stashpad-note-template-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-note-template-row:last-child { border-bottom: 0; }
+.stashpad-note-template-folder {
+  flex: 0 0 auto;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  min-width: 120px;
+  max-width: 35%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-note-template-input-wrap {
+  flex: 1 1 auto;
+  position: relative;
+  min-width: 0;
+}
+.stashpad-note-template-input {
+  width: 100%;
+  box-sizing: border-box;
+}
+.stashpad-note-template-suggest {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 2px);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  z-index: 30;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-note-template-suggest-item {
+  padding: 5px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-note-template-suggest-item:hover {
+  background: var(--background-modifier-hover);
+}
+.stashpad-note-template-warn {
+  flex: 1 0 100%;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-warning, #d6a32a);
+  padding: 4px 0 0 0;
+}
+
+/* Color filter — custom button + popover (replaces native <select>
+   so per-row colored swatches actually paint). */
+.stashpad-color-filter-btn {
+  /* Force a content-sized box. width: max-content + flex: 0 0 auto
+     defeats both flex-row stretching and any inherited min-width from
+     Obsidian's default div rules. */
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.stashpad-color-filter-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-color-filter-btn.is-disabled { opacity: 0.5; cursor: not-allowed; }
+.stashpad-color-filter-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex: 0 0 auto;
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-color-filter-swatch.is-empty {
+  background: transparent;
+  /* Diagonal slash so the "All / no color" sentinel reads as
+     "any" rather than as a real color. */
+  background-image: linear-gradient(to top right,
+    transparent 0%, transparent 45%,
+    var(--text-muted) 45%, var(--text-muted) 55%,
+    transparent 55%, transparent 100%);
+}
+.stashpad-color-filter-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-view.is-mobile .stashpad-color-filter-btn {
+  height: 28px;
+  padding: 0 6px;
+}
+
+.stashpad-color-filter-popover {
+  position: fixed;
+  z-index: var(--layer-popover, 30);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  padding: 4px 0;
+  font-size: var(--font-ui-small);
+  max-height: 300px;
+  overflow-y: auto;
+}
+.stashpad-color-filter-popover-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.stashpad-color-filter-popover-row:hover { background: var(--background-modifier-hover); }
+.stashpad-color-filter-popover-label {
+  white-space: nowrap;
+}
+@container (max-width: 360px) {
+  .stashpad-time-filter-btns { display: none; }
+  .stashpad-time-filter-select { display: block; }
+}
+.stashpad-view.is-mobile .stashpad-time-filter-btns { display: none; }
+.stashpad-view.is-mobile .stashpad-time-filter-select { display: block; }
+
+.stashpad-breadcrumb {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  padding: 4px 2px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+}
+.stashpad-crumb {
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 18ch;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+/* The current/last crumb gets first dibs on space. */
+.stashpad-breadcrumb .stashpad-crumb:last-child { max-width: 36ch; flex-shrink: 1; }
+.stashpad-crumb:hover { color: var(--text-normal); text-decoration: underline; }
+.stashpad-crumb-home { font-weight: 600; flex: 0 0 auto; max-width: none; }
+.stashpad-crumb-ellipsis { cursor: help; flex: 0 0 auto; max-width: none; }
+.stashpad-crumb-ellipsis:hover { text-decoration: none; }
+.stashpad-crumb-sep { color: var(--text-faint); flex: 0 0 auto; }
+
+/* Focused header — laid out exactly like a list row: 3 columns of
+   [meta | body | actions]. The meta column carries the timestamp +
+   an invisible grip-shaped spacer so the body's left edge column-
+   aligns with each list row. The actions column holds the edit
+   pencil and duplicate-tab button. */
+.stashpad-focused {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: start;
+  border-bottom: 1px solid var(--background-modifier-border);
+  /* Match list rows' horizontal padding (10px each side) PLUS the
+     list's always-visible scrollbar gutter (10px) so the action
+     buttons line up with each row's pencil + enter. The list reserves
+     its scrollbar inside its 12px right padding via overflow-y: scroll;
+     header doesn't have that gutter so we pad an extra 10px on the
+     right to compensate. */
+  padding: 8px 20px 12px 10px;
+  max-height: 40%;
+  overflow-y: auto;
+}
+.stashpad-focused-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+.stashpad-focused-meta-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+/* Invisible spacer the size of a list row's grip — keeps the
+   timestamp column-width matching, so the body's left edge lines
+   up across the header and rows. */
+.stashpad-focused-grip-spacer {
+  width: 14px;
+  height: 14px;
+}
+.stashpad-focused-time {
+  white-space: pre-line;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  line-height: 1.2;
+}
+.stashpad-focused-body { padding: 0; }
+.stashpad-focused-body > :first-child { margin-top: 0; }
+.stashpad-focused-body > :last-child { margin-bottom: 0; }
+.stashpad-focused-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.stashpad-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* `scroll` (not `auto`) keeps the scrollbar always visible so it doesn't
+     pop in/out and shift layout. */
+  overflow-y: scroll;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Extend the list to the view's right edge via a negative margin equal to
+     the view's right padding, then re-add that as inner padding so notes
+     don't sit under the scrollbar. Net effect: scrollbar is flush with the
+     view's right edge. */
+  margin-right: -12px;
+  padding: 4px 12px 4px 0;
+}
+/* Slim, themed scrollbar that matches the rest of the UI. */
+.stashpad-list::-webkit-scrollbar { width: 10px; }
+.stashpad-list::-webkit-scrollbar-track { background: transparent; }
+.stashpad-list::-webkit-scrollbar-thumb {
+  background: var(--background-modifier-border);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.stashpad-list::-webkit-scrollbar-thumb:hover {
+  background: var(--background-modifier-border-hover);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+.stashpad-note {
+  display: grid;
+  /* Meta column auto-sizes to its content (timestamp + grip) so the body sits
+     immediately to the right rather than across a fixed-width gap. */
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--background-secondary);
+  cursor: pointer;
+  transition: background 0.1s ease, box-shadow 0.1s ease;
+  border: 1px solid transparent;
+}
+/* Top row of meta: timestamp + grip side-by-side. */
+.stashpad-note-meta-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+/* Drag handle: visible only on row hover (when no color set). */
+.stashpad-note-grip {
+  width: 14px;
+  height: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  opacity: 0;
+  cursor: grab;
+  transition: opacity 0.1s ease, background 0.1s ease;
+  border-radius: 3px;
+  position: relative;
+}
+.stashpad-note:hover .stashpad-note-grip { opacity: 0.8; }
+.stashpad-note-grip:hover { color: var(--text-muted); opacity: 1 !important; }
+.stashpad-note-grip:active { cursor: grabbing; }
+.stashpad-note-grip .svg-icon { width: 14px; height: 14px; transition: opacity 0.1s ease; }
+/* Color-swatch mode: at rest, show a filled color square; on row hover swap
+   to the grip icon. The icon itself is hidden by default; row-hover reveals
+   it (and the swatch fades). */
+.stashpad-note-grip.has-color {
+  background: var(--stashpad-note-color, transparent);
+  opacity: 1;
+}
+.stashpad-note-grip.has-color .svg-icon { opacity: 0; }
+.stashpad-note:hover .stashpad-note-grip.has-color {
+  background: transparent;
+}
+.stashpad-note:hover .stashpad-note-grip.has-color .svg-icon { opacity: 1; }
+/* Colored border: per-note tint that wins over is-selected/is-cursor for
+   normal rows. is-pick-target (green nest indicator) still wins on top. */
+.stashpad-note.has-color {
+  border-color: var(--stashpad-note-color);
+}
+/* When the row is selected, the colored border thickens so the selection
+   state reads as a single, unified ring — no double-line from the default
+   selected accent or the is-cursor inset shadow. */
+.stashpad-note.has-color.is-selected,
+.stashpad-note.has-color.is-cursor,
+.stashpad-note.has-color.is-selected.is-cursor {
+  border-width: 3px;
+  border-color: var(--stashpad-note-color);
+  /* Compensate for the extra 2px of border so the body doesn't shift. */
+  padding: 6px 8px;
+  /* Suppress the default cursor inset shadow — the thick border carries
+     the selection signal on its own. */
+  box-shadow: none;
+}
+/* The grip icon, when revealed on hover for a colored note, picks up the
+   same color so the swatch-to-grip transition feels continuous. */
+.stashpad-note:hover .stashpad-note-grip.has-color { color: var(--stashpad-note-color); opacity: 1; }
+.stashpad-note-grip.has-color:hover { color: var(--stashpad-note-color); }
+/* Internal links inside a colored note's body inherit the tint. We scope
+   to anchor tags rendered by Obsidian's markdown renderer. */
+.stashpad-note.has-color .stashpad-note-body a,
+.stashpad-note.has-color .stashpad-note-body a.internal-link,
+.stashpad-note.has-color .stashpad-note-body a.external-link,
+.stashpad-note.has-color .stashpad-note-body a.tag {
+  color: var(--stashpad-note-color);
+}
+/* While being dragged, dim the row. */
+.stashpad-note.is-dragging { opacity: 0.5; }
+.stashpad-note { transition: background 0.08s ease, box-shadow 0.08s ease; }
+/* Drop INTO (nest as child): outline the whole row */
+.stashpad-note.drop-into {
+  background: var(--background-modifier-success);
+  box-shadow: 0 0 0 2px var(--color-green) inset;
+}
+/* Drop placeholder — a stable element that occupies the gap so the target row
+   doesn't shift under the cursor (no bounce). Height is set in JS to match the
+   dragged row's actual height. */
+.stashpad-drop-placeholder {
+  background: rgba(255, 200, 0, 0.10);
+  border: 2px dashed var(--color-yellow);
+  border-radius: 8px;
+  box-sizing: border-box;
+  margin: 0;
+  overflow: hidden;
+  /* Height is animated via JS (set to 0 on insert, then to dragRowHeight)
+     so the rows above and below smoothly slide apart instead of snapping. */
+  transition: height 0.14s ease, opacity 0.14s ease, border-width 0.14s ease;
+}
+.stashpad-note:hover { background: var(--background-modifier-hover); }
+.stashpad-note.is-selected {
+  background: var(--background-modifier-active-hover);
+  border-color: var(--interactive-accent);
+}
+/* Even when selected, hovering applies a subtle brightness bump so the user
+   gets the same affordance as on non-selected rows. */
+.stashpad-note.is-selected:hover {
+  filter: brightness(1.1);
+  background: var(--background-modifier-active-hover);
+}
+.stashpad-note.is-cursor {
+  box-shadow: 0 0 0 2px var(--interactive-accent) inset;
+}
+/* drop-into needs higher specificity than is-selected / is-cursor so the green
+   nest indicator wins when dragging onto a selected or cursor'd row. */
+.stashpad-note.drop-into,
+.stashpad-note.is-selected.drop-into,
+.stashpad-note.is-cursor.drop-into {
+  background: var(--background-modifier-success);
+  box-shadow: 0 0 0 2px var(--color-green) inset;
+  border-color: var(--color-green);
+}
+.stashpad-note.is-pick-target {
+  background: var(--background-modifier-success);
+  border-color: var(--color-green);
+}
+/* Dark theme: --background-modifier-success is a pale wash-out under
+   white body text. Substitute a deeper green tinted with the accent
+   so the highlight reads at a glance without killing legibility. */
+.theme-dark .stashpad-note.is-pick-target {
+  background: rgba(60, 160, 90, 0.35);
+  border-color: rgba(120, 220, 150, 0.9);
+}
+.stashpad-note.is-completed .stashpad-note-body,
+.stashpad-note.is-completed .stashpad-note-time {
+  text-decoration: line-through;
+  opacity: 0.55;
+}
+
+.stashpad-note-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.stashpad-note-time {
+  white-space: pre-line;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+.stashpad-note-enter { cursor: pointer; color: var(--text-accent); }
+.stashpad-note-enter:hover { text-decoration: underline; }
+
+.stashpad-note-body { min-width: 0; word-wrap: break-word; }
+.stashpad-note-body > :first-child { margin-top: 0; }
+.stashpad-note-body > :last-child { margin-bottom: 0; }
+.stashpad-note-text > :first-child { margin-top: 0; }
+.stashpad-note-text > :last-child { margin-bottom: 0; }
+/* Tighten heading → adjacent text spacing inside note previews. Both
+   the heading's bottom margin AND the FOLLOWING element's top margin
+   contribute to the gap, plus headings have padding-bottom in some
+   themes. Reset all three. */
+.stashpad-note-text :is(h1, h2, h3, h4, h5, h6),
+.stashpad-focused-body :is(h1, h2, h3, h4, h5, h6) {
+  margin-top: 4px;
+  margin-bottom: 0;
+  padding-bottom: 0;
+  line-height: 1.25;
+}
+.stashpad-note-text :is(h1, h2, h3, h4, h5, h6) + *,
+.stashpad-focused-body :is(h1, h2, h3, h4, h5, h6) + * {
+  margin-top: 0;
+}
+/* Multiplayer / authorship footer — rendered beneath the note body
+   in renderAuthorshipFooter. Pieces are space-separated and wrap as
+   the row narrows. */
+.stashpad-note-authorship {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+.stashpad-note-authorship .stashpad-authorship-label { color: var(--text-faint); }
+.stashpad-note-authorship .internal-link { color: var(--text-muted); }
+.stashpad-note-authorship .internal-link:hover { color: var(--text-accent); }
+.stashpad-note-authorship .stashpad-authorship-sep { color: var(--text-faint); opacity: 0.6; }
+
+/* Settings: Authorship → "Folders you've worked in" list. */
+.stashpad-authored-folders-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0 12px;
+}
+.stashpad-authored-folder-row {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-authored-folder-link {
+  color: var(--text-accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+.stashpad-authored-folder-link:hover { text-decoration: underline; }
+.stashpad-authored-folder-counts { color: var(--text-faint); }
+
+.stashpad-note-text.is-clamped {
+  /* Two-line clamp with ellipsis. Show More toggle (rendered after the
+     text) flips the .is-clamped class so the rest comes into view. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  position: relative;
+}
+.stashpad-expand-toggle {
+  margin-top: 4px;
+  padding: 2px 8px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-accent);
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.stashpad-expand-toggle:hover { background: var(--background-modifier-hover); }
+/* Icon-only variant (mobile): no margin, no border, hugs the text. */
+.stashpad-expand-toggle.is-icon {
+  margin: 0;
+  padding: 0;
+  border: none;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  color: var(--text-muted);
+}
+.stashpad-expand-toggle.is-icon:hover { color: var(--text-normal); background: transparent; }
+.stashpad-expand-toggle.is-icon .svg-icon { width: 14px; height: 14px; }
+/* Inline variant (desktop list rows): sit in the .stashpad-note-actions
+   cluster alongside the pencil + enter buttons, matching their box so
+   the three actions form a uniform row. */
+.stashpad-expand-toggle.is-icon.is-inline {
+  width: auto;
+  height: auto;
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+}
+.stashpad-expand-toggle.is-icon.is-inline:hover {
+  background: var(--background-modifier-hover);
+}
+.stashpad-expand-toggle.is-icon.is-inline .svg-icon {
+  /* The chevron is a wide-but-short glyph compared to the pencil/arrow
+     siblings, so match the rendered HEIGHT by drawing it at 18px (vs.
+     16px for pencil) — width is allowed to overflow the inline-flex
+     box visually so the button still reads square-ish. */
+  width: 20px;
+  height: 20px;
+}
+
+/* Attachment rail */
+.stashpad-rail {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 6px;
+  margin-top: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.stashpad-att {
+  flex: 0 0 auto;
+  width: 64px;
+  height: 64px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-primary);
+  overflow: hidden;
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--text-muted);
+  padding: 4px;
+  text-align: center;
+}
+.stashpad-att:hover { background: var(--background-modifier-hover); }
+.stashpad-att-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.stashpad-att-ext {
+  font-weight: 700;
+  font-size: 12px;
+  color: var(--text-normal);
+  letter-spacing: 0.5px;
+}
+.stashpad-att-name {
+  font-size: 9px;
+  line-height: 1.1;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-all;
+}
+
+.stashpad-note-actions {
+  display: flex;
+  gap: 4px;
+  align-items: flex-start;
+}
+.stashpad-pencil {
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+  padding: 4px 8px;
+  font-size: 14px;
+  border-radius: 6px;
+  line-height: 1;
+}
+.stashpad-pencil:hover { background: var(--background-modifier-hover); }
+
+.stashpad-empty {
+  text-align: center;
+  color: var(--text-faint);
+  padding: 32px 0;
+}
+
+/* Composer */
+.stashpad-composer-input-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+}
+.stashpad-composer-clear {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  cursor: pointer;
+  z-index: 2;
+}
+.stashpad-composer-clear:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-composer-clear .svg-icon { width: 14px; height: 14px; }
+
+.stashpad-composer {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 8px 0 2px;
+  border-top: 1px solid var(--background-modifier-border);
+  align-items: stretch;
+}
+/* Desktop: button rail flows in the row alongside the textarea wrap. */
+.stashpad-composer-btn-rail {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+.stashpad-composer-input {
+  flex: 1 1 auto;
+  width: 100%;
+  border-radius: 6px;
+  padding: 6px 10px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-family: inherit;
+  font-size: var(--font-ui-medium);
+  resize: none;
+  min-height: 54px;
+  max-height: 54px;
+  line-height: 1.3;
+}
+.stashpad-composer-btn {
+  background: var(--interactive-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 0 10px;
+  min-width: 40px;
+  height: 54px;
+  cursor: pointer;
+  font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+.stashpad-composer-btn:hover { background: var(--interactive-hover); }
+.stashpad-composer-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+.stashpad-composer-send { font-weight: 600; }
+
+.stashpad-composer-btn .stashpad-btn-icon,
+.stashpad-folder-btn .stashpad-btn-icon,
+.stashpad-note-enter .stashpad-btn-icon {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+.stashpad-composer-btn .svg-icon,
+.stashpad-folder-btn .svg-icon,
+.stashpad-pencil .svg-icon,
+.stashpad-note-enter .svg-icon {
+  width: 16px;
+  height: 16px;
+}
+.stashpad-pencil { display: inline-flex; align-items: center; justify-content: center; }
+
+.stashpad-composer-help {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  padding: 2px 2px 6px;
+}
+
+.stashpad-mobile-nav {
+  display: flex;
+  justify-content: space-around;
+  padding: 8px 0;
+  border-top: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+.stashpad-mobile-nav button { flex: 1; margin: 0 4px; }
+
+.stashpad-view.is-mobile .stashpad-note {
+  grid-template-columns: auto 1fr auto;
+}
+
+/* Suggest modal (pick/search) */
+.stashpad-suggest-item { padding: 6px 8px; }
+.stashpad-suggest-title { font-weight: 500; }
+.stashpad-suggest-preview {
+  margin-top: 4px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  white-space: pre-line;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.stashpad-suggest-create {
+  font-style: italic;
+  color: var(--text-accent);
+}
+
+.stashpad-log-modal { width: min(860px, 90vw); }
+
+.stashpad-split-modal { width: min(720px, 90vw); }
+.stashpad-split-list {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 6px 0;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  background: var(--background-primary);
+}
+.stashpad-split-line {
+  display: flex;
+  gap: 12px;
+  padding: 2px 12px;
+  white-space: pre-wrap;
+}
+.stashpad-split-lineno {
+  color: var(--text-faint);
+  flex: 0 0 32px;
+  text-align: right;
+  user-select: none;
+}
+.stashpad-split-text {
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.stashpad-split-divider {
+  margin: 6px 12px;
+  padding: 4px 0;
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-radius: 4px;
+  text-align: center;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-split-help {
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+}
+.stashpad-split-toggle-bar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 10px;
+  justify-content: center;
+}
+.stashpad-split-mode-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-split-mode-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+.stashpad-split-cursor-wrap {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.stashpad-split-cursor-ta {
+  width: 100%;
+  /* Height is set inline by the modal's auto-fit code (capped at
+     ~3 lines on mobile, ~12 on desktop). Don't enforce a min-height
+     in CSS — let the JS sizing govern. */
+  padding: 10px 12px;
+  border: 0;
+  outline: none;
+  resize: none;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  line-height: 1.5;
+  overflow-y: auto;
+}
+.stashpad-split-confirm-btn {
+  /* Push to the right edge of the toggle bar so it reads as a clear
+     primary action. */
+  margin-left: auto;
+  padding: 4px 14px;
+}
+/* Mobile: tighter modal padding, smaller line list. */
+.is-mobile .stashpad-split-modal { width: min(420px, 96vw); }
+.is-mobile .stashpad-split-list { max-height: 40vh; font-size: var(--font-ui-small); }
+.is-mobile .stashpad-split-line { padding: 6px 12px; }
+/* Tap-friendly line picker — make each line look interactable. */
+.stashpad-split-line { cursor: pointer; }
+.stashpad-split-line:hover { background: var(--background-modifier-hover); }
+
+.stashpad-settings-title {
+  font-size: 1.8em !important;
+  font-weight: 700 !important;
+  margin: 0 0 18px !important;
+}
+.stashpad-settings-note {
+  margin: 0 0 12px;
+  padding-bottom: 8px;
+}
+.stashpad-log-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.stashpad-log-toolbar button {
+  padding: 4px 10px;
+  font-size: var(--font-ui-smaller);
+  white-space: nowrap;
+}
+.stashpad-log-type-filter {
+  padding: 4px 8px;
+  font-size: var(--font-ui-smaller);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  max-width: 22ch;
+}
+.stashpad-log-count {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-right: auto;
+  white-space: nowrap;
+}
+.stashpad-log-list {
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+}
+.stashpad-log-row {
+  display: grid;
+  /* Type column is auto so the widest label (e.g. PALETTE_COLOR_REMOVE)
+     fits without wrapping or truncation. */
+  grid-template-columns: 150px auto 100px 1fr;
+  gap: 14px;
+  padding: 6px 10px;
+  font-size: var(--font-ui-smaller);
+  border-bottom: 1px solid var(--background-modifier-border);
+  align-items: baseline;
+}
+.stashpad-log-type { white-space: nowrap; }
+.stashpad-log-row:last-child { border-bottom: 0; }
+.stashpad-log-ts { color: var(--text-faint); font-variant-numeric: tabular-nums; }
+.stashpad-log-author {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-log-author.is-empty { color: var(--text-faint); }
+.stashpad-log-type {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--background-secondary);
+  justify-self: start;
+}
+.stashpad-log-create .stashpad-log-type { color: var(--color-green); }
+.stashpad-log-delete .stashpad-log-type { color: var(--color-red); }
+.stashpad-log-parent_change .stashpad-log-type { color: var(--color-blue); }
+.stashpad-log-rename .stashpad-log-type { color: var(--color-yellow); }
+.stashpad-log-missing .stashpad-log-type { color: var(--color-orange); }
+.stashpad-log-stash_export .stashpad-log-type { color: var(--color-purple); }
+.stashpad-log-stash_import .stashpad-log-type { color: var(--color-cyan); }
+.stashpad-log-attachment_add .stashpad-log-type { color: var(--color-green); }
+.stashpad-log-attachment_remove .stashpad-log-type { color: var(--color-red); }
+.stashpad-log-reorder .stashpad-log-type { color: var(--color-pink); }
+.stashpad-log-complete .stashpad-log-type { color: var(--color-green); }
+.stashpad-log-uncomplete .stashpad-log-type { color: var(--color-yellow); }
+.stashpad-log-palette_color_add .stashpad-log-type { color: var(--color-green); }
+.stashpad-log-palette_color_remove .stashpad-log-type { color: var(--color-red); }
+.stashpad-log-msg { word-break: break-word; }
+.stashpad-log-empty { padding: 16px; color: var(--text-faint); text-align: center; }
+/* Suggest popup: small folder badge for cross-Stashpad results */
+.stashpad-suggest-item.is-cross-folder { opacity: 0.92; }
+.stashpad-suggest-folder {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  margin-left: 4px;
+}
+
+/* Settings: cross-Stashpad search scope (one row per folder + pill) */
+.stashpad-folder-list {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0 12px;
+}
+.stashpad-folder-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-folder-row:last-child { border-bottom: 0; }
+.stashpad-folder-row-label {
+  flex: 1 1 auto;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-normal);
+}
+.stashpad-folder-row-state {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  min-width: 7ch;
+  text-align: right;
+}
+.stashpad-folder-row-state.is-excluded {
+  color: var(--text-error);
+}
+
+/* Mobile-only UI tweaks. All selectors gated on .is-mobile so desktop
+   stays untouched. Goal: reclaim vertical space, anchor the layout
+   above Obsidian's docked mobile toolbar, simplify chrome. */
+
+/* Mobile: lift the composer off the bottom of the view via margin
+   instead of view padding. View padding pushed the WHOLE flex column
+   up but Obsidian seemed to shrink the leaf to compensate, leaving
+   the composer sunken anyway. Pure margin on the composer just shifts
+   that one element without changing the leaf's content height. */
+.stashpad-view.is-mobile .stashpad-composer {
+  margin-bottom: 110px;
+  /* When the textarea blurs (keyboard dismisses), Obsidian's leaf
+     resize lags ~300ms behind the focus change — restoring the full
+     lift instantly leaves the composer momentarily off-screen until
+     the user taps something else and forces a re-layout. Delay the
+     restoration so the leaf has time to grow back. */
+  transition: margin-bottom 0s linear 0.4s;
+}
+/* Drop the lift ONLY when the composer textarea itself has focus.
+   Using :focus-within on the view caught any focus shift inside the
+   view (including clicks on a list row that focused viewRoot), which
+   left the composer hidden under the docked toolbar. :has() with a
+   specific child selector keeps the drop scoped to the textarea. */
+.stashpad-view.is-mobile:has(.stashpad-composer-input:focus) .stashpad-composer {
+  margin-bottom: 0;
+  /* Drop the lift IMMEDIATELY when the textarea gets focus — the
+     keyboard animates up at the same time and the composer should
+     be waiting for it. */
+  transition-delay: 0s;
+}
+
+/* Hide the composer's helper text on mobile — it wraps and eats
+   another row of vertical space we can't afford. */
+.stashpad-view.is-mobile .stashpad-composer-help { display: none; }
+
+/* Tighten the top filter row: pills match the action-button height
+   (28px) so the whole row reads as a single chip strip. */
+.stashpad-view.is-mobile .stashpad-time-filter-bar { padding: 1px 0 2px; gap: 4px; align-items: center; }
+.stashpad-view.is-mobile .stashpad-folder-btn,
+.stashpad-view.is-mobile .stashpad-time-filter-btn {
+  height: 28px;
+  padding: 0 8px;
+  font-size: var(--font-ui-smaller);
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+}
+.stashpad-view.is-mobile .stashpad-time-filter-select {
+  height: 28px;
+  padding: 0 6px;
+  font-size: var(--font-ui-smaller);
+}
+
+/* Mobile composer: textarea fills full width; button rail floats
+   inside the textarea anchored to the bottom-right. Each button
+   shrinks to a 32px square (or 36 for the send so it stays the
+   primary affordance). The textarea reserves right-padding so text
+   doesn't run under the rail. */
+.stashpad-view.is-mobile .stashpad-composer {
+  position: relative;
+  padding-top: 6px;
+}
+.stashpad-view.is-mobile .stashpad-composer-input-wrap {
+  width: 100%;
+  flex: 1 1 100%;
+}
+.stashpad-view.is-mobile .stashpad-composer-input {
+  padding-right: 96px;
+  min-height: 72px;
+  max-height: 220px;
+}
+.stashpad-view.is-mobile .stashpad-composer-btn-rail {
+  position: absolute;
+  right: 6px;
+  bottom: 8px;
+  gap: 0;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+}
+.stashpad-view.is-mobile .stashpad-composer-btn-rail > *,
+.stashpad-view.is-mobile .stashpad-composer-btn-group > * { pointer-events: auto; }
+/* Strip the button rectangle / background / border on mobile — keep
+   just the icon. Less visual noise inside the textarea overlay. */
+.stashpad-view.is-mobile .stashpad-composer-btn {
+  background: transparent;
+  border: none;
+  height: 32px;
+  width: 32px;
+  min-width: 0;
+  padding: 0;
+  color: var(--text-muted);
+  border-radius: 6px;
+}
+.stashpad-view.is-mobile .stashpad-composer-btn:hover { color: var(--text-normal); }
+.stashpad-view.is-mobile .stashpad-composer-btn.is-active { color: var(--interactive-accent); }
+.stashpad-view.is-mobile .stashpad-composer-btn .stashpad-btn-text { display: none; }
+/* Send keeps its accent fill so it reads as the primary action. */
+.stashpad-view.is-mobile .stashpad-composer-send {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.stashpad-view.is-mobile .stashpad-composer-send:hover { color: var(--text-on-accent); }
+/* Collapsible secondary-options group. Default state: width 0,
+   contents clipped — only the toggle chevron + send are visible.
+   Expanded: width grows to fit children, contents fade in. */
+.stashpad-view.is-mobile .stashpad-composer-btn-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition: max-width 0.2s ease, opacity 0.15s ease;
+}
+.stashpad-view.is-mobile .stashpad-composer-btn-rail.is-expanded .stashpad-composer-btn-group {
+  max-width: 200px;
+  opacity: 1;
+}
+.stashpad-view.is-mobile .stashpad-composer-rail-toggle .svg-icon { transition: transform 0.2s ease; }
+/* Desktop: no group collapsing — keep flat layout. */
+.stashpad-view:not(.is-mobile) .stashpad-composer-btn-group {
+  display: contents;
+}
+.stashpad-view:not(.is-mobile) .stashpad-composer-rail-toggle { display: none; }
+
+/* Action cluster (select-mode toggle + ⋯ menu) lives at the START of
+   the breadcrumb row — left of Home. */
+.stashpad-mobile-actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+  margin-right: 6px;
+  align-items: center;
+}
+.stashpad-mobile-action-btn {
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.stashpad-mobile-action-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-mobile-action-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+.stashpad-mobile-action-btn .svg-icon { width: 16px; height: 16px; }
+
+/* Bottom Home/Back/Bookmarks toolbar is redundant now that the
+   breadcrumb has a house-icon Home button + Alt+Left for back. Hide
+   it on mobile until we re-add bookmarks elsewhere. */
+.stashpad-view.is-mobile .stashpad-mobile-nav { display: none; }
+
+/* Breadcrumb tap-friendly on mobile. */
+.stashpad-view.is-mobile .stashpad-breadcrumb {
+  font-size: var(--font-ui-small);
+  padding: 6px 2px;
+  gap: 4px;
+}
+.stashpad-view.is-mobile .stashpad-crumb {
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.stashpad-view.is-mobile .stashpad-crumb-home {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px;
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+}
+.stashpad-view.is-mobile .stashpad-crumb-home .svg-icon { width: 18px; height: 18px; }
+
+/* Mobile: focused header sits inside the list scroll container so it
+   scrolls with the rows. A sticky 1-line preview takes its place at
+   the top once the full one scrolls out of view. */
+.stashpad-view.is-mobile .stashpad-focused {
+  /* When inside the list, drop the bottom border (we'll use margin
+     instead) so the layout looks like a row that happens to differ. */
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 6px;
+}
+.stashpad-focused-mini {
+  position: sticky;
+  /* Pull the sticky element UP into the view's flex `gap` between the
+     breadcrumb and the list (8px) PLUS the list's own 4px top padding
+     so it sits flush against the breadcrumb's bottom border. Without
+     this, rows scroll through the visible gap above the sticky bar
+     before disappearing under it. */
+  top: -12px;
+  z-index: 5;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  margin: -4px 0 4px;
+}
+.stashpad-focused-mini.is-visible { display: flex; }
+.stashpad-focused-mini-text {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-normal);
+}
+.stashpad-focused-mini-pencil {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.stashpad-focused-mini-pencil:hover { color: var(--text-normal); }
+.stashpad-focused-mini-pencil .svg-icon { width: 14px; height: 14px; }
+
+/* Mobile: shrink the per-row action buttons (edit pencil + enter
+   chevron) so they hug the row's text height instead of stretching
+   it. ~28px square — about two text lines tall — with smaller icons. */
+.stashpad-view.is-mobile .stashpad-pencil,
+.stashpad-view.is-mobile .stashpad-enter-btn,
+.stashpad-view.is-mobile .stashpad-focused-pencil {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.stashpad-view.is-mobile .stashpad-pencil .svg-icon,
+.stashpad-view.is-mobile .stashpad-enter-btn .svg-icon,
+.stashpad-view.is-mobile .stashpad-focused-pencil .svg-icon {
+  width: 14px;
+  height: 14px;
+}
+
+/* Mobile: tighten padding inside the focused header (the new shared
+   row layout already handles columns). Keep the 1-line clamp for the
+   inner text so the parent note doesn't dominate the screen. */
+.stashpad-view.is-mobile .stashpad-focused {
+  padding: 4px 0 6px;
+  max-height: none;
+}
+.stashpad-view.is-mobile .stashpad-focused .stashpad-note-text.is-clamped {
+  -webkit-line-clamp: 1;
+}
+
+/* Composer autocomplete popup */
+.stashpad-composer-suggest {
+  position: fixed;
+  z-index: var(--layer-popover, 30);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px 0;
+  font-size: var(--font-ui-small);
+}
+.stashpad-composer-suggest-row {
+  padding: 4px 10px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+}
+.stashpad-composer-suggest-row.is-active,
+.stashpad-composer-suggest-row:hover {
+  background: var(--background-modifier-hover);
+}
+.stashpad-composer-suggest-label {
+  color: var(--text-normal);
+  white-space: nowrap;
+}
+.stashpad-composer-suggest-sub {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Keyboard-binding row in settings */
+.stashpad-binding-slot {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 6px;
+}
+.stashpad-binding-input {
+  width: 11ch;
+  text-align: center;
+  font-family: var(--font-monospace);
+  cursor: pointer;
+}
+.stashpad-binding-input.is-recording {
+  background: var(--background-modifier-active-hover);
+  border-color: var(--interactive-accent);
+}
+.stashpad-binding-clear {
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  color: var(--text-muted);
+}
+.stashpad-binding-clear:hover {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+/* Pill toggle: a rounded track with a knob that slides L↔R. The knob
+   shows "L" when on the left (primary active) or "R" when on the right
+   (secondary active). Disabled state dims the whole pill. */
+.stashpad-binding-pill {
+  position: relative;
+  display: inline-block;
+  width: 48px;
+  height: 22px;
+  margin-left: 8px;
+  border-radius: 11px;
+  background: var(--background-modifier-border);
+  cursor: pointer;
+  transition: background 0.15s ease;
+  vertical-align: middle;
+  outline: none;
+}
+.stashpad-binding-pill:focus-visible {
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
+.stashpad-binding-pill.is-right {
+  background: var(--interactive-accent);
+}
+.stashpad-binding-pill.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.stashpad-binding-pill-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: left 0.15s ease, transform 0.15s ease;
+  user-select: none;
+  pointer-events: none;
+}
+.stashpad-binding-pill.is-right .stashpad-binding-pill-knob {
+  left: calc(100% - 20px);
+}
+/* Color picker modal */
+.stashpad-color-modal { width: min(360px, 90vw); }
+.stashpad-color-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(36px, 1fr));
+  gap: 8px;
+  padding: 8px 0;
+}
+.stashpad-color-tile {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: transform 0.08s ease, border-color 0.08s ease;
+  position: relative;
+}
+.stashpad-color-tile:hover { transform: scale(1.06); }
+.stashpad-color-tile.is-active { border-color: var(--text-normal); }
+/* Delete ✕ overlay on saved-custom tiles. Hidden until tile hover. */
+.stashpad-color-tile-del {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-size: 12px;
+  line-height: 14px;
+  text-align: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.08s ease, background 0.08s ease;
+}
+.stashpad-color-tile:hover .stashpad-color-tile-del { opacity: 1; }
+.stashpad-color-tile-del:hover {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+.stashpad-color-none {
+  background: var(--background-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+/* Diagonal slash for the "no color" tile — distinct from the previous
+   checkmark so it reads as "remove" rather than "selected". */
+.stashpad-color-none::before {
+  content: "";
+  position: absolute;
+  left: 4px; right: 4px;
+  top: 50%;
+  height: 2px;
+  background: var(--text-muted);
+  transform: rotate(-45deg);
+  transform-origin: center;
+}
+.stashpad-color-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 8px;
+}
+/* "+" tile: opens the custom-color submenu. Same size as the swatches. */
+.stashpad-color-add {
+  background: var(--background-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 24px;
+  line-height: 1;
+}
+.stashpad-color-add::before { content: "+"; }
+.stashpad-color-add:hover { color: var(--text-normal); }
+/* Custom-color submenu */
+.stashpad-custom-color-modal { width: min(380px, 90vw); }
+.stashpad-custom-color-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+}
+.stashpad-custom-color-preview {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+  overflow: hidden;
+}
+.stashpad-custom-color-wheel {
+  /* Native picker is invisible; clicking the preview pops it. */
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  border: none;
+  padding: 0;
+  pointer-events: none;
+}
+.stashpad-custom-color-hex {
+  flex: 1 1 auto;
+  font-family: var(--font-monospace);
+  text-transform: uppercase;
+}
+.stashpad-log-footer {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  padding: 8px 0 0;
+}
+.stashpad-log-footer:empty { display: none; }
+.stashpad-modal-check { display: block; margin: 8px 0; cursor: pointer; }
+.stashpad-modal-check input { margin-right: 6px; }
+
+.stashpad-modal-btns {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
