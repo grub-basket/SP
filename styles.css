@@ -328,6 +328,11 @@
   border-color: var(--interactive-accent);
   color: var(--interactive-accent);
 }
+.stashpad-sort-btn.is-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.stashpad-sort-btn.is-disabled:hover { background: var(--background-secondary); }
 .stashpad-sort-icon { display: inline-flex; align-items: center; }
 .stashpad-sort-icon .svg-icon { width: 14px; height: 14px; }
 .stashpad-sort-label {
@@ -367,6 +372,288 @@
 }
 .stashpad-sort-popover-label { white-space: nowrap; }
 
+/* View dropdown — same shape as Sort but each row is two-line (label + a
+   short description) so the three modes read clearly at a glance. */
+.stashpad-view-btn {
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.stashpad-view-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-view-btn.is-active {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+.stashpad-view-icon { display: inline-flex; align-items: center; }
+.stashpad-view-icon .svg-icon { width: 14px; height: 14px; }
+.stashpad-view-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stashpad-view.is-mobile .stashpad-view-btn {
+  height: 28px;
+  padding: 0 6px;
+}
+
+.stashpad-view-popover {
+  position: fixed;
+  z-index: var(--layer-popover, 30);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  padding: 4px 0;
+  font-size: var(--font-ui-small);
+  /* No max-height — the menu always expands fully so the user can see
+     every mode + filter at once. overflow-y is a no-op without a
+     height constraint, but kept declared as a safety net for any
+     future case where the popover needs to clamp (e.g. tiny popout
+     window on desktop). */
+  overflow-y: auto;
+}
+/* Mobile: hide per-row descriptions to keep popovers compact. Applies
+   to both the standalone view popover (.stashpad-view-popover.is-mobile)
+   AND the body of any section rendered inside the combined-filters
+   accordion (.stashpad-mobile-filters-popover wraps every section). */
+.stashpad-view-popover.is-mobile .stashpad-view-popover-desc,
+.stashpad-mobile-filters-popover .stashpad-view-popover-desc {
+  display: none;
+}
+.stashpad-view-popover.is-mobile .stashpad-view-popover-row,
+.stashpad-mobile-filters-popover .stashpad-view-popover-row {
+  padding: 6px 12px;
+}
+.stashpad-view-popover-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.stashpad-view-popover-row:hover { background: var(--background-modifier-hover); }
+.stashpad-view-popover-row.is-active .stashpad-view-popover-label {
+  color: var(--interactive-accent);
+  font-weight: 600;
+}
+.stashpad-view-popover-main { display: flex; align-items: center; gap: 8px; }
+.stashpad-view-popover-label { white-space: nowrap; }
+.stashpad-view-popover-desc {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  white-space: normal;
+  max-width: 280px;
+}
+.stashpad-view-popover-divider {
+  height: 1px;
+  background: var(--background-modifier-border);
+  margin: 4px 0;
+}
+/* Toggle row: 2-column grid keeps the checkbox aligned with the label
+   in the first row and the description tucked under the label in the
+   second row. Cleaner than the previous flex-wrap which depended on
+   browser-default checkbox widths matching the desc's left padding. */
+.stashpad-view-popover-toggle {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  row-gap: 2px;
+  align-items: center;
+  padding: 8px 12px;
+}
+.stashpad-view-popover-toggle input[type="checkbox"] {
+  /* Use transform: scale() instead of explicit width/height to shrink
+     the checkbox visually. Chromium draws the native checkmark glyph
+     at fixed pixel sizes; clamping the box smaller crops the glyph and
+     visually decentres the check. Scaling lets the glyph shrink in
+     proportion with the box so the check stays centred. transform-origin
+     left keeps the small box flush with the left edge of the grid
+     column. */
+  margin: 0;
+  transform: scale(0.85);
+  transform-origin: left center;
+  grid-row: 1;
+  grid-column: 1;
+  justify-self: start;
+  cursor: pointer;
+}
+.stashpad-view-popover-toggle .stashpad-view-popover-main {
+  grid-row: 1;
+  grid-column: 2;
+}
+.stashpad-view-popover-toggle .stashpad-view-popover-desc {
+  grid-row: 2;
+  grid-column: 2;
+  padding-left: 0;
+}
+.stashpad-view-popover-toggle.is-disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* Mobile combined-filters button: a single sliders icon that replaces
+   the four desktop dropdown buttons (tag/color/sort/view) on mobile.
+   Picks up an accent border when any of the underlying filters / view
+   options are in a non-default state. */
+.stashpad-mobile-filters-btn {
+  flex: 0 0 auto;
+  /* Push to the far right of the header bar — auto-margin in a flex
+     row absorbs all remaining space on the left of this element, so
+     the button sits hard against the right edge regardless of what
+     else (folder button, etc.) is rendered to its left. */
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  width: 32px;
+  padding: 0;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+  user-select: none;
+}
+.stashpad-mobile-filters-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-mobile-filters-btn.is-active {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+.stashpad-mobile-filters-icon { display: inline-flex; align-items: center; }
+.stashpad-mobile-filters-icon .svg-icon { width: 16px; height: 16px; }
+
+/* Accordion popover. Four sections stacked vertically; one expanded at
+   a time. Header chevron flips between right (collapsed) and down
+   (expanded). Bodies host the same row markup the desktop popovers
+   use — see populate*MenuBody methods. */
+.stashpad-mobile-filters-popover {
+  position: fixed;
+  z-index: var(--layer-popover, 30);
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  padding: 4px 0;
+  font-size: var(--font-ui-small);
+  overflow-y: auto;
+  /* Cap height so a fully expanded section with many rows can scroll
+     instead of clipping below the viewport. */
+  max-height: calc(100vh - 80px);
+}
+.stashpad-mobile-filters-section + .stashpad-mobile-filters-section {
+  border-top: 1px solid var(--background-modifier-border);
+}
+.stashpad-mobile-filters-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.stashpad-mobile-filters-header:hover { background: var(--background-modifier-hover); }
+.stashpad-mobile-filters-chev {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+.stashpad-mobile-filters-chev .svg-icon { width: 14px; height: 14px; }
+.stashpad-mobile-filters-title { font-weight: 600; }
+.stashpad-mobile-filters-summary {
+  margin-left: auto;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 50%;
+}
+.stashpad-mobile-filters-body {
+  padding: 2px 0 6px;
+}
+.stashpad-mobile-filters-note {
+  padding: 8px 16px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+/* Per-row breadcrumb shown in Flat / Everything modes. Sits above the
+   note body, muted by default so it doesn't compete with the body text.
+   Segments are clickable to focus into that ancestor. */
+.stashpad-row-breadcrumb {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  margin-bottom: 4px;
+  line-height: 1.2;
+}
+.stashpad-row-breadcrumb-seg {
+  cursor: pointer;
+}
+.stashpad-row-breadcrumb-seg:hover {
+  color: var(--text-normal);
+  text-decoration: underline;
+}
+.stashpad-row-breadcrumb-sep {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* Non-Stashpad file row in Everything mode — intentionally compact and
+   visually distinct from note rows so users see it's a different kind
+   of item (decorative click-to-open, not part of the selection model). */
+.stashpad-file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-left: 3px solid transparent;
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+.stashpad-file-row:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-file-meta {
+  flex: 0 0 auto;
+  min-width: 70px;
+}
+.stashpad-file-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+}
+.stashpad-file-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.stashpad-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stashpad-file-ext {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+  letter-spacing: 0.05em;
+}
+
 .stashpad-color-filter-popover {
   position: fixed;
   z-index: var(--layer-popover, 30);
@@ -394,8 +681,11 @@
   .stashpad-time-filter-btns { display: none; }
   .stashpad-time-filter-select { display: block; }
 }
-.stashpad-view.is-mobile .stashpad-time-filter-btns { display: none; }
-.stashpad-view.is-mobile .stashpad-time-filter-select { display: block; }
+/* Mobile: the time filter moves into the combined-filters accordion.
+   Hide both the button row AND the fallback select here — the accordion's
+   Time section provides the UI. */
+.stashpad-view.is-mobile .stashpad-time-filter-btns,
+.stashpad-view.is-mobile .stashpad-time-filter-select { display: none; }
 
 .stashpad-breadcrumb {
   font-size: var(--font-ui-small);
@@ -567,6 +857,32 @@
    normal rows. is-pick-target (green nest indicator) still wins on top. */
 .stashpad-note.has-color {
   border-color: var(--stashpad-note-color);
+}
+
+/* Inherited-color side stripe: rendered on rows whose nearest colored
+   ancestor is some depth above them. A short pseudo-element down the
+   left edge tinted with the ancestor's hex, faded by depth (~18% off
+   per level) via color-mix. Visually marks "this row belongs to a
+   colored branch" without overwhelming the row's own chrome. Hidden
+   beneath the row's normal border by being inset 1px from the edge.
+   color-mix is supported on Electron 113+ (current Obsidian). */
+.stashpad-note.has-inherited-color {
+  position: relative;
+}
+.stashpad-note.has-inherited-color::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: 4px;
+  bottom: 4px;
+  width: 3px;
+  border-radius: 2px;
+  background: color-mix(
+    in srgb,
+    var(--stashpad-inherited-color) calc(100% - var(--stashpad-inherited-depth, 0) * 18%),
+    transparent
+  );
+  pointer-events: none;
 }
 /* When the row is selected, the colored border thickens so the selection
    state reads as a single, unified ring — no double-line from the default
