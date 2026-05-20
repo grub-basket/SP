@@ -1,4 +1,5 @@
 import { App, Modal, Platform, moment, Notice } from "obsidian";
+import type { NotificationCategory, NotificationKind, NotificationRecord, NotificationService } from "./notifications";
 
 interface LogEv { ts: string; type: string; id: string; payload?: any; author?: string; }
 
@@ -766,6 +767,11 @@ export class ColorPickerModal extends Modal {
 }
 
 export class ConfirmModal extends Modal {
+  /** Tracks whether the user made an explicit choice via the button
+   *  row. If the modal closes any other way (Escape, click on the
+   *  background overlay), onClose treats it as Cancel so callers
+   *  don't hang waiting for a choice. */
+  private didChoose = false;
   constructor(
     app: App,
     private titleText: string,
@@ -779,11 +785,309 @@ export class ConfirmModal extends Modal {
     this.contentEl.createEl("p", { text: this.message });
     const row = this.contentEl.createDiv({ cls: "stashpad-modal-btns" });
     const cancel = row.createEl("button", { text: "Cancel" });
-    cancel.onclick = () => { this.close(); this.onChoose(false); };
+    cancel.onclick = () => { this.didChoose = true; this.close(); this.onChoose(false); };
     const ok = row.createEl("button", { cls: "mod-cta", text: this.confirmText });
-    ok.onclick = () => { this.close(); this.onChoose(true); };
+    ok.onclick = () => { this.didChoose = true; this.close(); this.onChoose(true); };
     // Focus the confirm button so Enter accepts.
     requestAnimationFrame(() => ok.focus());
   }
-  onClose(): void { this.contentEl.empty(); }
+  onClose(): void {
+    this.contentEl.empty();
+    // If the modal closed without an explicit Cancel/Confirm (e.g.
+    // user clicked the background overlay or pressed Escape), treat
+    // as Cancel so callers don't hang.
+    if (!this.didChoose) {
+      this.didChoose = true;
+      this.onChoose(false);
+    }
+  }
+}
+
+/** Browses the in-memory ring of NotificationRecords held by the
+ *  plugin's NotificationService. Live-updates via service.onChange so
+ *  new notifications appear without re-opening the modal. Mirrors
+ *  LogModal's toolbar + filter + paginated list shape so the two
+ *  feel cohesive. */
+export class NotificationHistoryModal extends Modal {
+  private records: NotificationRecord[] = [];
+  private visible: NotificationRecord[] = [];
+  private shownCount = 0;
+  private categoryFilter: NotificationCategory | null = null;
+  private listEl: HTMLDivElement | null = null;
+  private footerEl: HTMLDivElement | null = null;
+  private countEl: HTMLSpanElement | null = null;
+  private filterSelEl: HTMLSelectElement | null = null;
+  private unsubscribe: (() => void) | null = null;
+  private static PAGE = 100;
+
+  /** Author filter dimension orthogonal to the category filter:
+   *    - "all": no filter on author.
+   *    - "me": records whose authorId === currentAuthorId.
+   *    - "cross": records where the actor's authorId differs from at
+   *      least one affected note's author (covers "someone else
+   *      touched my notes" AND "I touched someone else's notes").
+   *    - "<id>": records authored by the given authorId. */
+  private authorFilter: "all" | "me" | "cross" | string = "all";
+  private authorSelEl: HTMLSelectElement | null = null;
+
+  constructor(
+    app: App,
+    private service: NotificationService,
+    private openLog?: (folder: string | undefined) => void,
+    /** Local user's authorId. Used by the "Me" filter; if null, the
+     *  "Me" option is hidden. */
+    private currentAuthorId: string | null = null,
+    /** Resolver: given a Stashpad id, returns all author + contributor
+     *  ids for that note (read from frontmatter.author +
+     *  frontmatter.contributors by the caller). Used by the
+     *  "Cross-author" filter. Note that for DESTROYED notes the
+     *  resolver can't help (the note's gone from the metadata cache)
+     *  — those records pre-stamp `affectedAuthorIds` at the time of
+     *  the action instead. */
+    private getNoteAuthorIds?: (id: string) => string[],
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.titleEl.setText("Stashpad notification history");
+    this.modalEl.addClass("stashpad-log-modal"); // Reuse the existing log-modal sizing.
+    this.modalEl.addClass("stashpad-notif-history-modal");
+
+    this.records = this.service.recent();
+
+    const toolbar = this.contentEl.createDiv({ cls: "stashpad-log-toolbar" });
+    this.countEl = toolbar.createSpan({ cls: "stashpad-log-count" }) as HTMLSpanElement;
+    this.updateCount();
+
+    this.filterSelEl = toolbar.createEl("select", { cls: "stashpad-log-type-filter" });
+    this.filterSelEl.onchange = () => this.setCategoryFilter((this.filterSelEl!.value || null) as NotificationCategory | null);
+    this.refreshCategoryFilter();
+
+    // Author filter dropdown — only renders when there's at least one
+    // authored record. Multiplayer filter: All / Me / Cross-author /
+    // per-author entries.
+    this.authorSelEl = toolbar.createEl("select", { cls: "stashpad-log-type-filter stashpad-notif-author-filter" });
+    this.authorSelEl.onchange = () => this.setAuthorFilter(this.authorSelEl!.value || "all");
+    this.refreshAuthorFilter();
+
+    if (this.openLog) {
+      const logBtn = toolbar.createEl("button", { text: "Open log" });
+      logBtn.title = "Open the per-folder Stashpad log for the most recent notification's folder.";
+      logBtn.onclick = () => {
+        const mostRecentWithFolder = this.records.find((r) => !!r.folder);
+        this.openLog?.(mostRecentWithFolder?.folder);
+      };
+    }
+
+    const clearBtn = toolbar.createEl("button", { cls: "mod-warning", text: "Clear history" });
+    clearBtn.onclick = () => {
+      // Confirm before wiping — same pattern as LogModal's "Clear log"
+      // button. ConfirmModal treats click-off-the-overlay as Cancel.
+      new ConfirmModal(
+        this.app,
+        "Clear notification history?",
+        `This will permanently remove all ${this.records.length} stored notifications from the history. The current toasts on screen are unaffected. This can't be undone.`,
+        "Clear history",
+        (ok) => {
+          if (!ok) return;
+          this.service.clearHistory();
+          // service.clearHistory emits — our subscriber refreshes.
+        },
+      ).open();
+    };
+
+    this.listEl = this.contentEl.createDiv({ cls: "stashpad-log-list" }) as HTMLDivElement;
+    this.refreshList();
+    this.footerEl = this.contentEl.createDiv({ cls: "stashpad-log-footer" }) as HTMLDivElement;
+    this.renderFooter();
+
+    // Live-update: re-pull records on every service change.
+    this.unsubscribe = this.service.onChange(() => {
+      this.records = this.service.recent();
+      this.refreshCategoryFilter();
+      this.refreshAuthorFilter();
+      this.refreshList();
+      this.renderFooter();
+    });
+  }
+
+  private setAuthorFilter(value: string): void {
+    if (this.authorFilter === value) return;
+    this.authorFilter = value;
+    this.refreshList();
+    this.renderFooter();
+  }
+
+  /** Build the author <select> options from distinct authorIds in the
+   *  history, plus the synthetic "All / Me / Cross-author" entries. */
+  private refreshAuthorFilter(): void {
+    if (!this.authorSelEl) return;
+    const sel = this.authorSelEl;
+    sel.empty();
+    sel.createEl("option", { text: "All authors" }).value = "all";
+    if (this.currentAuthorId) {
+      sel.createEl("option", { text: "Me" }).value = "me";
+    }
+    // "Cross-author" is always available — even without the resolver,
+    // pre-stamped affectedAuthorIds may suffice for destructive ops.
+    sel.createEl("option", { text: "Cross-author" }).value = "cross";
+    // Distinct authors present in the recorded set, excluding the
+    // local user (already covered by "Me"). Limited to authors who
+    // actually appear in history so the list stays meaningful.
+    const distinct = new Set<string>();
+    for (const r of this.records) {
+      if (r.authorId && r.authorId !== this.currentAuthorId) distinct.add(r.authorId);
+    }
+    if (distinct.size > 0) {
+      const sep = sel.createEl("option", { text: "──────────" });
+      sep.disabled = true;
+      for (const id of [...distinct].sort()) {
+        sel.createEl("option", { text: id }).value = id;
+      }
+    }
+    // If the active filter is no longer applicable, drop it.
+    const valid = new Set(["all", "cross", ...(this.currentAuthorId ? ["me"] : []), ...distinct]);
+    if (!valid.has(this.authorFilter)) this.authorFilter = "all";
+    sel.value = this.authorFilter;
+  }
+
+  /** Returns true when `record` is involved in cross-author activity:
+   *  any author / contributor of an affected note differs from the
+   *  actor (record.authorId). Either direction qualifies — "someone
+   *  else touched my notes" OR "I touched someone else's notes" or
+   *  "I touched a note that has other contributors".
+   *
+   *  Two sources are consulted, in priority order:
+   *    1. Pre-stamped `affectedAuthorIds` on the record — the only
+   *       way to detect cross-author DELETES (the deleted note is no
+   *       longer in the metadata cache).
+   *    2. The `getNoteAuthorIds` resolver — queries live frontmatter
+   *       at filter time. Covers all non-destructive actions.
+   */
+  private isCrossAuthor(record: NotificationRecord): boolean {
+    const actor = record.authorId ?? null;
+    if (!actor) return false;
+    for (const id of record.affectedAuthorIds ?? []) {
+      if (id && id !== actor) return true;
+    }
+    if (!this.getNoteAuthorIds) return false;
+    for (const noteId of record.affectedIds) {
+      const ids = this.getNoteAuthorIds(noteId);
+      for (const id of ids) {
+        if (id && id !== actor) return true;
+      }
+    }
+    return false;
+  }
+
+  onClose(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.contentEl.empty();
+  }
+
+  private setCategoryFilter(cat: NotificationCategory | null): void {
+    if ((this.categoryFilter ?? null) === (cat ?? null)) return;
+    this.categoryFilter = cat;
+    this.refreshList();
+    this.renderFooter();
+  }
+
+  private refreshCategoryFilter(): void {
+    if (!this.filterSelEl) return;
+    const sel = this.filterSelEl;
+    sel.empty();
+    const counts = new Map<NotificationCategory, number>();
+    for (const r of this.records) counts.set(r.category, (counts.get(r.category) ?? 0) + 1);
+    const entries = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const all = sel.createEl("option", { text: `All categories (${this.records.length})` });
+    all.value = "";
+    for (const [cat, n] of entries) {
+      const opt = sel.createEl("option", { text: `${cat} (${n})` });
+      opt.value = cat;
+    }
+    if (this.categoryFilter && !counts.has(this.categoryFilter)) this.categoryFilter = null;
+    sel.value = this.categoryFilter ?? "";
+  }
+
+  private refreshList(): void {
+    if (!this.listEl) return;
+    this.visible = this.records.filter((r) => {
+      if (this.categoryFilter && r.category !== this.categoryFilter) return false;
+      switch (this.authorFilter) {
+        case "all": return true;
+        case "me": return !!this.currentAuthorId && r.authorId === this.currentAuthorId;
+        case "cross": return this.isCrossAuthor(r);
+        default: return r.authorId === this.authorFilter;
+      }
+    });
+    this.shownCount = 0;
+    this.listEl.empty();
+    if (!this.visible.length) {
+      this.listEl.createDiv({
+        cls: "stashpad-log-empty",
+        text: this.categoryFilter ? `No "${this.categoryFilter}" notifications.` : "No notifications yet.",
+      });
+      this.updateCount();
+      return;
+    }
+    this.appendMore(NotificationHistoryModal.PAGE);
+  }
+
+  private appendMore(n: number): void {
+    if (!this.listEl) return;
+    const stop = Math.min(this.visible.length, this.shownCount + n);
+    for (let i = this.shownCount; i < stop; i++) this.renderRow(this.listEl, this.visible[i]);
+    this.shownCount = stop;
+    this.updateCount();
+  }
+
+  private renderRow(parent: HTMLElement, r: NotificationRecord): void {
+    const row = parent.createDiv({ cls: `stashpad-notif-row stashpad-notif-row-${r.kind}` });
+    const meta = row.createDiv({ cls: "stashpad-notif-meta" });
+    const time = meta.createSpan({ cls: "stashpad-notif-time" });
+    const m = moment(r.ts);
+    time.setText(m.fromNow());
+    time.title = m.format("YYYY-MM-DD HH:mm:ss");
+    const cat = meta.createSpan({ cls: `stashpad-notif-cat stashpad-notif-cat-${r.category}` });
+    cat.setText(r.category);
+    const msg = row.createDiv({ cls: "stashpad-notif-msg" });
+    msg.setText(r.message);
+    if (r.actionLabels.length > 0) {
+      const acts = row.createDiv({ cls: "stashpad-notif-actions-snapshot" });
+      for (const label of r.actionLabels) {
+        const chip = acts.createSpan({ cls: "stashpad-notif-action-chip" });
+        chip.setText(label);
+        chip.title = "Action button was shown on the original toast (handler not retained).";
+      }
+    }
+  }
+
+  private updateCount(): void {
+    if (!this.countEl) return;
+    const total = this.visible.length;
+    const label = this.categoryFilter
+      ? `${total} ${this.categoryFilter} notification${total === 1 ? "" : "s"}`
+      : `${total} notification${total === 1 ? "" : "s"}`;
+    if (this.shownCount === 0 || this.shownCount >= total) {
+      this.countEl.setText(label);
+    } else {
+      this.countEl.setText(`Showing ${this.shownCount} of ${label}`);
+    }
+  }
+
+  private renderFooter(): void {
+    if (!this.footerEl) return;
+    this.footerEl.empty();
+    const remaining = this.visible.length - this.shownCount;
+    if (remaining <= 0) return;
+    const moreBtn = this.footerEl.createEl("button", { text: `Load ${Math.min(NotificationHistoryModal.PAGE, remaining)} more` });
+    moreBtn.onclick = () => { this.appendMore(NotificationHistoryModal.PAGE); this.renderFooter(); };
+    if (remaining > NotificationHistoryModal.PAGE) {
+      const allBtn = this.footerEl.createEl("button", { text: `Load all (${remaining})` });
+      allBtn.onclick = () => { this.appendMore(remaining); this.renderFooter(); };
+    }
+  }
 }

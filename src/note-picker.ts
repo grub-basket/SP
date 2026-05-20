@@ -7,7 +7,12 @@ export interface PickerItem {
   id: string;
   label: string;
   node: TreeNode | null;
-  kind: "note" | "create";
+  /** Item kinds:
+   *  - "note": ordinary local-or-cross-folder note pick.
+   *  - "create": "Create new: <query>" virtual pick.
+   *  - "folder-open": pick a Stashpad folder — caller opens it in a new
+   *    tab. Carries `folder` but no node. 0.57.3. */
+  kind: "note" | "create" | "folder-open";
   bodyPreview?: string; // for search mode
   matchLine?: number;
   /** For cross-folder results: the source folder + raw TFile so the
@@ -15,15 +20,20 @@ export interface PickerItem {
    *  local (current-tree) results. */
   crossFolder?: string;
   crossFile?: TFile;
+  /** For "folder-open" items: the folder path to open in a new tab. */
+  folder?: string;
 }
 
 /** A cross-folder note loaded from another Stashpad. Shaped to plug into
  *  the same render/filter machinery as in-tree notes without inventing a
  *  full synthetic TreeNode. */
 export interface CrossFolderNote {
-  file: TFile;
+  /** Optional — synthetic root entries (one per external Stashpad folder)
+   *  carry no underlying TFile. The picker treats them as "Home of that
+   *  folder" pick targets. 0.57.2. */
+  file?: TFile;
   folder: string;
-  /** Note's id from frontmatter (just for stable item ids in the list). */
+  /** Note's id from frontmatter (or ROOT_ID for synthetic roots). */
   id: string;
   /** Rendered title/label (basename minus the trailing -id, with dashes
    *  → spaces). */
@@ -61,6 +71,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
        *  first, and this source is queried only after the local set is
        *  exhausted (or to fill out short result lists). */
       crossFolderNotes?: () => CrossFolderNote[];
+      /** Optional source of Stashpad folder paths. When provided, folders
+       *  whose name matches the query show up as their own "open this
+       *  folder in a new tab" pick. Used by the search modal. 0.57.3. */
+      folderResults?: () => string[];
     },
   ) {
     super(app);
@@ -98,6 +112,8 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       }
       for (const n of this.notes) {
         if (!n.cross || n.body) continue;
+        // Skip the synthetic-root entries (no TFile to read).
+        if (!n.cross.file) continue;
         this.app.vault.cachedRead(n.cross.file).then((md) => { n.body = this.stripFm(md); });
       }
     }
@@ -111,6 +127,21 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
 
   getSuggestions(query: string): PickerItem[] {
     const q = query.trim().toLowerCase();
+    // 0.57.0: token-order-agnostic matching. Same approach as the
+    // composer's `[[` link autocomplete — split on whitespace and require
+    // every token to appear somewhere in the haystack (any order). So
+    // "B and A" matches a note titled "A and B". Empty query matches
+    // everything.
+    const tokens = q ? q.split(/\s+/).filter(Boolean) : [];
+    const matchesAll = (haystack: string): boolean => {
+      if (!tokens.length) return true;
+      for (const t of tokens) if (!haystack.includes(t)) return false;
+      return true;
+    };
+    // For search mode's per-line matchLine: a line is a match when it
+    // contains EVERY token (token-order-agnostic on a single line).
+    const lineMatchesAll = (line: string): boolean => matchesAll(line.toLowerCase());
+
     // Tier the candidates: local first (notes from the active tree),
     // then cross-folder (notes from other Stashpads). The user wanted
     // cross-folder results to appear AFTER the local ones rather than
@@ -135,17 +166,21 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       for (const n of tier) {
         if (this.opts.mode === "search") {
           if (!q) { out.push(buildItem(n, -1)); continue; }
-          const titleHit = n.title.toLowerCase().includes(q);
+          const titleHit = matchesAll(n.title.toLowerCase());
           const lines = n.body.split(/\r?\n/);
           let matchLine = -1;
           for (let i = 0; i < lines.length; i++) {
-            if (lines[i].toLowerCase().includes(q)) { matchLine = i; break; }
+            if (lineMatchesAll(lines[i])) { matchLine = i; break; }
           }
-          if (!titleHit && matchLine === -1) continue;
+          // Body-anywhere match (tokens scattered across multiple lines)
+          // — show the row even if no single line contains every token.
+          // matchLine stays -1; the preview falls back to body start.
+          const bodyHit = matchLine !== -1 || matchesAll(n.body.toLowerCase());
+          if (!titleHit && !bodyHit) continue;
           out.push(buildItem(n, matchLine));
         } else {
-          // pick mode
-          if (q && !n.title.toLowerCase().includes(q) && !n.body.toLowerCase().includes(q)) continue;
+          // pick mode — tokens must all appear in title OR body.
+          if (q && !matchesAll(n.title.toLowerCase()) && !matchesAll(n.body.toLowerCase())) continue;
           out.push(buildItem(n, -1));
         }
       }
@@ -158,15 +193,43 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // OR when the user is in search mode with a real query (so they can
     // discover cross-folder hits). Pick mode without a query keeps the
     // list local for performance.
+    // 0.57.2: loosened pick-mode rule — cross-folder results always
+    // appear when the user has typed a query (was gated to
+    // localItems.length < 30, which hid them in mid-sized vaults where
+    // many local notes happened to match). Empty-query pick mode stays
+    // local-only for performance.
     const crossWanted = this.opts.mode === "search"
       ? (q ? true : localItems.length < 10)
-      : (q ? localItems.length < 30 : false);
+      : (q ? true : false);
     if (crossWanted) {
       const crossItems = matchTier(cross);
       // Cap the local tier so the user sees the cross-folder section
       // come up without scrolling through hundreds of local hits.
       if (this.opts.mode === "search" && !q) items.length = Math.min(items.length, 50);
       items.push(...crossItems);
+    }
+
+    // 0.57.3: folder-open results — prepended to the list so they're easy
+    // to spot when a query matches a folder name. Each one opens the
+    // folder's home in a new tab via the caller's onPick.
+    if (this.opts.folderResults) {
+      const folders = this.opts.folderResults();
+      const folderItems: PickerItem[] = [];
+      for (const folder of folders) {
+        // Token-order match against the folder's last path segment AND
+        // the full path (so the user can match by either).
+        const last = folder.split("/").pop() ?? folder;
+        const haystack = `${folder.toLowerCase()} ${last.toLowerCase()}`;
+        if (!matchesAll(haystack)) continue;
+        folderItems.push({
+          id: `folder:${folder}`,
+          label: `Open folder “${last}” in a new tab`,
+          node: null,
+          kind: "folder-open",
+          folder,
+        });
+      }
+      if (folderItems.length) items.unshift(...folderItems);
     }
 
     if (this.opts.allowCreate && q && !items.some((i) => i.label.trim().toLowerCase() === q)) {
@@ -188,6 +251,12 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     el.addClass("stashpad-suggest-item");
     if (item.kind === "create") {
       el.createDiv({ cls: "stashpad-suggest-create", text: item.label });
+      return;
+    }
+    if (item.kind === "folder-open") {
+      el.addClass("is-folder-open");
+      el.createDiv({ cls: "stashpad-suggest-title", text: item.label });
+      if (item.folder) el.createDiv({ cls: "stashpad-suggest-preview", text: item.folder });
       return;
     }
     if (item.crossFolder) el.addClass("is-cross-folder");

@@ -2050,3 +2050,145 @@
   justify-content: flex-end;
   margin-top: 12px;
 }
+
+/* Stashpad notification toast — wraps Obsidian's built-in .notice with
+   a structured layout so we can stack a message + action button row.
+   Color shifts by kind (info / success / warning / error) come from
+   small left-border accents; the toast's main background stays
+   Obsidian's default so theme integration stays clean. */
+.stashpad-notice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 8px;
+  border-left: 3px solid transparent;
+}
+.stashpad-notice-info    { border-left-color: var(--text-muted); }
+.stashpad-notice-success { border-left-color: var(--color-green, #44d07b); }
+.stashpad-notice-warning { border-left-color: var(--color-orange, #e8a25a); }
+.stashpad-notice-error   { border-left-color: var(--color-red, #e25c4c); }
+.stashpad-notice-message {
+  white-space: pre-wrap;
+  line-height: 1.4;
+}
+.stashpad-notice-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.stashpad-notice-action {
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+.stashpad-notice-action:hover {
+  background: var(--background-modifier-hover);
+}
+
+/* Notification history modal — extends the existing log-modal layout
+   with notification-specific row styling. Each row has a colored dot
+   for the kind, a category badge, the message, and (optional) snapshot
+   chips for the action labels the original toast carried. */
+.stashpad-notif-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-notif-row:last-child { border-bottom: none; }
+.stashpad-notif-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  grid-column: 1;
+  white-space: nowrap;
+}
+.stashpad-notif-time {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.stashpad-notif-cat {
+  font-size: var(--font-ui-smaller);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+.stashpad-notif-row-success .stashpad-notif-cat { background: rgba(68, 208, 123, 0.18); color: var(--color-green, #44d07b); }
+.stashpad-notif-row-warning .stashpad-notif-cat { background: rgba(232, 162, 90, 0.18); color: var(--color-orange, #e8a25a); }
+.stashpad-notif-row-error   .stashpad-notif-cat { background: rgba(226, 92, 76, 0.18);  color: var(--color-red, #e25c4c); }
+.stashpad-notif-msg {
+  grid-column: 2;
+  white-space: pre-wrap;
+}
+.stashpad-notif-actions-snapshot {
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 2px;
+}
+.stashpad-notif-action-chip {
+  font-size: var(--font-ui-smaller);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--background-secondary);
+  color: var(--text-faint);
+  border: 1px solid var(--background-modifier-border);
+}
+
+/* Mute-category settings — collapsed by default. The <details> arrow
+   and label use the theme's defaults; the help line gets a muted color
+   so it doesn't compete with the section header. */
+.stashpad-notif-mute-details {
+  margin: 8px 0 12px;
+}
+.stashpad-notif-mute-details > summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 4px 0;
+}
+.stashpad-notif-mute-help {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin: 4px 0 8px;
+}
+
+/* Notification toast polish — wrap, truncate, monospace paths.
+   The action button gets a max-width so a long "Jump to '<title>'"
+   doesn't extend off-screen; overflow is ellipsised. The message
+   body already does pre-wrap from 0.55.0, but we cap toast width
+   so super-long single lines don't push the viewport. */
+.stashpad-notice {
+  max-width: min(480px, 90vw);
+}
+.stashpad-notice-message {
+  word-break: break-word;
+}
+/* File names + vault paths inside notification messages render in
+   monospace + slightly muted background so they're visually distinct
+   from prose. Applied by wrapping the path in <code>...</code> in
+   the toast's message string OR by class. */
+.stashpad-notice-message code,
+.stashpad-notice-message .stashpad-notice-path {
+  font-family: var(--font-monospace);
+  font-size: 0.95em;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--background-modifier-border);
+  color: var(--text-normal);
+}
+.stashpad-notice-action {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

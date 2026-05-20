@@ -3,11 +3,13 @@ import {
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce, moment, setIcon,
 } from "obsidian";
 import {
-  ROOT_ID, STASHPAD_VIEW_TYPE, type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode,
+  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
 } from "./types";
 import { TreeIndex } from "./tree-index";
 import { OrderStore } from "./order-store";
 import { SortStore, type SortMode, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
+import { FrontmatterSyncQueue } from "./frontmatter-sync";
+import { buildFileActions } from "./notifications";
 import { newId } from "./id-service";
 import { bodyToSlug, buildFilename, parseIdFromFilename, DEFAULT_STOPWORDS } from "./slug-service";
 import { StashpadLog } from "./log";
@@ -81,6 +83,10 @@ export class StashpadView extends ItemView {
   private integrity: IntegrityWatcher;
   private order: OrderStore;
   private sortStore: SortStore;
+  /** Background queue that writes redundant `parentLink` + `children`
+   *  fields to frontmatter. Fire-and-forget — callers don't await. See
+   *  FrontmatterSyncQueue jsdoc for the why. */
+  private fmSync: FrontmatterSyncQueue;
 
   private focusId: StashpadId = ROOT_ID;
   private timeFilter: TimeFilter = "all";
@@ -117,6 +123,30 @@ export class StashpadView extends ItemView {
   private draftsLoadedFor: string | null = null;
   private autoSelectNewest = false;
   private scrollToBottomOnNextRender = false;
+  /** Debounce token for the scroll-event listener that keeps scrollByFocus
+   *  fresh as the user scrolls. Without this, reload could only restore
+   *  positions the user explicitly navigated to/from — free scrolling
+   *  inside one focus would never be saved. */
+  private scrollListenerSaveTimer: number | null = null;
+  /** Set true while restore-policy's multi-frame apply is asserting
+   *  scrollTop programmatically. The scroll listener checks this and
+   *  skips stamping the map — otherwise a transient clamped scrollTop
+   *  (scrollHeight not yet settled) overwrites the saved target with
+   *  the WRONG value. Reset by a microtask after each apply. */
+  private suppressScrollSave = false;
+  /** Generation counter bumped on focus change (navigateTo / navigateUp /
+   *  folder switch). The defensive tryReselect timers in moveAcrossThenReorder,
+   *  commitInListPicker, undo paths, etc. capture the counter at schedule
+   *  time and bail when it differs at fire time — that's what stops a
+   *  120/400ms re-apply from leaking selection across a navigation.
+   *  Removed in 0.56.11 once those flows are folded into a unified
+   *  selection-after-mutation primitive. */
+  private selectionGuardKey = 0;
+  /** Explicit scroll policy for the in-flight render() call. Set by render()
+   *  itself from its arg; consumed and cleared by the post-render block.
+   *  When null, legacy flag inference takes over (the ~70 sites that
+   *  haven't been annotated yet). Removed in 0.56.6. */
+  private pendingRenderPolicy: ScrollPolicy | null = null;
   /** When true, the listResizeObserver re-pins scroll to the bottom each time
    *  the list grows. Set after scrollListToBottom; cleared on user scroll. */
   private stickToListBottom = false;
@@ -128,8 +158,11 @@ export class StashpadView extends ItemView {
    *  teardown. */
   private stickyRowObserver: ResizeObserver | null = null;
   private listResizeObserver: ResizeObserver | null = null;
-  private scrollByFocus = new Map<StashpadId, number>();
-  private pendingScrollRestore: number | null = null;
+  /** Per-focus "last cursor note id" — persisted via plugin.saveLastCursor.
+   *  Read on view open / folder switch; restored via the `scroll-to-id`
+   *  policy so the user lands looking at the same note they were on, even
+   *  when row heights shift between sessions. 0.56.14. */
+  private lastCursorByFocus = new Map<StashpadId, StashpadId>();
   private expandedNotes = new Set<StashpadId>();
   private focusComposerOnNextRender = false;
   /** Debounced wrapper around saveDraft for the input event. Lazily
@@ -162,6 +195,7 @@ export class StashpadView extends ItemView {
     this.integrity = new IntegrityWatcher(this.tree, this.log);
     this.order = new OrderStore(this.app);
     this.sortStore = new SortStore(this.app);
+    this.fmSync = new FrontmatterSyncQueue(this.app, () => this.tree);
     // Plug the order store into the tree's children sort. The provider
     // dispatches per-parent:
     //   - sort mode === "manual" → defer to OrderStore (explicit manual array
@@ -320,6 +354,17 @@ export class StashpadView extends ItemView {
     this.loadConfig();
     await this.bootstrapFolder();
     this.tree.rebuild(this.noteFolder);
+    // Subscribe the persistent "updating recovery metadata…" notice
+    // to the fmSync queue's activity events. Done BEFORE the backfill
+    // schedules anything so its events are caught from the first
+    // pending-set change. Idempotent — only installs once per view.
+    this.installFmSyncActivityNotice();
+    // Now that the tree has been built from the metadata cache, run a
+    // background backfill of the redundant parentLink / children fields
+    // so notes from before 0.54.0 pick them up without requiring a
+    // mutation. Paced; non-blocking; safe to call on every onOpen
+    // (idempotent — already-correct fields are no-op writes).
+    this.backfillFrontmatterSync();
     // Integrity sweep is owned by the plugin (runs once at startup), not
     // per-view. Mounting / switching Stashpad tabs no longer triggers it —
     // that was producing repeated false-missing entries when the tree was
@@ -328,24 +373,55 @@ export class StashpadView extends ItemView {
     this.defaultCursorToLast();
     this.refreshHeaderTitle();
     await this.loadDraftsForFolder();
+    // 0.56.14: hydrate per-focus last-cursor-note from localStorage. Used
+    // by the initial render's scroll-to-id policy below — far more robust
+    // than the pixel-scrollTop approach (which fought layout reflows on
+    // every reload).
+    try {
+      const loaded = this.plugin.loadLastCursor(this.noteFolder);
+      for (const [focusId, noteId] of loaded) this.lastCursorByFocus.set(focusId, noteId);
+    } catch {}
     // On a fresh mount (app reload, tab restore, first-ever open), scroll
     // to the end of the list so the newest notes are visible. Once the
     // user navigates into / out of a parent, scrollByFocus has a saved
     // position for the focus and that takes precedence — no surprise
     // jumps mid-session.
-    if (!this.scrollByFocus.has(this.focusId)) {
+    // 0.56.14: initial policy is scroll-to-id when we have a saved last
+    // cursor for this focus; otherwise pin-bottom (fresh mount, no memory).
+    const savedCursorId = this.lastCursorByFocus.get(this.focusId);
+    let initialPolicy: ScrollPolicy;
+    if (savedCursorId && this.tree.get(savedCursorId)) {
+      // 0.56.16: align "start" (not "center"). captureScrollAnchor returns
+      // the TOPMOST visible row, so if we centered the saved id, the
+      // anchor returned on next save would be some row ABOVE it — and
+      // each reload would drift upward. Aligning to "start" puts the
+      // saved row at the top of the viewport, where captureScrollAnchor
+      // re-picks the same row. Stable across reloads.
+      initialPolicy = { kind: "scroll-to-id", id: savedCursorId, align: "start" };
+      // Also restore cursor + selection to that note so the user picks
+      // up exactly where they left off.
+      this.pendingFocusIds = [savedCursorId];
+    } else {
       this.scrollToBottomOnNextRender = true;
+      initialPolicy = { kind: "pin-bottom", until: "next-user-input" };
     }
-    this.render();
-    // Flush drafts before the app/window unloads.
-    this.registerDomEvent(window, "beforeunload", () => { void this.flushDrafts(); });
-    this.registerDomEvent(window, "blur", () => { void this.flushDrafts(); });
+    this.render(initialPolicy);
+    // Flush drafts before the app/window unloads. 0.56.17: also eager-stamp
+    // last-selected cursor so reload restores by id even if the debounce
+    // hasn't fired.
+    this.registerDomEvent(window, "beforeunload", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
+    this.registerDomEvent(window, "blur", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
     // Auto-focus the composer so users can type immediately on open.
     this.focusComposer();
     // Re-focus whenever this Stashpad leaf becomes the active one (e.g. user closes
     // a sibling tab via Cmd+W and lands back here, or switches into a Stashpad tab).
+    // Also release the sticky-bottom flag when the user switches AWAY from this
+    // Stashpad — leaving the tab signals their attention has moved; coming back
+    // shouldn't yank the view to the bottom on the next render. Re-arming the flag
+    // is the composer-submit / scrollToBottomOnNextRender path's job.
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
       if (leaf === this.leaf) this.focusComposer();
+      else this.stickToListBottom = false;
     }));
   }
 
@@ -409,6 +485,17 @@ export class StashpadView extends ItemView {
     // call when nothing's pending.
     try { await this.order.flush(this.noteFolder); } catch {}
     try { await this.sortStore.flush(this.noteFolder); } catch {}
+    // Drain any pending frontmatter sync writes so the recovery fields
+    // (parentLink / children) don't lag behind tree state across a
+    // close + reopen.
+    try { await this.fmSync.flush(); } catch {}
+    // 0.56.17: eager-stamp last-selected cursor; sync localStorage means
+    // it survives the reload that follows close.
+    this.stampSelectedCursor(true);
+    // Tear down the fmSync failure-notice subscription so it doesn't
+    // outlive the view.
+    this.fmSyncUnsubscribe?.();
+    this.fmSyncUnsubscribe = null;
   }
 
   setEphemeralState(state: unknown): void {
@@ -462,6 +549,7 @@ export class StashpadView extends ItemView {
       this.loadConfig();
       await this.bootstrapFolder();
       this.tree.rebuild(this.noteFolder);
+      this.backfillFrontmatterSync();
       this.defaultCursorToLast();
       // CRITICAL: reset stale composerDraft/cache and reload drafts for the new folder.
       // Otherwise a draft from the OLD folder (set by onOpen running before setState)
@@ -469,7 +557,23 @@ export class StashpadView extends ItemView {
       this.draftsLoadedFor = null;
       this.composerDraft = "";
       await this.loadDraftsForFolder();
-      this.render();
+      // 0.56.20: re-run lastCursor restore for the new folder. onOpen ran
+      // against the default folder (state hadn't loaded yet); now that we
+      // know the actual folder, hydrate + scroll-to-id again.
+      this.lastCursorByFocus.clear();
+      try {
+        const loaded = this.plugin.loadLastCursor(this.noteFolder);
+        for (const [focusId, noteId] of loaded) this.lastCursorByFocus.set(focusId, noteId);
+      } catch {}
+      const savedCursorId = this.lastCursorByFocus.get(this.focusId);
+      let policy: ScrollPolicy;
+      if (savedCursorId && this.tree.get(savedCursorId)) {
+        this.pendingFocusIds = [savedCursorId];
+        policy = { kind: "scroll-to-id", id: savedCursorId, align: "start" };
+      } else {
+        policy = { kind: "pin-bottom", until: "next-user-input" };
+      }
+      this.render(policy);
     }
   }
   focus(): void { this.viewRoot?.focus({ preventScroll: true }); }
@@ -495,7 +599,7 @@ export class StashpadView extends ItemView {
     if ((cleaned || null) === (this.folderOverride || null)) return;
     this.folderOverride = cleaned;
     this.focusId = ROOT_ID;
-    this.scrollByFocus.clear();
+    this.lastCursorByFocus.clear();
     this.selection.clear();
     this.cursorIdx = -1;
     this.lastSelected = null;
@@ -506,6 +610,7 @@ export class StashpadView extends ItemView {
     this.loadConfig();
     await this.bootstrapFolder();
     this.tree.rebuild(this.noteFolder);
+    this.backfillFrontmatterSync();
     // Integrity sweep is owned by the plugin (runs once at startup), not
     // per-view. Mounting / switching Stashpad tabs no longer triggers it —
     // that was producing repeated false-missing entries when the tree was
@@ -530,9 +635,20 @@ export class StashpadView extends ItemView {
   cmdOpenFolderPicker(): void { this.openFolderPicker(); }
 
   private openFolderPicker(): void {
-    const folders = this.listVaultFolders();
+    // 0.57.1: limit the list to folders that ACTUALLY contain Stashpad
+    // notes (per discoverStashpadFolders). Vanilla vault folders without
+    // any Stashpad notes are noise here. Plugin default is always
+    // present even if it doesn't have notes yet. The create-new path
+    // below still lets users type any path to create a fresh folder.
+    const stashpadFolders = this.plugin.discoverStashpadFolders();
+    const allVaultFolders = this.listVaultFolders();
     const settingsFolder = (this.plugin.settings.folder || "stashpad").trim().replace(/^\/+|\/+$/g, "") || "stashpad";
     type Item = { kind: "default" | "folder" | "create"; folder: string; label: string };
+    // Always include the settings default even if it has no notes (it's
+    // where freshly-created notes go).
+    const folderSet = new Set(stashpadFolders);
+    if (settingsFolder) folderSet.delete(settingsFolder);
+    const folders = [...folderSet].sort((a, b) => a.localeCompare(b));
     const baseItems: Item[] = [
       { kind: "default", folder: settingsFolder, label: `Use plugin default — ${settingsFolder}` },
       ...folders.map((f) => ({ kind: "folder" as const, folder: f, label: f })),
@@ -541,13 +657,25 @@ export class StashpadView extends ItemView {
     const modal = new (class extends SuggestModal<Item> {
       getSuggestions(query: string): Item[] {
         const q = query.trim().toLowerCase();
+        // 0.57.0: token-order-agnostic match — every whitespace-separated
+        // token must appear in the label (any order).
+        const tokens = q ? q.split(/\s+/).filter(Boolean) : [];
+        const matchesAll = (haystack: string) => {
+          if (!tokens.length) return true;
+          for (const t of tokens) if (!haystack.includes(t)) return false;
+          return true;
+        };
         const filtered = q
-          ? baseItems.filter((it) => it.label.toLowerCase().includes(q))
+          ? baseItems.filter((it) => matchesAll(it.label.toLowerCase()))
           : baseItems.slice();
-        // Offer "create" when the query is non-empty and not an exact path of an existing folder.
+        // Offer "create" when the query is non-empty and not an exact
+        // path of an EXISTING folder in the vault (Stashpad or not).
+        // Using the full allVaultFolders list here — not just Stashpad
+        // ones — so typing the name of a vanilla folder doesn't show a
+        // misleading "Create" suggestion.
         const cleaned = query.trim().replace(/^\/+|\/+$/g, "");
         if (cleaned
-            && !folders.some((f) => f.toLowerCase() === cleaned.toLowerCase())
+            && !allVaultFolders.some((f) => f.toLowerCase() === cleaned.toLowerCase())
             && !view.isReservedFolder(cleaned)) {
           const cased = properCaseFolderPath(cleaned);
           filtered.push({ kind: "create", folder: cleaned, label: `+ Create folder “${cased}”` });
@@ -620,20 +748,48 @@ export class StashpadView extends ItemView {
 
   cmdUndo(): void {
     const stack = this.plugin.getUndoStack(this.noteFolder);
-    if (!stack.canUndo()) { new Notice("Nothing to undo."); return; }
+    if (!stack.canUndo()) { new Notice("Nothing to undo."); return; } // info — keep raw
     const label = stack.peekUndoLabel();
+    // Lazy category propagation: read the most-recent notification's
+    // category and re-use it for the undo toast. This makes the
+    // undone action show up under the appropriate filter in history
+    // (e.g. undoing a delete files under "delete" instead of
+    // "system"). `system` remains the fallback if there's no recent
+    // record or it's unrelated.
+    const recentCat = this.plugin.notifications.recent()[0]?.category ?? "system";
     void stack.undo()
-      .then(() => new Notice(`Undid: ${label}`))
-      .catch((e: any) => new Notice(`Undo failed: ${(e as Error).message}`));
+      .then(() => this.plugin.notifications.show({
+        message: `Undid: ${label}`,
+        kind: "info",
+        category: recentCat,
+        folder: this.noteFolder,
+      }))
+      .catch((e: any) => this.plugin.notifications.show({
+        message: `Undo failed: ${(e as Error).message}`,
+        kind: "error",
+        category: "system",
+        folder: this.noteFolder,
+      }));
   }
 
   cmdRedo(): void {
     const stack = this.plugin.getUndoStack(this.noteFolder);
     if (!stack.canRedo()) { new Notice("Nothing to redo."); return; }
     const label = stack.peekRedoLabel();
+    const recentCat = this.plugin.notifications.recent()[0]?.category ?? "system";
     void stack.redo()
-      .then(() => new Notice(`Redid: ${label}`))
-      .catch((e: any) => new Notice(`Redo failed: ${(e as Error).message}`));
+      .then(() => this.plugin.notifications.show({
+        message: `Redid: ${label}`,
+        kind: "info",
+        category: recentCat,
+        folder: this.noteFolder,
+      }))
+      .catch((e: any) => this.plugin.notifications.show({
+        message: `Redo failed: ${(e as Error).message}`,
+        kind: "error",
+        category: "system",
+        folder: this.noteFolder,
+      }));
   }
 
   /** Snapshot a set of notes (and optionally their attachments) so we can recreate them.
@@ -707,6 +863,10 @@ export class StashpadView extends ItemView {
     }
     // Re-apply pendingFocusIds on every pass so the cursor lands on the restored
     // notes once the metadata cache catches up. Stop once they're found.
+    // 0.56.6: follow-cursor policy on each render so the restored note is
+    // scrolled into view, not just selected. Particularly important for
+    // undo-of-delete where the previously-deleted row needs to reappear in
+    // the viewport so the user can see what just came back.
     const tryFocus = () => {
       if (focusIds) {
         const inList = focusIds.some((id) => this.tree.get(id));
@@ -715,12 +875,32 @@ export class StashpadView extends ItemView {
     };
     tryFocus();
     this.tree.rebuild(this.noteFolder);
-    this.render();
-    setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render(); }, 100);
-    setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render(); }, 400);
+    this.render({ kind: "follow-cursor" });
+    setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render({ kind: "follow-cursor" }); }, 100);
+    setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render({ kind: "follow-cursor" }); }, 400);
+    // Restored notes carry their pre-delete frontmatter — which may
+    // include stale parentLink / children from before the tree
+    // evolved. Schedule the restored ids (and any parent they now
+    // point at) for re-sync so recovery fields land consistent with
+    // the live tree, not the snapshot.
+    setTimeout(() => {
+      for (const n of snap.notes) {
+        const id = this.tree.idForPath(n.path);
+        if (id) this.fmSync.schedule(id);
+      }
+    }, 500);
   }
 
   private async trashNotesAndAttachments(snap: { notes: { path: string; content: string }[]; attachments: { path: string; data: ArrayBuffer }[] }): Promise<void> {
+    // Collect parents BEFORE the trash so we can re-sync their children
+    // lists after the deletion settles.
+    const orphanedParents = new Set<StashpadId>();
+    for (const n of snap.notes) {
+      const id = this.tree.idForPath(n.path);
+      if (!id) continue;
+      const node = this.tree.get(id);
+      if (node?.parent) orphanedParents.add(node.parent);
+    }
     // Trash notes (children before parents — already in that order from our delete walk).
     for (const n of snap.notes) {
       const f = this.app.vault.getAbstractFileByPath(n.path) as TFile | null;
@@ -732,6 +912,7 @@ export class StashpadView extends ItemView {
     }
     this.tree.rebuild(this.noteFolder);
     this.render();
+    for (const pid of orphanedParents) this.fmSync.scheduleParentOfDeleted(pid);
   }
 
   // --- Per-folder composer drafts (one shared draft per Stashpad folder) ---
@@ -1223,10 +1404,114 @@ export class StashpadView extends ItemView {
     }
   }
 
-  private render(): void {
+  /** Persist the current cursor row's id as "last selected" for this focus.
+   *  Drives reload's scroll-to-id restoration. Debounced 400ms so a
+   *  flurry of arrow-key cursor moves doesn't hammer localStorage —
+   *  the eager onClose / blur / navigateTo / navigateUp paths flush
+   *  immediately. 0.56.17. */
+  private stampLastCursorTimer: number | null = null;
+  private stampSelectedCursor(eager = false): void {
+    const node = this.currentChildren[this.cursorIdx];
+    const id = node?.id ?? this.lastSelected;
+    if (!id) return;
+    this.lastCursorByFocus.set(this.focusId, id);
+    const flush = () => {
+      const cur = this.lastCursorByFocus.get(this.focusId);
+      if (cur) this.plugin.saveLastCursor(this.noteFolder, this.focusId, cur);
+    };
+    if (eager) {
+      if (this.stampLastCursorTimer != null) window.clearTimeout(this.stampLastCursorTimer);
+      this.stampLastCursorTimer = null;
+      flush();
+      return;
+    }
+    if (this.stampLastCursorTimer != null) window.clearTimeout(this.stampLastCursorTimer);
+    this.stampLastCursorTimer = window.setTimeout(() => {
+      this.stampLastCursorTimer = null;
+      flush();
+    }, 400);
+  }
+
+  /** Snapshot of "what row is the user looking at" so the post-render
+   *  block can re-scroll to keep that row at the same on-screen position.
+   *  Pixel-only prevScroll restoration can't do this — if rows ABOVE the
+   *  viewport shift in height between renders (markdown re-render of a
+   *  long note, attachment rail growing, sibling reorder), the same
+   *  scrollTop value now shows different content.
+   *
+   *  Pick policy: the topmost row whose top is inside the viewport. Fall
+   *  back to the first row whose bottom is inside (handles the case where
+   *  one tall row straddles the entire viewport). Returns null when the
+   *  list is empty / no row qualifies. */
+  private captureScrollAnchor(): { id: StashpadId; offsetFromListTop: number } | null {
+    const list = this.listEl;
+    if (!list) return null;
+    const listTop = list.getBoundingClientRect().top;
+    const rows = Array.from(list.querySelectorAll(".stashpad-note")) as HTMLElement[];
+    if (rows.length === 0) return null;
+    let best: { id: StashpadId; offsetFromListTop: number } | null = null;
+    for (const row of rows) {
+      const id = row.dataset.id;
+      if (!id) continue;
+      const top = row.getBoundingClientRect().top - listTop;
+      // First row whose top is inside the viewport (top >= 0) wins.
+      if (top >= 0) {
+        best = { id, offsetFromListTop: top };
+        break;
+      }
+      // Otherwise remember the most recent row whose top is above viewport;
+      // that's the row currently filling the top of the viewport.
+      best = { id, offsetFromListTop: top };
+    }
+    return best;
+  }
+
+  /** Restore the anchor row to its captured viewport offset. Falls back to
+   *  the pixel scrollTop if the anchor row is gone (deleted, filtered out,
+   *  navigated past). */
+  private restoreScrollAnchor(
+    anchor: { id: StashpadId; offsetFromListTop: number } | null,
+    fallbackScrollTop: number,
+  ): void {
+    const list = this.listEl;
+    if (!list) return;
+    if (anchor) {
+      const row = list.querySelector(`[data-id="${anchor.id}"]`) as HTMLElement | null;
+      if (row) {
+        const listTop = list.getBoundingClientRect().top;
+        const rowTop = row.getBoundingClientRect().top - listTop;
+        // Adjust scrollTop by the delta so rowTop ends up at offsetFromListTop.
+        list.scrollTop += rowTop - anchor.offsetFromListTop;
+        return;
+      }
+    }
+    if (fallbackScrollTop > 0) list.scrollTop = fallbackScrollTop;
+  }
+
+  private render(policy?: ScrollPolicy): void {
+    // 0.56.3: unannotated render() calls default to "preserve". That kills
+    // the bouncing class of regressions where metadataCache-driven
+    // re-renders (color change, frontmatter mod, fmSync rewrites) would
+    // pin the view to the bottom via the legacy prevAtBottom geometric
+    // inference. The few sites that genuinely want a different policy
+    // (composer submit → pin-bottom; the 3 already-annotated nav sites)
+    // pass an explicit policy.
+    //
+    // Legacy `scrollToBottomOnNextRender` is still honoured as an override
+    // within the preserve branch until 0.56.4 converts composer submit to
+    // pass an explicit pin-bottom policy directly.
+    this.pendingRenderPolicy = policy ?? { kind: "preserve" };
     this.loadConfig();
     const root = this.viewRoot;
     const prevScroll = this.listEl?.scrollTop ?? 0;
+    // 0.56.4: scroll anchoring. Capture the row whose top is closest to the
+    // viewport top (preferring rows fully inside the viewport over ones
+    // straddling the boundary). Its id + the offset between its rect.top
+    // and the list's rect.top lets the post-render block re-scroll so the
+    // SAME row sits at the SAME visual position — eliminating the bouncing
+    // caused by height shifts in rows ABOVE the viewport (which
+    // pixel-only prevScroll restoration can't compensate for).
+    const anchor = this.captureScrollAnchor();
     // Preserve composer focus across the rebuild. Without this, every
     // render that rebuilds the textarea drops focus for a frame and the
     // user sees the focus border flicker — especially noticeable when
@@ -1298,6 +1583,17 @@ export class StashpadView extends ItemView {
     this.listEl = list;
     // List-level dragover: handles the case where the cursor is in the *gap* between
     // rows (no row's dragover fires there). Picks the nearest row + position.
+    // 0.56.10: keep scrollByFocus fresh while the user scrolls within the
+    // current focus. Stamps the in-memory map on every scroll (cheap),
+    // debounces the disk write to 400ms so a fast scroll doesn't hammer
+    // the adapter. Reload then has an up-to-date saved position even if
+    // the user never navigated away from the focus.
+    // 0.56.17: scroll listener no longer captures the topmost row. We now
+    // persist the LAST SELECTED note id (cursor row) and restore by
+    // scrolling to it at the top of the viewport. The scroll listener
+    // is still in place for the suppressScrollSave gate's interactions
+    // (anchor restoration during preserve renders), but the save itself
+    // happens on selection mutations (see stampSelectedCursor).
     list.addEventListener("dragover", (e: DragEvent) => {
       if (!this.dragSourceIds) return;
       const t = e.target as HTMLElement | null;
@@ -1368,25 +1664,115 @@ export class StashpadView extends ItemView {
         });
       }
     }
-    if (this.scrollToBottomOnNextRender) {
+    // 0.56.2: explicit policy short-circuits legacy inference. When a
+    // policy is set (currently the 3 annotated sites: onOpen, navigateTo,
+    // navigateUp), it owns the scroll outcome; legacy flags are skipped
+    // so the two paths don't fight. Stale legacy flags from those sites
+    // get reset here too so they don't leak into the next render.
+    const scrollPolicy = this.pendingRenderPolicy;
+    this.pendingRenderPolicy = null;
+    if (scrollPolicy && this.listEl) {
+      // 0.56.22: legacy `scrollToBottomOnNextRender` (composer submit)
+      // still routes through here as a pin-bottom override on the
+      // preserve branch. `pendingScrollRestore` retired.
+      const legacyPinBottom = this.scrollToBottomOnNextRender;
+      this.scrollToBottomOnNextRender = false;
+      switch (scrollPolicy.kind) {
+        case "preserve":
+          // Anchor restore (id + viewport offset of topmost row) keeps the
+          // same row at the same on-screen position even when rows above
+          // change height. Composer submit's pin-bottom flag wins when set.
+          if (legacyPinBottom) {
+            this.scrollListToBottom();
+          } else {
+            this.restoreScrollAnchor(anchor, prevScroll);
+          }
+          break;
+        case "pin-bottom":
+          this.scrollListToBottom();
+          break;
+        case "restore": {
+          // 0.56.10: multi-frame restore — async markdown layout shifts row
+          // heights AFTER the synchronous render finishes. 0.56.12: also
+          // suppress the scroll-save listener during apply() so transient
+          // clamped values (when scrollHeight hasn't grown enough yet)
+          // can't overwrite the saved target with WRONG values in the
+          // map. Without this, restoring to a top-half scrollTop would
+          // get clamped to maxTop=bottom on the first apply, the scroll
+          // listener would stamp that bottom value into the map, and a
+          // quick reload would then "restore" to the bottom — exactly
+          // the regression the user saw.
+          const target = scrollPolicy.scrollTop;
+          const listForRestore = this.listEl;
+          const apply = () => {
+            this.suppressScrollSave = true;
+            const maxTop = Math.max(0, listForRestore.scrollHeight - listForRestore.clientHeight);
+            listForRestore.scrollTop = Math.min(target, maxTop);
+            // Release after the scroll event fires (microtask).
+            Promise.resolve().then(() => { this.suppressScrollSave = false; });
+          };
+          apply();
+          requestAnimationFrame(apply);
+          setTimeout(apply, 60);
+          setTimeout(apply, 200);
+          // Final hard re-assert after layout has fully settled — the
+          // scroll listener can stamp from here forward.
+          setTimeout(apply, 600);
+          break;
+        }
+        case "follow-cursor":
+          // Defer to revealCursorRow which already handles the multi-frame
+          // settle dance for async row-height changes.
+          if (prevScroll > 0) this.listEl.scrollTop = prevScroll;
+          this.revealCursorRow();
+          break;
+        case "scroll-to-id": {
+          // 0.56.14: multi-frame scroll-to-id. Same logic as restore —
+          // async markdown layout shifts row positions after the
+          // synchronous render. Re-asserting across frames + a 600ms
+          // tail catches late layouts so the saved note stays centered.
+          // 0.56.15: suppressScrollSave gate so the scroll listener
+          // doesn't stamp transient anchors back into the map (which
+          // corrupted the saved id on every subsequent reload).
+          const targetId = scrollPolicy.id;
+          const align = scrollPolicy.align;
+          const listForScroll = this.listEl;
+          const apply = () => {
+            this.suppressScrollSave = true;
+            const row = listForScroll.querySelector(`[data-id="${targetId}"]`) as HTMLElement | null;
+            if (row) row.scrollIntoView({ block: align, behavior: "auto" });
+            Promise.resolve().then(() => { this.suppressScrollSave = false; });
+          };
+          apply();
+          requestAnimationFrame(apply);
+          setTimeout(apply, 60);
+          setTimeout(apply, 200);
+          setTimeout(apply, 600);
+          // Belt-and-suspenders: after the last apply settles, hold the
+          // suppress flag a touch longer so any tail scroll events from
+          // the browser's smooth-scroll-completion don't sneak through.
+          setTimeout(() => { this.suppressScrollSave = false; }, 700);
+          break;
+        }
+      }
+    } else if (this.scrollToBottomOnNextRender) {
       this.scrollToBottomOnNextRender = false;
       this.scrollListToBottom();
-    } else if (this.listEl && this.pendingScrollRestore != null) {
-      const target = this.pendingScrollRestore;
-      this.pendingScrollRestore = null;
-      this.listEl.scrollTop = target;
     } else if (this.listEl && prevAtBottom) {
-      // Was at bottom — re-pin to the *new* bottom and attach the same
-      // per-row ResizeObserver scrollListToBottom uses, so async markdown
-      // / font / image growth keeps pinning. The previous "rAF + 60ms
-      // timeout" approach was too short for the cold-cache case (e.g.
-      // a second render firing right after a reload, while markdown
-      // was still parsing in the new rows) and the last note would
-      // settle below the viewport.
+      // Was at bottom — re-pin to the *new* bottom and attach the
+      // per-row ResizeObserver scrollListToBottom uses, so async
+      // markdown / font / image growth keeps pinning. Covers the
+      // cold-cache reload case where a second render fires while
+      // markdown is still parsing.
       this.scrollListToBottom();
     } else if (this.listEl && prevScroll > 0) {
       this.listEl.scrollTop = prevScroll;
     }
+
+    // 0.56.17: stamp the current cursor row as last-selected (debounced).
+    // Coalesces a burst of renders into one localStorage write. Eager
+    // paths (onClose / blur / navigateTo / navigateUp) flush immediately.
+    this.stampSelectedCursor();
 
     // Re-pin scroll if list's height changes post-render (async markdown in focused header, etc).
     if (this.listEl) {
@@ -1409,9 +1795,24 @@ export class StashpadView extends ItemView {
       });
       ro.observe(targetList);
       this.listResizeObserver = ro;
-      // Only UPWARD scrolls cancel sticky mode (the user wants to read older
-      // notes). Downward scrolls or following-the-bottom keeps stickiness, so
-      // a slow-arriving note still ends up in view.
+      // ANY user interaction with the list signals "I'm in control now,
+      // stop yanking me to the bottom on every render." This covers:
+      //
+      //  - Wheel up: classic "let me read older notes" gesture.
+      //  - Touch swipe down: same on mobile.
+      //  - Mouse down on any row: the user is targeting a specific
+      //    note for select / drag / right-click. Mutations triggered
+      //    from there (color, reparent, delete, etc.) shouldn't bounce
+      //    the view back to the bottom afterward.
+      //  - Any keydown on the list (Arrow up/down, Tab, letter keys
+      //    for shortcuts, etc.). Sticky-bottom is only appropriate
+      //    while the user is in "watching the bottom for new notes"
+      //    mode — typing anything signals they've moved on.
+      //
+      // The composer doesn't share the list's keydown surface (its
+      // textarea handles its own events), so this doesn't interfere
+      // with typing-into-composer-then-submitting flows: the submit
+      // path explicitly calls scrollListToBottom, re-arming the flag.
       targetList.addEventListener("wheel", (e) => {
         if ((e as WheelEvent).deltaY < 0) this.stickToListBottom = false;
       }, { passive: true });
@@ -1424,10 +1825,11 @@ export class StashpadView extends ItemView {
         if (y > lastTouchY) this.stickToListBottom = false; // finger moved DOWN → list scrolls UP
         lastTouchY = y;
       }, { passive: true });
-      targetList.addEventListener("keydown", (e) => {
-        if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") {
-          this.stickToListBottom = false;
-        }
+      targetList.addEventListener("mousedown", () => {
+        this.stickToListBottom = false;
+      });
+      targetList.addEventListener("keydown", () => {
+        this.stickToListBottom = false;
       });
     }
   }
@@ -2114,9 +2516,7 @@ export class StashpadView extends ItemView {
   private setTagFilter(raw: string | null): void {
     if ((this.tagFilter ?? null) === (raw ?? null)) return;
     this.tagFilter = raw;
-    this.cursorIdx = -1;
-    this.selection.clear();
-    this.firstSelectedId = null;
+    this.reconcileSelectionAfterFilter();
     this.persistFocus(); // queue a workspace.json save so reload restores it
     this.render();
   }
@@ -2245,9 +2645,10 @@ export class StashpadView extends ItemView {
     const next = hex ? hex.toLowerCase() : null;
     if ((this.colorFilter ?? null) === next) return;
     this.colorFilter = next;
-    this.cursorIdx = -1;
-    this.selection.clear();
-    this.firstSelectedId = null;
+    // 0.56.9: preserve any selected ids that still pass the new filter
+    // instead of wiping selection wholesale. Drop the ones that no longer
+    // match; recompute cursorIdx against the surviving selection.
+    this.reconcileSelectionAfterFilter();
     this.persistFocus();
     this.render();
   }
@@ -2255,10 +2656,35 @@ export class StashpadView extends ItemView {
   private setTimeFilter(tf: TimeFilter): void {
     if (this.timeFilter === tf) return;
     this.timeFilter = tf;
-    this.cursorIdx = -1;
-    this.selection.clear();
+    this.reconcileSelectionAfterFilter();
     this.persistFocus(); // queue a workspace.json save so reload restores it
     this.render();
+  }
+
+  /** After a filter change, drop selected ids that no longer pass the
+   *  filter, then re-index cursorIdx against the new currentChildren.
+   *  Wins back the "stay-put after toggling time/color/tag" UX without
+   *  letting stale selection point at filtered-out rows. */
+  private reconcileSelectionAfterFilter(): void {
+    const next = this.filterChildren(this.collectViewItems(this.focusId));
+    const visibleIds = new Set(next.map((n) => n.id));
+    for (const id of [...this.selection]) {
+      if (!visibleIds.has(id)) this.selection.delete(id);
+    }
+    if (this.firstSelectedId && !visibleIds.has(this.firstSelectedId)) {
+      this.firstSelectedId = null;
+    }
+    if (this.lastSelected && !visibleIds.has(this.lastSelected)) {
+      this.lastSelected = null;
+    }
+    // Recompute cursorIdx to the first surviving selection's position,
+    // falling back to clamping into the new list bounds.
+    if (this.selection.size > 0) {
+      const firstIdx = next.findIndex((n) => this.selection.has(n.id));
+      this.cursorIdx = firstIdx >= 0 ? firstIdx : Math.min(this.cursorIdx, next.length - 1);
+    } else if (this.cursorIdx >= next.length) {
+      this.cursorIdx = next.length - 1;
+    }
   }
 
   private renderBreadcrumb(parent: HTMLElement): void {
@@ -2490,6 +2916,89 @@ export class StashpadView extends ItemView {
         bc.createSpan({ cls: "stashpad-row-breadcrumb-sep", text: " / " });
       }
     });
+  }
+
+  /** Thin shim over the shared `buildFileActions` helper so existing
+   *  call sites read naturally. Returns Reveal/Show actions for a
+   *  vault file; [] when the path doesn't resolve. */
+  private actionsForFile(path: string): import("./notifications").NotificationAction[] {
+    return buildFileActions(this.app, path, Platform.isMobile);
+  }
+
+  /** Collect distinct author + contributor ids touching the given
+   *  nodes — read from each node's current frontmatter (author +
+   *  contributors). Used to pre-stamp `affectedAuthorIds` on
+   *  destructive notifications so the history modal's Cross-author
+   *  filter still works AFTER the notes are gone from the metadata
+   *  cache (a post-delete resolver lookup would return nothing). */
+  private collectAuthorIds(nodes: TreeNode[]): string[] {
+    const out = new Set<string>();
+    const extract = (raw: unknown): string | null => {
+      if (typeof raw !== "string") return null;
+      const m = raw.match(/-([a-z0-9]{4,12})(?:\.md)?(?:\||\]\])/i);
+      return m ? m[1] : null;
+    };
+    for (const n of nodes) {
+      if (!n.file) continue;
+      const fm = this.app.metadataCache.getFileCache(n.file)?.frontmatter;
+      if (!fm) continue;
+      const a = extract(fm.author);
+      if (a) out.add(a);
+      if (Array.isArray(fm.contributors)) {
+        for (const c of fm.contributors) {
+          const cid = extract(c);
+          if (cid) out.add(cid);
+        }
+      }
+    }
+    return Array.from(out);
+  }
+
+  /** Multi-line bulleted list of titles, headered by the verb. Used
+   *  by every bulk-action notification (delete / move / merge / etc.)
+   *  so the user sees a clean, scannable list of what was touched.
+   *
+   *  - Empty nodes array → just the verb (+ suffix / dest).
+   *  - Single node     → "Verb \"Title\" suffix dest" (single line).
+   *  - 2+ nodes        → header line + bulleted list, capped at
+   *                       `bulletMax` (default 10). Overflow tail is
+   *                       "…+ N more". */
+  private bulkActionMessage(opts: {
+    verb: string;
+    nodes: TreeNode[];
+    suffix?: string;
+    destination?: string;
+    bulletMax?: number;
+  }): string {
+    const titles = opts.nodes.map((n) =>
+      `"${this.titleForNode(n).trim() || "(untitled)"}"`,
+    );
+    const suffix = opts.suffix ? ` ${opts.suffix}` : "";
+    const dest = opts.destination ? ` ${opts.destination}` : "";
+    if (titles.length === 0) return `${opts.verb}${suffix}${dest}`;
+    if (titles.length === 1) return `${opts.verb} ${titles[0]}${suffix}${dest}`;
+    const max = opts.bulletMax ?? 10;
+    const body = titles.length <= max
+      ? titles.map((t) => `• ${t}`).join("\n")
+      : titles.slice(0, max).map((t) => `• ${t}`).join("\n")
+        + `\n…+ ${titles.length - max} more`;
+    return `${opts.verb} ${titles.length} notes${suffix}${dest}:\n${body}`;
+  }
+
+  /** Build a short comma-separated list of node titles for use in
+   *  verbose notification messages. Caps at `max` to keep toasts
+   *  scannable; tail becomes `+N more`. Quotes each title so the
+   *  delimiters read cleanly even with titles that contain commas.
+   *  Falls back to "(untitled)" for nodes without a resolvable title.
+   *  Prefer `bulkActionMessage` for >1-item action confirmations. */
+  private titleList(nodes: TreeNode[], max = 3): string {
+    if (!nodes.length) return "";
+    const titles = nodes.map((n) => this.titleForNode(n).trim() || "(untitled)");
+    if (titles.length <= max) {
+      return titles.map((t) => `"${t}"`).join(", ");
+    }
+    const head = titles.slice(0, max).map((t) => `"${t}"`).join(", ");
+    return `${head}, +${titles.length - max} more`;
   }
 
   private titleForNode(node: TreeNode): string {
@@ -3586,15 +4095,53 @@ export class StashpadView extends ItemView {
   }
 
   openDestinationPicker(): void {
+    // 0.57.2: destination picker now spans all Stashpad folders + offers
+    // each external Stashpad's root (Home) as its own pick. Picking a
+    // cross-folder destination switches the view to that folder first
+    // (matching the search modal's behaviour), then sets nextDestination
+    // there — so the next composer submit lands in the right place.
     new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
       mode: "pick", placeholder: "Send next note(s) under which note?",
       allowCreate: true,
-      onPick: (item) => { this.nextDestination = item.id; this.render(); this.composerInputEl?.focus(); },
+      onPick: async (item) => {
+        if (item.crossFolder) {
+          const targetId = item.id.replace(/^cross:/, "");
+          await this.switchToFolderAndFocus(item.crossFolder, targetId);
+          this.nextDestination = targetId;
+          this.render();
+          this.composerInputEl?.focus();
+          return;
+        }
+        this.nextDestination = item.id;
+        this.render();
+        this.composerInputEl?.focus();
+      },
       onCreate: async (q) => {
         const id = await this.createNoteUnder(q, this.focusId);
         if (id) { this.nextDestination = id; this.render(); this.composerInputEl?.focus(); }
       },
+      crossFolderNotes: () => this.collectCrossFolderDestinations(),
     }).open();
+  }
+
+  /** Like `collectCrossFolderNotes` but with synthetic "Home of <folder>"
+   *  entries prepended for each external Stashpad folder. Used by the
+   *  destination picker so the user can target another folder's root
+   *  directly without having to navigate there first. 0.57.2. */
+  private collectCrossFolderDestinations(): import("./note-picker").CrossFolderNote[] {
+    const out = this.collectCrossFolderNotes();
+    const folders = this.plugin.searchableFolders(this.noteFolder)
+      .filter((f) => f !== this.noteFolder);
+    // Surface each folder's root as a first-class pick. id = ROOT_ID so
+    // the cross-folder onPick handler can route directly into the new
+    // folder's home.
+    const roots = folders.map((folder) => ({
+      folder,
+      id: ROOT_ID,
+      title: `Home — ${folder.split("/").pop() || folder}`,
+      body: "",
+    }));
+    return [...roots, ...out];
   }
 
   /** Search restricted to the currently focused parent's direct children
@@ -3646,6 +4193,13 @@ export class StashpadView extends ItemView {
       mode: "search", placeholder: "Search Stashpad notes…",
       allowCreate: false,
       onPick: (item) => {
+        // 0.57.3: folder-open picks open the target folder in a new tab,
+        // leaving the current tab on its current folder. Useful for
+        // quickly side-by-side comparing two Stashpad folders.
+        if (item.kind === "folder-open" && item.folder) {
+          void this.openFolderInNewTab(item.folder);
+          return;
+        }
         if (item.crossFolder && item.crossFile) {
           // Cross-Stashpad result: switch this view's folder and focus
           // the picked note. The setState path rebuilds the tree, so by
@@ -3657,6 +4211,7 @@ export class StashpadView extends ItemView {
         if (item.node) this.navigateTo(item.node.id);
       },
       crossFolderNotes: () => this.collectCrossFolderNotes(),
+      folderResults: () => this.plugin.discoverStashpadFolders().filter((f) => f !== this.noteFolder),
     }).open();
   }
 
@@ -3744,7 +4299,18 @@ export class StashpadView extends ItemView {
     }
     this.render();
     if (skipped.length) {
-      new Notice(`Outdented ${moved.length} note${moved.length === 1 ? "" : "s"} (${skipped.length} already at root).`);
+      const outdentedNodes = moved.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+      this.plugin.notifications.show({
+        message: this.bulkActionMessage({
+          verb: "Outdented",
+          nodes: outdentedNodes,
+          suffix: skipped.length ? `(${skipped.length} already at root)` : undefined,
+        }),
+        kind: "success",
+        category: "move",
+        affectedIds: moved,
+        folder: this.noteFolder,
+      });
     }
   }
 
@@ -3822,7 +4388,10 @@ export class StashpadView extends ItemView {
         for (const t of targets) await this.changeParent(t, newId);
         this.selection.clear(); this.render();
       },
-      crossFolderNotes: () => this.collectCrossFolderNotes(),
+      // 0.57.2: use the same cross-folder + synthetic-root list the
+      // destination picker uses, so a move can target "Home of folder X"
+      // as a one-shot result without searching for it.
+      crossFolderNotes: () => this.collectCrossFolderDestinations(),
     }).open();
   }
 
@@ -3915,7 +4484,17 @@ export class StashpadView extends ItemView {
 
     // Source view loses these notes; rebuild + render.
     this.tree.rebuild(this.noteFolder);
-    new Notice(`Moved ${sources.length} note${sources.length === 1 ? "" : "s"} → ${targetDir}`);
+    const crossMovedNodes = sources.map((s) => this.tree.get(s.id)).filter((n): n is TreeNode => !!n);
+    const titleSummary = crossMovedNodes.length > 0
+      ? this.titleList(crossMovedNodes)
+      : `${sources.length} note${sources.length === 1 ? "" : "s"}`;
+    this.plugin.notifications.show({
+      message: `Moved ${titleSummary} → \`${targetDir}\``,
+      kind: "success",
+      category: "move",
+      affectedIds: sources.map((s) => s.id),
+      folder: this.noteFolder,
+    });
 
     // Undo: reverse every rename + restore root parent ids. Stored on
     // THIS view's folder undo stack (the originating Stashpad).
@@ -3977,8 +4556,26 @@ export class StashpadView extends ItemView {
     if (!target) { this.render(); return; }
     const targets = this.getActionTargets().filter((n) => n.id !== target.id);
     for (const t of targets) await this.changeParent(t, target.id);
+    // 0.56.7: select the new parent (the picker target) so the user sees
+    // where their note(s) went — matches the drag drop-into behaviour
+    // shipped in 0.56.5. Defensive re-apply at 120ms + 400ms covers the
+    // metadataCache-driven debouncedRender race (see moveAcrossThenReorder).
     this.selection.clear();
-    this.render();
+    this.cursorIdx = -1;
+    this.pendingFocusIds = [target.id];
+    this.render({ kind: "follow-cursor" });
+    const guardKey = this.selectionGuardKey;
+    const tryReselect = () => {
+      if (this.selectionGuardKey !== guardKey) return;
+      if (this.selection.has(target.id)) return;
+      const idx = this.currentChildren.findIndex((n) => n.id === target.id);
+      if (idx < 0) return;
+      this.selection.add(target.id);
+      this.cursorIdx = idx;
+      this.render({ kind: "follow-cursor" });
+    };
+    setTimeout(tryReselect, 120);
+    setTimeout(tryReselect, 400);
   }
 
   async cmdMerge(): Promise<void> {
@@ -4018,17 +4615,51 @@ export class StashpadView extends ItemView {
       await this.app.fileManager.trashFile(t.file);
       await this.log.append({ type: "delete", id: t.id, payload: { mergedInto: oldest.id } });
     }
+    // 0.56.9: focus the kept (merged) note so the user can see what was
+    // consolidated. Previously cleared selection left the user in the
+    // dark about where the data ended up.
     this.selection.clear();
-    new Notice(`Merged ${targets.length} notes.`);
+    this.cursorIdx = -1;
+    this.pendingFocusIds = [oldest.id];
+    const keptTitle = this.titleForNode(oldest);
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({
+        verb: "Merged",
+        nodes: targets,
+        destination: `→ kept "${keptTitle}"`,
+      }),
+      kind: "success",
+      category: "merge",
+      affectedIds: targets.map((t) => t.id),
+      folder: this.noteFolder,
+    });
     this.tree.rebuild(this.noteFolder);
-    this.render();
+    this.render({ kind: "follow-cursor" });
+    {
+      const keptId = oldest.id;
+      const guardKey = this.selectionGuardKey;
+      const tryReselect = () => {
+        if (this.selectionGuardKey !== guardKey) return;
+        if (this.selection.has(keptId)) return;
+        const idx = this.currentChildren.findIndex((n) => n.id === keptId);
+        if (idx < 0) return;
+        this.selection.add(keptId);
+        this.cursorIdx = idx;
+        this.render({ kind: "follow-cursor" });
+      };
+      setTimeout(tryReselect, 120);
+      setTimeout(tryReselect, 400);
+    }
 
     const folder = this.noteFolder;
     this.plugin.getUndoStack(folder).push({
       label: `Merge ${targets.length} notes`,
       undo: async () => {
         // Restore the deleted siblings first (children may need to be re-parented to them).
-        await this.restoreSnapshots(deletedSnap);
+        // 0.56.9: pass the full set of merged ids so restoreSnapshots
+        // selects + scrolls to all of them (cursor lands on the topmost
+        // surviving id via render()'s pendingFocusIds resolution).
+        await this.restoreSnapshots(deletedSnap, targets.map((t) => t.id));
         // Revert the kept (oldest) note's body.
         const f = this.app.vault.getAbstractFileByPath(oldestPath) as TFile | null;
         if (f) await this.app.vault.modify(f, oldestOriginal);
@@ -4037,8 +4668,9 @@ export class StashpadView extends ItemView {
           const cf = this.app.vault.getAbstractFileByPath(r.childPath) as TFile | null;
           if (cf) await this.app.fileManager.processFrontMatter(cf, (fm) => { fm.parent = r.oldParent; });
         }
+        this.pendingFocusIds = targets.map((t) => t.id);
         this.tree.rebuild(folder);
-        this.render();
+        this.render({ kind: "follow-cursor" });
       },
       redo: async () => {
         // Re-trash the merged-away notes.
@@ -4069,7 +4701,13 @@ export class StashpadView extends ItemView {
       out.push(prefix ? `${this.formatTimeInline(t.created)} ${body}` : body);
     }
     await navigator.clipboard.writeText(out.join("\n\n"));
-    new Notice(`Copied ${targets.length} note(s).`);
+    this.plugin.notifications.show({
+      message: `Copied ${this.titleList(targets)} to clipboard`,
+      kind: "success",
+      category: "system",
+      affectedIds: targets.map((t) => t.id),
+      folder: this.noteFolder,
+    });
   }
 
   async cmdCopyTree(): Promise<void> {
@@ -4093,7 +4731,13 @@ export class StashpadView extends ItemView {
     };
     for (const r of roots) await walk(r, 0);
     await navigator.clipboard.writeText(lines.join("\n"));
-    new Notice(`Copied tree (${lines.length} entries).`);
+    this.plugin.notifications.show({
+      message: `Copied tree of ${this.titleList(roots)} (${lines.length} entries)`,
+      kind: "success",
+      category: "system",
+      affectedIds: roots.map((r) => r.id),
+      folder: this.noteFolder,
+    });
   }
 
   /** Copy selection (or cursor row, or focused note) as a bullet list of
@@ -4115,7 +4759,13 @@ export class StashpadView extends ItemView {
     };
     for (const r of roots) walk(r, 0);
     await navigator.clipboard.writeText(lines.join("\n"));
-    new Notice(`Copied outline (${lines.length} entr${lines.length === 1 ? "y" : "ies"}).`);
+    this.plugin.notifications.show({
+      message: `Copied outline of ${this.titleList(roots)} (${lines.length} entr${lines.length === 1 ? "y" : "ies"})`,
+      kind: "success",
+      category: "system",
+      affectedIds: roots.map((r) => r.id),
+      folder: this.noteFolder,
+    });
   }
 
   /** Toggle the "Show more / show less" clamp for the current target(s).
@@ -4188,7 +4838,7 @@ export class StashpadView extends ItemView {
       try {
         await this.app.fileManager.processFrontMatter(newFile, (m: any) => {
           for (const [k, v] of Object.entries(sourceFm)) {
-            if (k === "id" || k === "parent" || k === "created" || k === "attachments" || k === "position") continue;
+            if (RESERVED_FRONTMATTER.includes(k)) continue;
             m[k] = v;
           }
         });
@@ -4201,6 +4851,10 @@ export class StashpadView extends ItemView {
           id: cloneId, parent: newParent, children: [], file: newFile, created,
         });
       } catch {}
+      // Background-sync the new clone's recovery fields + bump the new
+      // parent's children list. Cheap enqueue; the queue drains in the
+      // background, not blocking the clone loop.
+      this.fmSync.scheduleParentChange(cloneId, null, newParent);
     }
 
     // Recurse into children — each becomes a child of the just-cloned node.
@@ -4262,7 +4916,18 @@ export class StashpadView extends ItemView {
         await this.restoreSnapshots(snap, newRootIds);
       },
     });
-    new Notice(`Cloned ${newRootIds.length} note${newRootIds.length === 1 ? "" : "s"} (${createdPaths.length} file${createdPaths.length === 1 ? "" : "s"}).`);
+    const clonedRootNodes = newRootIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({
+        verb: "Cloned",
+        nodes: clonedRootNodes,
+        suffix: `(${createdPaths.length} file${createdPaths.length === 1 ? "" : "s"} total)`,
+      }),
+      kind: "success",
+      category: "clone",
+      affectedIds: newRootIds,
+      folder: this.noteFolder,
+    });
   }
 
   /** Insert-template flow: open the note picker, then deep-clone the
@@ -4308,7 +4973,12 @@ export class StashpadView extends ItemView {
           },
           redo: async () => { await this.restoreSnapshots(snap, [id]); },
         });
-        new Notice(`Inserted template (${createdPaths.length} file${createdPaths.length === 1 ? "" : "s"}).`);
+        this.plugin.notifications.show({
+          message: `Inserted template (${createdPaths.length} file${createdPaths.length === 1 ? "" : "s"})`,
+          kind: "success",
+          category: "clone",
+          folder: this.noteFolder,
+        });
       },
     }).open();
   }
@@ -4316,14 +4986,20 @@ export class StashpadView extends ItemView {
   // --- Navigation ---
 
   private navigateTo(id: StashpadId, opts: { keepForwardStack?: boolean } = {}): void {
-    if (this.listEl) this.scrollByFocus.set(this.focusId, this.listEl.scrollTop);
+    // 0.56.9: invalidate pending tryReselect timers from prior mutations so
+    // they don't apply a stale selection in the new focus.
+    this.selectionGuardKey++;
+    if (this.listEl) {
+      // 0.56.17: stamp last-selected cursor for the focus we're leaving
+      // so returning restores to it via scroll-to-id.
+      this.stampSelectedCursor(true);
+    }
     // Stash current focus's draft before switching.
     if (!opts.keepForwardStack) this.navForwardStack = [];
     this.focusId = id;
     this.persistFocus();
     this.defaultCursorToLast();
     this.syncComposerDraftForFocus();
-    this.pendingScrollRestore = this.scrollByFocus.get(id) ?? null;
     // Clear an active tag/color filter if the new subtree doesn't
     // contain it — otherwise we'd show "All …" in the dropdown while
     // a hidden filter empties the list.
@@ -4337,7 +5013,19 @@ export class StashpadView extends ItemView {
       const present = this.collectFolderColors().some((c) => c.hex === wanted);
       if (!present) this.colorFilter = null;
     }
-    this.render();
+    // 0.56.22: navigateTo uses the saved last-cursor for the new focus to
+    // scroll-to-id (id-based, robust). Falls back to preserve when there's
+    // no memory for this focus — fine, since defaultCursorToLast pre-set
+    // cursor to last child and the user will see something coherent.
+    const savedCursorId = this.lastCursorByFocus.get(id);
+    let navPolicy: ScrollPolicy;
+    if (savedCursorId && this.tree.get(savedCursorId)) {
+      this.pendingFocusIds = [savedCursorId];
+      navPolicy = { kind: "scroll-to-id", id: savedCursorId, align: "start" };
+    } else {
+      navPolicy = { kind: "preserve" };
+    }
+    this.render(navPolicy);
     this.refreshHeaderTitle();
     this.viewRoot.focus({ preventScroll: true });
   }
@@ -4358,6 +5046,7 @@ export class StashpadView extends ItemView {
   }
 
   private navigateUp(): void {
+    this.selectionGuardKey++;
     // History nav (back / Up arrow / Backspace) clears tag + color
     // filters for the same reason as navigateForward.
     this.tagFilter = null;
@@ -4366,11 +5055,15 @@ export class StashpadView extends ItemView {
     if (!node || node.parent == null) return this.navigateTo(ROOT_ID);
     const cameFrom = this.focusId;
     this.navForwardStack.push(cameFrom);
-    if (this.listEl) this.scrollByFocus.set(cameFrom, this.listEl.scrollTop);
+    if (this.listEl) {
+      // Stamp the focus we're leaving (`cameFrom`), not the new focus.
+      const cur = this.currentChildren[this.cursorIdx];
+      const id = cur?.id ?? this.lastSelected;
+      if (id) this.plugin.saveLastCursor(this.noteFolder, cameFrom, id);
+    }
     this.focusId = node.parent;
     this.persistFocus();
     this.syncComposerDraftForFocus();
-    this.pendingScrollRestore = this.scrollByFocus.get(this.focusId) ?? null;
     const kids = this.filterChildren(this.tree.getChildren(this.focusId));
     const idx = kids.findIndex((k) => k.id === cameFrom);
     this.selection.clear();
@@ -4385,7 +5078,9 @@ export class StashpadView extends ItemView {
         this.lastSelected = kids[kids.length - 1].id;
       }
     }
-    this.render();
+    // 0.56.22: follow-cursor — we just set cursor to `cameFrom` (the
+    // child we came from). It IS the right thing to scroll to.
+    this.render({ kind: "follow-cursor" });
     this.refreshHeaderTitle();
     // Always reveal — the cached scroll restore puts us approximately back,
     // but the cursor row (often the child we just left) can still hide
@@ -4430,20 +5125,120 @@ export class StashpadView extends ItemView {
     await this.sortStore.load(this.noteFolder);
     this.bootstrappedFolders.add(this.noteFolder);
   }
+
+  /** First-time-per-session backfill of the redundant parentLink +
+   *  children fields across every note in the folder. Designed to be
+   *  called AFTER tree.rebuild so getRoot().children is actually
+   *  populated — that's the bug the previous in-bootstrap call hit
+   *  (bootstrapFolder runs before rebuild, so the tree was empty and
+   *  the schedule loop was a no-op).
+   *
+   *  Walks every node and enqueues it. The queue's 100ms pacing means
+   *  a 500-note folder finishes in roughly a minute — non-blocking,
+   *  runs entirely in the background.
+   *
+   *  Each `syncOne` short-circuits when fields are already correct, so
+   *  subsequent bootstraps of an already-synced vault produce zero
+   *  writes (and zero render churn). On the FIRST bootstrap of a
+   *  pre-0.54 vault, the queue churns through actual writes — and
+   *  every frontmatter modify cascades into a debounced render, which
+   *  is what the user sees as "the composer flashing". Show a notice
+   *  so it's clear that's what's happening. */
+  private backfillFrontmatterSync(): void {
+    // Walk the tree, pre-filter via wouldWrite, schedule only ids that
+    // would result in actual writes. Already-synced vaults schedule
+    // zero writes here. The visible progress notice (if any) is
+    // managed by installFmSyncActivityNotice() — it fires for ANY
+    // sustained queue activity, not just the bootstrap backfill, so
+    // we don't need a threshold check or batch-specific UI here.
+    const candidates: StashpadId[] = [ROOT_ID];
+    const root = this.tree.getRoot();
+    const walk = (id: StashpadId): void => {
+      for (const child of this.tree.getChildren(id)) {
+        candidates.push(child.id);
+        walk(child.id);
+      }
+    };
+    for (const childId of root.children) walk(childId);
+    for (const id of candidates) {
+      if (this.fmSync.wouldWrite(id)) this.fmSync.schedule(id);
+    }
+  }
+
+  /** Subscribe to fmSync queue FAILURE events. Successful writes are
+   *  silent (per user feedback: the previous activity-based notice
+   *  was too chatty for external edits + dismissed too fast to read
+   *  for big batches). A failure, by contrast, demands attention —
+   *  recovery fields drift out of sync and the user needs to know.
+   *
+   *  Records each failure to notification history with kind=error.
+   *  Persistent toast (duration 0) so the user has time to read +
+   *  decide whether to investigate. Path is included verbatim in
+   *  the message body. */
+  private fmSyncUnsubscribe: (() => void) | null = null;
+  private installFmSyncActivityNotice(): void {
+    if (this.fmSyncUnsubscribe) return; // already installed
+    this.fmSyncUnsubscribe = this.fmSync.onError((path, error) => {
+      this.plugin.notifications.show({
+        message: `Stashpad: couldn't update recovery metadata\nFile: \`${path}\`\nError: ${error.message}`,
+        kind: "error",
+        category: "system",
+        duration: 0,
+        affectedPaths: [path],
+        folder: this.noteFolder,
+      });
+    });
+  }
   private async ensureHomeNote(): Promise<TFile> {
     const folder = this.noteFolder;
+    const desiredPath = `${folder}/${this.buildHomeFilename(folder)}`;
+
+    // Locate any existing home note in this folder (regardless of filename)
+    // by frontmatter id, so legacy files like `home-__root__.md` are
+    // picked up and renamed in place to the new folder-tagged form.
     const files = this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(folder + "/"));
     for (const f of files) {
       const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
-      if (id === ROOT_ID) return f;
+      if (id !== ROOT_ID) continue;
+      if (f.path === desiredPath) return f;
+      // Found an old-style home note. Rename it to the new path. Skip if
+      // the desired path is somehow occupied (collision is unexpected
+      // since only one note carries id=ROOT_ID per folder).
+      const collision = this.app.vault.getAbstractFileByPath(desiredPath);
+      if (collision) return f;
+      try {
+        await this.app.fileManager.renameFile(f, desiredPath);
+        // After rename, return the new TFile reference so callers
+        // operate on the up-to-date file.
+        const renamed = this.app.vault.getAbstractFileByPath(desiredPath);
+        if (renamed instanceof TFile) return renamed;
+      } catch (e) {
+        console.warn("[Stashpad] home note rename failed; keeping legacy path", e);
+      }
+      return f;
     }
-    const path = `${folder}/home-${ROOT_ID}.md`;
+
+    // No home note exists yet — create at the canonical path.
     const created = new Date().toISOString();
     const body = [
       "---", `id: ${ROOT_ID}`, "parent: null", `created: ${created}`, "attachments: []", "---",
       "", "# Home", "", "This is your Stashpad home note. Edit me freely — everything else nests below.", "",
     ].join("\n");
-    return this.app.vault.create(path, body);
+    return this.app.vault.create(desiredPath, body);
+  }
+
+  /** Build the home-note filename for a given Stashpad folder. Uses the
+   *  folder's last path segment so multiple Stashpads don't all produce
+   *  identically-named "Home" files visible in Obsidian's file finder.
+   *  Sanitises to alnum + dash + underscore so the filename is safe on
+   *  every filesystem. */
+  private buildHomeFilename(folder: string): string {
+    const lastSeg = folder.split("/").filter(Boolean).pop() ?? "stashpad";
+    const slug = lastSeg
+      .replace(/[^A-Za-z0-9_-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return `Home-${slug || "stashpad"}.md`;
   }
   private async migrateNullParents(): Promise<void> {
     const folder = this.noteFolder;
@@ -4463,7 +5258,9 @@ export class StashpadView extends ItemView {
   // --- Open in new Stashpad tab ---
 
   private async openInNewStashpadTab(focusId: StashpadId): Promise<void> {
-    const leaf = this.app.workspace.getLeaf("tab");
+    const ws = this.app.workspace;
+    const originLeaf = this.leaf;
+    const leaf = ws.getLeaf("tab");
     await leaf.setViewState({
       type: STASHPAD_VIEW_TYPE,
       active: true,
@@ -4473,7 +5270,79 @@ export class StashpadView extends ItemView {
         folderOverride: this.folderOverride,
       },
     });
-    this.app.workspace.revealLeaf(leaf);
+    ws.setActiveLeaf(leaf, { focus: true } as any);
+    ws.revealLeaf(leaf);
+    // 0.57.5: same return-to-origin one-shot as openFolderInNewTab /
+    // openFileAtEnd — when this spawned tab closes, the originating
+    // Stashpad tab regains focus.
+    const off = ws.on("active-leaf-change", () => {
+      const stillOpen = (() => {
+        let found = false;
+        ws.iterateAllLeaves((l) => { if (l === leaf) found = true; });
+        return found;
+      })();
+      if (stillOpen) return;
+      ws.offref(off);
+      const originStillOpen = (() => {
+        let found = false;
+        ws.iterateAllLeaves((l) => { if (l === originLeaf) found = true; });
+        return found;
+      })();
+      if (originStillOpen) {
+        ws.setActiveLeaf(originLeaf, { focus: true } as any);
+        ws.revealLeaf(originLeaf);
+      }
+    });
+  }
+
+  /** Open a Stashpad folder's home in a new tab (any folder, not just
+   *  this view's current one). Used by the search modal's folder-open
+   *  pick. 0.57.3.
+   *
+   *  Refocus behaviour (0.57.4): same one-shot return-to-origin pattern
+   *  as `openFileAtEnd` — when the spawned tab closes, the originating
+   *  Stashpad tab regains focus instead of whatever tab Obsidian's
+   *  default would pick (usually the tab to the right). */
+  private async openFolderInNewTab(folder: string): Promise<void> {
+    const cleaned = (folder || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!cleaned) return;
+    const settingsFolder = (this.plugin.settings.folder || "stashpad").trim().replace(/^\/+|\/+$/g, "") || "stashpad";
+    const ws = this.app.workspace;
+    const originLeaf = this.leaf;
+    const leaf = ws.getLeaf("tab");
+    await leaf.setViewState({
+      type: STASHPAD_VIEW_TYPE,
+      active: true,
+      state: {
+        focusId: ROOT_ID,
+        // Only override when it's not the plugin default — keeps state
+        // tidy (folderOverride null means "use plugin default").
+        folderOverride: cleaned === settingsFolder ? null : cleaned,
+      },
+    });
+    ws.setActiveLeaf(leaf, { focus: true } as any);
+    ws.revealLeaf(leaf);
+
+    // One-shot: when the spawned leaf closes, restore focus to the
+    // originating Stashpad tab.
+    const off = ws.on("active-leaf-change", () => {
+      const stillOpen = (() => {
+        let found = false;
+        ws.iterateAllLeaves((l) => { if (l === leaf) found = true; });
+        return found;
+      })();
+      if (stillOpen) return;
+      ws.offref(off);
+      const originStillOpen = (() => {
+        let found = false;
+        ws.iterateAllLeaves((l) => { if (l === originLeaf) found = true; });
+        return found;
+      })();
+      if (originStillOpen) {
+        ws.setActiveLeaf(originLeaf, { focus: true } as any);
+        ws.revealLeaf(originLeaf);
+      }
+    });
   }
 
   // --- Open shortcuts ---
@@ -4591,7 +5460,17 @@ export class StashpadView extends ItemView {
         id: changedIds[0],
         payload: { ids: changedIds, count: changedIds.length },
       });
-      new Notice(`${newState ? "Marked complete" : "Unmarked"} (${changedIds.length})`);
+      const toggledNodes = changedIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+      this.plugin.notifications.show({
+        message: this.bulkActionMessage({
+          verb: newState ? "Marked complete" : "Unmarked",
+          nodes: toggledNodes,
+        }),
+        kind: "success",
+        category: newState ? "complete" : "uncomplete",
+        affectedIds: changedIds,
+        folder: this.noteFolder,
+      });
     }
 
     const folder = this.noteFolder;
@@ -4868,6 +5747,11 @@ export class StashpadView extends ItemView {
     }
     affectedParents.add(targetParentId);
 
+    // Capture author/contributor ids BEFORE the move so cross-author filtering picks it up.
+    const movedAuthorIds = this.collectAuthorIds(
+      sourceIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n)
+    );
+
     const folder = this.noteFolder;
 
     // Snapshot affected parents' current orders before mutating.
@@ -4879,6 +5763,9 @@ export class StashpadView extends ItemView {
       const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
       if (!f) continue;
       await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = targetParentId; });
+      // Schedule background recovery-fields sync for the moved note +
+      // both parents.
+      this.fmSync.scheduleParentChange(p.id, p.oldParent, targetParentId);
       await this.log.append({
         type: "parent_change", id: p.id,
         payload: { from: p.oldParent, to: targetParentId, reason: "drag" },
@@ -4909,13 +5796,60 @@ export class StashpadView extends ItemView {
       payload: { dir: "drag-cross", parent: targetParentId, ids: sourceIds, count: sourceIds.length },
     });
 
-    // Cursor follows: if we're currently viewing the new parent, focus the moved
-    // notes; otherwise (we're somewhere else) just clear cursor + selection.
-    this.pendingFocusIds = sourceIds.slice();
-    if (this.focusId !== targetParentId) { this.selection.clear(); this.cursorIdx = -1; }
+    // Cursor follows: if we're currently viewing the new parent, focus the
+    // moved notes; otherwise the moved notes are now off-screen — so focus
+    // the new parent instead (when it's visible in the current view). That
+    // gives the user a visible anchor pointing at "where your notes went."
+    // 0.56.5: previously this just cleared selection, which left the user
+    // staring at an unrelated row.
+    // 0.56.6: also re-apply selection on a delayed pass to cover the case
+    // where the metadataCache-driven debouncedRender (fired by
+    // processFrontMatter writes during the move) lands AFTER our render
+    // and wipes the highlight. tryReselect bails as soon as the row is
+    // visibly selected, so it's a no-op if the first render stuck.
+    const targetIsFocused = this.focusId === targetParentId;
+    const focusTarget: StashpadId = targetIsFocused ? sourceIds[0]! : targetParentId;
+    const focusIdsForRender = targetIsFocused ? sourceIds.slice() : [targetParentId];
+    if (targetIsFocused) {
+      this.pendingFocusIds = focusIdsForRender;
+    } else {
+      this.selection.clear();
+      this.cursorIdx = -1;
+      this.pendingFocusIds = focusIdsForRender;
+    }
     this.tree.rebuild(folder);
-    this.render();
-    new Notice(`Reparented ${sourceIds.length} note${sourceIds.length === 1 ? "" : "s"}`);
+    this.render({ kind: "follow-cursor" });
+    const guardKey = this.selectionGuardKey;
+    const tryReselect = () => {
+      if (this.selectionGuardKey !== guardKey) return; // user navigated away
+      if (this.selection.has(focusTarget)) return;
+      const idx = this.currentChildren.findIndex((n) => n.id === focusTarget);
+      if (idx < 0) return;
+      this.selection.add(focusTarget);
+      this.cursorIdx = idx;
+      this.render({ kind: "follow-cursor" });
+    };
+    setTimeout(tryReselect, 120);
+    setTimeout(tryReselect, 400);
+    const movedNodes = sourceIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+    const targetNode = this.tree.get(targetParentId);
+    const targetTitle = targetNode ? this.titleForNode(targetNode) : "(root)";
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({
+        verb: "Reparented",
+        nodes: movedNodes,
+        destination: `→ "${targetTitle}"`,
+      }),
+      kind: "success",
+      category: "move",
+      affectedIds: sourceIds,
+      affectedAuthorIds: movedAuthorIds,
+      folder,
+      actions: targetParentId === ROOT_ID ? [] : [{
+        label: `Jump to "${targetTitle}"`,
+        onClick: () => this.navigateTo(targetParentId),
+      }],
+    });
 
     // Undo: revert each parent change AND restore the order snapshots for every affected parent.
     this.plugin.getUndoStack(folder).push({
@@ -4981,12 +5915,28 @@ export class StashpadView extends ItemView {
       .map((id) => this.tree.get(id))
       .filter((n): n is TreeNode => !!n && !!n.file);
     if (sourceNodes.length === 0) return;
-    if (sourceNodes.some((n) => n.id === targetId)) return; // can't drop onto self
+    if (sourceNodes.some((n) => n.id === targetId)) {
+      // User tried to drop a note onto itself — silent today; surface
+      // an error so the user knows the action was understood and
+      // intentionally refused (not just ignored).
+      this.plugin.notifications.show({
+        message: "Can't move a note into itself.",
+        kind: "warning",
+        category: "move",
+        folder: this.noteFolder,
+      });
+      return;
+    }
     // For nesting: prevent dropping onto a descendant of the source (would create a cycle).
     if (position === "into") {
       for (const src of sourceNodes) {
         if (this.isDescendant(targetId, src.id)) {
-          new Notice("Can't nest a note under one of its own descendants.");
+          this.plugin.notifications.show({
+            message: `Can't nest "${this.titleForNode(src)}" under one of its own descendants — that would create a cycle.`,
+            kind: "warning",
+            category: "move",
+            folder: this.noteFolder,
+          });
           return;
         }
       }
@@ -5055,7 +6005,14 @@ export class StashpadView extends ItemView {
     this.pendingFocusIds = validSources.slice();
     this.tree.rebuild(folder);
     this.render();
-    new Notice(`Reordered ${validSources.length} note${validSources.length === 1 ? "" : "s"}`);
+    const reorderedNodes = validSources.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({ verb: "Reordered", nodes: reorderedNodes }),
+      kind: "success",
+      category: "reorder",
+      affectedIds: validSources,
+      folder,
+    });
 
     this.plugin.getUndoStack(folder).push({
       label: `Reorder (drag, ${validSources.length})`,
@@ -5142,10 +6099,25 @@ export class StashpadView extends ItemView {
     });
 
     // Re-render to reflect the new sort. Keep the cursor on the moved note(s).
+    // 0.56.5: explicit follow-cursor policy so the moved row gets scrolled
+    // into view. Without this, holding ⌥↑ would let the row slide out of
+    // the viewport because preserve's anchor restoration locks the OLD
+    // top-of-viewport row in place, not the cursor.
     this.pendingFocusIds = targetIds.slice();
     this.tree.rebuild(folder);
-    this.render();
-    new Notice(`Moved ${targetIds.length} note${targetIds.length === 1 ? "" : "s"} ${dir}`);
+    this.render({ kind: "follow-cursor" });
+    const keyMovedNodes = targetIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({
+        verb: "Moved",
+        nodes: keyMovedNodes,
+        destination: dir,
+      }),
+      kind: "success",
+      category: "reorder",
+      affectedIds: targetIds,
+      folder,
+    });
 
     // Undo support.
     this.plugin.getUndoStack(folder).push({
@@ -5238,9 +6210,51 @@ export class StashpadView extends ItemView {
               try {
                 await this.app.fileManager.trashFile(f);
                 await this.log.append({ type: "attachment_remove", id: ROOT_ID, payload: { path: f.path } });
-                new Notice(`Deleted attachment "${f.name}"`);
+                // Route through plugin.notifications so this matches the
+                // parent delete's styled toast (left-border accent,
+                // history entry, mute support via the "attachment"
+                // category). Kind=warning to mirror the parent.
+                this.plugin.notifications.show({
+                  message: `Deleted attachment "${f.name}"`,
+                  kind: "warning",
+                  category: "attachment",
+                  affectedPaths: [f.path],
+                  folder: this.noteFolder,
+                });
                 attsRemoved += 1;
               } catch {}
+            }
+          }
+        }
+        // Capture surviving parent ids BEFORE we delete, so the
+        // post-delete sync can update their children lists.
+        const orphanedParents = new Set<StashpadId>();
+        for (const n of allNotes) if (n.parent) orphanedParents.add(n.parent);
+        // Capture author/contributor ids BEFORE deletion so cross-author
+        // filtering can pick this up (resolver can't read deleted files).
+        const deletedAuthorIds = this.collectAuthorIds(allNotes);
+        // 0.56.5: pick a surviving neighbour for cursor BEFORE the rebuild
+        // wipes everything. Look forward from the topmost deleted position
+        // for the first non-deleted sibling; fall back to looking backward.
+        const deletedIdSet = new Set(targets.map((t) => t.id));
+        const deletedIndices = this.currentChildren
+          .map((c, i) => (deletedIdSet.has(c.id) ? i : -1))
+          .filter((i) => i >= 0);
+        const topDeletedIdx = deletedIndices.length > 0 ? deletedIndices[0] : -1;
+        let neighbourId: StashpadId | null = null;
+        if (topDeletedIdx >= 0) {
+          for (let i = topDeletedIdx + 1; i < this.currentChildren.length; i++) {
+            if (!deletedIdSet.has(this.currentChildren[i].id)) {
+              neighbourId = this.currentChildren[i].id;
+              break;
+            }
+          }
+          if (!neighbourId) {
+            for (let i = topDeletedIdx - 1; i >= 0; i--) {
+              if (!deletedIdSet.has(this.currentChildren[i].id)) {
+                neighbourId = this.currentChildren[i].id;
+                break;
+              }
             }
           }
         }
@@ -5251,12 +6265,28 @@ export class StashpadView extends ItemView {
         }
         this.selection.clear();
         this.cursorIdx = -1;
+        if (neighbourId) this.pendingFocusIds = [neighbourId];
         this.tree.rebuild(this.noteFolder);
-        this.render();
+        for (const pid of orphanedParents) {
+          if (allNotes.some((n) => n.id === pid)) continue;
+          this.fmSync.scheduleParentOfDeleted(pid);
+        }
+        this.render({ kind: "follow-cursor" });
         const attSuffix = attsRemoved > 0
           ? ` with ${attsRemoved} attachment${attsRemoved === 1 ? "" : "s"}`
           : "";
-        new Notice(`Deleted ${targets.length} note${targets.length === 1 ? "" : "s"}${attSuffix}`);
+        this.plugin.notifications.show({
+          message: this.bulkActionMessage({
+            verb: "Deleted",
+            nodes: targets,
+            suffix: attSuffix.trim() || undefined,
+          }),
+          kind: "warning",
+          category: "delete",
+          affectedIds: targets.map((t) => t.id),
+          affectedAuthorIds: deletedAuthorIds,
+          folder: this.noteFolder,
+        });
         const folder = this.noteFolder;
         const undoFocusIds = targets.map((t) => t.id);
         this.plugin.getUndoStack(folder).push({
@@ -5336,7 +6366,13 @@ export class StashpadView extends ItemView {
         });
         this.tree.rebuild(this.noteFolder);
         this.render();
-        new Notice("Note split.");
+        this.plugin.notifications.show({
+          message: `Split "${this.titleForNode(target)}" into two`,
+          kind: "success",
+          category: "split",
+          affectedIds: [target.id],
+          folder: this.noteFolder,
+        });
 
         // Find the new note's path so undo/redo can locate it.
         const newNode = newId ? this.tree.get(newId) : undefined;
@@ -5444,9 +6480,20 @@ export class StashpadView extends ItemView {
         id: roots[0].id,
         payload: { path: outPath, noteCount: all.length, rootIds: roots.map((r) => r.id) },
       });
-      new Notice(`Exported ${all.length} note${all.length === 1 ? "" : "s"} → ${outPath}`);
+      this.plugin.notifications.show({
+        message: `Exported ${all.length} note${all.length === 1 ? "" : "s"} → \`${outPath}\``,
+        kind: "success",
+        category: "export",
+        affectedPaths: [outPath],
+        folder: this.noteFolder,
+        actions: this.actionsForFile(outPath),
+      });
     } catch (e) {
-      new Notice(`Stashpad: export failed (${(e as Error).message})`);
+      this.plugin.notifications.show({
+        message: `Stashpad: export failed\nError: ${(e as Error).message}\nCheck disk space + write permissions on the export folder.`,
+        kind: "error",
+        category: "export",
+      });
       console.error(e);
     }
   }
@@ -5513,9 +6560,23 @@ export class StashpadView extends ItemView {
       const parts = [`Imported ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"}`];
       if (summary.attachmentsWritten) parts.push(`+ ${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"}`);
       if (summary.collisionsRenamed) parts.push(`(${summary.collisionsRenamed} id collision${summary.collisionsRenamed === 1 ? "" : "s"} renamed)`);
-      new Notice(parts.join(" "));
+      this.plugin.notifications.show({
+        message: parts.join(" "),
+        kind: "success",
+        category: "import",
+        folder: this.noteFolder,
+      });
     } catch (e) {
-      new Notice(`Stashpad: import failed (${(e as Error).message})`);
+      this.plugin.notifications.show({
+        message: `Stashpad: import failed\nFile: \`${file.name}\`\nError: ${(e as Error).message}\nInspect with the buttons below — rename to .zip to crack it open in an archive tool.`,
+        kind: "error",
+        category: "import",
+        affectedPaths: [file.path],
+        // Reveal/Show actions on the source .stash so the user can
+        // inspect the bad bundle. Failure path doesn't trash the file
+        // (only success does), so it's still there to inspect.
+        actions: this.actionsForFile(file.path),
+      });
       console.error(e);
     }
   }
@@ -5615,6 +6676,10 @@ export class StashpadView extends ItemView {
             id, parent: parentId, children: [], file: f as TFile, created,
           });
           this.render();
+          // Schedule the redundant parentLink / children fields. The
+          // tree is now in its post-create shape, so the queue will
+          // see the right state when it drains.
+          this.fmSync.scheduleParentChange(id, null, parentId);
           // Layer template frontmatter (color, tags, custom keys). Auto
           // fields (id/parent/created/attachments) are skipped so the
           // values written above always win.
@@ -5622,7 +6687,7 @@ export class StashpadView extends ItemView {
             try {
               await this.app.fileManager.processFrontMatter(f as TFile, (m: any) => {
                 for (const [k, v] of Object.entries(templateFm!)) {
-                  if (k === "id" || k === "parent" || k === "created" || k === "attachments" || k === "position") continue;
+                  if (RESERVED_FRONTMATTER.includes(k)) continue;
                   if (m[k] === undefined) m[k] = v;
                 }
               });
@@ -5703,7 +6768,13 @@ export class StashpadView extends ItemView {
       const path = `${folder}/${stamp}-${safeName}`;
       await this.app.vault.createBinary(path, buf);
       await this.log.append({ type: "attachment_add", id: ROOT_ID, payload: { path, name: file.name, size: file.size } });
-      new Notice(`Attached ${file.name}`);
+      this.plugin.notifications.show({
+        message: `Attached ${file.name}`,
+        kind: "success",
+        category: "attachment",
+        affectedPaths: [path],
+        folder: this.noteFolder,
+      });
       return `![[${path}]]`;
     } catch (e) {
       new Notice(`Stashpad: attachment failed (${(e as Error).message})`);
@@ -6057,7 +7128,20 @@ export class StashpadView extends ItemView {
         list.scrollTop = h;
         lastH = h;
       }
-      if (performance.now() - startedAt < 30000) requestAnimationFrame(watchdog);
+      if (performance.now() - startedAt < 30000) {
+        requestAnimationFrame(watchdog);
+      } else {
+        // Initial paint has long since settled. Releasing the sticky
+        // flag here prevents the regression where every subsequent
+        // mutation (color change, reparent, move, etc.) bounces the
+        // view back to the bottom even though the user had navigated
+        // away. Disconnect the row observer too — it'd otherwise
+        // remain wired to the now-stale list children, doing nothing
+        // useful but holding references.
+        this.stickToListBottom = false;
+        this.stickyRowObserver?.disconnect();
+        this.stickyRowObserver = null;
+      }
     };
     requestAnimationFrame(watchdog);
   }
@@ -6083,12 +7167,20 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
     menu.addItem((it: any) => it.setTitle("Export to .stash").setIcon("package").onClick(() => void this.cmdExportStash(node)));
     menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Move to…").onClick(() => this.cmdMovePicker()));
-    menu.addItem((it: any) => it.setTitle("Move to Home").onClick(async () => { await this.changeParent(node, ROOT_ID); }));
+    menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => this.cmdMovePicker()));
+    menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => { await this.changeParent(node, ROOT_ID); }));
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       this.cmdSetColor();
+    }));
+    // 0.58.0: toggle complete — label flips based on current state of the
+    // right-clicked node. Operates on the right-clicked row, normalising
+    // selection first so cmdToggleComplete picks the right target.
+    const isDone = this.isCompleted(node);
+    menu.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => {
+      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      void this.cmdToggleComplete();
     }));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Delete").setIcon("trash").onClick(async () => {
@@ -6129,6 +7221,8 @@ export class StashpadView extends ItemView {
     }
     const uniqueAtts = [...new Set(attachments)];
 
+    // Captured BEFORE deletion so cross-author filtering works after files are gone.
+    const deletedAuthorIds = this.collectAuthorIds(all);
     const doDelete = async (alsoAtts: boolean) => {
       const snap = await this.snapshotNotes(all, alsoAtts);
       let attsRemoved = 0;
@@ -6140,10 +7234,45 @@ export class StashpadView extends ItemView {
               await this.app.fileManager.trashFile(f);
               await this.log.append({ type: "attachment_remove", id: ROOT_ID, payload: { path: f.path } });
               // Per-attachment toast so the user has visible confirmation
-              // for every external file that disappeared.
-              new Notice(`Deleted attachment "${f.name}"`);
+              // for every external file that disappeared. Routed via
+              // plugin.notifications for matching styling + history;
+              // kind=warning mirrors the parent delete toast.
+              this.plugin.notifications.show({
+                message: `Deleted attachment "${f.name}"`,
+                kind: "warning",
+                category: "attachment",
+                affectedPaths: [f.path],
+                folder: this.noteFolder,
+              });
               attsRemoved += 1;
             } catch {}
+          }
+        }
+      }
+      // Capture parents of every deleted note BEFORE we trash them, so
+      // the post-delete recovery-fields sync can update those parents'
+      // children lists. The deleted notes themselves are gone, so we
+      // don't bother with their own fields.
+      const orphanedParents = new Set<StashpadId>();
+      for (const n of all) if (n.parent) orphanedParents.add(n.parent);
+      // 0.56.5: surviving-neighbour selection for the single-delete path.
+      // Look forward in currentChildren for the next non-self sibling;
+      // fall back to the previous sibling.
+      const nodeIdx = this.currentChildren.findIndex((c) => c.id === node.id);
+      let neighbourId: StashpadId | null = null;
+      if (nodeIdx >= 0) {
+        for (let i = nodeIdx + 1; i < this.currentChildren.length; i++) {
+          if (this.currentChildren[i].id !== node.id) {
+            neighbourId = this.currentChildren[i].id;
+            break;
+          }
+        }
+        if (!neighbourId) {
+          for (let i = nodeIdx - 1; i >= 0; i--) {
+            if (this.currentChildren[i].id !== node.id) {
+              neighbourId = this.currentChildren[i].id;
+              break;
+            }
           }
         }
       }
@@ -6152,19 +7281,32 @@ export class StashpadView extends ItemView {
         try { await this.app.fileManager.trashFile(n.file); } catch {}
         await this.log.append({ type: "delete", id: n.id, payload: { path: n.file.path, attachmentsRemoved: alsoAtts ? uniqueAtts : [] } });
       }
-      // Clear cursor + selection so the row that fills the deleted slot doesn't
-      // inherit the cursor highlight.
       this.selection.clear();
       this.cursorIdx = -1;
+      if (neighbourId) this.pendingFocusIds = [neighbourId];
       this.tree.rebuild(this.noteFolder);
-      this.render();
+      this.render({ kind: "follow-cursor" });
+      // Now that the tree reflects the deletions, schedule the surviving
+      // parents so their children lists drop the trashed entries.
+      // Filter out any parent that was itself just deleted.
+      for (const pid of orphanedParents) {
+        if (all.some((n) => n.id === pid)) continue;
+        this.fmSync.scheduleParentOfDeleted(pid);
+      }
       const folder = this.noteFolder;
       const label = `Delete "${this.titleForNode(node)}"`;
       const undoFocusId = node.id;
       const attSuffix = attsRemoved > 0
         ? ` with ${attsRemoved} attachment${attsRemoved === 1 ? "" : "s"}`
         : "";
-      new Notice(`Deleted "${this.titleForNode(node)}"${attSuffix}`);
+      this.plugin.notifications.show({
+        message: `Deleted "${this.titleForNode(node)}"${attSuffix}`,
+        kind: "warning",
+        category: "delete",
+        affectedIds: [node.id],
+        affectedAuthorIds: deletedAuthorIds,
+        folder: this.noteFolder,
+      });
       this.plugin.getUndoStack(folder).push({
         label,
         undo: async () => {
@@ -6205,9 +7347,41 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     const file = node.file;
     const oldParent = node.parent;
-    if (oldParent === newParent) return;
-    if (newParent === node.id) return;
+    // 0.58.2: surface a warning when a move is a no-op so the user knows
+    // their action was understood and intentionally refused (not just
+    // ignored). null parent and ROOT_ID both mean "home" — normalise so
+    // "Move to Home" on a note already at home fires the warning.
+    const norm = (p: StashpadId | null): StashpadId => (p == null ? ROOT_ID : p);
+    if (norm(oldParent) === norm(newParent)) {
+      if (!opts.quiet) {
+        const title = this.titleForNode(node);
+        const dest = newParent === ROOT_ID ? "Home" : `"${this.titleForNode(this.tree.get(newParent) ?? node)}"`;
+        this.plugin.notifications.show({
+          message: `"${title}" is already under ${dest}.`,
+          kind: "info",
+          category: "move",
+          affectedIds: [node.id],
+          folder: this.noteFolder,
+        });
+      }
+      return;
+    }
+    if (newParent === node.id) {
+      if (!opts.quiet) {
+        this.plugin.notifications.show({
+          message: `Can't move "${this.titleForNode(node)}" into itself.`,
+          kind: "warning",
+          category: "move",
+          affectedIds: [node.id],
+          folder: this.noteFolder,
+        });
+      }
+      return;
+    }
+    const movedAuthorIds = this.collectAuthorIds([node]);
     await this.app.fileManager.processFrontMatter(file, (fm) => { fm.parent = newParent; });
+    // Background-sync the moved note + both parents' redundant fields.
+    this.fmSync.scheduleParentChange(node.id, oldParent, newParent);
     await this.log.append({ type: "parent_change", id: node.id, payload: { from: oldParent, to: newParent } });
     // Cursor follows the moved note. Selection stays on it as well.
     this.pendingFocusIds = [node.id];
@@ -6220,7 +7394,22 @@ export class StashpadView extends ItemView {
       this.cursorIdx = -1;
       this.pendingFocusIds = null;
     }
-    if (!opts.quiet) new Notice(`Reparented note`);
+    if (!opts.quiet) {
+      const dest = this.tree.get(newParent);
+      const destTitle = dest ? this.titleForNode(dest) : "(root)";
+      this.plugin.notifications.show({
+        message: `Reparented "${this.titleForNode(node)}" → "${destTitle}"`,
+        kind: "success",
+        category: "move",
+        affectedIds: [node.id],
+        affectedAuthorIds: movedAuthorIds,
+        folder: this.noteFolder,
+        actions: newParent === ROOT_ID ? [] : [{
+          label: `Jump to "${destTitle}"`,
+          onClick: () => this.navigateTo(newParent),
+        }],
+      });
+    }
     if (opts.record !== false) {
       const folder = this.noteFolder;
       const filePath = file.path;
@@ -6241,7 +7430,23 @@ export class StashpadView extends ItemView {
             this.pendingFocusIds = null;
           }
           this.tree.rebuild(folder);
-          this.render();
+          // 0.56.8: follow-cursor so the un-nested note scrolls back into
+          // view, and a delayed re-apply covers the metadataCache race.
+          this.render({ kind: "follow-cursor" });
+          {
+            const guardKey = this.selectionGuardKey;
+            const tryReselect = () => {
+              if (this.selectionGuardKey !== guardKey) return;
+              if (this.selection.has(movedId)) return;
+              const idx = this.currentChildren.findIndex((n) => n.id === movedId);
+              if (idx < 0) return;
+              this.selection.add(movedId);
+              this.cursorIdx = idx;
+              this.render({ kind: "follow-cursor" });
+            };
+            setTimeout(tryReselect, 120);
+            setTimeout(tryReselect, 400);
+          }
         },
         redo: async () => {
           const f = this.app.vault.getAbstractFileByPath(filePath) as TFile | null;
@@ -6257,7 +7462,21 @@ export class StashpadView extends ItemView {
             this.pendingFocusIds = null;
           }
           this.tree.rebuild(folder);
-          this.render();
+          this.render({ kind: "follow-cursor" });
+          {
+            const guardKey = this.selectionGuardKey;
+            const tryReselect = () => {
+              if (this.selectionGuardKey !== guardKey) return;
+              if (this.selection.has(movedId)) return;
+              const idx = this.currentChildren.findIndex((n) => n.id === movedId);
+              if (idx < 0) return;
+              this.selection.add(movedId);
+              this.cursorIdx = idx;
+              this.render({ kind: "follow-cursor" });
+            };
+            setTimeout(tryReselect, 120);
+            setTimeout(tryReselect, 400);
+          }
         },
       });
     }

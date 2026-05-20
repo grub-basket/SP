@@ -1,20 +1,31 @@
-import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { Notice, Platform, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { STASHPAD_VIEW_TYPE } from "./types";
 import { StashpadView } from "./view";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, type CommandId,
 } from "./settings";
-import { DEFAULT_STOPWORDS } from "./slug-service";
+import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, STASH_EXT } from "./stash-package";
 import { StashpadLog } from "./log";
 import { ROOT_ID } from "./types";
 import { UndoStack } from "./undo-stack";
+import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
+import { NotificationService, buildFileActions } from "./notifications";
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
   private undoStacks = new Map<string, UndoStack>();
+  /** Plugin-level notification service. Routes all toasts through one
+   *  pipe so history + per-category mute + multiplayer filters work
+   *  uniformly across views. Instantiated lazily on first access in
+   *  case `this.app` isn't ready at field-initialiser time. */
+  private _notifications: NotificationService | null = null;
+  get notifications(): NotificationService {
+    if (!this._notifications) this._notifications = new NotificationService(this.app);
+    return this._notifications;
+  }
 
   /** Vault-relative path to a file/dir inside the plugin's private
    *  folder (`.obsidian/plugins/<id>/.stashpad/...`). Used for the log,
@@ -632,6 +643,27 @@ export default class StashpadPlugin extends Plugin {
       name: "Set missing parents to Home (orphan fix)",
       callback: () => void this.fixOrphanParents(),
     });
+    // 0.58.0: rebootstrap as a command palette entry — mirrors the
+    // "Rebootstrap now" button in settings. Useful when troubleshooting
+    // / migrating without opening Settings.
+    this.addCommand({
+      id: "stashpad-rebootstrap-all",
+      name: "Rebootstrap all Stashpad folders (backfill metadata + rename stale titles)",
+      callback: async () => {
+        new Notice("Stashpad: rebootstrapping…");
+        try {
+          const { touched, fmChecked, fmWritten, slugsRenamed } = await this.rebootstrapAllFolders();
+          const parts: string[] = [];
+          parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
+          if (fmWritten > 0) parts.push(`updated ${fmWritten} note${fmWritten === 1 ? "" : "s"}' metadata`);
+          if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"}`);
+          parts.push(`(checked ${fmChecked} total)`);
+          new Notice(`Stashpad: ${parts.join(" · ")}`);
+        } catch (e) {
+          new Notice(`Stashpad: rebootstrap failed (${(e as Error).message})`);
+        }
+      },
+    });
     this.addCommand({
       id: "stashpad-adopt-note",
       name: "Adopt active note into Stashpad (fill missing frontmatter)",
@@ -641,6 +673,33 @@ export default class StashpadPlugin extends Plugin {
         if (checking) return true;
         void this.adoptNote(f);
         return true;
+      },
+    });
+    this.addCommand({
+      id: "stashpad-open-notification-history",
+      name: "Open notification history",
+      callback: () => {
+        // Lazy require to avoid a hard import dependency at plugin
+        // load time — the modal pulls in modals.ts which is fine but
+        // we keep the surface area minimal.
+        void import("./modals").then(({ NotificationHistoryModal, LogModal }) => {
+          new NotificationHistoryModal(
+            this.app,
+            this.notifications,
+            async () => {
+              const adapter = this.app.vault.adapter;
+              const path = this.pluginPrivatePath("log.jsonl");
+              if (!(await adapter.exists(path))) {
+                new Notice("No log yet — make some changes first.");
+                return;
+              }
+              const data = await adapter.read(path);
+              new LogModal(this.app, data, path).open();
+            },
+            this.settings.authorId || null,
+            (id) => this.lookupNoteAuthorIds(id),
+          ).open();
+        });
       },
     });
     this.addCommand({
@@ -897,18 +956,78 @@ export default class StashpadPlugin extends Plugin {
       const parts = [`Auto-imported ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"} from ${file.name}`];
       if (summary.attachmentsWritten) parts.push(`+ ${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"}`);
       if (summary.collisionsRenamed) parts.push(`(${summary.collisionsRenamed} renamed)`);
-      new Notice(parts.join(" "));
+      this.notifications.show({
+        message: parts.join(" "),
+        kind: "success",
+        category: "import",
+        folder: destFolder,
+      });
       if (view && typeof (view as any).debouncedRender === "function") (view as any).debouncedRender();
     } catch (e) {
-      new Notice(`Stashpad: auto-import failed for ${file.name} — ${(e as Error).message}`);
+      this.notifications.show({
+        message: `Stashpad: auto-import failed\nFile: \`${file.name}\`\nError: ${(e as Error).message}\nInspect with the buttons below — rename to .zip to crack it open in an archive tool.`,
+        kind: "error",
+        category: "import",
+        affectedPaths: [file.path],
+        // On failure, the source .stash is NOT trashed (only success
+        // trashes), so the file is still at its drop path. Reveal /
+        // Show actions point at it for inspection.
+        actions: buildFileActions(this.app, file.path, Platform.isMobile),
+      });
       console.error(e);
     }
   }
 
+  /** Resolve a Stashpad id → all author + contributor ids for that
+   *  note. Author lives in frontmatter as a wikilink (e.g.
+   *  `[[demo/_authors/Jane-743jcy.md|Jane]]`); contributors is an
+   *  array of the same shape. Each wikilink has the authorId as the
+   *  `-<id>` suffix of the target's basename.
+   *
+   *  Returns the distinct list — for the history modal's
+   *  Cross-author filter, "any party of an affected note differs
+   *  from the actor" is enough to qualify.
+   *
+   *  O(n) per call (full vault scan). Acceptable since this fires
+   *  only inside the history filter, not in any hot path. Returns
+   *  [] when the id isn't found or all fields are absent / malformed. */
+  lookupNoteAuthorIds(id: string): string[] {
+    const out = new Set<string>();
+    const extract = (raw: unknown): string | null => {
+      if (typeof raw !== "string") return null;
+      const m = raw.match(/-([a-z0-9]{4,12})(?:\.md)?(?:\||\]\])/i);
+      return m ? m[1] : null;
+    };
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      if (fm?.id !== id) continue;
+      const author = extract(fm?.author);
+      if (author) out.add(author);
+      const contribs = fm?.contributors;
+      if (Array.isArray(contribs)) {
+        for (const c of contribs) {
+          const cid = extract(c);
+          if (cid) out.add(cid);
+        }
+      }
+      break;
+    }
+    return Array.from(out);
+  }
+
+  /** Back-compat wrapper for callers that just want the primary
+   *  author. Unused since 0.55.15 — the history modal now consumes
+   *  lookupNoteAuthorIds directly — but kept for downstream / future
+   *  callers that need the simpler shape. */
+  lookupNoteAuthorId(id: string): string | null {
+    return this.lookupNoteAuthorIds(id)[0] ?? null;
+  }
+
   /** Walk every folder in the vault that contains a Stashpad home note (id=__root__),
-   *  ensure it has the import/export subfolders, and write an empty drafts file if
-   *  one is missing. Used by the "Rebootstrap" button in settings to retrofit older folders. */
-  async rebootstrapAllFolders(): Promise<{ touched: string[] }> {
+   *  ensure it has the import/export subfolders, and run the redundant-frontmatter
+   *  backfill (parentLink + children) so older notes pick up the recovery fields.
+   *  Used by the "Rebootstrap" button in settings to retrofit older folders. */
+  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number }> {
     const ROOT_ID = "__root__";
     const seen = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -924,16 +1043,69 @@ export default class StashpadPlugin extends Plugin {
       if (!path) return;
       if (!(await this.app.vault.adapter.exists(path))) await this.app.vault.createFolder(path);
     };
+    let fmChecked = 0;
+    let fmWritten = 0;
+    let slugsRenamed = 0;
     for (const folder of seen) {
       try {
         if (importSub) await ensureFolder(`${folder}/${importSub}`);
         if (exportSub) await ensureFolder(`${folder}/${exportSub}`);
+        // Standalone (no-view-required) frontmatter backfill: reads
+        // metadata cache, skip-if-equal, writes only what's actually
+        // different. Paced internally so multi-folder rebootstrap
+        // doesn't stall the FS.
+        const stats = await rebootstrapFolderFrontmatter(this.app, folder);
+        fmChecked += stats.checked;
+        fmWritten += stats.written;
+        // 0.58.1: rename files whose slug no longer matches their body's
+        // first line — catches notes from before the auto-retitle logic
+        // landed (and any whose body was edited without the per-view
+        // scheduleSlugRename firing).
+        slugsRenamed += await this.rebootstrapFolderSlugs(folder);
         touched.push(folder);
       } catch (e) {
         console.warn(`Stashpad: rebootstrap skipped ${folder}`, e);
       }
     }
-    return { touched };
+    return { touched, fmChecked, fmWritten, slugsRenamed };
+  }
+
+  /** Walk every Stashpad note in `folder`. For each one whose filename
+   *  slug no longer matches its current body's first line, rename via
+   *  fileManager.renameFile. Returns the number of files renamed.
+   *  Standalone — no view dependency. 0.58.1. */
+  private async rebootstrapFolderSlugs(folder: string): Promise<number> {
+    const ROOT_ID = "__root__";
+    const dir = folder.replace(/\/+$/, "");
+    const stopwords = this.settings.slugStopWords ?? DEFAULT_STOPWORDS;
+    let renamed = 0;
+    const files = this.app.vault.getMarkdownFiles().filter((f) => {
+      const p = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      return p === dir;
+    });
+    for (const file of files) {
+      const id = parseIdFromFilename(file.basename);
+      if (!id || id === ROOT_ID) continue;
+      // Confirm it's actually a Stashpad note (id matches frontmatter).
+      const fmId = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+      if (fmId !== id) continue;
+      try {
+        const raw = await this.app.vault.cachedRead(file);
+        const body = raw.startsWith("---")
+          ? raw.slice(raw.indexOf("\n---", 3) + 4).replace(/^\r?\n/, "")
+          : raw;
+        const newSlug = bodyToSlug(body, stopwords);
+        const desired = buildFilename(newSlug, id);
+        if (file.name === desired) continue;
+        const newPath = file.parent ? `${file.parent.path}/${desired}` : desired;
+        if (this.app.vault.getAbstractFileByPath(newPath)) continue;
+        await this.app.fileManager.renameFile(file, newPath);
+        renamed += 1;
+      } catch (e) {
+        console.warn(`Stashpad: slug rebootstrap skipped ${file.path}`, e);
+      }
+    }
+    return renamed;
   }
 
   async activateView(opts: { reveal: boolean } = { reveal: true }): Promise<void> {
@@ -1044,6 +1216,12 @@ export default class StashpadPlugin extends Plugin {
       hideCompletedNotes: (data?.hideCompletedNotes && typeof data.hideCompletedNotes === "object" && !Array.isArray(data.hideCompletedNotes))
         ? data.hideCompletedNotes
         : {},
+      mutedNotificationCategories: Array.isArray(data?.mutedNotificationCategories)
+        ? data.mutedNotificationCategories.filter((x: unknown): x is string => typeof x === "string")
+        : [],
+      notificationHistoryLimit: (typeof data?.notificationHistoryLimit === "number" && Number.isFinite(data.notificationHistoryLimit))
+        ? data.notificationHistoryLimit
+        : 5000,
       drafts: normalizeDrafts(data?.drafts),
       lastSubmitted: data?.lastSubmitted && typeof data.lastSubmitted === "object" ? data.lastSubmitted : {},
       // Migrate: when slugStopWords has never been set on this install
@@ -1055,6 +1233,104 @@ export default class StashpadPlugin extends Plugin {
         : [...DEFAULT_STOPWORDS],
     };
     setSettings(this.settings);
+    // Sync the notification service's mute set from settings. Safe to
+    // call before any toasts fire — the service no-ops on empty mute
+    // sets. Cast through string[] → NotificationCategory[] since the
+    // on-disk list is opaque (forward-compatible with new categories).
+    this.notifications.loadMutedFromList(this.settings.mutedNotificationCategories as any);
+    // Apply the user's history-cap setting (default 5000; <=0 means
+    // unlimited). Setting this BEFORE the loadHistory call below
+    // ensures the restored history is trimmed to the right size.
+    this.notifications.setHistoryLimit(this.settings.notificationHistoryLimit);
+    // Stamp the local user's authorId so multiplayer filters in the
+    // history modal can pivot on "who acted here" without every
+    // notification site having to remember.
+    this.notifications.setDefaultAuthorId(this.settings.authorId);
+    // Restore persisted notification history from disk + wire a
+    // debounced save on every push so it survives reloads.
+    void this.attachNotificationPersistence();
+  }
+
+  /** Notification-history persistence — load on plugin onload, save
+   *  on every history mutation (debounced 1s to coalesce bursts).
+   *  Storage lives at <pluginDir>/notifications.json as a single
+   *  JSON dump of NotificationRecord[]. Idempotent: subsequent calls
+   *  early-return after the first wire-up. */
+  private notifPersistenceWired = false;
+  private notifSaveTimer: number | null = null;
+  private notificationsPath(): string {
+    return this.pluginPrivatePath("notifications.json");
+  }
+  private async attachNotificationPersistence(): Promise<void> {
+    if (this.notifPersistenceWired) return;
+    this.notifPersistenceWired = true;
+    const adapter = this.app.vault.adapter;
+    const path = this.notificationsPath();
+    try {
+      if (await adapter.exists(path)) {
+        const raw = await adapter.read(path);
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) this.notifications.loadHistory(parsed);
+      }
+    } catch (e) {
+      console.warn("[Stashpad] failed to load notification history", e);
+    }
+    // Debounced save on every history change.
+    this.notifications.onChange(() => {
+      if (this.notifSaveTimer != null) window.clearTimeout(this.notifSaveTimer);
+      this.notifSaveTimer = window.setTimeout(() => {
+        this.notifSaveTimer = null;
+        void this.persistNotificationHistory();
+      }, 1000);
+    });
+  }
+  private async persistNotificationHistory(): Promise<void> {
+    try {
+      const records = this.notifications.recent().slice().reverse(); // oldest-first on disk
+      const path = this.notificationsPath();
+      const dir = path.replace(/\/[^/]+$/, "");
+      const adapter = this.app.vault.adapter;
+      if (dir && !(await adapter.exists(dir))) await adapter.mkdir(dir);
+      await adapter.write(path, JSON.stringify(records));
+    } catch (e) {
+      console.warn("[Stashpad] failed to save notification history", e);
+    }
+  }
+
+  /** Per-(folder, focus) "last cursor note id" persistence via localStorage.
+   *  0.56.14: replaces the pixel-scrollTop approach. Stable across layout
+   *  changes (markdown reflows, font/image loads, list growth) because
+   *  it's a logical id, not a pixel coordinate. On view restore we scroll
+   *  that note into view via the `scroll-to-id` policy.
+   *
+   *  Storage key: "stashpad:last-cursor" → JSON { "<folder>": { "<focusId>": "<noteId>" } } */
+  private readonly LAST_CURSOR_LS_KEY = "stashpad:last-cursor";
+  private readLastCursorFile(): Record<string, Record<string, string>> {
+    try {
+      const raw = window.localStorage.getItem(this.LAST_CURSOR_LS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed as Record<string, Record<string, string>> : {};
+    } catch {
+      return {};
+    }
+  }
+  /** Map of <focusId> → <last cursor note id> for the given folder. */
+  loadLastCursor(folder: string): Map<string, string> {
+    const all = this.readLastCursorFile();
+    const slice = all[folder] ?? {};
+    return new Map(Object.entries(slice));
+  }
+  /** Synchronously persist last cursor for one (folder, focus). */
+  saveLastCursor(folder: string, focusId: string, noteId: string): void {
+    try {
+      const all = this.readLastCursorFile();
+      if (!all[folder]) all[folder] = {};
+      all[folder][focusId] = noteId;
+      window.localStorage.setItem(this.LAST_CURSOR_LS_KEY, JSON.stringify(all));
+    } catch (e) {
+      console.warn("[Stashpad] failed to save last-cursor", e);
+    }
   }
 
   /** Serializes ALL settings writes so a fast draft-write can't race with

@@ -1,12 +1,12 @@
 {
   "name": "stashpad-obsidian",
-  "version": "0.53.20",
+  "version": "0.58.2",
   "private": true,
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "node esbuild.config.mjs production",
     "deploy:files": "node scripts/deploy.mjs",
-    "deploy": "npm run build && node scripts/deploy.mjs"
+    "deploy": "pnpm run build && node scripts/deploy.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

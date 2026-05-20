@@ -1,7 +1,8 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type StashpadPlugin from "./main";
-import type { ViewMode } from "./types";
-import { LogModal, ColorPickerModal } from "./modals";
+import { RESERVED_FRONTMATTER, type ViewMode } from "./types";
+import { LogModal, ColorPickerModal, NotificationHistoryModal } from "./modals";
+import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
 import { DEFAULT_STOPWORDS } from "./slug-service";
 import { newId } from "./id-service";
@@ -223,6 +224,15 @@ export interface StashpadSettings {
    *  visible only if there's still work somewhere in its subtree.
    *  Default false. */
   hideCompletedNotes: Record<string, boolean>;
+  /** Notification categories the user has silenced. Empty by default —
+   *  every toast renders. Set per-category by the settings UI (commit
+   *  0.55.5 wires this up). Stored as a string array on disk so future
+   *  categories load gracefully. */
+  mutedNotificationCategories: string[];
+  /** Notification history buffer cap. 0 or negative = unlimited.
+   *  Default 5000. Persisted alongside the live history in
+   *  `<pluginDir>/notifications.json`. */
+  notificationHistoryLimit: number;
   /** Per-folder composer draft text. Stored in the plugin's data.json. */
   drafts: Record<string, string>;
   /** Per-folder: the text most recently sent via Enter, used to suppress
@@ -269,6 +279,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   includeAttachmentsInEverything: {},
   hideChildlessNotes: {},
   hideCompletedNotes: {},
+  mutedNotificationCategories: [],
+  notificationHistoryLimit: 5000,
   drafts: {},
   lastSubmitted: {},
   bindings: buildDefaultBindings(),
@@ -328,6 +340,78 @@ export class StashpadSettingTab extends PluginSettingTab {
           new LogModal(this.app, data, path).open();
         }));
 
+    new Setting(containerEl)
+      .setName("Notification history limit")
+      .setDesc("Maximum number of notifications kept in the persistent history. Set to 0 for unlimited (the file size grows with usage; expect a few hundred KB per ~5000 entries). Default: 5000.")
+      .addText((t) =>
+        t
+          .setValue(String(this.plugin.settings.notificationHistoryLimit ?? 5000))
+          .setPlaceholder("5000")
+          .onChange(async (v) => {
+            const n = parseInt(v, 10);
+            if (!Number.isFinite(n)) return;
+            this.plugin.settings.notificationHistoryLimit = n;
+            this.plugin.notifications.setHistoryLimit(n);
+            await this.plugin.saveSettings();
+          }));
+
+    // Per-category mute settings — collapsed by default to keep the
+    // settings tab scannable. Toggling here updates both
+    // settings.mutedNotificationCategories AND the runtime service
+    // so muting takes effect immediately, no reload required.
+    const muteDetails = containerEl.createEl("details", { cls: "stashpad-notif-mute-details" });
+    muteDetails.createEl("summary", { text: "Mute notification categories" });
+    const muteHelp = muteDetails.createDiv({ cls: "stashpad-notif-mute-help" });
+    muteHelp.setText("Muted categories don't pop toasts but still appear in the history panel so you can review what was suppressed.");
+    const muted = new Set<NotificationCategory>(
+      (this.plugin.settings.mutedNotificationCategories ?? []) as NotificationCategory[],
+    );
+    const categories = Object.keys(CATEGORY_LABELS) as NotificationCategory[];
+    for (const cat of categories) {
+      const meta = CATEGORY_LABELS[cat];
+      new Setting(muteDetails)
+        .setName(meta.label)
+        .setDesc(meta.desc)
+        .addToggle((t) =>
+          t.setValue(!muted.has(cat)).onChange(async (showOn) => {
+            // Toggle reads "show this category" — checked = show, unchecked = mute.
+            const muteOn = !showOn;
+            if (muteOn) muted.add(cat);
+            else muted.delete(cat);
+            this.plugin.settings.mutedNotificationCategories = Array.from(muted);
+            this.plugin.notifications.setMuted(cat, muteOn);
+            await this.plugin.saveSettings();
+          }));
+    }
+
+    new Setting(containerEl)
+      .setName("Notification history")
+      .setDesc("Browse the last 200 toasts. Filter by category. Live-updates as new notifications arrive. Muted categories still appear here so you can review what was suppressed.")
+      .addButton((b) =>
+        b.setButtonText("View notification history").onClick(() => {
+          new NotificationHistoryModal(
+            this.app,
+            this.plugin.notifications,
+            async (folder) => {
+              // Open-log shortcut from inside the history modal. Falls
+              // back to the per-plugin log when no folder is supplied
+              // (the history just hasn't recorded any folder-scoped
+              // entries yet).
+              const adapter = this.app.vault.adapter;
+              const path = this.plugin.pluginPrivatePath("log.jsonl");
+              if (!(await adapter.exists(path))) {
+                new Notice("No log yet — make some changes first.");
+                return;
+              }
+              const data = await adapter.read(path);
+              new LogModal(this.app, data, path).open();
+              void folder;
+            },
+            this.plugin.settings.authorId || null,
+            (id) => this.plugin.lookupNoteAuthorIds(id),
+          ).open();
+        }));
+
     containerEl.createEl("h3", { text: "General" });
 
     new Setting(containerEl)
@@ -372,13 +456,18 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Rebootstrap existing Stashpad folders")
-      .setDesc("Walk every folder that has a home note and create any missing infrastructure (_imports, _exports, drafts file). Safe to run anytime.")
+      .setDesc("Walk every folder that has a home note: ensure infrastructure (_imports, _exports, drafts file), backfill the redundant parentLink + children frontmatter fields, AND rename any note whose filename slug no longer matches its body's first line. Safe to run anytime; skip-if-equal means already-synced notes are no-op writes.")
       .addButton((b) =>
         b.setButtonText("Rebootstrap now").onClick(async () => {
           b.setDisabled(true).setButtonText("Working…");
           try {
-            const { touched } = await this.plugin.rebootstrapAllFolders();
-            new Notice(`Stashpad: rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}.`);
+            const { touched, fmChecked, fmWritten, slugsRenamed } = await this.plugin.rebootstrapAllFolders();
+            const parts: string[] = [];
+            parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
+            if (fmWritten > 0) parts.push(`updated frontmatter on ${fmWritten} of ${fmChecked} notes`);
+            else if (fmChecked > 0) parts.push(`frontmatter already in sync (${fmChecked} notes checked)`);
+            if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"} to match body`);
+            new Notice(`Stashpad: ${parts.join("; ")}.`);
           } catch (e) {
             new Notice(`Stashpad: rebootstrap failed (${(e as Error).message})`);
           } finally {
@@ -827,7 +916,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           return;
         }
         const fm = (this.app.metadataCache.getFileCache(tplFile as any)?.frontmatter ?? {}) as Record<string, any>;
-        const RESERVED = ["id", "parent", "created", "attachments", "position"];
+        const RESERVED = RESERVED_FRONTMATTER;
         const conflicts = RESERVED.filter((k) => {
           const v = fm[k];
           if (v === undefined || v === null) return false;
