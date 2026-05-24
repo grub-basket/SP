@@ -49,13 +49,19 @@ export function startHotkeyRecording(
   opts: { allowSingleKey?: boolean } = { allowSingleKey: true },
 ): () => void {
   const placeholderBefore = input.placeholder;
+  // 0.59.3: stash the prior value so cancel paths (Backspace, blur
+  // without commit) can restore it instead of leaving the input blank.
+  const valueBefore = input.value;
   input.placeholder = "Press a key… (Backspace to cancel)";
   input.value = "";
   input.classList.add("is-recording");
 
+  let committed = false;
   const cleanup = () => {
     input.placeholder = placeholderBefore;
     input.classList.remove("is-recording");
+    // Restore prior value if the user cancelled (didn't commit a chord).
+    if (!committed) input.value = valueBefore;
     input.removeEventListener("keydown", onKeyDown, true);
     input.removeEventListener("blur", onBlur);
   };
@@ -64,6 +70,15 @@ export function startHotkeyRecording(
     // Ignore standalone modifier presses — wait for the actual key.
     if (e.key === "Control" || e.key === "Shift" || e.key === "Alt"
         || e.key === "Meta" || e.key === "OS") return;
+    // 0.59.4: dead-key starters (Option+E on Mac, etc.) report e.key as
+    // "Dead" because the OS is waiting for a follow-up to form a
+    // diacritic. We still want to let the user BIND Option+E — it's a
+    // real chord in a non-typing context — so accept them as long as
+    // e.code resolves to a usable identity (KeyE → "E"). IME compose
+    // states ("Process" / "Unidentified") with no usable code stay
+    // rejected.
+    const codeUsable = !!e.code && (/^Key[A-Z]$/.test(e.code) || /^Digit\d$/.test(e.code));
+    if ((e.key === "Dead" || e.key === "Process" || e.key === "Unidentified") && !codeUsable) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -92,13 +107,14 @@ export function startHotkeyRecording(
     if (e.altKey) parts.push("Alt");
     if (e.shiftKey) parts.push("Shift");
 
-    const key = normalizeKey(e.key);
+    const key = normalizeKey(e.key, e.code);
     if (!key) return;
 
     if (parts.length === 0 && !opts.allowSingleKey) return;
 
     parts.push(key);
     const chord = parts.join("+");
+    committed = true;
     cleanup();
     onCapture(chord);
   };
@@ -110,12 +126,22 @@ export function startHotkeyRecording(
   return cleanup;
 }
 
-/** Normalize KeyboardEvent.key to our chord vocabulary.
- *  - Letters → uppercase.
- *  - Arrow / Enter / etc → keep canonical name.
- *  - Symbols (/, ;, etc) → keep as-is. */
-function normalizeKey(k: string): string {
+/** Normalize KeyboardEvent.key + .code to our chord vocabulary.
+ *  - Letters/digits: derive from .code (KeyF → "F", Digit1 → "1") so
+ *    Mac modifier-induced Unicode substitutions (Option+F → "ƒ") don't
+ *    leak into the saved chord.
+ *  - Named keys (Enter, ArrowUp, etc.): keep .key.
+ *  - Symbols (/, ;, etc.): keep .key as-is. */
+function normalizeKey(k: string, code?: string): string {
   if (!k) return "";
+  // .code-based mapping for letters and digits — robust to Alt/Option
+  // dead-key transformations and other modifier-induced glyph changes.
+  if (code) {
+    const m = /^Key([A-Z])$/.exec(code);
+    if (m) return m[1];
+    const d = /^Digit(\d)$/.exec(code);
+    if (d) return d[1];
+  }
   if (k.length === 1) {
     return k.toUpperCase();
   }

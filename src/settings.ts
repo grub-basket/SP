@@ -33,7 +33,7 @@ export interface ModShortcuts {
   moveToTop: string;        // "Mod+Shift+ArrowUp"
   moveToBottom: string;     // "Mod+Shift+ArrowDown"
   outdent: string;          // "Mod+[" — re-parent selection to its grandparent
-  setColor: string;         // "Shift+;" — open color picker for selection
+  setColor: string;         // "Shift+:" — open color picker for selection
 }
 
 /** All keyboard-bindable commands, in display order. The labels and
@@ -47,7 +47,7 @@ export type CommandId =
   | "clone" | "insertTemplate"
   | "toggleExpand"
   | "exportStash" | "importStash" | "pickFolder"
-  | "cloneStashpadTab";
+  | "cloneStashpadTab" | "selectAll";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
  *  When BOTH are set, `preferRight` decides which actually fires. */
@@ -55,6 +55,11 @@ export interface CommandBinding {
   primary: string;
   secondary: string;
   preferRight: boolean;
+  /** When true, BOTH `primary` and `secondary` fire — `preferRight` is
+   *  ignored. Lets users bind two simultaneously-active chords for a
+   *  command (e.g. "Mod+Enter" + "T") instead of having to pick one.
+   *  0.59.1. */
+  useBoth?: boolean;
 }
 export type CommandBindingMap = Record<CommandId, CommandBinding>;
 
@@ -89,7 +94,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "moveToTop",       label: "Move note to top",              desc: "Default: Mod+Shift+ArrowUp",                                                              defaultPrimary: "Mod+Shift+ArrowUp" },
   { id: "moveToBottom",    label: "Move note to bottom",           desc: "Default: Mod+Shift+ArrowDown",                                                            defaultPrimary: "Mod+Shift+ArrowDown" },
   { id: "outdent",         label: "Outdent (move to grandparent)", desc: "Default: Mod+[ — re-parents the selection one level up.",                                defaultPrimary: "Mod+[" },
-  { id: "setColor",        label: "Set note color",                desc: "Default: Shift+; — open the color picker for the selection.",                              defaultPrimary: "Shift+;" },
+  { id: "setColor",        label: "Set note color",                desc: "Default: Shift+: — open the color picker for the selection.",                              defaultPrimary: "Shift+:" },
   { id: "clone",           label: "Clone (duplicate / copy) selection", desc: "Default: Mod+Shift+D — clone selected notes (with their subtrees) as siblings.",   defaultPrimary: "Mod+Shift+D" },
   { id: "insertTemplate",  label: "Insert template (clone an existing note)", desc: "Pick any note in this Stashpad; clone it (with subtree + attachments) into the current view, retimestamped.", defaultPrimary: "" },
   { id: "toggleExpand",    label: "Show more / show less (expand toggle)", desc: "Default: Shift+? — toggle the clamp on the cursor row (or every selected row).", defaultPrimary: "Shift+?" },
@@ -97,6 +102,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "importStash",     label: "Import .stash file",            desc: "Open the .stash bundle picker and import its notes into this Stashpad.",                  defaultPrimary: "" },
   { id: "pickFolder",      label: "Switch this Stashpad tab to another folder", desc: "Open the folder picker so this tab shows a different Stashpad.",            defaultPrimary: "" },
   { id: "cloneStashpadTab",label: "Clone (duplicate / copy) this Stashpad tab", desc: "Open a second tab on the same folder + focus, mirroring the \"copy\" button in the focused-header actions.", defaultPrimary: "" },
+  { id: "selectAll",       label: "Select all notes in view",      desc: "Default: Mod+A — adds every visible row to the selection.",                              defaultPrimary: "Mod+A" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -241,7 +247,7 @@ export interface StashpadSettings {
 }
 
 export const DEFAULT_SETTINGS: StashpadSettings = {
-  folder: "stashpad",
+  folder: "Stashpad",
   importDropFolder: "_imports",
   exportFolder: "_exports",
   useTemplatesFormat: false,
@@ -263,7 +269,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
     moveUp: "Mod+ArrowUp", moveDown: "Mod+ArrowDown",
     moveToTop: "Mod+Shift+ArrowUp", moveToBottom: "Mod+Shift+ArrowDown",
     outdent: "Mod+[",
-    setColor: "Shift+;",
+    setColor: "Shift+:",
   },
   customPalette: [],
   colorAliases: {},
@@ -418,7 +424,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       .setName("Stashpad notes folder")
       .setDesc("Vault-relative folder where Stashpad stores its notes and attachments. Created on demand.")
       .addText((t) =>
-        t.setValue(this.plugin.settings.folder).setPlaceholder("stashpad").onChange(async (v) => {
+        t.setValue(this.plugin.settings.folder).setPlaceholder("Stashpad").onChange(async (v) => {
           const cleaned = (v || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.folder;
           const last = cleaned.split("/").filter(Boolean).pop() ?? "";
           const reserved = new Set([
@@ -702,7 +708,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       if (allHexes.size === 0) {
         list.createEl("p", {
           cls: "setting-item-description",
-          text: `No colors used or aliased in "${chosen}" yet. Set a per-note color (Shift+; or right-click → Set color) and it'll appear here.`,
+          text: `No colors used or aliased in "${chosen}" yet. Set a per-note color (Shift+: or right-click → Set color) and it'll appear here.`,
         });
         return;
       }
@@ -1094,10 +1100,17 @@ export class StashpadSettingTab extends PluginSettingTab {
       input.placeholder = "Click & press a key";
       input.value = prettifyChord(get()[which]);
       input.classList.add("stashpad-binding-input");
+      // 0.59.3: belt-and-suspenders auto-resize fallback for the CSS
+      // `field-sizing: content` — sync the `size` attribute to the
+      // current value's length on every update so even older Electron
+      // builds without field-sizing support still grow with content.
+      const syncSize = () => { input.size = Math.max(3, input.value.length || input.placeholder.length); };
+      syncSize();
       input.onclick = () => {
         startHotkeyRecording(input, async (chord) => {
           this.plugin.settings.bindings[meta.id][which] = chord;
           input.value = prettifyChord(chord);
+          syncSize();
           await this.plugin.saveSettings();
           refreshToggle();
         });
@@ -1107,6 +1120,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       clearBtn.onclick = async () => {
         this.plugin.settings.bindings[meta.id][which] = "";
         input.value = "";
+        syncSize();
         await this.plugin.saveSettings();
         refreshToggle();
       };
@@ -1125,17 +1139,37 @@ export class StashpadSettingTab extends PluginSettingTab {
     pill.setAttribute("tabindex", "0");
     const knob = pill.createDiv({ cls: "stashpad-binding-pill-knob" });
 
+    // 0.59.1: "Use both" checkbox — when checked, both bindings fire and
+    // the L/R pill becomes a no-op (visually greyed). Only meaningful
+    // when both slots are filled.
+    const bothWrap = row.controlEl.createDiv({ cls: "stashpad-binding-useboth" });
+    const bothCb = bothWrap.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    bothCb.title = "Use both bindings simultaneously (overrides the L/R toggle)";
+    bothWrap.createSpan({ text: "Use both" });
+    bothCb.onchange = async () => {
+      this.plugin.settings.bindings[meta.id].useBoth = bothCb.checked;
+      await this.plugin.saveSettings();
+      refreshToggle();
+    };
+
     refreshToggle = (): void => {
       const b = get();
       const both = !!(b.primary && b.secondary);
-      pill.toggleClass("is-disabled", !both);
+      bothCb.checked = !!b.useBoth;
+      bothCb.disabled = !both;
+      bothWrap.toggleClass("is-disabled", !both);
+      const useBoth = !!b.useBoth && both;
+      // L/R pill: disabled when fewer than two slots OR when useBoth wins.
+      pill.toggleClass("is-disabled", !both || useBoth);
       pill.toggleClass("is-right", b.preferRight);
       pill.setAttribute("aria-checked", String(b.preferRight));
-      pill.setAttribute("aria-disabled", String(!both));
+      pill.setAttribute("aria-disabled", String(!both || useBoth));
       knob.setText(b.preferRight ? "R" : "L");
-      pill.title = both
-        ? (b.preferRight ? "Right slot active — click for left" : "Left slot active — click for right")
-        : "Set both slots to enable the toggle";
+      pill.title = !both
+        ? "Set both slots to enable the toggle"
+        : useBoth
+          ? "Overridden by \"Use both\""
+          : (b.preferRight ? "Right slot active — click for left" : "Left slot active — click for right");
     };
 
     const flip = async () => {

@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { Menu, Notice, Platform, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { STASHPAD_VIEW_TYPE } from "./types";
 import { StashpadView } from "./view";
 import {
@@ -496,7 +496,29 @@ export default class StashpadPlugin extends Plugin {
     setTimeout(refreshGeometry, 250);
     setTimeout(refreshGeometry, 1000);
 
-    this.addRibbonIcon("list-tree", "Open Stashpad", () => void this.activateView({ reveal: true }));
+    // 0.60.0: smarter ribbon icon.
+    //  - Click w/ 0 leaves open  → open default in a new tab.
+    //  - Click w/ 1 leaf open    → reveal it.
+    //  - Click w/ 2+ leaves open → menu listing each leaf to reveal,
+    //                              plus every discovered Stashpad folder
+    //                              that isn't currently open (opens new
+    //                              tab on click), plus "Switch folder…"
+    //                              entry for the full picker.
+    //  - Right-click             → same menu unconditionally (so the
+    //                              user can reach the folder switcher
+    //                              even with only one tab open).
+    const ribbon = this.addRibbonIcon("list-tree", "Open Stashpad", (evt) => {
+      const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
+      if (leaves.length >= 2) {
+        this.showRibbonMenu(evt as MouseEvent);
+        return;
+      }
+      void this.activateView({ reveal: true });
+    });
+    ribbon.addEventListener("contextmenu", (evt) => {
+      evt.preventDefault();
+      this.showRibbonMenu(evt as MouseEvent);
+    });
 
     this.addCommand({
       id: "stashpad-open",
@@ -595,6 +617,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-pick-move", name: "Move (in-list, arrow + Enter)", callback: () => call("cmdInListPicker") });
     this.addCommand({ id: "stashpad-open-in-new-tab", name: "Open in new Stashpad tab", callback: () => call("cmdOpenInNewStashpadTab") });
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
+    this.addCommand({ id: "stashpad-select-all", name: "Select all visible notes", callback: () => call("cmdSelectAll") });
     // Mirror of the "copy" / duplicate button in the focused-header
     // actions cluster. Three synonyms in the name for fuzzy lookup.
     this.addCommand({ id: "stashpad-clone-tab", name: "Clone (duplicate / copy) this Stashpad tab", callback: () => call("cmdCloneStashpadTab") });
@@ -1106,6 +1129,67 @@ export default class StashpadPlugin extends Plugin {
       }
     }
     return renamed;
+  }
+
+  /** Ribbon-icon quick menu — built from the open Stashpad leaves +
+   *  the discovered Stashpad folders. Picked entries either reveal an
+   *  existing leaf (for currently-open folders) or open a new tab on
+   *  the picked folder. A "Switch folder…" trailing entry opens the
+   *  full picker for create-or-rare-folder cases. 0.60.0. */
+  private showRibbonMenu(evt: MouseEvent): void {
+    const menu = new Menu();
+    const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
+    // Per-leaf entries: reveal an existing tab. Title is the folder the
+    // leaf is targeting, falling back to the plugin default.
+    const folderForLeaf = (leaf: WorkspaceLeaf): string => {
+      const state = leaf.getViewState();
+      const fOverride = (state.state as any)?.folderOverride;
+      if (typeof fOverride === "string" && fOverride.trim()) {
+        return fOverride.trim().replace(/^\/+|\/+$/g, "");
+      }
+      return (this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "");
+    };
+    const seenFolders = new Set<string>();
+    if (leaves.length > 0) {
+      for (const leaf of leaves) {
+        const f = folderForLeaf(leaf);
+        seenFolders.add(f);
+        const label = f.split("/").pop() || f;
+        menu.addItem((it: any) => it
+          .setTitle(`Reveal "${label}" tab`)
+          .setIcon("layout-grid")
+          .onClick(() => this.app.workspace.revealLeaf(leaf)));
+      }
+      menu.addSeparator();
+    }
+    // Per-folder entries for Stashpad folders NOT currently open as
+    // their own tab — open a new tab on that folder.
+    const allFolders = this.discoverStashpadFolders().filter((f) => !seenFolders.has(f));
+    for (const folder of allFolders) {
+      const label = folder.split("/").pop() || folder;
+      menu.addItem((it: any) => it
+        .setTitle(`Open "${label}" in new tab`)
+        .setIcon("layout-template")
+        .onClick(() => void this.activateViewForFolder(folder)));
+    }
+    if (allFolders.length > 0) menu.addSeparator();
+    // Trailing entry: open the full folder picker on the active leaf
+    // (or a fresh one if there isn't one). Picker handles create-new-
+    // folder + arbitrary-vault-path cases the discovered list can't.
+    menu.addItem((it: any) => it
+      .setTitle("Switch folder…")
+      .setIcon("folder-search")
+      .onClick(async () => {
+        // Reveal an existing leaf first so its picker has the right
+        // origin; create one if none exists.
+        if (leaves.length === 0) await this.activateView({ reveal: true });
+        else this.app.workspace.revealLeaf(leaves[0]);
+        const v = getActiveView();
+        if (v && typeof (v as any).cmdOpenFolderPicker === "function") {
+          (v as any).cmdOpenFolderPicker();
+        }
+      }));
+    menu.showAtMouseEvent(evt);
   }
 
   async activateView(opts: { reveal: boolean } = { reveal: true }): Promise<void> {

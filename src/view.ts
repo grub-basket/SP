@@ -100,7 +100,7 @@ export class StashpadView extends ItemView {
   /** Active color filter — null means show everything; otherwise the
    *  hex string (e.g. "#E07A78") that visible notes must carry. */
   private colorFilter: string | null = null;
-  private noteFolder = "stashpad";
+  private noteFolder = "Stashpad";
   private folderOverride: string | null = null;
   private detachTreeHook: (() => void) | null = null;
   private detachSettings: (() => void) | null = null;
@@ -539,9 +539,9 @@ export class StashpadView extends ItemView {
     }
     // Resolve noteFolder immediately so getDisplayText() reflects the right folder
     // even before onOpen() has run (Obsidian queries it during view restore).
-    const settingsFolder = (this.plugin?.settings?.folder ?? "stashpad").trim().replace(/^\/+|\/+$/g, "");
+    const settingsFolder = (this.plugin?.settings?.folder ?? "Stashpad").trim().replace(/^\/+|\/+$/g, "");
     const overrideFolder = this.folderOverride?.trim().replace(/^\/+|\/+$/g, "") || null;
-    this.noteFolder = overrideFolder || settingsFolder || "stashpad";
+    this.noteFolder = overrideFolder || settingsFolder || "Stashpad";
     await super.setState(state, result);
     this.refreshHeaderTitle();
     // If the view is already mounted, refresh now that state has changed.
@@ -579,9 +579,9 @@ export class StashpadView extends ItemView {
   focus(): void { this.viewRoot?.focus({ preventScroll: true }); }
 
   private loadConfig(): void {
-    const settingsFolder = (this.plugin?.settings?.folder ?? "stashpad").trim().replace(/^\/+|\/+$/g, "");
+    const settingsFolder = (this.plugin?.settings?.folder ?? "Stashpad").trim().replace(/^\/+|\/+$/g, "");
     const overrideFolder = this.folderOverride?.trim().replace(/^\/+|\/+$/g, "") || null;
-    const folder = overrideFolder || settingsFolder || "stashpad";
+    const folder = overrideFolder || settingsFolder || "Stashpad";
     if (folder !== this.noteFolder) {
       this.noteFolder = folder;
       this.tree.rebuild(this.noteFolder);
@@ -642,16 +642,19 @@ export class StashpadView extends ItemView {
     // below still lets users type any path to create a fresh folder.
     const stashpadFolders = this.plugin.discoverStashpadFolders();
     const allVaultFolders = this.listVaultFolders();
-    const settingsFolder = (this.plugin.settings.folder || "stashpad").trim().replace(/^\/+|\/+$/g, "") || "stashpad";
+    const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
     type Item = { kind: "default" | "folder" | "create"; folder: string; label: string };
     // Always include the settings default even if it has no notes (it's
     // where freshly-created notes go).
     const folderSet = new Set(stashpadFolders);
     if (settingsFolder) folderSet.delete(settingsFolder);
     const folders = [...folderSet].sort((a, b) => a.localeCompare(b));
+    // 0.59.2: title-case folder labels so a legacy lowercase "stashpad"
+    // setting still reads as "Stashpad" in the picker. Stored value is
+    // untouched — purely a display polish.
     const baseItems: Item[] = [
-      { kind: "default", folder: settingsFolder, label: `Use plugin default — ${settingsFolder}` },
-      ...folders.map((f) => ({ kind: "folder" as const, folder: f, label: f })),
+      { kind: "default", folder: settingsFolder, label: `Use plugin default — ${properCaseFolderPath(settingsFolder)}` },
+      ...folders.map((f) => ({ kind: "folder" as const, folder: f, label: properCaseFolderPath(f) })),
     ];
     const view = this;
     const modal = new (class extends SuggestModal<Item> {
@@ -1682,7 +1685,19 @@ export class StashpadView extends ItemView {
           // Anchor restore (id + viewport offset of topmost row) keeps the
           // same row at the same on-screen position even when rows above
           // change height. Composer submit's pin-bottom flag wins when set.
+          // 0.59.5: when the user was at the bottom (within 12px), pin to
+          // the new bottom instead of anchor-restoring. Otherwise mutating
+          // a near-bottom row (color border thickness change, completed
+          // strikethrough wrap, hide-completed making it disappear) shifts
+          // the anchor row's offset and the view jitters.
           if (legacyPinBottom) {
+            this.scrollListToBottom();
+          } else if (prevAtBottom) {
+            // 0.59.6: use scrollListToBottom (with its multi-frame
+            // settle watchdog) instead of a one-shot scrollTop set.
+            // The async markdown re-render of the just-mutated row
+            // shifts the row height a few hundred ms later; the
+            // watchdog keeps re-pinning until layout stabilises.
             this.scrollListToBottom();
           } else {
             this.restoreScrollAnchor(anchor, prevScroll);
@@ -1840,7 +1855,7 @@ export class StashpadView extends ItemView {
     // Folder switcher
     const folderBtn = bar.createEl("button", { cls: "stashpad-folder-btn" });
     const isOverride = !!this.folderOverride;
-    const displayName = (this.noteFolder.split("/").pop() || this.noteFolder) || "stashpad";
+    const displayName = (this.noteFolder.split("/").pop() || this.noteFolder) || "Stashpad";
     setIcon(folderBtn.createSpan({ cls: "stashpad-btn-icon" }), "folder");
     folderBtn.createSpan({ text: displayName, cls: "stashpad-btn-text" });
     folderBtn.title = isOverride
@@ -2760,6 +2775,15 @@ export class StashpadView extends ItemView {
     if (Platform.isMobile) {
       const homeEl = bar.querySelector(".stashpad-crumb-home") as HTMLElement | null;
       if (homeEl) this.attachLongPress(homeEl, () => this.openCrumbMenu(null, ROOT_ID));
+    }
+    // 0.59.0: children count chip at the end of the breadcrumb. Counts
+    // immediate children of the focus from the tree (unfiltered) so the
+    // number reflects the parent's actual subtree size, not the
+    // currently-visible filtered slice.
+    const childCount = this.tree.getChildren(this.focusId).length;
+    if (childCount > 0) {
+      bar.createSpan({ cls: "stashpad-crumb-count", text: `· ${childCount}` })
+        .title = `${childCount} direct child${childCount === 1 ? "" : "ren"}`;
     }
   }
 
@@ -3964,6 +3988,8 @@ export class StashpadView extends ItemView {
     if (matchBinding(e, b.moveDown)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdMoveDown(); return; }
     if (matchBinding(e, b.outdent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdOutdent(); return; }
     if (matchBinding(e, b.setColor)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetColor(); return; }
+    // 0.59.0: select all visible notes.
+    if (matchBinding(e, b.selectAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSelectAll(); return; }
 
     // Stashpad undo/redo when focus is on the view (not the composer).
     if (matchBinding(e, b.undo)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdUndo(); return; }
@@ -4328,8 +4354,12 @@ export class StashpadView extends ItemView {
       seed,
       palette,
       async (color, opts) => {
+        // 0.59.0: capture prior color per target so we can undo. null
+        // (or absent) means "no color set."
+        const priors: { id: StashpadId; path: string; was: string | null }[] = [];
         for (const t of targets) {
           if (!t.file) continue;
+          priors.push({ id: t.id, path: t.file.path, was: this.colorForNode(t) ?? null });
           try {
             await this.app.fileManager.processFrontMatter(t.file, (fm) => {
               if (color) fm.color = color;
@@ -4351,6 +4381,30 @@ export class StashpadView extends ItemView {
           }
         }
         this.render();
+        // 0.59.0: push an undo entry so the user can reverse a color
+        // change with Cmd+Z. Restores each target's prior color (or
+        // removes the color frontmatter entirely if there was none).
+        const undoFolder = this.noteFolder;
+        const newColor = color;
+        const applyColors = async (mapping: { path: string; col: string | null }[]) => {
+          for (const m of mapping) {
+            const file = this.app.vault.getAbstractFileByPath(m.path) as TFile | null;
+            if (!file) continue;
+            try {
+              await this.app.fileManager.processFrontMatter(file, (fm) => {
+                if (m.col) fm.color = m.col;
+                else delete fm.color;
+              });
+            } catch {}
+          }
+          this.tree.rebuild(undoFolder);
+          this.render();
+        };
+        this.plugin.getUndoStack(undoFolder).push({
+          label: priors.length === 1 ? "Color change" : `Color change (${priors.length})`,
+          undo: () => applyColors(priors.map((p) => ({ path: p.path, col: p.was }))),
+          redo: () => applyColors(priors.map((p) => ({ path: p.path, col: newColor }))),
+        });
       },
       async (color) => {
         // Delete a saved custom color from the palette.
@@ -4488,12 +4542,24 @@ export class StashpadView extends ItemView {
     const titleSummary = crossMovedNodes.length > 0
       ? this.titleList(crossMovedNodes)
       : `${sources.length} note${sources.length === 1 ? "" : "s"}`;
+    // 0.59.0: cross-folder move notice gets a Jump-to-destination action
+    // (intra-folder moves already had one). Action switches THIS view
+    // to the target folder + navigates to the new parent (or Home when
+    // the new parent is ROOT_ID).
+    const folderTag = targetDir.split("/").pop() || targetDir;
+    const destLabel = newParentId === ROOT_ID
+      ? `Jump to Home — ${folderTag}`
+      : `Jump to "${folderTag}" parent`;
     this.plugin.notifications.show({
       message: `Moved ${titleSummary} → \`${targetDir}\``,
       kind: "success",
       category: "move",
       affectedIds: sources.map((s) => s.id),
       folder: this.noteFolder,
+      actions: [{
+        label: destLabel,
+        onClick: () => { void this.switchToFolderAndFocus(targetDir, newParentId); },
+      }],
     });
 
     // Undo: reverse every rename + restore root parent ids. Stored on
@@ -5233,12 +5299,12 @@ export class StashpadView extends ItemView {
    *  Sanitises to alnum + dash + underscore so the filename is safe on
    *  every filesystem. */
   private buildHomeFilename(folder: string): string {
-    const lastSeg = folder.split("/").filter(Boolean).pop() ?? "stashpad";
+    const lastSeg = folder.split("/").filter(Boolean).pop() ?? "Stashpad";
     const slug = lastSeg
       .replace(/[^A-Za-z0-9_-]+/g, "-")
       .replace(/-+/g, "-")
       .replace(/^-+|-+$/g, "");
-    return `Home-${slug || "stashpad"}.md`;
+    return `Home-${slug || "Stashpad"}.md`;
   }
   private async migrateNullParents(): Promise<void> {
     const folder = this.noteFolder;
@@ -5306,7 +5372,7 @@ export class StashpadView extends ItemView {
   private async openFolderInNewTab(folder: string): Promise<void> {
     const cleaned = (folder || "").trim().replace(/^\/+|\/+$/g, "");
     if (!cleaned) return;
-    const settingsFolder = (this.plugin.settings.folder || "stashpad").trim().replace(/^\/+|\/+$/g, "") || "stashpad";
+    const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
     const ws = this.app.workspace;
     const originLeaf = this.leaf;
     const leaf = ws.getLeaf("tab");
@@ -5426,6 +5492,17 @@ export class StashpadView extends ItemView {
   /** T key. Opens the cursor row (or focused note) in a new Stashpad tab focused on it. */
   /** Mod+Enter: toggle the "completed" frontmatter flag on selected/cursor/focused notes.
    *  When true, the row body renders with a strikethrough. */
+  /** Add every visible note to the selection. Default Mod+A. 0.59.0. */
+  cmdSelectAll(): void {
+    if (this.currentChildren.length === 0) return;
+    this.selection.clear();
+    for (const n of this.currentChildren) this.selection.add(n.id);
+    this.firstSelectedId = this.currentChildren[0].id;
+    this.lastSelected = this.currentChildren[this.currentChildren.length - 1].id;
+    this.cursorIdx = this.currentChildren.length - 1;
+    this.render();
+  }
+
   async cmdToggleComplete(): Promise<void> {
     let targets = this.getActionTargets();
     if (targets.length === 0) {
@@ -6468,7 +6545,13 @@ export class StashpadView extends ItemView {
         sourceFolder: this.noteFolder,
       });
       const stamp = (moment as any)().format("YYYYMMDD-HHmmss");
-      const baseName = roots.length === 1 ? this.titleForNode(roots[0]) : `stashpad-${roots.length}notes`;
+      // 0.59.0: multi-note exports include the source folder name so the
+      // exported filename tells you where it came from. Single-note
+      // exports still use the note's title since it's already unique.
+      const folderTag = (this.noteFolder.split("/").pop() || this.noteFolder).trim();
+      const baseName = roots.length === 1
+        ? this.titleForNode(roots[0])
+        : `${folderTag}-${roots.length}notes`;
       const safe = baseName.replace(/[^\w.\-]+/g, "_").slice(0, 60) || "stash-export";
       const exportSub = (this.plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
       const exportFolder = `${this.noteFolder}/${exportSub}`;
@@ -6487,6 +6570,11 @@ export class StashpadView extends ItemView {
         affectedPaths: [outPath],
         folder: this.noteFolder,
         actions: this.actionsForFile(outPath),
+        // 0.59.0: export toast stays open until user dismisses. With
+        // keepOpen:true on the file actions, the user often wants to
+        // click Reveal, glance, come back, and click Show in OS. The
+        // 4s auto-dismiss was cutting that flow short.
+        duration: 0,
       });
     } catch (e) {
       this.plugin.notifications.show({
@@ -7165,7 +7253,14 @@ export class StashpadView extends ItemView {
       void this.cmdClone();
     }));
     menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
-    menu.addItem((it: any) => it.setTitle("Export to .stash").setIcon("package").onClick(() => void this.cmdExportStash(node)));
+    menu.addItem((it: any) => it.setTitle("Export to .stash").setIcon("package").onClick(() => {
+      // Multi-select normalisation (matches Clone / Delete / Set color):
+      // if the right-clicked row isn't in the selection, treat the
+      // right-click as a single-target action. Otherwise honour the
+      // full selection.
+      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      void this.cmdExportStash();
+    }));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => this.cmdMovePicker()));
     menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => { await this.changeParent(node, ROOT_ID); }));
@@ -7498,10 +7593,12 @@ function matchChord(e: KeyboardEvent, chord: string): boolean {
 
 /** Match a CommandBinding against the event, honoring preferRight when both
  *  primary and secondary are set. */
-export function matchBinding(e: KeyboardEvent, b?: { primary: string; secondary: string; preferRight: boolean }): boolean {
+export function matchBinding(e: KeyboardEvent, b?: { primary: string; secondary: string; preferRight: boolean; useBoth?: boolean }): boolean {
   if (!b) return false;
-  const { primary, secondary, preferRight } = b;
+  const { primary, secondary, preferRight, useBoth } = b;
   if (primary && secondary) {
+    // 0.59.1: useBoth overrides preferRight — both chords are active.
+    if (useBoth) return matchChord(e, primary) || matchChord(e, secondary);
     return preferRight ? matchChord(e, secondary) : matchChord(e, primary);
   }
   return matchChord(e, primary) || matchChord(e, secondary);

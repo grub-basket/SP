@@ -12,24 +12,18 @@ export function bodyToSlug(body: string, stopwords: string[] = DEFAULT_STOPWORDS
   const stopSet = stopwords instanceof Set ? stopwords : new Set(stopwords.map((s) => s.toLowerCase()));
   const firstLine = (body.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
   if (!firstLine) return "Untitled";
-  // Lowercase only for the stop-word filter; the emitted slug is Proper-Cased
-  // so Obsidian's title display reads naturally ("My First Note" not
-  // "my first note").
-  // Strip common English contraction tails BEFORE removing punctuation,
-  // so "Stash's" becomes "Stash" (not "Stash s") and we don't end up with
-  // an orphan "s" segment in the slug. The character class covers ASCII
-  // ', unicode right single quote U+2019, modifier letter apostrophe
-  // U+02BC, and the common smart-quote variants U+2018/201A/201B.
-  const cleaned = firstLine.replace(/['‘-‛ʼ](s|t|re|ll|ve|d|m)\b/gi, "");
-  // Set of contraction tails to drop if they survive as bare tokens
-  // (because the apostrophe was an exotic variant we missed). Without
-  // this, "I'm falling asleep" → "M Falling Asleep" when the right-single-
-  // quote stripper missed.
-  const CONTRACTION_TAILS = new Set(["s", "t", "re", "ll", "ve", "d", "m"]);
-  const words = cleaned
+  // Simplified slug rule (0.59.0): strip apostrophe-likes WITHOUT
+  // splitting the word ("don't" → "dont", not "don t" or "Don"), then
+  // collapse every other non-alphanumeric run to a space, tokenise,
+  // drop stopwords, proper-case, join with hyphens. Earlier rule
+  // specially handled English contraction tails and over-aggressively
+  // dropped the second half — losing "t" off "don't" to leave "Don".
+  // Apostrophe class covers ASCII ', U+2019, U+02BC, U+2018, U+201A, U+201B.
+  const noQuotes = firstLine.replace(/['‘-‛ʼ]/g, "");
+  const words = noQuotes
     .replace(/[^A-Za-z0-9\s]+/g, " ")
     .split(/\s+/)
-    .filter((w) => w && !stopSet.has(w.toLowerCase()) && !CONTRACTION_TAILS.has(w.toLowerCase()))
+    .filter((w) => w && !stopSet.has(w.toLowerCase()))
     .map((w) => {
       // Smart proper-case: preserve all-caps tokens (HCC, NASA, US, etc.)
       // so acronyms don't read as "Hcc". A token counts as all-caps if

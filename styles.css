@@ -716,6 +716,12 @@
 .stashpad-crumb-ellipsis { cursor: help; flex: 0 0 auto; max-width: none; }
 .stashpad-crumb-ellipsis:hover { text-decoration: none; }
 .stashpad-crumb-sep { color: var(--text-faint); flex: 0 0 auto; }
+.stashpad-crumb-count {
+  color: var(--text-faint);
+  font-size: 0.85em;
+  margin-left: 6px;
+  flex: 0 0 auto;
+}
 
 /* Focused header — laid out exactly like a list row: 3 columns of
    [meta | body | actions]. The meta column carries the timestamp +
@@ -1851,10 +1857,31 @@
   margin-right: 6px;
 }
 .stashpad-binding-input {
-  width: 11ch;
+  /* 0.59.3: real auto-grow. Drop the 14ch floor — single-char chords
+     ("M", "T") should be narrow; longer chords ("Mod+Shift+ArrowDown")
+     stretch to fit. `field-sizing: content` (Chrome 123+, which
+     Obsidian's Electron meets) does the resizing. The JS fallback in
+     settings.ts also sets `.size` on every value change for older
+     Electron builds. */
+  min-width: 3ch;
+  max-width: 28ch;
+  field-sizing: content;
+  width: auto;
   text-align: center;
   font-family: var(--font-monospace);
   cursor: pointer;
+}
+.stashpad-binding-useboth {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 8px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+}
+.stashpad-binding-useboth.is-disabled {
+  opacity: 0.45;
+  pointer-events: none;
 }
 .stashpad-binding-input.is-recording {
   background: var(--background-modifier-active-hover);
