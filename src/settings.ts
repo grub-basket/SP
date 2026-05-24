@@ -47,7 +47,7 @@ export type CommandId =
   | "clone" | "insertTemplate"
   | "toggleExpand"
   | "exportStash" | "importStash" | "pickFolder"
-  | "cloneStashpadTab" | "selectAll";
+  | "cloneStashpadTab" | "selectAll" | "copyCodeBlock";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
  *  When BOTH are set, `preferRight` decides which actually fires. */
@@ -103,6 +103,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "pickFolder",      label: "Switch this Stashpad tab to another folder", desc: "Open the folder picker so this tab shows a different Stashpad.",            defaultPrimary: "" },
   { id: "cloneStashpadTab",label: "Clone (duplicate / copy) this Stashpad tab", desc: "Open a second tab on the same folder + focus, mirroring the \"copy\" button in the focused-header actions.", defaultPrimary: "" },
   { id: "selectAll",       label: "Select all notes in view",      desc: "Default: Mod+A — adds every visible row to the selection.",                              defaultPrimary: "Mod+A" },
+  { id: "copyCodeBlock",   label: "Copy code from codeblock",      desc: "Default: { — copy the contents of the cursor row's first codeblock (or pick one when multiple exist).", defaultPrimary: "{" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -138,6 +139,11 @@ export interface StashpadSettings {
    *  Enter-submit so you can keep typing the next note. Off = focus stays
    *  in the list so arrow-keys keep working without an extra click. */
   autofocusComposerAfterSend: boolean;
+  /** When true (default), the "open in new window" button duplicates
+   *  the current tab into the popout window (original stays open in the
+   *  main window). When false, the leaf is moved — the original tab
+   *  closes. 0.61.3. */
+  popoutDuplicates: boolean;
   /** Mobile-only: hide Obsidian's mobile toolbar (the floating bar above
    *  the keyboard) while a Stashpad view is the active leaf. Stashpad's
    *  composer doesn't need it and it covers the input on smaller screens.
@@ -257,6 +263,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   confirmBulkDelete: true,
   confirmAttachmentDelete: true,
   autofocusComposerAfterSend: true,
+  popoutDuplicates: true,
   hideMobileToolbarInStashpad: true,
   slugStopWords: [],  // empty → DEFAULT_STOPWORDS used at runtime
   searchIncludedFolders: [],
@@ -325,11 +332,10 @@ export class StashpadSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Stashpad", cls: "stashpad-settings-title" });
 
-    // Authorship sits at the top — useful even for solo users who may
-    // collaborate later (their notes already carry attribution from
-    // day one if their name is set).
-    this.renderAuthorshipSection(containerEl);
-
+    // 0.62.4: Log section promoted to the top of settings — diagnostic
+    // shortcuts (log file, notification history) are usually what
+    // people open Settings for, and burying them below Authorship +
+    // General was a tax. Authorship + the rest follow.
     containerEl.createEl("h3", { text: "Log" });
     new Setting(containerEl)
       .setName("Open log file")
@@ -417,6 +423,9 @@ export class StashpadSettingTab extends PluginSettingTab {
             (id) => this.plugin.lookupNoteAuthorIds(id),
           ).open();
         }));
+
+    // Authorship reinserted between Log and General per 0.62.4.
+    this.renderAuthorshipSection(containerEl);
 
     containerEl.createEl("h3", { text: "General" });
 
@@ -634,6 +643,15 @@ export class StashpadSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.autofocusComposerAfterSend).onChange(async (v) => {
           this.plugin.settings.autofocusComposerAfterSend = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName("Open in new window — duplicate tab")
+      .setDesc("ON: the new-window button (in the time-filter row) duplicates the current Stashpad tab — original stays open in the main window. OFF: the leaf is MOVED to the new window, closing the original tab.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.popoutDuplicates).onChange(async (v) => {
+          this.plugin.settings.popoutDuplicates = v;
           await this.plugin.saveSettings();
         }));
 

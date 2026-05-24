@@ -2219,3 +2219,227 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* 0.61.1: tiny mode — minimal popout shell. */
+.stashpad-tiny-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: 0.85em;
+}
+.stashpad-tiny-title {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.stashpad-tiny-sticky {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.85em;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+}
+.stashpad-tiny-sticky input[type="checkbox"] { margin-right: 0; }
+.stashpad-tiny-expand {
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  line-height: 1;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.stashpad-tiny-expand:hover {
+  background: var(--background-modifier-hover);
+}
+
+/* 0.61.2: tiny-mode header icon + view-mode buttons in the time filter row. */
+.stashpad-tiny-title-icon {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  color: var(--text-faint);
+}
+.stashpad-tiny-title-icon svg { width: 14px; height: 14px; }
+
+.stashpad-view-mode-btns {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  /* 0.61.13: tighten gap to the time-filter buttons. Was 8px, now 2px
+     so the three view-mode buttons read as part of the same control
+     cluster rather than a separated trailing group. */
+  margin-left: 2px;
+}
+.stashpad-view-mode-btn {
+  /* Match the time-filter button's metrics so the row reads uniformly.
+     Icon-only → square aspect via aspect-ratio + matching padding. */
+  flex: 0 0 auto;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 4px;
+  aspect-ratio: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-view-mode-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-view-mode-btn.is-active {
+  background: var(--background-modifier-active-hover);
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}
+.stashpad-view-mode-btn svg { width: 14px; height: 14px; }
+
+/* 0.61.3: compact mode (in-tab) — strip the row down to body text +
+   children-count arrow only. Hide timestamp, authorship, action buttons. */
+.stashpad-view.is-compact .stashpad-note-meta-top .stashpad-note-time,
+.stashpad-view.is-compact .stashpad-note-meta-top .stashpad-note-grip,
+.stashpad-view.is-compact .stashpad-note-authorship,
+.stashpad-view.is-compact .stashpad-note-actions {
+  display: none !important;
+}
+.stashpad-view.is-compact .stashpad-note-meta {
+  /* The meta column normally holds time + grip + child-count link. Once
+     the first two are hidden the column collapses. Keep the arrow
+     visible by NOT hiding .stashpad-note-enter. */
+  min-width: 0;
+}
+.stashpad-view.is-compact .stashpad-note-body {
+  /* One-line clamp — body text gets ellipsised at the right edge. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-view.is-compact .stashpad-note-body-content {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-height: 1.4em;
+}
+.stashpad-view.is-compact .stashpad-note-body-content > * {
+  display: inline;
+}
+
+/* Exit-compact button (rendered in the breadcrumb in 0.61.3 since the
+   filter-row exit is hidden under compact). */
+.stashpad-compact-exit-btn {
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  margin-left: 8px;
+  color: var(--text-muted);
+}
+.stashpad-compact-exit-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-compact-exit-btn svg { width: 13px; height: 13px; }
+
+/* Hide Obsidian's view-header + tab-header strip when the leaf hosts a
+   compact-mode or tiny-mode Stashpad view. Uses :has() so we don't
+   need a corresponding class on the leaf container — modern Chromium
+   supports it and Obsidian's Electron meets the version. */
+.workspace-leaf:has(.stashpad-view.is-compact) > .view-header,
+.workspace-leaf:has(.stashpad-view.is-tiny) > .view-header {
+  display: none !important;
+}
+.workspace-tabs:has(.stashpad-view.is-tiny) .workspace-tab-header-container {
+  display: none !important;
+}
+
+/* 0.61.4: composer collapses to a chevron-+-send pair on narrow widths
+   (compact mode, tiny windows, narrow splits). The ResizeObserver in
+   view.ts toggles .is-narrow on .stashpad-composer when its clientWidth
+   < 360px. */
+.stashpad-composer:not(.is-narrow) .stashpad-composer-rail-toggle {
+  display: none;
+}
+.stashpad-composer.is-narrow .stashpad-composer-btn-rail:not(.is-expanded) .stashpad-composer-btn-group {
+  display: none;
+}
+.stashpad-composer.is-narrow .stashpad-composer-rail-toggle {
+  display: inline-flex;
+}
+
+/* 0.61.5: apply the compact row rules to tiny mode too, plus drop the
+   > direct-child constraint on .view-header so Obsidian's wrapper
+   .workspace-leaf-content layers don't defeat the selector. */
+.stashpad-view.is-tiny.is-compact .stashpad-note-meta-top .stashpad-note-time,
+.stashpad-view.is-tiny.is-compact .stashpad-note-meta-top .stashpad-note-grip,
+.stashpad-view.is-tiny.is-compact .stashpad-note-authorship,
+.stashpad-view.is-tiny.is-compact .stashpad-note-actions {
+  display: none !important;
+}
+.stashpad-view.is-tiny.is-compact .stashpad-note-meta { min-width: 0; }
+.stashpad-view.is-tiny.is-compact .stashpad-note-body {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.stashpad-view.is-tiny.is-compact .stashpad-note-body-content {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-height: 1.4em;
+}
+.stashpad-view.is-tiny.is-compact .stashpad-note-body-content > * { display: inline; }
+
+.workspace-leaf:has(.stashpad-view.is-compact) .view-header,
+.workspace-leaf:has(.stashpad-view.is-tiny) .view-header {
+  display: none !important;
+}
+
+/* 0.61.8: compact + tiny — give every row a fixed height so cursor
+   navigation doesn't shift the list around. The body's natural height
+   varies with markdown content; clamping prevents the up/down jitter
+   reported when arrowing through a compact list. */
+.stashpad-view.is-compact .stashpad-note,
+.stashpad-view.is-tiny.is-compact .stashpad-note {
+  height: 32px;
+  min-height: 32px;
+  align-items: center;
+  overflow: hidden;
+}
+/* Make sure the tiny-header buttons never get shrunk out of view. */
+.stashpad-tiny-header .stashpad-tiny-expand,
+.stashpad-tiny-header .stashpad-tiny-sticky {
+  flex: 0 0 auto;
+}
+.stashpad-tiny-exit-compact.is-active {
+  background: var(--background-modifier-active-hover);
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+}
+
+/* 0.62.2: ribbon suggest modal — icon + label rows. */
+.stashpad-ribbon-suggest-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.stashpad-ribbon-suggest-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+.stashpad-ribbon-suggest-icon svg { width: 16px; height: 16px; }
+.stashpad-ribbon-suggest-body { flex: 1 1 auto; min-width: 0; }

@@ -39,13 +39,18 @@ function isAnyModalOpen(target?: EventTarget | null): boolean {
   if (target instanceof Element) {
     if (target.closest(".modal, .modal-container, .suggestion-container, .menu, .prompt")) return true;
   }
-  // Fallback: any modal/prompt/menu is in the DOM (regardless of focus).
-  // Use specific selectors that are only added when actively open, not
-  // the always-present .modal-container shell.
-  if (document.body.querySelector(".modal-bg")) return true;
-  if (document.body.querySelector(".modal-container .modal")) return true;
-  if (document.body.querySelector(".suggestion-container")) return true;
-  if (document.body.querySelector(".menu.mod-active")) return true;
+  // 0.61.8: check the target's owner document FIRST, then fall back to
+  // the main `document`. Popout windows host modals in their OWN
+  // document — the main-document-only check used to miss them, so the
+  // ColorPickerModal in a tiny window couldn't capture arrow keys.
+  const docs = new Set<Document>([document]);
+  if (target instanceof Element && target.ownerDocument) docs.add(target.ownerDocument);
+  for (const doc of docs) {
+    if (doc.body?.querySelector(".modal-bg")) return true;
+    if (doc.body?.querySelector(".modal-container .modal")) return true;
+    if (doc.body?.querySelector(".suggestion-container")) return true;
+    if (doc.body?.querySelector(".menu.mod-active")) return true;
+  }
   return false;
 }
 
@@ -102,6 +107,17 @@ export class StashpadView extends ItemView {
   private colorFilter: string | null = null;
   private noteFolder = "Stashpad";
   private folderOverride: string | null = null;
+  /** 0.61.1: tiny-mode flag — when true the view renders a minimal
+   *  shell (folder name + list + composer + sticky/expand controls)
+   *  and the leaf's BrowserWindow gets shrunk + optionally pinned
+   *  always-on-top. Persisted via view state so a tiny-mode tab
+   *  survives reloads. */
+  private tinyMode = false;
+  private tinyAlwaysOnTop = false;
+  /** 0.61.2: compact mode — like tiny mode but stays in the current
+   *  tab/leaf (no popout, no resize). Hides the time filter row and
+   *  focused-header; keeps breadcrumb + list + composer. Persisted. */
+  private compactMode = false;
   private detachTreeHook: (() => void) | null = null;
   private detachSettings: (() => void) | null = null;
   private slugDebouncers = new Map<string, ReturnType<typeof debounce>>();
@@ -158,6 +174,10 @@ export class StashpadView extends ItemView {
    *  teardown. */
   private stickyRowObserver: ResizeObserver | null = null;
   private listResizeObserver: ResizeObserver | null = null;
+  /** 0.61.4: observes the composer's width so the secondary-button
+   *  rail can collapse behind a chevron when the composer is narrow
+   *  (compact mode, tiny window, narrow split). */
+  private composerNarrowObserver: ResizeObserver | null = null;
   /** Per-focus "last cursor note id" — persisted via plugin.saveLastCursor.
    *  Read on view open / folder switch; restored via the `scroll-to-id`
    *  policy so the user lands looking at the same note they were on, even
@@ -406,6 +426,16 @@ export class StashpadView extends ItemView {
       initialPolicy = { kind: "pin-bottom", until: "next-user-input" };
     }
     this.render(initialPolicy);
+    // 0.61.7: defer the tiny resize to ~1s after launch. Obsidian's own
+    // popout init grabs the BrowserWindow size during the first frames,
+    // and racing it with rAF/150ms/600ms calls only sometimes won. Let
+    // the popout settle at its default size, THEN shrink. A second
+    // pass at 1500ms catches the edge case where the first resize is
+    // still clamped.
+    if (this.tinyMode) {
+      setTimeout(() => this.applyTinyWindow(), 1000);
+      setTimeout(() => this.applyTinyWindow(), 1500);
+    }
     // Flush drafts before the app/window unloads. 0.56.17: also eager-stamp
     // last-selected cursor so reload restores by id even if the debounce
     // hasn't fired.
@@ -468,6 +498,8 @@ export class StashpadView extends ItemView {
     this.listResizeObserver = null;
     this.stickyRowObserver?.disconnect();
     this.stickyRowObserver = null;
+    this.composerNarrowObserver?.disconnect();
+    this.composerNarrowObserver = null;
     this.focusedMiniObserver?.disconnect();
     this.focusedMiniObserver = null;
     this.composerAutocomplete?.detach();
@@ -520,6 +552,9 @@ export class StashpadView extends ItemView {
       tagFilter: this.tagFilter,
       colorFilter: this.colorFilter,
       timeFilterCalendar: this.timeFilterCalendar,
+      tinyMode: this.tinyMode,
+      tinyAlwaysOnTop: this.tinyAlwaysOnTop,
+      compactMode: this.compactMode,
     };
   }
   async setState(state: unknown, result: any): Promise<void> {
@@ -528,6 +563,9 @@ export class StashpadView extends ItemView {
       tagFilter?: string | null;
       colorFilter?: string | null;
       timeFilterCalendar?: boolean;
+      tinyMode?: boolean;
+      tinyAlwaysOnTop?: boolean;
+      compactMode?: boolean;
     }) | null) ?? null;
     if (s) {
       if ("folderOverride" in s) this.folderOverride = s.folderOverride ?? null;
@@ -536,6 +574,9 @@ export class StashpadView extends ItemView {
       if ("tagFilter" in s) this.tagFilter = s.tagFilter ?? null;
       if ("colorFilter" in s) this.colorFilter = s.colorFilter ?? null;
       if ("timeFilterCalendar" in s) this.timeFilterCalendar = !!s.timeFilterCalendar;
+      if ("tinyMode" in s) this.tinyMode = !!s.tinyMode;
+      if ("tinyAlwaysOnTop" in s) this.tinyAlwaysOnTop = !!s.tinyAlwaysOnTop;
+      if ("compactMode" in s) this.compactMode = !!s.compactMode;
     }
     // Resolve noteFolder immediately so getDisplayText() reflects the right folder
     // even before onOpen() has run (Obsidian queries it during view restore).
@@ -1545,16 +1586,31 @@ export class StashpadView extends ItemView {
         || this.listEl.scrollTop + this.listEl.clientHeight >= this.listEl.scrollHeight - 2);
     root.empty();
     root.toggleClass("is-mobile", Platform.isMobile);
-
-    this.renderTimeFilterBar(root);
-    this.renderBreadcrumb(root);
+    // 0.61.1: tiny-mode shell — skip the filter bar, breadcrumb, and
+    // focused-header. Render a slim strip with the folder name +
+    // sticky toggle + expand button instead.
+    root.toggleClass("is-tiny", this.tinyMode);
+    root.toggleClass("is-compact", this.compactMode);
+    if (this.tinyMode) {
+      this.renderTinyHeader(root);
+    } else {
+      // 0.61.2: compact mode skips the time-filter row (folder switcher,
+      // tag/color/sort/view dropdowns, time-window buttons, the three
+      // view-mode buttons). Breadcrumb stays — it's the smallest signal
+      // of "where am I" worth keeping, and the breadcrumb is where the
+      // actions cluster (select-mode toggle + ⚡ actions menu) lives.
+      if (!this.compactMode) this.renderTimeFilterBar(root);
+      this.renderBreadcrumb(root);
+    }
 
     const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
     // On desktop the focused header sits above the list (pinned). On
     // mobile it's appended INTO the list as the first child so it scrolls
     // with the rows — see further down. A 1-line sticky mini preview
     // appears at the top of the list when the full header scrolls out.
-    if (focused.file && !Platform.isMobile) this.renderFocusedHeader(root, focused);
+    // 0.61.1: tiny mode hides the focused-header too. 0.61.2: compact
+    // mode also hides it.
+    if (focused.file && !Platform.isMobile && !this.tinyMode && !this.compactMode) this.renderFocusedHeader(root, focused);
 
     this.currentChildren = this.filterChildren(this.collectViewItems(focused.id));
     if (this.autoSelectNewest && this.currentChildren.length > 0) {
@@ -1919,8 +1975,58 @@ export class StashpadView extends ItemView {
     }
     sel.onchange = () => this.setTimeFilter(sel.value as TimeFilter);
 
+    // 0.61.2: three view-mode buttons at the end of the time-filter row
+    // (after the time buttons, NOT anchored to the right). Tiny mode,
+    // compact mode, and "open this tab in a new window" — the latter
+    // is mildly redundant with native Obsidian "Open in new window"
+    // but more discoverable.
+    const modeBtns = bar.createDiv({ cls: "stashpad-view-mode-btns" });
+    const tinyBtn = modeBtns.createEl("button", { cls: "stashpad-view-mode-btn" });
+    setIcon(tinyBtn, "minimize-2");
+    tinyBtn.title = "Tiny mode — open this tab in a small always-on-top-capable popout window.";
+    tinyBtn.onclick = (e) => { e.preventDefault(); void this.plugin.openTinyWindow(); };
+    const compactBtn = modeBtns.createEl("button", { cls: "stashpad-view-mode-btn" });
+    setIcon(compactBtn, "rows-2");
+    compactBtn.title = this.compactMode
+      ? "Compact mode is ON — click to restore full chrome."
+      : "Compact mode — hide the filter row + focused header; keep breadcrumb + list + composer.";
+    if (this.compactMode) compactBtn.addClass("is-active");
+    compactBtn.onclick = (e) => { e.preventDefault(); this.toggleCompactMode(); };
+    const popoutBtn = modeBtns.createEl("button", { cls: "stashpad-view-mode-btn" });
+    setIcon(popoutBtn, "external-link");
+    popoutBtn.title = getSettings().popoutDuplicates
+      ? "Duplicate this Stashpad tab into a new Obsidian window. (Toggle in Settings → Open in new window — duplicate tab.)"
+      : "Move this Stashpad tab to a new Obsidian window. (Toggle in Settings → Open in new window — duplicate tab.)";
+    popoutBtn.onclick = (e) => {
+      e.preventDefault();
+      const duplicate = getSettings().popoutDuplicates;
+      try {
+        const ws = this.app.workspace as any;
+        if (duplicate) {
+          // Spawn a new popout leaf carrying this leaf's full state, then
+          // re-set it so the popout shows the same folder/focus. Original
+          // tab stays open.
+          const state = this.leaf.getViewState();
+          const popLeaf = ws.openPopoutLeaf?.();
+          if (popLeaf) void popLeaf.setViewState({ ...state, active: true });
+          else new Notice("Stashpad: this Obsidian build doesn't expose openPopoutLeaf.");
+        } else {
+          ws.moveLeafToPopout?.(this.leaf);
+        }
+      } catch (err) {
+        new Notice(`Stashpad: open-in-new-window failed (${(err as Error).message})`);
+      }
+    };
+
     // Action cluster moved to the breadcrumb row's start — see
     // renderActionsCluster, called from renderBreadcrumb.
+  }
+
+  /** Toggle compact mode + persist + re-render. 0.61.2. */
+  toggleCompactMode(): void {
+    this.compactMode = !this.compactMode;
+    this.render();
+    try { (this.app.workspace as any).requestSaveLayout?.(); } catch {}
   }
 
   /** Select-mode toggle + ⋯ actions menu. Rendered at the START of the
@@ -1984,6 +2090,13 @@ export class StashpadView extends ItemView {
     // Undo / Redo at the top — independent of selection state.
     menu.addItem((it: any) => it.setTitle("Undo").setIcon("undo").onClick(() => this.cmdUndo()));
     menu.addItem((it: any) => it.setTitle("Redo").setIcon("redo").onClick(() => this.cmdRedo()));
+    menu.addSeparator();
+    // 0.62.4: shortcut to the notification history / log so users
+    // don't have to dive into Settings or the command palette to
+    // review what happened. Triggers the same command palette entry.
+    menu.addItem((it: any) => it.setTitle("Notification history…").setIcon("bell").onClick(() => {
+      (this.app as any).commands?.executeCommandById?.("stashpad:stashpad-open-notification-history");
+    }));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").setDisabled(!hasTargets).onClick(() => this.cmdOpenInNewStashpadTab()));
     menu.addItem((it: any) => it.setTitle("Open in editor").setIcon("pencil").setDisabled(!hasTargets).onClick(() => this.cmdOpenInEditor()));
@@ -2702,6 +2815,205 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** Slim header strip rendered in tiny mode — folder/focus title +
+   *  sticky-on-top checkbox + expand-out button. No back/home crumbs,
+   *  no time filter, no action cluster (the whole point of tiny mode
+   *  is "just compose"). 0.61.1. */
+  private renderTinyHeader(parent: HTMLElement): void {
+    const bar = parent.createDiv({ cls: "stashpad-tiny-header" });
+    // Folder + focus title with a folder icon prefix (replaced the
+    // bullet/dot per user feedback). Compact, ellipsised.
+    const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
+    const folderLabel = (this.noteFolder.split("/").pop() || this.noteFolder).trim();
+    const focusLabel = this.focusId === ROOT_ID
+      ? folderLabel
+      : `${folderLabel} / ${this.titleForNode(focused).trim()}`;
+    const title = bar.createDiv({ cls: "stashpad-tiny-title" });
+    const iconEl = title.createSpan({ cls: "stashpad-tiny-title-icon" });
+    setIcon(iconEl, "folder");
+    title.createSpan({ cls: "stashpad-tiny-title-text", text: focusLabel });
+    title.title = `${this.noteFolder}${this.focusId !== ROOT_ID ? ` / ${this.titleForNode(focused).trim()}` : ""}`;
+
+    // Sticky-on-top checkbox.
+    const stickyWrap = bar.createDiv({ cls: "stashpad-tiny-sticky" });
+    const stickyCb = stickyWrap.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    stickyCb.checked = this.tinyAlwaysOnTop;
+    stickyWrap.createSpan({ text: "Sticky" });
+    stickyCb.onchange = () => {
+      this.tinyAlwaysOnTop = stickyCb.checked;
+      // 0.61.6: only toggle always-on-top; don't re-trigger the window
+      // resize. Re-applying full applyTinyWindow on the sticky toggle
+      // was snapping the user's manually-resized window back to 280×360.
+      this.applyTinyAlwaysOnTop();
+    };
+
+    // 0.61.8: ALWAYS render the compact-toggle button in the tiny
+    // header. Carrying compactMode through to tiny was meant to surface
+    // the exit, but if a user enters tiny WITHOUT being in compact
+    // (the common case — there's no compact-toggle UI in normal mode
+    // OUTSIDE the time-filter row) they had no way to flip compact.
+    // Now the rows-2 button always shows, tooltip flips, and clicking
+    // toggles the underlying compactMode state regardless.
+    const compactBtn = bar.createEl("button", { cls: "stashpad-tiny-expand stashpad-tiny-exit-compact" });
+    setIcon(compactBtn, "rows-2");
+    compactBtn.title = this.compactMode
+      ? "Compact mode is ON — click to turn off."
+      : "Compact mode — click to turn on (strips row metadata).";
+    if (this.compactMode) compactBtn.addClass("is-active");
+    compactBtn.onclick = () => { this.toggleCompactMode(); };
+
+    // Expand button — exit tiny mode + restore window size.
+    const expandBtn = bar.createEl("button", { cls: "stashpad-tiny-expand", text: "⤢" });
+    expandBtn.title = "Exit tiny mode";
+    expandBtn.onclick = () => { void this.exitTinyMode(); };
+  }
+
+  /** Resolve the Electron BrowserWindow that hosts THIS view's leaf —
+   *  not the main app window. Each Obsidian popout runs its own renderer,
+   *  so require() must be invoked through the leaf's owner-document's
+   *  global to land in the correct context. Otherwise calls bleed into
+   *  the main window (which the user saw shrink + hide other windows).
+   *  0.61.2. */
+  private getOwnElectronWindow(): any | null {
+    try {
+      const ownerWindow = (this.containerEl?.ownerDocument?.defaultView ?? window) as any;
+      const electron = ownerWindow?.require?.("electron")
+        ?? (window as any).require?.("electron");
+      const remote = electron?.remote
+        ?? ownerWindow?.electron?.remote
+        ?? (ownerWindow as any)?.["@electron/remote"];
+      // First try: getCurrentWindow from the owner-document's renderer
+      // context. If require is sandboxed away in the popout, this is
+      // null and we fall through.
+      let win = remote?.getCurrentWindow?.()
+        ?? (ownerWindow as any)?.electronWindow
+        ?? null;
+      // 0.61.5 fallback: enumerate every BrowserWindow and match the one
+      // whose webContents ID equals the owner window's webContents ID.
+      // Lets us resolve the popout from the MAIN renderer's electron
+      // module when the popout itself can't access require().
+      if (!win) {
+        try {
+          const mainElectron = (window as any).require?.("electron");
+          const mainRemote = mainElectron?.remote ?? mainElectron?.["@electron/remote"];
+          const BrowserWindow = mainRemote?.BrowserWindow ?? mainElectron?.BrowserWindow;
+          const all: any[] = BrowserWindow?.getAllWindows?.() ?? [];
+          if (all.length === 1) {
+            win = all[0];
+          } else if (all.length > 1) {
+            // Prefer the most recently focused one (popouts get focus
+            // right after open) as the "current" window for tiny ops.
+            const focused = mainRemote?.getFocusedWindow?.() ?? null;
+            win = focused ?? all[all.length - 1];
+          }
+        } catch (e) {
+          console.debug("[Stashpad] BrowserWindow.getAllWindows fallback failed", e);
+        }
+      }
+      if (!win) console.debug("[Stashpad] couldn't resolve own electron window");
+      return win ?? null;
+    } catch (e) {
+      console.debug("[Stashpad] resolve own electron window failed", e);
+      return null;
+    }
+  }
+
+  /** Toggle always-on-top WITHOUT touching window size. Separated from
+   *  applyTinyWindow so the sticky checkbox doesn't snap the window
+   *  back to 280×360 when the user has already manually resized it.
+   *  0.61.6. */
+  private applyTinyAlwaysOnTop(): void {
+    const win = this.getOwnElectronWindow();
+    if (!win) return;
+    try { win.setAlwaysOnTop?.(!!this.tinyAlwaysOnTop); } catch (e) {
+      console.debug("[Stashpad] setAlwaysOnTop failed", e);
+    }
+  }
+
+  /** Apply tiny-mode side-effects to the BrowserWindow that hosts this
+   *  leaf: resize down + optionally pin always-on-top. Best-effort —
+   *  bails silently if Electron's window APIs aren't reachable
+   *  (sandboxed builds). 0.61.1 / 0.61.2 fix-window-target. */
+  private applyTinyWindow(): void {
+    const win = this.getOwnElectronWindow();
+    if (!win) return;
+    try {
+      if (this.tinyMode) {
+        // Decisive resize path. setMinimumSize first so prior constraints
+        // can't clamp the new size up. Then prefer setBounds over setSize
+        // because some Electron versions ignore setSize on a freshly-
+        // created BrowserWindow until the renderer is fully painted —
+        // setBounds with an explicit position is usually honoured.
+        const targetW = 280;
+        const targetH = 360;
+        win.setMinimumSize?.(220, 260);
+        // Preserve current position if available so the window doesn't
+        // jump to (0, 0). Fallback to (100, 100) if bounds aren't
+        // readable.
+        let x = 100, y = 100;
+        try {
+          const cur = win.getBounds?.();
+          if (cur && typeof cur.x === "number") { x = cur.x; y = cur.y; }
+        } catch {}
+        try { win.setBounds?.({ x, y, width: targetW, height: targetH }); } catch {}
+        try { win.setSize?.(targetW, targetH); } catch {}
+        win.setAlwaysOnTop?.(!!this.tinyAlwaysOnTop);
+      } else {
+        win.setAlwaysOnTop?.(false);
+      }
+    } catch (e) {
+      console.debug("[Stashpad] tiny window apply failed", e);
+    }
+  }
+
+  /** Flip out of tiny mode. Maximises the host window on the way out
+   *  so the user lands back at near-fullscreen instead of a fixed
+   *  900×700 (which the user noted was way too small on hi-res screens). */
+  private async exitTinyMode(): Promise<void> {
+    this.tinyMode = false;
+    this.tinyAlwaysOnTop = false;
+    // 0.61.10: also clear compact when leaving tiny. The user expected
+    // expand-out to restore the full chrome, not retain the compact
+    // row-stripping. (They can still toggle compact back on via the
+    // time-filter row's compact button.)
+    this.compactMode = false;
+    this.applyTinyWindow();
+    const win = this.getOwnElectronWindow();
+    try {
+      // Reset the minimum first so maximise/setSize aren't clamped.
+      win?.setMinimumSize?.(400, 300);
+      // Maximise on Windows/Linux; on macOS the system "maximize" button
+      // does true fullscreen which is more disruptive, so prefer setSize
+      // to the screen's workArea bounds when available.
+      const isMac = (Platform as any).isMacOS ?? false;
+      if (isMac) {
+        const electron = (this.containerEl?.ownerDocument?.defaultView as any)?.require?.("electron")
+          ?? (window as any).require?.("electron");
+        const screen = electron?.remote?.screen ?? electron?.screen;
+        const wa = screen?.getPrimaryDisplay?.().workArea;
+        if (wa) {
+          win?.setBounds?.({ x: wa.x, y: wa.y, width: wa.width, height: wa.height });
+        } else {
+          win?.maximize?.();
+        }
+      } else {
+        win?.maximize?.();
+      }
+    } catch {}
+    this.render();
+    // Persist state so reload doesn't snap back to tiny.
+    try { await (this.app.workspace as any).requestSaveLayout?.(); } catch {}
+  }
+
+  /** Enter tiny mode (called by the command or right after the popout
+   *  leaf is set up). Updates state, applies window shrink, re-renders. */
+  enterTinyMode(): void {
+    this.tinyMode = true;
+    this.applyTinyWindow();
+    this.render();
+    try { (this.app.workspace as any).requestSaveLayout?.(); } catch {}
+  }
+
   private renderBreadcrumb(parent: HTMLElement): void {
     const bar = parent.createDiv({ cls: "stashpad-breadcrumb" });
     // Action cluster (select-mode toggle + ⋯ menu) sits at the START of
@@ -2717,7 +3029,24 @@ export class StashpadView extends ItemView {
       homeBtn.setText("Home");
     }
     homeBtn.onclick = () => this.navigateTo(ROOT_ID);
-    if (this.focusId === ROOT_ID) return;
+    if (this.focusId === ROOT_ID) {
+      // 0.61.4: even at root, surface the exit-compact button + the
+      // children-count chip when applicable. The earlier early-return
+      // skipped both, which left the user stranded in compact mode
+      // when at home.
+      const childCount = this.tree.getChildren(this.focusId).length;
+      if (childCount > 0) {
+        bar.createSpan({ cls: "stashpad-crumb-count", text: `· ${childCount}` })
+          .title = `${childCount} direct child${childCount === 1 ? "" : "ren"}`;
+      }
+      if (this.compactMode) {
+        const exitBtn = bar.createEl("button", { cls: "stashpad-compact-exit-btn" });
+        setIcon(exitBtn, "rows-2");
+        exitBtn.title = "Exit compact mode";
+        exitBtn.onclick = (e) => { e.preventDefault(); this.toggleCompactMode(); };
+      }
+      return;
+    }
 
     const PER_CRUMB_MAX = 28;     // hard per-crumb char cap (then per-CSS visual ellipsis)
     const TOTAL_CHAR_BUDGET = 100; // path length budget across all crumbs (excluding "Home")
@@ -2784,6 +3113,16 @@ export class StashpadView extends ItemView {
     if (childCount > 0) {
       bar.createSpan({ cls: "stashpad-crumb-count", text: `· ${childCount}` })
         .title = `${childCount} direct child${childCount === 1 ? "" : "ren"}`;
+    }
+    // 0.61.3: exit-compact button. The compact toggle in the time-filter
+    // row is hidden while compact mode is on (the entire row is gone),
+    // so we surface a way out here. Only rendered when compactMode is
+    // active.
+    if (this.compactMode) {
+      const exitBtn = bar.createEl("button", { cls: "stashpad-compact-exit-btn" });
+      setIcon(exitBtn, "rows-2");
+      exitBtn.title = "Exit compact mode";
+      exitBtn.onclick = (e) => { e.preventDefault(); this.toggleCompactMode(); };
     }
   }
 
@@ -3596,28 +3935,55 @@ export class StashpadView extends ItemView {
       ta.focus();
     });
 
-    // Mobile: insert the expand-toggle BEFORE the group in the rail.
-    // Tapping it slides the group out (and flips the chevron). Desktop
-    // ignores this — the group is always visible there via CSS.
-    if (Platform.isMobile) {
-      const toggleBtn = btnRail.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-rail-toggle" });
-      setIcon(toggleBtn, "chevron-left");
-      toggleBtn.title = "Show more composer options";
-      // Prepend so it sits BEFORE the group in source order.
-      btnRail.insertBefore(toggleBtn, expandedGroup);
-      const setExpanded = (open: boolean): void => {
-        btnRail.toggleClass("is-expanded", open);
-        toggleBtn.title = open ? "Hide options" : "Show more composer options";
-        // Flip the chevron to face right when open (rail collapses to the right).
-        setIcon(toggleBtn, open ? "chevron-right" : "chevron-left");
-      };
-      toggleBtn.onmousedown = (e) => e.preventDefault();
-      toggleBtn.onclick = (e) => {
-        e.preventDefault();
-        setExpanded(!btnRail.hasClass("is-expanded"));
-      };
-      setExpanded(false);
-    }
+    // 0.61.4: render the expand-toggle on BOTH mobile and desktop. CSS
+    // controls when it's actually visible — by default desktop hides it
+    // (the secondary buttons fit), but when the composer is narrow
+    // (`.is-narrow` set by the ResizeObserver below), the toggle shows
+    // and the secondary-button group collapses behind it. Tiny mode +
+    // compact mode in a small window benefit most.
+    const toggleBtn = btnRail.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-rail-toggle" });
+    setIcon(toggleBtn, "chevron-left");
+    toggleBtn.title = "Show more composer options";
+    btnRail.insertBefore(toggleBtn, expandedGroup);
+    const setExpanded = (open: boolean): void => {
+      btnRail.toggleClass("is-expanded", open);
+      toggleBtn.title = open ? "Hide options" : "Show more composer options";
+      setIcon(toggleBtn, open ? "chevron-right" : "chevron-left");
+    };
+    toggleBtn.onmousedown = (e) => e.preventDefault();
+    toggleBtn.onclick = (e) => {
+      e.preventDefault();
+      setExpanded(!btnRail.hasClass("is-expanded"));
+    };
+    setExpanded(false);
+    // 0.61.10: ResizeObserver runs on every platform (no isMobile gate
+    // — mobile already has its own narrow rendering and the class is a
+    // no-op there). The CSS-only chevron-toggle now triggers when the
+    // composer drops below 700px wide. Also do an immediate eager
+    // class assignment so the first paint already reflects narrow
+    // state without waiting for the observer's first callback.
+    const computeNarrow = () => composer.clientWidth < 700;
+    const applyNarrow = () => {
+      const narrow = computeNarrow();
+      composer.toggleClass("is-narrow", narrow);
+      // 0.61.12: also collapse the rail when transitioning INTO narrow.
+      // The old code only force-expanded on widening; on narrowing we
+      // left is-expanded at whatever it was, so the group stayed
+      // visible after a wide → narrow resize.
+      if (narrow) setExpanded(false);
+      else setExpanded(true);
+    };
+    applyNarrow();
+    // Multi-frame retry — composer.clientWidth is sometimes 0 on the
+    // first synchronous call inside render() before layout. Re-apply
+    // a couple of times so the class is correct without needing the
+    // observer to fire.
+    requestAnimationFrame(applyNarrow);
+    setTimeout(applyNarrow, 100);
+    const ro = new ResizeObserver(applyNarrow);
+    ro.observe(composer);
+    this.composerNarrowObserver?.disconnect();
+    this.composerNarrowObserver = ro;
 
     const sendBtn = btnRail.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-send" });
     sendBtn.title = "Send (Enter)";
@@ -4063,6 +4429,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.copy)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopy(); return; }
       if (matchBinding(e, sb.copyTree)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyTree(); return; }
       if (matchBinding(e, sb.copyOutline)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyOutline(); return; }
+      if (matchBinding(e, sb.copyCodeBlock)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyCodeBlock(); return; }
       if (matchBinding(e, sb.openEditor)) {
         e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
         if (e.shiftKey) {
@@ -4774,6 +5141,83 @@ export class StashpadView extends ItemView {
       affectedIds: targets.map((t) => t.id),
       folder: this.noteFolder,
     });
+  }
+
+  /** Copy the contents of a fenced codeblock from the cursor row's body.
+   *  - 0 codeblocks → info toast.
+   *  - 1 codeblock  → copy silently with a success toast.
+   *  - 2+ blocks    → pick one via a SuggestModal (with a "Copy all"
+   *                   choice at the end that joins them with blank lines).
+   *  Operates on the first selected note when there's a selection,
+   *  otherwise the cursor row. 0.61.0. */
+  async cmdCopyCodeBlock(): Promise<void> {
+    const targets = this.getActionTargets();
+    if (!targets.length || !targets[0].file) { new Notice("Nothing to copy from."); return; }
+    const node = targets[0];
+    const raw = await this.app.vault.cachedRead(node.file!);
+    const body = this.stripFrontmatter(raw);
+    const blocks = extractCodeBlocks(body);
+    if (blocks.length === 0) {
+      this.plugin.notifications.show({
+        message: `No codeblock found in "${this.titleForNode(node)}".`,
+        kind: "info",
+        category: "system",
+        affectedIds: [node.id],
+        folder: this.noteFolder,
+      });
+      return;
+    }
+    if (blocks.length === 1) {
+      await navigator.clipboard.writeText(blocks[0].code);
+      this.plugin.notifications.show({
+        message: `Copied codeblock${blocks[0].lang ? ` (${blocks[0].lang})` : ""} from "${this.titleForNode(node)}".`,
+        kind: "success",
+        category: "system",
+        affectedIds: [node.id],
+        folder: this.noteFolder,
+      });
+      return;
+    }
+    // Multiple — pick one (or all). Lightweight SuggestModal.
+    type Item = { kind: "one" | "all"; idx: number; label: string };
+    const items: Item[] = blocks.map((b, i) => ({
+      kind: "one" as const,
+      idx: i,
+      label: `${i + 1}. ${b.lang || "(no language)"} — ${b.code.split("\n")[0].slice(0, 60)}${b.code.includes("\n") ? "…" : ""}`,
+    }));
+    items.push({ kind: "all", idx: -1, label: `Copy all ${blocks.length} blocks (joined with blank lines)` });
+    const view = this;
+    const modal = new (class extends SuggestModal<Item> {
+      getSuggestions(query: string): Item[] {
+        const q = query.trim().toLowerCase();
+        if (!q) return items;
+        const tokens = q.split(/\s+/).filter(Boolean);
+        return items.filter((it) => {
+          const h = it.label.toLowerCase();
+          return tokens.every((t) => h.includes(t));
+        });
+      }
+      renderSuggestion(item: Item, el: HTMLElement): void {
+        el.createDiv({ cls: "stashpad-suggest-title", text: item.label });
+      }
+      async onChooseSuggestion(item: Item): Promise<void> {
+        const text = item.kind === "all"
+          ? blocks.map((b) => b.code).join("\n\n")
+          : blocks[item.idx].code;
+        await navigator.clipboard.writeText(text);
+        view.plugin.notifications.show({
+          message: item.kind === "all"
+            ? `Copied all ${blocks.length} codeblocks from "${view.titleForNode(node)}".`
+            : `Copied codeblock${blocks[item.idx].lang ? ` (${blocks[item.idx].lang})` : ""} from "${view.titleForNode(node)}".`,
+          kind: "success",
+          category: "system",
+          affectedIds: [node.id],
+          folder: view.noteFolder,
+        });
+      }
+    })(this.app);
+    modal.setPlaceholder(`${blocks.length} codeblocks in "${this.titleForNode(node)}" — pick one to copy.`);
+    modal.open();
   }
 
   async cmdCopyTree(): Promise<void> {
@@ -7651,6 +8095,22 @@ function matchMod(e: KeyboardEvent, combo: string): boolean {
  *    "HealthMD/work-stuff"        → "HealthMD/Work-stuff"
  *    "BIG"                        → "BIG"
  */
+/** Extract fenced ```lang … ``` codeblocks from a markdown body. Returns
+ *  one entry per block in document order with the language tag and
+ *  inner content (no surrounding fences). Tildes (~~~) are not matched
+ *  — Obsidian's writers always emit backtick fences. 0.61.0. */
+function extractCodeBlocks(body: string): Array<{ lang: string; code: string }> {
+  const out: Array<{ lang: string; code: string }> = [];
+  // ``` (optional info string) <newline> body <newline> ```.
+  // Use 3+ backticks to accommodate nested fences (Markdown spec).
+  const re = /^([ \t]*)(`{3,})[ \t]*([^\n`]*)\n([\s\S]*?)\n\1\2[ \t]*$/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) != null) {
+    out.push({ lang: m[3].trim(), code: m[4] });
+  }
+  return out;
+}
+
 function properCaseFolderPath(path: string): string {
   return path
     .split("/")

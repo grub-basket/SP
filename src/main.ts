@@ -1,4 +1,4 @@
-import { Menu, Notice, Platform, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import { STASHPAD_VIEW_TYPE } from "./types";
 import { StashpadView } from "./view";
 import {
@@ -452,6 +452,52 @@ export default class StashpadPlugin extends Plugin {
     };
     this.register(onActiveViewChange(refreshActiveClass));
     this.registerEvent(this.app.workspace.on("active-leaf-change", refreshActiveClass));
+
+    // 0.61.9: Obsidian popout windows don't automatically inherit
+    // plugin stylesheets — opening a Stashpad view in a popout (tiny
+    // mode, "open in new window" button, native Obsidian popout) means
+    // our CSS rules silently no-op. Clone every <style> tag from the
+    // main document into each popout window on open. Also do an
+    // immediate pass for popouts that already exist.
+    const injectStashpadStyles = (popoutDoc: Document): void => {
+      try {
+        // Only clone OUR stylesheets — they have hashes Obsidian adds.
+        // The cheapest reliable filter: any <style> whose text mentions
+        // `.stashpad-` (we use that prefix everywhere).
+        const own = Array.from(document.querySelectorAll("style"))
+          .filter((s) => (s.textContent ?? "").includes(".stashpad-"));
+        for (const s of own) {
+          // Skip if already cloned (by data-stashpad attr).
+          const id = s.id || "";
+          const sel = id ? `style[data-stashpad-source="${id}"]` : null;
+          if (sel && popoutDoc.head.querySelector(sel)) continue;
+          const clone = popoutDoc.createElement("style");
+          if (id) clone.setAttribute("data-stashpad-source", id);
+          else clone.setAttribute("data-stashpad-source", "anon");
+          clone.textContent = s.textContent ?? "";
+          popoutDoc.head.appendChild(clone);
+        }
+      } catch (e) {
+        console.warn("[Stashpad] inject popout styles failed", e);
+      }
+    };
+    this.registerEvent((this.app.workspace as any).on("window-open", (win: any) => {
+      const doc = win?.doc ?? win?.win?.document ?? null;
+      if (doc) injectStashpadStyles(doc);
+    }));
+    // Existing popouts at plugin-load time (e.g. after a reload while
+    // a tiny window was open) — walk all known windows and inject.
+    setTimeout(() => {
+      try {
+        const ws = this.app.workspace as any;
+        if (typeof ws.iterateAllLeaves === "function") {
+          ws.iterateAllLeaves((leaf: any) => {
+            const d = leaf?.view?.containerEl?.ownerDocument;
+            if (d && d !== document) injectStashpadStyles(d);
+          });
+        }
+      } catch {}
+    }, 200);
     refreshActiveClass();
     // Re-evaluate when settings change (the toggle could have flipped).
     this.register(() => document.body.classList.remove("stashpad-hide-mobile-toolbar", "stashpad-active"));
@@ -496,34 +542,42 @@ export default class StashpadPlugin extends Plugin {
     setTimeout(refreshGeometry, 250);
     setTimeout(refreshGeometry, 1000);
 
-    // 0.60.0: smarter ribbon icon.
-    //  - Click w/ 0 leaves open  → open default in a new tab.
-    //  - Click w/ 1 leaf open    → reveal it.
-    //  - Click w/ 2+ leaves open → menu listing each leaf to reveal,
-    //                              plus every discovered Stashpad folder
-    //                              that isn't currently open (opens new
-    //                              tab on click), plus "Switch folder…"
-    //                              entry for the full picker.
-    //  - Right-click             → same menu unconditionally (so the
-    //                              user can reach the folder switcher
-    //                              even with only one tab open).
-    const ribbon = this.addRibbonIcon("list-tree", "Open Stashpad", (evt) => {
-      const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
-      if (leaves.length >= 2) {
-        this.showRibbonMenu(evt as MouseEvent);
+    // 0.62.0: ribbon click ALWAYS shows the folder/leaf menu. Earlier
+    // behaviour (0 or 1 leaves → silently open/reveal; 2+ → menu) was
+    // confusing — users with multiple Stashpad folders couldn't reach
+    // the picker without right-clicking, and the leaves-count heuristic
+    // wasn't discoverable. Now: click → menu listing every Stashpad
+    // folder; picking one reveals its tab if open, else opens a new
+    // tab on it. Empty case (no folders discovered yet) falls through
+    // to creating the default Stashpad.
+    const ribbon = this.addRibbonIcon("list-tree", "Open Stashpad", () => {
+      const folders = this.discoverStashpadFolders();
+      if (folders.length === 0) {
+        void this.activateView({ reveal: true });
         return;
       }
-      void this.activateView({ reveal: true });
+      this.showRibbonPicker();
     });
     ribbon.addEventListener("contextmenu", (evt) => {
       evt.preventDefault();
-      this.showRibbonMenu(evt as MouseEvent);
+      this.showRibbonPicker();
     });
 
+    // 0.62.3: same smarts as the ribbon icon — if there's more than one
+    // Stashpad folder, show the picker instead of silently defaulting
+    // to the plugin's configured folder. Single-folder vaults still
+    // get the direct "open" behaviour they had before.
     this.addCommand({
       id: "stashpad-open",
       name: "Open Stashpad in new tab",
-      callback: () => void this.activateView({ reveal: false }),
+      callback: () => {
+        const folders = this.discoverStashpadFolders();
+        if (folders.length >= 2) {
+          this.showRibbonPicker();
+          return;
+        }
+        void this.activateView({ reveal: false });
+      },
     });
     this.addCommand({
       id: "stashpad-reveal",
@@ -618,6 +672,14 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-open-in-new-tab", name: "Open in new Stashpad tab", callback: () => call("cmdOpenInNewStashpadTab") });
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
     this.addCommand({ id: "stashpad-select-all", name: "Select all visible notes", callback: () => call("cmdSelectAll") });
+    this.addCommand({ id: "stashpad-copy-codeblock", name: "Copy code from codeblock", callback: () => call("cmdCopyCodeBlock") });
+    // 0.61.1: tiny mode — opens a popout window with the minimal shell
+    // (folder/focus title + list + composer + sticky/expand controls).
+    this.addCommand({
+      id: "stashpad-open-tiny",
+      name: "Open Stashpad in tiny window",
+      callback: () => void this.openTinyWindow(),
+    });
     // Mirror of the "copy" / duplicate button in the focused-header
     // actions cluster. Three synonyms in the name for fuzzy lookup.
     this.addCommand({ id: "stashpad-clone-tab", name: "Clone (duplicate / copy) this Stashpad tab", callback: () => call("cmdCloneStashpadTab") });
@@ -1131,16 +1193,17 @@ export default class StashpadPlugin extends Plugin {
     return renamed;
   }
 
-  /** Ribbon-icon quick menu — built from the open Stashpad leaves +
-   *  the discovered Stashpad folders. Picked entries either reveal an
-   *  existing leaf (for currently-open folders) or open a new tab on
-   *  the picked folder. A "Switch folder…" trailing entry opens the
-   *  full picker for create-or-rare-folder cases. 0.60.0. */
-  private showRibbonMenu(evt: MouseEvent): void {
-    const menu = new Menu();
-    const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
-    // Per-leaf entries: reveal an existing tab. Title is the folder the
-    // leaf is targeting, falling back to the plugin default.
+  /** Ribbon-icon picker — SuggestModal listing every open Stashpad leaf
+   *  + every discovered Stashpad folder + a "Switch folder…" trailing
+   *  entry. Scales to long lists (search-by-typing) where the Menu
+   *  version got unwieldy. Token-order-agnostic match against folder
+   *  paths.
+   *  0.62.1. */
+  private showRibbonPicker(): void {
+    type Item =
+      | { kind: "reveal"; folder: string; label: string; leaf: WorkspaceLeaf; icon: string }
+      | { kind: "open"; folder: string; label: string; icon: string }
+      | { kind: "switch"; label: string; icon: string };
     const folderForLeaf = (leaf: WorkspaceLeaf): string => {
       const state = leaf.getViewState();
       const fOverride = (state.state as any)?.folderOverride;
@@ -1149,47 +1212,105 @@ export default class StashpadPlugin extends Plugin {
       }
       return (this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "");
     };
-    const seenFolders = new Set<string>();
-    if (leaves.length > 0) {
-      for (const leaf of leaves) {
-        const f = folderForLeaf(leaf);
-        seenFolders.add(f);
-        const label = f.split("/").pop() || f;
-        menu.addItem((it: any) => it
-          .setTitle(`Reveal "${label}" tab`)
-          .setIcon("layout-grid")
-          .onClick(() => this.app.workspace.revealLeaf(leaf)));
-      }
-      menu.addSeparator();
-    }
-    // Per-folder entries for Stashpad folders NOT currently open as
-    // their own tab — open a new tab on that folder.
-    const allFolders = this.discoverStashpadFolders().filter((f) => !seenFolders.has(f));
-    for (const folder of allFolders) {
+    const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
+    const seen = new Set<string>();
+    const items: Item[] = [];
+    for (const leaf of leaves) {
+      const folder = folderForLeaf(leaf);
+      seen.add(folder);
       const label = folder.split("/").pop() || folder;
-      menu.addItem((it: any) => it
-        .setTitle(`Open "${label}" in new tab`)
-        .setIcon("layout-template")
-        .onClick(() => void this.activateViewForFolder(folder)));
+      items.push({ kind: "reveal", folder, label: `Reveal "${label}" tab`, leaf, icon: "layout-grid" });
     }
-    if (allFolders.length > 0) menu.addSeparator();
-    // Trailing entry: open the full folder picker on the active leaf
-    // (or a fresh one if there isn't one). Picker handles create-new-
-    // folder + arbitrary-vault-path cases the discovered list can't.
-    menu.addItem((it: any) => it
-      .setTitle("Switch folder…")
-      .setIcon("folder-search")
-      .onClick(async () => {
-        // Reveal an existing leaf first so its picker has the right
-        // origin; create one if none exists.
-        if (leaves.length === 0) await this.activateView({ reveal: true });
-        else this.app.workspace.revealLeaf(leaves[0]);
-        const v = getActiveView();
-        if (v && typeof (v as any).cmdOpenFolderPicker === "function") {
-          (v as any).cmdOpenFolderPicker();
+    const folders = this.discoverStashpadFolders().filter((f) => !seen.has(f));
+    for (const folder of folders) {
+      const label = folder.split("/").pop() || folder;
+      items.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: "layout-template" });
+    }
+    // 0.62.2: "Switch folder…" lives at index 1 (second result) instead
+    // of the bottom — high-traffic shortcut for users who want the full
+    // picker (create-new-folder, arbitrary vault paths) without
+    // scrolling past the auto-discovered list. Falls to index 0 when
+    // there are no other entries.
+    const switchItem: Item = {
+      kind: "switch",
+      label: "Switch folder… (full picker, create new)",
+      icon: "folder-search",
+    };
+    items.splice(Math.min(1, items.length), 0, switchItem);
+
+    const plugin = this;
+    const modal = new (class extends SuggestModal<Item> {
+      getSuggestions(query: string): Item[] {
+        const q = query.trim().toLowerCase();
+        if (!q) return items;
+        const tokens = q.split(/\s+/).filter(Boolean);
+        const matches = (s: string) => tokens.every((t) => s.toLowerCase().includes(t));
+        return items.filter((it) => {
+          const f = "folder" in it ? it.folder : "";
+          return matches(it.label) || matches(f);
+        });
+      }
+      renderSuggestion(item: Item, el: HTMLElement): void {
+        el.addClass("stashpad-suggest-item");
+        el.addClass("stashpad-ribbon-suggest-item");
+        const iconEl = el.createSpan({ cls: "stashpad-ribbon-suggest-icon" });
+        setIcon(iconEl, item.icon);
+        const body = el.createDiv({ cls: "stashpad-ribbon-suggest-body" });
+        body.createDiv({ cls: "stashpad-suggest-title", text: item.label });
+        if ("folder" in item && item.folder && item.label !== item.folder) {
+          body.createDiv({ cls: "stashpad-suggest-preview", text: item.folder });
         }
-      }));
-    menu.showAtMouseEvent(evt);
+      }
+      async onChooseSuggestion(item: Item): Promise<void> {
+        if (item.kind === "reveal") {
+          plugin.app.workspace.revealLeaf(item.leaf);
+        } else if (item.kind === "open") {
+          await plugin.activateViewForFolder(item.folder);
+        } else {
+          if (leaves.length === 0) await plugin.activateView({ reveal: true });
+          else plugin.app.workspace.revealLeaf(leaves[0]);
+          const v = getActiveView();
+          if (v && typeof (v as any).cmdOpenFolderPicker === "function") {
+            (v as any).cmdOpenFolderPicker();
+          }
+        }
+      }
+    })(this.app);
+    modal.setPlaceholder("Stashpad — type to filter folders…");
+    modal.open();
+  }
+
+  /** Open a popout Obsidian window with a Stashpad view in tiny mode.
+   *  Carries over the currently-active view's folder/focus if there is
+   *  one — so "Open tiny window" from a folder you're working in keeps
+   *  you in that folder. 0.61.1. */
+  async openTinyWindow(): Promise<void> {
+    const active = getActiveView();
+    const folderOverride = (active as any)?.folderOverride ?? null;
+    const focusId = (active as any)?.focusId ?? "__root__";
+    // 0.61.8: carry over compactMode from the active tab so the tiny
+    // window inherits the user's chrome preference. The exit-compact
+    // button in the tiny header then has something to toggle.
+    const compactMode = !!(active as any)?.compactMode;
+    const popLeaf = (this.app.workspace as any).openPopoutLeaf?.();
+    if (!popLeaf) {
+      new Notice("Stashpad: couldn't open popout window on this build.");
+      return;
+    }
+    await popLeaf.setViewState({
+      type: STASHPAD_VIEW_TYPE,
+      active: true,
+      state: {
+        folderOverride,
+        focusId,
+        tinyMode: true,
+        tinyAlwaysOnTop: false,
+        compactMode,
+      } as any,
+    });
+    // The view's onOpen path will detect tinyMode and apply the window
+    // shrink + always-on-top. Reveal to be safe.
+    try { this.app.workspace.revealLeaf(popLeaf); } catch {}
   }
 
   async activateView(opts: { reveal: boolean } = { reveal: true }): Promise<void> {
