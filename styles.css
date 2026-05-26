@@ -769,7 +769,15 @@
   color: var(--text-muted);
   line-height: 1.2;
 }
-.stashpad-focused-body { padding: 0; }
+.stashpad-focused-body {
+  padding: 0;
+  /* 0.71.15: cap the focused-header body to a few lines + scroll. A
+     long home note (especially after the JD index Preview overwrites
+     it with a hierarchy) was eating ~half the viewport; users prefer
+     a stable header strip and scroll-on-demand. */
+  max-height: calc(var(--font-text-size, 16px) * 1.5 * 3);
+  overflow-y: auto;
+}
 .stashpad-focused-body > :first-child { margin-top: 0; }
 .stashpad-focused-body > :last-child { margin-bottom: 0; }
 .stashpad-focused-actions {
