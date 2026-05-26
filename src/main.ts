@@ -1,6 +1,7 @@
 import { Notice, Platform, Plugin, SuggestModal, TFile, WorkspaceLeaf, setIcon } from "obsidian";
-import { STASHPAD_VIEW_TYPE } from "./types";
-import { StashpadView } from "./view";
+import { STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, type PinnedNoteRef } from "./types";
+import { StashpadView, properCaseFolderPath } from "./view";
+import { StashpadPanelsView, openStashpadPanelsView } from "./panels-view";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, type CommandId,
@@ -17,6 +18,10 @@ import { NotificationService, buildFileActions } from "./notifications";
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
   private undoStacks = new Map<string, UndoStack>();
+  /** Most-recently-active Stashpad leaf — set on active-leaf-change.
+   *  Used by sidebar panel actions (Search, Home) so they target the
+   *  user's actual current tab rather than getLeavesOfType()[0]. */
+  lastActiveStashpadLeaf: WorkspaceLeaf | null = null;
   /** Plugin-level notification service. Routes all toasts through one
    *  pipe so history + per-category mute + multiplayer filters work
    *  uniformly across views. Instantiated lazily on first access in
@@ -426,6 +431,20 @@ export default class StashpadPlugin extends Plugin {
       STASHPAD_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadView(leaf, this),
     );
+    // 0.68.0: sidebar panels view (Pinned Notes + future panels).
+    this.registerView(
+      STASHPAD_PANELS_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadPanelsView(leaf, this),
+    );
+    // 0.68.1: track the most-recently-active Stashpad leaf so the
+    // sidebar panel's Search / Home buttons target the leaf the user
+    // last worked in — not "leaves[0]" (= leftmost tab) which has
+    // nothing to do with recency.
+    this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
+      if (leaf && leaf.view.getViewType() === STASHPAD_VIEW_TYPE) {
+        this.lastActiveStashpadLeaf = leaf;
+      }
+    }));
 
     // Toggle a body class while a Stashpad view is the active leaf, so
     // CSS can hide Obsidian's mobile toolbar (or other chrome we don't
@@ -556,11 +575,19 @@ export default class StashpadPlugin extends Plugin {
         void this.activateView({ reveal: true });
         return;
       }
-      this.showRibbonPicker();
+      this.openFolderPicker();
     });
     ribbon.addEventListener("contextmenu", (evt) => {
       evt.preventDefault();
-      this.showRibbonPicker();
+      this.openFolderPicker();
+    });
+
+    // 0.68.1: ribbon icon for the sidebar panels view — installed by
+    // default so users discover it without running a command first.
+    // The matching command-palette entry still works as a restore
+    // path if the user removes the ribbon icon.
+    this.addRibbonIcon("panel-left", "Open Stashpad panels (sidebar)", () => {
+      void openStashpadPanelsView(this.app);
     });
 
     // 0.62.3: same smarts as the ribbon icon — if there's more than one
@@ -573,7 +600,7 @@ export default class StashpadPlugin extends Plugin {
       callback: () => {
         const folders = this.discoverStashpadFolders();
         if (folders.length >= 2) {
-          this.showRibbonPicker();
+          this.openFolderPicker();
           return;
         }
         void this.activateView({ reveal: false });
@@ -673,6 +700,14 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
     this.addCommand({ id: "stashpad-select-all", name: "Select all visible notes", callback: () => call("cmdSelectAll") });
     this.addCommand({ id: "stashpad-copy-codeblock", name: "Copy code from codeblock", callback: () => call("cmdCopyCodeBlock") });
+    // 0.68.0: open the sidebar panels view (Pinned Notes + future panels).
+    this.addCommand({
+      id: "stashpad-open-panels",
+      name: "Open Stashpad panels (sidebar)",
+      callback: () => void openStashpadPanelsView(this.app),
+    });
+    this.addCommand({ id: "stashpad-swap-with-parent", name: "Swap with parent (ouroboros)", callback: () => call("cmdSwapWithParent") });
+    this.addCommand({ id: "stashpad-toggle-pin", name: "Pin / unpin selected note (sidebar)", callback: () => call("cmdTogglePin") });
     // 0.61.1: tiny mode — opens a popout window with the minimal shell
     // (folder/focus title + list + composer + sticky/expand controls).
     this.addCommand({
@@ -703,10 +738,14 @@ export default class StashpadPlugin extends Plugin {
       name: "Import .stash file…",
       callback: () => call("cmdImportStash"),
     });
+    // 0.65.0: command-palette entry calls the plugin's unified picker
+    // directly so it works even when no Stashpad tab is active. (The
+    // view-local `call("cmdOpenFolderPicker")` only fires when an
+    // active Stashpad view is present.) Renamed for the broader scope.
     this.addCommand({
       id: "stashpad-pick-folder",
-      name: "Switch this Stashpad tab to another folder…",
-      callback: () => call("cmdOpenFolderPicker"),
+      name: "Stashpad: open / switch / create folder…",
+      callback: () => this.openFolderPicker(),
     });
     this.addCommand({
       id: "stashpad-run-integrity-check",
@@ -1193,17 +1232,66 @@ export default class StashpadPlugin extends Plugin {
     return renamed;
   }
 
-  /** Ribbon-icon picker — SuggestModal listing every open Stashpad leaf
-   *  + every discovered Stashpad folder + a "Switch folder…" trailing
-   *  entry. Scales to long lists (search-by-typing) where the Menu
-   *  version got unwieldy. Token-order-agnostic match against folder
-   *  paths.
-   *  0.62.1. */
-  private showRibbonPicker(): void {
+  // ---------- Sidebar panels (0.68.0) ----------
+
+  /** Pin a note to the sidebar panels' Pinned Notes list. Idempotent. */
+  async pinNote(pin: PinnedNoteRef): Promise<void> {
+    const list = this.settings.pinnedNotes ?? [];
+    if (list.some((p) => p.folder === pin.folder && p.id === pin.id)) return;
+    this.settings.pinnedNotes = [...list, pin];
+    await this.saveSettings();
+    this.refreshPanelsView();
+  }
+
+  /** Remove a pin. Idempotent. */
+  async unpinNote(pin: PinnedNoteRef): Promise<void> {
+    const list = this.settings.pinnedNotes ?? [];
+    const next = list.filter((p) => !(p.folder === pin.folder && p.id === pin.id));
+    if (next.length === list.length) return;
+    this.settings.pinnedNotes = next;
+    await this.saveSettings();
+    this.refreshPanelsView();
+  }
+
+  isPinned(pin: PinnedNoteRef): boolean {
+    return (this.settings.pinnedNotes ?? []).some((p) => p.folder === pin.folder && p.id === pin.id);
+  }
+
+  /** Force any open panels view to re-render — used after pin/unpin. */
+  private refreshPanelsView(): void {
+    const leaves = this.app.workspace.getLeavesOfType(STASHPAD_PANELS_VIEW_TYPE);
+    for (const leaf of leaves) {
+      const v = leaf.view as any;
+      if (v && typeof v.render === "function") v.render();
+    }
+  }
+
+  /** Unified folder picker / switcher / creator — the single entry
+   *  point for the ribbon button, the view's switch-folder button, and
+   *  the `pickFolder` keybinding / command-palette entry. 0.65.0.
+   *
+   *  Items (built dynamically based on context + query):
+   *  - Reveal an existing Stashpad tab (icon: layout-grid).
+   *  - Open a Stashpad folder in a new tab (icon: layout-template).
+   *  - When the user is on a Stashpad tab AND types a query matching a
+   *    DIFFERENT existing folder: "Switch this tab to <folder>"
+   *    (icon: folder-input). When the user is NOT on a Stashpad tab,
+   *    this entry is hidden — "open in new tab" carries the load
+   *    instead, so we don't accidentally repurpose someone's random
+   *    Stashpad tab.
+   *  - When the typed value doesn't match any existing folder + isn't
+   *    reserved: "Create new Stashpad" (icon: folder-plus). Creates
+   *    the folder; if the user's on a Stashpad tab, switches that tab
+   *    to the new folder; otherwise opens it in a fresh tab. */
+  openFolderPicker(): void {
     type Item =
       | { kind: "reveal"; folder: string; label: string; leaf: WorkspaceLeaf; icon: string }
       | { kind: "open"; folder: string; label: string; icon: string }
-      | { kind: "switch"; label: string; icon: string };
+      | { kind: "open-anyway"; folder: string; label: string; icon: string }
+      | { kind: "switch-current"; folder: string; label: string; icon: string }
+      | { kind: "create"; folder: string; label: string; icon: string }
+      | { kind: "convert"; folder: string; label: string; icon: string };
+
     const folderForLeaf = (leaf: WorkspaceLeaf): string => {
       const state = leaf.getViewState();
       const fOverride = (state.state as any)?.folderOverride;
@@ -1212,47 +1300,129 @@ export default class StashpadPlugin extends Plugin {
       }
       return (this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "");
     };
+
     const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
-    const seen = new Set<string>();
-    const items: Item[] = [];
+    const stashpadFolders = this.discoverStashpadFolders();
+    const activeView = getActiveView();
+    const activeFolder = activeView ? ((activeView as any).noteFolder ?? "").trim().replace(/^\/+|\/+$/g, "") : "";
+
+    // Collect every folder path in the vault (for the create guard:
+    // don't offer "Create" if the path already exists as a vanilla
+    // folder).
+    const allVaultFolderPaths = new Set<string>();
+    for (const f of this.app.vault.getAllLoadedFiles()) {
+      if ((f as any).children) {
+        const path = (f as any).path as string;
+        if (path && path !== "/" && !path.startsWith(".")) {
+          allVaultFolderPaths.add(path);
+        }
+      }
+    }
+    const isReservedFolder = (p: string): boolean => {
+      const last = p.split("/").filter(Boolean).pop() ?? "";
+      if (!last) return false;
+      const reserved = new Set(
+        [this.settings.importDropFolder, this.settings.exportFolder, "_attachments", "_processed", "_authors"]
+          .map((s) => (s ?? "").trim().replace(/^\/+|\/+$/g, ""))
+          .filter(Boolean),
+      );
+      return reserved.has(last);
+    };
+
+    const seenOpen = new Set<string>();
+    const baseItems: Item[] = [];
+    // 0.65.1: for each open Stashpad folder we ALSO emit an
+    // "Open <folder> in new tab anyway" entry — kept separate from
+    // baseItems and appended at the very end of the suggestion list so
+    // it doesn't compete with the reveal-existing-tab default. Useful
+    // when the user actually wants a second tab on the same folder
+    // (e.g., for tiny mode + main side by side).
+    const openAnywayItems: Item[] = [];
     for (const leaf of leaves) {
       const folder = folderForLeaf(leaf);
-      seen.add(folder);
+      seenOpen.add(folder);
       const label = folder.split("/").pop() || folder;
-      items.push({ kind: "reveal", folder, label: `Reveal "${label}" tab`, leaf, icon: "layout-grid" });
+      baseItems.push({ kind: "reveal", folder, label: `Reveal "${label}" tab`, leaf, icon: "layout-grid" });
+      openAnywayItems.push({ kind: "open-anyway", folder, label: `Open "${label}" in another new tab`, icon: "layout-template" });
     }
-    const folders = this.discoverStashpadFolders().filter((f) => !seen.has(f));
-    for (const folder of folders) {
+    for (const folder of stashpadFolders.filter((f) => !seenOpen.has(f))) {
       const label = folder.split("/").pop() || folder;
-      items.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: "layout-template" });
+      baseItems.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: "layout-template" });
     }
-    // 0.62.2: "Switch folder…" lives at index 1 (second result) instead
-    // of the bottom — high-traffic shortcut for users who want the full
-    // picker (create-new-folder, arbitrary vault paths) without
-    // scrolling past the auto-discovered list. Falls to index 0 when
-    // there are no other entries.
-    const switchItem: Item = {
-      kind: "switch",
-      label: "Switch folder… (full picker, create new)",
-      icon: "folder-search",
-    };
-    items.splice(Math.min(1, items.length), 0, switchItem);
 
     const plugin = this;
     const modal = new (class extends SuggestModal<Item> {
       getSuggestions(query: string): Item[] {
         const q = query.trim().toLowerCase();
-        if (!q) return items;
-        const tokens = q.split(/\s+/).filter(Boolean);
-        const matches = (s: string) => tokens.every((t) => s.toLowerCase().includes(t));
-        return items.filter((it) => {
-          const f = "folder" in it ? it.folder : "";
-          return matches(it.label) || matches(f);
+        const tokens = q ? q.split(/\s+/).filter(Boolean) : [];
+        const matchesAll = (s: string) => {
+          if (!tokens.length) return true;
+          const h = s.toLowerCase();
+          for (const t of tokens) if (!h.includes(t)) return false;
+          return true;
+        };
+        const filtered = !q ? baseItems.slice() : baseItems.filter((it) => {
+          const f = "folder" in it ? (it as any).folder : "";
+          return matchesAll(it.label) || matchesAll(f);
         });
+        // Switch-current items: only when there's an active Stashpad
+        // view and the query matches a stashpad folder that isn't its
+        // current one. The user said: if not on a Stashpad tab, don't
+        // surface this — "open in new tab" is the safe fallback.
+        if (q && activeView && activeFolder) {
+          for (const folder of stashpadFolders) {
+            if (folder.toLowerCase() === activeFolder.toLowerCase()) continue;
+            const last = folder.split("/").pop() ?? folder;
+            const haystack = `${folder} ${last}`;
+            if (!matchesAll(haystack)) continue;
+            filtered.push({
+              kind: "switch-current",
+              folder,
+              label: `Switch this tab to "${last}"`,
+              icon: "folder-input",
+            });
+          }
+        }
+        // Create / convert offer. Query is non-empty AND isn't reserved.
+        //  - If the folder doesn't exist anywhere in the vault →
+        //    "Create new Stashpad" (creates folder + opens new tab).
+        //  - If it exists as a vault folder but isn't a Stashpad folder
+        //    yet → "Convert <folder> into a Stashpad" (opens new tab
+        //    which bootstraps a Home note inside; non-destructive).
+        //  - If it's already a Stashpad folder, neither offer fires —
+        //    the existing reveal/open entries handle it.
+        const cleaned = query.trim().replace(/^\/+|\/+$/g, "");
+        if (cleaned && !isReservedFolder(cleaned)) {
+          const existsLower = Array.from(allVaultFolderPaths).find((f) => f.toLowerCase() === cleaned.toLowerCase());
+          const isStashpad = stashpadFolders.some((f) => f.toLowerCase() === cleaned.toLowerCase());
+          if (existsLower && !isStashpad) {
+            filtered.push({
+              kind: "convert",
+              folder: existsLower,
+              label: `Convert “${properCaseFolderPath(existsLower)}” into a Stashpad…`,
+              icon: "folder-cog",
+            });
+          } else if (!existsLower) {
+            const cased = properCaseFolderPath(cleaned);
+            filtered.push({
+              kind: "create",
+              folder: cleaned,
+              label: `+ Create new Stashpad “${cased}”`,
+              icon: "folder-plus",
+            });
+          }
+        }
+        // 0.65.1: open-anyway entries pinned to the very bottom — one
+        // per currently-open folder, in case the user wants a second
+        // tab on the same folder (e.g., main + tiny side by side).
+        const openAnywayFiltered = openAnywayItems.filter((it) => matchesAll(it.label) || matchesAll(it.folder));
+        filtered.push(...openAnywayFiltered);
+        return filtered;
       }
       renderSuggestion(item: Item, el: HTMLElement): void {
         el.addClass("stashpad-suggest-item");
         el.addClass("stashpad-ribbon-suggest-item");
+        if (item.kind === "create") el.addClass("stashpad-suggest-create");
         const iconEl = el.createSpan({ cls: "stashpad-ribbon-suggest-icon" });
         setIcon(iconEl, item.icon);
         const body = el.createDiv({ cls: "stashpad-ribbon-suggest-body" });
@@ -1264,19 +1434,72 @@ export default class StashpadPlugin extends Plugin {
       async onChooseSuggestion(item: Item): Promise<void> {
         if (item.kind === "reveal") {
           plugin.app.workspace.revealLeaf(item.leaf);
-        } else if (item.kind === "open") {
+          return;
+        }
+        if (item.kind === "open" || item.kind === "open-anyway") {
           await plugin.activateViewForFolder(item.folder);
-        } else {
-          if (leaves.length === 0) await plugin.activateView({ reveal: true });
-          else plugin.app.workspace.revealLeaf(leaves[0]);
-          const v = getActiveView();
-          if (v && typeof (v as any).cmdOpenFolderPicker === "function") {
-            (v as any).cmdOpenFolderPicker();
+          return;
+        }
+        if (item.kind === "switch-current") {
+          // Caller already checked activeView exists when emitting.
+          const v = activeView as any;
+          if (v && typeof v.setFolderOverride === "function") {
+            await v.setFolderOverride(item.folder);
+            plugin.app.workspace.revealLeaf(v.leaf);
           }
+          return;
+        }
+        if (item.kind === "create") {
+          // 0.65.2: ALWAYS open a new tab for fresh Stashpad folders —
+          // never replace the active tab. Predictable, doesn't strand
+          // whatever the user was looking at.
+          try {
+            const properCased = properCaseFolderPath(item.folder);
+            if (!(await plugin.app.vault.adapter.exists(properCased))) {
+              await plugin.app.vault.createFolder(properCased);
+            }
+            await plugin.activateViewForFolder(properCased);
+          } catch (e) {
+            new Notice(`Stashpad: couldn't create folder (${(e as Error).message})`);
+          }
+          return;
+        }
+        if (item.kind === "convert") {
+          // 0.65.2: convert an EXISTING vault folder into a Stashpad.
+          // Just opens a new tab on it — bootstrapFolder adds the Home
+          // note + _imports / _exports subfolders. Existing files in
+          // the folder are NOT touched. Confirmation modal warns the
+          // user about the additions.
+          const { ConfirmModal } = await import("./modals");
+          const folder = item.folder;
+          const lines = [
+            `“${folder}” already exists as a regular vault folder.`,
+            `Converting will add a Home note + _imports / _exports subfolders inside it.`,
+            `Existing files are NOT touched.`,
+          ];
+          new ConfirmModal(
+            plugin.app,
+            "Convert into a Stashpad?",
+            lines.join("\n"),
+            "Convert",
+            async (ok: boolean) => {
+              if (!ok) return;
+              try {
+                await plugin.activateViewForFolder(folder);
+              } catch (e) {
+                new Notice(`Stashpad: couldn't convert folder (${(e as Error).message})`);
+              }
+            },
+          ).open();
+          return;
         }
       }
     })(this.app);
-    modal.setPlaceholder("Stashpad — type to filter folders…");
+    modal.setPlaceholder(
+      activeView
+        ? "Open, switch this tab, or create a Stashpad folder — type to filter…"
+        : "Open or create a Stashpad folder — type to filter…"
+    );
     modal.open();
   }
 

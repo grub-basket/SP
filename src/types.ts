@@ -1,7 +1,17 @@
 import type { TFile } from "obsidian";
 
 export const STASHPAD_VIEW_TYPE = "stashpad-view";
+/** 0.68.0: sidebar panels view (Pinned Notes + future panels). */
+export const STASHPAD_PANELS_VIEW_TYPE = "stashpad-panels";
 export const ROOT_ID = "__root__";
+
+/** A user's pinned-note record. Cross-folder by design — the panel
+ *  shows pins from every Stashpad folder in one flat list with a
+ *  folder badge for context. 0.68.0. */
+export interface PinnedNoteRef {
+  folder: string;
+  id: StashpadId;
+}
 
 export type StashpadId = string;
 

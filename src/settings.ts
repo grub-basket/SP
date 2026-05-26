@@ -47,7 +47,9 @@ export type CommandId =
   | "clone" | "insertTemplate"
   | "toggleExpand"
   | "exportStash" | "importStash" | "pickFolder"
-  | "cloneStashpadTab" | "selectAll" | "copyCodeBlock";
+  | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
+  | "swapWithParent"
+  | "togglePin";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
  *  When BOTH are set, `preferRight` decides which actually fires. */
@@ -100,10 +102,12 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "toggleExpand",    label: "Show more / show less (expand toggle)", desc: "Default: Shift+? — toggle the clamp on the cursor row (or every selected row).", defaultPrimary: "Shift+?" },
   { id: "exportStash",     label: "Export selection to .stash",    desc: "Export the selected subtree(s) as a .stash bundle (notes + attachments).",                defaultPrimary: "" },
   { id: "importStash",     label: "Import .stash file",            desc: "Open the .stash bundle picker and import its notes into this Stashpad.",                  defaultPrimary: "" },
-  { id: "pickFolder",      label: "Switch this Stashpad tab to another folder", desc: "Open the folder picker so this tab shows a different Stashpad.",            defaultPrimary: "" },
+  { id: "pickFolder",      label: "Open / switch / create Stashpad folder", desc: "Default: Mod+S — opens the unified folder picker (reveal, switch, create, convert).", defaultPrimary: "Mod+S" },
   { id: "cloneStashpadTab",label: "Clone (duplicate / copy) this Stashpad tab", desc: "Open a second tab on the same folder + focus, mirroring the \"copy\" button in the focused-header actions.", defaultPrimary: "" },
   { id: "selectAll",       label: "Select all notes in view",      desc: "Default: Mod+A — adds every visible row to the selection.",                              defaultPrimary: "Mod+A" },
   { id: "copyCodeBlock",   label: "Copy code from codeblock",      desc: "Default: { — copy the contents of the cursor row's first codeblock (or pick one when multiple exist).", defaultPrimary: "{" },
+  { id: "swapWithParent",  label: "Swap with parent (ouroboros)",  desc: "Promote the cursor row above its current parent; the parent slides under it (carrying its other children). No default — bind in this tab.", defaultPrimary: "" },
+  { id: "togglePin",       label: "Pin / unpin selected note",     desc: "Default: P — toggle the sidebar pin state of the cursor row (or focused note).", defaultPrimary: "P" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -144,6 +148,9 @@ export interface StashpadSettings {
    *  main window). When false, the leaf is moved — the original tab
    *  closes. 0.61.3. */
   popoutDuplicates: boolean;
+  /** 0.68.0: notes the user has pinned to the sidebar Pinned Notes
+   *  panel. Cross-folder; rendered in array order. */
+  pinnedNotes: Array<{ folder: string; id: string }>;
   /** Mobile-only: hide Obsidian's mobile toolbar (the floating bar above
    *  the keyboard) while a Stashpad view is the active leaf. Stashpad's
    *  composer doesn't need it and it covers the input on smaller screens.
@@ -264,6 +271,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   confirmAttachmentDelete: true,
   autofocusComposerAfterSend: true,
   popoutDuplicates: true,
+  pinnedNotes: [],
   hideMobileToolbarInStashpad: true,
   slugStopWords: [],  // empty → DEFAULT_STOPWORDS used at runtime
   searchIncludedFolders: [],

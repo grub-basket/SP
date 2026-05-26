@@ -58,6 +58,14 @@ function isAnyModalOpen(target?: EventTarget | null): boolean {
  *  long-form description used as the button's tooltip. The displayed
  *  short label switches between calendar mode (Today/Week/…) and rolling
  *  mode (24h/7d/30d/365d/∞) based on the active filterCalendar flag. */
+/** Per-tab navigation history snapshot — folder + focus, the two
+ *  axes the user can navigate along. Used by the back/forward stacks
+ *  in 0.67.0. */
+interface NavSnapshot {
+  folder: string;
+  focusId: StashpadId;
+}
+
 interface TimeFilterOption {
   key: TimeFilter;
   /** Short label in calendar mode (e.g. "Today"). */
@@ -205,7 +213,16 @@ export class StashpadView extends ItemView {
   /** When set, the next composer render restores the caret to this index
    *  in the new textarea. Paired with focusComposerOnNextRender. */
   private pendingComposerCaret: number | null = null;
-  private navForwardStack: StashpadId[] = [];
+  /** 0.67.0: per-tab navigation history. Each entry is a snapshot of
+   *  `{folder, focusId}` so going back restores the previous folder
+   *  AND its focus, not just the previous note within the same
+   *  folder. Browser-style: every recordable nav mutation pushes the
+   *  PRE-change state onto navBack; navigateBack pops from there and
+   *  pushes onto navForward; navigateForward does the reverse. New
+   *  navigation (when not going via back/forward) clears the forward
+   *  stack. */
+  private navBackStack: NavSnapshot[] = [];
+  private navForwardSnapshots: NavSnapshot[] = [];
 
   constructor(leaf: WorkspaceLeaf, plugin: StashpadPlugin) {
     super(leaf);
@@ -555,6 +572,11 @@ export class StashpadView extends ItemView {
       tinyMode: this.tinyMode,
       tinyAlwaysOnTop: this.tinyAlwaysOnTop,
       compactMode: this.compactMode,
+      // 0.67.2: persist nav stacks so reloads keep the back/forward
+      // history. Without this every reload starts the user with empty
+      // stacks → the back arrow has nowhere to go.
+      navBackStack: this.navBackStack,
+      navForwardSnapshots: this.navForwardSnapshots,
     };
   }
   async setState(state: unknown, result: any): Promise<void> {
@@ -566,6 +588,8 @@ export class StashpadView extends ItemView {
       tinyMode?: boolean;
       tinyAlwaysOnTop?: boolean;
       compactMode?: boolean;
+      navBackStack?: NavSnapshot[];
+      navForwardSnapshots?: NavSnapshot[];
     }) | null) ?? null;
     if (s) {
       if ("folderOverride" in s) this.folderOverride = s.folderOverride ?? null;
@@ -577,6 +601,16 @@ export class StashpadView extends ItemView {
       if ("tinyMode" in s) this.tinyMode = !!s.tinyMode;
       if ("tinyAlwaysOnTop" in s) this.tinyAlwaysOnTop = !!s.tinyAlwaysOnTop;
       if ("compactMode" in s) this.compactMode = !!s.compactMode;
+      // 0.67.2: restore nav stacks from view state. Validate the
+      // shape so a malformed entry doesn't crash navigation later.
+      const isSnap = (x: any): x is NavSnapshot =>
+        x && typeof x.folder === "string" && typeof x.focusId === "string";
+      if (Array.isArray(s.navBackStack)) {
+        this.navBackStack = s.navBackStack.filter(isSnap);
+      }
+      if (Array.isArray(s.navForwardSnapshots)) {
+        this.navForwardSnapshots = s.navForwardSnapshots.filter(isSnap);
+      }
     }
     // Resolve noteFolder immediately so getDisplayText() reflects the right folder
     // even before onOpen() has run (Obsidian queries it during view restore).
@@ -631,13 +665,35 @@ export class StashpadView extends ItemView {
     }
   }
 
-  private async setFolderOverride(folder: string | null): Promise<void> {
+  /** Snapshot the active state for the history stacks. */
+  private captureNavSnapshot(): NavSnapshot {
+    return { folder: this.noteFolder, focusId: this.focusId };
+  }
+
+  /** Push current state onto back stack + clear forward unless told
+   *  otherwise. Called by every nav mutation that should be reversible
+   *  via back. 0.67.0. */
+  private recordNavState(opts: { keepForward?: boolean } = {}): void {
+    const snap = this.captureNavSnapshot();
+    // Skip if the new state is identical to the most recent back-stack
+    // entry — avoids stacking duplicates from re-render flushes.
+    const last = this.navBackStack[this.navBackStack.length - 1];
+    if (last && last.folder === snap.folder && last.focusId === snap.focusId) return;
+    this.navBackStack.push(snap);
+    if (!opts.keepForward) this.navForwardSnapshots = [];
+  }
+
+  private async setFolderOverride(folder: string | null, opts: { skipHistory?: boolean } = {}): Promise<void> {
     const cleaned = folder?.trim().replace(/^\/+|\/+$/g, "") || null;
     if (cleaned && this.isReservedFolder(cleaned)) {
       new Notice(`"${cleaned}" is a reserved Stashpad subfolder (imports/exports/attachments). Pick a different folder.`);
       return;
     }
     if ((cleaned || null) === (this.folderOverride || null)) return;
+    // 0.67.0: record current state so back can return to the previous
+    // folder + focus. Skip when applyNavSnapshot is the caller (it
+    // already arranged the stacks).
+    if (!opts.skipHistory) this.recordNavState();
     this.folderOverride = cleaned;
     this.focusId = ROOT_ID;
     this.lastCursorByFocus.clear();
@@ -675,78 +731,12 @@ export class StashpadView extends ItemView {
   /** Public so main.ts can dispatch a command to it. */
   cmdOpenFolderPicker(): void { this.openFolderPicker(); }
 
+  /** 0.65.0: delegate to the plugin's unified folder picker. The old
+   *  view-local SuggestModal had its own (less polished) layout and
+   *  fewer item kinds. The plugin's version covers reveal / open /
+   *  switch-current / create with icons and full token matching. */
   private openFolderPicker(): void {
-    // 0.57.1: limit the list to folders that ACTUALLY contain Stashpad
-    // notes (per discoverStashpadFolders). Vanilla vault folders without
-    // any Stashpad notes are noise here. Plugin default is always
-    // present even if it doesn't have notes yet. The create-new path
-    // below still lets users type any path to create a fresh folder.
-    const stashpadFolders = this.plugin.discoverStashpadFolders();
-    const allVaultFolders = this.listVaultFolders();
-    const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
-    type Item = { kind: "default" | "folder" | "create"; folder: string; label: string };
-    // Always include the settings default even if it has no notes (it's
-    // where freshly-created notes go).
-    const folderSet = new Set(stashpadFolders);
-    if (settingsFolder) folderSet.delete(settingsFolder);
-    const folders = [...folderSet].sort((a, b) => a.localeCompare(b));
-    // 0.59.2: title-case folder labels so a legacy lowercase "stashpad"
-    // setting still reads as "Stashpad" in the picker. Stored value is
-    // untouched — purely a display polish.
-    const baseItems: Item[] = [
-      { kind: "default", folder: settingsFolder, label: `Use plugin default — ${properCaseFolderPath(settingsFolder)}` },
-      ...folders.map((f) => ({ kind: "folder" as const, folder: f, label: properCaseFolderPath(f) })),
-    ];
-    const view = this;
-    const modal = new (class extends SuggestModal<Item> {
-      getSuggestions(query: string): Item[] {
-        const q = query.trim().toLowerCase();
-        // 0.57.0: token-order-agnostic match — every whitespace-separated
-        // token must appear in the label (any order).
-        const tokens = q ? q.split(/\s+/).filter(Boolean) : [];
-        const matchesAll = (haystack: string) => {
-          if (!tokens.length) return true;
-          for (const t of tokens) if (!haystack.includes(t)) return false;
-          return true;
-        };
-        const filtered = q
-          ? baseItems.filter((it) => matchesAll(it.label.toLowerCase()))
-          : baseItems.slice();
-        // Offer "create" when the query is non-empty and not an exact
-        // path of an EXISTING folder in the vault (Stashpad or not).
-        // Using the full allVaultFolders list here — not just Stashpad
-        // ones — so typing the name of a vanilla folder doesn't show a
-        // misleading "Create" suggestion.
-        const cleaned = query.trim().replace(/^\/+|\/+$/g, "");
-        if (cleaned
-            && !allVaultFolders.some((f) => f.toLowerCase() === cleaned.toLowerCase())
-            && !view.isReservedFolder(cleaned)) {
-          const cased = properCaseFolderPath(cleaned);
-          filtered.push({ kind: "create", folder: cleaned, label: `+ Create folder “${cased}”` });
-        }
-        return filtered;
-      }
-      renderSuggestion(item: Item, el: HTMLElement): void {
-        el.createDiv({ cls: "stashpad-suggest-title", text: item.label });
-        if (item.kind === "create") el.addClass("stashpad-suggest-create");
-      }
-      async onChooseSuggestion(item: Item): Promise<void> {
-        if (item.kind === "default") { void view.setFolderOverride(null); return; }
-        if (item.kind === "create") {
-          try {
-            const properCased = properCaseFolderPath(item.folder);
-            await view.ensureFolder(properCased);
-            await view.setFolderOverride(properCased);
-          } catch (e) {
-            new Notice(`Stashpad: couldn't create folder (${(e as Error).message})`);
-          }
-          return;
-        }
-        void view.setFolderOverride(item.folder);
-      }
-    })(this.app);
-    modal.setPlaceholder("Pick a folder, or type a new path to create one…");
-    modal.open();
+    this.plugin.openFolderPicker();
   }
 
   private listVaultFolders(): string[] {
@@ -1555,7 +1545,15 @@ export class StashpadView extends ItemView {
     // SAME row sits at the SAME visual position — eliminating the bouncing
     // caused by height shifts in rows ABOVE the viewport (which
     // pixel-only prevScroll restoration can't compensate for).
-    const anchor = this.captureScrollAnchor();
+    // 0.63.6 perf: only capture the anchor when the policy that will
+    // run actually needs it (preserve). Skip the per-row rect walk for
+    // pin-bottom / scroll-to-id / restore / follow-cursor paths.
+    // Anchor MUST be captured BEFORE root.empty() destroys the rows it
+    // reads, so we read the policy here pre-rebuild.
+    const _policyForAnchor = policy ?? { kind: "preserve" as const };
+    const anchor = _policyForAnchor.kind === "preserve"
+      ? this.captureScrollAnchor()
+      : null;
     // Preserve composer focus across the rebuild. Without this, every
     // render that rebuilds the textarea drops focus for a frame and the
     // user sees the focus border flicker — especially noticeable when
@@ -1591,6 +1589,21 @@ export class StashpadView extends ItemView {
     // sticky toggle + expand button instead.
     root.toggleClass("is-tiny", this.tinyMode);
     root.toggleClass("is-compact", this.compactMode);
+    // 0.63.6 perf: also toggle classes on the leaf wrapper and the
+    // workspace-tabs ancestor. Earlier code used CSS `:has()` to reach
+    // these elements from the view-root's class, but `:has()` triggers
+    // a global style recalc on every DOM change inside the leaf —
+    // which on each arrow-key cursor move (toggles is-cursor on rows)
+    // re-validated every selector. Direct classes have zero recalc cost.
+    const leafEl = this.containerEl.closest(".workspace-leaf") as HTMLElement | null;
+    if (leafEl) {
+      leafEl.classList.toggle("stashpad-is-tiny", this.tinyMode);
+      leafEl.classList.toggle("stashpad-is-compact", this.compactMode);
+    }
+    const tabsEl = this.containerEl.closest(".workspace-tabs") as HTMLElement | null;
+    if (tabsEl) {
+      tabsEl.classList.toggle("stashpad-has-tiny", this.tinyMode);
+    }
     if (this.tinyMode) {
       this.renderTinyHeader(root);
     } else {
@@ -1920,6 +1933,13 @@ export class StashpadView extends ItemView {
     if (isOverride) folderBtn.addClass("is-override");
     folderBtn.onclick = (e) => { e.preventDefault(); this.openFolderPicker(); };
 
+    // 0.68.4: icon-only Search button between the folder switcher and
+    // the tags dropdown. Mirrors the Mod+F binding for mouse users.
+    const searchBtn = bar.createEl("button", { cls: "stashpad-search-btn" });
+    setIcon(searchBtn, "search");
+    searchBtn.title = "Search notes (Mod+F)";
+    searchBtn.onclick = (e) => { e.preventDefault(); this.openSearchModal(); };
+
     if (Platform.isMobile) {
       // Mobile: collapse the four filter/view buttons into a single
       // entry-point button. Tapping it opens a vertical accordion with
@@ -2033,6 +2053,26 @@ export class StashpadView extends ItemView {
    *  breadcrumb row (left of Home) on every platform. */
   private renderActionsCluster(parent: HTMLElement): void {
     const actions = parent.createDiv({ cls: "stashpad-mobile-actions" });
+    // 0.66.0: Stashpad-internal back / forward nav buttons. Stashpad
+    // keeps its own focusId stack (navigateUp / navigateForward) that
+    // Obsidian's view-header back/forward doesn't touch — and in
+    // compact / tiny mode we hide view-header entirely, leaving the
+    // user no way to undo an accidental drill-in. These two buttons
+    // sit at the start of the actions cluster so they're always
+    // visible alongside the breadcrumb.
+    const backBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
+    setIcon(backBtn, "arrow-left");
+    const canGoBack = this.navBackStack.length > 0 || this.focusId !== ROOT_ID;
+    backBtn.title = this.navBackStack.length > 0 ? "Back" : (this.focusId !== ROOT_ID ? "Back (up to parent)" : "No back history");
+    if (!canGoBack) backBtn.addClass("is-disabled");
+    backBtn.onclick = (e) => { e.preventDefault(); this.navigateBack(); };
+    const fwdBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
+    setIcon(fwdBtn, "arrow-right");
+    const canGoFwd = this.navForwardSnapshots.length > 0;
+    fwdBtn.title = canGoFwd ? "Forward" : "No forward history";
+    if (!canGoFwd) fwdBtn.addClass("is-disabled");
+    fwdBtn.onclick = (e) => { e.preventDefault(); this.navigateForward(); };
+
     const selectBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
     const inSelect = this.mobileSelectMode;
     setIcon(selectBtn, inSelect ? "check-square" : "square");
@@ -2217,21 +2257,12 @@ export class StashpadView extends ItemView {
     pop.style.maxWidth = "min(280px, calc(100vw - 16px))";
     pop.style.width = "max-content";
 
-    this.populateColorMenuBody(pop, colors, close);
-
-    // Push a keymap Scope that consumes Escape so Obsidian's workspace
-    // handler ("Escape returns to last leaf") doesn't fire and yank the
-    // user back to a previously-active non-Stashpad tab. DOM listeners
-    // alone aren't enough — Obsidian routes Escape through its keymap
-    // ahead of bubble-phase listeners.
+    // 0.69.13: `close` was being referenced before its `const close =`
+    // declaration (TDZ ReferenceError) — populateColorMenuBody and the
+    // Escape Scope handler both captured it, which crashed the whole
+    // wiring and left the popover non-functional. Declare scope +
+    // close + outside FIRST, then attach.
     const scope = new Scope((this.app as any).scope);
-    scope.register([], "Escape", (ev: KeyboardEvent) => {
-      ev.preventDefault();
-      close();
-      return false;
-    });
-    (this.app as any).keymap?.pushScope(scope);
-
     const close = (): void => {
       pop.remove();
       doc.removeEventListener("mousedown", outside, true);
@@ -2242,6 +2273,18 @@ export class StashpadView extends ItemView {
         close();
       }
     };
+
+    // Escape closes; pushed onto Obsidian's keymap so its workspace-level
+    // "Escape returns to last leaf" handler doesn't fire instead.
+    scope.register([], "Escape", (ev: KeyboardEvent) => {
+      ev.preventDefault();
+      close();
+      return false;
+    });
+    (this.app as any).keymap?.pushScope(scope);
+
+    this.populateColorMenuBody(pop, colors, close);
+
     // Defer the listener attach so the click that opened us doesn't immediately close it.
     setTimeout(() => {
       doc.addEventListener("mousedown", outside, true);
@@ -2821,18 +2864,40 @@ export class StashpadView extends ItemView {
    *  is "just compose"). 0.61.1. */
   private renderTinyHeader(parent: HTMLElement): void {
     const bar = parent.createDiv({ cls: "stashpad-tiny-header" });
-    // Folder + focus title with a folder icon prefix (replaced the
-    // bullet/dot per user feedback). Compact, ellipsised.
+    // 0.66.0: back / forward at the very start so tiny mode users have
+    // a way to undo accidental drill-ins. The tiny header replaces
+    // both the view-header and the breadcrumb, so without these the
+    // user is stuck unless they ⤢ out of tiny mode first.
+    const backBtn = bar.createEl("button", { cls: "stashpad-tiny-nav-btn" });
+    setIcon(backBtn, "arrow-left");
+    backBtn.title = "Back (up to parent)";
+    const tinyCanBack = this.navBackStack.length > 0 || this.focusId !== ROOT_ID;
+    if (!tinyCanBack) backBtn.addClass("is-disabled");
+    backBtn.title = this.navBackStack.length > 0
+      ? "Back"
+      : (this.focusId !== ROOT_ID ? "Back (up to parent)" : "No back history");
+    backBtn.onclick = () => this.navigateBack();
+    const fwdBtn = bar.createEl("button", { cls: "stashpad-tiny-nav-btn" });
+    setIcon(fwdBtn, "arrow-right");
+    fwdBtn.title = this.navForwardSnapshots.length > 0 ? "Forward" : "No forward history";
+    if (this.navForwardSnapshots.length === 0) fwdBtn.addClass("is-disabled");
+    fwdBtn.onclick = () => this.navigateForward();
+
+    // 0.67.1: folder/title is now a button — click opens the unified
+    // folder picker (same as the regular view's folder switcher).
+    // Visually still reads as the slim path label, but it's
+    // tap-actionable in tiny mode.
     const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
     const folderLabel = (this.noteFolder.split("/").pop() || this.noteFolder).trim();
     const focusLabel = this.focusId === ROOT_ID
       ? folderLabel
       : `${folderLabel} / ${this.titleForNode(focused).trim()}`;
-    const title = bar.createDiv({ cls: "stashpad-tiny-title" });
-    const iconEl = title.createSpan({ cls: "stashpad-tiny-title-icon" });
+    const title = bar.createEl("button", { cls: "stashpad-tiny-title stashpad-folder-btn" });
+    const iconEl = title.createSpan({ cls: "stashpad-tiny-title-icon stashpad-btn-icon" });
     setIcon(iconEl, "folder");
-    title.createSpan({ cls: "stashpad-tiny-title-text", text: focusLabel });
-    title.title = `${this.noteFolder}${this.focusId !== ROOT_ID ? ` / ${this.titleForNode(focused).trim()}` : ""}`;
+    title.createSpan({ cls: "stashpad-tiny-title-text stashpad-btn-text", text: focusLabel });
+    title.title = `${this.noteFolder}${this.focusId !== ROOT_ID ? ` / ${this.titleForNode(focused).trim()}` : ""}\nClick to switch / create folder.`;
+    title.onclick = (e) => { e.preventDefault(); this.plugin.openFolderPicker(); };
 
     // Sticky-on-top checkbox.
     const stickyWrap = bar.createDiv({ cls: "stashpad-tiny-sticky" });
@@ -3759,6 +3824,15 @@ export class StashpadView extends ItemView {
         this.viewRoot?.focus({ preventScroll: true } as any);
         return false;
       });
+      // 0.69.39: Mod+Z / Mod+Shift+Z must reach the textarea's native
+      // undo / redo. Without these no-op handlers, composerScope's
+      // dispatch would walk to its parent (app.scope) whose Mod+Z
+      // handler consumes the event (preventDefault) — blocking
+      // browser-native textarea undo. Returning `true` stops scope
+      // dispatch here without triggering Keymap's preventDefault, so
+      // the DOM keydown reaches the textarea and native undo runs.
+      composerScope.register(["Mod"], "z", () => true);
+      composerScope.register(["Mod", "Shift"], "z", () => true);
       (this.app as any).keymap?.pushScope(composerScope);
     };
     const popComposerScope = (): void => {
@@ -3974,12 +4048,11 @@ export class StashpadView extends ItemView {
       else setExpanded(true);
     };
     applyNarrow();
-    // Multi-frame retry — composer.clientWidth is sometimes 0 on the
-    // first synchronous call inside render() before layout. Re-apply
-    // a couple of times so the class is correct without needing the
-    // observer to fire.
+    // 0.63.6 perf: drop the 100ms setTimeout retry — the rAF below
+    // catches the post-layout width, and the observer covers later
+    // changes. The extra setTimeout fired on every arrow-key render
+    // for no observable benefit.
     requestAnimationFrame(applyNarrow);
-    setTimeout(applyNarrow, 100);
     const ro = new ResizeObserver(applyNarrow);
     ro.observe(composer);
     this.composerNarrowObserver?.disconnect();
@@ -4022,13 +4095,18 @@ export class StashpadView extends ItemView {
 
     ta.addEventListener("keydown", (e) => {
       const submitsOnEnter = this.modeEnterSubmits;
-      // Cmd+Z / Cmd+Shift+Z: when the composer is empty (typically right after submit),
-      // route to Stashpad's undo/redo instead of the textarea's native undo.
-      if (ta.value.length === 0) {
-        const cb = getSettings().bindings;
-        if (matchBinding(e, cb.undo)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdUndo(); return; }
-        if (matchBinding(e, cb.redo)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdRedo(); return; }
-      }
+      // 0.69.38: Mod+Z / Mod+Shift+Z inside the composer is ALWAYS
+      // routed to the textarea's native undo, regardless of whether
+      // the textarea is currently empty. Previously, when value.length
+      // was 0 we'd route to Stashpad's cmdUndo — intended as a "after
+      // submit, Mod+Z undoes the submit" shortcut. But that broke a
+      // common pattern: user types text → deletes it via keyboard
+      // shortcut (Cmd+Backspace etc.) → presses Mod+Z to restore.
+      // The textarea was now empty so Stashpad's undo fired instead
+      // of restoring the deleted text, often unwinding the prior
+      // note creation. To undo a Stashpad action from the composer
+      // now, blur first (Esc) — then Mod+Z hits the view-level
+      // binding.
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -4173,12 +4251,13 @@ export class StashpadView extends ItemView {
       void this.commitInListPicker();
       return;
     }
-    this.cursorIdx = idx;
-    // Track the FIRST id added to the current selection sequence — set
-    // when selection grows from empty, cleared when it goes back to
-    // empty. Esc collapses multi-select down to this anchor.
+    // 0.63.5: defer setting cursorIdx until we know the click's intent.
+    // Mod-click-deselect should NOT move the cursor onto the just-
+    // deselected row (the residual is-cursor highlight is what the user
+    // perceived as a "thin highlight left behind").
     const wasEmpty = this.selection.size === 0;
     if (e.shiftKey && this.lastSelected) {
+      this.cursorIdx = idx;
       const lastIdx = this.currentChildren.findIndex((n) => n.id === this.lastSelected);
       if (wasEmpty) this.firstSelectedId = this.lastSelected;
       if (lastIdx !== -1) {
@@ -4187,13 +4266,27 @@ export class StashpadView extends ItemView {
       } else this.selection.add(node.id);
     } else if (e.metaKey || e.ctrlKey) {
       if (this.selection.has(node.id)) {
+        // Deselect — keep cursor off this row entirely. Move it to the
+        // most-recently-selected remaining note when possible.
         this.selection.delete(node.id);
         if (this.firstSelectedId === node.id) this.firstSelectedId = null;
+        if (this.lastSelected === node.id) {
+          this.lastSelected = this.selection.size > 0 ? [...this.selection][this.selection.size - 1] : null;
+        }
+        if (this.selection.size === 0) {
+          this.cursorIdx = -1;
+        } else {
+          const fallbackId = this.lastSelected ?? [...this.selection][this.selection.size - 1];
+          const fallbackIdx = fallbackId ? this.currentChildren.findIndex((n) => n.id === fallbackId) : -1;
+          if (fallbackIdx >= 0) this.cursorIdx = fallbackIdx;
+        }
       } else {
+        this.cursorIdx = idx;
         if (wasEmpty) this.firstSelectedId = node.id;
         this.selection.add(node.id);
       }
     } else if (this.mobileSelectMode) {
+      this.cursorIdx = idx;
       // In explicit select mode: taps toggle membership. Tap the select
       // button (top-right) to exit — that collapses to the first added.
       if (this.selection.has(node.id)) {
@@ -4205,12 +4298,17 @@ export class StashpadView extends ItemView {
     } else {
       // Plain click: replace the selection. Reset firstSelectedId so
       // the new anchor is this node.
+      this.cursorIdx = idx;
       this.selection.clear();
       this.selection.add(node.id);
       this.firstSelectedId = node.id;
+      this.lastSelected = node.id;
     }
     if (this.selection.size === 0) this.firstSelectedId = null;
-    this.lastSelected = node.id;
+    // 0.63.5: only stamp lastSelected when the click ADDED the row.
+    // The Mod-deselect branch already chose a fallback lastSelected
+    // (or cleared it); the plain/shift/add paths set it inline.
+    if (this.selection.has(node.id)) this.lastSelected = node.id;
     this.viewRoot.focus({ preventScroll: true });
     this.render();
     this.revealCursorRow();
@@ -4356,6 +4454,7 @@ export class StashpadView extends ItemView {
     if (matchBinding(e, b.setColor)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetColor(); return; }
     // 0.59.0: select all visible notes.
     if (matchBinding(e, b.selectAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSelectAll(); return; }
+    if (matchBinding(e, b.swapWithParent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdSwapWithParent(); return; }
 
     // Stashpad undo/redo when focus is on the view (not the composer).
     if (matchBinding(e, b.undo)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdUndo(); return; }
@@ -4446,6 +4545,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.clone)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdClone(); return; }
       if (matchBinding(e, sb.insertTemplate)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInsertTemplate(); return; }
       if (matchBinding(e, sb.toggleExpand)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdToggleExpand(); return; }
+      if (matchBinding(e, sb.togglePin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdTogglePin(); return; }
     }
     // Allow E / T from focused-header context too (no selection / cursor required).
     const focused = this.tree.get(this.focusId);
@@ -4463,9 +4563,29 @@ export class StashpadView extends ItemView {
   private selectCursor(shift: boolean): void {
     const node = this.currentChildren[this.cursorIdx];
     if (!node) return;
-    if (!shift) this.selection.clear();
-    this.selection.add(node.id);
-    this.lastSelected = node.id;
+    if (!shift) {
+      this.selection.clear();
+      this.selection.add(node.id);
+      this.firstSelectedId = node.id;
+      this.lastSelected = node.id;
+    } else {
+      // 0.63.5: shift-arrow now maintains selection as the RANGE between
+      // the anchor (firstSelectedId) and the current cursor. Backing up
+      // toward the anchor drops the just-passed rows from the selection.
+      // Mirrors text-editor / file-explorer multi-select conventions.
+      const anchorId = this.firstSelectedId ?? node.id;
+      const anchorIdx = this.currentChildren.findIndex((n) => n.id === anchorId);
+      if (anchorIdx === -1) {
+        this.selection.add(node.id);
+        this.firstSelectedId = node.id;
+      } else {
+        const [a, b] = anchorIdx < this.cursorIdx ? [anchorIdx, this.cursorIdx] : [this.cursorIdx, anchorIdx];
+        this.selection.clear();
+        for (let i = a; i <= b; i++) this.selection.add(this.currentChildren[i].id);
+        this.firstSelectedId = anchorId;
+      }
+      this.lastSelected = node.id;
+    }
     this.render();
     this.revealCursorRow();
   }
@@ -4581,10 +4701,73 @@ export class StashpadView extends ItemView {
     }).open();
   }
 
+  /** 0.69.35: track the currently-open Stashpad search modal so a
+   *  second press of the keybind selects-all in the existing modal's
+   *  input (escape any popover the user is in + clear-by-typing). */
+  private openSearchInstance: StashpadSuggest | null = null;
   openSearchModal(): void {
-    new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+    // If a search modal is already open, focus its input + select all
+    // so the next keystroke replaces the query. Don't stack a new modal.
+    if (this.openSearchInstance) {
+      const existing = (this.openSearchInstance as any).inputEl as HTMLInputElement | undefined;
+      if (existing) {
+        existing.focus();
+        existing.select();
+      }
+      return;
+    }
+    const instance = new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
       mode: "search", placeholder: "Search Stashpad notes…",
-      allowCreate: false,
+      // 0.69.22 / 0.69.24 / 0.69.25: Create flow opens a destination
+      // picker. The picker spans EVERY searchable Stashpad folder so
+      // the user can drop the new note under any parent across the
+      // vault — not just within the active folder. Picking a
+      // cross-folder parent switches the view to that folder first
+      // (via setFolderOverride / rebuild), then creates the note
+      // under the picked parent.
+      allowCreate: true,
+      onCreate: async (q) => {
+        const trimmed = q.trim();
+        if (!trimmed) return;
+        new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+          mode: "pick",
+          placeholder: `Create "${trimmed}" under which note?`,
+          allowCreate: false,
+          crossFolderNotes: () => this.collectCrossFolderNotes(),
+          folderResults: () => this.plugin.discoverStashpadFolders().filter((f) => f !== this.noteFolder),
+          localFolder: this.noteFolder,
+          // 0.69.26: always spawn a NEW Stashpad tab on the picked
+          // parent's folder + focus, then create the note in that
+          // fresh view. Avoids hijacking the current tab and works
+          // identically for local and cross-folder parent picks.
+          onPick: async (picked) => {
+            const parentId = picked.crossFolder
+              ? picked.id.replace(/^cross:/, "")
+              : picked.node?.id;
+            const folder = picked.crossFolder ?? this.noteFolder;
+            if (!parentId) return;
+            const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
+            const ws = this.app.workspace;
+            const leaf = ws.getLeaf("tab");
+            await leaf.setViewState({
+              type: STASHPAD_VIEW_TYPE,
+              active: true,
+              state: {
+                focusId: parentId,
+                folderOverride: folder === settingsFolder ? null : folder,
+              },
+            });
+            ws.revealLeaf(leaf);
+            // The freshly-mounted view rebuilt its tree during
+            // setViewState. Reach into it to create the note + navigate.
+            const newView = leaf.view as any;
+            if (newView && typeof newView.createNoteUnder === "function") {
+              const newId = await newView.createNoteUnder(trimmed, parentId);
+              if (newId && typeof newView.navigateTo === "function") newView.navigateTo(newId);
+            }
+          },
+        }).open();
+      },
       onPick: (item) => {
         // 0.57.3: folder-open picks open the target folder in a new tab,
         // leaving the current tab on its current folder. Useful for
@@ -4605,7 +4788,19 @@ export class StashpadView extends ItemView {
       },
       crossFolderNotes: () => this.collectCrossFolderNotes(),
       folderResults: () => this.plugin.discoverStashpadFolders().filter((f) => f !== this.noteFolder),
-    }).open();
+      // 0.64.0: search modal gets the filter chips row.
+      showFilterChips: true,
+      // 0.69.3: show the active folder badge on local results too.
+      localFolder: this.noteFolder,
+    });
+    this.openSearchInstance = instance;
+    // Wrap onClose to clear our tracked reference when the modal closes.
+    const prevOnClose = instance.onClose.bind(instance);
+    instance.onClose = (): void => {
+      prevOnClose();
+      if (this.openSearchInstance === instance) this.openSearchInstance = null;
+    };
+    instance.open();
   }
 
   /** Walk the vault for every Stashpad note that lives in a folder
@@ -4656,7 +4851,7 @@ export class StashpadView extends ItemView {
               .replace(/-/g, " ");
           }
         }
-        out.push({ file, folder, id, title, body: "", parentBlurb });
+        out.push({ file, folder, id, title, body: "", parentBlurb, parentId: parentId ?? null });
       }
     }
     return out;
@@ -4813,6 +5008,9 @@ export class StashpadView extends ItemView {
       // destination picker uses, so a move can target "Home of folder X"
       // as a one-shot result without searching for it.
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
+      // 0.64.1: move picker also gets the advanced filter chips — same
+      // in:/before:/after:/on: syntax helps narrow long destination lists.
+      showFilterChips: true,
     }).open();
   }
 
@@ -5314,6 +5512,19 @@ export class StashpadView extends ItemView {
     createdPaths: string[],
   ): Promise<StashpadId | null> {
     if (!source.file) return null;
+    // 0.67.4: SAFETY CHECK — refuse to clone a node into itself or a
+    // descendant of itself. Previously, picking the Home note as the
+    // insert-template target made cloneSubtree recurse infinitely:
+    // each iteration added a clone to Home's children, which the
+    // for-loop below then saw and cloned again, ad infinitum.
+    if (source.id === newParent || this.isDescendant(newParent, source.id)) {
+      new Notice(`Can't insert "${this.titleForNode(source)}" into itself or a descendant — that would loop forever.`);
+      return null;
+    }
+    // SNAPSHOT children NOW, before insertSynthetic mutates source's
+    // parent's children list. Otherwise the just-inserted clone shows
+    // up in the iteration and we recurse onto it.
+    const childrenSnapshot = this.tree.getChildren(source.id).slice();
     const sourceFile = source.file;
     const oldRaw = await this.app.vault.read(sourceFile);
     const body = this.stripFrontmatter(oldRaw);
@@ -5367,8 +5578,10 @@ export class StashpadView extends ItemView {
       this.fmSync.scheduleParentChange(cloneId, null, newParent);
     }
 
-    // Recurse into children — each becomes a child of the just-cloned node.
-    for (const c of this.tree.getChildren(source.id)) {
+    // Recurse into children — each becomes a child of the just-cloned
+    // node. 0.67.4: use the pre-insert snapshot, NEVER call
+    // getChildren again at this depth.
+    for (const c of childrenSnapshot) {
       await this.cloneSubtree(c, cloneId, createdPaths);
     }
     return cloneId;
@@ -5496,6 +5709,10 @@ export class StashpadView extends ItemView {
   // --- Navigation ---
 
   private navigateTo(id: StashpadId, opts: { keepForwardStack?: boolean } = {}): void {
+    // 0.67.0: record pre-change state so back can return here. Skip
+    // when keepForwardStack:true (the legacy "we're navigating via
+    // back/forward, don't disturb history" signal).
+    if (!opts.keepForwardStack) this.recordNavState();
     // 0.56.9: invalidate pending tryReselect timers from prior mutations so
     // they don't apply a stale selection in the new focus.
     this.selectionGuardKey++;
@@ -5504,8 +5721,6 @@ export class StashpadView extends ItemView {
       // so returning restores to it via scroll-to-id.
       this.stampSelectedCursor(true);
     }
-    // Stash current focus's draft before switching.
-    if (!opts.keepForwardStack) this.navForwardStack = [];
     this.focusId = id;
     this.persistFocus();
     this.defaultCursorToLast();
@@ -5540,19 +5755,63 @@ export class StashpadView extends ItemView {
     this.viewRoot.focus({ preventScroll: true });
   }
 
-  /** Mouse "back" button — alias for navigating to the parent. */
-  navigateBack(): void { this.navigateUp(); }
-  /** Mouse "forward" button — re-enter the last child you came back from, if any. */
+  /** Browser-style back: pop the back stack, push current onto forward,
+   *  apply. 0.67.0 — restores folder switches too, not just tree-up.
+   *  0.67.2: when the back stack is empty (e.g. fresh reload), fall
+   *  through to navigateUp so the user still has a way to climb out
+   *  of a deeply-focused state. */
+  navigateBack(): void {
+    const target = this.navBackStack.pop();
+    if (!target) {
+      // Fallback: walk up the tree if there's anywhere to go.
+      if (this.focusId !== ROOT_ID) this.navigateUp();
+      return;
+    }
+    this.navForwardSnapshots.push(this.captureNavSnapshot());
+    void this.applyNavSnapshot(target);
+  }
+  /** Browser-style forward: pop forward, push current onto back, apply. */
   navigateForward(): void {
-    const id = this.navForwardStack.pop();
-    if (!id) return;
-    if (!this.tree.get(id)) return;
-    // History nav clears any active tag/color filter — the user has
-    // changed context and probably doesn't expect filters to keep
-    // applying.
+    const target = this.navForwardSnapshots.pop();
+    if (!target) return;
+    this.navBackStack.push(this.captureNavSnapshot());
+    void this.applyNavSnapshot(target);
+  }
+
+  /** Apply a {folder, focusId} snapshot to the live view, handling the
+   *  cross-folder case (delegate to setFolderOverride with skipHistory)
+   *  and the intra-folder case (just navigate). 0.67.0. */
+  private async applyNavSnapshot(snap: NavSnapshot): Promise<void> {
     this.tagFilter = null;
     this.colorFilter = null;
-    this.navigateTo(id, { keepForwardStack: true });
+    if (snap.folder !== this.noteFolder) {
+      await this.setFolderOverride(snap.folder, { skipHistory: true });
+      // After folder switch the view is at ROOT_ID; nudge focus to the
+      // captured focusId if it differs and exists in the new tree.
+      if (snap.focusId !== this.focusId && this.tree.get(snap.focusId)) {
+        this.focusId = snap.focusId;
+        this.render({ kind: "preserve" });
+      }
+      return;
+    }
+    if (!this.tree.get(snap.focusId)) return;
+    this.selectionGuardKey++;
+    if (this.listEl) this.stampSelectedCursor(true);
+    this.focusId = snap.focusId;
+    this.persistFocus();
+    this.defaultCursorToLast();
+    this.syncComposerDraftForFocus();
+    const savedCursorId = this.lastCursorByFocus.get(snap.focusId);
+    let policy: ScrollPolicy;
+    if (savedCursorId && this.tree.get(savedCursorId)) {
+      this.pendingFocusIds = [savedCursorId];
+      policy = { kind: "scroll-to-id", id: savedCursorId, align: "start" };
+    } else {
+      policy = { kind: "preserve" };
+    }
+    this.render(policy);
+    this.refreshHeaderTitle();
+    this.viewRoot.focus({ preventScroll: true });
   }
 
   private navigateUp(): void {
@@ -5562,9 +5821,16 @@ export class StashpadView extends ItemView {
     this.tagFilter = null;
     this.colorFilter = null;
     const node = this.tree.get(this.focusId);
-    if (!node || node.parent == null) return this.navigateTo(ROOT_ID);
+    if (!node || node.parent == null) {
+      // Already at home — if there's history, go back through it instead
+      // of being a dead-end.
+      if (this.navBackStack.length > 0) { this.navigateBack(); return; }
+      return this.navigateTo(ROOT_ID);
+    }
     const cameFrom = this.focusId;
-    this.navForwardStack.push(cameFrom);
+    // 0.67.0: record current state on the back stack so a subsequent
+    // back can return here. navigateUp is itself a recordable nav.
+    this.recordNavState();
     if (this.listEl) {
       // Stamp the focus we're leaving (`cameFrom`), not the new focus.
       const cur = this.currentChildren[this.cursorIdx];
@@ -5945,6 +6211,31 @@ export class StashpadView extends ItemView {
     this.lastSelected = this.currentChildren[this.currentChildren.length - 1].id;
     this.cursorIdx = this.currentChildren.length - 1;
     this.render();
+  }
+
+  /** Toggle the sidebar-pin state of every action-target (cursor row or
+   *  selection; falls back to focused note). 0.68.1. */
+  async cmdTogglePin(): Promise<void> {
+    let targets = this.getActionTargets();
+    if (targets.length === 0) {
+      const focused = this.tree.get(this.focusId);
+      if (focused?.file) targets = [focused];
+    }
+    if (targets.length === 0) { new Notice("Nothing to pin."); return; }
+    // If any target is unpinned, pin all; else unpin all (mirrors
+    // cmdToggleComplete's "majority-toward-action" heuristic).
+    const anyUnpinned = targets.some((t) => !this.plugin.isPinned({ folder: this.noteFolder, id: t.id }));
+    let pinned = 0, unpinned = 0;
+    for (const t of targets) {
+      const ref = { folder: this.noteFolder, id: t.id };
+      if (anyUnpinned) {
+        if (!this.plugin.isPinned(ref)) { await this.plugin.pinNote(ref); pinned++; }
+      } else {
+        if (this.plugin.isPinned(ref)) { await this.plugin.unpinNote(ref); unpinned++; }
+      }
+    }
+    if (pinned > 0) new Notice(`Pinned ${pinned} note${pinned === 1 ? "" : "s"} to sidebar.`);
+    else if (unpinned > 0) new Notice(`Unpinned ${unpinned} note${unpinned === 1 ? "" : "s"} from sidebar.`);
   }
 
   async cmdToggleComplete(): Promise<void> {
@@ -7708,6 +7999,16 @@ export class StashpadView extends ItemView {
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => this.cmdMovePicker()));
     menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => { await this.changeParent(node, ROOT_ID); }));
+    // 0.68.0: pin / unpin from the sidebar Pinned Notes panel.
+    const pinRef = { folder: this.noteFolder, id: node.id };
+    const pinned = this.plugin.isPinned(pinRef);
+    menu.addItem((it: any) => it
+      .setTitle(pinned ? "Unpin from sidebar" : "Pin to sidebar")
+      .setIcon(pinned ? "pin-off" : "pin")
+      .onClick(async () => {
+        if (pinned) await this.plugin.unpinNote(pinRef);
+        else await this.plugin.pinNote(pinRef);
+      }));
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
@@ -7882,6 +8183,238 @@ export class StashpadView extends ItemView {
     }).open();
   }
 
+  /** Swap a note with its direct parent — the user's "ouroboros"
+   *  feature. Net effect:
+   *  - The child takes the parent's slot (under the grandparent).
+   *  - The parent slides under the child, in front of any existing
+   *    children of the child.
+   *  - All other descendants stay attached to their immediate parents.
+   *
+   *  Algorithmically this is just two frontmatter writes (one for each
+   *  note's `parent` field) plus an ordering update under the
+   *  grandparent and the child. Tree rebuilds from frontmatter so the
+   *  new shape materialises automatically. 0.63.0. */
+  async cmdSwapWithParent(): Promise<void> {
+    // 0.63.1: pick the CURSOR ROW explicitly (not getActionTargets()'s
+    // "first selected"). Multi-selection's "first" was insertion-order
+    // dependent — confusing. The cursor row is what the user is
+    // visually focused on.
+    const node = this.cursorIdx >= 0 ? this.currentChildren[this.cursorIdx] : null;
+    if (!node?.file) { new Notice("Pick a note first (move the cursor onto it)."); return; }
+    if (!node.parent || node.parent === ROOT_ID) {
+      new Notice("Already at Home — no parent to swap with.");
+      return;
+    }
+    const parent = this.tree.get(node.parent);
+    if (!parent?.file) { new Notice("Couldn't find the parent note."); return; }
+    const grandparent: StashpadId = parent.parent ?? ROOT_ID;
+    // 0.63.3: terser modal copy per user feedback — title + one line of
+    // "X becomes child of Y", plus an optional sibling-count footer.
+    const nodeTitle = this.titleForNode(node);
+    const parentTitle = this.titleForNode(parent);
+    const siblingCount = this.tree.getChildren(parent.id).filter((c) => c.id !== node.id).length;
+    const lines = [
+      `"${parentTitle}" becomes a child of "${nodeTitle}".`,
+    ];
+    if (siblingCount > 0) {
+      lines.push(`${siblingCount} sibling${siblingCount === 1 ? "" : "s"} move with it.`);
+    }
+    new ConfirmModal(
+      this.app,
+      "Swap notes?",
+      lines.join("\n"),
+      "Swap",
+      async (ok) => {
+        if (!ok) return;
+        await this.swapParentChild(parent, node, grandparent);
+      },
+    ).open();
+  }
+
+  /** Modal recovery flow when the user tries to nest a note under one
+   *  of its own descendants — instead of silently refusing (the old
+   *  warning toast) or crashing (the pre-0.63.0 freeze), offer the
+   *  swap as the "did you mean this?" path. */
+  private offerSwapForDescendantMove(node: TreeNode, descendantId: StashpadId): void {
+    const desc = this.tree.get(descendantId);
+    if (!desc?.file) {
+      this.plugin.notifications.show({
+        message: `Can't nest "${this.titleForNode(node)}" under one of its own descendants — that would create a cycle.`,
+        kind: "warning", category: "move", affectedIds: [node.id], folder: this.noteFolder,
+      });
+      return;
+    }
+    // Only direct-parent ↔ direct-child swaps are supported in this MVP.
+    // For non-adjacent (descendant is a grandchild or deeper), show the
+    // legacy warning so the user knows it's structurally complex.
+    if (desc.parent !== node.id) {
+      this.plugin.notifications.show({
+        message: `Can't nest "${this.titleForNode(node)}" under "${this.titleForNode(desc)}" — it's a deeper descendant. Only direct parent ↔ child swaps are supported (try moving "${this.titleForNode(desc)}" up first, then swap).`,
+        kind: "warning", category: "move", affectedIds: [node.id, desc.id], folder: this.noteFolder,
+      });
+      return;
+    }
+    // Direct parent → child case — offer the swap. Terse 0.63.3 copy.
+    const nodeTitle = this.titleForNode(node);
+    const descTitle = this.titleForNode(desc);
+    const siblingCount = this.tree.getChildren(node.id).filter((c) => c.id !== desc.id).length;
+    const lines = [
+      `"${nodeTitle}" becomes a child of "${descTitle}".`,
+    ];
+    if (siblingCount > 0) {
+      lines.push(`${siblingCount} sibling${siblingCount === 1 ? "" : "s"} move with it.`);
+    }
+    new ConfirmModal(
+      this.app,
+      "Confirm Note Swap",
+      lines.join("\n"),
+      "Swap",
+      async (ok) => {
+        if (!ok) return;
+        const gp: StashpadId = node.parent ?? ROOT_ID;
+        await this.swapParentChild(node, desc, gp);
+      },
+    ).open();
+  }
+
+  /** Execute a parent ↔ child swap. Assumes `child.parent === parent.id`
+   *  (caller validates).
+   *
+   *  Post-swap shape per user request (0.63.1):
+   *  - `child` takes `parent`'s slot under `grandparent`.
+   *  - `parent` slides under `child` with NO children of its own.
+   *  - All of `parent`'s OTHER children (the to-be-swapped child's
+   *    former siblings) ALSO move under `child` — they become siblings
+   *    of `parent` rather than staying with it. So if A had B, C, T, …
+   *    and T is promoted, T ends up with {A, B, C, …} as children
+   *    and A is empty.
+   *  - `child`'s ORIGINAL children stay under `child` (they were
+   *    already there).
+   *
+   *  Frontmatter write order is cycle-safe at every step. Pushes a
+   *  single undo entry that reverses all changes in cycle-safe order
+   *  too. 0.63.1. */
+  private async swapParentChild(parent: TreeNode, child: TreeNode, grandparent: StashpadId): Promise<void> {
+    if (!parent.file || !child.file) return;
+    if (child.parent !== parent.id) {
+      new Notice("Swap aborted: parent/child relationship changed.");
+      return;
+    }
+    const folder = this.noteFolder;
+    const priorParentParent = parent.parent;
+    // Capture parent's OTHER children (siblings of `child`) BEFORE
+    // any mutations — they'll all be re-parented to `child` so they
+    // surface as siblings of `parent` post-swap.
+    const otherChildren = this.tree.getChildren(parent.id)
+      .filter((c) => c.id !== child.id)
+      .filter((c): c is TreeNode & { file: TFile } => !!c.file);
+    const otherChildPriors = otherChildren.map((c) => ({ id: c.id, path: c.file.path, was: c.parent }));
+    // Snapshot orderings so undo can restore them verbatim.
+    const gpOrder = this.order.getOrder(folder, grandparent).slice();
+    const childOrder = this.order.getOrder(folder, child.id).slice();
+    const parentOrder = this.order.getOrder(folder, parent.id).slice();
+
+    // ---- Forward writes — cycle-safe order ----
+    // (a) child.parent → grandparent. Both child and parent are now
+    //     siblings under grandparent — no cycle.
+    await this.app.fileManager.processFrontMatter(child.file, (fm) => { fm.parent = grandparent; });
+    this.fmSync.scheduleParentChange(child.id, parent.id, grandparent);
+    // (b) parent.parent → child.id. parent slides under child; child is
+    //     under grandparent — still no cycle.
+    await this.app.fileManager.processFrontMatter(parent.file, (fm) => { fm.parent = child.id; });
+    this.fmSync.scheduleParentChange(parent.id, priorParentParent, child.id);
+    // (c) Re-parent each of parent's other children to `child` — they
+    //     become siblings of `parent` under `child`.
+    for (const oc of otherChildren) {
+      await this.app.fileManager.processFrontMatter(oc.file, (fm) => { fm.parent = child.id; });
+      this.fmSync.scheduleParentChange(oc.id, parent.id, child.id);
+    }
+
+    // ---- Ordering updates ----
+    // Grandparent: replace parent.id with child.id in-place. Tree
+    // rebuild fills order if there was no explicit one.
+    if (gpOrder.length > 0) {
+      const newGp = gpOrder.includes(parent.id)
+        ? gpOrder.map((id) => id === parent.id ? child.id : id)
+        : [...gpOrder.filter((id) => id !== child.id), child.id];
+      this.order.setOrder(folder, grandparent, newGp);
+    }
+    // Under child after swap: parent first (just demoted), then child's
+    // original children, then the former siblings (in their original
+    // order from parent's child list).
+    const formerSiblingIds = otherChildren.map((c) => c.id);
+    const newChildOrder = [
+      parent.id,
+      ...childOrder.filter((id) => id !== parent.id && !formerSiblingIds.includes(id)),
+      ...formerSiblingIds,
+    ];
+    this.order.setOrder(folder, child.id, newChildOrder);
+    // Parent has no children now — clear its order.
+    this.order.setOrder(folder, parent.id, []);
+    await this.order.save(folder);
+
+    await this.log.append({ type: "parent_change", id: child.id, payload: { from: parent.id, to: grandparent, reason: "swap" } });
+    await this.log.append({ type: "parent_change", id: parent.id, payload: { from: priorParentParent, to: child.id, reason: "swap" } });
+    for (const p of otherChildPriors) {
+      await this.log.append({ type: "parent_change", id: p.id, payload: { from: p.was, to: child.id, reason: "swap" } });
+    }
+
+    this.tree.rebuild(folder);
+    this.pendingFocusIds = [child.id];
+    this.render({ kind: "follow-cursor" });
+    this.plugin.notifications.show({
+      message: `Swapped "${this.titleForNode(child)}" ↔ "${this.titleForNode(parent)}".`,
+      kind: "success",
+      category: "move",
+      affectedIds: [child.id, parent.id, ...formerSiblingIds],
+      folder,
+    });
+
+    // ---- Undo — cycle-safe REVERSE order ----
+    // The trap: if we set child.parent=parent.id while parent.parent is
+    // still child.id, the tree has a 2-node cycle for the duration of
+    // the next render and tree.rebuild recurses forever → freeze. So
+    // restore parent.parent FIRST, then child.parent, then siblings.
+    this.plugin.getUndoStack(folder).push({
+      label: `Swap "${this.titleForNode(child)}" ↔ parent`,
+      undo: async () => {
+        const p = this.tree.get(parent.id);
+        const c = this.tree.get(child.id);
+        // 1) parent.parent back to its original. No cycle: parent
+        //    leaves child's subtree, child stays under grandparent.
+        if (p?.file) await this.app.fileManager.processFrontMatter(p.file, (fm) => {
+          if (priorParentParent == null || priorParentParent === ROOT_ID) {
+            delete fm.parent;
+            fm.parent = ROOT_ID;
+          } else {
+            fm.parent = priorParentParent;
+          }
+        });
+        // 2) child.parent back to parent.id. parent.parent is now the
+        //    original grandparent, so child going under parent is
+        //    cycle-free.
+        if (c?.file) await this.app.fileManager.processFrontMatter(c.file, (fm) => { fm.parent = parent.id; });
+        // 3) Re-parent each former sibling back to parent.id.
+        for (const op of otherChildPriors) {
+          const f = this.app.vault.getAbstractFileByPath(op.path) as TFile | null;
+          if (f) await this.app.fileManager.processFrontMatter(f, (fm) => {
+            if (op.was == null) fm.parent = ROOT_ID;
+            else fm.parent = op.was;
+          });
+        }
+        // 4) Restore orderings.
+        this.order.setOrder(folder, grandparent, gpOrder);
+        this.order.setOrder(folder, child.id, childOrder);
+        this.order.setOrder(folder, parent.id, parentOrder);
+        await this.order.save(folder);
+        this.tree.rebuild(folder);
+        this.pendingFocusIds = [parent.id];
+        this.render({ kind: "follow-cursor" });
+      },
+      redo: async () => { await this.swapParentChild(parent, child, grandparent); },
+    });
+  }
+
   private async changeParent(node: TreeNode, newParent: StashpadId, opts: { record?: boolean; quiet?: boolean } = { record: true }): Promise<void> {
     if (!node.file) return;
     const file = node.file;
@@ -7914,6 +8447,16 @@ export class StashpadView extends ItemView {
           affectedIds: [node.id],
           folder: this.noteFolder,
         });
+      }
+      return;
+    }
+    // 0.63.0 ouroboros: refuse to nest a note under one of its own
+    // descendants — that creates a cycle in the parent chain and
+    // tree.rebuild walks it infinitely → app freeze. The cycle-aware
+    // recovery flow is "swap": see cmdSwapWithParent / offerSwapForDescendantMove.
+    if (newParent !== ROOT_ID && this.isDescendant(newParent, node.id)) {
+      if (!opts.quiet) {
+        this.offerSwapForDescendantMove(node, newParent);
       }
       return;
     }
@@ -8111,7 +8654,7 @@ function extractCodeBlocks(body: string): Array<{ lang: string; code: string }> 
   return out;
 }
 
-function properCaseFolderPath(path: string): string {
+export function properCaseFolderPath(path: string): string {
   return path
     .split("/")
     .map((seg) => seg.split(" ").map((w) => (w && /^[a-z]/.test(w) ? w[0].toUpperCase() + w.slice(1) : w)).join(" "))

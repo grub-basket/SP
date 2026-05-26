@@ -782,7 +782,14 @@ export class ConfirmModal extends Modal {
   onOpen(): void {
     this.contentEl.empty();
     this.titleEl.setText(this.titleText);
-    this.contentEl.createEl("p", { text: this.message });
+    // 0.63.2: render each newline-separated sentence on its own line.
+    // Earlier the entire message was crammed into one <p> which
+    // collapsed newlines into single spaces — callers passing
+    // multi-sentence prose lost the formatting.
+    const block = this.contentEl.createDiv({ cls: "stashpad-confirm-body" });
+    for (const line of this.message.split("\n")) {
+      block.createDiv({ cls: "stashpad-confirm-line", text: line });
+    }
     const row = this.contentEl.createDiv({ cls: "stashpad-modal-btns" });
     const cancel = row.createEl("button", { text: "Cancel" });
     cancel.onclick = () => { this.didChoose = true; this.close(); this.onChoose(false); };
