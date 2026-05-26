@@ -836,6 +836,103 @@ export default class StashpadPlugin extends Plugin {
         setting.openTabById(this.manifest.id);
       },
     });
+    // 0.71.0 / 0.71.2: JD-style index builder.
+    // Two commands so the heavyweight "create Stashpad notes" is
+    // separable from the cheap single-file Preview that the user can
+    // inspect before committing.
+    const openSettingsToJd = (): void => {
+      const setting = (this.app as any).setting;
+      if (!setting?.open || !setting?.openTabById) return;
+      setting.open();
+      setting.openTabById(this.manifest.id);
+      // Scroll to the JD section if the heading is present.
+      setTimeout(() => {
+        const header = document.getElementById("stashpad-jd-index-section");
+        header?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 100);
+    };
+    this.addCommand({
+      id: "stashpad-preview-jd-index",
+      name: "Preview JD index (overwrites home note body)",
+      callback: async () => {
+        try {
+          const { buildJdIndexPreview } = await import("./index-builder");
+          const result = await buildJdIndexPreview(this.app, this, this.settings);
+          if (result.error === "no-dest") {
+            new Notice("Set a Designated Stashpad folder for Index in settings first.", 6000);
+            openSettingsToJd();
+            return;
+          }
+          if (result.error === "no-home") {
+            new Notice(
+              `"${this.settings.jdIndexStashpadFolder}" has no Stashpad home note. Open the folder in Stashpad first to create one.`,
+              7000,
+            );
+            return;
+          }
+          const { buildJdPreviewNotice } = await import("./index-builder");
+          buildJdPreviewNotice(this.app, result);
+        } catch (err) {
+          console.error("[stashpad] preview failed", err);
+          new Notice(`Preview failed: ${(err as Error)?.message ?? err}`, 8000);
+        }
+      },
+    });
+    this.addCommand({
+      id: "stashpad-build-jd-index",
+      name: "Build JD index notes (creates Stashpad-note hierarchy)",
+      callback: async () => {
+        try {
+          const { buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal } = await import("./index-builder");
+          const dest = (this.settings.jdIndexStashpadFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
+          if (!dest) {
+            new Notice("Set a Designated Stashpad folder for Index in settings first.", 6000);
+            openSettingsToJd();
+            return;
+          }
+          const scan = scanForJdNotes(this.app, this, this.settings);
+          // 0.71.3: route through the confirm modal so first-time users
+          // see the "Preview first?" affordance + large-build warning.
+          const modal = new JdBuildConfirmModal(
+            this.app,
+            this,
+            this.settings,
+            scan.indexed.length,
+            async () => {
+              try {
+                const result = await buildJdIndexNotes(this.app, this, this.settings);
+                if (result.error === "no-dest") {
+                  new Notice("Set a Designated Stashpad folder for Index in settings first.", 6000);
+                  openSettingsToJd();
+                  return;
+                }
+                if (result.error === "dest-not-stashpad") {
+                  new Notice(
+                    `"${result.destFolder}" isn't a known Stashpad folder. Pick a real Stashpad folder in settings.`,
+                    7000,
+                  );
+                  openSettingsToJd();
+                  return;
+                }
+                this.settings.jdIndexHasBuilt = true;
+                await this.saveSettings();
+                new Notice(
+                  `Index built: ${result.created} created, ${result.updated} updated, ${result.skipped} skipped → ${result.destFolder}`,
+                  6000,
+                );
+              } catch (err) {
+                console.error("[stashpad] build failed", err);
+                new Notice(`Build failed: ${(err as Error)?.message ?? err}`, 8000);
+              }
+            },
+          );
+          modal.open();
+        } catch (err) {
+          console.error("[stashpad] build failed", err);
+          new Notice(`Build failed: ${(err as Error)?.message ?? err}`, 8000);
+        }
+      },
+    });
 
     // Drop-folder watcher: a .stash file appearing (created OR moved) inside any
     // "<stashpadFolder>/<dropSub>/" path gets auto-imported into that <stashpadFolder>.
@@ -1609,6 +1706,14 @@ export default class StashpadPlugin extends Plugin {
       if (typeof data.confirmBulkDelete !== "boolean") data.confirmBulkDelete = data.confirmMultiDelete;
       if (typeof data.confirmAttachmentDelete !== "boolean") data.confirmAttachmentDelete = data.confirmMultiDelete;
       delete data.confirmMultiDelete;
+    }
+    // 0.71.4: migrate jdIndexDestFolder (0.71.0 name) → jdIndexStashpadFolder
+    // (0.71.2 rename). Without this, users who configured the field
+    // before the rename would silently lose their value and the
+    // preview would land in no-dest territory.
+    if (typeof (data as any)?.jdIndexDestFolder === "string"
+        && typeof (data as any)?.jdIndexStashpadFolder !== "string") {
+      (data as any).jdIndexStashpadFolder = (data as any).jdIndexDestFolder;
     }
     this.settings = {
       ...DEFAULT_SETTINGS,

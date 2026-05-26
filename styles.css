@@ -3153,3 +3153,53 @@
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+
+/* 0.70.0 — Shared panel: filter chips row + author byline beneath
+   each row. Re-uses .stashpad-pinned-row styling for the rows. */
+.stashpad-shared-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-shared-chip {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-shared-chip:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-shared-chip.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+.stashpad-shared-author-select {
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-shared-row {
+  flex-wrap: wrap;
+}
+.stashpad-shared-meta {
+  flex: 1 0 100%;
+  font-size: 0.78em;
+  color: var(--text-faint);
+  padding-left: 28px; /* align under the title */
+  margin-top: -2px;
+}
+.stashpad-shared-empty {
+  padding: 12px;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+}

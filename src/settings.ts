@@ -1,4 +1,6 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting, TFile } from "obsidian";
+import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal, buildJdPreviewNotice } from "./index-builder";
+import { FolderSuggest } from "./folder-suggest";
 import type StashpadPlugin from "./main";
 import { RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { LogModal, ColorPickerModal, NotificationHistoryModal } from "./modals";
@@ -252,6 +254,35 @@ export interface StashpadSettings {
    *  Default 5000. Persisted alongside the live history in
    *  `<pluginDir>/notifications.json`. */
   notificationHistoryLimit: number;
+  /** 0.71.0 / 0.71.2: JD Index Builder. Two flavors:
+   *    - "Preview" → writes a single Index.md inside the designated
+   *      Stashpad folder, showing the would-be hierarchy + non-matches.
+   *      Useful before committing to the heavier build.
+   *    - "Build" → creates an actual Stashpad-note hierarchy in the
+   *      designated folder, one note per prefix, child→parent
+   *      relationships matching the dotted segments. */
+  jdIndexScope: "vault" | "folder";
+  jdIndexScopeFolder: string;
+  /** Designated Stashpad folder for the index. Must be a known
+   *  Stashpad folder (validated against discoverStashpadFolders).
+   *  Renamed from jdIndexDestFolder in 0.71.2 for clarity. */
+  jdIndexStashpadFolder: string;
+  jdIndexFile: string;
+  /** 0.71.2: by default, notes inside any known Stashpad folder are
+   *  EXCLUDED from the scan (the destination shouldn't index itself,
+   *  and other Stashpad folders are usually already organized). Toggle
+   *  on to include them anyway. */
+  jdIndexIncludeStashpadFolders: boolean;
+  /** 0.71.2: sort mode for word-only / mixed indexes. "natural" =
+   *  numbers first then alphabetical (default). "created" = sort by
+   *  source file's creation time (handy when the prefix doesn't carry
+   *  ordering, e.g. pure-word schemes). */
+  jdIndexSort: "natural" | "created";
+  /** 0.71.3: flag flips to true after the user's first successful
+   *  Build. Used by the confirm modal to lead with "Try Preview first"
+   *  before that — and to step back to the terser confirm once the
+   *  user has built once and presumably knows what they're doing. */
+  jdIndexHasBuilt: boolean;
   /** Per-folder composer draft text. Stored in the plugin's data.json. */
   drafts: Record<string, string>;
   /** Per-folder: the text most recently sent via Enter, used to suppress
@@ -302,6 +333,13 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   hideCompletedNotes: {},
   mutedNotificationCategories: [],
   notificationHistoryLimit: 5000,
+  jdIndexScope: "vault",
+  jdIndexScopeFolder: "",
+  jdIndexStashpadFolder: "",
+  jdIndexFile: "Index",
+  jdIndexIncludeStashpadFolders: false,
+  jdIndexSort: "natural",
+  jdIndexHasBuilt: false,
   drafts: {},
   lastSubmitted: {},
   bindings: buildDefaultBindings(),
@@ -440,7 +478,8 @@ export class StashpadSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Stashpad notes folder")
       .setDesc("Vault-relative folder where Stashpad stores its notes and attachments. Created on demand.")
-      .addText((t) =>
+      .addText((t) => {
+        new FolderSuggest(this.app, t.inputEl);
         t.setValue(this.plugin.settings.folder).setPlaceholder("Stashpad").onChange(async (v) => {
           const cleaned = (v || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.folder;
           const last = cleaned.split("/").filter(Boolean).pop() ?? "";
@@ -456,7 +495,8 @@ export class StashpadSettingTab extends PluginSettingTab {
           }
           this.plugin.settings.folder = cleaned;
           await this.plugin.saveSettings();
-        }));
+        });
+      });
 
     new Setting(containerEl)
       .setName("Stash import subfolder")
@@ -672,6 +712,9 @@ export class StashpadSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
+    // 0.71.0: JD Index Builder — settings UI rendered here.
+    this.renderJdIndexSection(containerEl);
+
     containerEl.createEl("h3", { text: "Keyboard shortcuts" });
     containerEl.createEl("p", {
       cls: "setting-item-description",
@@ -681,6 +724,207 @@ export class StashpadSettingTab extends PluginSettingTab {
     for (const meta of COMMAND_META) {
       this.renderBindingRow(containerEl, meta);
     }
+  }
+
+  /** 0.71.0: JD Index Builder settings section.
+   *
+   *  Generates a nested Index.md from notes whose basenames start with
+   *  a dotted prefix — pure JD ("11.01 Driver's license") or any
+   *  alphanumeric dotted scheme ("animal.duck.yellow Eggs"). Never
+   *  modifies anything but the Index file; non-indexed notes are
+   *  recorded inside the index itself so the user can see what didn't
+   *  match. */
+  private renderJdIndexSection(containerEl: HTMLElement): void {
+    const header = containerEl.createEl("h3", { text: "JD Index Builder" });
+    header.id = "stashpad-jd-index-section";
+    const blurb = containerEl.createEl("p", { cls: "setting-item-description" });
+    blurb.innerHTML =
+      'Builds a Johnny-Decimal-style index inside a designated Stashpad folder. Two commands:' +
+      '<br/><strong>Preview</strong> overwrites the designated folder&rsquo;s HOME note body with the would-be hierarchy + everything that didn&rsquo;t match. Frontmatter is preserved; everything below it is replaced.' +
+      '<br/><strong>Build</strong> creates an actual hierarchy of Stashpad notes (one per prefix), with child→parent relationships matching the dotted segments.' +
+      '<br/>Matches strict prefixes only: all-digits (<code>10 Life</code>) or alphanumeric-with-dots (<code>1.2 Family</code>, <code>animal.duck.yellow Eggs</code>). Mixed schemes sort numbers first, then alphabetically.';
+
+    const stashpadFolders = this.plugin.discoverStashpadFolders();
+
+    new Setting(containerEl)
+      .setName("Scope")
+      .setDesc("Scan the whole vault, or restrict to a single folder + its descendants.")
+      .addDropdown((d) => {
+        d.addOption("vault", "Entire vault");
+        d.addOption("folder", "Single folder");
+        d.setValue(this.plugin.settings.jdIndexScope ?? "vault");
+        d.onChange(async (v) => {
+          this.plugin.settings.jdIndexScope = (v === "folder" ? "folder" : "vault");
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      });
+
+    if ((this.plugin.settings.jdIndexScope ?? "vault") === "folder") {
+      new Setting(containerEl)
+        .setName("Scope folder")
+        .setDesc("Vault-relative path. Leave empty to fall back to the entire vault.")
+        .addText((t) => {
+          new FolderSuggest(this.app, t.inputEl);
+          t.setPlaceholder("Path/To/Folder");
+          t.setValue(this.plugin.settings.jdIndexScopeFolder ?? "");
+          t.onChange(async (v) => {
+            this.plugin.settings.jdIndexScopeFolder = (v || "").trim().replace(/^\/+|\/+$/g, "");
+            await this.plugin.saveSettings();
+          });
+        });
+    }
+
+    new Setting(containerEl)
+      .setName("Include Stashpad folders in scan")
+      .setDesc("By default, notes inside any known Stashpad folder are excluded — the index destination shouldn't index itself, and other Stashpad folders are usually already organized. Toggle on if you want them included anyway.")
+      .addToggle((t) => {
+        t.setValue(this.plugin.settings.jdIndexIncludeStashpadFolders === true);
+        t.onChange(async (v) => {
+          this.plugin.settings.jdIndexIncludeStashpadFolders = v;
+          await this.plugin.saveSettings();
+          this.display(); // refresh preview counts
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Designated Stashpad folder for Index")
+      .setDesc("Required. Must be a Stashpad folder. The index hierarchy is built here. New notes are created; nothing is deleted.")
+      .addText((t) => {
+        new FolderSuggest(this.app, t.inputEl);
+        t.setPlaceholder(stashpadFolders[0] ?? "(pick a Stashpad folder)");
+        t.setValue(this.plugin.settings.jdIndexStashpadFolder ?? "");
+        t.onChange(async (v) => {
+          this.plugin.settings.jdIndexStashpadFolder = (v || "").trim().replace(/^\/+|\/+$/g, "");
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Sort")
+      .setDesc("Order of entries within the same depth. Natural: numbers first then alphabetical (recommended). Created: by source file's creation time — handy when prefixes are word-only and don't carry ordering.")
+      .addDropdown((d) => {
+        d.addOption("natural", "Natural (numeric → alphabetical)");
+        d.addOption("created", "By creation time");
+        d.setValue(this.plugin.settings.jdIndexSort ?? "natural");
+        d.onChange(async (v) => {
+          this.plugin.settings.jdIndexSort = (v === "created" ? "created" : "natural");
+          await this.plugin.saveSettings();
+        });
+      });
+
+    // Preview line: shows current counts before building.
+    const scan = scanForJdNotes(this.app, this.plugin, this.plugin.settings);
+    const previewEl = containerEl.createEl("p", { cls: "setting-item-description" });
+    const skippedSuffix = scan.skippedStashpadNotes.length > 0
+      ? ` (${scan.skippedStashpadNotes.length} Stashpad-folder note${scan.skippedStashpadNotes.length === 1 ? "" : "s"} excluded by default)`
+      : "";
+    previewEl.setText(
+      `Preview: ${scan.indexed.length} note${scan.indexed.length === 1 ? "" : "s"} would be indexed, ` +
+      `${scan.nonIndex.length} would NOT be indexed${skippedSuffix}.`,
+    );
+
+    new Setting(containerEl)
+      .setName("Actions")
+      .setDesc("Preview aggressively overwrites the designated folder's HOME note body (frontmatter preserved). Build creates Stashpad notes (existing notes with the same jdPrefix are updated, not duplicated).")
+      .addButton((b) => {
+        b.setButtonText("Preview");
+        b.setTooltip("Overwrites the designated Stashpad folder's HOME note body with the preview.");
+        b.onClick(async () => {
+          try {
+            const result = await buildJdIndexPreview(this.app, this.plugin, this.plugin.settings);
+            if (result.error === "no-dest") {
+              new Notice("Set a Designated Stashpad folder for Index first.", 5000);
+              return;
+            }
+            if (result.error === "no-home") {
+              new Notice(
+                `"${this.plugin.settings.jdIndexStashpadFolder}" doesn't have a Stashpad home note. Open the folder in Stashpad first (it creates one automatically).`,
+                7000,
+              );
+              return;
+            }
+            buildJdPreviewNotice(this.app, result);
+            this.display();
+          } catch (err) {
+            console.error("[stashpad] preview failed", err);
+            new Notice(`Preview failed: ${(err as Error)?.message ?? err}`, 8000);
+          }
+        });
+      })
+      .addButton((b) => {
+        b.setButtonText("Build Stashpad notes");
+        b.setCta();
+        b.setTooltip("Create the Stashpad-note hierarchy. Existing notes with matching jdPrefix are updated.");
+        b.onClick(() => {
+          const dest = (this.plugin.settings.jdIndexStashpadFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
+          if (!dest) {
+            new Notice("Set a Designated Stashpad folder for Index first.", 5000);
+            return;
+          }
+          // 0.71.3: confirm via the JdBuildConfirmModal so first-time
+          // users get a "Preview first?" affordance (with a button that
+          // runs preview inline) and large builds get a sterner warning.
+          const modal = new JdBuildConfirmModal(
+            this.app,
+            this.plugin,
+            this.plugin.settings,
+            scan.indexed.length,
+            async () => {
+              try {
+                const result = await buildJdIndexNotes(this.app, this.plugin, this.plugin.settings);
+                if (result.error === "no-dest") {
+                  new Notice("Set a Designated Stashpad folder for Index first.", 5000);
+                  return;
+                }
+                if (result.error === "dest-not-stashpad") {
+                  new Notice(
+                    `"${result.destFolder}" isn't a known Stashpad folder. Pick a real Stashpad folder (or create one first).`,
+                    7000,
+                  );
+                  return;
+                }
+                this.plugin.settings.jdIndexHasBuilt = true;
+                await this.plugin.saveSettings();
+                new Notice(
+                  `Built: ${result.created} created, ${result.updated} updated, ${result.skipped} skipped → ${result.destFolder}`,
+                  6000,
+                );
+                this.display();
+              } catch (err) {
+                console.error("[stashpad] build failed", err);
+                new Notice(`Build failed: ${(err as Error)?.message ?? err}`, 8000);
+              }
+            },
+          );
+          modal.open();
+        });
+      })
+      .addButton((b) => {
+        b.setButtonText("Reveal in Finder");
+        b.setTooltip("Open the designated Stashpad folder in your OS file browser.");
+        b.onClick(async () => {
+          const dest = (this.plugin.settings.jdIndexStashpadFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
+          if (!dest) { new Notice("Set a Designated Stashpad folder for Index first.", 5000); return; }
+          const af = this.app.vault.getAbstractFileByPath(dest);
+          if (!af) {
+            new Notice(`Folder "${dest}" doesn't exist yet.`, 5000);
+            return;
+          }
+          try {
+            const basePath = (this.app.vault.adapter as any).basePath as string | undefined;
+            if (basePath) {
+              const { shell } = (window as any).require?.("electron") ?? {};
+              const fullPath = `${basePath}/${dest}`;
+              shell?.openPath?.(fullPath);
+            } else {
+              new Notice("Reveal in file system not supported on this platform.", 4000);
+            }
+          } catch (err) {
+            new Notice(`Couldn't open folder: ${(err as Error)?.message ?? err}`, 5000);
+          }
+        });
+      });
   }
 
   /** One Stashpad-folder row in the cross-Stashpad scope list. */

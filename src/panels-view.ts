@@ -11,11 +11,15 @@ import {
 /** Panel ids registered with the StashpadPanelsView. Future panels
  *  (e.g. recent activity, search results, attachments) add to this
  *  union; the master-panel button bar surfaces one button per id. */
-type PanelId = "pinned";
+type PanelId = "pinned" | "shared";
 
 /** Per-panel metadata used by the master button bar. */
 const PANEL_REGISTRY: Record<PanelId, { label: string; icon: string }> = {
   pinned: { label: "Pinned Notes", icon: "pin" },
+  // 0.70.0: Shared panel — surfaces notes you authored that have
+  // contributors AND notes in folders whose home you authored but
+  // someone else wrote.
+  shared: { label: "Shared", icon: "users" },
 };
 
 /** Sidebar view containing every Stashpad panel. The top of the view
@@ -83,6 +87,7 @@ export class StashpadPanelsView extends ItemView {
     }
     const body = root.createDiv({ cls: "stashpad-panels-body" });
     if (this.activePanel === "pinned") this.renderPinnedPanel(body);
+    else if (this.activePanel === "shared") this.renderSharedPanel(body);
   }
 
   // ---------- Pinned Notes panel ----------
@@ -355,6 +360,243 @@ export class StashpadPanelsView extends ItemView {
     const leaf = this.app.workspace.activeLeaf;
     if (leaf && leaf.view.getViewType() === STASHPAD_VIEW_TYPE) return leaf.view;
     return null;
+  }
+
+  // ---------- Shared panel (0.70.0) ----------
+
+  /** Active author-filter id. "all" = no filter; "mine" = author is me;
+   *  "others" = author is not me; or a specific authorId string. */
+  private sharedAuthorFilter: string = "all";
+  /** Toggle: only show notes that have at least one contributor.
+   *  Off by default; combined with the author filter via AND. */
+  private sharedContribOnly: boolean = false;
+
+  private renderSharedPanel(parent: HTMLElement): void {
+    const list = parent.createDiv({ cls: "stashpad-panel-shared" });
+    const myId = (this.plugin.settings.authorId ?? "").trim();
+    if (!myId) {
+      list.createDiv({ cls: "stashpad-shared-empty" })
+        .setText("Set an author name in Stashpad settings to populate Shared.");
+      return;
+    }
+    const shared = this.collectSharedNotes(myId);
+    // Distinct author ids present in the result set — fed to the
+    // author-filter dropdown so users can narrow to a specific person.
+    const authorSet = new Map<string, string>(); // id → display name
+    for (const s of shared) {
+      const aid = s.authorId;
+      if (aid && !authorSet.has(aid)) authorSet.set(aid, s.authorDisplay || aid);
+    }
+
+    // Filter chips row.
+    const filtersRow = list.createDiv({ cls: "stashpad-shared-filters" });
+    const mkChip = (label: string, active: boolean, onClick: () => void) => {
+      const c = filtersRow.createEl("button", { cls: "stashpad-shared-chip", text: label });
+      if (active) c.addClass("is-active");
+      c.onclick = onClick;
+      return c;
+    };
+    mkChip("All", this.sharedAuthorFilter === "all", () => {
+      this.sharedAuthorFilter = "all";
+      this.render();
+    });
+    mkChip("Mine", this.sharedAuthorFilter === "mine", () => {
+      this.sharedAuthorFilter = "mine";
+      this.render();
+    });
+    mkChip("Others", this.sharedAuthorFilter === "others", () => {
+      this.sharedAuthorFilter = "others";
+      this.render();
+    });
+    // Author-specific filter: a small dropdown when 2+ distinct authors
+    // appear in the result set. Otherwise the All/Mine/Others chips
+    // are sufficient.
+    if (authorSet.size > 1) {
+      const sel = filtersRow.createEl("select", { cls: "stashpad-shared-author-select" });
+      const optAll = sel.createEl("option", { text: "Any author" });
+      optAll.value = "__any__";
+      for (const [id, name] of authorSet) {
+        const o = sel.createEl("option", { text: name });
+        o.value = id;
+      }
+      const current = ["all", "mine", "others"].includes(this.sharedAuthorFilter)
+        ? "__any__"
+        : this.sharedAuthorFilter;
+      sel.value = current;
+      sel.onchange = () => {
+        const v = sel.value;
+        if (v === "__any__") this.sharedAuthorFilter = "all";
+        else this.sharedAuthorFilter = v;
+        this.render();
+      };
+    }
+    // Toggle: "Has contributors" — when on, only notes with >=1 contrib
+    // appear. Off = no filter on contributor count.
+    const contribBtn = filtersRow.createEl("button", {
+      cls: "stashpad-shared-chip",
+      text: "Has contributors",
+    });
+    if (this.sharedContribOnly) contribBtn.addClass("is-active");
+    contribBtn.onclick = () => {
+      this.sharedContribOnly = !this.sharedContribOnly;
+      this.render();
+    };
+
+    // Apply filters.
+    const filtered = shared.filter((s) => {
+      if (this.sharedContribOnly && s.contributorCount === 0) return false;
+      switch (this.sharedAuthorFilter) {
+        case "all": return true;
+        case "mine": return s.authorId === myId;
+        case "others": return s.authorId !== myId;
+        default: return s.authorId === this.sharedAuthorFilter;
+      }
+    });
+
+    if (filtered.length === 0) {
+      list.createDiv({ cls: "stashpad-shared-empty" })
+        .setText("No shared notes match the current filters.");
+      return;
+    }
+
+    // Render rows. Reuse the pinned-row visual styling — color icon +
+    // title + folder badge. Click navigates to that note in the MRU
+    // Stashpad tab (or activates one).
+    for (const s of filtered) {
+      const row = list.createDiv({ cls: "stashpad-pinned-row stashpad-shared-row" });
+      const icon = row.createSpan({ cls: "stashpad-pinned-icon" });
+      setIcon(icon, "users");
+      if (s.color) icon.style.color = s.color;
+      const label = row.createSpan({ cls: "stashpad-pinned-label", text: s.title });
+      label.onclick = () => this.openSharedFromPanel(s.folder, s.id);
+      const folderName = s.folder.split("/").pop() || s.folder;
+      row.createSpan({ cls: "stashpad-pinned-folder", text: folderName });
+      // Author byline beneath the title (shown when not "Mine" view).
+      if (s.authorDisplay) {
+        const meta = row.createSpan({ cls: "stashpad-shared-meta" });
+        meta.setText(
+          s.authorId === myId
+            ? `you · ${s.contributorCount} contributor${s.contributorCount === 1 ? "" : "s"}`
+            : `by ${s.authorDisplay}${s.contributorCount > 0 ? ` · ${s.contributorCount} contributor${s.contributorCount === 1 ? "" : "s"}` : ""}`,
+        );
+      }
+    }
+  }
+
+  /** Walk every searchable Stashpad folder and collect notes that
+   *  match the "shared" criteria:
+   *    - The note has at least one contributor in frontmatter, OR
+   *    - The user authored the home (root) note of the folder AND the
+   *      note in question is NOT authored by the user.
+   *  The two conditions are OR'd so the panel surfaces both
+   *  "things I started that others worked on" and "things others
+   *  added to a folder I own." */
+  private collectSharedNotes(myId: string): Array<{
+    file: TFile;
+    folder: string;
+    id: string;
+    title: string;
+    color: string | null;
+    authorId: string | null;
+    authorDisplay: string;
+    contributorCount: number;
+  }> {
+    const folders = this.plugin.discoverStashpadFolders();
+    const folderSet = new Set(folders);
+    // First pass: find the home-note author per folder (the root note
+    // is the one whose `id` frontmatter is ROOT_ID).
+    const homeAuthorByFolder = new Map<string, string | null>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folderSet.has(dir)) continue;
+      const fm = (this.app.metadataCache.getFileCache(f)?.frontmatter ?? {}) as any;
+      if (fm.id !== ROOT_ID) continue;
+      homeAuthorByFolder.set(dir, this.extractAuthorId(fm.author));
+    }
+
+    const out: Array<{
+      file: TFile;
+      folder: string;
+      id: string;
+      title: string;
+      color: string | null;
+      authorId: string | null;
+      authorDisplay: string;
+      contributorCount: number;
+    }> = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folderSet.has(dir)) continue;
+      // Skip _authors subfolder bookkeeping files.
+      if (dir.endsWith("/_authors") || f.path.includes("/_authors/")) continue;
+      const fm = (this.app.metadataCache.getFileCache(f)?.frontmatter ?? {}) as any;
+      if (typeof fm.id !== "string") continue;
+      // Skip the home note itself — it surfaces elsewhere via Home row.
+      if (fm.id === ROOT_ID) continue;
+      const authorId = this.extractAuthorId(fm.author);
+      const contributors: string[] = Array.isArray(fm.contributors)
+        ? fm.contributors.filter((c: any) => typeof c === "string")
+        : [];
+      const homeAuthor = homeAuthorByFolder.get(dir) ?? null;
+      const hasContributors = contributors.length > 0;
+      const ownsFolder = homeAuthor === myId;
+      const someoneElseWroteIt = authorId !== null && authorId !== myId;
+      const isShared = hasContributors || (ownsFolder && someoneElseWroteIt);
+      if (!isShared) continue;
+      const title = this.titleFromFile(f);
+      const color = typeof fm.color === "string" ? fm.color : null;
+      out.push({
+        file: f,
+        folder: dir,
+        id: fm.id,
+        title,
+        color,
+        authorId,
+        authorDisplay: this.extractAuthorDisplay(fm.author) || (authorId ?? ""),
+        contributorCount: contributors.length,
+      });
+    }
+    // Newest first by frontmatter `modified` (fall back to `created`).
+    out.sort((a, b) => {
+      const fmA = (this.app.metadataCache.getFileCache(a.file)?.frontmatter ?? {}) as any;
+      const fmB = (this.app.metadataCache.getFileCache(b.file)?.frontmatter ?? {}) as any;
+      const tA = (fmA.modified ?? fmA.created ?? "") as string;
+      const tB = (fmB.modified ?? fmB.created ?? "") as string;
+      return tB.localeCompare(tA);
+    });
+    return out;
+  }
+
+  /** Extract the author ID from a frontmatter author value (wikilink or
+   *  plain string). Mirrors the regex used in view.ts:3366. */
+  private extractAuthorId(raw: unknown): string | null {
+    if (typeof raw !== "string") return null;
+    const m = raw.match(/-([a-z0-9]{4,12})(?:\.md)?(?:\||\]\])/i);
+    return m ? m[1] : null;
+  }
+
+  /** Extract the display name portion of a `[[_authors/<name>-<id>]]`
+   *  or `[[_authors/<name>-<id>|alias]]` reference. */
+  private extractAuthorDisplay(raw: unknown): string {
+    if (typeof raw !== "string") return "";
+    // If aliased ([[...|alias]]), use the alias.
+    const aliased = raw.match(/\|([^\]]+)\]\]/);
+    if (aliased) return aliased[1].trim();
+    // Otherwise, strip wikilink syntax + path + trailing id.
+    const m = raw.match(/_authors\/([^\]|]+)-[a-z0-9]{4,12}/i);
+    if (m) return m[1].replace(/[-_]/g, " ").trim();
+    return "";
+  }
+
+  /** Navigate to a shared note: open the folder (in a new tab if it's
+   *  not the active one) and navigate to the note. */
+  private async openSharedFromPanel(folder: string, id: StashpadId): Promise<void> {
+    await this.plugin.activateViewForFolder(folder);
+    const target = this.plugin.lastActiveStashpadLeaf?.view as any
+      ?? this.findActiveStashpad();
+    if (target && typeof target.navigateTo === "function") {
+      target.navigateTo(id);
+    }
   }
 }
 
