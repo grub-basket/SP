@@ -5,22 +5,26 @@ import { newId } from "./id-service";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { ROOT_ID } from "./types";
 
-/** Match a JD-style prefix at the START of a note's basename followed by
- *  a single space and the human title. A prefix is either:
- *    - All digits (a top-level JD area: `10 Life`)
- *    - At least one dot between alphanumeric segments
- *      (`1.2 Family`, `11.01 Driver's license`, `animal.duck.yellow Eggs`)
- *  Sentences without a dotted shape don't match, so "Hello there" isn't
- *  accidentally indexed. Each segment must be pure alphanumeric — any
- *  non-alphanum (spaces, punctuation, underscores) inside the prefix
- *  span disqualifies it. */
-const PREFIX_RE = /^(\d+|[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+)\s+(.+)$/;
+/** Match a JD-style prefix at the START of a basename (file or folder)
+ *  followed by a single space and the human title. A prefix is one of:
+ *    - Range area: `\d+-\d+` (e.g. `10-19 Life Admin`).
+ *    - All digits: `\d+` (category, e.g. `11 Me & My Family`).
+ *    - Dotted alphanumeric (`11.01 Driver's license`,
+ *      `animal.duck.yellow Eggs`).
+ *  Sentences without one of those shapes don't match, so "Hello there"
+ *  isn't accidentally indexed. Each segment must be pure alphanumeric —
+ *  any other character inside the prefix span disqualifies it. */
+const PREFIX_RE = /^(\d+-\d+|\d+|[A-Za-z0-9]+(?:\.[A-Za-z0-9]+)+)\s+(.+)$/;
 
 export interface IndexEntry {
   prefix: string;
   segments: string[];
   title: string;
-  file: TFile;
+  /** The source. Exactly ONE of file or folder is set for "real"
+   *  entries; both null for synthetic parents (auto-created for gaps
+   *  in the hierarchy). */
+  file: TFile | null;
+  folder: TFolder | null;
 }
 
 export interface ScanResult {
@@ -30,6 +34,39 @@ export interface ScanResult {
    *  default-skip-stashpads rule. Surfaced separately so the user can
    *  see what got intentionally filtered. */
   skippedStashpadNotes: TFile[];
+}
+
+/** 0.71.14: JD areas (`10-19 Life Admin`) sit at the top of the
+ *  hierarchy; categories (`11 Me & My Family`) and IDs (`11.01 …`) fall
+ *  inside them by NUMERIC RANGE, not by dotted parent. Compute the
+ *  parent prefix for any entry by consulting the full prefix set. */
+function findParentPrefix(prefix: string, allPrefixes: Set<string>): string | null {
+  // Range area → top level.
+  if (/^\d+-\d+$/.test(prefix)) return null;
+  // Dotted prefix → parent is segments[:-1] if that exists in the
+  // set; otherwise climb until we find an ancestor that does, or fall
+  // through to the digit-range logic for the head segment.
+  if (prefix.includes(".")) {
+    const segs = prefix.split(".");
+    const direct = segs.slice(0, -1).join(".");
+    if (allPrefixes.has(direct)) return direct;
+    // Direct dotted parent isn't in the set — likely a synthetic gap.
+    // Try the next ancestor up.
+    return findParentPrefix(direct, allPrefixes);
+  }
+  // Pure-digit category → find the area whose [lo,hi] range contains it.
+  if (/^\d+$/.test(prefix)) {
+    const n = parseInt(prefix, 10);
+    for (const key of allPrefixes) {
+      const m = key.match(/^(\d+)-(\d+)$/);
+      if (!m) continue;
+      const lo = parseInt(m[1], 10);
+      const hi = parseInt(m[2], 10);
+      if (n >= lo && n <= hi) return key;
+    }
+    return null;
+  }
+  return null;
 }
 
 export interface BuildNotesResult {
@@ -55,10 +92,13 @@ export function scanForJdNotes(
   const allFiles = app.vault.getMarkdownFiles();
   const scoped = filterByScope(allFiles, settings);
 
-  // Build the set of folders to exclude. Default = all known Stashpad
-  // folders. Toggle off the exclusion if the user opts in.
   const includeStashpads = settings.jdIndexIncludeStashpadFolders === true;
   const stashpadFolders = includeStashpads ? new Set<string>() : new Set(plugin.discoverStashpadFolders());
+
+  const isInStashpad = (path: string): boolean => {
+    if (includeStashpads) return false;
+    return Array.from(stashpadFolders).some((sf) => path === sf || path.startsWith(sf + "/"));
+  };
 
   const indexed: IndexEntry[] = [];
   const nonIndex: TFile[] = [];
@@ -66,27 +106,49 @@ export function scanForJdNotes(
 
   for (const f of scoped) {
     const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-    // Skip if file is inside (or is a descendant of) any known Stashpad
-    // folder and the user hasn't opted-in to include them.
-    if (!includeStashpads) {
-      const inStashpad = Array.from(stashpadFolders).some((sf) => dir === sf || dir.startsWith(sf + "/"));
-      if (inStashpad) {
-        skippedStashpadNotes.push(f);
-        continue;
-      }
+    if (isInStashpad(dir)) {
+      skippedStashpadNotes.push(f);
+      continue;
     }
     const m = f.basename.match(PREFIX_RE);
     if (m) {
-      const prefix = m[1];
-      const title = m[2];
-      indexed.push({ prefix, segments: prefix.split("."), title, file: f });
+      indexed.push({ prefix: m[1], segments: m[1].split("."), title: m[2], file: f, folder: null });
     } else {
       nonIndex.push(f);
     }
   }
 
-  // Sort: numeric segments first / numeric-aware. For pure-word
-  // indexes, fall back to user's preferred sort (created vs alpha).
+  // 0.71.14: also walk folders in scope. JD areas/categories often
+  // exist as folder containers (e.g. `10-19 Life Admin/`, `11 Me &
+  // My Family/`) rather than as separate notes. Add matching folders
+  // as virtual entries so they appear in the hierarchy. Folders
+  // already inside a Stashpad are skipped under the same rule.
+  const folderScope = (settings.jdIndexScope ?? "vault") === "folder"
+    ? (settings.jdIndexScopeFolder ?? "").trim().replace(/^\/+|\/+$/g, "")
+    : "";
+  const walkFolders = (folder: TFolder): void => {
+    const path = folder.path.replace(/\/+$/, "");
+    // Folder scope filter (when "folder" mode is on).
+    if (folderScope && path && path !== folderScope && !path.startsWith(folderScope + "/")) {
+      // descend in case the configured scope is itself deeper than this
+      // folder — but skip the entry itself.
+    } else if (path) { // root folder ("") has empty path; skip self
+      if (!isInStashpad(path)) {
+        const m = folder.name.match(PREFIX_RE);
+        if (m) {
+          indexed.push({ prefix: m[1], segments: m[1].split("."), title: m[2], file: null, folder });
+        }
+        // Non-matching folders are NOT added to nonIndex — listing
+        // every random folder would be noise. Only file-level
+        // non-matches surface there.
+      }
+    }
+    for (const c of folder.children) {
+      if (c instanceof TFolder) walkFolders(c);
+    }
+  };
+  walkFolders(app.vault.getRoot());
+
   const sortMode = settings.jdIndexSort ?? "natural";
   indexed.sort((a, b) => compareEntries(a, b, sortMode));
   return { indexed, nonIndex, skippedStashpadNotes };
@@ -176,22 +238,27 @@ export async function buildJdIndexNotes(
 
   const scan = scanForJdNotes(app, plugin, settings);
 
-  // Build the full prefix tree. Add synthetic parents where a source
-  // exists deeper than its ancestors.
+  // Build the full prefix tree. Add synthetic dotted ancestors where
+  // a source exists deeper than its ancestors. Range-area ancestors
+  // are NOT auto-synthesized — if there's no `10-19` area, categories
+  // just live at root (don't materialize an empty area).
   const entries = new Map<string, IndexEntry | null>();
   for (const e of scan.indexed) entries.set(e.prefix, e);
   for (const e of scan.indexed) {
+    if (!e.prefix.includes(".")) continue;
     for (let i = 1; i < e.segments.length; i++) {
       const ancestor = e.segments.slice(0, i).join(".");
-      if (!entries.has(ancestor)) entries.set(ancestor, null); // synthetic placeholder
+      if (!entries.has(ancestor)) entries.set(ancestor, null);
     }
   }
-  // Sort prefixes so parents come before children.
-  const sortedPrefixes = Array.from(entries.keys()).sort((a, b) => {
-    const aSeg = a.split(".");
-    const bSeg = b.split(".");
-    return compareSegments(aSeg, bSeg);
-  });
+  // 0.71.14: compute hierarchy via parent walk (handles range areas).
+  const { roots, childrenOf } = buildJdHierarchy(entries);
+  const sortedPrefixes: string[] = [];
+  const walk = (prefix: string): void => {
+    sortedPrefixes.push(prefix);
+    for (const c of childrenOf.get(prefix) ?? []) walk(c);
+  };
+  for (const r of roots) walk(r);
 
   // Index of existing notes in the destination folder, keyed by jdPrefix.
   const existingByPrefix = new Map<string, TFile>();
@@ -213,11 +280,15 @@ export async function buildJdIndexNotes(
 
   for (const prefix of sortedPrefixes) {
     const entry = entries.get(prefix) ?? null;
-    const segments = prefix.split(".");
-    const parentPrefix = segments.length > 1 ? segments.slice(0, -1).join(".") : null;
+    // 0.71.14: parent resolution honors range areas. Use the same
+    // findParentPrefix logic the hierarchy was built from so range
+    // areas become real Stashpad parents.
+    const parentPrefix = findParentPrefix(prefix, new Set(entries.keys()));
     const parentId = parentPrefix ? (prefixToId.get(parentPrefix) ?? ROOT_ID) : ROOT_ID;
-    const title = entry ? `${prefix} ${entry.title}` : prefix; // synthetic = just the prefix
-    const sourceLink = entry ? `[[${entry.file.basename}]]` : "";
+    const title = entry ? `${prefix} ${entry.title}` : prefix;
+    // Source link applies to FILES; FOLDERS render as plain text
+    // (folder paths don't link cleanly via wikilink syntax).
+    const sourceLink = entry?.file ? `[[${entry.file.basename}]]` : "";
 
     // 0.71.11: individual index-note bodies are link-only (no H1).
     // The user explicitly wanted nothing above the link — the
@@ -318,6 +389,18 @@ function compareEntries(a: IndexEntry, b: IndexEntry, mode: "natural" | "created
   return compareSegments(a.segments, b.segments);
 }
 
+/** Compare two whole prefix strings. Handles range-area shape
+ *  (`\d+-\d+`) by using the LOWER bound as the sort key; otherwise
+ *  splits on dots and does the segment-by-segment numeric-aware
+ *  compare. */
+function comparePrefixes(a: string, b: string): number {
+  const aRange = a.match(/^(\d+)-(\d+)$/);
+  const bRange = b.match(/^(\d+)-(\d+)$/);
+  const aKey = aRange ? [aRange[1]] : a.split(".");
+  const bKey = bRange ? [bRange[1]] : b.split(".");
+  return compareSegments(aKey, bKey);
+}
+
 /** Numeric-aware segment compare. All-numeric segments sort numerically
  *  ("10" after "9"); all-alpha segments sort alphabetically; mixed:
  *  numbers come before letters at the same depth. */
@@ -341,6 +424,37 @@ function compareSegments(a: string[], b: string[]): number {
     }
   }
   return a.length - b.length;
+}
+
+/** Build a {roots, childrenOf, depthOf} hierarchy from the full set of
+ *  prefixes. Areas (`10-19`) are roots; categories nest under their
+ *  area via NUMERIC RANGE; IDs nest under their dotted parent. */
+function buildJdHierarchy(entries: Map<string, IndexEntry | null>) {
+  const allPrefixes = new Set(entries.keys());
+  const parentOf = new Map<string, string | null>();
+  const childrenOf = new Map<string, string[]>();
+  for (const prefix of allPrefixes) {
+    const parent = findParentPrefix(prefix, allPrefixes);
+    parentOf.set(prefix, parent);
+    if (parent !== null) {
+      const kids = childrenOf.get(parent) ?? [];
+      kids.push(prefix);
+      childrenOf.set(parent, kids);
+    }
+  }
+  const roots: string[] = [];
+  for (const prefix of allPrefixes) {
+    if (parentOf.get(prefix) === null) roots.push(prefix);
+  }
+  roots.sort(comparePrefixes);
+  for (const list of childrenOf.values()) list.sort(comparePrefixes);
+  const depthOf = new Map<string, number>();
+  const walk = (prefix: string, d: number): void => {
+    depthOf.set(prefix, d);
+    for (const c of childrenOf.get(prefix) ?? []) walk(c, d + 1);
+  };
+  for (const r of roots) walk(r, 0);
+  return { roots, childrenOf, depthOf };
 }
 
 function renderPreview(indexed: IndexEntry[], nonIndex: TFile[], skipped: TFile[]): string {
@@ -368,26 +482,37 @@ function renderPreview(indexed: IndexEntry[], nonIndex: TFile[], skipped: TFile[
   } else {
     const entries = new Map<string, IndexEntry | null>();
     for (const e of indexed) entries.set(e.prefix, e);
+    // Add synthetic dotted ancestors (e.g. "1.2.3" present but no
+    // "1.2"). Range ancestors are NOT auto-synthesized — categories
+    // without a containing area just live at root.
     for (const e of indexed) {
+      if (!e.prefix.includes(".")) continue;
       for (let i = 1; i < e.segments.length; i++) {
         const ancestor = e.segments.slice(0, i).join(".");
         if (!entries.has(ancestor)) entries.set(ancestor, null);
       }
     }
-    const sortedPrefixes = Array.from(entries.keys()).sort((a, b) =>
-      compareSegments(a.split("."), b.split(".")),
-    );
-    for (const prefix of sortedPrefixes) {
+    const { roots, childrenOf, depthOf } = buildJdHierarchy(entries);
+    const visit = (prefix: string): void => {
       const entry = entries.get(prefix);
-      const depth = prefix.split(".").length - 1;
+      const depth = depthOf.get(prefix) ?? 0;
       const indent = "  ".repeat(depth);
       const hashes = hashesAt(depth);
-      if (entry) {
+      const titleSuffix = entry?.folder
+        ? ` ${entry.title} _(folder)_`
+        : entry?.file
+          ? ""
+          : "";
+      if (entry?.file) {
         lines.push(`${indent}- ${hashes} [[${entry.file.basename}|${entry.prefix} ${entry.title}]]`);
+      } else if (entry?.folder) {
+        lines.push(`${indent}- ${hashes} ${entry.prefix}${titleSuffix}`);
       } else {
         lines.push(`${indent}- ${hashes} ${prefix}`);
       }
-    }
+      for (const c of childrenOf.get(prefix) ?? []) visit(c);
+    };
+    for (const r of roots) visit(r);
   }
   if (nonIndex.length > 0) {
     lines.push("");
