@@ -30,21 +30,28 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Generate release notes from commits
+      - name: Generate release notes
         if: steps.check.outputs.exists == 'false'
         id: notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$PREV_TAG" ]; then
-            LOG=$(git log --pretty=format:'- %s')
-          else
-            LOG=$(git log "$PREV_TAG"..HEAD --pretty=format:'- %s')
-          fi
+          NOTES_FILE="release-notes/${VERSION}.md"
           {
             echo "notes<<EOF"
-            echo "## Changes since ${PREV_TAG:-the beginning}"
-            echo ""
-            echo "$LOG"
+            if [ -f "$NOTES_FILE" ]; then
+              cat "$NOTES_FILE"
+            else
+              PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+              if [ -z "$PREV_TAG" ]; then
+                LOG=$(git log --pretty=format:'- %s')
+              else
+                LOG=$(git log "$PREV_TAG"..HEAD --pretty=format:'- %s')
+              fi
+              echo "## Changes since ${PREV_TAG:-the beginning}"
+              echo ""
+              echo "$LOG"
+            fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
