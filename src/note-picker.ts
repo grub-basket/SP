@@ -122,8 +122,19 @@ export function parseSearchQuery(query: string): ParsedQuery {
     } else if (key === "on") {
       const ts = parseDateToken(value);
       if (ts != null) {
-        const start = moment(ts).startOf("day").valueOf();
-        out.filters.on = { start, end: start + 86_400_000 };
+        // 0.69.45: if the value includes a time-of-day component (e.g.
+        // "on: 9:45pm", "on: 2025-01-15 14:30"), narrow the window to
+        // ±60 seconds around that exact moment. Without a time, fall
+        // back to the full-day window. Previously any time-of-day was
+        // dropped and the filter degenerated to the whole day, which
+        // is why "on: 9:45pm" returned every note from today.
+        const hasTime = /\b\d{1,2}:\d{2}\b|\b\d{1,2}\s*(?:am|pm)\b/i.test(value);
+        if (hasTime) {
+          out.filters.on = { start: ts - 60_000, end: ts + 60_000 };
+        } else {
+          const start = moment(ts).startOf("day").valueOf();
+          out.filters.on = { start, end: start + 86_400_000 };
+        }
       }
     }
     // Remove the matched filter slice from remaining so it doesn't
@@ -894,14 +905,26 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       // siblings on the stack below, and arrows never updated the
       // selection.
       const chipScope = new Scope(this.scope);
-      const handleChipKey = (ev: KeyboardEvent): boolean => {
+      const handleChipKey = (ev: KeyboardEvent): boolean | void => {
         const active = document.activeElement as HTMLElement | null;
+        // Chip-focused: activate the chip.
         if (active?.classList?.contains("stashpad-search-filter-chip")) {
           ev.preventDefault();
           active.click();
           return false; // consume — SuggestModal must NOT pick
         }
-        return true; // don't preventDefault — DOM continues → SuggestModal handles
+        // Non-chip Enter: explicitly invoke SuggestModal's pick path.
+        // (0.69.44 — the previous `return true; → DOM continues → inputEl
+        // onKeydown → this.scope.handleKey` path wasn't reliably firing
+        // the Suggester's Enter handler in this setup. Calling
+        // selectActiveSuggestion directly does the same thing
+        // SuggestModal would have done.)
+        if (ev.key === "Enter" && !ev.isComposing) {
+          ev.preventDefault();
+          (this as any).selectActiveSuggestion?.(ev);
+          return false;
+        }
+        return true; // Space etc. — let DOM continue normally
       };
       chipScope.register([], "Enter", handleChipKey);
       chipScope.register([], " ", handleChipKey);
@@ -1709,15 +1732,20 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         if (!picked) {
           const restored = new StashpadSuggest(appRef, tree, titleFn, opts);
           restored.open();
-          if (savedQuery) {
-            setTimeout(() => {
-              const ie = (restored as any).inputEl as HTMLInputElement | undefined;
-              if (ie) {
-                ie.value = savedQuery;
-                ie.dispatchEvent(new Event("input", { bubbles: true }));
-              }
-            }, 0);
-          }
+          // 0.69.45: always focus the restored modal's inputEl after
+          // open. Without explicit focus the modal renders but keyboard
+          // focus stays on whatever Obsidian's modal-stack restored to
+          // (often the underlying app behind the modal).
+          setTimeout(() => {
+            const ie = (restored as any).inputEl as HTMLInputElement | undefined;
+            if (!ie) return;
+            if (savedQuery) {
+              ie.value = savedQuery;
+              ie.dispatchEvent(new Event("input", { bubbles: true }));
+            }
+            ie.focus();
+            ie.setSelectionRange(ie.value.length, ie.value.length);
+          }, 0);
         }
       };
       sub.open();
