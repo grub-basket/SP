@@ -2001,17 +2001,25 @@ export class StashpadView extends ItemView {
     // is mildly redundant with native Obsidian "Open in new window"
     // but more discoverable.
     const modeBtns = bar.createDiv({ cls: "stashpad-view-mode-btns" });
-    const tinyBtn = modeBtns.createEl("button", { cls: "stashpad-view-mode-btn" });
-    setIcon(tinyBtn, "minimize-2");
-    tinyBtn.title = "Tiny mode — open this tab in a small always-on-top-capable popout window.";
-    tinyBtn.onclick = (e) => { e.preventDefault(); void this.plugin.openTinyWindow(); };
+    // 0.71.16: on mobile, hide the tiny-mode + open-in-new-window
+    // buttons — neither works on mobile (no popout windows). Compact
+    // mode still has value on small screens.
+    if (!Platform.isMobile) {
+      const tinyBtn = modeBtns.createEl("button", { cls: "stashpad-view-mode-btn" });
+      setIcon(tinyBtn, "minimize-2");
+      tinyBtn.title = "Tiny mode — open this tab in a small always-on-top-capable popout window.";
+      tinyBtn.onclick = (e) => { e.preventDefault(); void this.plugin.openTinyWindow(); };
+    }
     const compactBtn = modeBtns.createEl("button", { cls: "stashpad-view-mode-btn" });
-    setIcon(compactBtn, "rows-2");
+    // 0.71.16: when compact mode is ON, swap the icon to one that
+    // reads as "exit / expand" so the affordance flips clearly.
+    setIcon(compactBtn, this.compactMode ? "panel-top" : "rows-2");
     compactBtn.title = this.compactMode
       ? "Compact mode is ON — click to restore full chrome."
       : "Compact mode — hide the filter row + focused header; keep breadcrumb + list + composer.";
     if (this.compactMode) compactBtn.addClass("is-active");
     compactBtn.onclick = (e) => { e.preventDefault(); this.toggleCompactMode(); };
+    if (Platform.isMobile) return; // skip the popout button on mobile
     const popoutBtn = modeBtns.createEl("button", { cls: "stashpad-view-mode-btn" });
     setIcon(popoutBtn, "external-link");
     popoutBtn.title = getSettings().popoutDuplicates
@@ -2920,7 +2928,9 @@ export class StashpadView extends ItemView {
     // Now the rows-2 button always shows, tooltip flips, and clicking
     // toggles the underlying compactMode state regardless.
     const compactBtn = bar.createEl("button", { cls: "stashpad-tiny-expand stashpad-tiny-exit-compact" });
-    setIcon(compactBtn, "rows-2");
+    // 0.71.17: flip icon to "exit / expand" when compact mode is on,
+    // same as the desktop button.
+    setIcon(compactBtn, this.compactMode ? "panel-top" : "rows-2");
     compactBtn.title = this.compactMode
       ? "Compact mode is ON — click to turn off."
       : "Compact mode — click to turn on (strips row metadata).";
@@ -2928,7 +2938,10 @@ export class StashpadView extends ItemView {
     compactBtn.onclick = () => { this.toggleCompactMode(); };
 
     // Expand button — exit tiny mode + restore window size.
-    const expandBtn = bar.createEl("button", { cls: "stashpad-tiny-expand", text: "⤢" });
+    // 0.71.20: swap the ⤢ glyph for the maximize-2 lucide icon so it
+    // matches the rest of the header's icon-button styling.
+    const expandBtn = bar.createEl("button", { cls: "stashpad-tiny-expand" });
+    setIcon(expandBtn, "maximize-2");
     expandBtn.title = "Exit tiny mode";
     expandBtn.onclick = () => { void this.exitTinyMode(); };
   }
@@ -3106,7 +3119,9 @@ export class StashpadView extends ItemView {
       }
       if (this.compactMode) {
         const exitBtn = bar.createEl("button", { cls: "stashpad-compact-exit-btn" });
-        setIcon(exitBtn, "rows-2");
+        // 0.71.18: this exit button only renders while compact mode
+        // is on, so the icon is always "exit / expand."
+        setIcon(exitBtn, "panel-top");
         exitBtn.title = "Exit compact mode";
         exitBtn.onclick = (e) => { e.preventDefault(); this.toggleCompactMode(); };
       }
@@ -3185,7 +3200,9 @@ export class StashpadView extends ItemView {
     // active.
     if (this.compactMode) {
       const exitBtn = bar.createEl("button", { cls: "stashpad-compact-exit-btn" });
-      setIcon(exitBtn, "rows-2");
+      // 0.71.17: this button only renders WHILE in compact mode, so
+      // its icon is always the "exit / expand" affordance.
+      setIcon(exitBtn, "panel-top");
       exitBtn.title = "Exit compact mode";
       exitBtn.onclick = (e) => { e.preventDefault(); this.toggleCompactMode(); };
     }

@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
+import { App, FuzzySuggestModal, Platform, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
 import type { TreeIndex } from "./tree-index";
 import type { TreeNode } from "./types";
 import { ROOT_ID } from "./types";
@@ -765,14 +765,14 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // list. Each chip click inserts the filter prefix at the input's
     // current caret. Free-text typing still works the same — chips
     // are an affordance, not a different input mode.
-    if (this.opts.showFilterChips) {
+    // 0.71.16: skip the chip row on mobile — the modal can't size to
+    // fit dynamically, and the chip row plus the When-builder it
+    // opens eat all the vertical room. Mobile gets a plain
+    // SuggestModal; typed filters (`in:` / `when:` etc.) still work.
+    if (this.opts.showFilterChips && !Platform.isMobile) {
       const inputEl = (this as any).inputEl as HTMLInputElement | undefined;
       const resultsEl = (this as any).resultContainerEl as HTMLElement | undefined;
       if (!inputEl || !resultsEl) return;
-      // 0.64.14: insert synchronously now that the chip-row CSS has
-      // `width: 100%` — earlier "squeezed initial state" was the chip
-      // row being sized to its content because the parent didn't
-      // stretch flex children. Width: 100% sidesteps the dependency.
       this.mountFilterChipRow(inputEl, resultsEl);
       return;
     }

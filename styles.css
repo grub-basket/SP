@@ -1607,6 +1607,19 @@
   display: inline-flex;
   align-items: center;
 }
+/* 0.71.16: shrink the lone (compact-mode) view-mode button on mobile
+   so it matches the other small icon buttons in the row. The desktop
+   default uses larger padding for visual weight; on phone screens
+   that wastes precious header width. */
+.stashpad-view.is-mobile .stashpad-view-mode-btn {
+  height: 28px;
+  width: 28px;
+  padding: 0;
+}
+.stashpad-view.is-mobile .stashpad-view-mode-btn svg {
+  width: 14px;
+  height: 14px;
+}
 .stashpad-view.is-mobile .stashpad-time-filter-select {
   height: 28px;
   padding: 0 6px;
@@ -2263,10 +2276,18 @@
   line-height: 1;
   cursor: pointer;
   flex: 0 0 auto;
+  /* 0.71.20: center the lucide icon now that the button uses
+     setIcon() instead of a text glyph. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
 }
 .stashpad-tiny-expand:hover {
   background: var(--background-modifier-hover);
+  color: var(--text-normal);
 }
+.stashpad-tiny-expand svg { width: 12px; height: 12px; }
 
 /* 0.61.2: tiny-mode header icon + view-mode buttons in the time filter row. */
 .stashpad-tiny-title-icon {
