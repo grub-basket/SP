@@ -1059,6 +1059,13 @@
 .stashpad-authored-folder-link:hover { text-decoration: underline; }
 .stashpad-authored-folder-counts { color: var(--text-faint); }
 
+/* 0.71.23: compact/tiny modes render plain text instead of rendered
+   markdown so headings / code blocks / lists don't blow out the row
+   height. Preserve user-authored line breaks. */
+.stashpad-note-text.is-plain {
+  white-space: pre-wrap;
+}
+
 .stashpad-note-text.is-clamped {
   /* Two-line clamp with ellipsis. Show More toggle (rendered after the
      text) flips the .is-clamped class so the rest comes into view. */
@@ -2124,17 +2131,28 @@
   gap: 6px;
   flex-wrap: wrap;
 }
+/* 0.72.1: action buttons use Obsidian's interactive-* tokens so they
+   read correctly in BOTH light + dark themes. The earlier
+   --background-modifier-hover hover state resolved to near-black on
+   some light themes, making button text unreadable on hover. */
 .stashpad-notice-action {
-  background: var(--background-secondary);
+  background: var(--interactive-normal);
   color: var(--text-normal);
   border: 1px solid var(--background-modifier-border);
   border-radius: 4px;
   padding: 4px 10px;
   font-size: var(--font-ui-smaller);
+  font-weight: 500;
   cursor: pointer;
+  transition: background 80ms ease;
 }
 .stashpad-notice-action:hover {
-  background: var(--background-modifier-hover);
+  background: var(--interactive-hover);
+  color: var(--text-normal);
+}
+.stashpad-notice-action:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
 }
 
 /* Notification history modal — extends the existing log-modal layout
@@ -2234,8 +2252,11 @@
   background: var(--background-modifier-border);
   color: var(--text-normal);
 }
+/* Safety cap so a future long label still ellipsises instead of
+   pushing the toast off-screen. 0.72.1: tightened now that labels are
+   verbs ("Reveal", "Jump to parent") rather than note titles. */
 .stashpad-notice-action {
-  max-width: 240px;
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2578,6 +2599,71 @@
   min-width: 0;
 }
 
+/* 0.73.1: tabbed settings UI. Search box at top, tab bar below,
+   body underneath. Search mode dims the tab bar and shows every
+   section grouped under its tab label. */
+.stashpad-settings-search-wrap { margin: 8px 0 12px; }
+.stashpad-settings-search-input {
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+}
+.stashpad-settings-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 0 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 12px;
+}
+.stashpad-settings-tab {
+  padding: 6px 12px;
+  border-radius: 6px 6px 0 0;
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  font-weight: 500;
+}
+.stashpad-settings-tab:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-settings-tab.is-active {
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border-color: var(--background-modifier-border);
+  position: relative;
+  top: 1px;
+}
+.stashpad-settings-tabs.is-search-mode .stashpad-settings-tab { opacity: 0.65; }
+.stashpad-settings-search-group { margin-bottom: 16px; }
+.stashpad-settings-search-group-header {
+  font-size: 0.95em;
+  color: var(--text-accent);
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 4px;
+  margin: 0 0 8px;
+}
+
+/* 0.71.24 — when the When-builder is open, grow the modal so a short
+   results list can't clip the builder's mode tabs / inputs / buttons.
+   `.suggestion-container` is Obsidian's scrollable results wrapper; we
+   give it (and the prompt) a generous min-height so the builder always
+   has room. Falls back to overflow auto for ultra-short viewports. */
+.modal.is-when-builder-open .prompt,
+.modal.is-when-builder-open .suggestion-container {
+  min-height: 360px;
+  max-height: 80vh;
+}
+.modal.is-when-builder-open .prompt { overflow-y: auto; }
+
 /* 0.69.0 — When-builder inline panel (search modal). Toggled by the
    unified When chip; sits between the chip row and the results. */
 .stashpad-when-builder {
@@ -2655,7 +2741,7 @@
 }
 .stashpad-panels-bar {
   display: flex;
-  gap: 2px;
+  gap: 8px;
   padding: 6px;
   border-bottom: 1px solid var(--background-modifier-border);
   background: var(--background-secondary);
@@ -2663,6 +2749,8 @@
 .stashpad-panels-bar-btn {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  flex: 1 1 0;
   gap: 4px;
   padding: 4px 8px;
   background: transparent;
@@ -2742,6 +2830,39 @@
   margin-left: 4px;
 }
 
+/* 0.71.26: group header above each Stashpad's batch of pins. Highlights
+   when its folder is the MRU Stashpad's folder. The per-row folder
+   badge is redundant once pins are grouped — hide it. */
+.stashpad-pinned-group-header {
+  display: flex;
+  align-items: center;
+  padding: 8px 10px 2px 10px;
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+.stashpad-pinned-group-header.is-active-folder { color: var(--text-accent); }
+.stashpad-panel-pinned .stashpad-pinned-folder { display: none; }
+
+/* 0.71.30: Tasks panel — borrows pinned-row layout. Due date sits at
+   the trailing edge; overdue gets a warning tint. Completed rows are
+   muted + struck-through via the shared is-completed class. */
+.stashpad-task-due {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-left: 6px;
+  white-space: nowrap;
+}
+.stashpad-task-due.is-overdue { color: var(--text-error); }
+.stashpad-tasks-empty {
+  padding: 12px 10px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
 .stashpad-pinned-subrow {
   display: flex;
   align-items: center;
@@ -2790,6 +2911,13 @@
   gap: 4px;
   padding: 6px 6px 0 6px;
 }
+/* 0.71.31: side-by-side row of global buttons (Log + Notifications). */
+.stashpad-panels-globals-row {
+  display: flex;
+  gap: 4px;
+}
+.stashpad-panels-globals-row .stashpad-panels-global-btn { flex: 1 1 0; }
+
 .stashpad-panels-global-btn {
   display: flex;
   align-items: center;

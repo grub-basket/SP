@@ -281,5 +281,13 @@ async function ensureFolder(app: App, path: string): Promise<void> {
   if (!path) return;
   const adapter = app.vault.adapter;
   if (await adapter.exists(path)) return;
-  await app.vault.createFolder(path);
+  try {
+    await app.vault.createFolder(path);
+  } catch (e) {
+    // Race-safe: adapter.exists can lag the actual FS state on plugin
+    // reload. Swallow the "Folder already exists" throw; rethrow
+    // anything else.
+    const msg = (e as Error)?.message ?? "";
+    if (!/already exists/i.test(msg)) throw e;
+  }
 }

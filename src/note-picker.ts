@@ -1015,11 +1015,18 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
   /** Toggle the inline When-builder panel. When opening, it inserts
    *  itself directly after the chip row. When closing, it's removed. */
   private toggleWhenBuilder(inputEl: HTMLInputElement, chipRow: HTMLElement): void {
+    const modalEl = (this as any).modalEl as HTMLElement | undefined;
     if (this.whenBuilderEl) {
       this.whenBuilderEl.remove();
       this.whenBuilderEl = null;
+      // 0.71.24: drop the modal-grow class so the picker returns to its
+      // natural compact size after the builder closes.
+      modalEl?.removeClass("is-when-builder-open");
       return;
     }
+    // 0.71.24: stretch the modal so a short results list can't clip the
+    // builder. The class on modalEl is removed when the builder closes.
+    modalEl?.addClass("is-when-builder-open");
     const panel = document.createElement("div");
     panel.className = "stashpad-when-builder";
     // Mode tabs row.
@@ -1694,6 +1701,8 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     if (!this.whenBuilderEl) return;
     this.whenBuilderEl.remove();
     this.whenBuilderEl = null;
+    const modalEl = (this as any).modalEl as HTMLElement | undefined;
+    modalEl?.removeClass("is-when-builder-open");
   }
 
   onChooseSuggestion(item: PickerItem): void {

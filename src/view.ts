@@ -389,7 +389,14 @@ export class StashpadView extends ItemView {
     (this.app.vault as any).on("create", this.onFileCreate);
     window.addEventListener("keydown", this.onDocKeyDown, true);
     this.loadConfig();
-    await this.bootstrapFolder();
+    // 0.71.36: bootstrap can throw "Folder already exists" when the
+    // vault state races our cache check on tab open/close. Swallow
+    // that specific case so the wrap doesn't surface as Obsidian's
+    // "Failed to open view" — bootstrap is idempotent on next mount.
+    try { await this.bootstrapFolder(); } catch (e) {
+      const msg = (e as Error)?.message ?? "";
+      if (!/already exists/i.test(msg)) console.warn("[Stashpad] bootstrapFolder failed:", e);
+    }
     this.tree.rebuild(this.noteFolder);
     // Subscribe the persistent "updating recovery metadata…" notice
     // to the fmSync queue's activity events. Done BEFORE the backfill
@@ -705,7 +712,14 @@ export class StashpadView extends ItemView {
     await this.flushDrafts();
     this.draftsLoadedFor = null;
     this.loadConfig();
-    await this.bootstrapFolder();
+    // 0.71.36: bootstrap can throw "Folder already exists" when the
+    // vault state races our cache check on tab open/close. Swallow
+    // that specific case so the wrap doesn't surface as Obsidian's
+    // "Failed to open view" — bootstrap is idempotent on next mount.
+    try { await this.bootstrapFolder(); } catch (e) {
+      const msg = (e as Error)?.message ?? "";
+      if (!/already exists/i.test(msg)) console.warn("[Stashpad] bootstrapFolder failed:", e);
+    }
     this.tree.rebuild(this.noteFolder);
     this.backfillFrontmatterSync();
     // Integrity sweep is owned by the plugin (runs once at startup), not
@@ -3662,21 +3676,32 @@ export class StashpadView extends ItemView {
     (container as any).__stashpadRenderToken = token;
     void this.getOrComputeRender(file).then((entry) => {
       if ((container as any).__stashpadRenderToken !== token) return;
-      const { text: _text, attachments, html } = entry;
+      const { text, attachments, html } = entry;
       // Clear any stale content that earlier renders left behind before
       // appending fresh nodes.
       container.empty();
       const textEl = container.createDiv({ cls: "stashpad-note-text" });
       const expanded = this.expandedNotes.has(node.id);
       if (opts.clamp && !expanded) textEl.addClass("is-clamped");
-      // Re-hydrate the cached markdown HTML by assigning innerHTML. Obsidian
-      // uses event delegation for internal links / tags / embeds, so the
-      // restored DOM still wires up correctly without needing a fresh
-      // MarkdownRenderer pass. (Live-rendered widgets like Mermaid/MathJax
-      // are the one weak spot — those won't re-execute from cached HTML,
-      // but they're rare in chat-style notes and re-render on next mtime
-      // change anyway.)
-      textEl.innerHTML = html;
+      // 0.71.23: in compact/tiny modes the row is too short to host
+      // rendered markdown — headings overflow, code blocks get clipped
+      // mid-line, lists wrap awkwardly. Render the raw text instead so
+      // every row reads as plain prose at the same line-height. The
+      // markdown HTML is still cached, so toggling back out of
+      // compact/tiny re-uses it instantly.
+      if (this.compactMode || this.tinyMode) {
+        textEl.addClass("is-plain");
+        textEl.textContent = text;
+      } else {
+        // Re-hydrate the cached markdown HTML by assigning innerHTML. Obsidian
+        // uses event delegation for internal links / tags / embeds, so the
+        // restored DOM still wires up correctly without needing a fresh
+        // MarkdownRenderer pass. (Live-rendered widgets like Mermaid/MathJax
+        // are the one weak spot — those won't re-execute from cached HTML,
+        // but they're rare in chat-style notes and re-render on next mtime
+        // change anyway.)
+        textEl.innerHTML = html;
+      }
       if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
       // Multiplayer footer: author / contributors / last-edit. Each
       // sub-piece is gated by its own toggle in settings; the row only
@@ -4327,8 +4352,13 @@ export class StashpadView extends ItemView {
     // (or cleared it); the plain/shift/add paths set it inline.
     if (this.selection.has(node.id)) this.lastSelected = node.id;
     this.viewRoot.focus({ preventScroll: true });
-    this.render();
+    // 0.73.4 perf: row clicks only mutate selection state — same
+    // cheap-repaint path as arrow-key nav. Skips the full
+    // this.render() that previously rebuilt every row's DOM (markdown
+    // hydrate, drag handlers, etc.) on each click.
+    this.repaintSelectionClasses();
     this.revealCursorRow();
+    this.stampSelectedCursor();
   }
 
   private revealCursorRow(): void {
@@ -4532,7 +4562,10 @@ export class StashpadView extends ItemView {
         this.lastSelected = collapseTo;
         if (idx >= 0) this.cursorIdx = idx;
       }
-      this.render();
+      // 0.73.4 perf: collapse-selection on Escape only changes class
+      // state — no row content moved. Cheap class repaint instead of
+      // a full this.render() saves 100–300ms on big folders.
+      this.repaintSelectionClasses();
       this.revealCursorRow();
       return;
     }
@@ -4586,10 +4619,9 @@ export class StashpadView extends ItemView {
       this.firstSelectedId = node.id;
       this.lastSelected = node.id;
     } else {
-      // 0.63.5: shift-arrow now maintains selection as the RANGE between
-      // the anchor (firstSelectedId) and the current cursor. Backing up
-      // toward the anchor drops the just-passed rows from the selection.
-      // Mirrors text-editor / file-explorer multi-select conventions.
+      // 0.73.4 perf: shift-arrow range selection. Backing up toward the
+      // anchor drops the just-passed rows. Mirrors text-editor /
+      // file-explorer multi-select conventions.
       const anchorId = this.firstSelectedId ?? node.id;
       const anchorIdx = this.currentChildren.findIndex((n) => n.id === anchorId);
       if (anchorIdx === -1) {
@@ -4603,8 +4635,31 @@ export class StashpadView extends ItemView {
       }
       this.lastSelected = node.id;
     }
-    this.render();
+    // 0.73.4 perf: arrow-key nav used to trigger a full this.render(),
+    // which rebuilt every row (markdown re-hydration, drag handlers,
+    // authorship footer reads, etc.) just to flip two CSS classes. On
+    // folders with 200+ notes that was 100–300ms per keystroke. Now
+    // we just toggle .is-cursor / .is-selected on existing rows. The
+    // selection model is fully described by this.selection +
+    // this.cursorIdx, so no rebuild is needed.
+    this.repaintSelectionClasses();
     this.revealCursorRow();
+    this.stampSelectedCursor();
+  }
+
+  /** O(N rows) class toggle — far cheaper than a full render(). Read
+   *  the live selection state and bring each row's .is-cursor /
+   *  .is-selected classes in line with it. Used by arrow-key nav and
+   *  any other "only the selection changed" path. 0.73.4. */
+  private repaintSelectionClasses(): void {
+    if (!this.listEl) return;
+    const rows = this.listEl.querySelectorAll<HTMLElement>(".stashpad-note");
+    rows.forEach((row) => {
+      const idx = Number(row.dataset.idx);
+      const id = row.dataset.id ?? "";
+      row.classList.toggle("is-cursor", idx === this.cursorIdx);
+      row.classList.toggle("is-selected", this.selection.has(id));
+    });
   }
 
   private getActionTargets(): TreeNode[] {
@@ -4665,12 +4720,27 @@ export class StashpadView extends ItemView {
     // Surface each folder's root as a first-class pick. id = ROOT_ID so
     // the cross-folder onPick handler can route directly into the new
     // folder's home.
-    const roots = folders.map((folder) => ({
-      folder,
-      id: ROOT_ID,
-      title: `Home — ${folder.split("/").pop() || folder}`,
-      body: "",
-    }));
+    // 0.71.22: attach the home note's file so the picker can fill a
+    // body preview via cachedRead — matters when the home note has
+    // been renamed/customized.
+    const homeFileByFolder = new Map<string, TFile>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folders.includes(dir)) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
+        | { id?: string } | undefined;
+      if (fm?.id === ROOT_ID) homeFileByFolder.set(dir, f);
+    }
+    const roots = folders.map((folder) => {
+      const homeFile = homeFileByFolder.get(folder);
+      return {
+        file: homeFile,
+        folder,
+        id: ROOT_ID,
+        title: `Home — ${folder.split("/").pop() || folder}`,
+        body: "",
+      };
+    });
     return [...roots, ...out];
   }
 
@@ -4750,7 +4820,7 @@ export class StashpadView extends ItemView {
           mode: "pick",
           placeholder: `Create "${trimmed}" under which note?`,
           allowCreate: false,
-          crossFolderNotes: () => this.collectCrossFolderNotes(),
+          crossFolderNotes: () => this.collectCrossFolderDestinations(),
           folderResults: () => this.plugin.discoverStashpadFolders().filter((f) => f !== this.noteFolder),
           localFolder: this.noteFolder,
           // 0.69.26: always spawn a NEW Stashpad tab on the picked
@@ -4803,7 +4873,7 @@ export class StashpadView extends ItemView {
         }
         if (item.node) this.navigateTo(item.node.id);
       },
-      crossFolderNotes: () => this.collectCrossFolderNotes(),
+      crossFolderNotes: () => this.collectCrossFolderDestinations(),
       folderResults: () => this.plugin.discoverStashpadFolders().filter((f) => f !== this.noteFolder),
       // 0.64.0: search modal gets the filter chips row.
       showFilterChips: true,
@@ -4852,6 +4922,10 @@ export class StashpadView extends ItemView {
           | { id?: string; parent?: string | null } | undefined;
         const id = typeof fm?.id === "string" ? fm.id : "";
         if (!id) continue;
+        // 0.71.22: skip the folder's home note here — it's surfaced via
+        // the synthetic "Home — <folder>" entry in
+        // `collectCrossFolderDestinations` so it doesn't appear twice.
+        if (id === ROOT_ID) continue;
         const title = file.basename
           .replace(/-[a-z0-9]{4,12}$/, "")
           .replace(/-/g, " ");
@@ -4916,6 +4990,15 @@ export class StashpadView extends ItemView {
         affectedIds: moved,
         folder: this.noteFolder,
       });
+    }
+    // 0.72.6: optionally follow the outdented note(s) into their new
+    // (shared) grandparent. Works only when every moved target shares
+    // the same destination; mixed-source outdents would otherwise
+    // surprise-jump somewhere arbitrary.
+    if (this.plugin.settings.autoNavOnMoveOut && moved.length > 0) {
+      const dest = moved[0].parent;
+      const allShareDest = dest != null && moved.every((m) => m.parent === dest);
+      if (allShareDest && dest !== ROOT_ID) this.navigateTo(dest);
     }
   }
 
@@ -5014,12 +5097,19 @@ export class StashpadView extends ItemView {
         const newParent = item.id;
         for (const t of targets) await this.changeParent(t, newParent);
         this.selection.clear(); this.render();
+        // 0.72.6: optionally follow the moved note(s) into the new
+        // parent. Skip when newParent is ROOT_ID — that means "moved
+        // to Home", and Home IS the focus, so no navigation needed.
+        if (this.plugin.settings.autoNavOnMoveOut && newParent !== ROOT_ID) {
+          this.navigateTo(newParent);
+        }
       },
       onCreate: async (q) => {
         const newId = await this.createNoteUnder(q, this.focusId);
         if (!newId) return;
         for (const t of targets) await this.changeParent(t, newId);
         this.selection.clear(); this.render();
+        if (this.plugin.settings.autoNavOnMoveOut) this.navigateTo(newId);
       },
       // 0.57.2: use the same cross-folder + synthetic-root list the
       // destination picker uses, so a move can target "Home of folder X"
@@ -5128,10 +5218,9 @@ export class StashpadView extends ItemView {
     // (intra-folder moves already had one). Action switches THIS view
     // to the target folder + navigates to the new parent (or Home when
     // the new parent is ROOT_ID).
-    const folderTag = targetDir.split("/").pop() || targetDir;
-    const destLabel = newParentId === ROOT_ID
-      ? `Jump to Home — ${folderTag}`
-      : `Jump to "${folderTag}" parent`;
+    // 0.72.1: action labels are short verbs now — the destination
+    // context already lives in the message body.
+    const destLabel = newParentId === ROOT_ID ? "Open home" : "Open parent";
     this.plugin.notifications.show({
       message: `Moved ${titleSummary} → \`${targetDir}\``,
       kind: "success",
@@ -5204,6 +5293,14 @@ export class StashpadView extends ItemView {
     if (!target) { this.render(); return; }
     const targets = this.getActionTargets().filter((n) => n.id !== target.id);
     for (const t of targets) await this.changeParent(t, target.id);
+    // 0.72.6: optional auto-navigate INTO the destination parent so
+    // the user follows their moved note. Skips the select-in-place
+    // flow below because navigateTo rebuilds the view for the new
+    // focus anyway.
+    if (this.plugin.settings.autoNavOnMoveIn) {
+      this.navigateTo(target.id);
+      return;
+    }
     // 0.56.7: select the new parent (the picker target) so the user sees
     // where their note(s) went — matches the drag drop-into behaviour
     // shipped in 0.56.5. Defensive re-apply at 120ms + 400ms covers the
@@ -6675,7 +6772,8 @@ export class StashpadView extends ItemView {
       affectedAuthorIds: movedAuthorIds,
       folder,
       actions: targetParentId === ROOT_ID ? [] : [{
-        label: `Jump to "${targetTitle}"`,
+        // 0.72.1: short verb label; the destination title is in the message.
+        label: "Jump to parent",
         onClick: () => this.navigateTo(targetParentId),
       }],
     });
@@ -7592,10 +7690,23 @@ export class StashpadView extends ItemView {
   }
 
   private async ensureFolder(path: string): Promise<void> {
-    const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing instanceof TFolder) return;
-    if (existing) throw new Error(`${path} exists and is not a folder`);
-    await this.app.vault.createFolder(path);
+    // 0.71.35: prefer the adapter (authoritative for on-disk state)
+    // over getAbstractFileByPath, which races the metadataCache on
+    // plugin reload — returning null for folders that actually exist,
+    // which then makes createFolder throw "Folder already exists."
+    if (await this.app.vault.adapter.exists(path)) {
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      if (existing && !(existing instanceof TFolder)) {
+        throw new Error(`${path} exists and is not a folder`);
+      }
+      return;
+    }
+    try {
+      await this.app.vault.createFolder(path);
+    } catch (e) {
+      const msg = (e as Error)?.message ?? "";
+      if (!/already exists/i.test(msg)) throw e;
+    }
   }
 
   private async importAttachment(file: File): Promise<string | null> {
@@ -7756,10 +7867,28 @@ export class StashpadView extends ItemView {
    *  no-ops if the body matches what we already saw, so the
    *  contribution write itself doesn't recurse. */
   private contribTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** 0.72.4: timestamps of writes we INITIATED (processFrontMatter
+   *  calls inside maybeRecordContribution). A vault.modify event that
+   *  fires within EXTERNAL_WRITE_GRACE_MS of one of these is "ours" —
+   *  the rest are external (another client on the network share). */
+  private recentSelfWrites = new Map<string, number>();
+  /** 0.72.4: most recent external modify per path. Drives the "park
+   *  the stamp until external activity quiets down" logic — if
+   *  another client just touched the file, we don't write back over
+   *  them; we keep the contribution parked and retry. */
+  private lastExternalModify = new Map<string, number>();
 
   private onFileModify = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
+    // 0.72.4: classify the modify before any downstream handler reads
+    // it. If the modify arrived within the grace window after our own
+    // processFrontMatter, treat it as self; otherwise stamp it as
+    // external so the contribution scheduler can park its work.
+    const now = Date.now();
+    const self = this.recentSelfWrites.get(file.path);
+    const isSelf = self !== undefined && (now - self) < StashpadView.EXTERNAL_WRITE_GRACE_MS;
+    if (!isSelf) this.lastExternalModify.set(file.path, now);
     this.scheduleSlugRename(file);
     this.scheduleAttachmentSync(file);
     this.scheduleContribution(file);
@@ -7771,20 +7900,85 @@ export class StashpadView extends ItemView {
     this.debouncedRender();
   };
 
-  /** Queue (or re-queue) a contributor stamp for `file`, flushing 1.5s
-   *  after the most recent modify. Continuous typing keeps pushing the
-   *  flush out, so a long edit session writes one contribution at the
-   *  end. Quiescence threshold tuned to "slightly longer than the
-   *  natural pause between sentences" — short enough to feel timely,
-   *  long enough to not stamp mid-thought. */
+  /** Queue (or re-queue) a contributor stamp for `file`, flushing
+   *  CONTRIB_DEBOUNCE_MS after the most recent modify. Continuous
+   *  typing keeps pushing the flush out, so a long edit session writes
+   *  one contribution at the end.
+   *
+   *  Quiescence threshold tuned to "slightly longer than the natural
+   *  pause between sentences" while also outliving Obsidian's editor
+   *  save debounce — short enough to feel timely, long enough that
+   *  the editor has fsync'd its in-flight content before our
+   *  processFrontMatter call reads + rewrites the file. The old 1.5s
+   *  threshold was tight enough on network drives (especially with
+   *  multiplayer racing two clients' writes) that we'd occasionally
+   *  read pre-save body content + clobber a few typed characters.
+   *  See 0.72.3.
+   *
+   *  Also: if a Markdown editor leaf for this file is currently the
+   *  active leaf, the user is probably still mid-thought even if they
+   *  paused; defer the stamp by an additional bump so we don't fire
+   *  while their cursor is in the doc. */
+  private static CONTRIB_DEBOUNCE_MS = 4000;
+  private static CONTRIB_ACTIVE_EDITOR_BONUS_MS = 2000;
+  /** 0.72.4: how long after a self-initiated processFrontMatter we
+   *  expect the resulting vault.modify event. Anything that arrives
+   *  inside this window is classified as our own write. */
+  private static EXTERNAL_WRITE_GRACE_MS = 1500;
+  /** 0.72.4: cooldown after an external (multiplayer) modify before
+   *  we'll fire our own contribution stamp on the same file. Picks
+   *  a value comfortably larger than typical network-share modify
+   *  echo time so two clients don't volley last-write-wins. */
+  private static EXTERNAL_QUIESCENCE_MS = 5000;
   private scheduleContribution(file: TFile): void {
     const existing = this.contribTimers.get(file.path);
     if (existing) clearTimeout(existing);
+    const isActivelyEdited = this.isFileActivelyEdited(file);
+    const delay = StashpadView.CONTRIB_DEBOUNCE_MS
+      + (isActivelyEdited ? StashpadView.CONTRIB_ACTIVE_EDITOR_BONUS_MS : 0);
     const t = setTimeout(() => {
       this.contribTimers.delete(file.path);
+      // Double-check at flush time: if the file is STILL being edited
+      // (cursor in the editor, last keystroke very recent), defer
+      // again. Prevents the worst-case "user paused 4s mid-paragraph,
+      // we wrote, they resumed and lost their last typed run".
+      if (this.isFileActivelyEdited(file)) {
+        this.scheduleContribution(file);
+        return;
+      }
+      // 0.72.4: if another client wrote to this file recently, park
+      // the contribution stamp until external activity quiets down.
+      // The stamp stays scheduled — every onFileModify call reschedules
+      // — so once the cross-client volley dies down we eventually
+      // flush a single combined stamp. Prevents stomping over a
+      // teammate's in-flight save on a slow network share.
+      const lastExt = this.lastExternalModify.get(file.path);
+      if (lastExt !== undefined && (Date.now() - lastExt) < StashpadView.EXTERNAL_QUIESCENCE_MS) {
+        this.scheduleContribution(file);
+        return;
+      }
       void this.maybeRecordContribution(file);
-    }, 1500);
+    }, delay);
     this.contribTimers.set(file.path, t);
+  }
+
+  /** True when the given file is open in the active Markdown leaf and
+   *  the editor (or its container) currently holds focus. Used to
+   *  guard the contribution stamp against racing in-flight typing. */
+  private isFileActivelyEdited(file: TFile): boolean {
+    try {
+      const active: any = this.app.workspace.activeLeaf;
+      if (!active) return false;
+      const view = active.view;
+      if (!view || view.getViewType?.() !== "markdown") return false;
+      if (view.file?.path !== file.path) return false;
+      // Editor focus check — if Obsidian's editor element contains the
+      // focused element, the user is actively typing.
+      const root = (view.containerEl ?? null) as HTMLElement | null;
+      return !!root && root.contains(document.activeElement);
+    } catch {
+      return false;
+    }
   }
 
   /** Compare the current file body against the last seen body for this
@@ -7806,6 +8000,12 @@ export class StashpadView extends ItemView {
     if (!author) return;                  // user opted out of stamping
     void this.ensureAuthorFile(author);
     const now = new Date().toISOString();
+    // 0.72.4: stamp BEFORE the write so the resulting vault.modify
+    // event (which fires asynchronously) can be classified as ours
+    // instead of external. Without this, our own stamp would get
+    // logged as an external modify, parking the next stamp
+    // unnecessarily.
+    this.recentSelfWrites.set(file.path, Date.now());
     try {
       await this.app.fileManager.processFrontMatter(file, (m: any) => {
         m.modified = now;
@@ -8015,7 +8215,14 @@ export class StashpadView extends ItemView {
     }));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => this.cmdMovePicker()));
-    menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => { await this.changeParent(node, ROOT_ID); }));
+    menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => {
+      await this.changeParent(node, ROOT_ID);
+      // 0.72.6: follow the moved note up to Home if the user enabled
+      // it. No-op when the view is already focused on Home.
+      if (this.plugin.settings.autoNavOnMoveOut && this.focusId !== ROOT_ID) {
+        this.navigateTo(ROOT_ID);
+      }
+    }));
     // 0.68.0: pin / unpin from the sidebar Pinned Notes panel.
     const pinRef = { folder: this.noteFolder, id: node.id };
     const pinned = this.plugin.isPinned(pinRef);
@@ -8504,7 +8711,8 @@ export class StashpadView extends ItemView {
         affectedAuthorIds: movedAuthorIds,
         folder: this.noteFolder,
         actions: newParent === ROOT_ID ? [] : [{
-          label: `Jump to "${destTitle}"`,
+          // 0.72.1: short verb label; the destination title is in the message.
+          label: "Jump to parent",
           onClick: () => this.navigateTo(newParent),
         }],
       });

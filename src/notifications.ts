@@ -334,17 +334,27 @@ export function buildFileActions(
   // that open another window/pane. The user often wants to click one,
   // glance at the file, then come back to use the OTHER action. The
   // toast staying open lets them do that without re-triggering.
+  // 0.72.1: short verb labels — the file path is already in the
+  // message body, so the buttons just need to name the action.
   const actions: NotificationAction[] = [{
-    label: "Reveal in file explorer",
+    label: "Reveal",
     keepOpen: true,
     onClick: () => {
-      const fe = app.workspace.getLeavesOfType("file-explorer")[0]?.view as any;
+      // 0.72.2: reveal the file-explorer LEAF first, then call
+      // revealInFolder. Without the revealLeaf step, the scroll-to /
+      // highlight runs inside a collapsed sidebar tab and isn't
+      // visible until the user manually switches to the Files panel —
+      // at which point the previous reveal has long been overwritten.
+      const leaf = app.workspace.getLeavesOfType("file-explorer")[0];
+      if (!leaf) return;
+      app.workspace.revealLeaf(leaf);
+      const fe = leaf.view as any;
       fe?.revealInFolder?.(file);
     },
   }];
   if (!isMobile) {
     actions.push({
-      label: "Show in OS File System",
+      label: "Show in Finder",
       keepOpen: true,
       onClick: () => {
         try {

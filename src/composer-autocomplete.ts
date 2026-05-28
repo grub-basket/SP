@@ -31,10 +31,15 @@ export class ComposerAutocomplete {
   private activeIdx = 0;
   private state: AutocompleteState | null = null;
 
-  /** Cached lowercased basenames + tag list, refreshed when the vault
-   *  fires create/delete/rename. Avoids re-walking getMarkdownFiles()
-   *  on every keystroke. */
-  private fileIndex: { basename: string; lower: string; file: TFile }[] = [];
+  /** Cached lowercased labels + tag list, refreshed when the vault
+   *  fires create/delete/rename. Avoids re-walking getFiles() on every
+   *  keystroke.
+   *
+   *  0.73.3: switched from getMarkdownFiles() to all TFiles so the
+   *  link autocomplete surfaces images, PDFs, attachments, etc. — not
+   *  just markdown. `.edtz` files (Encrypted Templater) stay excluded
+   *  because they're internal-tooling files users never link to. */
+  private fileIndex: { label: string; lower: string; insertText: string; file: TFile }[] = [];
   private tagIndex: string[] = [];
   private indexBuilt = false;
   private vaultListeners: Array<() => void> = [];
@@ -85,11 +90,21 @@ export class ComposerAutocomplete {
 
   private buildIndex(): void {
     if (this.indexBuilt) return;
-    this.fileIndex = this.app.vault.getMarkdownFiles().map((f) => ({
-      basename: f.basename,
-      lower: f.basename.toLowerCase(),
-      file: f,
-    }));
+    // 0.73.3: include every TFile in the vault — images, PDFs,
+    // audio, attachments, etc. — so the link autocomplete isn't
+    // limited to markdown. Skip .edtz (Encrypted Templater) files
+    // which users never link to manually. Markdown files insert as
+    // [[Title]] (basename only); everything else uses [[name.ext]]
+    // because Obsidian only resolves non-md wikilinks WITH the
+    // extension.
+    this.fileIndex = this.app.vault.getFiles()
+      .filter((f) => f.extension !== "edtz")
+      .map((f) => {
+        const isMd = f.extension === "md";
+        const label = isMd ? f.basename : f.name;
+        const insertText = isMd ? f.basename : f.name;
+        return { label, lower: label.toLowerCase(), insertText, file: f };
+      });
     const tagsRecord = (this.app.metadataCache as any).getTags?.() ?? {};
     this.tagIndex = Object.keys(tagsRecord).sort((a, b) =>
       (tagsRecord[b] || 0) - (tagsRecord[a] || 0)
@@ -152,15 +167,19 @@ export class ComposerAutocomplete {
       return true;
     };
     if (state.kind === "link") {
+      // 0.73.3: cap bumped 30 → 50 now that the index includes every
+      // file type — more candidates means fuzzy queries have more to
+      // narrow down.
       const matches = this.fileIndex
         .filter((f) => matchesAll(f.lower))
-        .slice(0, 30)
+        .slice(0, 50)
         .map((f) => ({
-          label: f.basename,
-          // Include the opening "[[" — replaceStart points BEFORE the
-          // brackets, so we re-emit them along with the basename and
-          // closing brackets to produce a complete wikilink.
-          insert: `[[${f.basename}]]`,
+          label: f.label,
+          // replaceStart points BEFORE the opening "[[", so we re-emit
+          // them along with the link text + closing brackets. Markdown
+          // notes use the basename; non-md files keep their extension
+          // because Obsidian only resolves [[image.png]] WITH the ext.
+          insert: `[[${f.insertText}]]`,
           subtitle: f.file.path,
         }));
       return matches;

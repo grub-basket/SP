@@ -970,11 +970,31 @@ export default class StashpadPlugin extends Plugin {
       // Defer to give metadataCache time to parse the frontmatter.
       setTimeout(() => { void this.fixOrphanParentForFile(file); }, 800);
     };
+    // 0.72.5: bare .md files dropped into <stashpad>/<importSub>/ get
+    // adopted into the parent Stashpad — move them up to the folder
+    // root + stamp orphan frontmatter so they appear as Home-rooted
+    // notes. Mirrors what .stash drops already do, but for raw
+    // markdown the user shares without packaging.
+    const onMaybeMarkdownImport = (file: TFile): void => {
+      if (file.extension !== "md") return;
+      const dropSub = (this.settings.importDropFolder || "").trim().replace(/^\/+|\/+$/g, "");
+      if (!dropSub) return;
+      const parent = file.parent?.path?.replace(/\/+$/, "") ?? "";
+      const parentBase = parent.split("/").pop() ?? "";
+      if (parentBase !== dropSub) return;
+      // Stashpad folder is the parent of the dropSub.
+      const stashFolder = parent.slice(0, parent.length - dropSub.length).replace(/\/+$/, "");
+      if (!stashFolder || !this.discoverStashpadFolders().includes(stashFolder)) return;
+      // Defer to let the metadataCache parse the file, then move it
+      // up + run the orphan-fix path. Picks a unique filename if a
+      // name collision exists at the destination.
+      setTimeout(() => { void this.adoptMarkdownDrop(file, stashFolder); }, 200);
+    };
     this.registerEvent(this.app.vault.on("create", (file) => {
-      if (file instanceof TFile) onMaybeOrphan(file);
+      if (file instanceof TFile) { onMaybeOrphan(file); onMaybeMarkdownImport(file); }
     }));
     this.registerEvent(this.app.vault.on("rename", (file) => {
-      if (file instanceof TFile) onMaybeOrphan(file);
+      if (file instanceof TFile) { onMaybeOrphan(file); onMaybeMarkdownImport(file); }
     }));
 
     // Multiplayer: keep settings.authorName in sync with the on-disk
@@ -1084,6 +1104,54 @@ export default class StashpadPlugin extends Plugin {
     this.settings.authorName = newName;
     await this.saveSettings();
     await this.syncAuthorFilesToName();
+  }
+
+  /** 0.72.5: move a markdown file that landed in <stashpad>/<importSub>
+   *  up into the Stashpad root, then stamp Home-rooted frontmatter.
+   *  Adopts files a user dropped without packaging into a .stash —
+   *  they show up as fresh top-level notes ready to be reparented. */
+  private async adoptMarkdownDrop(file: TFile, stashFolder: string): Promise<void> {
+    try {
+      // Pick a non-colliding destination filename. If <basename>.md
+      // already exists in the Stashpad root, append "-1", "-2", … until
+      // we find a free slot.
+      const adapter = this.app.vault.adapter;
+      let destName = file.name;
+      const dot = destName.lastIndexOf(".");
+      const stem = dot > 0 ? destName.slice(0, dot) : destName;
+      const ext = dot > 0 ? destName.slice(dot) : "";
+      let suffix = 0;
+      while (await adapter.exists(`${stashFolder}/${destName}`)) {
+        suffix += 1;
+        destName = `${stem}-${suffix}${ext}`;
+      }
+      const destPath = `${stashFolder}/${destName}`;
+      await this.app.fileManager.renameFile(file, destPath);
+      // The rename event re-fires onMaybeOrphan via the registered
+      // listener, which runs the standard frontmatter backfill. We
+      // also call it directly here so the timing is deterministic
+      // (no race against the metadataCache reparse) and the user sees
+      // the adoption notice promptly.
+      const moved = this.app.vault.getAbstractFileByPath(destPath);
+      if (moved instanceof TFile) {
+        // Small delay so metadataCache catches up to the new path.
+        setTimeout(() => { void this.fixOrphanParentForFile(moved); }, 500);
+      }
+      this.notifications.show({
+        message: `Imported \`${file.name}\` → \`${stashFolder}\``,
+        kind: "success",
+        category: "import",
+        folder: stashFolder,
+        affectedPaths: [destPath],
+      });
+    } catch (e) {
+      console.warn("Stashpad: markdown drop adoption failed", e);
+      this.notifications.show({
+        message: `Couldn't import \`${file.name}\`: ${(e as Error).message}`,
+        kind: "error",
+        category: "import",
+      });
+    }
   }
 
   /** Single-file version of fixOrphanParents. Stamps id/parent/created
@@ -1262,7 +1330,13 @@ export default class StashpadPlugin extends Plugin {
     const touched: string[] = [];
     const ensureFolder = async (path: string) => {
       if (!path) return;
-      if (!(await this.app.vault.adapter.exists(path))) await this.app.vault.createFolder(path);
+      if (await this.app.vault.adapter.exists(path)) return;
+      try {
+        await this.app.vault.createFolder(path);
+      } catch (e) {
+        const msg = (e as Error)?.message ?? "";
+        if (!/already exists/i.test(msg)) throw e;
+      }
     };
     let fmChecked = 0;
     let fmWritten = 0;
@@ -1435,8 +1509,16 @@ export default class StashpadPlugin extends Plugin {
     // when the user actually wants a second tab on the same folder
     // (e.g., for tiny mode + main side by side).
     const openAnywayItems: Item[] = [];
+    // 0.71.21: dedupe by folder. When two tabs are open on the same
+    // folder the picker used to emit two identical "Reveal X" rows
+    // (and two "Open X anyway" rows). Now we emit one row per
+    // distinct folder; the leaf picked for reveal is the first tab
+    // encountered (workspace order).
+    const seenLeafFolders = new Set<string>();
     for (const leaf of leaves) {
       const folder = folderForLeaf(leaf);
+      if (seenLeafFolders.has(folder)) continue;
+      seenLeafFolders.add(folder);
       seenOpen.add(folder);
       const label = folder.split("/").pop() || folder;
       baseItems.push({ kind: "reveal", folder, label: `Reveal "${label}" tab`, leaf, icon: "layout-grid" });

@@ -11,15 +11,18 @@ import {
 /** Panel ids registered with the StashpadPanelsView. Future panels
  *  (e.g. recent activity, search results, attachments) add to this
  *  union; the master-panel button bar surfaces one button per id. */
-type PanelId = "pinned" | "shared";
+type PanelId = "pinned" | "shared" | "tasks";
 
 /** Per-panel metadata used by the master button bar. */
 const PANEL_REGISTRY: Record<PanelId, { label: string; icon: string }> = {
-  pinned: { label: "Pinned Notes", icon: "pin" },
+  pinned: { label: "Pinned", icon: "pin" },
   // 0.70.0: Shared panel — surfaces notes you authored that have
   // contributors AND notes in folders whose home you authored but
   // someone else wrote.
   shared: { label: "Shared", icon: "users" },
+  // 0.71.30: Tasks panel — lists notes whose frontmatter has
+  // `completed: true` or any `due` key. Grouped by folder.
+  tasks: { label: "Tasks", icon: "check-circle-2" },
 };
 
 /** Sidebar view containing every Stashpad panel. The top of the view
@@ -46,6 +49,12 @@ export class StashpadPanelsView extends ItemView {
     this.registerEvent(this.app.metadataCache.on("changed", () => this.scheduleRender()));
     this.registerEvent(this.app.vault.on("rename", () => this.scheduleRender()));
     this.registerEvent(this.app.vault.on("delete", () => this.scheduleRender()));
+    // 0.71.26: re-render when the user switches to a different
+    // Stashpad tab so the pinned-notes panel can float that folder's
+    // group to the top of the list.
+    this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
+      if (leaf && leaf.view.getViewType() === STASHPAD_VIEW_TYPE) this.scheduleRender();
+    }));
   }
 
   private renderTimer: number | null = null;
@@ -71,6 +80,31 @@ export class StashpadPanelsView extends ItemView {
     searchBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Search" });
     searchBtn.onclick = () => this.openSearchFromPanel();
 
+    // 0.71.32: Folder Switcher — full-width global button just below
+    // Search. Delegates to the plugin's openFolderPicker so the same
+    // modal opens whether the user invokes it from the view header,
+    // the command palette, or here.
+    const folderBtn = globals.createEl("button", { cls: "stashpad-panels-global-btn" });
+    setIcon(folderBtn.createSpan({ cls: "stashpad-panels-global-btn-icon" }), "folder-tree");
+    folderBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Folder Switcher" });
+    folderBtn.onclick = () => this.plugin.openFolderPicker();
+
+    // 0.71.31: Log + Notifications share a row underneath Search —
+    // they're sibling diagnostic shortcuts so they live side-by-side.
+    const diagRow = globals.createDiv({ cls: "stashpad-panels-globals-row" });
+    const logBtn = diagRow.createEl("button", { cls: "stashpad-panels-global-btn" });
+    setIcon(logBtn.createSpan({ cls: "stashpad-panels-global-btn-icon" }), "scroll-text");
+    logBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Log" });
+    logBtn.onclick = () => this.openLogFromPanel();
+
+    const notifBtn = diagRow.createEl("button", { cls: "stashpad-panels-global-btn" });
+    setIcon(notifBtn.createSpan({ cls: "stashpad-panels-global-btn-icon" }), "bell");
+    notifBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Notifications" });
+    notifBtn.onclick = () => this.openNotificationsFromPanel();
+
+    // 0.71.30: Completed-notes shortcut moved into the dedicated Tasks
+    // panel below; no global button anymore.
+
     // Master button bar — one button per registered panel.
     const bar = root.createDiv({ cls: "stashpad-panels-bar" });
     for (const id of Object.keys(PANEL_REGISTRY) as PanelId[]) {
@@ -88,6 +122,7 @@ export class StashpadPanelsView extends ItemView {
     const body = root.createDiv({ cls: "stashpad-panels-body" });
     if (this.activePanel === "pinned") this.renderPinnedPanel(body);
     else if (this.activePanel === "shared") this.renderSharedPanel(body);
+    else if (this.activePanel === "tasks") this.renderTasksPanel(body);
   }
 
   // ---------- Pinned Notes panel ----------
@@ -108,7 +143,34 @@ export class StashpadPanelsView extends ItemView {
       empty.setText("No pinned notes yet — right-click a note and choose “Pin to sidebar.”");
       return;
     }
-    pins.forEach((pin, idx) => this.renderPinnedRow(list, pin, idx));
+
+    // 0.71.26: group pins by folder so the user can scan by Stashpad
+    // instead of a single flat list. Groups are ordered by first
+    // appearance in `pinnedNotes` (so manual reorders within a folder
+    // still survive), EXCEPT the MRU Stashpad's folder is floated to
+    // the top — switching tabs reorders the groups so the relevant
+    // pins are always at the top.
+    const groups = new Map<string, { pin: PinnedNoteRef; idx: number }[]>();
+    pins.forEach((pin, idx) => {
+      let bucket = groups.get(pin.folder);
+      if (!bucket) { bucket = []; groups.set(pin.folder, bucket); }
+      bucket.push({ pin, idx });
+    });
+    const mruFolder = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
+    const order = Array.from(groups.keys());
+    if (mruFolder && groups.has(mruFolder)) {
+      order.splice(order.indexOf(mruFolder), 1);
+      order.unshift(mruFolder);
+    }
+
+    for (const folder of order) {
+      const folderName = folder.split("/").pop() || folder;
+      const header = list.createDiv({ cls: "stashpad-pinned-group-header" });
+      if (folder === mruFolder) header.addClass("is-active-folder");
+      header.createSpan({ cls: "stashpad-pinned-group-name", text: folderName });
+      const bucket = groups.get(folder) ?? [];
+      for (const { pin, idx } of bucket) this.renderPinnedRow(list, pin, idx);
+    }
   }
 
   private renderPinnedRow(parent: HTMLElement, pin: PinnedNoteRef, idx: number): void {
@@ -308,6 +370,27 @@ export class StashpadPanelsView extends ItemView {
     if (target && typeof (target as any).openSearchModal === "function") {
       (target as any).openSearchModal();
     }
+  }
+
+  /** 0.71.25: Log button → open the plugin-wide log.jsonl in LogModal.
+   *  Folder-independent (log captures actions across every Stashpad). */
+  private async openLogFromPanel(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const path = this.plugin.pluginPrivatePath("log.jsonl");
+    if (!(await adapter.exists(path))) {
+      new Notice("No log yet — make some changes first.");
+      return;
+    }
+    const data = await adapter.read(path);
+    const { LogModal } = await import("./modals");
+    new LogModal(this.app, data, path).open();
+  }
+
+  /** 0.71.25: Notifications button → open the in-memory notification
+   *  history modal. Delegates to the existing command so the wiring
+   *  (author resolver, log-open callback) stays in one place. */
+  private openNotificationsFromPanel(): void {
+    (this.app as any).commands?.executeCommandById?.("stashpad:stashpad-open-notification-history");
   }
 
   /** Home button → navigate the MRU Stashpad to its root. */
@@ -597,6 +680,143 @@ export class StashpadPanelsView extends ItemView {
     if (target && typeof target.navigateTo === "function") {
       target.navigateTo(id);
     }
+  }
+
+  // ---------- Tasks panel (0.71.30) ----------
+
+  /** Scan every Stashpad folder for notes whose frontmatter looks like
+   *  a task: `completed: true` OR any `due` key (date string parsed
+   *  lazily). Result is grouped by folder, with the MRU folder floated
+   *  to the top — same convention as the Pinned panel. */
+  private renderTasksPanel(parent: HTMLElement): void {
+    const list = parent.createDiv({ cls: "stashpad-panel-tasks" });
+    const tasks = this.collectTasks();
+    if (tasks.length === 0) {
+      list.createDiv({ cls: "stashpad-tasks-empty" })
+        .setText("No tasks yet — add `completed: true` or a `due:` date to any note's frontmatter.");
+      return;
+    }
+    // Group by folder, MRU-first.
+    const groups = new Map<string, typeof tasks>();
+    for (const t of tasks) {
+      let bucket = groups.get(t.folder);
+      if (!bucket) { bucket = []; groups.set(t.folder, bucket); }
+      bucket.push(t);
+    }
+    const mruFolder = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
+    const order = Array.from(groups.keys());
+    if (mruFolder && groups.has(mruFolder)) {
+      order.splice(order.indexOf(mruFolder), 1);
+      order.unshift(mruFolder);
+    }
+    for (const folder of order) {
+      const folderName = folder.split("/").pop() || folder;
+      const header = list.createDiv({ cls: "stashpad-pinned-group-header" });
+      if (folder === mruFolder) header.addClass("is-active-folder");
+      header.createSpan({ cls: "stashpad-pinned-group-name", text: folderName });
+      const bucket = (groups.get(folder) ?? []).slice().sort(this.compareTasks);
+      for (const t of bucket) this.renderTaskRow(list, t);
+    }
+  }
+
+  /** Order tasks within a group: incomplete first (by due-date asc,
+   *  undated last), completed last. */
+  private compareTasks = (
+    a: { completed: boolean; due: number | null },
+    b: { completed: boolean; due: number | null },
+  ): number => {
+    if (a.completed !== b.completed) return a.completed ? 1 : -1;
+    if (a.due == null && b.due == null) return 0;
+    if (a.due == null) return 1;
+    if (b.due == null) return -1;
+    return a.due - b.due;
+  };
+
+  private renderTaskRow(
+    parent: HTMLElement,
+    t: { file: TFile; folder: string; id: string; title: string; completed: boolean; due: number | null; dueRaw: string | null; color: string | null },
+  ): void {
+    const row = parent.createDiv({ cls: "stashpad-pinned-row stashpad-task-row" });
+    if (t.color) row.addClass("has-color");
+    if (t.completed) row.addClass("is-completed");
+    // Status icon (checkmark = done, circle = open).
+    const icon = row.createSpan({ cls: "stashpad-pinned-icon" });
+    setIcon(icon, t.completed ? "check-circle-2" : "circle");
+    if (t.color) icon.style.color = t.color;
+    const label = row.createSpan({ cls: "stashpad-pinned-label", text: t.title });
+    label.onclick = () => this.openTaskFromPanel(t.folder, t.id);
+    if (t.dueRaw) {
+      const due = row.createSpan({ cls: "stashpad-task-due", text: t.dueRaw });
+      if (t.due != null && t.due < Date.now() && !t.completed) due.addClass("is-overdue");
+    }
+    row.oncontextmenu = (e) => {
+      e.preventDefault();
+      const menu = new Menu();
+      menu.addItem((it: any) => it.setTitle("Open").setIcon("arrow-right").onClick(() => {
+        void this.openTaskFromPanel(t.folder, t.id);
+      }));
+      menu.showAtMouseEvent(e);
+    };
+  }
+
+  private async openTaskFromPanel(folder: string, id: StashpadId): Promise<void> {
+    await this.plugin.activateViewForFolder(folder);
+    const target = this.plugin.lastActiveStashpadLeaf?.view as any
+      ?? this.findActiveStashpad();
+    if (target && typeof target.navigateTo === "function") target.navigateTo(id);
+  }
+
+  private collectTasks(): Array<{
+    file: TFile;
+    folder: string;
+    id: string;
+    title: string;
+    completed: boolean;
+    due: number | null;
+    dueRaw: string | null;
+    color: string | null;
+  }> {
+    const folders = this.plugin.discoverStashpadFolders();
+    const folderSet = new Set(folders);
+    const out: Array<{
+      file: TFile;
+      folder: string;
+      id: string;
+      title: string;
+      completed: boolean;
+      due: number | null;
+      dueRaw: string | null;
+      color: string | null;
+    }> = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folderSet.has(dir)) continue;
+      const fm = (this.app.metadataCache.getFileCache(f)?.frontmatter ?? {}) as any;
+      const id = typeof fm.id === "string" ? fm.id : null;
+      if (!id || id === ROOT_ID) continue;
+      const completed = fm.completed === true;
+      const dueRaw = typeof fm.due === "string" || typeof fm.due === "number" ? String(fm.due) : null;
+      // `due` can be either a moment-parseable date string or a raw
+      // ISO timestamp number. Try Date.parse — if NaN, keep dueRaw for
+      // display but leave due=null so sort doesn't mis-order it.
+      let due: number | null = null;
+      if (dueRaw) {
+        const t = Date.parse(dueRaw);
+        if (!Number.isNaN(t)) due = t;
+      }
+      if (!completed && due == null && !dueRaw) continue;
+      out.push({
+        file: f,
+        folder: dir,
+        id,
+        title: this.titleFromFile(f),
+        completed,
+        due,
+        dueRaw,
+        color: typeof fm.color === "string" ? fm.color : null,
+      });
+    }
+    return out;
   }
 }
 
