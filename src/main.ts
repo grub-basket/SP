@@ -755,6 +755,22 @@ export default class StashpadPlugin extends Plugin {
       name: "Open Stashpad detail panel (right sidebar)",
       callback: () => void openStashpadDetailView(this.app),
     });
+    // 0.76.19: jump from a plain Obsidian markdown tab to the same
+    // note inside Stashpad — for when you open a Stashpad note in the
+    // normal editor by accident. Reuses an existing Stashpad tab on
+    // that folder if one's open, else opens a fresh one, then focuses
+    // the note.
+    this.addCommand({
+      id: "stashpad-reveal-active-note",
+      name: "Open this note in Stashpad",
+      checkCallback: (checking: boolean) => {
+        const file = this.app.workspace.getActiveFile();
+        const ok = !!file && file.extension === "md" && this.isStashpadNoteFile(file);
+        if (checking) return ok;
+        if (ok && file) void this.revealNoteInStashpad(file);
+        return ok;
+      },
+    });
     // 0.73.11: per-panel shortcuts — open the sidebar panels view AND
     // select the matching tab (Pinned / Shared / Tasks).
     const panelIds = Object.keys(PANEL_REGISTRY) as PanelId[];
@@ -1934,6 +1950,40 @@ export default class StashpadPlugin extends Plugin {
       state: { folderOverride: cleaned } as any,
     });
     this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** 0.76.19: true when `file` is a Stashpad note — lives in a known
+   *  Stashpad folder AND has an `id` in frontmatter. */
+  private isStashpadNoteFile(file: TFile): boolean {
+    const dir = file.parent?.path?.replace(/\/+$/, "") ?? "";
+    if (!this.discoverStashpadFolders().includes(dir)) return false;
+    const id = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+    return typeof id === "string" && id.length > 0;
+  }
+
+  /** 0.76.19: focus `file`'s note inside Stashpad. Reuses an open
+   *  Stashpad tab already on that folder (reveals + navigates it);
+   *  otherwise opens a fresh tab on the folder, then navigates to the
+   *  note's id. */
+  async revealNoteInStashpad(file: TFile): Promise<void> {
+    const folder = file.parent?.path?.replace(/\/+$/, "") ?? "";
+    const id = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+    if (!folder || typeof id !== "string" || !id) {
+      new Notice("That note isn't a Stashpad note.");
+      return;
+    }
+    // Reuse an existing Stashpad tab already viewing this folder.
+    const existing = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+      .find((leaf) => ((leaf.view as any)?.noteFolder ?? "") === folder);
+    if (existing) {
+      this.app.workspace.revealLeaf(existing);
+      const view = existing.view as any;
+      if (typeof view?.navigateTo === "function") view.navigateTo(id);
+      return;
+    }
+    await this.activateViewForFolder(folder);
+    const view = this.lastActiveStashpadLeaf?.view as any;
+    if (typeof view?.navigateTo === "function") view.navigateTo(id);
   }
 
   /** Walk vault markdown frontmatter for notes whose author or

@@ -325,6 +325,10 @@ export class ConfirmDeleteModal extends Modal {
   ) { super(app); }
 
   onOpen(): void {
+    // 0.76.18: size the modal to its content instead of Obsidian's
+    // default tall box — the delete confirm is just a sentence + two
+    // buttons, and the empty space read as oversized on mobile.
+    this.modalEl?.addClass("stashpad-compact-modal");
     this.contentEl.empty();
     this.titleEl.setText(`Delete "${this.noteTitle}"?`);
     const parts: string[] = [];
@@ -780,6 +784,7 @@ export class ConfirmModal extends Modal {
     private onChoose: (confirmed: boolean) => void,
   ) { super(app); }
   onOpen(): void {
+    this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
     this.contentEl.empty();
     this.titleEl.setText(this.titleText);
     // 0.63.2: render each newline-separated sentence on its own line.
@@ -828,6 +833,7 @@ export class DueDatePickerModal extends Modal {
   ) { super(app); }
 
   onOpen(): void {
+    this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
     this.contentEl.empty();
     this.titleEl.setText("Set due date");
 

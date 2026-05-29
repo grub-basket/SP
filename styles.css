@@ -2139,6 +2139,21 @@
   margin-top: 12px;
 }
 
+/* 0.76.18: compact confirm dialogs (delete, generic confirm, due
+   picker) size to their content instead of Obsidian's default tall
+   box — the leftover empty space looked oversized, especially on
+   mobile where modals lean large. */
+.modal.stashpad-compact-modal {
+  height: auto;
+  min-height: 0;
+  width: auto;
+  max-width: min(440px, 92vw);
+}
+.modal.stashpad-compact-modal .modal-content {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
 /* 0.76.1 / 0.76.5: due-date picker modal. Native date/time inputs
    (OS pickers on mobile), each with a leading icon at a constrained
    width. Presets + actions share one 3-column grid so all six
@@ -2175,7 +2190,16 @@
   background: var(--background-primary);
   color: var(--text-normal);
   font-size: var(--font-ui-small);
+  /* 0.76.17: uppercase any letters (month abbreviation / AM·PM). */
+  text-transform: uppercase;
 }
+/* 0.76.17: kill the leading gap webkit reserves inside the value
+   editor (looked like stray space before the date now that the
+   picker indicator is hidden). */
+.stashpad-due-date::-webkit-datetime-edit,
+.stashpad-due-time::-webkit-datetime-edit { padding: 0; }
+.stashpad-due-date::-webkit-datetime-edit-fields-wrapper,
+.stashpad-due-time::-webkit-datetime-edit-fields-wrapper { padding: 0; }
 .stashpad-due-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

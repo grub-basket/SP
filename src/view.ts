@@ -142,6 +142,14 @@ export class StashpadView extends ItemView {
   private modeSplit: boolean | null = null;
   private modeEnterSubmits = true; // per-view, defaults true
   private nextDestination: StashpadId | null = null;
+  /** 0.76.15: when the chosen destination lives in ANOTHER Stashpad
+   *  folder, this holds that folder (and a display label). The next
+   *  composer submit creates the note THERE, remotely, without
+   *  switching this view away from where you are — the whole point of
+   *  "ship it off while stationary." Null = destination is in the
+   *  current folder. */
+  private nextDestinationFolder: string | null = null;
+  private nextDestinationLabel: string | null = null;
   private inListPicker: { activeIdx: number } | null = null;
   private listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
@@ -4236,21 +4244,34 @@ export class StashpadView extends ItemView {
       try { await this.recordLastSubmitted(text); } catch {}
       const split = this.modeSplit ?? getSettings().splitOnLines;
       const dest = this.nextDestination;
+      // 0.76.15: capture the cross-folder target (if any) before
+      // resetting. A remote destination creates the note in that
+      // folder without moving this view.
+      const destFolder = this.nextDestinationFolder;
+      const remote = !!destFolder && destFolder !== this.noteFolder;
       this.nextDestination = null;
-      this.autoSelectNewest = true;
-      this.scrollToBottomOnNextRender = true;
+      this.nextDestinationFolder = null;
+      this.nextDestinationLabel = null;
+      // autoSelectNewest only makes sense for LOCAL creates (the new
+      // row is in this view). Remote sends leave the local list alone.
+      this.autoSelectNewest = !remote;
+      this.scrollToBottomOnNextRender = !remote;
+      const createOpts = remote ? { targetFolder: destFolder! } : undefined;
       if (split) {
         for (const line of text.split(/\r?\n/)) {
           const t = line.trim();
-          if (t) await this.createNoteUnder(t, dest);
+          if (t) await this.createNoteUnder(t, dest, createOpts);
         }
       } else {
-        await this.createNoteUnder(text, dest);
+        await this.createNoteUnder(text, dest, createOpts);
       }
       // Keep focus in the composer so the user can keep typing without
       // re-clicking — unless the user disabled this in settings.
       if (getSettings().autofocusComposerAfterSend) {
         this.focusComposerOnNextRender = true;
+        // 0.76.15: remote sends already rendered inside createNoteUnder
+        // (before this flag was set), so restore focus directly.
+        if (remote) this.composerInputEl?.focus();
       }
     };
     sendBtn.onclick = () => void submit();
@@ -4327,6 +4348,9 @@ export class StashpadView extends ItemView {
   }
   private destinationLabel(): string {
     if (!this.nextDestination) return "current";
+    // 0.76.15: cross-folder destination — the parent isn't in this
+    // view's tree, so use the label captured at pick time.
+    if (this.nextDestinationFolder) return this.nextDestinationLabel ?? this.nextDestinationFolder;
     if (this.nextDestination === ROOT_ID) return "Home";
     const node = this.tree.get(this.nextDestination);
     return node ? this.titleForNode(node).trim() : "?";
@@ -4859,19 +4883,36 @@ export class StashpadView extends ItemView {
       onPick: async (item) => {
         if (item.crossFolder) {
           const targetId = item.id.replace(/^cross:/, "");
-          await this.switchToFolderAndFocus(item.crossFolder, targetId);
+          // 0.76.15: DON'T switch folders. Record the cross-folder
+          // destination; the next submit ships the note there while
+          // this view stays exactly where it is. Composer content is
+          // untouched (no folder switch to clear it).
           this.nextDestination = targetId;
+          this.nextDestinationFolder = item.crossFolder;
+          const folderName = item.crossFolder.split("/").pop() || item.crossFolder;
+          const noteTitle = targetId === ROOT_ID
+            ? "Home"
+            : (item.crossFile?.basename ?? "note").replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+          this.nextDestinationLabel = `${folderName} ▸ ${noteTitle}`;
           this.render();
           this.composerInputEl?.focus();
           return;
         }
         this.nextDestination = item.id;
+        this.nextDestinationFolder = null;
+        this.nextDestinationLabel = null;
         this.render();
         this.composerInputEl?.focus();
       },
       onCreate: async (q) => {
         const id = await this.createNoteUnder(q, this.focusId);
-        if (id) { this.nextDestination = id; this.render(); this.composerInputEl?.focus(); }
+        if (id) {
+          this.nextDestination = id;
+          this.nextDestinationFolder = null;
+          this.nextDestinationLabel = null;
+          this.render();
+          this.composerInputEl?.focus();
+        }
       },
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
     }).open();
@@ -7943,8 +7984,16 @@ export class StashpadView extends ItemView {
 
   // --- Note creation ---
 
-  private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string } = { record: true }): Promise<StashpadId | null> {
-    await this.ensureFolder(this.noteFolder);
+  private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string } = { record: true }): Promise<StashpadId | null> {
+    // 0.76.15: targetFolder lets the destination picker SHIP a note to
+    // another Stashpad folder without switching this view there. When
+    // it differs from the current folder we skip the synthetic insert
+    // / render / fmSync that assume the note belongs to this view's
+    // tree, and instead surface a "sent to <folder>" notice with a
+    // Jump action.
+    const folder = (opts.targetFolder ?? this.noteFolder).replace(/\/+$/, "");
+    const remote = folder !== this.noteFolder;
+    await this.ensureFolder(folder);
     const id = newId();
 
     // Per-Stashpad template: if the user has set one for this folder, fold
@@ -7954,7 +8003,7 @@ export class StashpadView extends ItemView {
     // attachments) always win over the template.
     let templateFm: Record<string, any> | null = null;
     {
-      const tplPath = (this.plugin.settings.noteTemplates ?? {})[this.noteFolder.replace(/\/+$/, "")];
+      const tplPath = (this.plugin.settings.noteTemplates ?? {})[folder];
       if (tplPath) {
         const tplFile = this.app.vault.getAbstractFileByPath(tplPath) as TFile | null;
         if (tplFile && (tplFile as any).extension === "md") {
@@ -7982,7 +8031,10 @@ export class StashpadView extends ItemView {
 
     const slug = bodyToSlug(body, this.activeStopwords());
     const filename = buildFilename(slug, id);
-    const path = `${this.noteFolder}/${filename}`;
+    const path = `${folder}/${filename}`;
+    // For remote sends parentOverride is always supplied (the picked
+    // remote parent); falling back to this.focusId would be wrong (it
+    // belongs to the current folder).
     const parentId = parentOverride ?? this.focusId;
     // createdOverride lets callers (e.g. split) preserve the source
     // note's created time for the second half so it sorts in the same
@@ -8014,23 +8066,44 @@ export class StashpadView extends ItemView {
     try {
       const fullContent = fmLines.join("\n");
       await this.app.vault.create(path, fullContent);
-      // Synthetic insert: put the node into the tree immediately, without waiting
-      // for metadataCache to parse the new file. On slow drives the cache parse is
-      // the dominant lag — this makes the new note appear in the list right away.
       try {
         const f = this.app.vault.getAbstractFileByPath(path);
         if (f && (f as any).extension === "md") {
-          this.tree.insertSynthetic({
-            id, parent: parentId, children: [], file: f as TFile, created,
-          });
-          this.render();
-          // Schedule the redundant parentLink / children fields. The
-          // tree is now in its post-create shape, so the queue will
-          // see the right state when it drains.
-          this.fmSync.scheduleParentChange(id, null, parentId);
+          if (!remote) {
+            // Local create: synthetic insert so the row appears instantly
+            // (before the metadataCache parses), render, and sync the
+            // redundant recovery fields.
+            this.tree.insertSynthetic({
+              id, parent: parentId, children: [], file: f as TFile, created,
+            });
+            this.render();
+            this.fmSync.scheduleParentChange(id, null, parentId);
+          } else {
+            // 0.76.15: remote send — the note belongs to another
+            // folder's tree, not this view's. Just refresh the local
+            // view (clears the destination badge) and tell the user
+            // where it went, with a Jump action.
+            this.render();
+            const folderName = folder.split("/").pop() || folder;
+            const noteTitle = (body.split("\n").find((s) => s.trim()) ?? "note").trim().slice(0, 60);
+            this.plugin.notifications.show({
+              // 0.76.16: persistent so it waits for you to act, and the
+              // Jump action targets the NOTE itself (not just its parent).
+              message: `"${noteTitle}" landed in \`${folderName}\``,
+              kind: "success",
+              category: "create",
+              duration: 0,
+              folder,
+              affectedIds: [id],
+              actions: [{
+                label: "Jump to note",
+                onClick: () => { void this.switchToFolderAndFocus(folder, id); },
+              }],
+            });
+          }
           // Layer template frontmatter (color, tags, custom keys). Auto
           // fields (id/parent/created/attachments) are skipped so the
-          // values written above always win.
+          // values written above always win. Applies local + remote.
           if (templateFm) {
             try {
               await this.app.fileManager.processFrontMatter(f as TFile, (m: any) => {
@@ -8048,18 +8121,21 @@ export class StashpadView extends ItemView {
       // log.append is fire-and-forget — no actual await happens, but we keep `await` for symmetry.
       await this.log.append({ type: "create", id, payload: { path, parent: parentId } });
       if (opts.record !== false) {
-        const folder = this.noteFolder;
+        // 0.76.15: push the undo onto the TARGET folder's stack (so it
+        // belongs with that folder's history), and only rebuild THIS
+        // view's tree when the create was local — a remote create
+        // mustn't repoint this.tree at the remote folder.
         const originalBody = body;
         this.plugin.getUndoStack(folder).push({
-          label: "Create note",
+          label: remote ? "Send note" : "Create note",
           undo: async () => {
             const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
             if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
-            // Restore the body to the per-folder composer draft.
+            // Restore the body to the composer so the send/create can be
+            // re-typed. (For remote sends the destination is gone after
+            // submit, but the text returning is still the useful part.)
             this.composerDraft = originalBody;
             void this.saveDraft(originalBody);
-            // Clear the "last submitted" marker so this restored draft is offered on reload
-            // (otherwise the suggestion-suppression guard treats it as already-sent).
             void this.recordLastSubmitted("");
             if (this.composerInputEl) {
               this.composerInputEl.value = originalBody;
@@ -8067,7 +8143,7 @@ export class StashpadView extends ItemView {
               this.composerInputEl.setSelectionRange(end, end);
               this.composerInputEl.focus();
             }
-            this.tree.rebuild(folder);
+            if (!remote) this.tree.rebuild(this.noteFolder);
             this.render();
           },
           redo: async () => {
@@ -8076,10 +8152,9 @@ export class StashpadView extends ItemView {
             }
             this.composerDraft = "";
             void this.saveDraft("");
-            // Re-record the body as last-submitted so the restore-banner guard kicks back in.
             void this.recordLastSubmitted(originalBody);
             if (this.composerInputEl) this.composerInputEl.value = "";
-            this.tree.rebuild(folder);
+            if (!remote) this.tree.rebuild(this.noteFolder);
             this.render();
           },
         });
