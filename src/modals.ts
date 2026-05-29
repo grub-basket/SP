@@ -1,4 +1,4 @@
-import { App, Modal, Platform, moment, Notice } from "obsidian";
+import { App, Modal, Platform, moment, Notice, setIcon } from "obsidian";
 import type { NotificationCategory, NotificationKind, NotificationRecord, NotificationService } from "./notifications";
 
 interface LogEv { ts: string; type: string; id: string; payload?: any; author?: string; }
@@ -807,6 +807,115 @@ export class ConfirmModal extends Modal {
       this.didChoose = true;
       this.onChoose(false);
     }
+  }
+}
+
+/** 0.76.1: pick a due date + time for a task. Uses native
+ *  <input type="date"> + <input type="time"> so mobile gets the OS
+ *  date/time pickers for free. Quick-preset buttons (Today, Tomorrow,
+ *  Next week) fill the inputs without typing. Returns an ISO string
+ *  (date + time, local) or null to clear the due date. The callback
+ *  receives `undefined` if the modal was dismissed without choosing. */
+export class DueDatePickerModal extends Modal {
+  private didChoose = false;
+  constructor(
+    app: App,
+    /** Existing due value (ISO) to pre-fill, or null/undefined. */
+    private current: string | null | undefined,
+    /** Called with the new ISO string, or null to clear. Not called
+     *  on dismiss-without-choice. */
+    private onPick: (iso: string | null) => void,
+  ) { super(app); }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.titleEl.setText("Set due date");
+
+    // Pre-fill from the current value when parseable.
+    let initial: Date | null = null;
+    if (this.current) {
+      const t = Date.parse(this.current);
+      if (!Number.isNaN(t)) initial = new Date(t);
+    }
+
+    const wrap = this.contentEl.createDiv({ cls: "stashpad-due-picker" });
+    // 0.76.5: each field is [leading icon] + input, constrained width
+    // (the native inputs default to absurdly wide). Date row gets a
+    // calendar icon; time row gets a clock icon at its START.
+    const fields = wrap.createDiv({ cls: "stashpad-due-fields" });
+    const dateField = fields.createDiv({ cls: "stashpad-due-field" });
+    const dateIcon = dateField.createSpan({ cls: "stashpad-due-field-icon" });
+    setIcon(dateIcon, "calendar");
+    const dateInput = dateField.createEl("input", { type: "date", cls: "stashpad-due-date" }) as HTMLInputElement;
+    const timeField = fields.createDiv({ cls: "stashpad-due-field" });
+    const timeIcon = timeField.createSpan({ cls: "stashpad-due-field-icon" });
+    setIcon(timeIcon, "clock");
+    const timeInput = timeField.createEl("input", { type: "time", cls: "stashpad-due-time" }) as HTMLInputElement;
+    // 0.76.8: the leading icon IS the picker button. The native
+    // ::-webkit-calendar-picker-indicator (on the input's right) is
+    // hidden via CSS; clicking our left icon opens the OS picker via
+    // showPicker(). Wrapped in try — showPicker throws outside a user
+    // gesture or on platforms that lack it (the input is still
+    // directly editable / clickable as a fallback).
+    dateIcon.onclick = () => { try { (dateInput as any).showPicker?.(); } catch { /* noop */ } };
+    timeIcon.onclick = () => { try { (timeInput as any).showPicker?.(); } catch { /* noop */ } };
+    if (initial) {
+      dateInput.value = this.toDateValue(initial);
+      timeInput.value = this.toTimeValue(initial);
+    }
+
+    // 0.76.5: presets (top row) + actions (bottom row) share ONE
+    // 3-column grid so the six buttons line up in two tidy rows.
+    const grid = wrap.createDiv({ cls: "stashpad-due-grid" });
+    const addPreset = (label: string, build: () => Date) => {
+      const b = grid.createEl("button", { cls: "stashpad-due-btn stashpad-due-preset", text: label });
+      b.onclick = () => {
+        const d = build();
+        dateInput.value = this.toDateValue(d);
+        if (!timeInput.value) timeInput.value = this.toTimeValue(d);
+      };
+    };
+    const atNine = (d: Date): Date => { d.setHours(9, 0, 0, 0); return d; };
+    addPreset("Today", () => atNine(this.startOfTodayLocal()));
+    addPreset("Tomorrow", () => { const d = this.startOfTodayLocal(); d.setDate(d.getDate() + 1); return atNine(d); });
+    addPreset("Next week", () => { const d = this.startOfTodayLocal(); d.setDate(d.getDate() + 7); return atNine(d); });
+
+    const clear = grid.createEl("button", { cls: "stashpad-due-btn", text: "Clear" });
+    clear.onclick = () => { this.didChoose = true; this.close(); this.onPick(null); };
+    const cancel = grid.createEl("button", { cls: "stashpad-due-btn", text: "Cancel" });
+    cancel.onclick = () => { this.didChoose = true; this.close(); };
+    const ok = grid.createEl("button", { cls: "stashpad-due-btn mod-cta", text: "Set" });
+    ok.onclick = () => {
+      if (!dateInput.value) { new Notice("Pick a date first (or use Clear)."); return; }
+      // Default time to 09:00 when only a date was chosen.
+      const [y, m, d] = dateInput.value.split("-").map((n) => parseInt(n, 10));
+      let hh = 9, mm = 0;
+      if (timeInput.value) { const [h, mi] = timeInput.value.split(":").map((n) => parseInt(n, 10)); hh = h; mm = mi; }
+      const due = new Date(y, m - 1, d, hh, mm, 0, 0);
+      this.didChoose = true;
+      this.close();
+      this.onPick(due.toISOString());
+    };
+    requestAnimationFrame(() => dateInput.focus());
+  }
+
+  onClose(): void { this.contentEl.empty(); void this.didChoose; }
+
+  private startOfTodayLocal(): Date {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  private toDateValue(d: Date): string {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+  private toTimeValue(d: Date): string {
+    const h = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    return `${h}:${mi}`;
   }
 }
 

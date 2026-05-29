@@ -831,6 +831,22 @@
   transition: background 0.1s ease, box-shadow 0.1s ease;
   border: 1px solid transparent;
 }
+/* 0.76.10: task rows get a leading checkbox column. */
+.stashpad-note.is-task { grid-template-columns: auto auto 1fr auto; }
+.stashpad-note-task-checkbox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  cursor: pointer;
+  /* 0.76.12: enlarge the hit target so a click reliably lands on the
+     checkbox (not the row) — negative margin keeps the visual size. */
+  padding: 4px;
+  margin: -3px;
+  border-radius: 4px;
+}
+.stashpad-note-task-checkbox:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-note-task-checkbox svg { width: 16px; height: 16px; }
 /* Top row of meta: timestamp + grip side-by-side. */
 .stashpad-note-meta-top {
   display: flex;
@@ -972,6 +988,12 @@
 .stashpad-note.is-pick-target {
   background: var(--background-modifier-success);
   border-color: var(--color-green);
+  /* 0.73.15: explicit green inset shadow so the highlight is visible
+     even when the row ALSO carries .is-cursor (which sets its own
+     accent-color inset shadow). Without this, the accent ring
+     covered the green border and the pick-target read as just "the
+     cursor row" with no visible destination cue. */
+  box-shadow: 0 0 0 2px var(--color-green) inset;
 }
 /* Dark theme: --background-modifier-success is a pale wash-out under
    white body text. Substitute a deeper green tinted with the accent
@@ -979,6 +1001,7 @@
 .theme-dark .stashpad-note.is-pick-target {
   background: rgba(60, 160, 90, 0.35);
   border-color: rgba(120, 220, 150, 0.9);
+  box-shadow: 0 0 0 2px rgba(120, 220, 150, 0.9) inset;
 }
 .stashpad-note.is-completed .stashpad-note-body,
 .stashpad-note.is-completed .stashpad-note-time {
@@ -1075,6 +1098,16 @@
   overflow: hidden;
   text-overflow: ellipsis;
   position: relative;
+}
+/* 0.73.14: transient un-clamp for the row under the keyboard cursor.
+   Settings toggle: "Expand the cursor row's body automatically".
+   CSS-only — moving the cursor away flips .is-cursor-expanded off
+   on the previous row, restoring the clamp. */
+.stashpad-note.is-cursor-expanded .stashpad-note-text.is-clamped {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
+  text-overflow: clip;
 }
 .stashpad-expand-toggle {
   margin-top: 4px;
@@ -2106,6 +2139,62 @@
   margin-top: 12px;
 }
 
+/* 0.76.1 / 0.76.5: due-date picker modal. Native date/time inputs
+   (OS pickers on mobile), each with a leading icon at a constrained
+   width. Presets + actions share one 3-column grid so all six
+   buttons line up as two even rows. */
+.stashpad-due-picker { display: flex; flex-direction: column; gap: 14px; }
+.stashpad-due-fields { display: flex; flex-direction: column; gap: 8px; }
+.stashpad-due-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 260px;
+}
+.stashpad-due-field-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+.stashpad-due-field-icon:hover { color: var(--text-normal); }
+.stashpad-due-field-icon svg { width: 16px; height: 16px; }
+/* 0.76.8: hide the native right-side picker indicator — our left
+   icon is the picker button now (calls showPicker). */
+.stashpad-due-date::-webkit-calendar-picker-indicator,
+.stashpad-due-time::-webkit-calendar-picker-indicator {
+  display: none;
+}
+.stashpad-due-date, .stashpad-due-time {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+}
+.stashpad-due-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.stashpad-due-btn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+}
+.stashpad-due-btn:hover { background: var(--interactive-hover); }
+.stashpad-due-btn.mod-cta { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
+.stashpad-due-btn.mod-cta:hover { background: var(--interactive-accent-hover); }
+
 /* Stashpad notification toast — wraps Obsidian's built-in .notice with
    a structured layout so we can stack a message + action button row.
    Color shifts by kind (info / success / warning / error) come from
@@ -2599,6 +2688,257 @@
   min-width: 0;
 }
 
+/* 0.74.1: right-sidebar detail panel. Surfaces the cursored note's
+   body, metadata, and children list. Counterpart to the left panels
+   view (Pinned/Shared/Tasks). Styling kept light so theme variables
+   carry the look. */
+.stashpad-detail-root {
+  /* 0.74.7: full-height flex column — content scrolls, composer
+     stays pinned at the bottom and rides up as the panel shrinks. */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 8px 10px;
+  font-size: var(--font-ui-small);
+}
+/* 0.74.7: scrollable content region above the pinned composer. */
+.stashpad-detail-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+.stashpad-detail-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px 8px;
+  color: var(--text-muted);
+  text-align: center;
+}
+.stashpad-detail-empty-icon svg { width: 28px; height: 28px; opacity: 0.5; }
+.stashpad-detail-empty-text { font-size: var(--font-ui-smaller); line-height: 1.4; }
+.stashpad-detail-header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 10px;
+}
+.stashpad-detail-titlerow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.stashpad-detail-title {
+  flex: 1 1 auto;
+  font-size: var(--font-ui-medium);
+  font-weight: 600;
+  color: var(--text-normal);
+  overflow-wrap: anywhere;
+}
+.stashpad-detail-open-btn {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+}
+.stashpad-detail-open-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-detail-metarow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.stashpad-detail-meta-chip {
+  font-size: var(--font-ui-smaller);
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+.stashpad-detail-meta-chip.is-completed { color: var(--color-green); }
+.stashpad-detail-meta-chip.is-due { color: var(--color-orange); }
+.stashpad-detail-meta-color {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-detail-meta-tag {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-accent);
+}
+.stashpad-detail-body {
+  margin: 0 0 12px;
+  font-size: var(--font-text-size);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.stashpad-detail-body > :first-child { margin-top: 0; }
+.stashpad-detail-body > :last-child { margin-bottom: 0; }
+.stashpad-detail-footer-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 0;
+  border-top: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-detail-meta-line { display: flex; gap: 6px; }
+.stashpad-detail-meta-key { flex: 0 0 86px; color: var(--text-faint); }
+.stashpad-detail-meta-val { flex: 1 1 auto; overflow-wrap: anywhere; }
+.stashpad-detail-children {
+  margin-top: 12px;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 8px;
+}
+.stashpad-detail-children-header {
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  margin-bottom: 6px;
+}
+.stashpad-detail-children-list { display: flex; flex-direction: column; gap: 1px; }
+.stashpad-detail-child-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-normal);
+}
+.stashpad-detail-child-row:hover { background: var(--background-modifier-hover); }
+/* 0.74.2: chevron toggle on rows with descendants — mirrors the
+   Pinned panel's outline expander. Always reserves the slot so
+   row contents stay aligned regardless of whether the toggle is
+   visible on a given row. */
+.stashpad-detail-child-toggle {
+  flex: 0 0 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.stashpad-detail-child-toggle:hover { color: var(--text-normal); }
+.stashpad-detail-child-toggle svg { width: 12px; height: 12px; }
+/* 0.76.10: task checkbox on detail child rows. */
+.stashpad-detail-child-checkbox {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.stashpad-detail-child-checkbox:hover { color: var(--text-normal); }
+.stashpad-detail-child-checkbox svg { width: 14px; height: 14px; }
+
+/* 0.74.3: child-count badge shared by the Pinned + detail outline
+   rows (replaces the caret expander). Collapsed = muted; .is-expanded
+   = accent tint so open/closed state still reads at a glance even
+   though the count is always shown. */
+.stashpad-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 15px;
+  padding: 0 4px;
+  /* 0.76.13: square (rounded corners) instead of a pill/circle. */
+  border-radius: 3px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 80ms ease, color 80ms ease;
+}
+.stashpad-count-badge:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-count-badge.is-expanded {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.stashpad-detail-child-icon { display: inline-flex; align-items: center; }
+.stashpad-detail-child-icon svg { width: 14px; height: 14px; }
+.stashpad-detail-child-title {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-detail-child-row.is-completed { text-decoration: line-through; opacity: 0.6; }
+/* 0.74.5: drag-reorder affordances, mirroring the Pinned panel. */
+.stashpad-detail-child-row.is-dragging { opacity: 0.4; }
+.stashpad-detail-child-row.drop-before { box-shadow: inset 0 2px 0 0 var(--interactive-accent); }
+.stashpad-detail-child-row.drop-after { box-shadow: inset 0 -2px 0 0 var(--interactive-accent); }
+.stashpad-detail-error { color: var(--color-red); font-size: var(--font-ui-smaller); }
+
+/* 0.74.4 / 0.74.7: simplified composer, pinned at the bottom of the
+   detail panel. Textarea on top, full-width "Add child note" button
+   below. Creates a child of the displayed note; shares the #/[[/@
+   autocomplete popover with the main composer. flex:0 so it keeps
+   its natural height while the scroll area above absorbs resizes. */
+.stashpad-detail-composer {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.stashpad-detail-composer-input {
+  width: 100%;
+  resize: vertical;
+  min-height: 2.4em;
+  max-height: 40vh;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  line-height: 1.4;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+.stashpad-detail-composer-input:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+.stashpad-detail-composer-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  height: 30px;
+  border-radius: 6px;
+  border: none;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  font-weight: 500;
+}
+.stashpad-detail-composer-send:hover { background: var(--interactive-accent-hover); }
+.stashpad-detail-composer-send-icon { display: inline-flex; align-items: center; }
+.stashpad-detail-composer-send-icon svg { width: 15px; height: 15px; }
+
 /* 0.73.1: tabbed settings UI. Search box at top, tab bar below,
    body underneath. Search mode dims the tab bar and shows every
    section grouped under its tab label. */
@@ -2857,10 +3197,80 @@
   white-space: nowrap;
 }
 .stashpad-task-due.is-overdue { color: var(--text-error); }
+/* 0.76.3: clickable checkbox in the Tasks panel. */
+.stashpad-task-checkbox { cursor: pointer; }
+.stashpad-task-checkbox:hover { color: var(--text-normal); }
 .stashpad-tasks-empty {
   padding: 12px 10px;
   color: var(--text-muted);
   font-size: var(--font-ui-small);
+}
+
+/* 0.76.4: sub-filter button bar at the top of the Tasks panel.
+   All / Overdue / Today / Upcoming / Done, each with a count. */
+.stashpad-task-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px 6px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 6px;
+}
+.stashpad-task-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  /* 0.76.9: rounded-rectangle (matches the panel buttons above),
+     not a pill. */
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-task-filter:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-task-filter.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+.stashpad-task-filter-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+
+/* 0.76.2: status section headers in the Tasks panel (Overdue / Due
+   today / Upcoming / No date / Completed). Icon + label + count. The
+   Overdue header is tinted to draw the eye. */
+.stashpad-task-section-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 10px 3px 10px;
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+.stashpad-task-section-icon { display: inline-flex; align-items: center; }
+.stashpad-task-section-icon svg { width: 13px; height: 13px; }
+.stashpad-task-section-count {
+  margin-left: auto;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+.stashpad-task-section-header.is-overdue { color: var(--text-error); }
+.stashpad-task-section-header.is-overdue .stashpad-task-section-count { color: var(--text-error); }
+/* Folder chip on each task row (tasks span folders in v2). */
+.stashpad-task-folder {
+  flex: 0 0 auto;
+  font-size: 0.8em;
+  color: var(--text-faint);
+  margin-left: 6px;
+  white-space: nowrap;
 }
 
 .stashpad-pinned-subrow {

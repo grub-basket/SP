@@ -8,6 +8,7 @@ import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
 import { DEFAULT_STOPWORDS } from "./slug-service";
 import { newId } from "./id-service";
+import { formatDateTime } from "./format";
 import { getActiveView } from "./active-view";
 
 export interface ShortcutMap {
@@ -51,7 +52,8 @@ export type CommandId =
   | "exportStash" | "importStash" | "pickFolder"
   | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
   | "swapWithParent"
-  | "togglePin";
+  | "togglePin"
+  | "toggleTask" | "setDue";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
  *  When BOTH are set, `preferRight` decides which actually fires. */
@@ -110,6 +112,8 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "copyCodeBlock",   label: "Copy code from codeblock",      desc: "Default: { — copy the contents of the cursor row's first codeblock (or pick one when multiple exist).", defaultPrimary: "{" },
   { id: "swapWithParent",  label: "Swap with parent (ouroboros)",  desc: "Promote the cursor row above its current parent; the parent slides under it (carrying its other children). No default — bind in this tab.", defaultPrimary: "" },
   { id: "togglePin",       label: "Pin / unpin selected note",     desc: "Default: P — toggle the sidebar pin state of the cursor row (or focused note).", defaultPrimary: "P" },
+  { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: H — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "H" },
+  { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -256,6 +260,29 @@ export interface StashpadSettings {
    *  new parent; on, the view also drills into that parent so the user
    *  lands inside it. */
   autoNavOnMoveIn: boolean;
+  /** 0.73.14: when on, the row under the keyboard cursor temporarily
+   *  un-clamps its body — showing the full content as the user
+   *  arrow-keys through the list. Moving the cursor away re-collapses
+   *  the previous row. Doesn't touch the persistent expandedNotes
+   *  Set (the "Show more" toggle); this is a transient view-only
+   *  effect that vanishes the moment the cursor moves. Off by
+   *  default. */
+  autoExpandCursorRow: boolean;
+  /** 0.74.1: auto-open the right-sidebar detail panel whenever a
+   *  Stashpad view becomes active. Off by default — opt in via this
+   *  toggle or the matching palette command. */
+  autoOpenDetailPanel: boolean;
+  /** 0.75.0: double-click (or double-tap on mobile) a note row to
+   *  focus/open it — navigate into it, same as ArrowRight or the
+   *  enter arrow. On by default. Single click still just selects. */
+  doubleClickToFocus: boolean;
+  /** 0.76.6: how dates (due dates, created/modified) display across
+   *  the Tasks panel + detail panel. One of locale / iso / us / eu /
+   *  long. Default "locale". */
+  dateDisplayFormat: "locale" | "iso" | "us" | "eu" | "long";
+  /** 0.76.6: IANA timezone name for date display (e.g.
+   *  "America/New_York"). Empty = system timezone. */
+  dateDisplayTimezone: string;
   /** 0.72.6: companion to autoNavOnMoveIn — when a note is moved OUT
    *  of the current parent (outdent / move-to-Home / cross-folder /
    *  via the cross-parent picker), drill into the new destination
@@ -346,6 +373,11 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   notificationHistoryLimit: 5000,
   autoNavOnMoveIn: false,
   autoNavOnMoveOut: false,
+  autoExpandCursorRow: false,
+  autoOpenDetailPanel: false,
+  doubleClickToFocus: true,
+  dateDisplayFormat: "locale",
+  dateDisplayTimezone: "",
   jdIndexScope: "vault",
   jdIndexScopeFolder: "",
   jdIndexStashpadFolder: "",
@@ -386,8 +418,8 @@ export function getTemplatesFormats(app: App): { dateFormat: string; timeFormat:
 /** 0.73.1: settings tab redesigned into a tabbed UI. SETTINGS_TABS
  *  is the source of truth for both the bar at the top and the
  *  search-mode group order. Order here = display order. */
-type SettingsTabId = "general" | "diagnostics" | "authorship" | "templates" | "jdindex" | "hotkeys";
-const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
+export type SettingsTabId = "general" | "diagnostics" | "authorship" | "templates" | "jdindex" | "hotkeys";
+export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: "general",     label: "General" },
   { id: "diagnostics", label: "Diagnostics" },
   { id: "authorship",  label: "Authorship" },
@@ -407,6 +439,25 @@ export class StashpadSettingTab extends PluginSettingTab {
   private searchQuery = "";
 
   constructor(app: App, private plugin: StashpadPlugin) { super(app, plugin); }
+
+  /** 0.73.10: programmatic tab switch. Used by the per-tab "Open
+   *  settings: X" palette commands so they land on the right page. */
+  openToTab(tab: SettingsTabId): void {
+    this.activeTab = tab;
+    this.searchQuery = "";
+    if (this.containerEl?.isShown?.() !== false) this.display();
+  }
+
+  /** 0.73.13: focus the settings search input. Called by the
+   *  "Stashpad settings: search" palette command after the modal has
+   *  opened so the user can start typing immediately. Caret lands at
+   *  the end if the input has prior content. */
+  focusSearchInput(): void {
+    const input = this.containerEl?.querySelector<HTMLInputElement>(".stashpad-settings-search-input");
+    if (!input) return;
+    input.focus();
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
 
   display(): void {
     const { containerEl } = this;
@@ -684,6 +735,48 @@ export class StashpadSettingTab extends PluginSettingTab {
       ? `Templates plugin: date = "${fmt.dateFormat}", time = "${fmt.timeFormat}"`
       : "Templates plugin not enabled.");
 
+    // 0.76.6: how due dates + created/modified display in the Tasks
+    // and detail panels. A live sample updates as the user picks.
+    {
+      let sample: HTMLElement | null = null;
+      const refreshSample = () => {
+        if (!sample) return;
+        const now = Date.now();
+        const f = formatDateTime(now, this.plugin.settings);
+        sample.setText(`Sample: ${f}`);
+      };
+      new Setting(parent)
+        .setName("Date display format")
+        .setDesc("How due dates and created/modified times are shown in the Tasks and detail panels.")
+        .addDropdown((d) => {
+          d.addOption("locale", "Locale, short (Mar 5, 9:00 AM)");
+          d.addOption("long", "Locale, long (Thursday, March 5…)");
+          d.addOption("iso", "ISO (2026-03-05 09:00)");
+          d.addOption("us", "US (3/5/2026, 9:00 AM)");
+          d.addOption("eu", "EU (5/3/2026, 09:00)");
+          d.setValue(this.plugin.settings.dateDisplayFormat ?? "locale");
+          d.onChange(async (v) => {
+            this.plugin.settings.dateDisplayFormat = v as any;
+            await this.plugin.saveSettings();
+            refreshSample();
+          });
+        });
+      new Setting(parent)
+        .setName("Display timezone")
+        .setDesc("IANA timezone name (e.g. America/New_York, Europe/London, Asia/Kolkata). Leave blank to use your system timezone.")
+        .addText((t) => {
+          t.setPlaceholder("(system timezone)");
+          t.setValue(this.plugin.settings.dateDisplayTimezone ?? "");
+          t.onChange(async (v) => {
+            this.plugin.settings.dateDisplayTimezone = (v || "").trim();
+            await this.plugin.saveSettings();
+            refreshSample();
+          });
+        });
+      sample = parent.createDiv({ cls: "setting-item-description stashpad-settings-note" });
+      refreshSample();
+    }
+
     new Setting(parent)
       .setName("Navigate into parent after moving a note IN")
       .setDesc("When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.")
@@ -699,6 +792,33 @@ export class StashpadSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.settings.autoNavOnMoveOut).onChange(async (v) => {
           this.plugin.settings.autoNavOnMoveOut = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(parent)
+      .setName("Double-click a note to open it")
+      .setDesc("Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.doubleClickToFocus).onChange(async (v) => {
+          this.plugin.settings.doubleClickToFocus = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(parent)
+      .setName("Auto-open the detail panel")
+      .setDesc("Open the right-sidebar Stashpad detail panel automatically whenever a Stashpad view becomes active. The panel shows the cursored note's body, metadata, and children. Off = open manually via ribbon or command palette.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.autoOpenDetailPanel).onChange(async (v) => {
+          this.plugin.settings.autoOpenDetailPanel = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(parent)
+      .setName("Expand the cursor row's body automatically")
+      .setDesc("As you arrow-key through the list, the row under the cursor temporarily un-clamps to show its full body. Moving away re-collapses it. Doesn't affect the persistent 'Show more' state — this is a transient view-only effect.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.autoExpandCursorRow).onChange(async (v) => {
+          this.plugin.settings.autoExpandCursorRow = v;
           await this.plugin.saveSettings();
         }));
 

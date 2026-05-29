@@ -4,17 +4,44 @@ import {
   ROOT_ID,
   STASHPAD_PANELS_VIEW_TYPE,
   STASHPAD_VIEW_TYPE,
+  fmHasTag,
   type PinnedNoteRef,
   type StashpadId,
 } from "./types";
+import { formatDateOnly, formatTimeOnly } from "./format";
+
+/** 0.74.3: render a child-count badge into `host` (replaces the old
+ *  caret expander in the Pinned + detail panels). Collapsed shows a
+ *  muted badge; expanded adds .is-expanded for the accent tint. Count
+ *  caps at "99+" so triple-digit subtrees stay compact. Shared by
+ *  StashpadPanelsView + StashpadDetailView so the two outline UIs
+ *  stay visually identical. */
+export function renderCountBadge(host: HTMLElement, count: number, expanded: boolean): void {
+  const badge = host.createSpan({ cls: "stashpad-count-badge" });
+  if (expanded) badge.addClass("is-expanded");
+  badge.setText(count > 99 ? "99+" : String(count));
+}
+
+/** 0.76.2: one task row in the Tasks panel. */
+interface TaskItem {
+  file: TFile;
+  folder: string;
+  id: string;
+  title: string;
+  task: boolean;
+  completed: boolean;
+  due: number | null;
+  dueRaw: string | null;
+  color: string | null;
+}
 
 /** Panel ids registered with the StashpadPanelsView. Future panels
  *  (e.g. recent activity, search results, attachments) add to this
  *  union; the master-panel button bar surfaces one button per id. */
-type PanelId = "pinned" | "shared" | "tasks";
+export type PanelId = "pinned" | "shared" | "tasks";
 
 /** Per-panel metadata used by the master button bar. */
-const PANEL_REGISTRY: Record<PanelId, { label: string; icon: string }> = {
+export const PANEL_REGISTRY: Record<PanelId, { label: string; icon: string }> = {
   pinned: { label: "Pinned", icon: "pin" },
   // 0.70.0: Shared panel — surfaces notes you authored that have
   // contributors AND notes in folders whose home you authored but
@@ -30,6 +57,16 @@ const PANEL_REGISTRY: Record<PanelId, { label: string; icon: string }> = {
  *  rest is whichever panel is currently active. 0.68.0. */
 export class StashpadPanelsView extends ItemView {
   private activePanel: PanelId = "pinned";
+  /** 0.76.4: active sub-filter within the Tasks panel. "all" stacks
+   *  every section; the others show just that bucket. Per-session. */
+  private taskFilter: "all" | "overdue" | "today" | "upcoming" | "nodate" | "completed" = "all";
+  /** 0.73.11: programmatic panel switch. Called by the per-panel
+   *  command-palette entries so the sidebar lands on the right tab
+   *  when invoked from the keyboard. */
+  setActivePanel(id: PanelId): void {
+    this.activePanel = id;
+    if (this.containerEl.isConnected) this.render();
+  }
   /** Ids of pinned-note rows that are currently expanded into their
    *  subtree outline. Non-persistent; resets on view re-open. */
   private expanded = new Set<string>();
@@ -180,7 +217,8 @@ export class StashpadPanelsView extends ItemView {
     const title = this.titleFromFile(file);
     const color = typeof fm.color === "string" ? fm.color : null;
     const completed = fm.completed === true;
-    const hasChildren = this.childrenOf(pin.folder, pin.id).length > 0;
+    const childCount = this.childrenOf(pin.folder, pin.id).length;
+    const hasChildren = childCount > 0;
     const isExpanded = this.expanded.has(`${pin.folder}|${pin.id}`);
 
     const row = parent.createDiv({ cls: "stashpad-pinned-row" });
@@ -220,11 +258,13 @@ export class StashpadPanelsView extends ItemView {
       void this.reorderPin(fromIdx, before ? idx : idx + 1);
     });
 
-    // Expand toggle on the LEFT — caret-right when collapsed, caret-down
-    // when open. Disabled (invisible spacer) when there are no children.
+    // 0.74.3: child-count badge replaces the caret. Collapsed = muted
+    // badge with the count; expanded = accent-tinted badge (children
+    // are listed below). Childless rows keep an empty slot so titles
+    // stay aligned. Click toggles expansion.
     const toggle = row.createSpan({ cls: "stashpad-pinned-toggle" });
     if (hasChildren) {
-      setIcon(toggle, isExpanded ? "chevron-down" : "chevron-right");
+      renderCountBadge(toggle, childCount, isExpanded);
       toggle.onclick = (e) => {
         e.stopPropagation();
         const k = `${pin.folder}|${pin.id}`;
@@ -282,14 +322,15 @@ export class StashpadPanelsView extends ItemView {
       if (!childId) continue;
       const color = typeof fm.color === "string" ? fm.color : null;
       const completed = fm.completed === true;
-      const hasGrandkids = this.childrenOf(folder, childId).length > 0;
+      const grandkidCount = this.childrenOf(folder, childId).length;
+      const hasGrandkids = grandkidCount > 0;
       const isExpanded = this.expanded.has(`${folder}|${childId}`);
       const row = parent.createDiv({ cls: "stashpad-pinned-subrow" });
       if (completed) row.addClass("is-completed");
       row.style.paddingLeft = `${depth * 16}px`;
       const toggle = row.createSpan({ cls: "stashpad-pinned-toggle" });
       if (hasGrandkids) {
-        setIcon(toggle, isExpanded ? "chevron-down" : "chevron-right");
+        renderCountBadge(toggle, grandkidCount, isExpanded);
         toggle.onclick = (e) => {
           e.stopPropagation();
           const k = `${folder}|${childId}`;
@@ -684,70 +725,133 @@ export class StashpadPanelsView extends ItemView {
 
   // ---------- Tasks panel (0.71.30) ----------
 
-  /** Scan every Stashpad folder for notes whose frontmatter looks like
-   *  a task: `completed: true` OR any `due` key (date string parsed
-   *  lazily). Result is grouped by folder, with the MRU folder floated
-   *  to the top — same convention as the Pinned panel. */
+  /** 0.76.2: scan every Stashpad folder for tasks and bucket them by
+   *  due-window status: Overdue / Due today / Upcoming / No date /
+   *  Completed. Within each section, sort by due-date ascending
+   *  (undated by title). Each row carries a folder chip since tasks
+   *  span folders now (v1 grouped by folder; v2 groups by status). */
   private renderTasksPanel(parent: HTMLElement): void {
     const list = parent.createDiv({ cls: "stashpad-panel-tasks" });
     const tasks = this.collectTasks();
     if (tasks.length === 0) {
       list.createDiv({ cls: "stashpad-tasks-empty" })
-        .setText("No tasks yet — add `completed: true` or a `due:` date to any note's frontmatter.");
+        .setText("No tasks yet — press H on a note to mark it a task, or D to give it a due date.");
       return;
     }
-    // Group by folder, MRU-first.
-    const groups = new Map<string, typeof tasks>();
+
+    // Local day boundaries (so "today" is calendar-day, not 24h).
+    const startToday = new Date(); startToday.setHours(0, 0, 0, 0);
+    const startTodayMs = startToday.getTime();
+    const endTodayMs = startTodayMs + 24 * 60 * 60 * 1000;
+
+    type Section = "overdue" | "today" | "upcoming" | "nodate" | "completed";
+    const buckets: Record<Section, TaskItem[]> = {
+      overdue: [], today: [], upcoming: [], nodate: [], completed: [],
+    };
     for (const t of tasks) {
-      let bucket = groups.get(t.folder);
-      if (!bucket) { bucket = []; groups.set(t.folder, bucket); }
-      bucket.push(t);
+      if (t.completed) { buckets.completed.push(t); continue; }
+      if (t.due == null) { buckets.nodate.push(t); continue; }
+      if (t.due < startTodayMs) buckets.overdue.push(t);
+      else if (t.due < endTodayMs) buckets.today.push(t);
+      else buckets.upcoming.push(t);
     }
-    const mruFolder = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
-    const order = Array.from(groups.keys());
-    if (mruFolder && groups.has(mruFolder)) {
-      order.splice(order.indexOf(mruFolder), 1);
-      order.unshift(mruFolder);
+
+    const byDue = (a: TaskItem, b: TaskItem): number => {
+      if (a.due == null && b.due == null) return a.title.localeCompare(b.title);
+      if (a.due == null) return 1;
+      if (b.due == null) return -1;
+      return a.due - b.due;
+    };
+
+    const SECTIONS: Array<{ key: Section; label: string; icon: string }> = [
+      { key: "overdue",   label: "Overdue",   icon: "alert-circle" },
+      { key: "today",     label: "Due today", icon: "calendar-clock" },
+      { key: "upcoming",  label: "Upcoming",  icon: "calendar" },
+      { key: "nodate",    label: "No date",   icon: "inbox" },
+      { key: "completed", label: "Completed", icon: "check-circle-2" },
+    ];
+
+    // 0.76.4: filter button bar. "All" stacks every non-empty section;
+    // a specific filter shows just that bucket. The active filter is
+    // remembered per-session. Each button carries its bucket count.
+    const filterBar = list.createDiv({ cls: "stashpad-task-filters" });
+    const total = tasks.length;
+    const mkFilterBtn = (key: typeof this.taskFilter, label: string, count: number) => {
+      const btn = filterBar.createEl("button", { cls: "stashpad-task-filter" });
+      if (this.taskFilter === key) btn.addClass("is-active");
+      btn.createSpan({ cls: "stashpad-task-filter-label", text: label });
+      btn.createSpan({ cls: "stashpad-task-filter-count", text: String(count) });
+      btn.onclick = () => { this.taskFilter = key; this.render(); };
+    };
+    mkFilterBtn("all", "All", total);
+    mkFilterBtn("overdue", "Overdue", buckets.overdue.length);
+    mkFilterBtn("today", "Today", buckets.today.length);
+    mkFilterBtn("upcoming", "Upcoming", buckets.upcoming.length);
+    mkFilterBtn("nodate", "No date", buckets.nodate.length);
+    mkFilterBtn("completed", "Done", buckets.completed.length);
+
+    // Which sections to render: all (stacked) or the single filtered one.
+    const showSections = this.taskFilter === "all"
+      ? SECTIONS
+      : SECTIONS.filter((s) => s.key === this.taskFilter);
+
+    let any = false;
+    for (const sec of showSections) {
+      const items = buckets[sec.key];
+      if (items.length === 0) continue;
+      any = true;
+      // Completed sorts newest-due first; everything else soonest-first.
+      items.sort(sec.key === "completed" ? (a, b) => byDue(b, a) : byDue);
+      // In single-filter mode the button already names the bucket, so
+      // the in-list section header is redundant — skip it.
+      if (this.taskFilter === "all") {
+        const header = list.createDiv({ cls: `stashpad-task-section-header is-${sec.key}` });
+        setIcon(header.createSpan({ cls: "stashpad-task-section-icon" }), sec.icon);
+        header.createSpan({ cls: "stashpad-task-section-name", text: sec.label });
+        header.createSpan({ cls: "stashpad-task-section-count", text: String(items.length) });
+      }
+      for (const t of items) this.renderTaskRow(list, t, sec.key === "today");
     }
-    for (const folder of order) {
-      const folderName = folder.split("/").pop() || folder;
-      const header = list.createDiv({ cls: "stashpad-pinned-group-header" });
-      if (folder === mruFolder) header.addClass("is-active-folder");
-      header.createSpan({ cls: "stashpad-pinned-group-name", text: folderName });
-      const bucket = (groups.get(folder) ?? []).slice().sort(this.compareTasks);
-      for (const t of bucket) this.renderTaskRow(list, t);
+    // 0.76.4: a filtered view with no items in that bucket gets a
+    // tailored empty line instead of looking broken.
+    if (!any && this.taskFilter !== "all") {
+      list.createDiv({ cls: "stashpad-tasks-empty" })
+        .setText(`Nothing in "${showSections[0]?.label ?? this.taskFilter}".`);
+      return;
+    }
+    // collectTasks returned items but all fell outside the buckets
+    // (shouldn't happen) — guard so the panel never looks empty wrongly.
+    if (!any) {
+      list.createDiv({ cls: "stashpad-tasks-empty" }).setText("No tasks to show.");
     }
   }
 
-  /** Order tasks within a group: incomplete first (by due-date asc,
-   *  undated last), completed last. */
-  private compareTasks = (
-    a: { completed: boolean; due: number | null },
-    b: { completed: boolean; due: number | null },
-  ): number => {
-    if (a.completed !== b.completed) return a.completed ? 1 : -1;
-    if (a.due == null && b.due == null) return 0;
-    if (a.due == null) return 1;
-    if (b.due == null) return -1;
-    return a.due - b.due;
-  };
-
-  private renderTaskRow(
-    parent: HTMLElement,
-    t: { file: TFile; folder: string; id: string; title: string; completed: boolean; due: number | null; dueRaw: string | null; color: string | null },
-  ): void {
+  private renderTaskRow(parent: HTMLElement, t: TaskItem, isToday: boolean): void {
     const row = parent.createDiv({ cls: "stashpad-pinned-row stashpad-task-row" });
     if (t.color) row.addClass("has-color");
     if (t.completed) row.addClass("is-completed");
-    // Status icon (checkmark = done, circle = open).
-    const icon = row.createSpan({ cls: "stashpad-pinned-icon" });
-    setIcon(icon, t.completed ? "check-circle-2" : "circle");
+    // 0.76.3: clickable checkbox — unfilled (square) when open, filled
+    // (check-square) when done. Click toggles `completed` directly.
+    const icon = row.createSpan({ cls: "stashpad-pinned-icon stashpad-task-checkbox" });
+    setIcon(icon, t.completed ? "check-square" : "square");
     if (t.color) icon.style.color = t.color;
+    icon.title = t.completed ? "Mark not done" : "Mark done";
+    icon.onclick = (e) => {
+      e.stopPropagation();
+      void this.toggleTaskCompleted(t);
+    };
     const label = row.createSpan({ cls: "stashpad-pinned-label", text: t.title });
     label.onclick = () => this.openTaskFromPanel(t.folder, t.id);
-    if (t.dueRaw) {
-      const due = row.createSpan({ cls: "stashpad-task-due", text: t.dueRaw });
-      if (t.due != null && t.due < Date.now() && !t.completed) due.addClass("is-overdue");
+    // Folder chip — tasks span folders in the status-grouped view.
+    row.createSpan({ cls: "stashpad-task-folder", text: t.folder.split("/").pop() || t.folder });
+    if (t.due != null) {
+      const due = row.createSpan({ cls: "stashpad-task-due", text: this.formatDueShort(t.due, isToday) });
+      // Past-due (and not done) gets the warning tint even inside the
+      // "Due today" section (time has passed today).
+      if (t.due < Date.now() && !t.completed) due.addClass("is-overdue");
+    } else if (t.dueRaw) {
+      // Unparseable due string — show it raw rather than dropping it.
+      row.createSpan({ cls: "stashpad-task-due", text: t.dueRaw });
     }
     row.oncontextmenu = (e) => {
       e.preventDefault();
@@ -759,6 +863,14 @@ export class StashpadPanelsView extends ItemView {
     };
   }
 
+  /** 0.76.6: compact due label honouring the user's display format +
+   *  timezone. Time-only for today's tasks; date-only otherwise. */
+  private formatDueShort(dueMs: number, isToday: boolean): string {
+    return isToday
+      ? formatTimeOnly(dueMs, this.plugin.settings)
+      : formatDateOnly(dueMs, this.plugin.settings);
+  }
+
   private async openTaskFromPanel(folder: string, id: StashpadId): Promise<void> {
     await this.plugin.activateViewForFolder(folder);
     const target = this.plugin.lastActiveStashpadLeaf?.view as any
@@ -766,28 +878,25 @@ export class StashpadPanelsView extends ItemView {
     if (target && typeof target.navigateTo === "function") target.navigateTo(id);
   }
 
-  private collectTasks(): Array<{
-    file: TFile;
-    folder: string;
-    id: string;
-    title: string;
-    completed: boolean;
-    due: number | null;
-    dueRaw: string | null;
-    color: string | null;
-  }> {
+  /** 0.76.3: flip a task's `completed` field straight from the panel
+   *  checkbox — no need to open the note. Re-renders so the row moves
+   *  to/from the Completed section. */
+  private async toggleTaskCompleted(t: TaskItem): Promise<void> {
+    try {
+      await this.app.fileManager.processFrontMatter(t.file, (m: any) => {
+        m.completed = !(m.completed === true);
+      });
+    } catch (e) {
+      new Notice(`Couldn't update task: ${(e as Error).message}`);
+      return;
+    }
+    this.scheduleRender();
+  }
+
+  private collectTasks(): TaskItem[] {
     const folders = this.plugin.discoverStashpadFolders();
     const folderSet = new Set(folders);
-    const out: Array<{
-      file: TFile;
-      folder: string;
-      id: string;
-      title: string;
-      completed: boolean;
-      due: number | null;
-      dueRaw: string | null;
-      color: string | null;
-    }> = [];
+    const out: TaskItem[] = [];
     for (const f of this.app.vault.getMarkdownFiles()) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (!folderSet.has(dir)) continue;
@@ -795,6 +904,10 @@ export class StashpadPanelsView extends ItemView {
       const id = typeof fm.id === "string" ? fm.id : null;
       if (!id || id === ROOT_ID) continue;
       const completed = fm.completed === true;
+      // 0.76.3: a note is a task when it carries the `task` tag, or
+      // (legacy) the 0.76.1 `task: true` boolean, or a bare
+      // `completed` field set by an earlier complete-toggle.
+      const task = fmHasTag(fm, "task") || fm.task === true || fm.completed !== undefined;
       const dueRaw = typeof fm.due === "string" || typeof fm.due === "number" ? String(fm.due) : null;
       // `due` can be either a moment-parseable date string or a raw
       // ISO timestamp number. Try Date.parse — if NaN, keep dueRaw for
@@ -804,12 +917,16 @@ export class StashpadPanelsView extends ItemView {
         const t = Date.parse(dueRaw);
         if (!Number.isNaN(t)) due = t;
       }
-      if (!completed && due == null && !dueRaw) continue;
+      // 0.76.2: include anything flagged as a task, plus the legacy
+      // signals (completed / due) so notes from before the `task`
+      // field still surface.
+      if (!task && !completed && due == null && !dueRaw) continue;
       out.push({
         file: f,
         folder: dir,
         id,
         title: this.titleFromFile(f),
+        task,
         completed,
         due,
         dueRaw,

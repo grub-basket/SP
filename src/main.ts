@@ -1,9 +1,10 @@
 import { Notice, Platform, Plugin, SuggestModal, TFile, WorkspaceLeaf, setIcon } from "obsidian";
-import { STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, type PinnedNoteRef } from "./types";
+import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, type PinnedNoteRef, type StashpadId } from "./types";
+import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath } from "./view";
-import { StashpadPanelsView, openStashpadPanelsView } from "./panels-view";
+import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import {
-  DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings,
+  DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, type CommandId,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
@@ -22,6 +23,21 @@ export default class StashpadPlugin extends Plugin {
    *  Used by sidebar panel actions (Search, Home) so they target the
    *  user's actual current tab rather than getLeavesOfType()[0]. */
   lastActiveStashpadLeaf: WorkspaceLeaf | null = null;
+  /** 0.73.10: keep a handle on the settings tab so command-palette
+   *  entries can pre-select a specific tab when opening Settings. */
+  settingTab: StashpadSettingTab | null = null;
+  /** 0.74.1: selection-change listeners. Stashpad views fire this on
+   *  every cursor/selection mutation; the right-side detail panel
+   *  subscribes so it re-renders to match. Generic registry so future
+   *  surfaces (other detail views, status bar) can also subscribe. */
+  private stashpadSelectionListeners = new Set<() => void>();
+  /** 0.74.6: content-change listeners. Distinct from selection
+   *  listeners — these fire on every Stashpad render() (reorder,
+   *  edit, child added, color change) WITHOUT implying the user
+   *  picked a different note. The detail panel re-renders on these
+   *  but keeps showing the same locked note, so a background reorder
+   *  doesn't yank the panel to whatever the live cursor became. */
+  private stashpadContentListeners = new Set<() => void>();
   /** Plugin-level notification service. Routes all toasts through one
    *  pipe so history + per-category mute + multiplayer filters work
    *  uniformly across views. Instantiated lazily on first access in
@@ -425,11 +441,17 @@ export default class StashpadPlugin extends Plugin {
     // loadSettings so the data.json move is in place when we read.
     await this.migrateLegacyPaths();
     await this.loadSettings();
-    this.addSettingTab(new StashpadSettingTab(this.app, this));
+    this.settingTab = new StashpadSettingTab(this.app, this);
+    this.addSettingTab(this.settingTab);
 
     this.registerView(
       STASHPAD_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadView(leaf, this),
+    );
+    // 0.74.1: right-sidebar detail panel.
+    this.registerView(
+      STASHPAD_DETAIL_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadDetailView(leaf, this),
     );
     // 0.68.0: sidebar panels view (Pinned Notes + future panels).
     this.registerView(
@@ -443,6 +465,21 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
       if (leaf && leaf.view.getViewType() === STASHPAD_VIEW_TYPE) {
         this.lastActiveStashpadLeaf = leaf;
+        // 0.74.1: auto-open the right-sidebar detail panel when the
+        // user enters a Stashpad view, if the setting is on AND the
+        // panel isn't already open. Defer one tick so the leaf is
+        // fully settled before we touch workspace state.
+        if (this.settings.autoOpenDetailPanel) {
+          const existing = this.app.workspace.getLeavesOfType(STASHPAD_DETAIL_VIEW_TYPE);
+          if (existing.length === 0) {
+            setTimeout(() => { void openStashpadDetailView(this.app); }, 0);
+          }
+        }
+        // Always notify selection listeners when the active leaf
+        // becomes a Stashpad — the detail panel needs to refresh to
+        // match the new leaf's cursor row even if the leaf was open
+        // all along.
+        this.notifyStashpadSelectionChanged();
       }
     }));
 
@@ -589,6 +626,10 @@ export default class StashpadPlugin extends Plugin {
     this.addRibbonIcon("panel-left", "Open Stashpad panels (sidebar)", () => {
       void openStashpadPanelsView(this.app);
     });
+    // 0.74.1: right-sidebar detail panel ribbon entry.
+    this.addRibbonIcon("panel-right", "Open Stashpad detail panel (right sidebar)", () => {
+      void openStashpadDetailView(this.app);
+    });
 
     // 0.62.3: same smarts as the ribbon icon — if there's more than one
     // Stashpad folder, show the picker instead of silently defaulting
@@ -698,6 +739,8 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-pick-move", name: "Move (in-list, arrow + Enter)", callback: () => call("cmdInListPicker") });
     this.addCommand({ id: "stashpad-open-in-new-tab", name: "Open in new Stashpad tab", callback: () => call("cmdOpenInNewStashpadTab") });
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
+    this.addCommand({ id: "stashpad-toggle-task", name: "Toggle task (todo)", callback: () => call("cmdToggleTask") });
+    this.addCommand({ id: "stashpad-set-due", name: "Set due date…", callback: () => call("cmdSetDue") });
     this.addCommand({ id: "stashpad-select-all", name: "Select all visible notes", callback: () => call("cmdSelectAll") });
     this.addCommand({ id: "stashpad-copy-codeblock", name: "Copy code from codeblock", callback: () => call("cmdCopyCodeBlock") });
     // 0.68.0: open the sidebar panels view (Pinned Notes + future panels).
@@ -706,6 +749,30 @@ export default class StashpadPlugin extends Plugin {
       name: "Open Stashpad panels (sidebar)",
       callback: () => void openStashpadPanelsView(this.app),
     });
+    // 0.74.1: open the right-sidebar detail panel.
+    this.addCommand({
+      id: "stashpad-open-detail",
+      name: "Open Stashpad detail panel (right sidebar)",
+      callback: () => void openStashpadDetailView(this.app),
+    });
+    // 0.73.11: per-panel shortcuts — open the sidebar panels view AND
+    // select the matching tab (Pinned / Shared / Tasks).
+    const panelIds = Object.keys(PANEL_REGISTRY) as PanelId[];
+    for (const id of panelIds) {
+      const meta = PANEL_REGISTRY[id];
+      this.addCommand({
+        id: `stashpad-open-panels-${id}`,
+        name: `Open Stashpad panel: ${meta.label}`,
+        callback: async () => {
+          await openStashpadPanelsView(this.app);
+          // Find the now-active panels view and flip it to the picked
+          // panel. There's at most one panels view per workspace.
+          const leaves = this.app.workspace.getLeavesOfType(STASHPAD_PANELS_VIEW_TYPE);
+          const view = leaves[0]?.view as StashpadPanelsView | undefined;
+          view?.setActivePanel?.(id);
+        },
+      });
+    }
     this.addCommand({ id: "stashpad-swap-with-parent", name: "Swap with parent (ouroboros)", callback: () => call("cmdSwapWithParent") });
     this.addCommand({ id: "stashpad-toggle-pin", name: "Pin / unpin selected note (sidebar)", callback: () => call("cmdTogglePin") });
     // 0.61.1: tiny mode — opens a popout window with the minimal shell
@@ -826,6 +893,38 @@ export default class StashpadPlugin extends Plugin {
         });
       },
     });
+    // 0.73.12: every General-tab settings toggle now mirrors into the
+    // command palette as "Toggle: <name>". Lets power users flip
+    // behavior without opening Settings. Fires a Notice confirming
+    // the new state. Booleans only — text/textarea/dropdown settings
+    // stay in the Settings UI where they belong.
+    const TOGGLES: Array<{ key: keyof StashpadSettings; label: string }> = [
+      { key: "prefixTimestampsOnCopy",    label: "Prefix timestamps when copying" },
+      { key: "useTemplatesFormat",        label: "Use Templates plugin date/time formats" },
+      { key: "autoNavOnMoveIn",           label: "Auto-navigate into parent on move IN" },
+      { key: "autoNavOnMoveOut",          label: "Auto-navigate to destination on move OUT" },
+      { key: "confirmCrossParentDrag",    label: "Confirm cross-parent drag-and-drop" },
+      { key: "confirmBulkDelete",         label: "Confirm bulk deletes" },
+      { key: "confirmAttachmentDelete",   label: "Offer to delete attachments with note" },
+      { key: "autofocusComposerAfterSend", label: "Autofocus composer after sending" },
+      { key: "popoutDuplicates",          label: "Open in new window — duplicate tab" },
+      { key: "autoExpandCursorRow",       label: "Expand the cursor row's body automatically" },
+      { key: "autoOpenDetailPanel",       label: "Auto-open the detail panel" },
+      { key: "doubleClickToFocus",        label: "Double-click a note to open it" },
+    ];
+    for (const t of TOGGLES) {
+      const cmdId = `stashpad-toggle-${String(t.key).replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`;
+      this.addCommand({
+        id: cmdId,
+        name: `Toggle: ${t.label}`,
+        callback: async () => {
+          const next = !(this.settings as any)[t.key];
+          (this.settings as any)[t.key] = next;
+          await this.saveSettings();
+          new Notice(`${t.label}: ${next ? "ON" : "OFF"}`);
+        },
+      });
+    }
     this.addCommand({
       id: "stashpad-open-settings",
       name: "Open Stashpad settings",
@@ -836,6 +935,39 @@ export default class StashpadPlugin extends Plugin {
         setting.openTabById(this.manifest.id);
       },
     });
+    // 0.73.13: search-focused shortcut — opens Settings and lands the
+    // cursor in the search box so the user types straight into it.
+    this.addCommand({
+      id: "stashpad-search-settings",
+      name: "Search Stashpad settings…",
+      callback: () => {
+        const setting = (this.app as any).setting;
+        if (!setting?.open || !setting?.openTabById) return;
+        setting.open();
+        setting.openTabById(this.manifest.id);
+        // Defer one tick so display() has rebuilt the input by the
+        // time we focus.
+        setTimeout(() => this.settingTab?.focusSearchInput?.(), 0);
+      },
+    });
+    // 0.73.10: per-tab settings shortcuts. Each opens the Settings
+    // modal scrolled to the matching tab of the redesigned tabbed UI.
+    for (const t of SETTINGS_TABS) {
+      this.addCommand({
+        id: `stashpad-open-settings-${t.id}`,
+        name: `Open Stashpad settings: ${t.label}`,
+        callback: () => {
+          const setting = (this.app as any).setting;
+          if (!setting?.open || !setting?.openTabById) return;
+          // Pre-select the tab BEFORE opening so display() renders on
+          // the correct page from the first paint (no flash of the
+          // previous tab).
+          this.settingTab?.openToTab(t.id);
+          setting.open();
+          setting.openTabById(this.manifest.id);
+        },
+      });
+    }
     // 0.71.0 / 0.71.2: JD-style index builder.
     // Two commands so the heavyweight "create Stashpad notes" is
     // separable from the cheap single-file Preview that the user can
@@ -1404,6 +1536,66 @@ export default class StashpadPlugin extends Plugin {
   }
 
   // ---------- Sidebar panels (0.68.0) ----------
+
+  /** 0.74.1: subscribe to Stashpad-view selection changes. Listeners
+   *  fire whenever a Stashpad view's cursor/selection mutates. The
+   *  detail panel uses this to re-render in lock-step with the user
+   *  arrow-keying through the list. Returns an unsubscribe handle. */
+  onStashpadSelectionChange(fn: () => void): () => void {
+    this.stashpadSelectionListeners.add(fn);
+    return () => this.stashpadSelectionListeners.delete(fn);
+  }
+
+  /** 0.74.1: called by StashpadView whenever its cursor/selection
+   *  changes. Public so the view layer can fire from any selection-
+   *  mutation site (selectCursor, handleRowClick, Escape collapse,
+   *  navigate). Listener exceptions are swallowed so one broken
+   *  subscriber can't break the rest. */
+  notifyStashpadSelectionChanged(): void {
+    for (const fn of this.stashpadSelectionListeners) {
+      try { fn(); } catch (e) { console.warn("[Stashpad] selection listener failed", e); }
+    }
+  }
+
+  /** 0.74.6: subscribe to Stashpad content changes (every render that
+   *  isn't a deliberate selection change). The detail panel uses this
+   *  to refresh its body + children list while staying pinned to the
+   *  same note. Returns an unsubscribe handle. */
+  onStashpadContentChange(fn: () => void): () => void {
+    this.stashpadContentListeners.add(fn);
+    return () => this.stashpadContentListeners.delete(fn);
+  }
+
+  /** 0.74.6: fired from StashpadView.render() — "something repainted,
+   *  but the user didn't necessarily switch notes." */
+  notifyStashpadContentChanged(): void {
+    for (const fn of this.stashpadContentListeners) {
+      try { fn(); } catch (e) { console.warn("[Stashpad] content listener failed", e); }
+    }
+  }
+
+  /** 0.74.1: snapshot of "which Stashpad note is currently selected"
+   *  for the detail panel. Returns null when no Stashpad view is
+   *  active or when no row is selected/cursored. */
+  getActiveStashpadSelection(): { folder: string; id: StashpadId; file: TFile } | null {
+    const leaf = this.lastActiveStashpadLeaf;
+    const view = leaf?.view as any;
+    if (!view || view.getViewType?.() !== STASHPAD_VIEW_TYPE) return null;
+    const folder = (view.noteFolder as string | undefined) ?? "";
+    if (!folder) return null;
+    // Prefer the cursor row; fall back to the first selected id.
+    const children: Array<{ id: StashpadId; file: TFile | null }> = view.currentChildren ?? [];
+    let node: { id: StashpadId; file: TFile | null } | undefined;
+    if (typeof view.cursorIdx === "number" && view.cursorIdx >= 0) {
+      node = children[view.cursorIdx];
+    }
+    if (!node && view.selection?.size > 0) {
+      const firstId = view.firstSelectedId ?? [...view.selection][0];
+      node = children.find((n) => n.id === firstId);
+    }
+    if (!node?.file) return null;
+    return { folder, id: node.id, file: node.file };
+  }
 
   /** Pin a note to the sidebar panels' Pinned Notes list. Idempotent. */
   async pinNote(pin: PinnedNoteRef): Promise<void> {
@@ -2234,6 +2426,11 @@ function mergeBindings(
         primary: typeof r.primary === "string" ? r.primary : out[m.id].primary,
         secondary: typeof r.secondary === "string" ? r.secondary : "",
         preferRight: !!r.preferRight,
+        // 0.73.8: persist `useBoth` across reloads. Missing here meant
+        // the settings UI checkbox kept saving the value, but
+        // mergeBindings dropped it on the way back in, so reload
+        // always reset it to undefined → unchecked.
+        useBoth: !!r.useBoth,
       };
     }
   }

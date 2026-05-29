@@ -77,6 +77,13 @@ export class ComposerAutocomplete {
     );
   }
 
+  /** 0.74.4: true while the popup is showing suggestions. Lets a host
+   *  textarea's own Enter handler defer to the popup (which consumes
+   *  Enter to accept the highlighted suggestion). */
+  isOpen(): boolean {
+    return !!this.state && this.items.length > 0;
+  }
+
   detach(): void {
     this.close();
     this.ta.removeEventListener("input", this.onInput);

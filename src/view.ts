@@ -3,9 +3,11 @@ import {
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce, moment, setIcon,
 } from "obsidian";
 import {
-  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
+  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag,
+  type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
 } from "./types";
 import { TreeIndex } from "./tree-index";
+import { formatDateTime } from "./format";
 import { OrderStore } from "./order-store";
 import { SortStore, type SortMode, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue } from "./frontmatter-sync";
@@ -17,7 +19,7 @@ import { IntegrityWatcher } from "./integrity-watcher";
 import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
 import { StashpadSuggest } from "./note-picker";
 import { setActiveView, clearActiveView } from "./active-view";
-import { ColorPickerModal, ConfirmDeleteModal, ConfirmModal, SplitNoteModal } from "./modals";
+import { ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { buildStashZip, importStashZip, STASH_EXT } from "./stash-package";
 import type StashpadPlugin from "./main";
@@ -357,6 +359,27 @@ export class StashpadView extends ItemView {
     this.register(() => popViewScope());
 
     this.detachTreeHook = this.tree.hookMetadataCache(() => this.debouncedRender());
+    // 0.76.11: keep the authoritative completed-state map in sync with
+    // the metadataCache. A "changed" event means the cache is fresh
+    // for that file, so re-sync our cached value from it. This is what
+    // lets isCompleted read a STABLE value during the synthetic
+    // create-render (when getFileCache can transiently return stale
+    // frontmatter for sibling rows) — fixes "adding a note strips the
+    // completed styling off a previously-completed item."
+    this.registerEvent(this.app.metadataCache.on("changed", (file) => {
+      if (file.extension !== "md") return;
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as any;
+      this.completedState.set(file.path, !!fm?.completed);
+    }));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (this.completedState.has(oldPath)) {
+        this.completedState.set(file.path, this.completedState.get(oldPath)!);
+        this.completedState.delete(oldPath);
+      }
+    }));
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      this.completedState.delete(file.path);
+    }));
     this.detachSettings = onSettingsChange(() => {
       this.loadConfig();
       // Cross-tab draft sync: if another Stashpad tab on the same folder
@@ -1197,6 +1220,10 @@ export class StashpadView extends ItemView {
    *  used when a checkbox toggles a filter and the user expects the
    *  list to update without the full-view flicker. */
   private populateListBody(list: HTMLElement, focused: TreeNode): void {
+    // 0.76.7: capture the list width ONCE per paint as the key for the
+    // per-row overflow memo (see getOrComputeRender). One layout read
+    // instead of one per row.
+    this.lastListWidth = list.clientWidth || this.lastListWidth;
     if (focused.file && Platform.isMobile) {
       this.renderFocusedHeaderMini(list, focused);
       this.renderFocusedHeader(list, focused);
@@ -1724,6 +1751,14 @@ export class StashpadView extends ItemView {
 
     this.renderComposer(root);
     if (Platform.isMobile) this.renderMobileNav(root);
+    // 0.74.6: a full render is a CONTENT change, not a selection
+    // change. Firing selection-changed here made the detail panel
+    // re-lock to the live cursor on every reorder/edit re-render —
+    // so reordering children yanked the panel off the note being
+    // reordered. Content-changed lets the panel refresh in place
+    // while staying pinned to its displayed note. Genuine selection
+    // changes fire from selectCursor / handleRowClick / navigateTo.
+    this.plugin.notifyStashpadContentChanged();
     if (this.focusComposerOnNextRender) {
       this.focusComposerOnNextRender = false;
       const caret = this.pendingComposerCaret;
@@ -2168,6 +2203,8 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Outdent").setIcon("outdent").setDisabled(!hasTargets).onClick(() => void this.cmdOutdent()));
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").setDisabled(!hasTargets).onClick(() => this.cmdSetColor()));
     menu.addItem((it: any) => it.setTitle("Toggle complete").setIcon("check-circle").setDisabled(!hasTargets).onClick(() => void this.cmdToggleComplete()));
+    menu.addItem((it: any) => it.setTitle("Toggle task (todo)").setIcon("check-square").setDisabled(!hasTargets).onClick(() => void this.cmdToggleTask()));
+    menu.addItem((it: any) => it.setTitle("Set due date…").setIcon("calendar-clock").setDisabled(!hasTargets).onClick(() => this.cmdSetDue()));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Copy").setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopy()));
     menu.addItem((it: any) => it.setTitle("Copy tree").setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
@@ -3542,6 +3579,9 @@ export class StashpadView extends ItemView {
     const row = parent.createDiv({ cls: "stashpad-note" });
     if (isSelected) row.addClass("is-selected");
     if (isCursor) row.addClass("is-cursor");
+    // 0.73.14: auto-expand the cursor row on initial render too (not
+    // just on arrow-key repaints). Settings-gated.
+    if (isCursor && this.plugin.settings.autoExpandCursorRow) row.addClass("is-cursor-expanded");
     if (isPickTarget) row.addClass("is-pick-target");
     if (this.isCompleted(node)) row.addClass("is-completed");
     row.dataset.idx = String(idx);
@@ -3555,6 +3595,44 @@ export class StashpadView extends ItemView {
     if (draggable) this.attachRowDnD(row, node, idx);
 
     row.addEventListener("click", (e) => this.handleRowClick(e, idx, node));
+    // 0.75.0: double-click / double-tap focuses (navigates into) the
+    // note — same as ArrowRight or the enter arrow. Settings-gated,
+    // on by default. Skip when the dblclick lands on a link / tag so
+    // those keep their own behavior, and clear the word-selection the
+    // browser makes on double-click so it doesn't flash before nav.
+    row.addEventListener("dblclick", (e) => {
+      if (!this.plugin.settings.doubleClickToFocus) return;
+      const t = e.target as HTMLElement | null;
+      // 0.76.12: also skip the task checkbox — double-clicking it
+      // should toggle, never navigate.
+      if (t?.closest?.(".internal-link, .tag, a, .stashpad-note-task-checkbox")) return;
+      e.preventDefault();
+      window.getSelection()?.removeAllRanges();
+      this.navigateTo(node.id);
+    });
+
+    // 0.76.10: task checkbox at the leftmost edge of the row when the
+    // note is a task. Reflects `completed`; click toggles it in place
+    // (no need to open the Tasks panel). Sits before the meta column.
+    if (this.isTask(node)) {
+      row.addClass("is-task"); // adds the leading checkbox grid column
+      const cb = row.createSpan({ cls: "stashpad-note-task-checkbox" });
+      const done = this.isCompleted(node);
+      setIcon(cb, done ? "check-square" : "square");
+      cb.title = done ? "Mark not done" : "Mark done";
+      // 0.76.12: the checkbox fully owns its pointer events so
+      // interacting with it never selects/focuses or navigates the
+      // row — like flicking a control on an unfocused window. We stop
+      // mousedown (row selection / focus), click (handleRowClick), AND
+      // dblclick (the double-click-to-open handler) at the checkbox.
+      cb.addEventListener("mousedown", (e) => e.stopPropagation());
+      cb.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
+      cb.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void this.toggleCompletedForNode(node);
+      };
+    }
 
     const meta = row.createDiv({ cls: "stashpad-note-meta" });
     const metaTop = meta.createDiv({ cls: "stashpad-note-meta-top" });
@@ -3642,9 +3720,20 @@ export class StashpadView extends ItemView {
    *  Memory profile: typical Stashpad note renders to ~2-5 KB of HTML, so
    *  a 1000-note vault sits around 2-5 MB. Acceptable; an LRU bound can
    *  go on later if it becomes a problem. */
-  private renderCache = new Map<string, { mtime: number; text: string; attachments: string[]; html: string }>();
+  /** 0.76.7: per-file render cache. `ovW`/`ovV` memoize the body's
+   *  overflow decision (does it exceed the 2-line clamp?) keyed by the
+   *  list width it was measured at — so re-rendering an unchanged list
+   *  (e.g. after adding ONE note to a 200-child Home) doesn't force a
+   *  scrollHeight read (= layout reflow) on all 200 rows. That
+   *  per-row reflow thrash was the dominant cost of the "couple
+   *  seconds to render" lag. */
+  private renderCache = new Map<string, { mtime: number; text: string; attachments: string[]; html: string; ovW?: number; ovV?: boolean }>();
+  /** Width the list was last laid out at — the key for the overflow
+   *  memo above. Captured once per populateListBody (one read), not
+   *  per row. */
+  private lastListWidth = 0;
 
-  private async getOrComputeRender(file: TFile): Promise<{ text: string; attachments: string[]; html: string }> {
+  private async getOrComputeRender(file: TFile): Promise<{ mtime: number; text: string; attachments: string[]; html: string; ovW?: number; ovV?: boolean }> {
     const cached = this.renderCache.get(file.path);
     if (cached && cached.mtime === file.stat.mtime) return cached;
     // Cache miss / stale entry. Read + parse + render into a detached div
@@ -3708,52 +3797,83 @@ export class StashpadView extends ItemView {
       // renders if at least one piece is enabled AND has data.
       this.renderAuthorshipFooter(container, node);
       if (!opts.clamp) return;
+      // 0.76.7: fast path — if we've already measured this exact body
+      // (same path+mtime) at the current list width, reuse the cached
+      // overflow decision and skip the scrollHeight read entirely.
+      // This is what spares a 200-child Home from 200 layout reflows
+      // when one note is added (199 rows hit this branch).
+      const memoW = this.lastListWidth;
+      if (entry.ovW === memoW && entry.ovV !== undefined && !expanded) {
+        if (!entry.ovV) {
+          textEl.removeClass("is-clamped");
+        } else {
+          this.attachExpandToggle(opts, container, node, expanded);
+        }
+        return;
+      }
       // After layout, decide whether to keep the clamp + show the toggle.
       requestAnimationFrame(() => {
+        // 0.73.16: if the row is currently auto-expanded by the cursor
+        // (CSS rule on .is-cursor-expanded unclamps the text), the
+        // overflow check would see scrollHeight == clientHeight and
+        // strip .is-clamped — permanently destroying the clamp so the
+        // text NEVER re-collapses when the cursor moves away. Bail
+        // early when the cursor is on this row; the next renderNoteBody
+        // pass (or a future repaint) will measure correctly.
+        if (container.closest?.(".stashpad-note.is-cursor-expanded")) return;
         // With line-clamp the text node's clientHeight reflects the
         // 2-line cap; scrollHeight reflects the full unconstrained
         // height. A small tolerance avoids spurious "More" toggles for
         // text that fits in 2 lines exactly.
         const overflowing = textEl.scrollHeight > textEl.clientHeight + 4;
+        // Memoize for subsequent re-renders at this width.
+        entry.ovW = memoW;
+        entry.ovV = overflowing;
         if (!overflowing && !expanded) {
           // Short note that fits — drop the clamp so the fade gradient doesn't apply.
           textEl.removeClass("is-clamped");
           return;
         }
-        // Render the toggle into the host the caller provided (e.g. the
-        // actions cluster on a list row, or the focused-header bar) so
-        // it sits beside the edit pencil instead of below the body. The
-        // host always gets icon-only treatment regardless of platform —
-        // it's living inline with other action buttons. When no host is
-        // provided, fall back to inline-text-button below the body.
-        const inHost = !!opts.toggleHost;
-        const host = opts.toggleHost ?? container;
-        // Remove any old toggle the host may already have (re-renders).
-        host.querySelector(".stashpad-expand-toggle")?.remove();
-        const toggle = host.createEl("button", { cls: "stashpad-expand-toggle" });
-        toggle.title = expanded ? "Show less" : "Show more";
-        if (inHost || Platform.isMobile) {
-          setIcon(toggle, expanded ? "chevron-up" : "chevron-down");
-          toggle.addClass("is-icon");
-          if (inHost) toggle.addClass("is-inline");
-        } else {
-          toggle.setText(expanded ? "Show less" : "Show more");
-        }
-        // If the caller wanted the toggle slotted before a specific
-        // sibling (e.g. before the pencil), do that.
-        if (opts.toggleAnchor && opts.toggleAnchor.parentElement === host) {
-          host.insertBefore(toggle, opts.toggleAnchor);
-        }
-        toggle.onclick = (e) => {
-          e.stopPropagation();
-          if (this.expandedNotes.has(node.id)) this.expandedNotes.delete(node.id);
-          else this.expandedNotes.add(node.id);
-          // Re-render just this body in place to preserve list scroll.
-          container.empty();
-          this.renderNoteBody(container, node, opts);
-        };
+        this.attachExpandToggle(opts, container, node, expanded);
       });
     });
+  }
+
+  /** 0.76.7: extracted from renderNoteBody so the cached-overflow fast
+   *  path can build the Show-more/less toggle without re-measuring.
+   *  Renders the toggle into the caller's host (actions cluster) or
+   *  inline below the body, wired to flip expandedNotes + re-render
+   *  just this body. */
+  private attachExpandToggle(
+    opts: { clamp?: boolean; toggleHost?: HTMLElement; toggleAnchor?: HTMLElement },
+    container: HTMLElement,
+    node: TreeNode,
+    expanded: boolean,
+  ): void {
+    const inHost = !!opts.toggleHost;
+    const host = opts.toggleHost ?? container;
+    // Remove any old toggle the host may already have (re-renders).
+    host.querySelector(".stashpad-expand-toggle")?.remove();
+    const toggle = host.createEl("button", { cls: "stashpad-expand-toggle" });
+    toggle.title = expanded ? "Show less" : "Show more";
+    if (inHost || Platform.isMobile) {
+      setIcon(toggle, expanded ? "chevron-up" : "chevron-down");
+      toggle.addClass("is-icon");
+      if (inHost) toggle.addClass("is-inline");
+    } else {
+      toggle.setText(expanded ? "Show less" : "Show more");
+    }
+    if (opts.toggleAnchor && opts.toggleAnchor.parentElement === host) {
+      host.insertBefore(toggle, opts.toggleAnchor);
+    }
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      if (this.expandedNotes.has(node.id)) this.expandedNotes.delete(node.id);
+      else this.expandedNotes.add(node.id);
+      // Re-render just this body in place to preserve list scroll.
+      container.empty();
+      this.renderNoteBody(container, node, opts);
+    };
   }
 
   private splitAttachments(body: string): { text: string; attachments: string[] } {
@@ -4359,6 +4479,7 @@ export class StashpadView extends ItemView {
     this.repaintSelectionClasses();
     this.revealCursorRow();
     this.stampSelectedCursor();
+    this.plugin.notifyStashpadSelectionChanged();
   }
 
   private revealCursorRow(): void {
@@ -4480,8 +4601,25 @@ export class StashpadView extends ItemView {
       return;
     }
     if (this.inListPicker && !inInput) {
-      if (e.key === "ArrowDown") { e.preventDefault(); this.inListPicker.activeIdx = Math.min(this.currentChildren.length - 1, this.inListPicker.activeIdx + 1); this.render(); return; }
-      if (e.key === "ArrowUp") { e.preventDefault(); this.inListPicker.activeIdx = Math.max(0, this.inListPicker.activeIdx - 1); this.render(); return; }
+      // 0.73.15 perf: arrow-key picker nav used to call full
+      // this.render() on every step — on a 200-note list that's the
+      // same 100–300ms regression we fixed for normal cursor nav in
+      // 0.73.4. Now we just repaint the .is-pick-target class on
+      // existing rows and scroll the new target into view.
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        this.inListPicker.activeIdx = Math.min(this.currentChildren.length - 1, this.inListPicker.activeIdx + 1);
+        this.repaintSelectionClasses();
+        this.revealRowAt(this.inListPicker.activeIdx);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        this.inListPicker.activeIdx = Math.max(0, this.inListPicker.activeIdx - 1);
+        this.repaintSelectionClasses();
+        this.revealRowAt(this.inListPicker.activeIdx);
+        return;
+      }
       if (e.key === "Enter") { e.preventDefault(); void this.commitInListPicker(); return; }
       return;
     }
@@ -4596,6 +4734,8 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.insertTemplate)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInsertTemplate(); return; }
       if (matchBinding(e, sb.toggleExpand)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdToggleExpand(); return; }
       if (matchBinding(e, sb.togglePin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdTogglePin(); return; }
+      if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
+      if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
     }
     // Allow E / T from focused-header context too (no selection / cursor required).
     const focused = this.tree.get(this.focusId);
@@ -4645,6 +4785,9 @@ export class StashpadView extends ItemView {
     this.repaintSelectionClasses();
     this.revealCursorRow();
     this.stampSelectedCursor();
+    // 0.74.1: notify the right-sidebar detail panel so it can refresh
+    // to match the new cursor row.
+    this.plugin.notifyStashpadSelectionChanged();
   }
 
   /** O(N rows) class toggle — far cheaper than a full render(). Read
@@ -4653,13 +4796,38 @@ export class StashpadView extends ItemView {
    *  any other "only the selection changed" path. 0.73.4. */
   private repaintSelectionClasses(): void {
     if (!this.listEl) return;
+    const autoExpand = !!this.plugin.settings.autoExpandCursorRow;
+    const pickIdx = this.inListPicker?.activeIdx ?? -1;
     const rows = this.listEl.querySelectorAll<HTMLElement>(".stashpad-note");
     rows.forEach((row) => {
       const idx = Number(row.dataset.idx);
       const id = row.dataset.id ?? "";
-      row.classList.toggle("is-cursor", idx === this.cursorIdx);
+      const isCursor = idx === this.cursorIdx;
+      row.classList.toggle("is-cursor", isCursor);
       row.classList.toggle("is-selected", this.selection.has(id));
+      // 0.73.14: transient auto-expand. CSS-only — flips off the
+      // clamp on the cursor row's text without mutating the
+      // expandedNotes Set, so moving away naturally re-collapses.
+      row.classList.toggle("is-cursor-expanded", autoExpand && isCursor);
+      // 0.73.15: pick-target class. Used by the in-list parent picker
+      // so its arrow-key nav also avoids the full-render rebuild.
+      row.classList.toggle("is-pick-target", idx === pickIdx);
     });
+  }
+
+  /** 0.73.15: scroll the row at `idx` into view (centered when far
+   *  out of viewport, nearest edge when close). Cheap alternative to
+   *  a full render() when we just need to follow a moving cursor /
+   *  picker target. */
+  private revealRowAt(idx: number): void {
+    if (!this.listEl) return;
+    const row = this.listEl.querySelector<HTMLElement>(`.stashpad-note[data-idx="${idx}"]`);
+    if (!row) return;
+    const rowRect = row.getBoundingClientRect();
+    const listRect = this.listEl.getBoundingClientRect();
+    if (rowRect.top < listRect.top || rowRect.bottom > listRect.bottom) {
+      row.scrollIntoView({ block: "nearest", behavior: "auto" });
+    }
   }
 
   private getActionTargets(): TreeNode[] {
@@ -4991,14 +5159,19 @@ export class StashpadView extends ItemView {
         folder: this.noteFolder,
       });
     }
-    // 0.72.6: optionally follow the outdented note(s) into their new
-    // (shared) grandparent. Works only when every moved target shares
-    // the same destination; mixed-source outdents would otherwise
-    // surprise-jump somewhere arbitrary.
+    // 0.72.6 / 0.73.8: optionally follow the outdented note(s) into
+    // their new (shared) grandparent. Works only when every moved
+    // target shares the same destination; mixed-source outdents
+    // would otherwise surprise-jump somewhere arbitrary. The earlier
+    // version excluded ROOT_ID entirely — that broke the common
+    // "outdent a child of Note A back to Home" case (the user was
+    // focused on Note A, dest was ROOT_ID, nav was skipped). Now we
+    // only skip when the dest IS the current focus (already there,
+    // nothing to navigate to).
     if (this.plugin.settings.autoNavOnMoveOut && moved.length > 0) {
       const dest = moved[0].parent;
       const allShareDest = dest != null && moved.every((m) => m.parent === dest);
-      if (allShareDest && dest !== ROOT_ID) this.navigateTo(dest);
+      if (allShareDest && dest !== this.focusId) this.navigateTo(dest);
     }
   }
 
@@ -5097,10 +5270,12 @@ export class StashpadView extends ItemView {
         const newParent = item.id;
         for (const t of targets) await this.changeParent(t, newParent);
         this.selection.clear(); this.render();
-        // 0.72.6: optionally follow the moved note(s) into the new
-        // parent. Skip when newParent is ROOT_ID — that means "moved
-        // to Home", and Home IS the focus, so no navigation needed.
-        if (this.plugin.settings.autoNavOnMoveOut && newParent !== ROOT_ID) {
+        // 0.72.6 / 0.73.8: optionally follow the moved note(s) into
+        // the new parent. Skip only when the destination IS the
+        // current focus (no nav needed). The earlier ROOT_ID guard
+        // assumed Home is always the focus — wrong when the user is
+        // focused on a sub-parent and picks Home as destination.
+        if (this.plugin.settings.autoNavOnMoveOut && newParent !== this.focusId) {
           this.navigateTo(newParent);
         }
       },
@@ -5867,6 +6042,10 @@ export class StashpadView extends ItemView {
     this.render(navPolicy);
     this.refreshHeaderTitle();
     this.viewRoot.focus({ preventScroll: true });
+    // 0.74.6: drilling into a different note is a genuine selection
+    // change — the detail panel should follow. (render() above only
+    // fires content-changed, which keeps the panel pinned.)
+    this.plugin.notifyStashpadSelectionChanged();
   }
 
   /** Browser-style back: pop the back stack, push current onto forward,
@@ -6377,6 +6556,7 @@ export class StashpadView extends ItemView {
         if (newState) fm.completed = true;
         else delete fm.completed;
       });
+      this.completedState.set(t.file.path, newState); // 0.76.11
       changedIds.push(t.id);
     }
     this.render();
@@ -6445,10 +6625,240 @@ export class StashpadView extends ItemView {
     });
   }
 
+  /** 0.76.11: authoritative completed-state per path. Decouples
+   *  isCompleted from the live metadataCache, which can transiently
+   *  return stale frontmatter for sibling rows during the synthetic
+   *  create-render. Seeded lazily from the cache, kept fresh by the
+   *  metadataCache "changed" listener + our own toggles. */
+  private completedState = new Map<string, boolean>();
+
   private isCompleted(node: TreeNode): boolean {
     if (!node.file) return false;
+    const path = node.file.path;
+    const cached = this.completedState.get(path);
+    if (cached !== undefined) return cached;
     const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
-    return !!fm?.completed;
+    const v = !!fm?.completed;
+    this.completedState.set(path, v);
+    return v;
+  }
+
+  /** 0.76.1: open the due-date picker for the action targets and write
+   *  (or clear) the `due` frontmatter. Setting a due date also marks
+   *  the note(s) as a task so they surface in the Tasks panel. Bound
+   *  to D by default. Pre-fills from the first target's existing due. */
+  cmdSetDue(): void {
+    let targets = this.getActionTargets();
+    if (targets.length === 0) {
+      const focused = this.tree.get(this.focusId);
+      if (focused?.file) targets = [focused];
+    }
+    if (targets.length === 0) { new Notice("Nothing to schedule."); return; }
+    const first = targets[0];
+    const curFm = first.file ? this.app.metadataCache.getFileCache(first.file)?.frontmatter as any : null;
+    const current = curFm && (typeof curFm.due === "string" || typeof curFm.due === "number") ? String(curFm.due) : null;
+    new DueDatePickerModal(this.app, current, (iso) => {
+      void this.applyDue(targets, iso);
+    }).open();
+  }
+
+  /** Write the chosen due value (or clear it) across `targets`, with
+   *  undo. Setting a date also flips `task: true`; clearing leaves the
+   *  task flag intact (clearing a due ≠ "no longer a task"). */
+  private async applyDue(targets: TreeNode[], iso: string | null): Promise<void> {
+    const prior: { id: StashpadId; path: string; due: unknown; task: unknown }[] = [];
+    const changedIds: StashpadId[] = [];
+    for (const t of targets) {
+      if (!t.file) continue;
+      const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
+      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task });
+      await this.app.fileManager.processFrontMatter(t.file, (m) => {
+        if (iso === null) delete m.due;
+        else { m.due = iso; m.task = true; }
+      });
+      changedIds.push(t.id);
+    }
+    this.render();
+    if (changedIds.length > 0) {
+      const nodes = changedIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+      this.plugin.notifications.show({
+        message: this.bulkActionMessage({
+          verb: iso === null ? "Cleared due date" : `Due ${formatDateTime(Date.parse(iso), this.plugin.settings)}`,
+          nodes,
+        }),
+        kind: "success",
+        category: "edit",
+        affectedIds: changedIds,
+        folder: this.noteFolder,
+      });
+    }
+    const folder = this.noteFolder;
+    this.plugin.getUndoStack(folder).push({
+      label: iso === null ? `Clear due date (${targets.length})` : `Set due date (${targets.length})`,
+      undo: async () => {
+        for (const p of prior) {
+          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+          if (!f) continue;
+          await this.app.fileManager.processFrontMatter(f, (m) => {
+            if (p.due === undefined) delete m.due; else m.due = p.due;
+            if (p.task === undefined) delete m.task; else m.task = p.task;
+          });
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
+
+  /** 0.76.3: a note is a task when it carries the `task` tag in
+   *  frontmatter. (Legacy: the 0.76.1 `task: true` boolean and a bare
+   *  `completed` field also count, so older test notes still show.)
+   *  The checkbox STATE is the `completed` field — false = open
+   *  (unfilled box), true = done (checked box). */
+  private isTask(node: TreeNode): boolean {
+    if (!node.file) return false;
+    const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter as any;
+    if (!fm) return false;
+    return fmHasTag(fm, "task") || fm.task === true || fm.completed !== undefined;
+  }
+
+  /** 0.76.3: mark/unmark the selection (or cursor row, or focused
+   *  note) as a task. Marking adds the `task` tag and sets
+   *  `completed: false` (an unfilled checkbox) unless it's already
+   *  done. Unmarking strips the tag + the completed field. Mixed
+   *  selections resolve toward "make all tasks." Undo/redo via a
+   *  frontmatter snapshot. Bound to H by default. */
+  async cmdToggleTask(): Promise<void> {
+    let targets = this.getActionTargets();
+    if (targets.length === 0) {
+      const focused = this.tree.get(this.focusId);
+      if (focused?.file) targets = [focused];
+    }
+    if (targets.length === 0) { new Notice("Nothing to toggle."); return; }
+
+    const makeTask = targets.some((t) => !this.isTaskTagged(t));
+    // Snapshot the full prior frontmatter shape we touch (tags +
+    // completed + legacy task) so undo restores exactly.
+    const prior: { id: StashpadId; path: string; tags: unknown; completed: unknown; task: unknown }[] = [];
+    const changedIds: StashpadId[] = [];
+    for (const t of targets) {
+      if (!t.file) continue;
+      const wasTagged = this.isTaskTagged(t);
+      const fmNow = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
+      prior.push({ id: t.id, path: t.file.path, tags: fmNow?.tags, completed: fmNow?.completed, task: fmNow?.task });
+      if (wasTagged === makeTask) continue;
+      let nowCompleted = false;
+      await this.app.fileManager.processFrontMatter(t.file, (m: any) => {
+        if (makeTask) {
+          fmAddTag(m, "task");
+          if (m.completed === undefined) m.completed = false; // unfilled checkbox
+          nowCompleted = m.completed === true;
+          delete m.task; // drop the legacy 0.76.1 boolean
+        } else {
+          fmRemoveTag(m, "task");
+          delete m.completed;
+          delete m.task;
+          nowCompleted = false;
+        }
+      });
+      this.completedState.set(t.file.path, nowCompleted); // 0.76.11
+      changedIds.push(t.id);
+    }
+    this.render();
+    if (changedIds.length > 0) {
+      // 0.76.3: title-first wording — '"Foo" marked as task'.
+      const verb = makeTask ? "marked as task" : "unmarked as task";
+      let message: string;
+      if (changedIds.length === 1) {
+        const n = this.tree.get(changedIds[0]);
+        const title = n ? (this.titleForNode(n).trim() || "(untitled)") : "(untitled)";
+        message = `"${title}" ${verb}`;
+      } else {
+        message = `${changedIds.length} notes ${verb}`;
+      }
+      this.plugin.notifications.show({
+        message,
+        kind: "success",
+        category: "edit",
+        affectedIds: changedIds,
+        folder: this.noteFolder,
+      });
+    }
+
+    const folder = this.noteFolder;
+    const restore = async () => {
+      for (const p of prior) {
+        const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+        if (!f) continue;
+        await this.app.fileManager.processFrontMatter(f, (m: any) => {
+          if (p.tags === undefined) delete m.tags; else m.tags = p.tags;
+          if (p.completed === undefined) delete m.completed; else m.completed = p.completed;
+          if (p.task === undefined) delete m.task; else m.task = p.task;
+        });
+      }
+      this.tree.rebuild(folder);
+      this.render();
+    };
+    this.plugin.getUndoStack(folder).push({
+      label: `${makeTask ? "Mark task" : "Unmark task"} (${targets.length})`,
+      undo: restore,
+      redo: async () => {
+        for (const p of prior) {
+          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+          if (!f) continue;
+          await this.app.fileManager.processFrontMatter(f, (m: any) => {
+            if (makeTask) {
+              fmAddTag(m, "task");
+              if (m.completed === undefined) m.completed = false;
+              delete m.task;
+            } else {
+              fmRemoveTag(m, "task");
+              delete m.completed;
+              delete m.task;
+            }
+          });
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
+
+  /** 0.76.10: toggle one note's `completed` field straight from its
+   *  row checkbox (main list / detail panel). Flips true↔false (keeps
+   *  the field present so the row stays a task), logs, re-renders,
+   *  and pushes an undo. */
+  async toggleCompletedForNode(node: TreeNode): Promise<void> {
+    if (!node.file) return;
+    const path = node.file.path;
+    const was = this.isCompleted(node);
+    await this.app.fileManager.processFrontMatter(node.file, (m: any) => {
+      m.completed = !was;
+    });
+    this.completedState.set(path, !was); // authoritative, pre-cache-event
+    await this.log.append({ type: was ? "uncomplete" : "complete", id: node.id });
+    this.render();
+    const folder = this.noteFolder;
+    this.plugin.getUndoStack(folder).push({
+      label: was ? "Mark incomplete" : "Mark complete",
+      undo: async () => {
+        const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+        if (!f) return;
+        await this.app.fileManager.processFrontMatter(f, (m: any) => { m.completed = was; });
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
+
+  /** Tag-only task check (used by the H toggle's decision). Distinct
+   *  from isTask, which also counts the bare `completed` field for
+   *  panel inclusion. */
+  private isTaskTagged(node: TreeNode): boolean {
+    if (!node.file) return false;
+    const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter as any;
+    if (!fm) return false;
+    return fmHasTag(fm, "task") || fm.task === true;
   }
 
   /** Return the per-note color from frontmatter (already validated as a

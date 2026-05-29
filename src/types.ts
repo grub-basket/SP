@@ -3,6 +3,10 @@ import type { TFile } from "obsidian";
 export const STASHPAD_VIEW_TYPE = "stashpad-view";
 /** 0.68.0: sidebar panels view (Pinned Notes + future panels). */
 export const STASHPAD_PANELS_VIEW_TYPE = "stashpad-panels";
+/** 0.74.1: right-sidebar detail panel. Shows the currently-cursored
+ *  note's body + metadata + children. Lives separately from the
+ *  left-sidebar panels view (Pinned/Shared/Tasks). */
+export const STASHPAD_DETAIL_VIEW_TYPE = "stashpad-detail";
 export const ROOT_ID = "__root__";
 
 /** A user's pinned-note record. Cross-folder by design — the panel
@@ -14,6 +18,34 @@ export interface PinnedNoteRef {
 }
 
 export type StashpadId = string;
+
+/** 0.76.3: frontmatter `tags` helpers. Obsidian allows `tags` as
+ *  either a YAML list or a space/comma-separated string; these
+ *  normalize to an array, mutate, and write back as an array (or
+ *  delete the key when empty). `fm` is a live processFrontMatter
+ *  object or a cached frontmatter snapshot. Tags are compared
+ *  without a leading '#'. */
+function fmTagList(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.filter((t): t is string => typeof t === "string");
+  if (typeof raw === "string") return raw.split(/[,\s]+/).filter(Boolean);
+  return [];
+}
+export function fmHasTag(fm: any, tag: string): boolean {
+  const want = tag.replace(/^#/, "");
+  return fmTagList(fm?.tags).some((t) => t.replace(/^#/, "") === want);
+}
+export function fmAddTag(fm: any, tag: string): void {
+  const want = tag.replace(/^#/, "");
+  const list = fmTagList(fm.tags);
+  if (!list.some((t) => t.replace(/^#/, "") === want)) list.push(want);
+  fm.tags = list;
+}
+export function fmRemoveTag(fm: any, tag: string): void {
+  const want = tag.replace(/^#/, "");
+  const list = fmTagList(fm.tags).filter((t) => t.replace(/^#/, "") !== want);
+  if (list.length) fm.tags = list;
+  else delete fm.tags;
+}
 
 export interface NoteFrontmatter {
   id: StashpadId;
