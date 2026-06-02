@@ -2,6 +2,7 @@ import { App, FuzzySuggestModal, Platform, Scope, SuggestModal, TFile, moment, s
 import type { TreeIndex } from "./tree-index";
 import type { TreeNode } from "./types";
 import { ROOT_ID } from "./types";
+import { buildTimePickerInto, formatWhenTime } from "./time-picker";
 
 /** Parsed shape of a search query string. The original free-text tokens
  *  go into `text` (token-order-agnostic match against title/body); each
@@ -776,6 +777,20 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       this.mountFilterChipRow(inputEl, resultsEl);
       return;
     }
+    // 0.76.36: on mobile, when the picker opens while the composer holds
+    // the soft keyboard, focus doesn't move to the picker input on its
+    // own — typed queries land in the composer. Obsidian's SuggestModal
+    // deliberately doesn't autofocus its input on mobile (to avoid popping
+    // the keyboard). We DO want it here, and crucially this onOpen runs
+    // synchronously inside Modal.open(), which we call inside the button's
+    // tap handler — so this focus() executes while the user gesture is
+    // still live, letting iOS hop the keyboard from the composer textarea
+    // straight to the picker input WITHOUT dismissing it. (Deferred
+    // focus() via setTimeout would be outside the gesture and fail.)
+    if (Platform.isMobile) {
+      const inputEl = (this as any).inputEl as HTMLInputElement | undefined;
+      if (inputEl) inputEl.focus();
+    }
   }
 
   private mountFilterChipRow(inputEl: HTMLInputElement, resultsEl: HTMLElement): void {
@@ -1373,158 +1388,15 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         seedPeriod: "am" | "pm",
       ): void => {
         openInsertPopover(anchor, (pop, close, setOnEnter) => {
-          pop.addClass("stashpad-when-pop-time");
-          let period = seedPeriod;
-          // Top row: HH : MM   AM/PM toggle
-          const display = pop.createDiv({ cls: "stashpad-when-time-display" });
-          const hField = display.createEl("input", {
-            cls: "stashpad-when-time-field",
-            attr: { type: "text", inputmode: "numeric", maxlength: "2" },
-          }) as HTMLInputElement;
-          hField.value = String(seedH);
-          display.createSpan({ cls: "stashpad-when-time-colon", text: ":" });
-          const mField = display.createEl("input", {
-            cls: "stashpad-when-time-field",
-            attr: { type: "text", inputmode: "numeric", maxlength: "2" },
-          }) as HTMLInputElement;
-          mField.value = String(seedM).padStart(2, "0");
-          const periodWrap = display.createDiv({ cls: "stashpad-when-time-period" });
-          const amBtn = periodWrap.createEl("button", { cls: "stashpad-when-time-ampm", text: "AM" });
-          amBtn.type = "button";
-          const pmBtn = periodWrap.createEl("button", { cls: "stashpad-when-time-ampm", text: "PM" });
-          pmBtn.type = "button";
-          const syncPeriod = (): void => {
-            amBtn.toggleClass("is-active", period === "am");
-            pmBtn.toggleClass("is-active", period === "pm");
-          };
-          syncPeriod();
-          amBtn.addEventListener("mousedown", (ev) => ev.preventDefault());
-          pmBtn.addEventListener("mousedown", (ev) => ev.preventDefault());
-          amBtn.addEventListener("click", (ev) => { ev.preventDefault(); period = "am"; syncPeriod(); });
-          pmBtn.addEventListener("click", (ev) => { ev.preventDefault(); period = "pm"; syncPeriod(); });
-
-          // Track focused field for the numpad. When a field gains focus
-          // we select-all so the next digit replaces (0.69.15 fix).
-          let focused: HTMLInputElement = hField;
-          hField.addEventListener("focus", () => { focused = hField; hField.select(); });
-          mField.addEventListener("focus", () => { focused = mField; mField.select(); });
-
-          /** 0.69.15: when HH exceeds 12, AM/PM is meaningless (24h mode)
-           *  — grey out both buttons and treat the value as 24-hour. */
-          const syncAmpmEnabled = (): void => {
-            const h = parseInt(hField.value || "0", 10) || 0;
-            const is24 = h > 12;
-            amBtn.toggleClass("is-disabled", is24);
-            pmBtn.toggleClass("is-disabled", is24);
-            amBtn.disabled = is24;
-            pmBtn.disabled = is24;
-          };
-
-          // Constrain typed input — digits only, max 2 chars, clamp to range.
-          // 0.69.15: hours now accept 0-24 (24h), minutes 0-59.
-          const clamp = (el: HTMLInputElement): void => {
-            let v = el.value.replace(/\D/g, "").slice(0, 2);
-            if (v === "") { el.value = ""; if (el === hField) syncAmpmEnabled(); return; }
-            let n = parseInt(v, 10);
-            if (el === hField) { if (n > 24) n = 24; }
-            else { if (n > 59) n = 59; }
-            el.value = String(n);
-            if (el === hField) syncAmpmEnabled();
-          };
-          for (const el of [hField, mField]) {
-            el.addEventListener("input", () => clamp(el));
-          }
-          syncAmpmEnabled();
-
-          const finalize = (): void => {
-            const hNum = parseInt(hField.value || "12", 10) || 12;
-            const mm = parseInt(mField.value || "0", 10) || 0;
-            // 0.69.15: when HH > 12, output 24-hour without am/pm suffix.
-            // Otherwise output 12-hour with the toggled am/pm.
-            const time = hNum > 12
-              ? `${hNum}:${String(mm).padStart(2, "0")}`
-              : `${hNum}:${String(mm).padStart(2, "0")}${period}`;
-            insertAtCursor(targetInput, time);
-            close();
-          };
-          // 0.69.29: route popover-level Enter to finalize so it
-          // works regardless of which sub-element has focus (numpad
-          // buttons aren't focusable enough for the DOM Enter listener
-          // to be reliable).
-          setOnEnter(finalize);
-
-          // 0.69.15: list every tabbable element in the popover and trap
-          // Tab on each to cycle within (Tab forward, Shift+Tab back).
-          // Numpad buttons are constructed below — we collect them after.
-          const tabRing: HTMLElement[] = [hField, mField, amBtn, pmBtn];
-          const cycleFocus = (cur: HTMLElement, dir: 1 | -1): void => {
-            const idx = tabRing.indexOf(cur);
-            if (idx === -1) return;
-            const len = tabRing.length;
-            const next = (idx + dir + len) % len;
-            tabRing[next].focus();
-          };
-          const trapKey = (el: HTMLElement): void => {
-            el.addEventListener("keydown", (ev) => {
-              if (ev.key === "Enter") { ev.preventDefault(); ev.stopPropagation(); finalize(); }
-              else if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); close(); }
-              else if (ev.key === "Tab") {
-                ev.preventDefault();
-                ev.stopPropagation();
-                cycleFocus(el, ev.shiftKey ? -1 : 1);
-              }
-            });
-          };
-
-          // Numpad — 3x4 grid: 1 2 3 / 4 5 6 / 7 8 9 / ⌫ 0 Insert.
-          const pad = pop.createDiv({ cls: "stashpad-when-time-pad" });
-          const keys = ["1","2","3","4","5","6","7","8","9","backspace","0","insert"];
-          let okBtn: HTMLButtonElement | null = null;
-          for (const key of keys) {
-            const b = pad.createEl("button", { cls: "stashpad-when-time-padbtn" });
-            b.type = "button";
-            if (key === "backspace") setIcon(b, "delete");
-            else if (key === "insert") { b.setText("OK"); okBtn = b; }
-            else b.setText(key);
-            if (key === "insert") b.addClass("is-go");
-            b.addEventListener("mousedown", (ev) => ev.preventDefault());
-            b.addEventListener("click", (ev) => {
-              ev.preventDefault();
-              if (key === "insert") { finalize(); return; }
-              if (key === "backspace") {
-                focused.value = focused.value.slice(0, -1);
-                clamp(focused);
-                focused.focus();
-                return;
-              }
-              // 0.69.15: if the field's current value is fully selected
-              // (e.g. just got focus and select() ran), REPLACE with the
-              // digit. Otherwise append until the 2-char cap, then replace.
-              const allSelected =
-                focused.selectionStart === 0 &&
-                focused.selectionEnd === focused.value.length &&
-                focused.value.length > 0;
-              const cap = 2;
-              const next = allSelected || focused.value.length >= cap
-                ? key
-                : focused.value + key;
-              focused.value = next;
-              clamp(focused);
-              focused.focus();
-              // Move caret to end so subsequent presses append.
-              focused.setSelectionRange(focused.value.length, focused.value.length);
-              // Auto-advance from hours to minutes once full.
-              if (focused === hField && focused.value.length >= cap) {
-                mField.focus();
-                mField.select();
-              }
-            });
-          }
-          // 0.69.15: complete the tab ring (HH → MM → AM → PM → OK → HH).
-          if (okBtn) tabRing.push(okBtn);
-          for (const el of tabRing) trapKey(el);
-          hField.focus();
-          hField.select();
+          // 0.76.23: the picker UI now lives in src/time-picker.ts so
+          // the due-date modal can reuse the exact same control. This
+          // host keeps the SuggestModal scope-aware popover behaviour;
+          // the shared builder fills it + reports the result, which we
+          // format the same way as before and insert at the caret.
+          buildTimePickerInto(pop, {
+            seedH, seedM, seedPeriod, close, setOnEnter,
+            onFinalize: (r) => insertAtCursor(targetInput, formatWhenTime(r)),
+          });
         });
       };
 

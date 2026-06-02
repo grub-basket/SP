@@ -1,4 +1,5 @@
 import { App, Modal, Platform, moment, Notice, setIcon } from "obsidian";
+import { buildTimePickerInto } from "./time-picker";
 import type { NotificationCategory, NotificationKind, NotificationRecord, NotificationService } from "./notifications";
 
 interface LogEv { ts: string; type: string; id: string; payload?: any; author?: string; }
@@ -864,7 +865,11 @@ export class DueDatePickerModal extends Modal {
     // gesture or on platforms that lack it (the input is still
     // directly editable / clickable as a fallback).
     dateIcon.onclick = () => { try { (dateInput as any).showPicker?.(); } catch { /* noop */ } };
-    timeIcon.onclick = () => { try { (timeInput as any).showPicker?.(); } catch { /* noop */ } };
+    // 0.76.23: the clock opens Stashpad's numpad time picker (the same
+    // control as the search When-builder) instead of the OS time
+    // picker — consistent UX + works the same everywhere. The time
+    // input stays directly editable too.
+    timeIcon.onclick = () => this.openTimeNumpad(timeIcon, timeInput);
     if (initial) {
       dateInput.value = this.toDateValue(initial);
       timeInput.value = this.toTimeValue(initial);
@@ -886,13 +891,27 @@ export class DueDatePickerModal extends Modal {
     addPreset("Tomorrow", () => { const d = this.startOfTodayLocal(); d.setDate(d.getDate() + 1); return atNine(d); });
     addPreset("Next week", () => { const d = this.startOfTodayLocal(); d.setDate(d.getDate() + 7); return atNine(d); });
 
+    // 0.76.22: "Clear" only empties the fields and stays open — so you
+    // can clear a misapplied date and pick a new one without
+    // re-opening. To actually REMOVE the due, clear then Set (empty
+    // Set commits null). To keep the existing due, Cancel.
     const clear = grid.createEl("button", { cls: "stashpad-due-btn", text: "Clear" });
-    clear.onclick = () => { this.didChoose = true; this.close(); this.onPick(null); };
+    clear.onclick = () => {
+      dateInput.value = "";
+      timeInput.value = "";
+      dateInput.focus();
+    };
     const cancel = grid.createEl("button", { cls: "stashpad-due-btn", text: "Cancel" });
     cancel.onclick = () => { this.didChoose = true; this.close(); };
     const ok = grid.createEl("button", { cls: "stashpad-due-btn mod-cta", text: "Set" });
     ok.onclick = () => {
-      if (!dateInput.value) { new Notice("Pick a date first (or use Clear)."); return; }
+      // Empty Set = remove the due date.
+      if (!dateInput.value) {
+        this.didChoose = true;
+        this.close();
+        this.onPick(null);
+        return;
+      }
       // Default time to 09:00 when only a date was chosen.
       const [y, m, d] = dateInput.value.split("-").map((n) => parseInt(n, 10));
       let hh = 9, mm = 0;
@@ -905,7 +924,72 @@ export class DueDatePickerModal extends Modal {
     requestAnimationFrame(() => dateInput.focus());
   }
 
-  onClose(): void { this.contentEl.empty(); void this.didChoose; }
+  onClose(): void {
+    this.tinyClosePopover?.();
+    this.contentEl.empty();
+    void this.didChoose;
+  }
+
+  /** 0.76.23: open the shared numpad time picker anchored under the
+   *  clock icon, writing the result back to the native time input as
+   *  24-hour HH:MM. Plain-DOM popover host (the modal isn't a
+   *  SuggestModal, so no Obsidian Scope) with click-outside + Escape +
+   *  Enter handling. */
+  private tinyClosePopover: (() => void) | null = null;
+  private openTimeNumpad(anchor: HTMLElement, timeInput: HTMLInputElement): void {
+    this.tinyClosePopover?.();
+    // Seed from the current time value, else the current clock time.
+    let h24 = 9, mm = 0;
+    if (timeInput.value) {
+      const [h, mi] = timeInput.value.split(":").map((n) => parseInt(n, 10));
+      if (Number.isFinite(h)) h24 = h;
+      if (Number.isFinite(mi)) mm = mi;
+    } else {
+      const now = new Date();
+      h24 = now.getHours();
+      mm = now.getMinutes();
+    }
+    const period: "am" | "pm" = h24 >= 12 ? "pm" : "am";
+    const seedH = h24 === 0 ? 12 : (h24 > 12 ? h24 - 12 : h24);
+
+    const pop = document.body.createDiv({ cls: "stashpad-when-popover stashpad-due-time-pop" });
+    pop.style.position = "fixed";
+    // Above the modal (Obsidian modals sit ~var(--layer-modal)).
+    pop.style.zIndex = "9999";
+
+    let onEnter: (() => void) | null = null;
+    const close = (): void => {
+      pop.remove();
+      document.removeEventListener("mousedown", outside, true);
+      document.removeEventListener("keydown", onKey, true);
+      if (this.tinyClosePopover === close) this.tinyClosePopover = null;
+    };
+    const outside = (e: MouseEvent): void => {
+      if (!pop.contains(e.target as Node) && e.target !== anchor && !anchor.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+      else if (e.key === "Enter" && onEnter) { e.preventDefault(); e.stopPropagation(); onEnter(); }
+    };
+    this.tinyClosePopover = close;
+
+    buildTimePickerInto(pop, {
+      seedH, seedM: mm, seedPeriod: period,
+      close,
+      setOnEnter: (cb) => { onEnter = cb; },
+      onFinalize: (r) => {
+        timeInput.value = `${String(r.hours24).padStart(2, "0")}:${String(r.minutes).padStart(2, "0")}`;
+      },
+    });
+
+    const rect = anchor.getBoundingClientRect();
+    pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 220))}px`;
+    pop.style.top = `${rect.bottom + 4}px`;
+    setTimeout(() => {
+      document.addEventListener("mousedown", outside, true);
+      document.addEventListener("keydown", onKey, true);
+    }, 0);
+  }
 
   private startOfTodayLocal(): Date {
     const d = new Date();

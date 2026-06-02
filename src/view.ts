@@ -1,6 +1,7 @@
 import {
   FuzzySuggestModal, ItemView, MarkdownRenderer, Menu, Notice, Platform,
-  Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce, moment, setIcon,
+  Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce,
+  moment, setIcon,
 } from "obsidian";
 import {
   ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag,
@@ -25,6 +26,30 @@ import { buildStashZip, importStashZip, STASH_EXT } from "./stash-package";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
+
+/** 0.76.33: setIcon that never leaves a blank button. If `name` isn't
+ *  in this Obsidian build's bundled Lucide set (older iPad/iOS app
+ *  versions lag desktop, so some names that resolve on desktop don't
+ *  resolve there), setIcon injects no <svg> and the button renders
+ *  empty. We detect that (setIcon is synchronous) and drop in a
+ *  Unicode glyph so there's always a visible affordance. */
+function setIconSafe(el: HTMLElement, name: string, fallbackGlyph: string): void {
+  el.empty();
+  try { setIcon(el, name); } catch { /* ignore */ }
+  // The ONLY reliable signal that the icon actually rendered is the
+  // presence of a drawable shape element inside the injected <svg>.
+  // Older/stripped mobile Lucide bundles can inject an empty (or
+  // whitespace-only) <svg class="svg-icon"></svg> for names they don't
+  // know — an svg node that exists but draws nothing. Checking for a
+  // path/line/circle/etc. distinguishes "real icon" from "empty shell".
+  const svg = el.querySelector("svg");
+  const drawn = !!svg && !!svg.querySelector(
+    "path, line, circle, rect, polyline, polygon, ellipse"
+  );
+  if (drawn) return;
+  el.empty();
+  el.createSpan({ cls: "stashpad-icon-fallback", text: fallbackGlyph });
+}
 
 const VIEW_MODE_LABELS: Record<ViewMode, string> = {
   nested: "Nested",
@@ -124,6 +149,10 @@ export class StashpadView extends ItemView {
    *  survives reloads. */
   private tinyMode = false;
   private tinyAlwaysOnTop = false;
+  /** 0.77.0-feat: tiny-mode popout window opacity (0.3–1.0). Electron
+   *  `BrowserWindow.setOpacity` — desktop popouts only; a no-op on
+   *  mobile / non-popout. Persisted via view state. 1 = fully opaque. */
+  private tinyOpacity = 1;
   /** 0.61.2: compact mode — like tiny mode but stays in the current
    *  tab/leaf (no popout, no resize). Hides the time filter row and
    *  focused-header; keeps breadcrumb + list + composer. Persisted. */
@@ -184,6 +213,13 @@ export class StashpadView extends ItemView {
   /** When true, the listResizeObserver re-pins scroll to the bottom each time
    *  the list grows. Set after scrollListToBottom; cleared on user scroll. */
   private stickToListBottom = false;
+  /** 0.76.27: timestamp until which the listResizeObserver ignores
+   *  scroll adjustments. Set on mobile composer focus/blur — the
+   *  keyboard show/hide resizes the list, which otherwise fired the
+   *  observer and yanked the scroll position each time (the list
+   *  "moving" on every composer interaction). During this window we
+   *  let the browser's own reflow settle without fighting it. */
+  private keyboardTransitionUntil = 0;
   /** Per-row ResizeObserver attached during scrollListToBottom — re-pins
    *  the list to the bottom whenever a row's height changes. Survives
    *  past the initial paint so cold-cache markdown / late font loads
@@ -203,6 +239,12 @@ export class StashpadView extends ItemView {
   private lastCursorByFocus = new Map<StashpadId, StashpadId>();
   private expandedNotes = new Set<StashpadId>();
   private focusComposerOnNextRender = false;
+  /** 0.76.21: timestamp until which the activation auto-focus
+   *  (focusComposer) is suppressed. Set after actions that close a
+   *  modal and re-activate the leaf (e.g. Split) — the leaf
+   *  re-activation otherwise yanks focus into the composer regardless
+   *  of the autofocus-after-send setting. */
+  private suppressComposerFocusUntil = 0;
   /** Debounced wrapper around saveDraft for the input event. Lazily
    *  initialized on first composer render. */
   private debouncedSaveDraft?: (v: string) => void;
@@ -367,6 +409,17 @@ export class StashpadView extends ItemView {
     this.register(() => popViewScope());
 
     this.detachTreeHook = this.tree.hookMetadataCache(() => this.debouncedRender());
+    // 0.76.30: self-heal stale trees after a sync burst / cold start.
+    // The per-file create/changed hooks above can miss files that
+    // sync in before the view's listeners attach (mobile cold start)
+    // or land in a burst — leaving the folder showing fewer notes
+    // (or a stale layout) until a manual reload. metadataCache
+    // "resolved" fires when Obsidian finishes (re)indexing, which is
+    // exactly when synced-in files become known; reconcile then. The
+    // reconcile only rebuilds + renders when this folder's markdown
+    // file count actually differs from the tree, so it's a no-op
+    // during normal editing.
+    this.registerEvent(this.app.metadataCache.on("resolved", () => this.scheduleTreeReconcile()));
     // 0.76.11: keep the authoritative completed-state map in sync with
     // the metadataCache. A "changed" event means the cache is fresh
     // for that file, so re-sync our cached value from it. This is what
@@ -510,6 +563,37 @@ export class StashpadView extends ItemView {
     }));
   }
 
+  /** 0.76.30: debounced reconcile against the metadata cache. Counts
+   *  the markdown files actually under this folder and, if that count
+   *  differs from what the tree knows, rebuilds + re-renders — so a
+   *  folder that mounted with a stale/partial tree (mobile cold start,
+   *  post-sync burst) self-heals without a manual reload. No-op when
+   *  the counts already match. */
+  private treeReconcileTimer: number | null = null;
+  private scheduleTreeReconcile(): void {
+    if (this.treeReconcileTimer != null) return;
+    this.treeReconcileTimer = window.setTimeout(() => {
+      this.treeReconcileTimer = null;
+      if (!this.viewRoot?.isConnected) return;
+      const folder = this.noteFolder;
+      const prefix = folder + "/";
+      // Count actual Stashpad NOTES on disk (markdown files under this
+      // folder whose frontmatter carries an id) — matching what the
+      // tree tracks. Counting all markdown would over-count _authors
+      // stubs / templates and trigger perpetual no-op rebuilds.
+      let onDisk = 0;
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+        if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
+        const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+        if (typeof id === "string" && id) onDisk++;
+      }
+      if (onDisk === this.tree.fileBackedCount()) return; // in sync — no-op
+      this.tree.rebuild(folder);
+      this.debouncedRender();
+    }, 400);
+  }
+
   private focusView(): void {
     // Defer to next frame so Obsidian's own focus handling has settled first.
     requestAnimationFrame(() => {
@@ -525,8 +609,20 @@ export class StashpadView extends ItemView {
   /** Focus the composer input. Used when activating the view so users can type immediately.
    *  Runs multiple times to outlast Obsidian's own focus management on leaf activation. */
   private focusComposer(): void {
+    // 0.76.24: honour the autofocus setting. This activation auto-focus
+    // previously ignored it, so the composer kept grabbing focus on
+    // view open / leaf re-activation even with the setting OFF. When
+    // off, the user clicks the composer to type. (Focus PRESERVATION
+    // across renders — focusComposerOnNextRender — is separate and
+    // still works: it only re-focuses when the composer already had
+    // focus.)
+    if (!getSettings().autofocusComposerAfterSend) return;
     const tryFocus = () => {
       if (!this.viewRoot?.isConnected) return;
+      // 0.76.21: skip the activation auto-focus during the suppression
+      // window (set right after a Split etc. so the modal-close leaf
+      // re-activation doesn't steal focus into the composer).
+      if (Date.now() < this.suppressComposerFocusUntil) return;
       const ae = document.activeElement as HTMLElement | null;
       // Don't steal from another input/modal that the user is intentionally in.
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA") && ae !== this.composerInputEl) return;
@@ -557,6 +653,7 @@ export class StashpadView extends ItemView {
     this.composerNarrowObserver = null;
     this.focusedMiniObserver?.disconnect();
     this.focusedMiniObserver = null;
+    if (this.treeReconcileTimer != null) { window.clearTimeout(this.treeReconcileTimer); this.treeReconcileTimer = null; }
     this.composerAutocomplete?.detach();
     this.composerAutocomplete = null;
     for (const d of this.slugDebouncers.values()) d.cancel();
@@ -609,6 +706,7 @@ export class StashpadView extends ItemView {
       timeFilterCalendar: this.timeFilterCalendar,
       tinyMode: this.tinyMode,
       tinyAlwaysOnTop: this.tinyAlwaysOnTop,
+      tinyOpacity: this.tinyOpacity,
       compactMode: this.compactMode,
       // 0.67.2: persist nav stacks so reloads keep the back/forward
       // history. Without this every reload starts the user with empty
@@ -625,6 +723,7 @@ export class StashpadView extends ItemView {
       timeFilterCalendar?: boolean;
       tinyMode?: boolean;
       tinyAlwaysOnTop?: boolean;
+      tinyOpacity?: number;
       compactMode?: boolean;
       navBackStack?: NavSnapshot[];
       navForwardSnapshots?: NavSnapshot[];
@@ -638,6 +737,9 @@ export class StashpadView extends ItemView {
       if ("timeFilterCalendar" in s) this.timeFilterCalendar = !!s.timeFilterCalendar;
       if ("tinyMode" in s) this.tinyMode = !!s.tinyMode;
       if ("tinyAlwaysOnTop" in s) this.tinyAlwaysOnTop = !!s.tinyAlwaysOnTop;
+      if (typeof s.tinyOpacity === "number" && Number.isFinite(s.tinyOpacity)) {
+        this.tinyOpacity = Math.min(1, Math.max(0.3, s.tinyOpacity));
+      }
       if ("compactMode" in s) this.compactMode = !!s.compactMode;
       // 0.67.2: restore nav stacks from view state. Validate the
       // shape so a malformed entry doesn't crash navigation later.
@@ -1921,6 +2023,10 @@ export class StashpadView extends ItemView {
       const targetList = this.listEl;
       let settleTop = targetList.scrollTop;
       const ro = new ResizeObserver(() => {
+        // 0.76.27: during a mobile keyboard show/hide the list resizes;
+        // don't touch scrollTop then, or the list visibly jumps on
+        // every composer tap. Let the browser's reflow settle.
+        if (Date.now() < this.keyboardTransitionUntil) return;
         // Sticky-to-bottom mode: every growth of the list jumps to the new bottom.
         if (this.stickToListBottom) {
           targetList.scrollTop = targetList.scrollHeight;
@@ -1993,7 +2099,7 @@ export class StashpadView extends ItemView {
     // 0.68.4: icon-only Search button between the folder switcher and
     // the tags dropdown. Mirrors the Mod+F binding for mouse users.
     const searchBtn = bar.createEl("button", { cls: "stashpad-search-btn" });
-    setIcon(searchBtn, "search");
+    setIconSafe(searchBtn, "search", "🔍");
     searchBtn.title = "Search notes (Mod+F)";
     searchBtn.onclick = (e) => { e.preventDefault(); this.openSearchModal(); };
 
@@ -2126,13 +2232,13 @@ export class StashpadView extends ItemView {
     // sit at the start of the actions cluster so they're always
     // visible alongside the breadcrumb.
     const backBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
-    setIcon(backBtn, "arrow-left");
+    setIconSafe(backBtn, "arrow-left", "‹");
     const canGoBack = this.navBackStack.length > 0 || this.focusId !== ROOT_ID;
     backBtn.title = this.navBackStack.length > 0 ? "Back" : (this.focusId !== ROOT_ID ? "Back (up to parent)" : "No back history");
     if (!canGoBack) backBtn.addClass("is-disabled");
     backBtn.onclick = (e) => { e.preventDefault(); this.navigateBack(); };
     const fwdBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
-    setIcon(fwdBtn, "arrow-right");
+    setIconSafe(fwdBtn, "arrow-right", "›");
     const canGoFwd = this.navForwardSnapshots.length > 0;
     fwdBtn.title = canGoFwd ? "Forward" : "No forward history";
     if (!canGoFwd) fwdBtn.addClass("is-disabled");
@@ -2140,7 +2246,7 @@ export class StashpadView extends ItemView {
 
     const selectBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
     const inSelect = this.mobileSelectMode;
-    setIcon(selectBtn, inSelect ? "check-square" : "square");
+    setIconSafe(selectBtn, inSelect ? "check-square" : "square", inSelect ? "☑" : "☐");
     selectBtn.title = inSelect
       ? `${this.selection.size} selected — tap to exit (keeps the first selection)`
       : "Enter select mode (tap notes to add)";
@@ -2177,7 +2283,7 @@ export class StashpadView extends ItemView {
     };
 
     const moreBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
-    setIcon(moreBtn, "zap");
+    setIconSafe(moreBtn, "zap", "⚡");
     moreBtn.title = "Actions (move, delete, undo, …)";
     moreBtn.onclick = (e) => {
       e.preventDefault();
@@ -2936,7 +3042,7 @@ export class StashpadView extends ItemView {
     // both the view-header and the breadcrumb, so without these the
     // user is stuck unless they ⤢ out of tiny mode first.
     const backBtn = bar.createEl("button", { cls: "stashpad-tiny-nav-btn" });
-    setIcon(backBtn, "arrow-left");
+    setIconSafe(backBtn, "arrow-left", "‹");
     backBtn.title = "Back (up to parent)";
     const tinyCanBack = this.navBackStack.length > 0 || this.focusId !== ROOT_ID;
     if (!tinyCanBack) backBtn.addClass("is-disabled");
@@ -2945,7 +3051,7 @@ export class StashpadView extends ItemView {
       : (this.focusId !== ROOT_ID ? "Back (up to parent)" : "No back history");
     backBtn.onclick = () => this.navigateBack();
     const fwdBtn = bar.createEl("button", { cls: "stashpad-tiny-nav-btn" });
-    setIcon(fwdBtn, "arrow-right");
+    setIconSafe(fwdBtn, "arrow-right", "›");
     fwdBtn.title = this.navForwardSnapshots.length > 0 ? "Forward" : "No forward history";
     if (this.navForwardSnapshots.length === 0) fwdBtn.addClass("is-disabled");
     fwdBtn.onclick = () => this.navigateForward();
@@ -2979,6 +3085,17 @@ export class StashpadView extends ItemView {
       this.applyTinyAlwaysOnTop();
     };
 
+    // 0.77.0-feat: window-transparency button. Desktop popouts only
+    // (Electron setOpacity) — hidden on mobile, where there's no
+    // window to make transparent. Click toggles a small slider popover.
+    if (!Platform.isMobile) {
+      const opacityBtn = bar.createEl("button", { cls: "stashpad-tiny-nav-btn stashpad-tiny-opacity-btn" });
+      setIcon(opacityBtn, "contrast");
+      opacityBtn.title = "Window transparency";
+      if (this.tinyOpacity < 1) opacityBtn.addClass("is-active");
+      opacityBtn.onclick = (e) => { e.stopPropagation(); this.toggleTinyOpacityPopover(opacityBtn); };
+    }
+
     // 0.61.8: ALWAYS render the compact-toggle button in the tiny
     // header. Carrying compactMode through to tiny was meant to surface
     // the exit, but if a user enters tiny WITHOUT being in compact
@@ -3003,6 +3120,59 @@ export class StashpadView extends ItemView {
     setIcon(expandBtn, "maximize-2");
     expandBtn.title = "Exit tiny mode";
     expandBtn.onclick = () => { void this.exitTinyMode(); };
+  }
+
+  /** 0.77.0-feat: handle to the open opacity popover so a second click
+   *  (or click-outside) closes it. */
+  private tinyOpacityPopover: HTMLElement | null = null;
+  private toggleTinyOpacityPopover(anchor: HTMLElement): void {
+    if (this.tinyOpacityPopover) {
+      this.tinyOpacityPopover.remove();
+      this.tinyOpacityPopover = null;
+      return;
+    }
+    const pop = document.createElement("div");
+    pop.className = "stashpad-tiny-opacity-popover";
+    pop.createSpan({ cls: "stashpad-tiny-opacity-label", text: "Transparency" });
+    const slider = pop.createEl("input", { type: "range" }) as HTMLInputElement;
+    slider.min = "30"; slider.max = "100"; slider.step = "1";
+    slider.value = String(Math.round(this.tinyOpacity * 100));
+    const pct = pop.createSpan({ cls: "stashpad-tiny-opacity-pct", text: `${slider.value}%` });
+    // Live-apply as the user drags — opacity is cheap to set.
+    slider.addEventListener("input", () => {
+      const v = Math.min(100, Math.max(30, parseInt(slider.value, 10) || 100));
+      this.tinyOpacity = v / 100;
+      pct.setText(`${v}%`);
+      this.applyTinyOpacity();
+      anchor.toggleClass("is-active", this.tinyOpacity < 1);
+    });
+    // Persist on release so the value survives reloads (view state).
+    slider.addEventListener("change", () => { this.app.workspace.requestSaveLayout(); });
+    // Position under the anchor button.
+    this.viewRoot.appendChild(pop);
+    const r = anchor.getBoundingClientRect();
+    const rootR = this.viewRoot.getBoundingClientRect();
+    pop.style.top = `${r.bottom - rootR.top + 4}px`;
+    pop.style.left = `${Math.max(4, Math.min(r.left - rootR.left, rootR.width - 180))}px`;
+    // Close on click-outside / Escape. Added next tick so the opening
+    // click doesn't immediately dismiss it.
+    const onDoc = (ev: Event) => {
+      if (pop.contains(ev.target as Node) || ev.target === anchor || anchor.contains(ev.target as Node)) return;
+      close();
+    };
+    const onKey = (ev: KeyboardEvent) => { if (ev.key === "Escape") close(); };
+    const close = () => {
+      pop.remove();
+      this.tinyOpacityPopover = null;
+      document.removeEventListener("mousedown", onDoc, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+    setTimeout(() => {
+      document.addEventListener("mousedown", onDoc, true);
+      document.addEventListener("keydown", onKey, true);
+    }, 0);
+    this.tinyOpacityPopover = pop;
+    slider.focus();
   }
 
   /** Resolve the Electron BrowserWindow that hosts THIS view's leaf —
@@ -3067,6 +3237,18 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** 0.77.0-feat: push this.tinyOpacity onto the host BrowserWindow.
+   *  Electron-only; silent no-op on mobile / sandboxed builds. Clamped
+   *  to [0.3, 1] so the window can't vanish entirely. */
+  private applyTinyOpacity(): void {
+    const win = this.getOwnElectronWindow();
+    if (!win) return;
+    const o = Math.min(1, Math.max(0.3, this.tinyOpacity));
+    try { win.setOpacity?.(o); } catch (e) {
+      console.debug("[Stashpad] setOpacity failed", e);
+    }
+  }
+
   /** Apply tiny-mode side-effects to the BrowserWindow that hosts this
    *  leaf: resize down + optionally pin always-on-top. Best-effort —
    *  bails silently if Electron's window APIs aren't reachable
@@ -3095,6 +3277,8 @@ export class StashpadView extends ItemView {
         try { win.setBounds?.({ x, y, width: targetW, height: targetH }); } catch {}
         try { win.setSize?.(targetW, targetH); } catch {}
         win.setAlwaysOnTop?.(!!this.tinyAlwaysOnTop);
+        // 0.77.0-feat: restore the saved opacity when entering tiny.
+        try { win.setOpacity?.(Math.min(1, Math.max(0.3, this.tinyOpacity))); } catch {}
       } else {
         win.setAlwaysOnTop?.(false);
       }
@@ -3109,6 +3293,10 @@ export class StashpadView extends ItemView {
   private async exitTinyMode(): Promise<void> {
     this.tinyMode = false;
     this.tinyAlwaysOnTop = false;
+    // 0.77.0-feat: restore full opacity on the way out so the
+    // expanded window isn't left see-through.
+    this.tinyOpacity = 1;
+    try { this.getOwnElectronWindow()?.setOpacity?.(1); } catch {}
     // 0.61.10: also clear compact when leaving tiny. The user expected
     // expand-out to restore the full chrome, not retain the compact
     // row-stripping. (They can still toggle compact back on via the
@@ -4019,8 +4207,9 @@ export class StashpadView extends ItemView {
     // events don't fire reliably inside Obsidian's webview, so this is a
     // more dependable proxy for "keyboard is showing right now."
     if (Platform.isMobile) {
-      ta.addEventListener("focus", () => document.body.classList.add("stashpad-keyboard-open"));
-      ta.addEventListener("blur", () => document.body.classList.remove("stashpad-keyboard-open"));
+      const keyboardTransition = () => { this.keyboardTransitionUntil = Date.now() + 600; };
+      ta.addEventListener("focus", () => { document.body.classList.add("stashpad-keyboard-open"); keyboardTransition(); });
+      ta.addEventListener("blur", () => { document.body.classList.remove("stashpad-keyboard-open"); keyboardTransition(); });
     }
     this.composerInputEl = ta;
     // Tear down any previous autocomplete (the textarea was just rebuilt
@@ -4872,6 +5061,13 @@ export class StashpadView extends ItemView {
   }
 
   openDestinationPicker(): void {
+    // 0.76.36: do NOT blur the composer here. On iOS, blur() dismisses the
+    // soft keyboard, and once dismissed a programmatic focus() on the
+    // picker input can't bring it back (iOS only re-summons the keyboard
+    // inside a live user gesture). Instead the picker focuses its own
+    // input synchronously inside the tap gesture (see note-picker onOpen),
+    // which lets iOS hop the keyboard straight from the composer textarea
+    // to the picker input without ever dismissing it.
     // 0.57.2: destination picker now spans all Stashpad folders + offers
     // each external Stashpad's root (Home) as its own pick. Picking a
     // cross-folder destination switches the view to that folder first
@@ -6666,22 +6862,29 @@ export class StashpadView extends ItemView {
     });
   }
 
-  /** 0.76.11: authoritative completed-state per path. Decouples
-   *  isCompleted from the live metadataCache, which can transiently
-   *  return stale frontmatter for sibling rows during the synthetic
-   *  create-render. Seeded lazily from the cache, kept fresh by the
-   *  metadataCache "changed" listener + our own toggles. */
+  /** 0.76.11 / 0.76.32: completed-state OVERRIDE per path. Holds only
+   *  values written authoritatively — our own toggles + the
+   *  metadataCache "changed" listener (which fires as files parse).
+   *  isCompleted prefers an override when present (keeps a row stable
+   *  during the synthetic create-render, when getFileCache can
+   *  transiently return stale frontmatter for siblings); otherwise it
+   *  reads the LIVE cache.
+   *
+   *  0.76.32 fix: we no longer lazily cache a live read into the map.
+   *  That poisoned hide-completed on mobile cold start — the first
+   *  render ran before frontmatter parsed, cached `false` for a
+   *  completed note, and the cached value stuck forever (so the note
+   *  was treated as incomplete). Reading live when there's no override
+   *  self-corrects on the parse-triggered re-render, and the "changed"
+   *  listener still fills the map for create-render stability. */
   private completedState = new Map<string, boolean>();
 
   private isCompleted(node: TreeNode): boolean {
     if (!node.file) return false;
-    const path = node.file.path;
-    const cached = this.completedState.get(path);
-    if (cached !== undefined) return cached;
+    const override = this.completedState.get(node.file.path);
+    if (override !== undefined) return override;
     const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
-    const v = !!fm?.completed;
-    this.completedState.set(path, v);
-    return v;
+    return !!fm?.completed;
   }
 
   /** 0.76.1: open the due-date picker for the action targets and write
@@ -7744,6 +7947,13 @@ export class StashpadView extends ItemView {
         });
         this.tree.rebuild(this.noteFolder);
         this.render();
+        // 0.76.21: keep focus in the list, not the composer. Splitting
+        // closes a modal which re-activates the leaf and (via
+        // focusComposer) used to pull focus into the composer even
+        // with autofocus-after-send OFF. Suppress that activation
+        // focus briefly and land on the list instead.
+        this.suppressComposerFocusUntil = Date.now() + 500;
+        this.viewRoot?.focus({ preventScroll: true } as any);
         this.plugin.notifications.show({
           message: `Split "${this.titleForNode(target)}" into two`,
           kind: "success",
@@ -8235,6 +8445,151 @@ export class StashpadView extends ItemView {
     return { link, path, name, id };
   }
 
+  // --- 0.77.8: Claim authorship (retroactive stamping) ---
+
+  /** Public entry points (called from main.ts command palette). */
+  claimSelectedAsAuthor(): void { void this.claimAuthorship({ scope: "selection", contributorMode: false }); }
+  claimFolderAsAuthor(): void { void this.claimAuthorship({ scope: "folder", contributorMode: false }); }
+  claimSelectedWithContributor(): void { void this.claimAuthorship({ scope: "selection", contributorMode: true }); }
+  claimFolderWithContributor(): void { void this.claimAuthorship({ scope: "folder", contributorMode: true }); }
+
+  /** All file-backed Stashpad notes (frontmatter `id`) under this view's
+   *  folder, excluding the _authors stubs. */
+  private fileBackedNotesInFolder(): TFile[] {
+    const folder = this.noteFolder.replace(/\/+$/, "");
+    return this.app.vault.getMarkdownFiles().filter((f) => {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (dir !== folder && !dir.startsWith(folder + "/")) return false;
+      if (f.path.includes("/_authors/")) return false;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
+      return typeof fm?.id === "string" && !!fm.id;
+    });
+  }
+
+  /** Apply a frontmatter mutation across many files, paced in batches so
+   *  a bulk claim/unclaim doesn't choke the filesystem. Marks each as a
+   *  self-write so the multiplayer external-modify detector doesn't park
+   *  the change. */
+  private async pacedFrontmatter(paths: string[], mutate: (m: any, path: string) => void): Promise<void> {
+    const BATCH = 25, DELAY = 30;
+    for (let i = 0; i < paths.length; i++) {
+      const f = this.app.vault.getAbstractFileByPath(paths[i]);
+      if (f instanceof TFile) {
+        this.recentSelfWrites.set(f.path, Date.now());
+        try { await this.app.fileManager.processFrontMatter(f, (m) => mutate(m, paths[i])); }
+        catch (e) { console.warn("[Stashpad] claim: frontmatter write failed", paths[i], e); }
+      }
+      if ((i + 1) % BATCH === 0) await new Promise((r) => setTimeout(r, DELAY));
+    }
+  }
+
+  /** Retroactively stamp the local user onto notes that predate authorship
+   *  setup. SAFETY MODEL:
+   *    - Never overwrites an existing `author` (only fills blank ones).
+   *    - contributorMode=false: only blank-author notes are claimed.
+   *    - contributorMode=true: blank → authored; already-authored-by-
+   *      someone-else → we're added to `contributors` (original author
+   *      untouched). Notes already authored/contributed by us are skipped.
+   *    - Folder scope shows a counted confirmation first.
+   *    - Undo stores ONLY the changed paths (not content snapshots), so
+   *      undoing a big claim is cheap; undo guards against clobbering a
+   *      real author that landed after the claim. */
+  private async claimAuthorship(opts: { scope: "selection" | "folder"; contributorMode: boolean }): Promise<void> {
+    const author = this.currentAuthorLink();
+    if (!author) { new Notice("Set your author name in Stashpad settings first."); return; }
+    const idTag = `-${author.id}`;
+
+    const files = opts.scope === "selection"
+      ? this.getActionTargets().map((n) => n.file).filter((f): f is TFile => !!f)
+      : this.fileBackedNotesInFolder();
+    if (files.length === 0) { new Notice(opts.scope === "selection" ? "No notes selected." : "No notes in this folder."); return; }
+
+    const toAuthor: string[] = [];
+    const toContributor: string[] = [];
+    for (const f of files) {
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
+      const a = typeof fm?.author === "string" ? fm.author : "";
+      if (!a.trim()) { toAuthor.push(f.path); continue; }
+      if (a.includes(idTag)) continue;                       // already ours
+      if (!opts.contributorMode) continue;                   // skip authored
+      const contributors: string[] = Array.isArray(fm?.contributors)
+        ? fm.contributors.filter((c: any) => typeof c === "string") : [];
+      if (!contributors.some((c) => c.includes(idTag))) toContributor.push(f.path);
+    }
+
+    const total = toAuthor.length + toContributor.length;
+    if (total === 0) { new Notice("Nothing to claim — those notes are already authored by you."); return; }
+
+    if (opts.scope === "folder") {
+      const parts = [`Stamp yourself as author on ${toAuthor.length} unauthored note(s)`];
+      if (toContributor.length) parts.push(`and as a contributor on ${toContributor.length} already-authored note(s)`);
+      const ok = await new Promise<boolean>((resolve) => {
+        new ConfirmModal(this.app, "Claim authorship",
+          `${parts.join(" ")}?\nExisting authors are never overwritten. This can be undone.`,
+          "Claim", resolve).open();
+      });
+      if (!ok) return;
+    }
+
+    const folder = this.noteFolder;
+    const authorLink = author.link;
+    // 0.77.9: when we author-claim a note where we were ALSO a contributor,
+    // drop the (now-redundant) contributor entry — author supersedes. Track
+    // those paths so undo can faithfully restore the contributor entry.
+    const demotedFromContributor = new Set<string>();
+
+    // Forward apply, reused by redo.
+    const applyClaim = async () => {
+      await this.pacedFrontmatter(toAuthor, (m, path) => {
+        if (!(typeof m.author === "string" && m.author.trim())) m.author = authorLink;
+        if (Array.isArray(m.contributors) && m.contributors.some((c: any) => typeof c === "string" && c.includes(idTag))) {
+          m.contributors = m.contributors.filter((c: any) => !(typeof c === "string" && c.includes(idTag)));
+          demotedFromContributor.add(path);
+        }
+      });
+      await this.pacedFrontmatter(toContributor, (m) => {
+        const contributors: string[] = Array.isArray(m.contributors)
+          ? m.contributors.filter((c: any) => typeof c === "string") : [];
+        if (!contributors.some((c) => c.includes(idTag))) contributors.push(authorLink);
+        m.contributors = contributors;
+      });
+    };
+
+    void this.ensureAuthorFile(author);
+    await applyClaim();
+
+    this.plugin.getUndoStack(folder).push({
+      label: `Claim authorship (${total} note${total === 1 ? "" : "s"})`,
+      undo: async () => {
+        // Only strip what we added, and only if it's still ours (a real
+        // author/contributor that landed afterwards is left intact).
+        await this.pacedFrontmatter(toAuthor, (m, path) => {
+          if (typeof m.author === "string" && m.author.includes(idTag)) delete m.author;
+          // Restore a contributor entry we demoted during the claim.
+          if (demotedFromContributor.has(path)) {
+            const contributors: string[] = Array.isArray(m.contributors)
+              ? m.contributors.filter((c: any) => typeof c === "string") : [];
+            if (!contributors.some((c) => c.includes(idTag))) contributors.push(authorLink);
+            m.contributors = contributors;
+          }
+        });
+        await this.pacedFrontmatter(toContributor, (m) => {
+          if (Array.isArray(m.contributors)) {
+            m.contributors = m.contributors.filter((c: any) => !(typeof c === "string" && c.includes(idTag)));
+          }
+        });
+        this.debouncedRender();
+      },
+      redo: async () => { demotedFromContributor.clear(); await applyClaim(); this.debouncedRender(); },
+    });
+
+    const bits: string[] = [];
+    if (toAuthor.length) bits.push(`authored ${toAuthor.length}`);
+    if (toContributor.length) bits.push(`contributing to ${toContributor.length}`);
+    new Notice(`Claimed authorship: ${bits.join(", ")}. Undo available.`);
+    this.debouncedRender();
+  }
+
   /** Lazily create the author stub file under <stashpad>/_authors/.
    *  Idempotent: skips if the file already exists. The stub carries a
    *  small frontmatter with id + display name + created stamp, plus a
@@ -8243,18 +8598,22 @@ export class StashpadView extends ItemView {
    *  block note creation) but logged for diagnosis. */
   private async ensureAuthorFile(info: { path: string; name: string; id: string }): Promise<void> {
     try {
+      // 0.77.1: register the author in the rebuildable registry (recovery
+      // cache + rename history). Cheap upsert; no-op if unchanged.
+      if (info.id) this.plugin.authorRegistry.record({ id: info.id, name: info.name });
       const folder = `${this.noteFolder}/_authors`;
       await this.ensureFolder(folder);
       if (await this.app.vault.adapter.exists(info.path)) return;
-      const created = new Date().toISOString();
-      const content = [
-        "---",
-        `authorId: ${info.id}`,
-        `name: "${info.name.replace(/"/g, '\\"')}"`,
-        `created: ${created}`,
-        "---",
-        `# ${info.name}`,
-      ].join("\n");
+      // 0.77.4: stub uses the Obsidian-native `aliases` for the display
+      // name (so [[Name]] resolves + quick-switcher finds it). Role/dept
+      // come from the local user's settings when this stub is theirs.
+      const isSelf = info.id === (this.plugin.settings.authorId ?? "").trim();
+      const content = this.plugin.buildAuthorStub({
+        id: info.id,
+        name: info.name,
+        role: isSelf ? this.plugin.settings.authorRole : undefined,
+        department: isSelf ? this.plugin.settings.authorDepartment : undefined,
+      }, new Date().toISOString());
       await this.app.vault.create(info.path, content);
     } catch (e) {
       console.warn("[Stashpad] ensureAuthorFile failed", e);
@@ -8616,6 +8975,28 @@ export class StashpadView extends ItemView {
     if (!list) return;
     this.stickToListBottom = true;
     list.scrollTop = list.scrollHeight;
+
+    // 0.76.37: on mobile, skip the continuous re-pin entirely. The soft
+    // keyboard animating in/out, visualViewport resizes, and late
+    // markdown/attachment layout all change scrollHeight repeatedly after
+    // a composer submit — and the desktop watchdog below would yank the
+    // list to the bottom on every one of those, producing a visible
+    // up/down bounce. Instead do a few discrete, transition-aware
+    // settle scrolls and then leave the list alone.
+    if (Platform.isMobile) {
+      let tries = 0;
+      const settle = (): void => {
+        if (!this.stickToListBottom || tries >= 8) return;
+        tries++;
+        // Don't fight the keyboard while it's animating — just wait it out.
+        if (Date.now() >= this.keyboardTransitionUntil) {
+          list.scrollTop = list.scrollHeight;
+        }
+        window.setTimeout(settle, 120);
+      };
+      window.setTimeout(settle, 60);
+      return;
+    }
 
     // Per-row ResizeObserver: re-pin to bottom whenever any row's height
     // changes. Catches direct size changes (block re-layout, expand

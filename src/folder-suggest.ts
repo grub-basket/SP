@@ -18,14 +18,19 @@ export class FolderSuggest extends AbstractInputSuggest<TFolder> {
   }
 
   protected getSuggestions(query: string): TFolder[] {
-    const q = query.toLowerCase();
+    // 0.76.26: Sift — all-tokens, any-order match (see docs/sift.md)
+    // so "proj notes" finds "Notes/Projects" etc., not just literal
+    // substrings.
+    const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+    const sift = (path: string): boolean =>
+      tokens.every((t) => path.toLowerCase().includes(t));
     const out: TFolder[] = [];
     const walk = (folder: TFolder): void => {
       // Skip the vault root from the suggestion list — its path is "/"
       // and selecting it sets the input to "/" which most callers
       // normalize away anyway. Children are still suggested.
       if (folder.path !== "/") {
-        if (!q || folder.path.toLowerCase().includes(q)) out.push(folder);
+        if (sift(folder.path)) out.push(folder);
       }
       for (const child of folder.children) {
         if (child instanceof TFolder) walk(child);

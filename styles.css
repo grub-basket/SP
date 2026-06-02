@@ -1748,6 +1748,36 @@
   margin-right: 6px;
   align-items: center;
 }
+/* 0.77.5: known-authors registry list in settings. */
+.stashpad-known-authors-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 4px;
+}
+.stashpad-known-author-row {
+  padding: 6px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+}
+.stashpad-known-author-name { font-weight: 600; }
+.stashpad-known-author-meta { color: var(--text-muted); font-size: 0.85em; }
+.stashpad-known-author-history {
+  margin-top: 3px;
+  color: var(--text-faint);
+  font-size: 0.8em;
+}
+/* 0.76.33: glyph shown when an icon name isn't in the device's
+   bundled Lucide set (older iPad/iOS app) so the button isn't blank.
+   Sized to read like the icon it replaces. */
+.stashpad-icon-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+}
 .stashpad-mobile-action-btn {
   width: 32px;
   height: 28px;
@@ -2139,19 +2169,31 @@
   margin-top: 12px;
 }
 
-/* 0.76.18: compact confirm dialogs (delete, generic confirm, due
-   picker) size to their content instead of Obsidian's default tall
-   box — the leftover empty space looked oversized, especially on
-   mobile where modals lean large. */
+/* 0.76.28: compact confirm dialogs (delete, generic confirm, due
+   picker) size to their content. 0.76.18's `width: auto` shrank the
+   box to content width (cut the text off on mobile); now we use a
+   definite, readable width (capped on desktop, near-full on mobile)
+   and force the height to hug content with !important so Obsidian's
+   mobile modal min-height can't re-inflate it. */
 .modal.stashpad-compact-modal {
-  height: auto;
-  min-height: 0;
-  width: auto;
-  max-width: min(440px, 92vw);
+  width: min(440px, 94vw) !important;
+  max-width: 94vw !important;
+  height: auto !important;
+  min-height: unset !important;
+  max-height: 85vh;
+  /* 0.76.29: don't clip the content — the bottom button row was
+     getting shaved by the modal's rounded-corner overflow when the
+     box hugged content exactly. */
+  overflow: visible !important;
 }
 .modal.stashpad-compact-modal .modal-content {
-  max-height: 70vh;
+  height: auto;
+  min-height: 0;
+  max-height: 80vh;
   overflow-y: auto;
+  /* Clearance so the Cancel/Delete/Set row clears the modal's
+     bottom edge. */
+  padding-bottom: 16px;
 }
 
 /* 0.76.1 / 0.76.5: due-date picker modal. Native date/time inputs
@@ -2166,14 +2208,23 @@
   gap: 8px;
   max-width: 260px;
 }
+/* 0.76.22: give the picker icons a button-like background so they
+   read as clickable (they open the OS date/time picker). */
 .stashpad-due-field-icon {
   display: inline-flex;
   align-items: center;
-  color: var(--text-muted);
+  justify-content: center;
+  width: 30px;
+  height: 30px;
   flex: 0 0 auto;
+  color: var(--text-muted);
   cursor: pointer;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal);
 }
-.stashpad-due-field-icon:hover { color: var(--text-normal); }
+.stashpad-due-field-icon:hover { color: var(--text-normal); background: var(--interactive-hover); }
+.stashpad-due-field-icon:active { background: var(--background-modifier-active-hover); }
 .stashpad-due-field-icon svg { width: 16px; height: 16px; }
 /* 0.76.8: hide the native right-side picker indicator — our left
    icon is the picker button now (calls showPicker). */
@@ -2193,13 +2244,17 @@
   /* 0.76.17: uppercase any letters (month abbreviation / AM·PM). */
   text-transform: uppercase;
 }
-/* 0.76.17: kill the leading gap webkit reserves inside the value
-   editor (looked like stray space before the date now that the
-   picker indicator is hidden). */
+/* 0.76.17 / 0.76.22: kill the leading gap webkit reserves inside the
+   value editor so the date sits flush-left in its box (no stray
+   space where the picker indicator used to be). */
 .stashpad-due-date::-webkit-datetime-edit,
-.stashpad-due-time::-webkit-datetime-edit { padding: 0; }
+.stashpad-due-time::-webkit-datetime-edit { padding: 0; margin: 0; }
 .stashpad-due-date::-webkit-datetime-edit-fields-wrapper,
-.stashpad-due-time::-webkit-datetime-edit-fields-wrapper { padding: 0; }
+.stashpad-due-time::-webkit-datetime-edit-fields-wrapper { padding: 0; margin: 0; }
+.stashpad-due-date::-webkit-datetime-edit-text:first-child,
+.stashpad-due-date::-webkit-datetime-edit-month-field:first-child,
+.stashpad-due-date::-webkit-datetime-edit-year-field:first-child,
+.stashpad-due-date::-webkit-datetime-edit-day-field:first-child { padding-left: 0; margin-left: 0; }
 .stashpad-due-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -2383,6 +2438,33 @@
   padding: 4px 6px;
   border-bottom: 1px solid var(--background-modifier-border);
   font-size: 0.85em;
+}
+/* 0.77.0-feat: tiny-window transparency button + slider popover. */
+.stashpad-tiny-opacity-btn.is-active { color: var(--text-accent); }
+.stashpad-tiny-opacity-popover {
+  position: absolute;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 170px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+.stashpad-tiny-opacity-label {
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.stashpad-tiny-opacity-popover input[type="range"] { width: 100%; }
+.stashpad-tiny-opacity-pct {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .stashpad-tiny-title {
   flex: 1 1 auto;

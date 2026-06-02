@@ -188,6 +188,15 @@ export class TreeIndex {
       .filter((n): n is TreeNode => !!n);
   }
 
+  /** 0.76.30: number of nodes backed by an actual file. Compared
+   *  against the on-disk Stashpad-note count to detect a tree that
+   *  drifted out of sync (mobile cold start / post-sync burst). */
+  fileBackedCount(): number {
+    let n = 0;
+    for (const node of this.nodes.values()) if (node.file) n++;
+    return n;
+  }
+
   pathTo(id: StashpadId): TreeNode[] {
     const out: TreeNode[] = [];
     let cur = this.nodes.get(id);

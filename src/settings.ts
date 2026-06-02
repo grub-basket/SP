@@ -536,16 +536,24 @@ export class StashpadSettingTab extends PluginSettingTab {
 
   /** Hide every .setting-item whose name + desc doesn't match the
    *  current query, then collapse any group whose body has no
-   *  visible matches. Called after rendering in search mode. */
+   *  visible matches. Called after rendering in search mode.
+   *
+   *  0.76.24: all-tokens, order-agnostic matching (same approach as
+   *  the composer's link/tag autocomplete) instead of a single
+   *  substring. The query is split on whitespace; EVERY token must
+   *  appear somewhere in the item's name+desc, in any order — so
+   *  "folder import" matches "Stash import subfolder" and "date tz"
+   *  matches "Display timezone" via the date-format neighbours, etc. */
   private applySearchFilter(body: HTMLElement): void {
     const q = this.searchQuery.trim().toLowerCase();
     if (!q) return;
+    const tokens = q.split(/\s+/).filter(Boolean);
+    const matchesAll = (haystack: string): boolean => tokens.every((t) => haystack.includes(t));
     const items = body.querySelectorAll<HTMLElement>(".setting-item");
     items.forEach((el) => {
       const name = el.querySelector(".setting-item-name")?.textContent?.toLowerCase() ?? "";
       const desc = el.querySelector(".setting-item-description")?.textContent?.toLowerCase() ?? "";
-      const match = name.includes(q) || desc.includes(q);
-      el.style.display = match ? "" : "none";
+      el.style.display = matchesAll(`${name} ${desc}`) ? "" : "none";
     });
     body.querySelectorAll<HTMLElement>(".stashpad-settings-search-group").forEach((g) => {
       const any = Array.from(g.querySelectorAll<HTMLElement>(".setting-item"))
@@ -706,12 +714,13 @@ export class StashpadSettingTab extends PluginSettingTab {
         b.setButtonText("Rebootstrap now").onClick(async () => {
           b.setDisabled(true).setButtonText("Working…");
           try {
-            const { touched, fmChecked, fmWritten, slugsRenamed } = await this.plugin.rebootstrapAllFolders();
+            const { touched, fmChecked, fmWritten, slugsRenamed, authors } = await this.plugin.rebootstrapAllFolders();
             const parts: string[] = [];
             parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
             if (fmWritten > 0) parts.push(`updated frontmatter on ${fmWritten} of ${fmChecked} notes`);
             else if (fmChecked > 0) parts.push(`frontmatter already in sync (${fmChecked} notes checked)`);
             if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"} to match body`);
+            if (authors > 0) parts.push(`rebuilt author registry (${authors} author${authors === 1 ? "" : "s"})`);
             new Notice(`Stashpad: ${parts.join("; ")}.`);
           } catch (e) {
             new Notice(`Stashpad: rebootstrap failed (${(e as Error).message})`);
@@ -1341,6 +1350,64 @@ export class StashpadSettingTab extends PluginSettingTab {
         row.createSpan({ cls: "stashpad-authored-folder-counts", text: ` · ${counts.join(", ")}` });
       }
     }
+
+    this.renderKnownAuthorsSection(parent);
+  }
+
+  /** 0.77.5: surface the author registry — a rebuildable cache + rename
+   *  history of every author the plugin has seen. Lists known authors
+   *  with role/department + rename history, plus rebuild/restore actions.
+   *  The registry is NOT authoritative (the id baked into note frontmatter
+   *  is); this is recovery + an audit trail. */
+  private renderKnownAuthorsSection(parent: HTMLElement): void {
+    parent.createEl("h4", { text: "Known authors (registry)" });
+    parent.createEl("div", {
+      cls: "setting-item-description",
+      text: "A rebuildable cache of every author Stashpad has seen, with rename history. Not a source of truth — the author id stored in each note is authoritative. Use it to recover deleted author pages or audit name changes.",
+    });
+
+    new Setting(parent)
+      .setName("Registry maintenance")
+      .setDesc("Rebuild scans the whole vault to reconstruct the list. Restore regenerates any deleted author pages across every Stashpad folder.")
+      .addButton((b) => b.setButtonText("Rebuild").onClick(async () => {
+        b.setDisabled(true).setButtonText("Rebuilding…");
+        try {
+          const r = await this.plugin.rebuildAuthorRegistry();
+          new Notice(`Author registry rebuilt: ${r.total} author(s).`);
+        } catch (e) { new Notice(`Rebuild failed: ${(e as Error).message}`); }
+        b.setDisabled(false).setButtonText("Rebuild");
+        this.display();
+      }))
+      .addButton((b) => b.setButtonText("Restore missing pages").onClick(async () => {
+        b.setDisabled(true).setButtonText("Restoring…");
+        try {
+          const r = await this.plugin.restoreMissingAuthorStubs();
+          new Notice(r.created > 0 ? `Restored ${r.created} author page(s).` : "No missing author pages.");
+        } catch (e) { new Notice(`Restore failed: ${(e as Error).message}`); }
+        b.setDisabled(false).setButtonText("Restore missing pages");
+      }));
+
+    const authors = this.plugin.authorRegistry.all();
+    if (authors.length === 0) {
+      parent.createEl("div", { cls: "setting-item-description", text: "No authors recorded yet. Rebuild to scan the vault." });
+      return;
+    }
+    const list = parent.createDiv({ cls: "stashpad-known-authors-list" });
+    for (const a of authors) {
+      const row = list.createDiv({ cls: "stashpad-known-author-row" });
+      const main = row.createDiv({ cls: "stashpad-known-author-main" });
+      main.createSpan({ cls: "stashpad-known-author-name", text: a.name || "(unnamed)" });
+      const meta: string[] = [];
+      if (a.role) meta.push(a.role);
+      if (a.department) meta.push(a.department);
+      meta.push(`id ${a.id}`);
+      main.createSpan({ cls: "stashpad-known-author-meta", text: ` · ${meta.join(" · ")}` });
+      if (a.renames && a.renames.length > 0) {
+        const hist = row.createDiv({ cls: "stashpad-known-author-history" });
+        const trail = a.renames.map((r) => `${r.from} → ${r.to}`).join(", ");
+        hist.setText(`Renamed: ${trail}`);
+      }
+    }
   }
 
   private renderNoteTemplatesSection(parent: HTMLElement): void {
@@ -1391,9 +1458,14 @@ export class StashpadSettingTab extends PluginSettingTab {
 
       const renderSuggestions = (): void => {
         sugg.empty();
-        const q = input.value.trim().toLowerCase();
+        // 0.76.26: Sift — all-tokens, any-order match (see docs/sift.md).
+        const tokens = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+        const sift = (p: string): boolean => {
+          const h = p.toLowerCase();
+          return tokens.every((t) => h.includes(t));
+        };
         const matches = allMd()
-          .filter((p) => !q || p.toLowerCase().includes(q))
+          .filter((p) => sift(p))
           .slice(0, 12);
         if (matches.length === 0) { sugg.style.display = "none"; return; }
         sugg.style.display = "";

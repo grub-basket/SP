@@ -15,6 +15,7 @@ import { ROOT_ID } from "./types";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { NotificationService, buildFileActions } from "./notifications";
+import { AuthorRegistry } from "./author-registry";
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
@@ -46,6 +47,17 @@ export default class StashpadPlugin extends Plugin {
   get notifications(): NotificationService {
     if (!this._notifications) this._notifications = new NotificationService(this.app);
     return this._notifications;
+  }
+  /** 0.77.1: rebuildable author registry (authors.json in the plugin
+   *  private dir). NOT a source of truth — a recovery cache + rename
+   *  history. See author-registry.ts. Lazily constructed; load() is
+   *  awaited once during onload. */
+  private _authorRegistry: AuthorRegistry | null = null;
+  get authorRegistry(): AuthorRegistry {
+    if (!this._authorRegistry) {
+      this._authorRegistry = new AuthorRegistry(this.app, this.pluginPrivatePath());
+    }
+    return this._authorRegistry;
   }
 
   /** Vault-relative path to a file/dir inside the plugin's private
@@ -199,6 +211,9 @@ export default class StashpadPlugin extends Plugin {
       "Home",
     ].join("\n");
     await this.app.vault.create(homePath, body);
+    // 0.77.7: seed the local user's author page into the new folder so
+    // their links resolve everywhere from the start.
+    try { await this.seedLocalAuthorStub(cleaned); } catch {}
   }
 
   /** Tally per-note colors found in EVERY markdown file under `folder`.
@@ -444,6 +459,28 @@ export default class StashpadPlugin extends Plugin {
     this.settingTab = new StashpadSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
+    // 0.77.1: load the author registry and seed it with the local user.
+    await this.authorRegistry.load();
+    {
+      const id = (this.settings.authorId ?? "").trim();
+      if (id) {
+        this.authorRegistry.record({
+          id,
+          name: this.settings.authorName,
+          role: this.settings.authorRole,
+          department: this.settings.authorDepartment,
+        });
+      }
+    }
+    // 0.77.7: backfill the local user's author page into any existing
+    // Stashpad folder that lacks it. Deferred + after the metadata cache
+    // has settled so folder discovery + the "already has my stub" check
+    // are accurate (avoids creating a duplicate before the cache lists
+    // the existing one). New folders are seeded at creation time instead.
+    this.app.workspace.onLayoutReady(() => {
+      window.setTimeout(() => { void this.seedLocalAuthorStubsEverywhere(); }, 4000);
+    });
+
     this.registerView(
       STASHPAD_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadView(leaf, this),
@@ -663,6 +700,30 @@ export default class StashpadPlugin extends Plugin {
       name: "Toggle split-on-newlines",
       callback: () => call("toggleSplit"),
     });
+    // 0.77.8: claim authorship retroactively (for notes created before the
+    // user set their author name). Author-only variants only fill blank
+    // author fields; the "+ contributor" variants also add the user as a
+    // contributor to notes someone else already authored. All undoable.
+    this.addCommand({
+      id: "stashpad-claim-selected-author",
+      name: "Claim authorship of selected notes",
+      callback: () => call("claimSelectedAsAuthor"),
+    });
+    this.addCommand({
+      id: "stashpad-claim-folder-author",
+      name: "Claim authorship of all unauthored notes in this folder",
+      callback: () => call("claimFolderAsAuthor"),
+    });
+    this.addCommand({
+      id: "stashpad-claim-selected-contributor",
+      name: "Claim selected notes (author if unowned, else add me as contributor)",
+      callback: () => call("claimSelectedWithContributor"),
+    });
+    this.addCommand({
+      id: "stashpad-claim-folder-contributor",
+      name: "Claim all notes in this folder (author if unowned, else add me as contributor)",
+      callback: () => call("claimFolderWithContributor"),
+    });
     this.addCommand({
       id: "stashpad-pick-destination",
       name: "Pick destination for next note",
@@ -850,6 +911,45 @@ export default class StashpadPlugin extends Plugin {
       name: "Set missing parents to Home (orphan fix)",
       callback: () => void this.fixOrphanParents(),
     });
+    // 0.77.2: rebuild the author registry from a full vault scan.
+    this.addCommand({
+      id: "stashpad-rebuild-author-registry",
+      name: "Rebuild author registry (scan authors + note frontmatter)",
+      callback: async () => {
+        new Notice("Stashpad: rebuilding author registry…");
+        try {
+          const r = await this.rebuildAuthorRegistry();
+          this.notifications.show({
+            message: `Author registry rebuilt: ${r.total} author(s) — ${r.fromStubs} from stubs, ${r.fromNotes} from note links.`,
+            kind: "success",
+            category: "system",
+          });
+        } catch (e) {
+          new Notice(`Author registry rebuild failed: ${(e as Error).message}`);
+        }
+      },
+    });
+    // 0.77.3: regenerate any author stub files that were deleted, from
+    // the registry's remembered name/role/department.
+    this.addCommand({
+      id: "stashpad-restore-author-stubs",
+      name: "Restore missing author stubs (from registry)",
+      callback: async () => {
+        new Notice("Stashpad: restoring author stubs…");
+        try {
+          const r = await this.restoreMissingAuthorStubs();
+          this.notifications.show({
+            message: r.created > 0
+              ? `Restored ${r.created} author stub(s) across ${r.folders} folder(s).`
+              : `No missing author stubs — all present across ${r.folders} folder(s).`,
+            kind: "success",
+            category: "system",
+          });
+        } catch (e) {
+          new Notice(`Restore author stubs failed: ${(e as Error).message}`);
+        }
+      },
+    });
     // 0.58.0: rebootstrap as a command palette entry — mirrors the
     // "Rebootstrap now" button in settings. Useful when troubleshooting
     // / migrating without opening Settings.
@@ -859,11 +959,12 @@ export default class StashpadPlugin extends Plugin {
       callback: async () => {
         new Notice("Stashpad: rebootstrapping…");
         try {
-          const { touched, fmChecked, fmWritten, slugsRenamed } = await this.rebootstrapAllFolders();
+          const { touched, fmChecked, fmWritten, slugsRenamed, authors } = await this.rebootstrapAllFolders();
           const parts: string[] = [];
           parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
           if (fmWritten > 0) parts.push(`updated ${fmWritten} note${fmWritten === 1 ? "" : "s"}' metadata`);
           if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"}`);
+          if (authors > 0) parts.push(`${authors} author${authors === 1 ? "" : "s"} in registry`);
           parts.push(`(checked ${fmChecked} total)`);
           new Notice(`Stashpad: ${parts.join(" · ")}`);
         } catch (e) {
@@ -1156,6 +1257,75 @@ export default class StashpadPlugin extends Plugin {
       if (!(file instanceof TFile)) return;
       void this.maybeAdoptAuthorRename(file, oldPath);
     }));
+
+    // 0.76.31: detect when a newer plugin build has synced in but
+    // Obsidian is still running the old code (no hot-reload). Check
+    // shortly after load (let Sync settle) and whenever the app
+    // foregrounds. Nudges the user to reload so they're not stuck on
+    // stale code (the "old UI after opening the app" report).
+    this.registerDomEvent(window, "focus", () => void this.checkForSyncedBuild());
+    setTimeout(() => void this.checkForSyncedBuild(), 5000);
+  }
+
+  /** 0.76.31: compare the version Obsidian LOADED (this.manifest, read
+   *  from manifest.json at launch) against the manifest.json currently
+   *  on disk. If they differ, a different build has synced in since
+   *  launch and the user is running stale code — surface a persistent
+   *  notice with a Reload action (disable+enable re-reads main.js,
+   *  works on mobile too). Notifies once per detected on-disk version. */
+  private notifiedBuildVersion: string | null = null;
+  private async checkForSyncedBuild(): Promise<void> {
+    try {
+      const dir = (this.manifest as any).dir as string | undefined;
+      if (!dir) return;
+      const path = `${dir.replace(/\/+$/, "")}/manifest.json`;
+      const adapter = this.app.vault.adapter;
+      if (!(await adapter.exists(path))) return;
+      const onDisk = JSON.parse(await adapter.read(path))?.version as string | undefined;
+      const loaded = this.manifest.version;
+      if (typeof onDisk !== "string" || !onDisk || onDisk === loaded) return;
+      // 0.76.35: ONLY nudge when the on-disk build is strictly newer than
+      // what's running. If on-disk is OLDER (e.g. Obsidian Sync pushed a
+      // stale manifest.json back onto disk — a known Sync regression),
+      // reloading wouldn't help and the nudge would recur on every window
+      // focus forever. Silently ignore older/equal on-disk versions.
+      if (!this.isSemverGreater(onDisk, loaded)) return;
+      if (this.notifiedBuildVersion === onDisk) return;
+      this.notifiedBuildVersion = onDisk;
+      this.notifications.show({
+        message: `A newer Stashpad build synced in (\`${loaded}\` → \`${onDisk}\`). Reload to apply.`,
+        kind: "info",
+        category: "system",
+        duration: 0,
+        actions: [{
+          label: "Reload Stashpad",
+          onClick: async () => {
+            const plugins = (this.app as any).plugins;
+            try {
+              await plugins?.disablePlugin?.(this.manifest.id);
+              await plugins?.enablePlugin?.(this.manifest.id);
+            } catch (e) {
+              new Notice(`Couldn't reload — toggle Stashpad off/on in settings. (${(e as Error).message})`);
+            }
+          },
+        }],
+      });
+    } catch (e) {
+      console.debug("[Stashpad] synced-build check failed", e);
+    }
+  }
+
+  /** Tiny semver-ish compare: is `a` greater than `b`? Pads to equal
+   *  length, numeric per segment. Non-numeric segments compare as 0. */
+  private isSemverGreater(a: string, b: string): boolean {
+    const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+    const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+    const len = Math.max(pa.length, pb.length);
+    for (let i = 0; i < len; i++) {
+      const x = pa[i] ?? 0, y = pb[i] ?? 0;
+      if (x !== y) return x > y;
+    }
+    return false;
   }
 
   /** Author files live at "<stashpadFolder>/_authors/<safe-name>-<id>.md".
@@ -1212,8 +1382,10 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  /** Rewrite an author stub file's H1 heading + name/role/department
-   *  frontmatter to match the current settings. Idempotent. */
+  /** Rewrite an author stub file's H1 heading + aliases/role/department
+   *  frontmatter to match the current settings. Idempotent. 0.77.4: the
+   *  display name now lives in the Obsidian-native `aliases` array; the
+   *  legacy custom `name` key is migrated away (deleted) here. */
   private async refreshAuthorStub(file: TFile): Promise<void> {
     const name = (this.settings.authorName ?? "").trim();
     const role = (this.settings.authorRole ?? "").trim();
@@ -1224,7 +1396,13 @@ export default class StashpadPlugin extends Plugin {
       const replaced = raw.replace(/^# .*$/m, `# ${name}`);
       if (replaced !== raw) await this.app.vault.modify(file, replaced);
       await this.app.fileManager.processFrontMatter(file, (m: any) => {
-        m.name = name;
+        // Stashpad owns these stubs, so the alias list is authoritative:
+        // set it to exactly the current display name. This avoids
+        // accumulating stale names across renames (an old name would
+        // otherwise linger as an "extra" alias). Migrate off the legacy
+        // custom `name` key.
+        m.aliases = [name];
+        delete m.name;
         if (role) m.role = role; else delete m.role;
         if (dept) m.department = dept; else delete m.department;
       });
@@ -1464,7 +1642,7 @@ export default class StashpadPlugin extends Plugin {
    *  ensure it has the import/export subfolders, and run the redundant-frontmatter
    *  backfill (parentLink + children) so older notes pick up the recovery fields.
    *  Used by the "Rebootstrap" button in settings to retrofit older folders. */
-  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number }> {
+  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number }> {
     const ROOT_ID = "__root__";
     const seen = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -1510,7 +1688,16 @@ export default class StashpadPlugin extends Plugin {
         console.warn(`Stashpad: rebootstrap skipped ${folder}`, e);
       }
     }
-    return { touched, fmChecked, fmWritten, slugsRenamed };
+    // 0.77.6: rebootstrap is the catch-all full-vault repair, so refresh
+    // the author registry cache from the same scan. This is read-only
+    // w.r.t. the user's notes (it only rewrites the plugin-private
+    // authors.json). NOTE: we deliberately do NOT restore deleted author
+    // STUB files here — that creates files and a user may have deleted a
+    // page on purpose; stub restoration stays an explicit action.
+    let authors = 0;
+    try { authors = (await this.rebuildAuthorRegistry()).total; }
+    catch (e) { console.warn("Stashpad: rebootstrap author-registry rebuild failed", e); }
+    return { touched, fmChecked, fmWritten, slugsRenamed, authors };
   }
 
   /** Walk every Stashpad note in `folder`. For each one whose filename
@@ -2020,6 +2207,190 @@ export default class StashpadPlugin extends Plugin {
       .sort((a, b) => (b.authored + b.contributed) - (a.authored + a.contributed));
   }
 
+  /** Pull the display-name + id out of an author wikilink as written into
+   *  note frontmatter, e.g. `[[demo/_authors/Jane-743jcy.md|Jane Doe]]`
+   *  → { id: "743jcy", name: "Jane Doe" }. The alias (after `|`) is the
+   *  display name; if absent we fall back to de-slugging the filename
+   *  stem. Returns null when no id is present. */
+  private parseAuthorRef(raw: string): { id: string; name: string } | null {
+    if (typeof raw !== "string") return null;
+    const inner = raw.replace(/^\[\[/, "").replace(/\]\]$/, "");
+    const [target, alias] = inner.split("|");
+    const m = target.match(/_authors\/(.+?)-([a-z0-9]{4,12})(?:\.md)?$/i);
+    if (!m) return null;
+    const id = m[2];
+    const name = (alias ?? "").trim() || m[1].replace(/-/g, " ").trim();
+    return { id, name };
+  }
+
+  /** 0.77.2: rebuild the author registry from scratch by scanning the
+   *  vault. The authoritative inputs are (a) the `_authors` stub files
+   *  (id from filename, display name from `aliases`/`name`/H1, plus role/
+   *  department frontmatter) and (b) author/contributor wikilinks across
+   *  all note frontmatter (for ids whose stub was deleted). Stub metadata
+   *  wins over note-link names when both exist. Preserves firstSeen +
+   *  rename history for ids already in the registry. Returns a summary. */
+  async rebuildAuthorRegistry(): Promise<{ total: number; fromStubs: number; fromNotes: number }> {
+    const stashpads = this.discoverStashpadFolders();
+    const byId = new Map<string, { id: string; name?: string; role?: string; department?: string; fromStub: boolean }>();
+
+    // Pass 1: author wikilinks across all note frontmatter.
+    let fromNotes = 0;
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as any;
+      if (!fm) continue;
+      const refs: string[] = [];
+      if (typeof fm.author === "string") refs.push(fm.author);
+      if (Array.isArray(fm.contributors)) {
+        for (const c of fm.contributors) if (typeof c === "string") refs.push(c);
+      }
+      for (const raw of refs) {
+        const parsed = this.parseAuthorRef(raw);
+        if (!parsed) continue;
+        if (!byId.has(parsed.id)) { byId.set(parsed.id, { id: parsed.id, name: parsed.name, fromStub: false }); fromNotes++; }
+        else { const e = byId.get(parsed.id)!; if (!e.name && parsed.name) e.name = parsed.name; }
+      }
+    }
+
+    // Pass 2: stub files (authoritative for name/role/department).
+    let fromStubs = 0;
+    for (const folder of stashpads) {
+      const dir = `${folder}/_authors`;
+      for (const file of this.app.vault.getMarkdownFiles()) {
+        if (!file.path.startsWith(dir + "/")) continue;
+        const parsed = this.parseAuthorFilePath(file.path);
+        if (!parsed) continue;
+        const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as any;
+        const aliasName = Array.isArray(fm?.aliases) ? (fm.aliases.find((a: any) => typeof a === "string") ?? "")
+          : (typeof fm?.aliases === "string" ? fm.aliases : "");
+        const name = (aliasName || (typeof fm?.name === "string" ? fm.name : "") || parsed.name).trim();
+        const role = typeof fm?.role === "string" ? fm.role : undefined;
+        const department = typeof fm?.department === "string" ? fm.department : undefined;
+        const existing = byId.get(parsed.id);
+        if (!existing) fromStubs++;
+        byId.set(parsed.id, {
+          id: parsed.id,
+          name: name || existing?.name,
+          role: role ?? existing?.role,
+          department: department ?? existing?.department,
+          fromStub: true,
+        });
+      }
+    }
+
+    await this.authorRegistry.load();
+    this.authorRegistry.replaceAll([...byId.values()]);
+    await this.authorRegistry.save();
+    return { total: byId.size, fromStubs, fromNotes };
+  }
+
+  /** Build the markdown content for an author stub file. Uses the
+   *  Obsidian-native `aliases` for the display name (so `[[Name]]`
+   *  resolves to the stub and it surfaces in quick switcher) plus role/
+   *  department + a created stamp + an H1. Stashpad-owned; safe to
+   *  regenerate. */
+  buildAuthorStub(rec: { id: string; name: string; role?: string; department?: string }, created: string): string {
+    const esc = (s: string) => s.replace(/"/g, '\\"');
+    const lines = ["---", `authorId: ${rec.id}`, `aliases:`, `  - "${esc(rec.name)}"`];
+    if (rec.role) lines.push(`role: "${esc(rec.role)}"`);
+    if (rec.department) lines.push(`department: "${esc(rec.department)}"`);
+    lines.push(`created: ${created}`, "---", `# ${rec.name}`);
+    return lines.join("\n");
+  }
+
+  /** 0.77.3: for every author the registry knows about, ensure a stub
+   *  file exists in every discovered Stashpad folder — regenerating any
+   *  that were deleted, from the remembered name/role/department. Never
+   *  overwrites an existing stub (that's syncAuthorFilesToName's job).
+   *  Returns the count of stubs created. */
+  async restoreMissingAuthorStubs(): Promise<{ created: number; folders: number }> {
+    await this.authorRegistry.load();
+    const authors = this.authorRegistry.all().filter((a) => a.id && a.name);
+    const folders = this.discoverStashpadFolders();
+    let created = 0;
+    for (const folder of folders) {
+      const dir = `${folder}/_authors`;
+      for (const rec of authors) {
+        const safe = this.authorNameToSafe(rec.name);
+        const path = `${dir}/${safe}-${rec.id}.md`;
+        // Skip if a stub for this id already exists anywhere in this dir
+        // (under any name) — don't duplicate after a rename.
+        const exists = this.app.vault.getMarkdownFiles().some(
+          (f) => f.path.startsWith(dir + "/") && this.parseAuthorFilePath(f.path)?.id === rec.id,
+        );
+        if (exists) continue;
+        try {
+          await this.ensureFolderPath(dir);
+          if (await this.app.vault.adapter.exists(path)) continue;
+          await this.app.vault.create(path, this.buildAuthorStub(rec, rec.firstSeen ?? new Date().toISOString()));
+          created++;
+        } catch (e) {
+          console.warn("[Stashpad] restore author stub failed", path, e);
+        }
+      }
+    }
+    return { created, folders: folders.length };
+  }
+
+  /** 0.77.7: ensure the LOCAL user's author page exists in `folder`,
+   *  creating it from settings if missing. Targeted counterpart to
+   *  restoreMissingAuthorStubs — seeds only YOUR page (not every known
+   *  author), so links/quick-switcher resolve in every folder without the
+   *  N×M clutter of propagating coworker pages into folders they've never
+   *  touched. No-op if your name isn't set or a stub for your id already
+   *  exists in that folder (under any name). */
+  async seedLocalAuthorStub(folder: string): Promise<boolean> {
+    const id = (this.settings.authorId ?? "").trim();
+    const name = (this.settings.authorName ?? "").trim();
+    if (!id || !name) return false;
+    const dir = `${folder.replace(/\/+$/, "")}/_authors`;
+    const exists = this.app.vault.getMarkdownFiles().some(
+      (f) => f.path.startsWith(dir + "/") && this.parseAuthorFilePath(f.path)?.id === id,
+    );
+    if (exists) return false;
+    const safe = this.authorNameToSafe(name);
+    const path = `${dir}/${safe}-${id}.md`;
+    try {
+      await this.ensureFolderPath(dir);
+      if (await this.app.vault.adapter.exists(path)) return false;
+      await this.app.vault.create(path, this.buildAuthorStub(
+        { id, name, role: this.settings.authorRole, department: this.settings.authorDepartment },
+        new Date().toISOString(),
+      ));
+      this.authorRegistry.record({ id, name, role: this.settings.authorRole, department: this.settings.authorDepartment });
+      return true;
+    } catch (e) {
+      console.warn("[Stashpad] seedLocalAuthorStub failed", path, e);
+      return false;
+    }
+  }
+
+  /** Seed the local user's author page into every discovered Stashpad
+   *  folder that lacks it. Run once at startup so existing folders get
+   *  backfilled; new folders are handled at creation time. */
+  async seedLocalAuthorStubsEverywhere(): Promise<number> {
+    const name = (this.settings.authorName ?? "").trim();
+    if (!name) return 0;
+    let created = 0;
+    for (const folder of this.discoverStashpadFolders()) {
+      if (await this.seedLocalAuthorStub(folder)) created++;
+    }
+    return created;
+  }
+
+  /** mkdir a vault dir path, intermediates included. Tolerates races and
+   *  the "already exists" error Obsidian sometimes throws. */
+  private async ensureFolderPath(dir: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const parts = dir.split("/").filter(Boolean);
+    let cur = "";
+    for (const p of parts) {
+      cur = cur ? `${cur}/${p}` : p;
+      try { if (!(await adapter.exists(cur))) await adapter.mkdir(cur); }
+      catch (e) { if (!/already exists/i.test((e as Error).message)) throw e; }
+    }
+  }
+
   async loadSettings(): Promise<void> {
     const data = (await this.loadData()) ?? {};
     // Migrate legacy `confirmMultiDelete` (split in 0.51.12 into two flags:
@@ -2206,6 +2577,19 @@ export default class StashpadPlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.queueWrite();
     setSettings(this.settings);
+    // 0.77.1: keep the registry's record of the local user current. The
+    // registry is a recovery cache — recording here means a name/role/
+    // department change is remembered (with rename history) even if the
+    // _authors stubs are later deleted.
+    const id = (this.settings.authorId ?? "").trim();
+    if (id) {
+      this.authorRegistry.record({
+        id,
+        name: this.settings.authorName,
+        role: this.settings.authorRole,
+        department: this.settings.authorDepartment,
+      });
+    }
     console.debug("[Stashpad] saveSettings", {
       shortcuts: this.settings.shortcuts,
       mod: this.settings.mod,
