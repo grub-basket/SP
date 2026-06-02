@@ -1,5 +1,17 @@
 import { App, Modal, Platform, moment, Notice, setIcon } from "obsidian";
 import { buildTimePickerInto } from "./time-picker";
+import { siftMatch } from "./types";
+import { newId } from "./id-service";
+import type { ImportLogEntry } from "./import-log";
+
+export interface AssigneeRef { id: string; name: string }
+export interface DuePickResult { iso: string | null; assignees: AssigneeRef[] }
+export interface DuePickerOptions {
+  /** Known authors to offer in the assignee picker (from the registry). */
+  knownAuthors?: AssigneeRef[];
+  /** Assignees already on the note, to pre-fill the chips. */
+  currentAssignees?: AssigneeRef[];
+}
 import type { NotificationCategory, NotificationKind, NotificationRecord, NotificationService } from "./notifications";
 
 interface LogEv { ts: string; type: string; id: string; payload?: any; author?: string; }
@@ -822,16 +834,128 @@ export class ConfirmModal extends Modal {
  *  Next week) fill the inputs without typing. Returns an ISO string
  *  (date + time, local) or null to clear the due date. The callback
  *  receives `undefined` if the modal was dismissed without choosing. */
+/** 0.78.3: shared assignee-picker widget — removable chips + an
+ *  autocomplete that Sift-matches known authors and accepts free entry
+ *  ("Create 'Name'" → mints a fresh author id). Maintains its own working
+ *  list and calls onChange(list) on every mutation. Used by both the due
+ *  picker's "Assign to" section and the standalone AssignModal. */
+export function buildAssigneePicker(
+  wrap: HTMLElement,
+  opts: { knownAuthors: AssigneeRef[]; initial: AssigneeRef[]; onChange: (list: AssigneeRef[]) => void },
+): void {
+  let assignees: AssigneeRef[] = [...opts.initial];
+  const known = opts.knownAuthors;
+  const sec = wrap.createDiv({ cls: "stashpad-assign" });
+  sec.createDiv({ cls: "stashpad-assign-label", text: "Assign to" });
+  const chips = sec.createDiv({ cls: "stashpad-assign-chips" });
+  const inputWrap = sec.createDiv({ cls: "stashpad-assign-input-wrap" });
+  const input = inputWrap.createEl("input", {
+    type: "text", cls: "stashpad-assign-input",
+    attr: { placeholder: "Add a person — type a name…" },
+  }) as HTMLInputElement;
+  const sugg = inputWrap.createDiv({ cls: "stashpad-assign-suggest" });
+  sugg.style.display = "none";
+
+  const commit = () => opts.onChange([...assignees]);
+  const renderChips = (): void => {
+    chips.empty();
+    if (assignees.length === 0) chips.createSpan({ cls: "stashpad-assign-empty", text: "No one yet" });
+    for (const a of assignees) {
+      const chip = chips.createSpan({ cls: "stashpad-assign-chip" });
+      chip.createSpan({ cls: "stashpad-assign-chip-name", text: a.name });
+      const x = chip.createSpan({ cls: "stashpad-assign-chip-x", text: "×" });
+      x.title = `Remove ${a.name}`;
+      x.onclick = () => { assignees = assignees.filter((p) => p.id !== a.id); commit(); renderChips(); };
+    }
+  };
+  const addAssignee = (a: AssigneeRef): void => {
+    if (!a.name.trim()) return;
+    if (!assignees.some((p) => p.id === a.id)) assignees.push(a);
+    input.value = ""; sugg.style.display = "none"; commit(); renderChips(); input.focus();
+  };
+  const refresh = (): void => {
+    const q = input.value.trim();
+    sugg.empty();
+    const taken = new Set(assignees.map((p) => p.id));
+    const matches = known.filter((a) => !taken.has(a.id) && siftMatch(q, a.name)).slice(0, 6);
+    const rows: Array<{ label: string; onPick: () => void }> = matches.map((a) => ({
+      label: a.name, onPick: () => addAssignee(a),
+    }));
+    if (q && !known.some((a) => a.name.toLowerCase() === q.toLowerCase())) {
+      rows.push({ label: `Create “${q}”`, onPick: () => addAssignee({ id: newId(6), name: q }) });
+    }
+    if (rows.length === 0) { sugg.style.display = "none"; return; }
+    sugg.style.display = "";
+    for (const r of rows) {
+      const item = sugg.createDiv({ cls: "stashpad-assign-suggest-item", text: r.label });
+      item.onmousedown = (e) => { e.preventDefault(); r.onPick(); };
+    }
+  };
+  input.addEventListener("input", refresh);
+  input.addEventListener("focus", refresh);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const first = sugg.querySelector(".stashpad-assign-suggest-item") as HTMLElement | null;
+      if (first) first.dispatchEvent(new MouseEvent("mousedown"));
+    } else if (e.key === "Escape" && sugg.style.display !== "none") {
+      e.stopPropagation(); sugg.style.display = "none";
+    }
+  });
+  input.addEventListener("blur", () => { window.setTimeout(() => { sugg.style.display = "none"; }, 120); });
+  renderChips();
+}
+
+/** 0.78.3: standalone "Assign to" modal — assignment without touching the
+ *  due date. onPick gets the chosen assignee set; not called on dismiss. */
+export class AssignModal extends Modal {
+  private didChoose = false;
+  private assignees: AssigneeRef[] = [];
+  constructor(
+    app: App,
+    private opts: { knownAuthors: AssigneeRef[]; currentAssignees: AssigneeRef[] },
+    private onPick: (assignees: AssigneeRef[]) => void,
+  ) {
+    super(app);
+    this.assignees = [...opts.currentAssignees];
+  }
+  onOpen(): void {
+    this.modalEl?.addClass("stashpad-compact-modal");
+    this.contentEl.empty();
+    this.titleEl.setText("Assign task");
+    const wrap = this.contentEl.createDiv({ cls: "stashpad-due-picker" });
+    buildAssigneePicker(wrap, {
+      knownAuthors: this.opts.knownAuthors,
+      initial: this.assignees,
+      onChange: (list) => { this.assignees = list; },
+    });
+    const row = this.contentEl.createDiv({ cls: "stashpad-modal-btns" });
+    const cancel = row.createEl("button", { text: "Cancel" });
+    cancel.onclick = () => { this.didChoose = true; this.close(); };
+    const ok = row.createEl("button", { cls: "mod-cta", text: "Save" });
+    ok.onclick = () => { this.didChoose = true; this.close(); this.onPick(this.assignees); };
+  }
+  onClose(): void { this.contentEl.empty(); void this.didChoose; }
+}
+
 export class DueDatePickerModal extends Modal {
   private didChoose = false;
+  /** Working set of assignees, mutated by the chips UI. */
+  private assignees: AssigneeRef[] = [];
   constructor(
     app: App,
     /** Existing due value (ISO) to pre-fill, or null/undefined. */
     private current: string | null | undefined,
-    /** Called with the new ISO string, or null to clear. Not called
-     *  on dismiss-without-choice. */
-    private onPick: (iso: string | null) => void,
-  ) { super(app); }
+    /** Called with the chosen due ISO (or null to clear) AND the chosen
+     *  assignee set. Not called on dismiss-without-choice. Back-compat:
+     *  a caller may still pass a `(iso) => void` — we detect arity and
+     *  adapt — but new callers should take the DuePickResult. */
+    private onPick: (result: DuePickResult) => void,
+    private opts: DuePickerOptions = {},
+  ) {
+    super(app);
+    this.assignees = [...(opts.currentAssignees ?? [])];
+  }
 
   onOpen(): void {
     this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
@@ -875,6 +999,11 @@ export class DueDatePickerModal extends Modal {
       timeInput.value = this.toTimeValue(initial);
     }
 
+    // 0.78.1: "Assign to" section — chips for current assignees + an
+    // autocomplete input to add known authors (Sift) or a free-entry name
+    // (mints a new author id). Multiple assignees supported.
+    this.renderAssignSection(wrap);
+
     // 0.76.5: presets (top row) + actions (bottom row) share ONE
     // 3-column grid so the six buttons line up in two tidy rows.
     const grid = wrap.createDiv({ cls: "stashpad-due-grid" });
@@ -905,11 +1034,12 @@ export class DueDatePickerModal extends Modal {
     cancel.onclick = () => { this.didChoose = true; this.close(); };
     const ok = grid.createEl("button", { cls: "stashpad-due-btn mod-cta", text: "Set" });
     ok.onclick = () => {
-      // Empty Set = remove the due date.
+      // Empty Set = remove the due date (assignees still committed, so you
+      // can assign someone without a due date).
       if (!dateInput.value) {
         this.didChoose = true;
         this.close();
-        this.onPick(null);
+        this.onPick({ iso: null, assignees: this.assignees });
         return;
       }
       // Default time to 09:00 when only a date was chosen.
@@ -919,7 +1049,7 @@ export class DueDatePickerModal extends Modal {
       const due = new Date(y, m - 1, d, hh, mm, 0, 0);
       this.didChoose = true;
       this.close();
-      this.onPick(due.toISOString());
+      this.onPick({ iso: due.toISOString(), assignees: this.assignees });
     };
     requestAnimationFrame(() => dateInput.focus());
   }
@@ -928,6 +1058,16 @@ export class DueDatePickerModal extends Modal {
     this.tinyClosePopover?.();
     this.contentEl.empty();
     void this.didChoose;
+  }
+
+  /** 0.78.1: the "Assign to" block. Delegates to the shared
+   *  buildAssigneePicker so the standalone AssignModal reuses it. */
+  private renderAssignSection(wrap: HTMLElement): void {
+    buildAssigneePicker(wrap, {
+      knownAuthors: this.opts.knownAuthors ?? [],
+      initial: this.assignees,
+      onChange: (list) => { this.assignees = list; },
+    });
   }
 
   /** 0.76.23: open the shared numpad time picker anchored under the
@@ -1296,4 +1436,53 @@ export class NotificationHistoryModal extends Modal {
       allBtn.onclick = () => { this.appendMore(remaining); this.renderFooter(); };
     }
   }
+}
+
+/** 0.79.3: read-only viewer for the import log. Lists imports newest-first
+ *  so the user can see / reference what they've imported. */
+export class ImportLogModal extends Modal {
+  constructor(app: App, private entries: ImportLogEntry[]) { super(app); }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.titleEl.setText("Stashpad import log");
+    if (this.entries.length === 0) {
+      this.contentEl.createDiv({ cls: "stashpad-log-empty", text: "Nothing imported yet." });
+      return;
+    }
+    const list = this.contentEl.createDiv({ cls: "stashpad-import-log-list" });
+    for (const e of this.entries) {
+      const row = list.createDiv({ cls: "stashpad-import-log-row" });
+      const when = (moment as any)(e.ts).format("YYYY-MM-DD HH:mm");
+      row.createSpan({ cls: "stashpad-import-log-when", text: when });
+      const kindLabel = e.kind === "folder" ? "folder" : e.kind === "md" ? "note" : "file";
+      row.createSpan({ cls: `stashpad-import-log-kind is-${e.kind}`, text: kindLabel });
+      row.createSpan({ cls: "stashpad-import-log-name", text: e.originalName });
+      const meta: string[] = [e.folder.split("/").pop() || e.folder];
+      if (e.notePaths.length > 1) meta.push(`${e.notePaths.length} notes`);
+      row.createSpan({ cls: "stashpad-import-log-meta", text: meta.join(" · ") });
+    }
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.79.7: three-way choice for a likely-duplicate import. Escape / close
+ *  resolves to "skip" (the safe default for an accidental re-drop). */
+export class ImportDupChoiceModal extends Modal {
+  private chose = false;
+  constructor(app: App, private message: string, private onChoose: (c: "anyway" | "replace" | "skip") => void) { super(app); }
+  onOpen(): void {
+    this.modalEl?.addClass("stashpad-compact-modal");
+    this.contentEl.empty();
+    this.titleEl.setText("Possible duplicate import");
+    const block = this.contentEl.createDiv({ cls: "stashpad-confirm-body" });
+    for (const line of this.message.split("\n")) block.createDiv({ cls: "stashpad-confirm-line", text: line });
+    const row = this.contentEl.createDiv({ cls: "stashpad-modal-btns" });
+    const skip = row.createEl("button", { text: "Skip duplicates" });
+    skip.onclick = () => { this.chose = true; this.close(); this.onChoose("skip"); };
+    const replace = row.createEl("button", { text: "Replace existing" });
+    replace.onclick = () => { this.chose = true; this.close(); this.onChoose("replace"); };
+    const anyway = row.createEl("button", { cls: "mod-cta", text: "Import anyway" });
+    anyway.onclick = () => { this.chose = true; this.close(); this.onChoose("anyway"); };
+  }
+  onClose(): void { if (!this.chose) this.onChoose("skip"); this.contentEl.empty(); }
 }

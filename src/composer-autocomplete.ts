@@ -1,4 +1,6 @@
 import { App, Scope, TFile } from "obsidian";
+import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore } from "./types";
+import { getSettings } from "./settings";
 
 /**
  * Composer autocomplete: a lightweight popup attached to a plain
@@ -99,13 +101,23 @@ export class ComposerAutocomplete {
     if (this.indexBuilt) return;
     // 0.73.3: include every TFile in the vault — images, PDFs,
     // audio, attachments, etc. — so the link autocomplete isn't
-    // limited to markdown. Skip .edtz (Encrypted Templater) files
-    // which users never link to manually. Markdown files insert as
-    // [[Title]] (basename only); everything else uses [[name.ext]]
-    // because Obsidian only resolves non-md wikilinks WITH the
-    // extension.
+    // limited to markdown. 0.79.12: include ALL extensions (the link
+    // builder is the filesystem-alternative's "link to anything"), but
+    // exclude the _archive graveyard (import originals you don't link
+    // to). Markdown files insert as [[Title]] (basename only);
+    // everything else uses [[name.ext]] because Obsidian only resolves
+    // non-md wikilinks WITH the extension.
+    // 0.79.14: exclude the _archive graveyard + plugin-internal formats
+    // (.edtz), and — when enabled — anything in Obsidian's own "Excluded
+    // files" list so exclusions are managed in one place.
+    const inherit = getSettings().inheritObsidianExclusions;
+    const ignoreFilters = inherit
+      ? ((this.app.vault as any).getConfig?.("userIgnoreFilters") as string[] | undefined)
+      : undefined;
     this.fileIndex = this.app.vault.getFiles()
-      .filter((f) => f.extension !== "edtz")
+      .filter((f) => !isArchivedPath(f.path)
+        && !isIgnoredFileExtension(f.path)
+        && !(inherit && matchesObsidianIgnore(f.path, ignoreFilters)))
       .map((f) => {
         const isMd = f.extension === "md";
         const label = isMd ? f.basename : f.name;

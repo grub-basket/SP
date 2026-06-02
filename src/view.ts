@@ -4,7 +4,7 @@ import {
   moment, setIcon,
 } from "obsidian";
 import {
-  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag,
+  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees,
   type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
 } from "./types";
 import { TreeIndex } from "./tree-index";
@@ -20,7 +20,7 @@ import { IntegrityWatcher } from "./integrity-watcher";
 import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
 import { StashpadSuggest } from "./note-picker";
 import { setActiveView, clearActiveView } from "./active-view";
-import { ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
+import { AssignModal, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { buildStashZip, importStashZip, STASH_EXT } from "./stash-package";
 import type StashpadPlugin from "./main";
@@ -353,6 +353,10 @@ export class StashpadView extends ItemView {
     });
 
     setActiveView(this);
+    // 0.77.12: periodically bound the multiplayer-tracking maps so a
+    // long-lived session doesn't accumulate dead per-file entries.
+    // registerInterval auto-clears on view unload.
+    this.registerInterval(window.setInterval(() => this.pruneContribMaps(), 60_000));
 
     // Push a keymap Scope while focus is anywhere inside the view so
     // Escape can never warp to the previous tab. This sits BENEATH any
@@ -660,6 +664,12 @@ export class StashpadView extends ItemView {
     for (const d of this.attachmentDebouncers.values()) d.cancel();
     for (const t of this.contribTimers.values()) clearTimeout(t);
     this.contribTimers.clear();
+    // 0.77.12: release the per-file multiplayer-tracking maps so they
+    // don't outlive the view (knownBodies in particular holds full body
+    // strings). They rebuild lazily on the next modify event.
+    this.knownBodies.clear();
+    this.recentSelfWrites.clear();
+    this.lastExternalModify.clear();
     // Persist any in-flight draft text before tear-down. Await so Obsidian
     // doesn't unload the view before saveData() resolves.
     try { await this.flushDrafts(); } catch {}
@@ -1227,6 +1237,33 @@ export class StashpadView extends ItemView {
     await this.plugin.saveSettings();
   }
 
+  /** 0.79.8: per-folder "hide notes without attachments" filter. */
+  private currentAttachmentsOnly(): boolean {
+    return !!this.plugin.settings.attachmentsOnlyNotes?.[this.noteFolder];
+  }
+  private async setAttachmentsOnly(on: boolean): Promise<void> {
+    const map = { ...(this.plugin.settings.attachmentsOnlyNotes ?? {}) };
+    if (!on) delete map[this.noteFolder];
+    else map[this.noteFolder] = true;
+    this.plugin.settings.attachmentsOnlyNotes = map;
+    await this.plugin.saveSettings();
+  }
+  /** True if `node`'s own frontmatter `attachments` array is non-empty. */
+  private nodeHasAttachment(node: TreeNode): boolean {
+    if (!node.file) return false;
+    const a = this.app.metadataCache.getFileCache(node.file)?.frontmatter?.attachments;
+    return Array.isArray(a) && a.length > 0;
+  }
+  /** True if `node` or any descendant has an attachment — keeps parents
+   *  visible so the attachment-bearing child stays reachable. */
+  private hasAttachmentInSubtree(node: TreeNode): boolean {
+    if (this.nodeHasAttachment(node)) return true;
+    for (const child of this.tree.getChildren(node.id)) {
+      if (this.hasAttachmentInSubtree(child)) return true;
+    }
+    return false;
+  }
+
   /** True when any descendant of `node` is NOT completed. Used by the
    *  hide-completed filter to keep parents visible while their subtree
    *  still has work. Recurses depth-first; bails as soon as it finds
@@ -1289,7 +1326,7 @@ export class StashpadView extends ItemView {
     if (!(root instanceof TFolder)) return [];
     const includeAtts = this.currentIncludeAttachments();
     const embedded = includeAtts ? new Set<string>() : this.collectEmbeddedAttachmentPaths();
-    const RESERVED_SUBFOLDERS = new Set(["_authors", "_imports", "_exports", "_processed"]);
+    const RESERVED_SUBFOLDERS = new Set(["_authors", "_imports", "_exports", "_processed", "_attachments", "_archive", ".archive"]);
     const out: TFile[] = [];
     const stack: TFolder[] = [root];
     while (stack.length) {
@@ -1464,7 +1501,8 @@ export class StashpadView extends ItemView {
     const tag = this.tagFilter?.toLowerCase();
     const color = this.colorFilter?.toLowerCase() ?? null;
     const hideCompleted = this.currentHideCompleted();
-    if (!cutoff && !tag && !color && !hideCompleted) return children;
+    const attachmentsOnly = this.currentAttachmentsOnly();
+    if (!cutoff && !tag && !color && !hideCompleted && !attachmentsOnly) return children;
     return children.filter((n) => {
       if (cutoff && n.created) {
         const t = Date.parse(n.created);
@@ -1483,6 +1521,9 @@ export class StashpadView extends ItemView {
       // checked off but still containing an unchecked task stays
       // visible until the last task is done.
       if (hideCompleted && this.isCompleted(n) && !this.hasIncompleteDescendant(n)) return false;
+      // Attachments-only: keep a node if it (or any descendant) has an
+      // attachment, so the attachment-bearing child stays reachable.
+      if (attachmentsOnly && !this.hasAttachmentInSubtree(n)) return false;
       return true;
     });
   }
@@ -1777,6 +1818,7 @@ export class StashpadView extends ItemView {
     if (focused.file && !Platform.isMobile && !this.tinyMode && !this.compactMode) this.renderFocusedHeader(root, focused);
 
     this.currentChildren = this.filterChildren(this.collectViewItems(focused.id));
+    let selectionMovedByRender = false;
     if (this.autoSelectNewest && this.currentChildren.length > 0) {
       const last = this.currentChildren[this.currentChildren.length - 1];
       this.cursorIdx = this.currentChildren.length - 1;
@@ -1784,6 +1826,10 @@ export class StashpadView extends ItemView {
       this.selection.add(last.id);
       this.lastSelected = last.id;
       this.autoSelectNewest = false;
+      // 0.79.9: auto-selecting the just-created note is a genuine
+      // selection change — let the detail panel follow it instead of
+      // staying pinned to the previously-displayed note.
+      selectionMovedByRender = true;
     } else if (this.pendingFocusIds) {
       const ids = this.pendingFocusIds;
       this.pendingFocusIds = null;
@@ -1869,6 +1915,10 @@ export class StashpadView extends ItemView {
     // while staying pinned to its displayed note. Genuine selection
     // changes fire from selectCursor / handleRowClick / navigateTo.
     this.plugin.notifyStashpadContentChanged();
+    // 0.79.9: when this render auto-selected a newly-created note, that's
+    // a real selection change — notify so the detail panel unlocks and
+    // follows it (content-changed alone keeps it pinned to the old note).
+    if (selectionMovedByRender) this.plugin.notifyStashpadSelectionChanged();
     if (this.focusComposerOnNextRender) {
       this.focusComposerOnNextRender = false;
       const caret = this.pendingComposerCaret;
@@ -2319,6 +2369,7 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Toggle complete").setIcon("check-circle").setDisabled(!hasTargets).onClick(() => void this.cmdToggleComplete()));
     menu.addItem((it: any) => it.setTitle("Toggle task (todo)").setIcon("check-square").setDisabled(!hasTargets).onClick(() => void this.cmdToggleTask()));
     menu.addItem((it: any) => it.setTitle("Set due date…").setIcon("calendar-clock").setDisabled(!hasTargets).onClick(() => this.cmdSetDue()));
+    menu.addItem((it: any) => it.setTitle("Assign to…").setIcon("user-plus").setDisabled(!hasTargets).onClick(() => this.cmdAssign()));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Copy").setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopy()));
     menu.addItem((it: any) => it.setTitle("Copy tree").setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
@@ -2574,6 +2625,7 @@ export class StashpadView extends ItemView {
     const viewOn = this.currentViewMode() !== "nested"
       || this.currentHideChildless()
       || this.currentHideCompleted()
+      || this.currentAttachmentsOnly()
       || this.currentIncludeAttachments();
     if (tagOn || colorOn || timeOn || sortOn || viewOn) btn.addClass("is-active");
 
@@ -2831,6 +2883,22 @@ export class StashpadView extends ItemView {
     hdRow.onclick = async (e) => {
       if (e.target !== hdCheck) { e.preventDefault(); hdCheck.checked = !hdCheck.checked; }
       await this.setHideCompleted(hdCheck.checked);
+      this.refreshList();
+    };
+
+    // 0.79.8: hide notes without attachments (works in every view mode).
+    const haRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
+    const haCheck = haRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    haCheck.checked = this.currentAttachmentsOnly();
+    haRow.createDiv({ cls: "stashpad-view-popover-main" })
+      .createSpan({ cls: "stashpad-view-popover-label", text: "Hide notes without attachments" });
+    haRow.createDiv({
+      cls: "stashpad-view-popover-desc",
+      text: "Show only notes that have an attachment. A parent stays visible while any descendant has one.",
+    });
+    haRow.onclick = async (e) => {
+      if (e.target !== haCheck) { e.preventDefault(); haCheck.checked = !haCheck.checked; }
+      await this.setAttachmentsOnly(haCheck.checked);
       this.refreshList();
     };
 
@@ -5159,8 +5227,10 @@ export class StashpadView extends ItemView {
     const focusId = this.focusId;
     const inSubtree = (id: StashpadId): boolean => {
       if (id === focusId) return true;
+      const seen = new Set<StashpadId>();   // cycle guard
       let cur: TreeNode | undefined = this.tree.get(id);
-      while (cur && cur.id !== ROOT_ID) {
+      while (cur && cur.id !== ROOT_ID && !seen.has(cur.id)) {
+        seen.add(cur.id);
         if (cur.parent === focusId) return true;
         if (cur.id === focusId) return true;
         if (!cur.parent) return false;
@@ -6901,24 +6971,48 @@ export class StashpadView extends ItemView {
     const first = targets[0];
     const curFm = first.file ? this.app.metadataCache.getFileCache(first.file)?.frontmatter as any : null;
     const current = curFm && (typeof curFm.due === "string" || typeof curFm.due === "number") ? String(curFm.due) : null;
-    new DueDatePickerModal(this.app, current, (iso) => {
-      void this.applyDue(targets, iso);
-    }).open();
+    // 0.78.1: offer known authors (registry, newest-first) for assignment,
+    // and pre-fill any assignees already on the first target.
+    const knownAuthors = this.plugin.authorRegistry.all().map((a) => ({ id: a.id, name: a.name }));
+    const currentAssignees = parseAssignees(curFm ?? {});
+    new DueDatePickerModal(this.app, current, (result) => {
+      void this.applyDue(targets, result.iso, result.assignees);
+    }, { knownAuthors, currentAssignees }).open();
   }
 
   /** Write the chosen due value (or clear it) across `targets`, with
    *  undo. Setting a date also flips `task: true`; clearing leaves the
    *  task flag intact (clearing a due ≠ "no longer a task"). */
-  private async applyDue(targets: TreeNode[], iso: string | null): Promise<void> {
-    const prior: { id: StashpadId; path: string; due: unknown; task: unknown }[] = [];
+  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = []): Promise<void> {
+    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown }[] = [];
     const changedIds: StashpadId[] = [];
+    // 0.78.1: who is doing the assigning (the local user) — stamped as
+    // assignedBy so the "assigned by me" filter works. Null if the user
+    // hasn't set an author name.
+    const me = this.currentAuthorLink();
+    // Ensure an author stub exists in THIS folder for each assignee so
+    // their wikilink resolves (free-entry names mint a fresh stub).
+    for (const a of assignees) {
+      await this.plugin.ensureAuthorStubFor(this.noteFolder, a.id, a.name);
+    }
+    const assignLinks = assignees.map((a) => this.plugin.authorRefFor(this.noteFolder, a.id, a.name));
     for (const t of targets) {
       if (!t.file) continue;
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
-      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task });
+      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy });
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
         else { m.due = iso; m.task = true; }
+        // Assignment: empty list clears it; any assignment also flips the
+        // task flag (assigning makes it a task even without a due date).
+        if (assignLinks.length > 0) {
+          m.assignedTo = assignLinks;
+          if (me) m.assignedBy = me.link;
+          m.task = true;
+        } else {
+          delete m.assignedTo;
+          delete m.assignedBy;
+        }
       });
       changedIds.push(t.id);
     }
@@ -6945,6 +7039,88 @@ export class StashpadView extends ItemView {
           if (!f) continue;
           await this.app.fileManager.processFrontMatter(f, (m) => {
             if (p.due === undefined) delete m.due; else m.due = p.due;
+            if (p.task === undefined) delete m.task; else m.task = p.task;
+            if (p.assignedTo === undefined) delete m.assignedTo; else m.assignedTo = p.assignedTo;
+            if (p.assignedBy === undefined) delete m.assignedBy; else m.assignedBy = p.assignedBy;
+          });
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
+
+  /** 0.78.3: standalone assign command — assign people to the target
+   *  task(s) without touching the due date. Opens AssignModal pre-filled
+   *  with the first target's current assignees. */
+  cmdAssign(): void {
+    let targets = this.getActionTargets();
+    if (targets.length === 0) {
+      const focused = this.tree.get(this.focusId);
+      if (focused?.file) targets = [focused];
+    }
+    if (targets.length === 0) { new Notice("Nothing to assign."); return; }
+    const first = targets[0];
+    const curFm = first.file ? this.app.metadataCache.getFileCache(first.file)?.frontmatter as any : null;
+    const knownAuthors = this.plugin.authorRegistry.all().map((a) => ({ id: a.id, name: a.name }));
+    const currentAssignees = parseAssignees(curFm ?? {});
+    new AssignModal(this.app, { knownAuthors, currentAssignees }, (assignees) => {
+      void this.applyAssignees(targets, assignees);
+    }).open();
+  }
+
+  /** Write `assignedTo`/`assignedBy` across `targets` (without touching
+   *  `due`), with undo. An empty list clears the assignment. Assigning
+   *  also flips `task: true`. */
+  private async applyAssignees(targets: TreeNode[], assignees: Array<{ id: string; name: string }>): Promise<void> {
+    const me = this.currentAuthorLink();
+    for (const a of assignees) {
+      await this.plugin.ensureAuthorStubFor(this.noteFolder, a.id, a.name);
+    }
+    const assignLinks = assignees.map((a) => this.plugin.authorRefFor(this.noteFolder, a.id, a.name));
+    const prior: { path: string; assignedTo: unknown; assignedBy: unknown; task: unknown }[] = [];
+    const changedIds: StashpadId[] = [];
+    for (const t of targets) {
+      if (!t.file) continue;
+      const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
+      prior.push({ path: t.file.path, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, task: fm?.task });
+      await this.app.fileManager.processFrontMatter(t.file, (m) => {
+        if (assignLinks.length > 0) {
+          m.assignedTo = assignLinks;
+          if (me) m.assignedBy = me.link;
+          m.task = true;
+        } else {
+          delete m.assignedTo;
+          delete m.assignedBy;
+        }
+      });
+      changedIds.push(t.id);
+    }
+    this.render();
+    if (changedIds.length > 0) {
+      const nodes = changedIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+      const names = assignees.map((a) => a.name).join(", ");
+      this.plugin.notifications.show({
+        message: this.bulkActionMessage({
+          verb: assignLinks.length > 0 ? `Assigned to ${names}` : "Cleared assignment",
+          nodes,
+        }),
+        kind: "success",
+        category: "edit",
+        affectedIds: changedIds,
+        folder: this.noteFolder,
+      });
+    }
+    const folder = this.noteFolder;
+    this.plugin.getUndoStack(folder).push({
+      label: assignLinks.length > 0 ? `Assign (${targets.length})` : `Clear assignment (${targets.length})`,
+      undo: async () => {
+        for (const p of prior) {
+          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+          if (!f) continue;
+          await this.app.fileManager.processFrontMatter(f, (m) => {
+            if (p.assignedTo === undefined) delete m.assignedTo; else m.assignedTo = p.assignedTo;
+            if (p.assignedBy === undefined) delete m.assignedBy; else m.assignedBy = p.assignedBy;
             if (p.task === undefined) delete m.task; else m.task = p.task;
           });
         }
@@ -7129,7 +7305,9 @@ export class StashpadView extends ItemView {
   private inheritedColorForNode(node: TreeNode): { hex: string; depth: number } | null {
     let cur: TreeNode | undefined = node;
     let depth = 0;
-    while (cur && cur.id !== ROOT_ID) {
+    const seen = new Set<StashpadId>();   // cycle guard
+    while (cur && cur.id !== ROOT_ID && !seen.has(cur.id)) {
+      seen.add(cur.id);
       const c = this.colorForNode(cur);
       if (c) return { hex: c, depth };
       cur = cur.parent ? this.tree.get(cur.parent) : undefined;
@@ -7856,6 +8034,18 @@ export class StashpadView extends ItemView {
         const attSuffix = attsRemoved > 0
           ? ` with ${attsRemoved} attachment${attsRemoved === 1 ? "" : "s"}`
           : "";
+        const folder = this.noteFolder;
+        const undoFocusIds = targets.map((t) => t.id);
+        // Shared restore — used by both the notification's Undo button and
+        // the undo stack; guarded so a double-fire is a no-op.
+        let restored = false;
+        const doRestore = async () => {
+          if (restored) return; restored = true;
+          this.selection.clear();
+          this.cursorIdx = -1;
+          await this.restoreSnapshots(snap, undoFocusIds.slice());
+        };
+        // 0.79.11: persistent + an explicit Undo button on the delete toast.
         this.plugin.notifications.show({
           message: this.bulkActionMessage({
             verb: "Deleted",
@@ -7864,22 +8054,19 @@ export class StashpadView extends ItemView {
           }),
           kind: "warning",
           category: "delete",
+          duration: 0,
           affectedIds: targets.map((t) => t.id),
           affectedAuthorIds: deletedAuthorIds,
           folder: this.noteFolder,
+          actions: [{ label: "Undo delete", onClick: () => void doRestore() }],
         });
-        const folder = this.noteFolder;
-        const undoFocusIds = targets.map((t) => t.id);
         this.plugin.getUndoStack(folder).push({
           label: `Delete ${targets.length} note${targets.length === 1 ? "" : "s"}`,
-          undo: async () => {
-            this.selection.clear();
-            this.cursorIdx = -1;
-            await this.restoreSnapshots(snap, undoFocusIds.slice());
-          },
+          undo: async () => { await doRestore(); },
           redo: async () => {
             this.selection.clear();
             this.cursorIdx = -1;
+            restored = false;
             await this.trashNotesAndAttachments(snap);
           },
         });
@@ -8441,7 +8628,11 @@ export class StashpadView extends ItemView {
     if (!name || !id) return null;
     const safe = name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "author";
     const path = `${this.noteFolder}/_authors/${safe}-${id}.md`;
-    const link = `[[${path}|${name}]]`;
+    // 0.77.11: strip characters that would break out of the wikilink alias
+    // (`|` starts a new alias segment, `[`/`]` close/extend the link). A
+    // name like `a|b]]x` would otherwise corrupt the author frontmatter.
+    const aliasSafe = name.replace(/[\[\]|]/g, "").trim() || safe;
+    const link = `[[${path}|${aliasSafe}]]`;
     return { link, path, name, id };
   }
 
@@ -8721,6 +8912,31 @@ export class StashpadView extends ItemView {
    *  another client just touched the file, we don't write back over
    *  them; we keep the contribution parked and retry. */
   private lastExternalModify = new Map<string, number>();
+
+  /** 0.77.12: bound the per-file multiplayer-tracking maps during a long
+   *  session. recentSelfWrites / lastExternalModify entries are only
+   *  meaningful for a few seconds (the grace / quiescence windows), so
+   *  anything far older is dead weight — drop it. knownBodies holds full
+   *  body strings, so drop entries for paths no longer in this view's tree
+   *  (deleted / moved-away notes); live files stay (idForPath finds them),
+   *  so an in-progress edit's baseline is never lost. Fully cleared in
+   *  onClose; this just trims mid-session. Idempotent + cheap. */
+  private pruneContribMaps(): void {
+    const now = Date.now();
+    const SELF_TTL = StashpadView.EXTERNAL_WRITE_GRACE_MS * 20;  // ~30s
+    const EXT_TTL = StashpadView.EXTERNAL_QUIESCENCE_MS * 12;    // ~60s
+    for (const [path, ts] of this.recentSelfWrites) {
+      if (now - ts > SELF_TTL) this.recentSelfWrites.delete(path);
+    }
+    for (const [path, ts] of this.lastExternalModify) {
+      if (now - ts > EXT_TTL) this.lastExternalModify.delete(path);
+    }
+    if (this.knownBodies.size > 64) {
+      for (const path of this.knownBodies.keys()) {
+        if (!this.tree.idForPath(path)) this.knownBodies.delete(path);
+      }
+    }
+  }
 
   private onFileModify = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
@@ -9229,24 +9445,32 @@ export class StashpadView extends ItemView {
       const attSuffix = attsRemoved > 0
         ? ` with ${attsRemoved} attachment${attsRemoved === 1 ? "" : "s"}`
         : "";
+      // 0.79.11: persistent delete toast with a shared Undo (button +
+      // undo stack), single-fire guarded.
+      let restored = false;
+      const doRestore = async () => {
+        if (restored) return; restored = true;
+        this.selection.clear();
+        this.cursorIdx = -1;
+        await this.restoreSnapshots(snap, [undoFocusId]);
+      };
       this.plugin.notifications.show({
         message: `Deleted "${this.titleForNode(node)}"${attSuffix}`,
         kind: "warning",
         category: "delete",
+        duration: 0,
         affectedIds: [node.id],
         affectedAuthorIds: deletedAuthorIds,
         folder: this.noteFolder,
+        actions: [{ label: "Undo delete", onClick: () => void doRestore() }],
       });
       this.plugin.getUndoStack(folder).push({
         label,
-        undo: async () => {
-          this.selection.clear();
-          this.cursorIdx = -1;
-          await this.restoreSnapshots(snap, [undoFocusId]);
-        },
+        undo: async () => { await doRestore(); },
         redo: async () => {
           this.selection.clear();
           this.cursorIdx = -1;
+          restored = false;
           await this.trashNotesAndAttachments(snap);
         },
       });

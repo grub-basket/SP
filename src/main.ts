@@ -1,5 +1,5 @@
-import { Notice, Platform, Plugin, SuggestModal, TFile, WorkspaceLeaf, setIcon } from "obsidian";
-import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, type PinnedNoteRef, type StashpadId } from "./types";
+import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
+import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, type PinnedNoteRef, type StashpadId } from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath } from "./view";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
@@ -16,6 +16,8 @@ import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { NotificationService, buildFileActions } from "./notifications";
 import { AuthorRegistry } from "./author-registry";
+import { ImportService } from "./import-service";
+import { ImportLog } from "./import-log";
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
@@ -58,6 +60,18 @@ export default class StashpadPlugin extends Plugin {
       this._authorRegistry = new AuthorRegistry(this.app, this.pluginPrivatePath());
     }
     return this._authorRegistry;
+  }
+  /** 0.79.1: auto-import engine for files dropped into a Stashpad folder. */
+  private _importService: ImportService | null = null;
+  get importService(): ImportService {
+    if (!this._importService) this._importService = new ImportService(this);
+    return this._importService;
+  }
+  /** 0.79.3: append-only import history (de-dupe + viewer). */
+  private _importLog: ImportLog | null = null;
+  get importLog(): ImportLog {
+    if (!this._importLog) this._importLog = new ImportLog(this.app, this.pluginPrivatePath());
+    return this._importLog;
   }
 
   /** Vault-relative path to a file/dir inside the plugin's private
@@ -479,6 +493,15 @@ export default class StashpadPlugin extends Plugin {
     // the existing one). New folders are seeded at creation time instead.
     this.app.workspace.onLayoutReady(() => {
       window.setTimeout(() => { void this.seedLocalAuthorStubsEverywhere(); }, 4000);
+      // 0.79.12: register each Stashpad folder's _archive in Obsidian's
+      // "Excluded files" so native search / quick switcher / graph / link
+      // suggestions de-prioritise the import-originals graveyard.
+      window.setTimeout(() => this.syncObsidianExcludedArchives(), 4500);
+      // 0.79.15: arm auto-import only AFTER the startup create-storm has
+      // passed (Obsidian replays a create event for every existing file on
+      // load). Until armed, enqueue() ignores events — so opening the vault
+      // never looks like a mass "drop".
+      window.setTimeout(() => this.importService.setArmed(true), 2500);
     });
 
     this.registerView(
@@ -802,6 +825,25 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
     this.addCommand({ id: "stashpad-toggle-task", name: "Toggle task (todo)", callback: () => call("cmdToggleTask") });
     this.addCommand({ id: "stashpad-set-due", name: "Set due date…", callback: () => call("cmdSetDue") });
+    this.addCommand({ id: "stashpad-assign", name: "Assign task to…", callback: () => call("cmdAssign") });
+    // 0.79.3: view what's been auto-imported.
+    this.addCommand({
+      id: "stashpad-open-import-log",
+      name: "Open import log",
+      callback: async () => {
+        await this.importLog.load();
+        const { ImportLogModal } = await import("./modals");
+        new ImportLogModal(this.app, this.importLog.recent()).open();
+      },
+    });
+    // 0.79.4: import via the OS file picker. Opens a chooser whose pinned
+    // top result is "open the file picker" (targeting the active folder);
+    // the remaining results let you pick a different destination folder.
+    this.addCommand({
+      id: "stashpad-import-files",
+      name: "Import file(s) into Stashpad…",
+      callback: () => this.openImportPicker(),
+    });
     this.addCommand({ id: "stashpad-select-all", name: "Select all visible notes", callback: () => call("cmdSelectAll") });
     this.addCommand({ id: "stashpad-copy-codeblock", name: "Copy code from codeblock", callback: () => call("cmdCopyCodeBlock") });
     // 0.68.0: open the sidebar panels view (Pinned Notes + future panels).
@@ -959,9 +1001,10 @@ export default class StashpadPlugin extends Plugin {
       callback: async () => {
         new Notice("Stashpad: rebootstrapping…");
         try {
-          const { touched, fmChecked, fmWritten, slugsRenamed, authors } = await this.rebootstrapAllFolders();
+          const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported } = await this.rebootstrapAllFolders();
           const parts: string[] = [];
           parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
+          if (imported > 0) parts.push(`imported ${imported} loose file${imported === 1 ? "" : "s"}`);
           if (fmWritten > 0) parts.push(`updated ${fmWritten} note${fmWritten === 1 ? "" : "s"}' metadata`);
           if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"}`);
           if (authors > 0) parts.push(`${authors} author${authors === 1 ? "" : "s"} in registry`);
@@ -1244,6 +1287,18 @@ export default class StashpadPlugin extends Plugin {
     }));
     this.registerEvent(this.app.vault.on("rename", (file) => {
       if (file instanceof TFile) { onMaybeOrphan(file); onMaybeMarkdownImport(file); }
+    }));
+
+    // 0.79.1: auto-import — any file appearing directly in a Stashpad
+    // folder root (not a reserved subfolder, not an existing note) gets
+    // turned into a note. The service guards + debounces internally.
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (file instanceof TFile) this.importService.enqueue(file);
+      else if (file instanceof TFolder) this.importService.enqueueFolder(file);
+    }));
+    this.registerEvent(this.app.vault.on("rename", (file) => {
+      if (file instanceof TFile) this.importService.enqueue(file);
+      else if (file instanceof TFolder) this.importService.enqueueFolder(file);
     }));
 
     // Multiplayer: keep settings.authorName in sync with the on-disk
@@ -1642,7 +1697,7 @@ export default class StashpadPlugin extends Plugin {
    *  ensure it has the import/export subfolders, and run the redundant-frontmatter
    *  backfill (parentLink + children) so older notes pick up the recovery fields.
    *  Used by the "Rebootstrap" button in settings to retrofit older folders. */
-  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number }> {
+  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number }> {
     const ROOT_ID = "__root__";
     const seen = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -1667,10 +1722,20 @@ export default class StashpadPlugin extends Plugin {
     let fmChecked = 0;
     let fmWritten = 0;
     let slugsRenamed = 0;
+    let imported = 0;
     for (const folder of seen) {
       try {
         if (importSub) await ensureFolder(`${folder}/${importSub}`);
         if (exportSub) await ensureFolder(`${folder}/${exportSub}`);
+        // 0.79.5: sweep any pre-existing loose files in the folder root
+        // into notes (the rebootstrap "provision" for auto-import). Gated
+        // on the autoImport setting so a user who turned it off isn't
+        // surprised. Runs before the frontmatter backfill so the new notes
+        // get stamped in the same pass.
+        if (this.settings.autoImport) {
+          try { imported += await this.importService.importLooseFilesIn(folder); }
+          catch (e) { console.warn("Stashpad: loose-file sweep failed", folder, e); }
+        }
         // Standalone (no-view-required) frontmatter backfill: reads
         // metadata cache, skip-if-equal, writes only what's actually
         // different. Paced internally so multi-folder rebootstrap
@@ -1697,7 +1762,7 @@ export default class StashpadPlugin extends Plugin {
     let authors = 0;
     try { authors = (await this.rebuildAuthorRegistry()).total; }
     catch (e) { console.warn("Stashpad: rebootstrap author-registry rebuild failed", e); }
-    return { touched, fmChecked, fmWritten, slugsRenamed, authors };
+    return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported };
   }
 
   /** Walk every Stashpad note in `folder`. For each one whose filename
@@ -1888,7 +1953,7 @@ export default class StashpadPlugin extends Plugin {
       const last = p.split("/").filter(Boolean).pop() ?? "";
       if (!last) return false;
       const reserved = new Set(
-        [this.settings.importDropFolder, this.settings.exportFolder, "_attachments", "_processed", "_authors"]
+        [this.settings.importDropFolder, this.settings.exportFolder, "_attachments", "_processed", "_authors", "_exports", "_imports", "_archive", ".archive"]
           .map((s) => (s ?? "").trim().replace(/^\/+|\/+$/g, ""))
           .filter(Boolean),
       );
@@ -2207,20 +2272,51 @@ export default class StashpadPlugin extends Plugin {
       .sort((a, b) => (b.authored + b.contributed) - (a.authored + a.contributed));
   }
 
-  /** Pull the display-name + id out of an author wikilink as written into
-   *  note frontmatter, e.g. `[[demo/_authors/Jane-743jcy.md|Jane Doe]]`
-   *  → { id: "743jcy", name: "Jane Doe" }. The alias (after `|`) is the
-   *  display name; if absent we fall back to de-slugging the filename
-   *  stem. Returns null when no id is present. */
+  /** Parse an author wikilink → {id,name}. Delegates to the shared
+   *  helper in types.ts (kept as a thin method so existing call sites and
+   *  subclasses keep working). */
   private parseAuthorRef(raw: string): { id: string; name: string } | null {
-    if (typeof raw !== "string") return null;
-    const inner = raw.replace(/^\[\[/, "").replace(/\]\]$/, "");
-    const [target, alias] = inner.split("|");
-    const m = target.match(/_authors\/(.+?)-([a-z0-9]{4,12})(?:\.md)?$/i);
-    if (!m) return null;
-    const id = m[2];
-    const name = (alias ?? "").trim() || m[1].replace(/-/g, " ").trim();
-    return { id, name };
+    return parseAuthorRef(raw);
+  }
+
+  /** 0.78.1: build the wikilink Stashpad writes for an arbitrary author
+   *  (used by task assignment + the local-user author stamp). Mirrors the
+   *  view's currentAuthorLink shape but for any {id,name}, resolved into
+   *  the given Stashpad folder's _authors dir. The alias is stripped of
+   *  link-structural chars (see security-findings.md). */
+  authorRefFor(folder: string, id: string, name: string): string {
+    const safe = name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "author";
+    const path = `${folder.replace(/\/+$/, "")}/_authors/${safe}-${id}.md`;
+    const aliasSafe = name.replace(/[\[\]|]/g, "").trim() || safe;
+    return `[[${path}|${aliasSafe}]]`;
+  }
+
+  /** 0.78.1: ensure an author stub exists for {id,name} in `folder`,
+   *  creating it from the registry's known role/department if available.
+   *  Used when assigning a task to someone so the assignee wikilink
+   *  resolves. No-op if a stub for this id already exists in the dir
+   *  (under any name). Also registers the author. */
+  async ensureAuthorStubFor(folder: string, id: string, name: string): Promise<void> {
+    if (!id || !name) return;
+    this.authorRegistry.record({ id, name });
+    const dir = `${folder.replace(/\/+$/, "")}/_authors`;
+    const exists = this.app.vault.getMarkdownFiles().some(
+      (f) => f.path.startsWith(dir + "/") && this.parseAuthorFilePath(f.path)?.id === id,
+    );
+    if (exists) return;
+    const rec = this.authorRegistry.get(id);
+    const safe = this.authorNameToSafe(name);
+    const path = `${dir}/${safe}-${id}.md`;
+    try {
+      await this.ensureFolderPath(dir);
+      if (await this.app.vault.adapter.exists(path)) return;
+      await this.app.vault.create(path, this.buildAuthorStub(
+        { id, name, role: rec?.role, department: rec?.department },
+        new Date().toISOString(),
+      ));
+    } catch (e) {
+      console.warn("[Stashpad] ensureAuthorStubFor failed", path, e);
+    }
   }
 
   /** 0.77.2: rebuild the author registry from scratch by scanning the
@@ -2290,11 +2386,18 @@ export default class StashpadPlugin extends Plugin {
    *  department + a created stamp + an H1. Stashpad-owned; safe to
    *  regenerate. */
   buildAuthorStub(rec: { id: string; name: string; role?: string; department?: string }, created: string): string {
-    const esc = (s: string) => s.replace(/"/g, '\\"');
+    // Collapse any newlines (defensive — a pasted value could contain one)
+    // so YAML scalars + the H1 stay single-line, and escape backslashes
+    // before quotes for a valid double-quoted YAML string. Without the
+    // backslash pass, a name like `a\b` would produce invalid YAML and an
+    // unreadable stub.
+    const oneLine = (s: string) => s.replace(/[\r\n]+/g, " ").trim();
+    const esc = (s: string) => oneLine(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const name = oneLine(rec.name);
     const lines = ["---", `authorId: ${rec.id}`, `aliases:`, `  - "${esc(rec.name)}"`];
     if (rec.role) lines.push(`role: "${esc(rec.role)}"`);
     if (rec.department) lines.push(`department: "${esc(rec.department)}"`);
-    lines.push(`created: ${created}`, "---", `# ${rec.name}`);
+    lines.push(`created: ${created}`, "---", `# ${name}`);
     return lines.join("\n");
   }
 
@@ -2307,18 +2410,23 @@ export default class StashpadPlugin extends Plugin {
     await this.authorRegistry.load();
     const authors = this.authorRegistry.all().filter((a) => a.id && a.name);
     const folders = this.discoverStashpadFolders();
+    const allFiles = this.app.vault.getMarkdownFiles();
     let created = 0;
     for (const folder of folders) {
       const dir = `${folder}/_authors`;
+      // Precompute the set of author ids that already have a stub in this
+      // dir (under any name) once per folder, rather than rescanning the
+      // whole vault for every author.
+      const presentIds = new Set<string>();
+      for (const f of allFiles) {
+        if (!f.path.startsWith(dir + "/")) continue;
+        const id = this.parseAuthorFilePath(f.path)?.id;
+        if (id) presentIds.add(id);
+      }
       for (const rec of authors) {
+        if (presentIds.has(rec.id)) continue;     // don't duplicate after a rename
         const safe = this.authorNameToSafe(rec.name);
         const path = `${dir}/${safe}-${rec.id}.md`;
-        // Skip if a stub for this id already exists anywhere in this dir
-        // (under any name) — don't duplicate after a rename.
-        const exists = this.app.vault.getMarkdownFiles().some(
-          (f) => f.path.startsWith(dir + "/") && this.parseAuthorFilePath(f.path)?.id === rec.id,
-        );
-        if (exists) continue;
         try {
           await this.ensureFolderPath(dir);
           if (await this.app.vault.adapter.exists(path)) continue;
@@ -2330,6 +2438,41 @@ export default class StashpadPlugin extends Plugin {
       }
     }
     return { created, folders: folders.length };
+  }
+
+  /** 0.79.12: add each discovered Stashpad folder's `_archive` to
+   *  Obsidian's "Excluded files" list (`userIgnoreFilters`) so native
+   *  search, quick switcher, graph, and link suggestions skip the
+   *  import-originals graveyard. Add-only + idempotent — never removes the
+   *  user's own entries. Uses Obsidian's internal vault config getters,
+   *  which are undocumented; guarded in try/catch in case they change. */
+  syncObsidianExcludedArchives(): void {
+    try {
+      const vault = this.app.vault as any;
+      if (typeof vault.getConfig !== "function" || typeof vault.setConfig !== "function") return;
+      const current: string[] = Array.isArray(vault.getConfig("userIgnoreFilters"))
+        ? vault.getConfig("userIgnoreFilters") : [];
+      const set = new Set(current);
+      let changed = false;
+      for (const folder of this.discoverStashpadFolders()) {
+        const path = `${folder.replace(/\/+$/, "")}/_archive/`;
+        if (!set.has(path)) { set.add(path); changed = true; }
+      }
+      if (changed) vault.setConfig("userIgnoreFilters", [...set]);
+    } catch (e) {
+      console.warn("[Stashpad] couldn't update Obsidian excluded files", e);
+    }
+  }
+
+  /** 0.79.4: open the import destination chooser. Pinned top entry opens
+   *  the OS file picker into the default folder; other entries target a
+   *  specific Stashpad folder. With a single folder, skip to the picker. */
+  openImportPicker(): void {
+    const folders = this.discoverStashpadFolders();
+    if (folders.length === 0) { new Notice("No Stashpad folders to import into."); return; }
+    if (folders.length === 1) { this.importService.pickFilesInto(folders[0]); return; }
+    const def = this.importService.defaultDestination() ?? folders[0];
+    new ImportTargetModal(this.app, def, folders, (folder) => this.importService.pickFilesInto(folder)).open();
   }
 
   /** 0.77.7: ensure the LOCAL user's author page exists in `folder`,
@@ -2885,4 +3028,34 @@ function normalizeDrafts(raw: any): Record<string, string> {
     }
   }
   return out;
+}
+
+/** 0.79.4: destination chooser for the Import command. The pinned top
+ *  entry opens the OS file picker into the default folder; the rest target
+ *  a specific Stashpad folder. */
+interface ImportTarget { label: string; folder: string; pinned?: boolean }
+class ImportTargetModal extends SuggestModal<ImportTarget> {
+  constructor(
+    app: import("obsidian").App,
+    private def: string,
+    private folders: string[],
+    private onPick: (folder: string) => void,
+  ) {
+    super(app);
+    this.setPlaceholder("Open the file picker, or choose a destination folder…");
+  }
+  getSuggestions(query: string): ImportTarget[] {
+    const q = query.toLowerCase();
+    const defName = this.def.split("/").pop() || this.def;
+    const pinned: ImportTarget = { label: `📂 Open file picker → ${defName}`, folder: this.def, pinned: true };
+    const rest = this.folders
+      .filter((f) => f.toLowerCase().includes(q))
+      .map((f) => ({ label: `Import into ${f}`, folder: f }));
+    return [pinned, ...rest];
+  }
+  renderSuggestion(item: ImportTarget, el: HTMLElement): void {
+    el.createDiv({ text: item.label });
+    if (item.pinned) el.addClass("is-pinned-import-target");
+  }
+  onChooseSuggestion(item: ImportTarget): void { this.onPick(item.folder); }
 }

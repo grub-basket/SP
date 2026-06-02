@@ -5,6 +5,23 @@ import { ROOT_ID, type StashpadId } from "./types";
 
 export const STASH_EXT = "stash";
 export const SCHEMA_VERSION = 1;
+
+/** 0.77.11 (security): collapse a ZIP entry name to a safe, single-segment
+ *  filename — defends against zip-slip. A crafted .stash could contain
+ *  entries like `attachments/../../../.obsidian/evil.js`; without this the
+ *  `..` segments would let the write escape the destination folder (and
+ *  potentially the vault). We keep only the final path segment and reject
+ *  anything that's empty or still dot-only. Returns "" to signal "skip". */
+export function safeZipEntryName(name: string): string {
+  // Last segment after either separator; drops all directory components,
+  // which also neutralises any `..` parts.
+  const base = name.split(/[\\/]/).pop() ?? "";
+  const trimmed = base.trim();
+  if (!trimmed || trimmed === "." || trimmed === "..") return "";
+  // Belt-and-suspenders: no separators or parent refs survive.
+  if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("..")) return "";
+  return trimmed;
+}
 const ATTACHMENT_LINK_RE = /!\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]/g;
 
 export interface StashManifest {
@@ -113,7 +130,12 @@ export async function importStashZip(
   for (const f of noteEntries) {
     const content = await f.async("string");
     const { fm, body } = splitFrontmatter(content);
-    parsed.push({ originalName: f.name.slice("notes/".length), fm, body });
+    // Security: flatten to a safe single-segment name (zip-slip defense).
+    // Fall back to the note id (or a generated name) if the entry name is
+    // empty/traversal-only; a later collision check still de-dupes.
+    const safeName = safeZipEntryName(f.name.slice("notes/".length))
+      || `${(fm.id as string) || "imported-" + newId(4)}.md`;
+    parsed.push({ originalName: safeName, fm, body });
   }
 
   // Build id remap (collision-aware).
@@ -141,8 +163,8 @@ export async function importStashZip(
   );
   if (attEntries.length > 0) await ensureFolder(app, attachmentsFolder);
   for (const f of attEntries) {
-    const basename = f.name.slice("attachments/".length);
-    if (!basename) continue;
+    const basename = safeZipEntryName(f.name.slice("attachments/".length));
+    if (!basename) continue;  // empty or traversal attempt → skip
     const destPath = `${attachmentsFolder}/${basename}`;
     if (await app.vault.adapter.exists(destPath)) continue; // dedup by name
     const buf = await f.async("arraybuffer");
@@ -259,7 +281,7 @@ function remixFilename(originalName: string, oldId: string, newId: string): stri
   return originalName.replace(/\.md$/, `-${newId}.md`);
 }
 
-function splitFrontmatter(content: string): { fm: Record<string, any>; body: string } {
+export function splitFrontmatter(content: string): { fm: Record<string, any>; body: string } {
   if (!content.startsWith("---")) return { fm: {}, body: content };
   const end = content.indexOf("\n---", 3);
   if (end < 0) return { fm: {}, body: content };
@@ -272,7 +294,7 @@ function splitFrontmatter(content: string): { fm: Record<string, any>; body: str
   return { fm, body };
 }
 
-function serializeNote(fm: Record<string, any>, body: string): string {
+export function serializeNote(fm: Record<string, any>, body: string): string {
   const yaml = stringifyYaml(fm).trimEnd();
   return `---\n${yaml}\n---\n${body}`;
 }

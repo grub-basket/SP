@@ -5,6 +5,8 @@ import {
   STASHPAD_PANELS_VIEW_TYPE,
   STASHPAD_VIEW_TYPE,
   fmHasTag,
+  parseAssignees,
+  parseAuthorRef,
   type PinnedNoteRef,
   type StashpadId,
 } from "./types";
@@ -33,6 +35,10 @@ interface TaskItem {
   due: number | null;
   dueRaw: string | null;
   color: string | null;
+  /** 0.78.2: assignment. assignedTo = people the task is assigned to;
+   *  assignedBy = who delegated it (or null). */
+  assignedTo: Array<{ id: string; name: string }>;
+  assignedBy: { id: string; name: string } | null;
 }
 
 /** Panel ids registered with the StashpadPanelsView. Future panels
@@ -60,6 +66,10 @@ export class StashpadPanelsView extends ItemView {
   /** 0.76.4: active sub-filter within the Tasks panel. "all" stacks
    *  every section; the others show just that bucket. Per-session. */
   private taskFilter: "all" | "overdue" | "today" | "upcoming" | "nodate" | "completed" = "all";
+  /** 0.78.2: assignment sub-filter, combined with taskFilter via AND.
+   *  Fixed buckets ("all"/"mine"/"others"/"byme"/"unassigned") or a
+   *  per-person filter encoded as "person:<authorId>" (0.78.3). */
+  private taskAssignFilter: string = "all";
   /** 0.73.11: programmatic panel switch. Called by the per-panel
    *  command-palette entries so the sidebar lands on the right tab
    *  when invoked from the keyboard. */
@@ -732,10 +742,74 @@ export class StashpadPanelsView extends ItemView {
    *  span folders now (v1 grouped by folder; v2 groups by status). */
   private renderTasksPanel(parent: HTMLElement): void {
     const list = parent.createDiv({ cls: "stashpad-panel-tasks" });
-    const tasks = this.collectTasks();
-    if (tasks.length === 0) {
+    const allTasks = this.collectTasks();
+    if (allTasks.length === 0) {
       list.createDiv({ cls: "stashpad-tasks-empty" })
         .setText("No tasks yet — press H on a note to mark it a task, or D to give it a due date.");
+      return;
+    }
+
+    // 0.78.2: assignment filter (AND-combined with the status filter
+    // below). "me" = the local author id.
+    const meId = (this.plugin.settings.authorId ?? "").trim();
+    const isMine = (t: TaskItem) => !!meId && t.assignedTo.some((a) => a.id === meId);
+    const assignMatches = (t: TaskItem): boolean => {
+      const f = this.taskAssignFilter;
+      if (f.startsWith("person:")) {
+        const pid = f.slice("person:".length);
+        return t.assignedTo.some((a) => a.id === pid);
+      }
+      switch (f) {
+        case "mine": return isMine(t);
+        case "others": return t.assignedTo.length > 0 && !isMine(t);
+        case "byme": return !!meId && t.assignedBy?.id === meId;
+        case "unassigned": return t.assignedTo.length === 0;
+        default: return true;
+      }
+    };
+    // Distinct people across all tasks (assignees + assigners), for the
+    // per-person filter options. Sorted by name; "me" excluded from the
+    // per-person list since "Assigned to me" already covers it.
+    const people = new Map<string, string>();
+    for (const t of allTasks) {
+      for (const a of t.assignedTo) if (a.id !== meId) people.set(a.id, a.name);
+      if (t.assignedBy && t.assignedBy.id !== meId) people.set(t.assignedBy.id, t.assignedBy.name);
+    }
+    const personOpts = [...people.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    // Dropdown chip for the assignment filter.
+    const assignBar = list.createDiv({ cls: "stashpad-task-assign-bar" });
+    assignBar.createSpan({ cls: "stashpad-task-assign-label", text: "Assignment" });
+    const sel = assignBar.createEl("select", { cls: "stashpad-task-assign-select" });
+    const labelFor = (val: string): string => {
+      const fixed: Record<string, string> = {
+        all: "Everyone", mine: "Assigned to me", others: "Assigned to others",
+        byme: "Assigned by me", unassigned: "Unassigned",
+      };
+      if (val.startsWith("person:")) return people.get(val.slice(7)) ?? "Person";
+      return fixed[val] ?? val;
+    };
+    const addOpt = (val: string): void => {
+      const o = sel.createEl("option", { text: labelFor(val), value: val });
+      if (this.taskAssignFilter === val) o.selected = true;
+    };
+    for (const v of ["all", "mine", "others", "byme", "unassigned"]) addOpt(v);
+    if (personOpts.length > 0) {
+      const grp = sel.createEl("optgroup");
+      grp.setAttr("label", "By person");
+      for (const p of personOpts) {
+        const o = grp.createEl("option", { text: p.name, value: `person:${p.id}` });
+        if (this.taskAssignFilter === `person:${p.id}`) o.selected = true;
+      }
+    }
+    sel.onchange = () => { this.taskAssignFilter = sel.value; this.render(); };
+
+    const tasks = allTasks.filter(assignMatches);
+    if (tasks.length === 0) {
+      list.createDiv({ cls: "stashpad-tasks-empty" })
+        .setText(`No tasks match "${labelFor(this.taskAssignFilter)}".`);
       return;
     }
 
@@ -853,6 +927,20 @@ export class StashpadPanelsView extends ItemView {
       // Unparseable due string — show it raw rather than dropping it.
       row.createSpan({ cls: "stashpad-task-due", text: t.dueRaw });
     }
+    // 0.78.2: assignee chips. Show each assignee's first name (or initials
+    // when there are several) so you can see who owns the task at a glance.
+    if (t.assignedTo.length > 0) {
+      const meId = (this.plugin.settings.authorId ?? "").trim();
+      const wrap = row.createSpan({ cls: "stashpad-task-assignees" });
+      for (const a of t.assignedTo) {
+        const chip = wrap.createSpan({ cls: "stashpad-task-assignee" });
+        if (meId && a.id === meId) chip.addClass("is-me");
+        // 0.78.5: always show initials to save row space; hover reveals
+        // the full name.
+        chip.setText(this.initials(a.name));
+        chip.title = meId && a.id === meId ? `${a.name} (you)` : a.name;
+      }
+    }
     row.oncontextmenu = (e) => {
       e.preventDefault();
       const menu = new Menu();
@@ -893,6 +981,15 @@ export class StashpadPanelsView extends ItemView {
     this.scheduleRender();
   }
 
+  /** First-letter initials (up to 2) for a name, for compact assignee
+   *  chips when a task has several assignees. */
+  private initials(name: string): string {
+    const parts = name.trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) return "?";
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  }
+
   private collectTasks(): TaskItem[] {
     const folders = this.plugin.discoverStashpadFolders();
     const folderSet = new Set(folders);
@@ -931,6 +1028,8 @@ export class StashpadPanelsView extends ItemView {
         due,
         dueRaw,
         color: typeof fm.color === "string" ? fm.color : null,
+        assignedTo: parseAssignees(fm),
+        assignedBy: parseAuthorRef(fm.assignedBy),
       });
     }
     return out;

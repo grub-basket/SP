@@ -1,5 +1,5 @@
 import { TFile, TFolder, type App, type CachedMetadata } from "obsidian";
-import { ROOT_ID, type StashpadId, type TreeNode } from "./types";
+import { ROOT_ID, RESERVED_SUBFOLDER_NAMES, type StashpadId, type TreeNode } from "./types";
 
 /** Walk a Stashpad folder's TFolder subtree and return every .md file under
  *  it. Iterative DFS rather than recursive to avoid a deep-recursion blow-up
@@ -17,7 +17,11 @@ function collectMarkdown(app: App, folderPath: string): TFile[] {
       if (child instanceof TFile) {
         if (child.extension === "md") out.push(child);
       } else if (child instanceof TFolder) {
-        stack.push(child);
+        // 0.79.12: never descend into reserved Stashpad subfolders
+        // (_archive / _attachments / _authors / …) — their files aren't
+        // notes, and an archived original carrying a Stashpad id would
+        // otherwise surface as a phantom duplicate note.
+        if (!RESERVED_SUBFOLDER_NAMES.has(child.name)) stack.push(child);
       }
     }
   }
@@ -109,7 +113,11 @@ export class TreeIndex {
         this.byPath.set(f.path, ROOT_ID);
         continue;
       }
-      const parent = (fm?.parent as string | null | undefined) ?? null;
+      let parent = (fm?.parent as string | null | undefined) ?? null;
+      // 0.77.11 (robustness): a note declaring itself as its own parent
+      // (a 1-node cycle, e.g. from a hand-edited/synced frontmatter on a
+      // shared drive) would hang every parent-chain walk. Pin it to ROOT.
+      if (parent === id) parent = null;
       this.nodes.set(id, {
         id,
         parent: parent ?? ROOT_ID,
@@ -199,8 +207,10 @@ export class TreeIndex {
 
   pathTo(id: StashpadId): TreeNode[] {
     const out: TreeNode[] = [];
+    const seen = new Set<StashpadId>();   // cycle guard (see rebuild note)
     let cur = this.nodes.get(id);
-    while (cur && cur.id !== ROOT_ID) {
+    while (cur && cur.id !== ROOT_ID && !seen.has(cur.id)) {
+      seen.add(cur.id);
       out.unshift(cur);
       cur = cur.parent ? this.nodes.get(cur.parent) : undefined;
     }

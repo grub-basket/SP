@@ -96,7 +96,91 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   "id", "parent", "created", "modified", "attachments", "position",
   "author", "contributors",
   "parentLink", "children",
+  // 0.78.1: task scheduling/assignment — Stashpad-managed, so clones /
+  // templates must not carry someone else's due date or assignees.
+  "due", "assignedTo", "assignedBy",
 ] as const;
+
+/** Reserved Stashpad subfolder names (machine-managed; not user notes).
+ *  Centralised so search/link/folder surfaces filter them consistently. */
+export const RESERVED_SUBFOLDER_NAMES: ReadonlySet<string> = new Set([
+  "_attachments", "_authors", "_exports", "_imports", "_processed",
+  "_archive", ".archive", // .archive is legacy (pre-0.79.10)
+]);
+/** True if any path segment is a reserved Stashpad subfolder. */
+export function isInReservedSubfolder(path: string): boolean {
+  return path.split("/").some((seg) => RESERVED_SUBFOLDER_NAMES.has(seg));
+}
+/** True if the path lives under an archive subfolder (`_archive`/`.archive`)
+ *  — the import-originals graveyard, excluded from search + link surfaces. */
+export function isArchivedPath(path: string): boolean {
+  return path.split("/").some((seg) => seg === "_archive" || seg === ".archive");
+}
+
+/** File extensions Stashpad never surfaces in link/search (plugin-internal
+ *  formats users don't link to). `.edtz` = Encrypted Templater. */
+export const IGNORED_FILE_EXTENSIONS: ReadonlySet<string> = new Set(["edtz"]);
+export function isIgnoredFileExtension(path: string): boolean {
+  const m = path.match(/\.([^./]+)$/);
+  return !!m && IGNORED_FILE_EXTENSIONS.has(m[1].toLowerCase());
+}
+
+/** Test a path against Obsidian's "Excluded files" entries
+ *  (`userIgnoreFilters`): an entry wrapped in `/.../` is a regex; otherwise
+ *  it's a path prefix. Lets our surfaces inherit the user's exclusion list
+ *  so they manage it in one place. */
+export function matchesObsidianIgnore(path: string, filters: string[] | undefined): boolean {
+  if (!Array.isArray(filters)) return false;
+  for (const raw of filters) {
+    const f = (raw ?? "").trim();
+    if (!f) continue;
+    if (f.length > 2 && f.startsWith("/") && f.endsWith("/")) {
+      try { if (new RegExp(f.slice(1, -1)).test(path)) return true; } catch { /* bad regex */ }
+    } else if (path === f || path.startsWith(f.endsWith("/") ? f : f + "/")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Sift: the canonical Stashpad search match — all whitespace-split tokens
+ *  must each appear (case-insensitive substring) somewhere in the haystack,
+ *  in any order. Empty query matches everything. See docs/sift.md. Exported
+ *  so simple inputs (e.g. the assignee picker) reuse it instead of
+ *  re-implementing `includes`. */
+export function siftMatch(query: string, haystack: string): boolean {
+  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+  const hay = haystack.toLowerCase();
+  return tokens.every((t) => hay.includes(t));
+}
+
+/** 0.78.1: parse an author wikilink as Stashpad writes it into
+ *  author / contributors / assignedTo / assignedBy frontmatter —
+ *  `[[demo/_authors/Jane-743jcy.md|Jane Doe]]` → { id: "743jcy",
+ *  name: "Jane Doe" }. The alias (after `|`) is the display name; if
+ *  absent we de-slug the filename stem. Returns null when no id segment
+ *  is present. Shared so main/view/panels parse identically. */
+export function parseAuthorRef(raw: unknown): { id: string; name: string } | null {
+  if (typeof raw !== "string") return null;
+  const inner = raw.replace(/^\[\[/, "").replace(/\]\]$/, "");
+  const [target, alias] = inner.split("|");
+  const m = target.match(/_authors\/(.+?)-([a-z0-9]{4,12})(?:\.md)?$/i);
+  if (!m) return null;
+  const id = m[2];
+  const name = (alias ?? "").trim() || m[1].replace(/-/g, " ").trim();
+  return { id, name };
+}
+
+/** Read an assignee list (`assignedTo`) from frontmatter into
+ *  {id,name}[]. Accepts an array of wikilinks or a single wikilink. */
+export function parseAssignees(fm: any): Array<{ id: string; name: string }> {
+  const raw = fm?.assignedTo;
+  const arr = Array.isArray(raw) ? raw : (raw != null ? [raw] : []);
+  const out: Array<{ id: string; name: string }> = [];
+  for (const r of arr) { const p = parseAuthorRef(r); if (p) out.push(p); }
+  return out;
+}
 
 /** Explicit instruction for what the post-`render()` block should do with
  *  the list scrollTop. Replaces the legacy quorum of flags

@@ -1,4 +1,5 @@
 import { AbstractInputSuggest, App, TFolder } from "obsidian";
+import { RESERVED_SUBFOLDER_NAMES } from "./types";
 
 /** Folder-path autocomplete for a settings text input. Mirrors the
  *  affordance Obsidian itself uses for "default folder for new notes"
@@ -26,6 +27,10 @@ export class FolderSuggest extends AbstractInputSuggest<TFolder> {
       tokens.every((t) => path.toLowerCase().includes(t));
     const out: TFolder[] = [];
     const walk = (folder: TFolder): void => {
+      // 0.79.12: skip reserved Stashpad subfolders (e.g. _archive,
+      // _attachments) — and their subtrees — so they aren't offered as
+      // destinations.
+      if (folder.path !== "/" && RESERVED_SUBFOLDER_NAMES.has(folder.name)) return;
       // Skip the vault root from the suggestion list — its path is "/"
       // and selecting it sets the input to "/" which most callers
       // normalize away anyway. Children are still suggested.

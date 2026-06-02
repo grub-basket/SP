@@ -128,6 +128,14 @@ export interface StashpadSettings {
   folder: string;
   importDropFolder: string;
   exportFolder: string;
+  /** 0.79.1: auto-import files dropped directly into a Stashpad folder
+   *  root. Markdown → Stashpad note (original archived to .archive);
+   *  other files → a linking note + the file moved to _attachments. */
+  autoImport: boolean;
+  /** 0.79.14: when on, Stashpad's link autocomplete + file surfaces also
+   *  honor Obsidian's "Excluded files" (userIgnoreFilters), so exclusions
+   *  are managed in one place. `.edtz` is always excluded regardless. */
+  inheritObsidianExclusions: boolean;
   useTemplatesFormat: boolean;
   prefixTimestampsOnCopy: boolean;
   splitOnLines: boolean;
@@ -249,6 +257,10 @@ export interface StashpadSettings {
    *  visible only if there's still work somewhere in its subtree.
    *  Default false. */
   hideCompletedNotes: Record<string, boolean>;
+  /** 0.79.8: per-folder "hide notes without attachments" filter — show
+   *  only notes that have an attachment (a parent stays visible while any
+   *  descendant has one). Keyed by folder path. Default false. */
+  attachmentsOnlyNotes: Record<string, boolean>;
   /** Notification categories the user has silenced. Empty by default —
    *  every toast renders. Set per-category by the settings UI (commit
    *  0.55.5 wires this up). Stored as a string array on disk so future
@@ -330,8 +342,10 @@ export interface StashpadSettings {
 
 export const DEFAULT_SETTINGS: StashpadSettings = {
   folder: "Stashpad",
-  importDropFolder: "_imports",
+  importDropFolder: "",
   exportFolder: "_exports",
+  autoImport: true,
+  inheritObsidianExclusions: true,
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
   splitOnLines: false,
@@ -369,6 +383,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   includeAttachmentsInEverything: {},
   hideChildlessNotes: {},
   hideCompletedNotes: {},
+  attachmentsOnlyNotes: {},
   mutedNotificationCategories: [],
   notificationHistoryLimit: 5000,
   autoNavOnMoveIn: false,
@@ -689,10 +704,24 @@ export class StashpadSettingTab extends PluginSettingTab {
       });
 
     new Setting(parent)
-      .setName("Stash import subfolder")
-      .setDesc("Subfolder name (relative to each Stashpad folder) where dropped .stash files auto-import. Created on demand. Leave blank to disable auto-import.")
+      .setName("Auto-import dropped files")
+      .setDesc("When on, any file you drop directly into a Stashpad folder is imported automatically: markdown becomes a note (the original is archived to .archive); other files move to _attachments with a note that links to them. Large drops ask for confirmation first.")
+      .addToggle((t) => t.setValue(this.plugin.settings.autoImport).onChange(async (v) => {
+        this.plugin.settings.autoImport = v; await this.plugin.saveSettings();
+      }));
+
+    new Setting(parent)
+      .setName("Inherit Obsidian's excluded files")
+      .setDesc("Also hide files matching Obsidian's “Excluded files” list (Settings → Files & Links) from Stashpad's link autocomplete and file surfaces — so you manage exclusions in one place. Plugin-internal formats like .edtz are always excluded regardless.")
+      .addToggle((t) => t.setValue(this.plugin.settings.inheritObsidianExclusions).onChange(async (v) => {
+        this.plugin.settings.inheritObsidianExclusions = v; await this.plugin.saveSettings();
+      }));
+
+    new Setting(parent)
+      .setName("Dedicated import subfolder (optional)")
+      .setDesc("Optional. A subfolder (relative to each Stashpad folder) where dropped .stash files auto-import. Leave blank to just drop files into the Stashpad folder itself (recommended). Suggested name: _imports.")
       .addText((t) =>
-        t.setValue(this.plugin.settings.importDropFolder).setPlaceholder("_imports").onChange(async (v) => {
+        t.setValue(this.plugin.settings.importDropFolder).setPlaceholder("_imports (leave blank to use the folder root)").onChange(async (v) => {
           this.plugin.settings.importDropFolder = (v || "").trim().replace(/^\/+|\/+$/g, "");
           await this.plugin.saveSettings();
         }));
@@ -714,9 +743,10 @@ export class StashpadSettingTab extends PluginSettingTab {
         b.setButtonText("Rebootstrap now").onClick(async () => {
           b.setDisabled(true).setButtonText("Working…");
           try {
-            const { touched, fmChecked, fmWritten, slugsRenamed, authors } = await this.plugin.rebootstrapAllFolders();
+            const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported } = await this.plugin.rebootstrapAllFolders();
             const parts: string[] = [];
             parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
+            if (imported > 0) parts.push(`imported ${imported} loose file${imported === 1 ? "" : "s"}`);
             if (fmWritten > 0) parts.push(`updated frontmatter on ${fmWritten} of ${fmChecked} notes`);
             else if (fmChecked > 0) parts.push(`frontmatter already in sync (${fmChecked} notes checked)`);
             if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"} to match body`);
