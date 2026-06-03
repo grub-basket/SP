@@ -1,6 +1,7 @@
 import { TFile, type App } from "obsidian";
 import { ROOT_ID, type StashpadId, type TreeNode } from "./types";
 import type { TreeIndex } from "./tree-index";
+import { perf } from "./perf";
 
 const PARENT_LINK_FIELD = "parentLink";
 const CHILDREN_FIELD = "children";
@@ -213,12 +214,12 @@ export class FrontmatterSyncQueue {
     const parentLink = this.computeParentLink(node);
     const childrenLinks = this.computeChildrenLinks(node);
     try {
-      await this.app.fileManager.processFrontMatter(node.file, (fm) => {
+      await perf.timeAsync("write.fmSync", () => this.app.fileManager.processFrontMatter(node.file!, (fm) => {
         if (parentLink) fm[PARENT_LINK_FIELD] = parentLink;
         else delete fm[PARENT_LINK_FIELD];
         if (childrenLinks.length > 0) fm[CHILDREN_FIELD] = childrenLinks;
         else delete fm[CHILDREN_FIELD];
-      });
+      }));
     } catch (e) {
       console.warn("[Stashpad] frontmatter sync failed", node.file?.path, e);
       // Surface to subscribers (the view turns this into a persistent

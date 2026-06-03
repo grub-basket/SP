@@ -1,5 +1,5 @@
 import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
-import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, type PinnedNoteRef, type StashpadId } from "./types";
+import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, type PinnedNoteRef, type StashpadId } from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath } from "./view";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
@@ -18,6 +18,7 @@ import { NotificationService, buildFileActions } from "./notifications";
 import { AuthorRegistry } from "./author-registry";
 import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
+import { perf } from "./perf";
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
@@ -26,6 +27,11 @@ export default class StashpadPlugin extends Plugin {
    *  Used by sidebar panel actions (Search, Home) so they target the
    *  user's actual current tab rather than getLeavesOfType()[0]. */
   lastActiveStashpadLeaf: WorkspaceLeaf | null = null;
+  /** 0.79.19: true while rebootstrap is running. Suppresses the
+   *  contribution stamp so rebootstrap's own frontmatter writes — and the
+   *  wikilink rewrites Obsidian does when slug-renames move files — never
+   *  bump `modified` (or add the local user as a contributor). */
+  rebootstrapInProgress = false;
   /** 0.73.10: keep a handle on the settings tab so command-palette
    *  entries can pre-select a specific tab when opening Settings. */
   settingTab: StashpadSettingTab | null = null;
@@ -470,6 +476,7 @@ export default class StashpadPlugin extends Plugin {
     // loadSettings so the data.json move is in place when we read.
     await this.migrateLegacyPaths();
     await this.loadSettings();
+    perf.enabled = !!this.settings.enablePerfProfiling;
     this.settingTab = new StashpadSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
@@ -825,6 +832,28 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
     this.addCommand({ id: "stashpad-toggle-task", name: "Toggle task (todo)", callback: () => call("cmdToggleTask") });
     this.addCommand({ id: "stashpad-set-due", name: "Set due date…", callback: () => call("cmdSetDue") });
+    // 0.81.1: performance profiling — dump / reset the timing report.
+    this.addCommand({
+      id: "stashpad-dump-perf",
+      name: "Dump performance profile (copy to clipboard)",
+      callback: async () => {
+        if (!this.settings.enablePerfProfiling) {
+          new Notice("Enable “Performance profiling” in Stashpad settings first, then use the app and run this again.");
+          return;
+        }
+        const report = perf.report();
+        console.log(report);
+        try { await navigator.clipboard.writeText(report); } catch {}
+        new Notice("Performance profile copied to clipboard (also in the console).");
+      },
+    });
+    this.addCommand({
+      id: "stashpad-reset-perf",
+      name: "Reset performance profile",
+      callback: () => { perf.reset(); new Notice("Performance profile reset."); },
+    });
+    this.addCommand({ id: "stashpad-jump-to-top", name: "Jump to top of list", callback: () => call("jumpToTop") });
+    this.addCommand({ id: "stashpad-jump-to-bottom", name: "Jump to bottom of list", callback: () => call("jumpToBottom") });
     this.addCommand({ id: "stashpad-assign", name: "Assign task to…", callback: () => call("cmdAssign") });
     // 0.79.3: view what's been auto-imported.
     this.addCommand({
@@ -1001,10 +1030,11 @@ export default class StashpadPlugin extends Plugin {
       callback: async () => {
         new Notice("Stashpad: rebootstrapping…");
         try {
-          const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported } = await this.rebootstrapAllFolders();
+          const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked } = await this.rebootstrapAllFolders();
           const parts: string[] = [];
           parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
           if (imported > 0) parts.push(`imported ${imported} loose file${imported === 1 ? "" : "s"}`);
+          if (attachmentsLinked > 0) parts.push(`linked attachments on ${attachmentsLinked} note${attachmentsLinked === 1 ? "" : "s"}`);
           if (fmWritten > 0) parts.push(`updated ${fmWritten} note${fmWritten === 1 ? "" : "s"}' metadata`);
           if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"}`);
           if (authors > 0) parts.push(`${authors} author${authors === 1 ? "" : "s"} in registry`);
@@ -1697,7 +1727,19 @@ export default class StashpadPlugin extends Plugin {
    *  ensure it has the import/export subfolders, and run the redundant-frontmatter
    *  backfill (parentLink + children) so older notes pick up the recovery fields.
    *  Used by the "Rebootstrap" button in settings to retrofit older folders. */
-  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number }> {
+  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number }> {
+    // 0.79.19: suppress contribution stamping for the duration (+ a short
+    // tail to catch async link-rewrite modify events) so rebootstrap never
+    // bumps `modified`/`created` or adds contributors.
+    this.rebootstrapInProgress = true;
+    try {
+      return await this.rebootstrapAllFoldersInner();
+    } finally {
+      window.setTimeout(() => { this.rebootstrapInProgress = false; }, 2500);
+    }
+  }
+
+  private async rebootstrapAllFoldersInner(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number }> {
     const ROOT_ID = "__root__";
     const seen = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -1762,7 +1804,11 @@ export default class StashpadPlugin extends Plugin {
     let authors = 0;
     try { authors = (await this.rebuildAuthorRegistry()).total; }
     catch (e) { console.warn("Stashpad: rebootstrap author-registry rebuild failed", e); }
-    return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported };
+    // 0.79.18: convert any plain-text attachment frontmatter to links.
+    let attachmentsLinked = 0;
+    try { attachmentsLinked = await this.convertAttachmentsToLinks(); }
+    catch (e) { console.warn("Stashpad: attachment-link conversion failed", e); }
+    return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked };
   }
 
   /** Walk every Stashpad note in `folder`. For each one whose filename
@@ -2440,6 +2486,38 @@ export default class StashpadPlugin extends Plugin {
     return { created, folders: folders.length };
   }
 
+  /** 0.79.18: convert plain-text `attachments` frontmatter entries to
+   *  internal links (`[[path]]`) across all notes. Idempotent — only
+   *  rewrites notes that have at least one non-link entry, and
+   *  `toAttachmentLink` never re-brackets an existing link, so re-running
+   *  can't double-wrap or loop. Returns the count of notes changed. */
+  async convertAttachmentsToLinks(): Promise<number> {
+    let converted = 0;
+    const isLink = (s: string) => /^\[\[.*\]\]$/.test(s.trim());
+    for (const folder of this.discoverStashpadFolders()) {
+      const dir = folder.replace(/\/+$/, "");
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const fdir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+        if (fdir !== dir && !fdir.startsWith(dir + "/")) continue;
+        if (isInReservedSubfolder(f.path)) continue; // skip _archive/_attachments/…
+        const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
+        if (!fm || typeof fm.id !== "string" || !fm.id) continue;
+        if (!Array.isArray(fm.attachments)) continue;
+        const needs = fm.attachments.some((a: any) => typeof a === "string" && a.trim() && !isLink(a));
+        if (!needs) continue;
+        try {
+          await this.app.fileManager.processFrontMatter(f, (m: any) => {
+            if (Array.isArray(m.attachments)) {
+              m.attachments = m.attachments.map((a: any) => (typeof a === "string" && a.trim()) ? toAttachmentLink(a) : a);
+            }
+          });
+          converted++;
+        } catch (e) { console.warn("[Stashpad] attachment-link conversion failed", f.path, e); }
+      }
+    }
+    return converted;
+  }
+
   /** 0.79.12: add each discovered Stashpad folder's `_archive` to
    *  Obsidian's "Excluded files" list (`userIgnoreFilters`) so native
    *  search, quick switcher, graph, and link suggestions skip the
@@ -2720,6 +2798,7 @@ export default class StashpadPlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.queueWrite();
     setSettings(this.settings);
+    perf.enabled = !!this.settings.enablePerfProfiling;
     // 0.77.1: keep the registry's record of the local user current. The
     // registry is a recovery cache — recording here means a name/role/
     // department change is remembered (with rename history) even if the
@@ -3030,10 +3109,10 @@ function normalizeDrafts(raw: any): Record<string, string> {
   return out;
 }
 
-/** 0.79.4: destination chooser for the Import command. The pinned top
- *  entry opens the OS file picker into the default folder; the rest target
- *  a specific Stashpad folder. */
-interface ImportTarget { label: string; folder: string; pinned?: boolean }
+/** 0.79.4 / 0.80.1: destination chooser for the Import command. Lists the
+ *  Stashpad folders with the current/active one first; picking one opens
+ *  the OS file picker into that folder and imports the chosen files. */
+interface ImportTarget { label: string; folder: string; current?: boolean }
 class ImportTargetModal extends SuggestModal<ImportTarget> {
   constructor(
     app: import("obsidian").App,
@@ -3042,20 +3121,22 @@ class ImportTargetModal extends SuggestModal<ImportTarget> {
     private onPick: (folder: string) => void,
   ) {
     super(app);
-    this.setPlaceholder("Open the file picker, or choose a destination folder…");
+    this.setPlaceholder("Choose a Stashpad folder to import into…");
   }
   getSuggestions(query: string): ImportTarget[] {
     const q = query.toLowerCase();
-    const defName = this.def.split("/").pop() || this.def;
-    const pinned: ImportTarget = { label: `📂 Open file picker → ${defName}`, folder: this.def, pinned: true };
-    const rest = this.folders
+    // Current folder first, then the rest (deduped), filtered by query.
+    const ordered = [this.def, ...this.folders.filter((f) => f !== this.def)];
+    return ordered
       .filter((f) => f.toLowerCase().includes(q))
-      .map((f) => ({ label: `Import into ${f}`, folder: f }));
-    return [pinned, ...rest];
+      .map((f) => ({ label: f, folder: f, current: f === this.def }));
   }
   renderSuggestion(item: ImportTarget, el: HTMLElement): void {
     el.createDiv({ text: item.label });
-    if (item.pinned) el.addClass("is-pinned-import-target");
+    if (item.current) {
+      el.createDiv({ cls: "stashpad-suggest-note", text: "current" });
+      el.addClass("is-pinned-import-target");
+    }
   }
   onChooseSuggestion(item: ImportTarget): void { this.onPick(item.folder); }
 }

@@ -1,0 +1,6 @@
+# Allow esbuild's postinstall script (downloads its native binary). pnpm 11+
+# blocks all install scripts by default as a security policy; this opts
+# esbuild in. Without it, `pnpm run build` fails before invoking the build
+# command because pnpm's deps-status preamble sees the blocked script.
+allowBuilds:
+  esbuild: true

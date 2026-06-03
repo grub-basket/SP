@@ -1,5 +1,5 @@
 import { TFile, TFolder, type App, type CachedMetadata } from "obsidian";
-import { ROOT_ID, RESERVED_SUBFOLDER_NAMES, type StashpadId, type TreeNode } from "./types";
+import { ROOT_ID, RESERVED_SUBFOLDER_NAMES, isInReservedSubfolder, type StashpadId, type TreeNode } from "./types";
 
 /** Walk a Stashpad folder's TFolder subtree and return every .md file under
  *  it. Iterative DFS rather than recursive to avoid a deep-recursion blow-up
@@ -317,6 +317,15 @@ export class TreeIndex {
   /** Apply a single file create/modify event. Returns true if the tree
    *  changed (caller should schedule onUpdate). */
   private applyChange(file: TFile): boolean {
+    // 0.80.5: never index files in reserved subfolders (_archive,
+    // _attachments, …). The full rebuild already skips them, but this
+    // incremental hook didn't — so an archived note (which keeps its
+    // Stashpad id) got re-inserted when its metadata cache fired, and then
+    // showed up in every tree-backed picker (find / move / destination).
+    // Clean up any node that slipped in before this guard existed.
+    if (isInReservedSubfolder(file.path)) {
+      return this.byPath.has(file.path) ? this.applyDelete(file.path) : false;
+    }
     const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
     const id = fm?.id as string | undefined;
     const oldId = this.byPath.get(file.path);
@@ -447,6 +456,14 @@ export class TreeIndex {
     if (!wasIn && !isIn) return false;
     if (wasIn && !isIn) return this.applyDelete(oldPath);
     if (!wasIn && isIn) return this.applyChange(file);
+    // 0.80.5: a within-folder move INTO a reserved subfolder (e.g. import
+    // archiving root/Note.md → _archive/Note.md) must drop the node, not
+    // just remap its path — otherwise the archived note lingers in the
+    // tree. (Moving back OUT falls through to applyChange below, since the
+    // archived path was never indexed, and re-adds it.)
+    if (isInReservedSubfolder(file.path)) {
+      return this.byPath.has(oldPath) ? this.applyDelete(oldPath) : false;
+    }
     // Rename within folder.
     const id = this.byPath.get(oldPath);
     if (!id) {

@@ -1,4 +1,9 @@
-import { App, Notice, PluginSettingTab, Setting, TFile } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting, TFile } from "obsidian";
+
+/** Platform-correct OS file-manager name for button/notice labels. */
+function osFileManagerName(): string {
+  return Platform.isMacOS ? "Finder" : Platform.isWin ? "File Explorer" : "file manager";
+}
 import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal, buildJdPreviewNotice } from "./index-builder";
 import { FolderSuggest } from "./folder-suggest";
 import type StashpadPlugin from "./main";
@@ -53,7 +58,8 @@ export type CommandId =
   | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
   | "swapWithParent"
   | "togglePin"
-  | "toggleTask" | "setDue";
+  | "toggleTask" | "setDue"
+  | "jumpToTop" | "jumpToBottom";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
  *  When BOTH are set, `preferRight` decides which actually fires. */
@@ -114,6 +120,8 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "togglePin",       label: "Pin / unpin selected note",     desc: "Default: P — toggle the sidebar pin state of the cursor row (or focused note).", defaultPrimary: "P" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: H — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "H" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
+  { id: "jumpToTop",       label: "Jump to top of list",           desc: "Default: Home — move the cursor to the first note in the current list.", defaultPrimary: "Home" },
+  { id: "jumpToBottom",    label: "Jump to bottom of list",        desc: "Default: End — move the cursor to the last note in the current list.", defaultPrimary: "End" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -136,6 +144,10 @@ export interface StashpadSettings {
    *  honor Obsidian's "Excluded files" (userIgnoreFilters), so exclusions
    *  are managed in one place. `.edtz` is always excluded regardless. */
   inheritObsidianExclusions: boolean;
+  /** 0.81.1: opt-in performance profiling — accumulates render/read/write
+   *  timing so the "Dump performance profile" command reports where the
+   *  time goes on a slow vault. Off by default. */
+  enablePerfProfiling: boolean;
   useTemplatesFormat: boolean;
   prefixTimestampsOnCopy: boolean;
   splitOnLines: boolean;
@@ -344,8 +356,9 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   folder: "Stashpad",
   importDropFolder: "",
   exportFolder: "_exports",
-  autoImport: true,
+  autoImport: false,
   inheritObsidianExclusions: true,
+  enablePerfProfiling: false,
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
   splitOnLines: false,
@@ -595,6 +608,13 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  from the pre-0.73.1 Log section. Inventory items A1–A4. */
   private renderDiagnosticsTab(parent: HTMLElement): void {
     new Setting(parent)
+      .setName("Performance profiling")
+      .setDesc("Record timing for list rendering, body reads, and file writes. Turn on, use Stashpad normally (especially the slow operations), then run “Dump performance profile” from the command palette and share the result. Off = zero overhead.")
+      .addToggle((t) => t.setValue(this.plugin.settings.enablePerfProfiling).onChange(async (v) => {
+        this.plugin.settings.enablePerfProfiling = v; await this.plugin.saveSettings();
+      }));
+
+    new Setting(parent)
       .setName("Open log file")
       .setDesc("Append-only history of creates, deletes, parent changes, renames. Stored alongside the plugin's other private files.")
       .addButton((b) =>
@@ -743,10 +763,11 @@ export class StashpadSettingTab extends PluginSettingTab {
         b.setButtonText("Rebootstrap now").onClick(async () => {
           b.setDisabled(true).setButtonText("Working…");
           try {
-            const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported } = await this.plugin.rebootstrapAllFolders();
+            const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked } = await this.plugin.rebootstrapAllFolders();
             const parts: string[] = [];
             parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
             if (imported > 0) parts.push(`imported ${imported} loose file${imported === 1 ? "" : "s"}`);
+            if (attachmentsLinked > 0) parts.push(`linked attachments on ${attachmentsLinked} note${attachmentsLinked === 1 ? "" : "s"}`);
             if (fmWritten > 0) parts.push(`updated frontmatter on ${fmWritten} of ${fmChecked} notes`);
             else if (fmChecked > 0) parts.push(`frontmatter already in sync (${fmChecked} notes checked)`);
             if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"} to match body`);
@@ -1186,7 +1207,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         });
       })
       .addButton((b) => {
-        b.setButtonText("Reveal in Finder");
+        b.setButtonText(`Reveal in ${osFileManagerName()}`);
         b.setTooltip("Open the designated Stashpad folder in your OS file browser.");
         b.onClick(async () => {
           const dest = (this.plugin.settings.jdIndexStashpadFolder ?? "").trim().replace(/^\/+|\/+$/g, "");

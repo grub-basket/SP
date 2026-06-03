@@ -4,10 +4,11 @@ import {
   moment, setIcon,
 } from "obsidian";
 import {
-  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees,
+  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, attachmentLinkPath,
   type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
 } from "./types";
 import { TreeIndex } from "./tree-index";
+import { perf } from "./perf";
 import { formatDateTime } from "./format";
 import { OrderStore } from "./order-store";
 import { SortStore, type SortMode, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
@@ -653,6 +654,8 @@ export class StashpadView extends ItemView {
     this.listResizeObserver = null;
     this.stickyRowObserver?.disconnect();
     this.stickyRowObserver = null;
+    this.bodyObserver?.disconnect();
+    this.bodyObserver = null;
     this.composerNarrowObserver?.disconnect();
     this.composerNarrowObserver = null;
     this.focusedMiniObserver?.disconnect();
@@ -1299,12 +1302,13 @@ export class StashpadView extends ItemView {
         if (!fm || !Array.isArray(fm.attachments)) continue;
         for (const a of fm.attachments) {
           if (typeof a !== "string") continue;
-          // attachments may be stored as bare path or with a leading slash;
-          // resolve via Obsidian's linkpath resolver when possible, fall
-          // back to literal path.
-          const resolved = this.app.metadataCache.getFirstLinkpathDest(a, child.path);
+          // attachments may be a wikilink ([[path]]), a bare path, or have a
+          // leading slash; normalize to the linktext then resolve via
+          // Obsidian, falling back to the literal path.
+          const linktext = attachmentLinkPath(a);
+          const resolved = this.app.metadataCache.getFirstLinkpathDest(linktext, child.path);
           if (resolved) out.add(resolved.path);
-          else out.add(a);
+          else out.add(linktext);
         }
       }
     }
@@ -1371,6 +1375,12 @@ export class StashpadView extends ItemView {
     // per-row overflow memo (see getOrComputeRender). One layout read
     // instead of one per row.
     this.lastListWidth = list.clientWidth || this.lastListWidth;
+    // 0.82.1: (re)arm the lazy-body observer for this paint. Cold rows
+    // (no cached render) get a cheap title placeholder and only do the
+    // expensive cachedRead + MarkdownRenderer once they scroll near the
+    // viewport — the profile showed body reads at full-list scale were
+    // ~97% of the time.
+    this.armBodyObserver();
     if (focused.file && Platform.isMobile) {
       this.renderFocusedHeaderMini(list, focused);
       this.renderFocusedHeader(list, focused);
@@ -1714,7 +1724,9 @@ export class StashpadView extends ItemView {
     if (fallbackScrollTop > 0) list.scrollTop = fallbackScrollTop;
   }
 
+  private _renderT0: number | null = null;
   private render(policy?: ScrollPolicy): void {
+    if (perf.enabled) this._renderT0 = performance.now();
     // 0.56.3: unannotated render() calls default to "preserve". That kills
     // the bouncing class of regressions where metadataCache-driven
     // re-renders (color change, frontmatter mod, fmSync rewrites) would
@@ -1914,6 +1926,7 @@ export class StashpadView extends ItemView {
     // reordered. Content-changed lets the panel refresh in place
     // while staying pinned to its displayed note. Genuine selection
     // changes fire from selectCursor / handleRowClick / navigateTo.
+    if (this._renderT0 != null) { perf.record("render.total", performance.now() - this._renderT0); this._renderT0 = null; }
     this.plugin.notifyStashpadContentChanged();
     // 0.79.9: when this render auto-selected a newly-created note, that's
     // a real selection change — notify so the detail panel unlocks and
@@ -3992,6 +4005,11 @@ export class StashpadView extends ItemView {
    *  per-row reflow thrash was the dominant cost of the "couple
    *  seconds to render" lag. */
   private renderCache = new Map<string, { mtime: number; text: string; attachments: string[]; html: string; ovW?: number; ovV?: boolean }>();
+  /** 0.82.1: lazy-body machinery. `bodyObserver` watches cold rows; when
+   *  one nears the viewport its deferred render closure (stored in
+   *  `lazyBodies`, keyed by the body container) runs once. */
+  private bodyObserver: IntersectionObserver | null = null;
+  private lazyBodies = new WeakMap<HTMLElement, () => void>();
   /** Width the list was last laid out at — the key for the overflow
    *  memo above. Captured once per populateListBody (one read), not
    *  per row. */
@@ -3999,21 +4017,68 @@ export class StashpadView extends ItemView {
 
   private async getOrComputeRender(file: TFile): Promise<{ mtime: number; text: string; attachments: string[]; html: string; ovW?: number; ovV?: boolean }> {
     const cached = this.renderCache.get(file.path);
-    if (cached && cached.mtime === file.stat.mtime) return cached;
+    if (cached && cached.mtime === file.stat.mtime) { perf.record("render.row.cacheHit", 0); return cached; }
     // Cache miss / stale entry. Read + parse + render into a detached div
-    // and stash the result before returning.
-    const md = await this.app.vault.cachedRead(file);
+    // and stash the result before returning. 0.81.1: split the body READ
+    // (network I/O on a share) from the markdown RENDER (CPU) so the
+    // profile shows which dominates.
+    const md = await perf.timeAsync("render.row.read", () => this.app.vault.cachedRead(file));
     const raw = this.stripFrontmatter(md);
     const { text, attachments } = this.splitAttachments(raw);
     const detached = createDiv({ cls: "stashpad-note-text" });
-    await MarkdownRenderer.render(this.app, text, detached, file.path, this as any);
+    await perf.timeAsync("render.row.markdown", () => MarkdownRenderer.render(this.app, text, detached, file.path, this as any));
     const html = detached.innerHTML;
     const entry = { mtime: file.stat.mtime, text, attachments, html };
     this.renderCache.set(file.path, entry);
     return entry;
   }
 
+  /** (Re)create the lazy-body IntersectionObserver for the current paint.
+   *  Root is the view's scroll host; rootMargin pre-renders a screenful
+   *  above/below so scrolling rarely catches a placeholder. */
+  private armBodyObserver(): void {
+    this.bodyObserver?.disconnect();
+    this.lazyBodies = new WeakMap();
+    this.bodyObserver = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        const el = e.target as HTMLElement;
+        const fn = this.lazyBodies.get(el);
+        this.bodyObserver?.unobserve(el);
+        this.lazyBodies.delete(el);
+        if (fn) fn();
+      }
+    }, { root: this.contentEl, rootMargin: "1400px 0px" });
+  }
+
+  private hasFreshRenderCache(file: TFile): boolean {
+    const c = this.renderCache.get(file.path);
+    return !!c && c.mtime === file.stat.mtime;
+  }
+
+  /** Public entry: render the body NOW if it's already cached (cheap), or
+   *  show a title placeholder and defer the expensive read+render until the
+   *  row scrolls into view. 0.82.1. */
   private renderNoteBody(
+    container: HTMLElement,
+    node: TreeNode,
+    opts: { clamp?: boolean; toggleHost?: HTMLElement; toggleAnchor?: HTMLElement } = { clamp: true },
+  ): void {
+    if (!node.file) return;
+    // Warm rows (cached HTML) render instantly — no deferral needed. Cold
+    // rows (the expensive cachedRead misses) get a placeholder + observer.
+    if (this.hasFreshRenderCache(node.file) || !this.bodyObserver) {
+      this.renderNoteBodyNow(container, node, opts);
+      return;
+    }
+    container.empty();
+    const ph = container.createDiv({ cls: "stashpad-note-text is-plain is-lazy-placeholder" });
+    ph.textContent = this.titleForNode(node);
+    this.lazyBodies.set(container, () => this.renderNoteBodyNow(container, node, opts));
+    this.bodyObserver.observe(container);
+  }
+
+  private renderNoteBodyNow(
     container: HTMLElement,
     node: TreeNode,
     opts: { clamp?: boolean; toggleHost?: HTMLElement; toggleAnchor?: HTMLElement } = { clamp: true },
@@ -4554,15 +4619,19 @@ export class StashpadView extends ItemView {
         this.viewRoot.focus({ preventScroll: true });
         return;
       }
-      // ↑ at the very start of the textarea → jump out into the list, landing on
-      // the LAST note (closest to composer) regardless of any prior cursor state.
-      // Subsequent arrow ups within the list decrement normally.
+      // ↑ at the very start of the textarea → jump out into the list.
+      // 0.80.2: land on the LAST-FOCUSED note for this level (the one that
+      // still has the ring), not always the bottommost — so escaping the
+      // composer returns you to where you were. Falls back to the last
+      // note when there's no remembered cursor.
       if (e.key === "ArrowUp" && ta.selectionStart === 0 && ta.selectionEnd === 0) {
         e.preventDefault();
         ta.blur();
         this.viewRoot.focus({ preventScroll: true });
         if (this.currentChildren.length > 0) {
-          this.cursorIdx = this.currentChildren.length - 1;
+          const lastId = this.lastCursorByFocus.get(this.focusId) ?? this.lastSelected;
+          const idx = lastId ? this.currentChildren.findIndex((n) => n.id === lastId) : -1;
+          this.cursorIdx = idx >= 0 ? idx : this.currentChildren.length - 1;
           this.selectCursor(false);
         }
         return;
@@ -4887,16 +4956,20 @@ export class StashpadView extends ItemView {
       // same 100–300ms regression we fixed for normal cursor nav in
       // 0.73.4. Now we just repaint the .is-pick-target class on
       // existing rows and scroll the new target into view.
+      // 0.80.4: skip the notes being moved (the current selection) — you
+      // can't nest them under themselves, so stepping onto them is wasted
+      // motion. Both directions skip, so reversing also hops over the
+      // selected run.
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        this.inListPicker.activeIdx = Math.min(this.currentChildren.length - 1, this.inListPicker.activeIdx + 1);
+        this.inListPicker.activeIdx = this.nextPickableIdx(this.inListPicker.activeIdx, 1);
         this.repaintSelectionClasses();
         this.revealRowAt(this.inListPicker.activeIdx);
         return;
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
-        this.inListPicker.activeIdx = Math.max(0, this.inListPicker.activeIdx - 1);
+        this.inListPicker.activeIdx = this.nextPickableIdx(this.inListPicker.activeIdx, -1);
         this.repaintSelectionClasses();
         this.revealRowAt(this.inListPicker.activeIdx);
         return;
@@ -5018,6 +5091,11 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
     }
+    // Jump to top/bottom: no selection required — only a non-empty list.
+    if (this.currentChildren.length > 0) {
+      if (matchBinding(e, sb.jumpToTop)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.jumpToTop(); return; }
+      if (matchBinding(e, sb.jumpToBottom)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.jumpToBottom(); return; }
+    }
     // Allow E / T from focused-header context too (no selection / cursor required).
     const focused = this.tree.get(this.focusId);
     if (focused?.file) {
@@ -5030,6 +5108,19 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.openTab)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdOpenInNewStashpadTab(focused); return; }
     }
   };
+
+  /** 0.80.3: move the cursor to the first / last note in the current list
+   *  and reveal it. Single-select (no shift-range). */
+  jumpToTop(): void {
+    if (this.currentChildren.length === 0) return;
+    this.cursorIdx = 0;
+    this.selectCursor(false);
+  }
+  jumpToBottom(): void {
+    if (this.currentChildren.length === 0) return;
+    this.cursorIdx = this.currentChildren.length - 1;
+    this.selectCursor(false);
+  }
 
   private selectCursor(shift: boolean): void {
     const node = this.currentChildren[this.cursorIdx];
@@ -5750,11 +5841,28 @@ export class StashpadView extends ItemView {
     });
   }
 
+  /** 0.80.4: next index from `from` in `dir` whose note isn't part of the
+   *  current selection (the notes being moved — invalid as their own
+   *  parent). Stays put if there's no unselected note that way. */
+  private nextPickableIdx(from: number, dir: 1 | -1): number {
+    for (let i = from + dir; i >= 0 && i < this.currentChildren.length; i += dir) {
+      const node = this.currentChildren[i];
+      if (node && !this.selection.has(node.id)) return i;
+    }
+    return from;
+  }
+
   private cmdInListPicker(): void {
     if (this.currentChildren.length === 0) return;
     // Pre-select the note above the cursor (the most common nest target).
     // Falls back to index 0 when the cursor is already at the top.
-    const start = this.cursorIdx > 0 ? this.cursorIdx - 1 : 0;
+    let start = this.cursorIdx > 0 ? this.cursorIdx - 1 : 0;
+    // 0.80.4: if that lands on a note being moved, hop to the nearest
+    // unselected one (look up first, then down).
+    if (this.currentChildren[start] && this.selection.has(this.currentChildren[start].id)) {
+      const up = this.nextPickableIdx(start, -1);
+      start = up !== start ? up : this.nextPickableIdx(start, 1);
+    }
     this.inListPicker = { activeIdx: start };
     new Notice("Arrows to pick parent, Enter confirms, Esc cancels.");
     // Preserve scroll position across the activation render — the highlight is
@@ -6454,15 +6562,16 @@ export class StashpadView extends ItemView {
         this.lastSelected = kids[kids.length - 1].id;
       }
     }
-    // 0.56.22: follow-cursor — we just set cursor to `cameFrom` (the
-    // child we came from). It IS the right thing to scroll to.
-    this.render({ kind: "follow-cursor" });
+    // 0.80.3 / 0.82.4: pin the note we came from to the TOP of the view
+    // (when it's still present in the parent list). NOTE: the align value
+    // is passed to scrollIntoView({ block }), which only accepts
+    // start/center/end/nearest — "top" was invalid and silently did
+    // nothing (cursor set, but scroll stayed at 0). "start" = top.
+    if (idx >= 0) this.render({ kind: "scroll-to-id", id: cameFrom, align: "start" });
+    else this.render({ kind: "follow-cursor" });
     this.refreshHeaderTitle();
-    // Always reveal — the cached scroll restore puts us approximately back,
-    // but the cursor row (often the child we just left) can still hide
-    // behind the composer when it sits at the bottom of a long list.
-    // revealCursorRow is a no-op if the row is already comfortably visible.
-    this.revealCursorRow();
+    // Belt-and-suspenders reveal in the fallback case.
+    if (idx < 0) this.revealCursorRow();
   }
   private openBookmarks(): void {
     const bookmarks = (this.app as any).internalPlugins?.plugins?.bookmarks?.instance?.items ?? [];
@@ -7947,7 +8056,8 @@ export class StashpadView extends ItemView {
       const fm = this.app.metadataCache.getFileCache(n.file)?.frontmatter;
       if (Array.isArray(fm?.attachments)) {
         for (const a of fm.attachments) {
-          if (typeof a === "string" && a.trim()) attachments.push(a);
+          // 0.79.18: entries may be wikilinks now — normalize to linktext.
+          if (typeof a === "string" && a.trim()) attachments.push(attachmentLinkPath(a));
         }
       }
     }
@@ -8462,7 +8572,12 @@ export class StashpadView extends ItemView {
     fmLines.push("---", body);
     try {
       const fullContent = fmLines.join("\n");
-      await this.app.vault.create(path, fullContent);
+      // 0.79.20: exempt our own new note from auto-import. On a slow
+      // network drive the file's frontmatter may not have flushed when the
+      // importer's create event fires, so its disk id-check would miss the
+      // id and "import" the note into Home. Long TTL covers a laggy create.
+      this.plugin.importService.suppress(path, 60000);
+      await perf.timeAsync("write.createNote.file", () => this.app.vault.create(path, fullContent));
       try {
         const f = this.app.vault.getAbstractFileByPath(path);
         if (f && (f as any).extension === "md") {
@@ -9056,6 +9171,11 @@ export class StashpadView extends ItemView {
     this.knownBodies.set(file.path, body);
     if (prev === undefined) return;       // first sighting — no contribution
     if (prev === body) return;            // frontmatter-only write — skip
+    // 0.79.19: never stamp during rebootstrap — its frontmatter writes and
+    // the wikilink rewrites from slug-renames must not bump `modified` or
+    // add contributors. knownBodies is already updated above, so the next
+    // genuine edit is still detected correctly.
+    if (this.plugin.rebootstrapInProgress) return;
     const author = this.currentAuthorLink();
     if (!author) return;                  // user opted out of stamping
     void this.ensureAuthorFile(author);
@@ -9361,7 +9481,8 @@ export class StashpadView extends ItemView {
       const fm = this.app.metadataCache.getFileCache(n.file)?.frontmatter;
       if (Array.isArray(fm?.attachments)) {
         for (const a of fm.attachments) {
-          if (typeof a === "string" && a.trim()) attachments.push(a);
+          // 0.79.18: entries may be wikilinks now — normalize to linktext.
+          if (typeof a === "string" && a.trim()) attachments.push(attachmentLinkPath(a));
         }
       }
     }

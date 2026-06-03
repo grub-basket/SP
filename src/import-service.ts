@@ -1,6 +1,6 @@
 import { Notice, TFile, TFolder } from "obsidian";
 import type StashpadPlugin from "./main";
-import { ROOT_ID, RESERVED_FRONTMATTER } from "./types";
+import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink } from "./types";
 import { newId } from "./id-service";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { splitFrontmatter, serializeNote, STASH_EXT } from "./stash-package";
@@ -89,11 +89,23 @@ export class ImportService {
   /** Path-level eligibility (no content read): the file sits directly in a
    *  discovered Stashpad folder ROOT (not a reserved subfolder), and isn't
    *  a .stash archive (those have their own importer) or our own .edtz. */
-  /** Suppress auto-import for `path` for a few seconds — used around our
-   *  own moves so the resulting vault event doesn't re-import the file. */
-  private suppress(path: string): void {
+  /** Suppress auto-import for `path` for `ttl` ms — used around our own
+   *  moves (undo restores) and for Stashpad-created notes so the resulting
+   *  vault event doesn't re-import the file. 0.79.20: public + tunable TTL;
+   *  createNoteUnder uses a long window because on a slow network drive the
+   *  create event (and the frontmatter flush its id-check needs) can lag
+   *  well past a few seconds. */
+  suppress(path: string, ttl = 4000): void {
     this.suppressed.add(path);
-    window.setTimeout(() => this.suppressed.delete(path), 4000);
+    window.setTimeout(() => this.suppressed.delete(path), ttl);
+  }
+
+  /** Create a note file, suppressing auto-import for it first — the notes
+   *  the importer itself creates must never be re-imported (same slow-drive
+   *  frontmatter-flush race as composer-created notes). */
+  private async createNote(path: string, content: string): Promise<void> {
+    this.suppress(path, 60000);
+    await this.app.vault.create(path, content);
   }
 
   private isEligiblePath(file: TFile): boolean {
@@ -105,15 +117,20 @@ export class ImportService {
     return this.plugin.discoverStashpadFolders().includes(dir);
   }
 
-  /** Re-validate at drain time (after the debounce, when the metadata
-   *  cache has had a chance to parse). A markdown file that already has a
-   *  Stashpad `id` is an existing note (or one we just created) — skip it.
-   *  Reads frontmatter from the cache; that's settled by now. */
-  private isStillImportable(file: TFile): boolean {
+  /** Re-validate at drain time. A markdown file that already has a Stashpad
+   *  `id` is an existing note (or one we just created) — skip it. 0.79.18:
+   *  read the frontmatter FROM DISK rather than the metadata cache. The
+   *  cache lags badly on mobile, so an existing note (re)appearing via a
+   *  rename event — e.g. Stashpad's own slug-rename after an edit — looked
+   *  id-less and got "imported" again, archiving + cloning it in an endless
+   *  loop. Reading the file is authoritative and breaks that. */
+  private async isStillImportable(file: TFile): Promise<boolean> {
     if (!this.isEligiblePath(file)) return false;
     if (file.extension === "md") {
-      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as any;
-      if (fm && typeof fm.id === "string" && fm.id) return false;
+      try {
+        const { fm } = splitFrontmatter(await this.app.vault.read(file));
+        if (fm && typeof fm.id === "string" && fm.id) return false;
+      } catch { /* unreadable — fall through and let the import try */ }
     }
     return true;
   }
@@ -125,10 +142,13 @@ export class ImportService {
     try {
       const paths = [...this.pending.keys()];
       this.pending.clear();
-      const files = paths
+      const candidates = paths
         .map((p) => this.app.vault.getAbstractFileByPath(p))
-        .filter((f): f is TFile => f instanceof TFile)
-        .filter((f) => this.isStillImportable(f));
+        .filter((f): f is TFile => f instanceof TFile);
+      const files: TFile[] = [];
+      for (const f of candidates) {
+        if (await this.isStillImportable(f)) files.push(f);
+      }
 
       // Eligible dropped folders, with their (non-empty) file lists.
       const folderPaths = [...this.pendingFolders.keys()];
@@ -253,6 +273,12 @@ export class ImportService {
     await this.ensureFolder(archiveDir);
     const archivePath = await this.uniquePath(archiveDir, file.name);
     await this.app.fileManager.renameFile(file, archivePath);
+    // 0.79.21: conflict guard — if the archive move didn't actually land,
+    // ABORT before creating the clone. Otherwise we'd produce a clone while
+    // the original is lost (the pre-0.79.10 .archive dot-folder failure).
+    if (!(this.app.vault.getAbstractFileByPath(archivePath) instanceof TFile)) {
+      throw new Error(`archive move failed for ${file.path} — import aborted to avoid data loss`);
+    }
 
     // Build the clone's frontmatter: keep the user's non-reserved keys,
     // then stamp Stashpad's structural fields.
@@ -262,12 +288,16 @@ export class ImportService {
     }
     cloneFm.id = newId();
     cloneFm.parent = ROOT_ID;
-    cloneFm.created = new Date().toISOString();
+    // 0.79.21: preserve the original timestamps — don't stamp "now" over a
+    // note that already has a created/modified (e.g. re-imported export).
+    const t = this.preservedTimes(fm, file);
+    cloneFm.created = t.created;
+    if (t.modified) cloneFm.modified = t.modified;
     cloneFm.attachments = Array.isArray(fm.attachments) ? fm.attachments : [];
 
     const slug = bodyToSlug(body) || file.basename;
     const notePath = await this.uniquePath(folder, buildFilename(slug, cloneFm.id));
-    await this.app.vault.create(notePath, serializeNote(cloneFm, body));
+    await this.createNote(notePath, serializeNote(cloneFm, body));
     return { kind: "md", folder, archivePath, notePath, originalName: file.name };
   }
 
@@ -287,14 +317,28 @@ export class ImportService {
       id,
       parent: ROOT_ID,
       created: new Date().toISOString(),
-      attachments: [attachmentPath],
+      // 0.79.18: attachments stored as internal links (not plain text).
+      attachments: [toAttachmentLink(attachmentPath)],
     };
-    // Body: a wikilink to the attachment (link, not embed).
-    const body = `${title}\n\n[[${attachmentPath}]]\n`;
+    // 0.79.18: embed the attachment (! prefix) so it previews inline.
+    const body = `${title}\n\n![[${attachmentPath}]]\n`;
     const slug = bodyToSlug(title) || title;
     const notePath = await this.uniquePath(folder, buildFilename(slug, id));
-    await this.app.vault.create(notePath, serializeNote(fm, body));
+    await this.createNote(notePath, serializeNote(fm, body));
     return { kind: "file", folder, attachmentPath, notePath, originalName: file.name };
+  }
+
+  /** Choose the created/modified to stamp on an imported note: prefer the
+   *  source frontmatter's own values; else fall back to the file's
+   *  filesystem ctime/mtime (usually survives a rename, far better than
+   *  "now"); else, only as a last resort, now. */
+  private preservedTimes(fm: Record<string, any>, file: TFile): { created: string; modified: string | null } {
+    const valid = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0 && !Number.isNaN(Date.parse(v));
+    const created = valid(fm.created) ? fm.created
+      : (file.stat?.ctime ? new Date(file.stat.ctime).toISOString() : new Date().toISOString());
+    const modified = valid(fm.modified) ? fm.modified
+      : (file.stat?.mtime ? new Date(file.stat.mtime).toISOString() : null);
+    return { created, modified };
   }
 
   /** All files anywhere under `folderPath` (recursive). */
@@ -340,7 +384,7 @@ export class ImportService {
     };
     const slug = bodyToSlug(title) || title;
     const notePath = await this.uniquePath(root, buildFilename(slug, id));
-    await this.app.vault.create(notePath, serializeNote(fm, `${title}\n`));
+    await this.createNote(notePath, serializeNote(fm, `${title}\n`));
     notePaths.push(notePath);
     return id;
   }
@@ -363,22 +407,25 @@ export class ImportService {
           }
           cloneFm.id = newId();
           cloneFm.parent = parentId;
-          cloneFm.created = new Date().toISOString();
+          const t = this.preservedTimes(fm, child);
+          cloneFm.created = t.created;
+          if (t.modified) cloneFm.modified = t.modified;
           cloneFm.attachments = Array.isArray(fm.attachments) ? fm.attachments : [];
           const slug = bodyToSlug(body) || child.basename;
           const notePath = await this.uniquePath(root, buildFilename(slug, cloneFm.id));
-          await this.app.vault.create(notePath, serializeNote(cloneFm, body));
+          await this.createNote(notePath, serializeNote(cloneFm, body));
           notePaths.push(notePath);
         } else {
           // Link the archived file (no _attachments copy).
           const id = newId();
           const fm: Record<string, any> = {
-            id, parent: parentId, created: new Date().toISOString(), attachments: [child.path],
+            id, parent: parentId, created: new Date().toISOString(),
+            attachments: [toAttachmentLink(child.path)],
           };
-          const body = `${child.basename}\n\n[[${child.path}]]\n`;
+          const body = `${child.basename}\n\n![[${child.path}]]\n`;
           const slug = bodyToSlug(child.basename) || child.basename;
           const notePath = await this.uniquePath(root, buildFilename(slug, id));
-          await this.app.vault.create(notePath, serializeNote(fm, body));
+          await this.createNote(notePath, serializeNote(fm, body));
           notePaths.push(notePath);
         }
       }
@@ -482,33 +529,55 @@ export class ImportService {
     new Notice(`Undid import of ${records.length} file(s).`);
   }
 
-  /** 0.79.4: open the OS file picker and copy the chosen files into
-   *  `folder`'s root; the auto-import watcher then turns them into notes.
-   *  Uses an <input type=file> so it works on desktop AND mobile (native
-   *  file/photo picker) without Electron-version juggling. */
+  /** 0.79.4 / 0.80.1: open the OS file picker, copy the chosen files into
+   *  `folder`, then import them DIRECTLY (not via the watcher) so this works
+   *  regardless of the auto-import toggle. Uses an <input type=file> so it
+   *  works on desktop AND mobile (native file/photo picker). */
   pickFilesInto(folder: string): void {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
     input.style.display = "none";
     input.onchange = async () => {
-      const files = Array.from(input.files ?? []);
+      const picked = Array.from(input.files ?? []);
       input.remove();
-      if (files.length === 0) return;
-      let written = 0;
-      for (const file of files) {
+      if (picked.length === 0) return;
+      // 1) write each picked file into the folder root (suppressed so the
+      //    watcher, if armed, doesn't ALSO process it — we import below).
+      const written: TFile[] = [];
+      for (const file of picked) {
         try {
           const buf = await file.arrayBuffer();
           const dest = await this.uniquePath(folder, file.name);
+          this.suppress(dest, 60000);
           await this.app.vault.createBinary(dest, buf);
-          written++;
+          const tf = this.app.vault.getAbstractFileByPath(dest);
+          if (tf instanceof TFile) written.push(tf);
         } catch (e) {
-          console.warn("[Stashpad] file-picker import failed", file.name, e);
+          console.warn("[Stashpad] file-picker write failed", file.name, e);
         }
       }
-      if (written > 0) {
-        new Notice(`Added ${written} file(s) to "${folder.split("/").pop()}" — importing…`);
+      if (written.length === 0) return;
+      // 2) import the written files directly.
+      await this.plugin.importLog.load();
+      const records: ImportRecord[] = [];
+      for (const f of written) {
+        try {
+          const size = f.stat?.size ?? null;
+          const rec = f.extension === "md" ? await this.importMarkdown(f) : await this.importOtherFile(f);
+          if (rec) {
+            records.push(rec);
+            this.plugin.importLog.append({
+              ts: new Date().toISOString(), folder: rec.folder, kind: rec.kind,
+              originalName: f.name, size, sourcePath: f.path,
+              notePaths: rec.kind === "folder" ? rec.notePaths : [rec.notePath],
+            });
+          }
+        } catch (e) {
+          console.warn("[Stashpad] file-picker import failed", f.path, e);
+        }
       }
+      if (records.length > 0) this.announce(records, []);
     };
     document.body.appendChild(input);
     input.click();
@@ -524,9 +593,12 @@ export class ImportService {
    *  mode to surface. */
   async importLooseFilesIn(folder: string): Promise<number> {
     const root = folder.replace(/\/+$/, "");
-    const files = this.app.vault.getFiles()
-      .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === root)
-      .filter((f) => this.isStillImportable(f));
+    const candidates = this.app.vault.getFiles()
+      .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === root);
+    const files: TFile[] = [];
+    for (const f of candidates) {
+      if (await this.isStillImportable(f)) files.push(f);
+    }
     if (files.length === 0) return 0;
     await this.plugin.importLog.load();
     let n = 0;

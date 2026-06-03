@@ -1,7 +1,7 @@
 import JSZip from "jszip";
 import { App, TFile, parseYaml, stringifyYaml } from "obsidian";
 import { newId } from "./id-service";
-import { ROOT_ID, type StashpadId } from "./types";
+import { ROOT_ID, attachmentLinkPath, toAttachmentLink, type StashpadId } from "./types";
 
 export const STASH_EXT = "stash";
 export const SCHEMA_VERSION = 1;
@@ -198,8 +198,10 @@ export async function importStashZip(
       import_date: importDate,
     };
     if (Array.isArray(newFm.attachments)) {
+      // 0.79.18: attachments may be wikilinks now — normalize to a path,
+      // re-root into the export's attachments folder, re-wrap as a link.
       newFm.attachments = (newFm.attachments as string[]).map((a) =>
-        `${attachmentsFolder}/${baseFileName(a)}`,
+        toAttachmentLink(`${attachmentsFolder}/${baseFileName(attachmentLinkPath(a))}`),
       );
     }
 

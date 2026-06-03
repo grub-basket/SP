@@ -117,6 +117,25 @@ export function isArchivedPath(path: string): boolean {
   return path.split("/").some((seg) => seg === "_archive" || seg === ".archive");
 }
 
+/** 0.79.18: an `attachments` frontmatter entry as a wikilink. Idempotent —
+ *  returns an existing `[[...]]` unchanged (never double-brackets), so it's
+ *  safe to run repeatedly (e.g. in rebootstrap) without looping. */
+export function toAttachmentLink(entry: string): string {
+  const s = (entry ?? "").trim();
+  if (!s) return s;
+  if (/^\[\[.*\]\]$/.test(s)) return s;
+  return `[[${s}]]`;
+}
+/** The resolvable vault path/linktext inside an attachment entry — strips
+ *  `[[ ]]`, a trailing `|alias`, and `#heading`/`^block` refs. Accepts both
+ *  the new wikilink form and the legacy plain-path form. */
+export function attachmentLinkPath(entry: string): string {
+  let s = (entry ?? "").trim();
+  const m = s.match(/^\[\[(.*)\]\]$/);
+  if (m) s = m[1];
+  return s.split("|")[0].split("#")[0].split("^")[0].trim();
+}
+
 /** File extensions Stashpad never surfaces in link/search (plugin-internal
  *  formats users don't link to). `.edtz` = Encrypted Templater. */
 export const IGNORED_FILE_EXTENSIONS: ReadonlySet<string> = new Set(["edtz"]);
@@ -202,7 +221,10 @@ export type ScrollPolicy =
   | { kind: "pin-bottom"; until: "settle" | "next-user-input" }
   | { kind: "restore"; scrollTop: number }
   | { kind: "follow-cursor" }
-  | { kind: "scroll-to-id"; id: StashpadId; align: "center" | "nearest" | "top" };
+  // `align` is passed straight to scrollIntoView({ block }), so it must be
+  // one of its valid values — "start" means top. ("top" was a long-standing
+  // typo that silently no-op'd; esbuild doesn't typecheck so it slipped by.)
+  | { kind: "scroll-to-id"; id: StashpadId; align: "start" | "center" | "end" | "nearest" };
 
 export interface ViewConfigState {
   focusId: StashpadId;

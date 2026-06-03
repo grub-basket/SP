@@ -1,4 +1,4 @@
-import { Notice, TFile, type App } from "obsidian";
+import { Notice, Platform, TFile, type App } from "obsidian";
 import type { StashpadId } from "./types";
 
 /** Visual severity. Drives the toast's color + the history panel's
@@ -353,8 +353,13 @@ export function buildFileActions(
     },
   }];
   if (!isMobile) {
+    // Platform-correct OS file-manager name (Windows: "File Explorer",
+    // capitalised; macOS: "Finder"; otherwise generic).
+    const osManager = Platform.isMacOS ? "Finder"
+      : Platform.isWin ? "File Explorer"
+      : "file manager";
     actions.push({
-      label: "Show in Finder",
+      label: `Show in ${osManager}`,
       keepOpen: true,
       onClick: () => {
         try {
