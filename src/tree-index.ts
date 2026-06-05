@@ -260,7 +260,19 @@ export class TreeIndex {
       if (!(file instanceof TFile)) return;
       if (!pathInFolder(file.path)) return;
       if (file.extension !== "md") return;
-      if (this.applyChange(file)) scheduleUpdate();
+      // Patch the tree structure first (parent/created/etc.), then ALWAYS
+      // repaint. applyChange returns false for a frontmatter-only edit
+      // (color, due date, assignees, task state) because nothing structural
+      // moved — but the view reads those live (colorForNode etc.), so it
+      // still needs to re-render once the cache reflects the new value.
+      // 0.82.12: previously a non-structural change relied on the vault
+      // "modify" debounce landing AFTER the metadata reparse — a race that
+      // left a just-set color one change behind (and undo unable to clear
+      // it). Repainting on the cache event removes the race: render runs
+      // exactly when the fresh frontmatter is available. Coalesced (16ms)
+      // so bursts collapse to one paint; render writes nothing, so no loop.
+      this.applyChange(file);
+      scheduleUpdate();
     };
     const onCreate = (file: any): void => {
       if (!(file instanceof TFile)) return;

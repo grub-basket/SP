@@ -539,6 +539,189 @@ export class SplitNoteModal extends Modal {
  *  any hex color, then either save (apply once) or add (apply + persist to
  *  the palette). Closing without a button applies as "save" (consistent
  *  with the user's hasty-apply expectation). */
+/** 0.84.2: shown before a .stash export runs. Lets the user rename the export
+ *  (the field is prefilled with the auto-generated base name and selected on
+ *  open, so typing overwrites it; native Cmd/Ctrl+Z undo works because we
+ *  don't intercept it). The final on-disk name is `<base>-<timestamp>.stash`
+ *  — the timestamp is appended automatically so reusing a name never clobbers
+ *  a prior export. Returns the chosen base name (sanitized by the caller), or
+ *  nothing if cancelled. */
+export class ExportStashModal extends Modal {
+  private delivered = false;
+  constructor(
+    app: App,
+    private defaultBaseName: string,
+    private noteCount: number,
+    private onConfirm: (baseName: string, password: string | null) => void,
+  ) {
+    super(app);
+  }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.titleEl.setText("Export to .stash");
+    this.modalEl.addClass("stashpad-export-modal");
+
+    this.contentEl.createEl("p", {
+      cls: "stashpad-export-desc",
+      text: `${this.noteCount} note${this.noteCount === 1 ? "" : "s"} will be bundled into a single .stash file.`,
+    });
+
+    const field = this.contentEl.createDiv({ cls: "stashpad-export-field" });
+    field.createEl("label", { cls: "stashpad-export-label", text: "File name" });
+    const input = field.createEl("input", { type: "text" }) as HTMLInputElement;
+    input.addClass("stashpad-export-name");
+    input.value = this.defaultBaseName;
+
+    // Live preview of the final on-disk filename (timestamp appended at
+    // export; "-encrypted" tag added when encryption is on — see below).
+    const preview = this.contentEl.createEl("div", { cls: "stashpad-export-preview" });
+
+    // --- 0.84.3: optional password encryption (opt-in, default off) ---
+    const encWrap = this.contentEl.createDiv({ cls: "stashpad-export-encrypt" });
+    const toggleRow = encWrap.createDiv({ cls: "stashpad-export-toggle" });
+    const cb = toggleRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    cb.id = "stashpad-export-encrypt-cb";
+    const cbLabel = toggleRow.createEl("label", { text: "Encrypt with a password" });
+    cbLabel.htmlFor = cb.id;
+
+    const pwArea = encWrap.createDiv({ cls: "stashpad-export-pw-area" });
+    pwArea.style.display = "none";
+    const pw1 = pwArea.createEl("input", { type: "password" }) as HTMLInputElement;
+    pw1.addClass("stashpad-export-name"); pw1.placeholder = "Password";
+    const pw2 = pwArea.createEl("input", { type: "password" }) as HTMLInputElement;
+    pw2.addClass("stashpad-export-name"); pw2.placeholder = "Confirm password";
+    const hint = pwArea.createEl("div", { cls: "stashpad-export-pw-hint" });
+    // 0.84.15: name the scheme so it's clear up front; the export toast then
+    // reports which KDF actually ran (Argon2id, or the weaker PBKDF2 fallback).
+    pwArea.createEl("div", {
+      cls: "stashpad-export-pw-suite",
+      text: "Encryption: Argon2id + AES-256-GCM (strongest). Falls back to PBKDF2 only if Argon2 can't run on this device.",
+    });
+
+    // 0.84.13: encrypted exports get an "-encrypted" tag in the filename so
+    // secure bundles are identifiable at a glance. The preview reflects it live
+    // as the checkbox toggles.
+    const effectiveBase = (): string => {
+      const b = input.value.trim() || this.defaultBaseName;
+      return cb.checked ? `${b}-encrypted` : b;
+    };
+    const renderPreview = () => preview.setText(`Saves as:  ${effectiveBase()}-<timestamp>.stash`);
+    input.oninput = renderPreview;
+
+    const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
+    const cancel = footer.createEl("button", { text: "Cancel" });
+    cancel.onclick = () => this.close();
+    const go = footer.createEl("button", { cls: "mod-cta", text: "Export" });
+
+    // Gate the Export button on a valid (matching, non-empty) password when
+    // encryption is enabled. People are warned that a lost password = lost
+    // export, but the button itself only blocks the typo/empty cases.
+    const refresh = () => {
+      const enc = cb.checked;
+      pwArea.style.display = enc ? "" : "none";
+      let ok = true;
+      if (enc) {
+        if (!pw1.value) { hint.setText("Enter a password to encrypt this export."); hint.removeClass("is-error"); ok = false; }
+        else if (pw1.value !== pw2.value) { hint.setText("Passwords don't match."); hint.addClass("is-error"); ok = false; }
+        else { hint.setText("⚠️ If you lose this password, the export can't be recovered."); hint.removeClass("is-error"); }
+      }
+      go.disabled = !ok;
+      go.toggleClass("is-disabled", !ok);
+      renderPreview(); // keep the filename preview in sync with the toggle
+    };
+    cb.onchange = refresh;
+    pw1.oninput = refresh;
+    pw2.oninput = refresh;
+    refresh();
+
+    go.onclick = () => this.commit(effectiveBase(), cb.checked ? pw1.value : null);
+
+    // Enter confirms (when not blocked); Esc / click-out cancels (modal
+    // default). No Mod+Z registration → native input undo handles clears.
+    this.scope.register([], "Enter", (e) => {
+      e.preventDefault();
+      if (!go.disabled) this.commit(effectiveBase(), cb.checked ? pw1.value : null);
+    });
+
+    // Focus + select-all so the prefilled name is ready to type over.
+    requestAnimationFrame(() => { input.focus(); input.select(); });
+  }
+  private commit(raw: string, password: string | null): void {
+    const base = raw.trim() || this.defaultBaseName;
+    this.delivered = true;
+    this.close();
+    this.onConfirm(base, password && password.length ? password : null);
+  }
+  onClose(): void {
+    // No delivery on cancel/Esc/click-out — the export simply doesn't run.
+    this.contentEl.empty();
+  }
+}
+
+/** Outcome of the encrypted-.stash password prompt. */
+export type StashPasswordResult =
+  | { kind: "password"; value: string }
+  | { kind: "later" }   // reschedule — snooze the auto-import notification
+  | { kind: "cancel" }; // back out for now (Esc / click-out / Cancel)
+
+/** 0.84.3: prompt for the password of an encrypted .stash on import. `errorMsg`
+ *  shows a retry hint after a wrong password. 0.84.16: when `allowLater` is set
+ *  (the auto-import "Import now" flow), a "Remind me later" button is offered so
+ *  Cancel can mean just "not right now" while "Remind me later" reschedules. */
+export class StashPasswordModal extends Modal {
+  private delivered = false;
+  constructor(
+    app: App,
+    private errorMsg: string | undefined,
+    private allowLater: boolean,
+    private onResult: (result: StashPasswordResult) => void,
+  ) {
+    super(app);
+  }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.titleEl.setText("Encrypted .stash");
+    this.modalEl.addClass("stashpad-export-modal");
+    this.contentEl.createEl("p", {
+      cls: "stashpad-export-desc",
+      text: "This export is password-protected. Enter its password to import it.",
+    });
+    if (this.errorMsg) {
+      this.contentEl.createEl("div", { cls: "stashpad-export-error", text: this.errorMsg });
+    }
+    const input = this.contentEl.createEl("input", { type: "password" }) as HTMLInputElement;
+    input.addClass("stashpad-export-name");
+    input.placeholder = "Password";
+
+    const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
+    footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    if (this.allowLater) {
+      const later = footer.createEl("button", { text: "Remind me later" });
+      later.title = "Don't import now — surface the reminder again later.";
+      later.onclick = () => this.finish({ kind: "later" });
+    }
+    const go = footer.createEl("button", { cls: "mod-cta", text: "Decrypt & import" });
+    go.onclick = () => this.submit(input.value);
+
+    this.scope.register([], "Enter", (e) => { e.preventDefault(); this.submit(input.value); });
+    requestAnimationFrame(() => input.focus());
+  }
+  private submit(pw: string): void {
+    if (!pw) return; // empty password can't be right; keep the modal open
+    this.finish({ kind: "password", value: pw });
+  }
+  private finish(result: StashPasswordResult): void {
+    this.delivered = true;
+    this.close();
+    this.onResult(result);
+  }
+  onClose(): void {
+    // Esc / click-out / Cancel button → "cancel" (back out for now, no snooze).
+    if (!this.delivered) { this.delivered = true; this.onResult({ kind: "cancel" }); }
+    this.contentEl.empty();
+  }
+}
+
 export class CustomColorModal extends Modal {
   private value: string;
   private delivered = false;

@@ -148,6 +148,12 @@ export interface StashpadSettings {
    *  timing so the "Dump performance profile" command reports where the
    *  time goes on a slow vault. Off by default. */
   enablePerfProfiling: boolean;
+  /** 0.83.1: maintain the redundant `parentLink`/`children` recovery
+   *  fields on every move. Default true. Turning it off skips those writes
+   *  entirely — a big speedup on slow/network drives (each is a full
+   *  round-trip and a move triggers several); Rebootstrap backfills them on
+   *  demand, and the canonical id/parent is unaffected. */
+  writeRecoveryLinks: boolean;
   useTemplatesFormat: boolean;
   prefixTimestampsOnCopy: boolean;
   splitOnLines: boolean;
@@ -359,6 +365,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   autoImport: false,
   inheritObsidianExclusions: true,
   enablePerfProfiling: false,
+  writeRecoveryLinks: true,
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
   splitOnLines: false,
@@ -607,6 +614,13 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** Diagnostics tab: log + notification controls. Lifted verbatim
    *  from the pre-0.73.1 Log section. Inventory items A1–A4. */
   private renderDiagnosticsTab(parent: HTMLElement): void {
+    new Setting(parent)
+      .setName("Write recovery navigation links")
+      .setDesc("Maintain the redundant parentLink/children frontmatter so you can walk the hierarchy from raw Markdown if the index ever breaks. On a slow / network drive this is a big per-move cost (several round-trips each); turn it off there for snappier moves — Rebootstrap rebuilds the fields on demand, and your notes' canonical structure (id/parent) is unaffected either way.")
+      .addToggle((t) => t.setValue(this.plugin.settings.writeRecoveryLinks).onChange(async (v) => {
+        this.plugin.settings.writeRecoveryLinks = v; await this.plugin.saveSettings();
+      }));
+
     new Setting(parent)
       .setName("Performance profiling")
       .setDesc("Record timing for list rendering, body reads, and file writes. Turn on, use Stashpad normally (especially the slow operations), then run “Dump performance profile” from the command palette and share the result. Off = zero overhead.")

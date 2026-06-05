@@ -1,5 +1,5 @@
 import {
-  FuzzySuggestModal, ItemView, MarkdownRenderer, Menu, Notice, Platform,
+  ItemView, MarkdownRenderer, Menu, Notice, Platform,
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce,
   moment, setIcon,
 } from "obsidian";
@@ -23,64 +23,23 @@ import { StashpadSuggest } from "./note-picker";
 import { setActiveView, clearActiveView } from "./active-view";
 import { AssignModal, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
 import { ComposerAutocomplete } from "./composer-autocomplete";
-import { buildStashZip, importStashZip, STASH_EXT } from "./stash-package";
+import { matchBinding, humanCombo } from "./view-keys";
+import { AuthorshipTracker } from "./authorship-tracker";
+import { ViewDnD } from "./view-dnd";
+import { NoteBodyRenderer } from "./note-body-renderer";
+import { computeSortedIds } from "./view-sort";
+import * as clipboardCmds from "./commands/clipboard-cmds";
+import * as ioCmds from "./commands/io-cmds";
+import { setIconSafe, isAnyModalOpen, extractCodeBlocks, properCaseFolderPath, computeReorder, arraysEqual } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
-
-/** 0.76.33: setIcon that never leaves a blank button. If `name` isn't
- *  in this Obsidian build's bundled Lucide set (older iPad/iOS app
- *  versions lag desktop, so some names that resolve on desktop don't
- *  resolve there), setIcon injects no <svg> and the button renders
- *  empty. We detect that (setIcon is synchronous) and drop in a
- *  Unicode glyph so there's always a visible affordance. */
-function setIconSafe(el: HTMLElement, name: string, fallbackGlyph: string): void {
-  el.empty();
-  try { setIcon(el, name); } catch { /* ignore */ }
-  // The ONLY reliable signal that the icon actually rendered is the
-  // presence of a drawable shape element inside the injected <svg>.
-  // Older/stripped mobile Lucide bundles can inject an empty (or
-  // whitespace-only) <svg class="svg-icon"></svg> for names they don't
-  // know — an svg node that exists but draws nothing. Checking for a
-  // path/line/circle/etc. distinguishes "real icon" from "empty shell".
-  const svg = el.querySelector("svg");
-  const drawn = !!svg && !!svg.querySelector(
-    "path, line, circle, rect, polyline, polygon, ellipse"
-  );
-  if (drawn) return;
-  el.empty();
-  el.createSpan({ cls: "stashpad-icon-fallback", text: fallbackGlyph });
-}
 
 const VIEW_MODE_LABELS: Record<ViewMode, string> = {
   nested: "Nested",
   flat: "Flat",
   everything: "Everything",
 };
-
-/** Heuristic: returns true when an Obsidian modal/prompt/menu is currently
- *  open. Used to gate the view's keydown handler so arrow/Enter shortcuts
- *  don't bleed through to the underlying note list. Tries multiple shapes
- *  because the exact DOM varies by Obsidian version. */
-function isAnyModalOpen(target?: EventTarget | null): boolean {
-  // Definitive: the keydown originated inside a modal-ish container.
-  if (target instanceof Element) {
-    if (target.closest(".modal, .modal-container, .suggestion-container, .menu, .prompt")) return true;
-  }
-  // 0.61.8: check the target's owner document FIRST, then fall back to
-  // the main `document`. Popout windows host modals in their OWN
-  // document — the main-document-only check used to miss them, so the
-  // ColorPickerModal in a tiny window couldn't capture arrow keys.
-  const docs = new Set<Document>([document]);
-  if (target instanceof Element && target.ownerDocument) docs.add(target.ownerDocument);
-  for (const doc of docs) {
-    if (doc.body?.querySelector(".modal-bg")) return true;
-    if (doc.body?.querySelector(".modal-container .modal")) return true;
-    if (doc.body?.querySelector(".suggestion-container")) return true;
-    if (doc.body?.querySelector(".menu.mod-active")) return true;
-  }
-  return false;
-}
 
 /** Labels for each time-filter mode, plus a per-mode short label and
  *  long-form description used as the button's tooltip. The displayed
@@ -116,11 +75,20 @@ const TIME_FILTER_OPTIONS: TimeFilterOption[] = [
 ];
 
 export class StashpadView extends ItemView {
-  private plugin: StashpadPlugin;
+  /** public: read by AuthorshipTracker (the host interface). */
+  plugin: StashpadPlugin;
   private viewRoot!: HTMLElement;
 
-  private tree: TreeIndex;
-  private log: StashpadLog;
+  /** Owns authorship/contribution stamping + multiplayer write tracking. */
+  authorship: AuthorshipTracker;
+
+  /** Owns the drag-and-drop row interaction (drag state + drop placeholder). */
+  dnd: ViewDnD;
+
+  /** public: read by AuthorshipTracker (the host interface). */
+  tree: TreeIndex;
+  /** public: used by extracted command modules (commands/*.ts). */
+  log: StashpadLog;
   private integrity: IntegrityWatcher;
   private order: OrderStore;
   private sortStore: SortStore;
@@ -129,7 +97,8 @@ export class StashpadView extends ItemView {
    *  FrontmatterSyncQueue jsdoc for the why. */
   private fmSync: FrontmatterSyncQueue;
 
-  private focusId: StashpadId = ROOT_ID;
+  /** public: read by extracted command modules (commands/*.ts). */
+  focusId: StashpadId = ROOT_ID;
   private timeFilter: TimeFilter = "all";
   /** When true, time filters use CALENDAR boundaries (start of today /
    *  this week / this month / this year) instead of rolling N-day
@@ -141,7 +110,8 @@ export class StashpadView extends ItemView {
   /** Active color filter — null means show everything; otherwise the
    *  hex string (e.g. "#E07A78") that visible notes must carry. */
   private colorFilter: string | null = null;
-  private noteFolder = "Stashpad";
+  /** public: read by AuthorshipTracker (the host interface). */
+  noteFolder = "Stashpad";
   private folderOverride: string | null = null;
   /** 0.61.1: tiny-mode flag — when true the view renders a minimal
    *  shell (folder name + list + composer + sticky/expand controls)
@@ -162,13 +132,17 @@ export class StashpadView extends ItemView {
   private detachSettings: (() => void) | null = null;
   private slugDebouncers = new Map<string, ReturnType<typeof debounce>>();
   private attachmentDebouncers = new Map<string, ReturnType<typeof debounce>>();
-  private debouncedRender: ReturnType<typeof debounce>;
+  /** public: called by AuthorshipTracker (the host interface). */
+  debouncedRender: ReturnType<typeof debounce>;
   private bootstrappedFolders = new Set<string>();
 
-  private selection = new Set<StashpadId>();
+  /** public: read by ViewDnD (the host interface). */
+  selection = new Set<StashpadId>();
   private lastSelected: StashpadId | null = null;
-  private cursorIdx = -1;
-  private currentChildren: TreeNode[] = [];
+  /** public: read by extracted command modules (commands/*.ts). */
+  cursorIdx = -1;
+  /** public: read by extracted command modules (commands/*.ts). */
+  currentChildren: TreeNode[] = [];
   private modeSplit: boolean | null = null;
   private modeEnterSubmits = true; // per-view, defaults true
   private nextDestination: StashpadId | null = null;
@@ -181,7 +155,8 @@ export class StashpadView extends ItemView {
   private nextDestinationFolder: string | null = null;
   private nextDestinationLabel: string | null = null;
   private inListPicker: { activeIdx: number } | null = null;
-  private listEl: HTMLElement | null = null;
+  /** public: read by ViewDnD (the host interface). */
+  listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
   private composerDraft = "";
   private draftsLoadedFor: string | null = null;
@@ -299,9 +274,15 @@ export class StashpadView extends ItemView {
       const folder = this.noteFolder;
       const mode = this.sortStore.getMode(folder, parentId);
       if (mode === "manual") return this.order.getOrder(folder, parentId);
-      return this.computeSortedIds(parentId, mode);
+      return computeSortedIds(this, parentId, mode);
     });
     this.debouncedRender = debounce(() => this.render(), 80);
+    this.authorship = new AuthorshipTracker(this);
+    this.dnd = new ViewDnD(this);
+    // 0.83.2: back the body render cache with the plugin's persisted store
+    // so rendered bodies survive reloads (cold open reads one cache file,
+    // not N bodies over a slow drive).
+    this.bodyRenderer = new NoteBodyRenderer(this, this, this.plugin.renderCacheStore);
   }
 
   getViewType(): string { return STASHPAD_VIEW_TYPE; }
@@ -357,7 +338,7 @@ export class StashpadView extends ItemView {
     // 0.77.12: periodically bound the multiplayer-tracking maps so a
     // long-lived session doesn't accumulate dead per-file entries.
     // registerInterval auto-clears on view unload.
-    this.registerInterval(window.setInterval(() => this.pruneContribMaps(), 60_000));
+    this.registerInterval(window.setInterval(() => this.authorship.pruneContribMaps(), 60_000));
 
     // Push a keymap Scope while focus is anywhere inside the view so
     // Escape can never warp to the previous tab. This sits BENEATH any
@@ -654,8 +635,7 @@ export class StashpadView extends ItemView {
     this.listResizeObserver = null;
     this.stickyRowObserver?.disconnect();
     this.stickyRowObserver = null;
-    this.bodyObserver?.disconnect();
-    this.bodyObserver = null;
+    this.bodyRenderer.dispose();
     this.composerNarrowObserver?.disconnect();
     this.composerNarrowObserver = null;
     this.focusedMiniObserver?.disconnect();
@@ -665,14 +645,11 @@ export class StashpadView extends ItemView {
     this.composerAutocomplete = null;
     for (const d of this.slugDebouncers.values()) d.cancel();
     for (const d of this.attachmentDebouncers.values()) d.cancel();
-    for (const t of this.contribTimers.values()) clearTimeout(t);
-    this.contribTimers.clear();
-    // 0.77.12: release the per-file multiplayer-tracking maps so they
-    // don't outlive the view (knownBodies in particular holds full body
-    // strings). They rebuild lazily on the next modify event.
-    this.knownBodies.clear();
-    this.recentSelfWrites.clear();
-    this.lastExternalModify.clear();
+    // 0.77.12: cancel pending stamps + release the per-file multiplayer-
+    // tracking maps so they don't outlive the view (knownBodies in
+    // particular holds full body strings). They rebuild lazily on the next
+    // modify event.
+    this.authorship.dispose();
     // Persist any in-flight draft text before tear-down. Await so Obsidian
     // doesn't unload the view before saveData() resolves.
     try { await this.flushDrafts(); } catch {}
@@ -1380,7 +1357,7 @@ export class StashpadView extends ItemView {
     // expensive cachedRead + MarkdownRenderer once they scroll near the
     // viewport — the profile showed body reads at full-list scale were
     // ~97% of the time.
-    this.armBodyObserver();
+    this.bodyRenderer.arm();
     if (focused.file && Platform.isMobile) {
       this.renderFocusedHeaderMini(list, focused);
       this.renderFocusedHeader(list, focused);
@@ -1725,7 +1702,8 @@ export class StashpadView extends ItemView {
   }
 
   private _renderT0: number | null = null;
-  private render(policy?: ScrollPolicy): void {
+  /** public: called by extracted command modules (commands/*.ts). */
+  render(policy?: ScrollPolicy): void {
     if (perf.enabled) this._renderT0 = performance.now();
     // 0.56.3: unannotated render() calls default to "preserve". That kills
     // the bouncing class of regressions where metadataCache-driven
@@ -1875,46 +1853,7 @@ export class StashpadView extends ItemView {
     // is still in place for the suppressScrollSave gate's interactions
     // (anchor restoration during preserve renders), but the save itself
     // happens on selection mutations (see stampSelectedCursor).
-    list.addEventListener("dragover", (e: DragEvent) => {
-      if (!this.dragSourceIds) return;
-      const t = e.target as HTMLElement | null;
-      // If the cursor is over a row, the per-row handler decides (above/into/below).
-      // BUT we still want to recompute when cursor is over the placeholder (so the
-      // placeholder slides to a new gap as the user moves through the list).
-      if (t && t.closest && t.closest(".stashpad-note")) return;
-      e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-      const rows = Array.from(list.querySelectorAll(".stashpad-note")) as HTMLElement[];
-      if (rows.length === 0) return;
-      // Find the first row whose vertical midpoint is below the cursor → drop before it.
-      for (const r of rows) {
-        const rect = r.getBoundingClientRect();
-        if (e.clientY < rect.top + rect.height / 2) {
-          this.placePlaceholder(r, "before");
-          return;
-        }
-      }
-      // Cursor is below all rows → drop after the last row.
-      this.placePlaceholder(rows[rows.length - 1], "after");
-    });
-    list.addEventListener("drop", (e: DragEvent) => {
-      // Only handle if no nested target consumed it.
-      if (!this.dragSourceIds) return;
-      e.preventDefault();
-      const sources = this.dragSourceIds.slice();
-      this.dragSourceIds = null;
-      if (!this.dragPlaceholder) return;
-      const after = this.dragPlaceholder.nextElementSibling as HTMLElement | null;
-      const before = this.dragPlaceholder.previousElementSibling as HTMLElement | null;
-      this.removeDragPlaceholder();
-      if (after && after.classList.contains("stashpad-note")) {
-        const id = (after as HTMLElement).dataset.id;
-        if (id) void this.reorderToTarget(sources, id, "before");
-      } else if (before && before.classList.contains("stashpad-note")) {
-        const id = (before as HTMLElement).dataset.id;
-        if (id) void this.reorderToTarget(sources, id, "after");
-      }
-    });
+    this.dnd.attachListDnD(list);
     this.populateListBody(list, focused);
 
     this.renderComposer(root);
@@ -3694,37 +3633,9 @@ export class StashpadView extends ItemView {
   /** Thin shim over the shared `buildFileActions` helper so existing
    *  call sites read naturally. Returns Reveal/Show actions for a
    *  vault file; [] when the path doesn't resolve. */
-  private actionsForFile(path: string): import("./notifications").NotificationAction[] {
+  /** public: called by extracted command modules (commands/*.ts). */
+  actionsForFile(path: string): import("./notifications").NotificationAction[] {
     return buildFileActions(this.app, path, Platform.isMobile);
-  }
-
-  /** Collect distinct author + contributor ids touching the given
-   *  nodes — read from each node's current frontmatter (author +
-   *  contributors). Used to pre-stamp `affectedAuthorIds` on
-   *  destructive notifications so the history modal's Cross-author
-   *  filter still works AFTER the notes are gone from the metadata
-   *  cache (a post-delete resolver lookup would return nothing). */
-  private collectAuthorIds(nodes: TreeNode[]): string[] {
-    const out = new Set<string>();
-    const extract = (raw: unknown): string | null => {
-      if (typeof raw !== "string") return null;
-      const m = raw.match(/-([a-z0-9]{4,12})(?:\.md)?(?:\||\]\])/i);
-      return m ? m[1] : null;
-    };
-    for (const n of nodes) {
-      if (!n.file) continue;
-      const fm = this.app.metadataCache.getFileCache(n.file)?.frontmatter;
-      if (!fm) continue;
-      const a = extract(fm.author);
-      if (a) out.add(a);
-      if (Array.isArray(fm.contributors)) {
-        for (const c of fm.contributors) {
-          const cid = extract(c);
-          if (cid) out.add(cid);
-        }
-      }
-    }
-    return Array.from(out);
   }
 
   /** Multi-line bulleted list of titles, headered by the verb. Used
@@ -3764,7 +3675,8 @@ export class StashpadView extends ItemView {
    *  delimiters read cleanly even with titles that contain commas.
    *  Falls back to "(untitled)" for nodes without a resolvable title.
    *  Prefer `bulkActionMessage` for >1-item action confirmations. */
-  private titleList(nodes: TreeNode[], max = 3): string {
+  /** public: read by extracted command modules (commands/*.ts). */
+  titleList(nodes: TreeNode[], max = 3): string {
     if (!nodes.length) return "";
     const titles = nodes.map((n) => this.titleForNode(n).trim() || "(untitled)");
     if (titles.length <= max) {
@@ -3774,62 +3686,13 @@ export class StashpadView extends ItemView {
     return `${head}, +${titles.length - max} more`;
   }
 
-  private titleForNode(node: TreeNode): string {
+  /** public: read by view-sort's compareForSort (the SortHost interface). */
+  titleForNode(node: TreeNode): string {
     if (!node.file) return "Untitled";
     const cache = this.app.metadataCache.getFileCache(node.file);
     const firstHeading = cache?.headings?.[0]?.heading;
     if (firstHeading) return firstHeading;
     return node.file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
-  }
-
-  /** Synthesize an id order array for a parent under a non-manual sort mode.
-   *  Reads the parent's existing children straight from the TreeIndex (which
-   *  has already been populated by the rebuild) and sorts them per the mode.
-   *  Title/modified lookups use the metadata cache — cheap and consistent
-   *  with how the rest of the view reads frontmatter. */
-  private computeSortedIds(parentId: StashpadId, mode: SortMode): string[] {
-    const kids = this.tree.getChildren(parentId);
-    return kids.slice().sort((a, b) => this.compareForSort(a, b, mode)).map((n) => n.id);
-  }
-
-  private compareForSort(a: TreeNode, b: TreeNode, mode: SortMode): number {
-    switch (mode) {
-      case "created-asc":
-        return (a.created || "").localeCompare(b.created || "");
-      case "created-desc":
-        return (b.created || "").localeCompare(a.created || "");
-      case "modified-asc":
-      case "modified-desc": {
-        // Fall back to created when modified is absent so a never-edited
-        // note still has a stable position.
-        const ma = this.modifiedFor(a) || a.created || "";
-        const mb = this.modifiedFor(b) || b.created || "";
-        return mode === "modified-asc"
-          ? ma.localeCompare(mb)
-          : mb.localeCompare(ma);
-      }
-      case "title-az":
-      case "title-za": {
-        const ta = this.titleForNode(a);
-        const tb = this.titleForNode(b);
-        // `numeric: true` makes "Item 2" come before "Item 10", which is
-        // what you want when notes are numbered lists. `sensitivity: base`
-        // makes the sort case-insensitive (A and a tie before the next
-        // letter). Both compare-options are universally supported.
-        const opts = { numeric: true, sensitivity: "base" } as const;
-        return mode === "title-az"
-          ? ta.localeCompare(tb, undefined, opts)
-          : tb.localeCompare(ta, undefined, opts);
-      }
-      default:
-        return 0;
-    }
-  }
-
-  private modifiedFor(node: TreeNode): string {
-    if (!node.file) return "";
-    const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
-    return (typeof fm?.modified === "string" ? fm.modified : "") || "";
   }
 
   /** Force a parent's sort mode back to "manual" after any operation that
@@ -3869,7 +3732,7 @@ export class StashpadView extends ItemView {
     // would have nothing well-defined to mutate.
     const draggable = this.currentViewMode() === "nested";
     row.draggable = draggable;
-    if (draggable) this.attachRowDnD(row, node, idx);
+    if (draggable) this.dnd.attachRowDnD(row, node, idx);
 
     row.addEventListener("click", (e) => this.handleRowClick(e, idx, node));
     // 0.75.0: double-click / double-tap focuses (navigates into) the
@@ -3984,77 +3847,13 @@ export class StashpadView extends ItemView {
     row.oncontextmenu = (evt) => { evt.preventDefault(); this.openNoteMenu(evt, node); };
   }
 
-  /** Per-file rendered-body cache, keyed by `(path, mtime)`. Stores the
-   *  parsed (stripped frontmatter, attachments split out) text + rendered
-   *  HTML so a re-render of the same row doesn't re-issue the cachedRead,
-   *  re-run stripFrontmatter/splitAttachments, or re-run MarkdownRenderer.
-   *
-   *  On a network drive this skips the round-trip; on a low-spec CPU it
-   *  skips the markdown parse (the dominant per-row cost). On mtime
-   *  mismatch the entry is silently replaced — Obsidian updates `stat.mtime`
-   *  whenever the file changes, so cache invalidation is automatic.
-   *
-   *  Memory profile: typical Stashpad note renders to ~2-5 KB of HTML, so
-   *  a 1000-note vault sits around 2-5 MB. Acceptable; an LRU bound can
-   *  go on later if it becomes a problem. */
-  /** 0.76.7: per-file render cache. `ovW`/`ovV` memoize the body's
-   *  overflow decision (does it exceed the 2-line clamp?) keyed by the
-   *  list width it was measured at — so re-rendering an unchanged list
-   *  (e.g. after adding ONE note to a 200-child Home) doesn't force a
-   *  scrollHeight read (= layout reflow) on all 200 rows. That
-   *  per-row reflow thrash was the dominant cost of the "couple
-   *  seconds to render" lag. */
-  private renderCache = new Map<string, { mtime: number; text: string; attachments: string[]; html: string; ovW?: number; ovV?: boolean }>();
-  /** 0.82.1: lazy-body machinery. `bodyObserver` watches cold rows; when
-   *  one nears the viewport its deferred render closure (stored in
-   *  `lazyBodies`, keyed by the body container) runs once. */
-  private bodyObserver: IntersectionObserver | null = null;
-  private lazyBodies = new WeakMap<HTMLElement, () => void>();
+  /** Lazy-body render cache + IntersectionObserver machinery (0.82.1).
+   *  Owns renderCache / bodyObserver / lazyBodies; see NoteBodyRenderer. */
+  bodyRenderer: NoteBodyRenderer;
   /** Width the list was last laid out at — the key for the overflow
    *  memo above. Captured once per populateListBody (one read), not
    *  per row. */
   private lastListWidth = 0;
-
-  private async getOrComputeRender(file: TFile): Promise<{ mtime: number; text: string; attachments: string[]; html: string; ovW?: number; ovV?: boolean }> {
-    const cached = this.renderCache.get(file.path);
-    if (cached && cached.mtime === file.stat.mtime) { perf.record("render.row.cacheHit", 0); return cached; }
-    // Cache miss / stale entry. Read + parse + render into a detached div
-    // and stash the result before returning. 0.81.1: split the body READ
-    // (network I/O on a share) from the markdown RENDER (CPU) so the
-    // profile shows which dominates.
-    const md = await perf.timeAsync("render.row.read", () => this.app.vault.cachedRead(file));
-    const raw = this.stripFrontmatter(md);
-    const { text, attachments } = this.splitAttachments(raw);
-    const detached = createDiv({ cls: "stashpad-note-text" });
-    await perf.timeAsync("render.row.markdown", () => MarkdownRenderer.render(this.app, text, detached, file.path, this as any));
-    const html = detached.innerHTML;
-    const entry = { mtime: file.stat.mtime, text, attachments, html };
-    this.renderCache.set(file.path, entry);
-    return entry;
-  }
-
-  /** (Re)create the lazy-body IntersectionObserver for the current paint.
-   *  Root is the view's scroll host; rootMargin pre-renders a screenful
-   *  above/below so scrolling rarely catches a placeholder. */
-  private armBodyObserver(): void {
-    this.bodyObserver?.disconnect();
-    this.lazyBodies = new WeakMap();
-    this.bodyObserver = new IntersectionObserver((entries) => {
-      for (const e of entries) {
-        if (!e.isIntersecting) continue;
-        const el = e.target as HTMLElement;
-        const fn = this.lazyBodies.get(el);
-        this.bodyObserver?.unobserve(el);
-        this.lazyBodies.delete(el);
-        if (fn) fn();
-      }
-    }, { root: this.contentEl, rootMargin: "1400px 0px" });
-  }
-
-  private hasFreshRenderCache(file: TFile): boolean {
-    const c = this.renderCache.get(file.path);
-    return !!c && c.mtime === file.stat.mtime;
-  }
 
   /** Public entry: render the body NOW if it's already cached (cheap), or
    *  show a title placeholder and defer the expensive read+render until the
@@ -4067,15 +3866,14 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     // Warm rows (cached HTML) render instantly — no deferral needed. Cold
     // rows (the expensive cachedRead misses) get a placeholder + observer.
-    if (this.hasFreshRenderCache(node.file) || !this.bodyObserver) {
+    if (this.bodyRenderer.hasFreshRenderCache(node.file) || !this.bodyRenderer.isArmed()) {
       this.renderNoteBodyNow(container, node, opts);
       return;
     }
     container.empty();
     const ph = container.createDiv({ cls: "stashpad-note-text is-plain is-lazy-placeholder" });
     ph.textContent = this.titleForNode(node);
-    this.lazyBodies.set(container, () => this.renderNoteBodyNow(container, node, opts));
-    this.bodyObserver.observe(container);
+    this.bodyRenderer.defer(container, () => this.renderNoteBodyNow(container, node, opts));
   }
 
   private renderNoteBodyNow(
@@ -4092,7 +3890,7 @@ export class StashpadView extends ItemView {
     // the second resolve attached over a stale shell.
     const token = ((container as any).__stashpadRenderToken ?? 0) + 1;
     (container as any).__stashpadRenderToken = token;
-    void this.getOrComputeRender(file).then((entry) => {
+    void this.bodyRenderer.getOrComputeRender(file).then((entry) => {
       if ((container as any).__stashpadRenderToken !== token) return;
       const { text, attachments, html } = entry;
       // Clear any stale content that earlier renders left behind before
@@ -4203,15 +4001,6 @@ export class StashpadView extends ItemView {
       container.empty();
       this.renderNoteBody(container, node, opts);
     };
-  }
-
-  private splitAttachments(body: string): { text: string; attachments: string[] } {
-    const attachments: string[] = [];
-    const text = body.replace(/!\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (_m, p1) => {
-      attachments.push(p1);
-      return "";
-    }).replace(/\n{3,}/g, "\n\n").trim();
-    return { text, attachments };
   }
 
   private renderAttachmentRail(parent: HTMLElement, paths: string[]): void {
@@ -5202,7 +4991,8 @@ export class StashpadView extends ItemView {
     }
   }
 
-  private getActionTargets(): TreeNode[] {
+  /** public: called by AuthorshipTracker (the host interface). */
+  getActionTargets(): TreeNode[] {
     if (this.selection.size > 0) {
       return [...this.selection].map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
     }
@@ -6024,161 +5814,13 @@ export class StashpadView extends ItemView {
     });
   }
 
-  async cmdCopy(): Promise<void> {
-    const targets = this.getActionTargets();
-    if (!targets.length) return;
-    const prefix = getSettings().prefixTimestampsOnCopy;
-    const out: string[] = [];
-    for (const t of targets) {
-      if (!t.file) continue;
-      const raw = await this.app.vault.cachedRead(t.file);
-      const body = this.stripFrontmatter(raw).trim();
-      out.push(prefix ? `${this.formatTimeInline(t.created)} ${body}` : body);
-    }
-    await navigator.clipboard.writeText(out.join("\n\n"));
-    this.plugin.notifications.show({
-      message: `Copied ${this.titleList(targets)} to clipboard`,
-      kind: "success",
-      category: "system",
-      affectedIds: targets.map((t) => t.id),
-      folder: this.noteFolder,
-    });
-  }
-
-  /** Copy the contents of a fenced codeblock from the cursor row's body.
-   *  - 0 codeblocks → info toast.
-   *  - 1 codeblock  → copy silently with a success toast.
-   *  - 2+ blocks    → pick one via a SuggestModal (with a "Copy all"
-   *                   choice at the end that joins them with blank lines).
-   *  Operates on the first selected note when there's a selection,
-   *  otherwise the cursor row. 0.61.0. */
-  async cmdCopyCodeBlock(): Promise<void> {
-    const targets = this.getActionTargets();
-    if (!targets.length || !targets[0].file) { new Notice("Nothing to copy from."); return; }
-    const node = targets[0];
-    const raw = await this.app.vault.cachedRead(node.file!);
-    const body = this.stripFrontmatter(raw);
-    const blocks = extractCodeBlocks(body);
-    if (blocks.length === 0) {
-      this.plugin.notifications.show({
-        message: `No codeblock found in "${this.titleForNode(node)}".`,
-        kind: "info",
-        category: "system",
-        affectedIds: [node.id],
-        folder: this.noteFolder,
-      });
-      return;
-    }
-    if (blocks.length === 1) {
-      await navigator.clipboard.writeText(blocks[0].code);
-      this.plugin.notifications.show({
-        message: `Copied codeblock${blocks[0].lang ? ` (${blocks[0].lang})` : ""} from "${this.titleForNode(node)}".`,
-        kind: "success",
-        category: "system",
-        affectedIds: [node.id],
-        folder: this.noteFolder,
-      });
-      return;
-    }
-    // Multiple — pick one (or all). Lightweight SuggestModal.
-    type Item = { kind: "one" | "all"; idx: number; label: string };
-    const items: Item[] = blocks.map((b, i) => ({
-      kind: "one" as const,
-      idx: i,
-      label: `${i + 1}. ${b.lang || "(no language)"} — ${b.code.split("\n")[0].slice(0, 60)}${b.code.includes("\n") ? "…" : ""}`,
-    }));
-    items.push({ kind: "all", idx: -1, label: `Copy all ${blocks.length} blocks (joined with blank lines)` });
-    const view = this;
-    const modal = new (class extends SuggestModal<Item> {
-      getSuggestions(query: string): Item[] {
-        const q = query.trim().toLowerCase();
-        if (!q) return items;
-        const tokens = q.split(/\s+/).filter(Boolean);
-        return items.filter((it) => {
-          const h = it.label.toLowerCase();
-          return tokens.every((t) => h.includes(t));
-        });
-      }
-      renderSuggestion(item: Item, el: HTMLElement): void {
-        el.createDiv({ cls: "stashpad-suggest-title", text: item.label });
-      }
-      async onChooseSuggestion(item: Item): Promise<void> {
-        const text = item.kind === "all"
-          ? blocks.map((b) => b.code).join("\n\n")
-          : blocks[item.idx].code;
-        await navigator.clipboard.writeText(text);
-        view.plugin.notifications.show({
-          message: item.kind === "all"
-            ? `Copied all ${blocks.length} codeblocks from "${view.titleForNode(node)}".`
-            : `Copied codeblock${blocks[item.idx].lang ? ` (${blocks[item.idx].lang})` : ""} from "${view.titleForNode(node)}".`,
-          kind: "success",
-          category: "system",
-          affectedIds: [node.id],
-          folder: view.noteFolder,
-        });
-      }
-    })(this.app);
-    modal.setPlaceholder(`${blocks.length} codeblocks in "${this.titleForNode(node)}" — pick one to copy.`);
-    modal.open();
-  }
-
-  async cmdCopyTree(): Promise<void> {
-    // Roots: selection > cursor row > focused note (last resort).
-    let roots = this.getActionTargets();
-    if (roots.length === 0) {
-      const focused = this.tree.get(this.focusId);
-      if (focused?.file) roots = [focused];
-    }
-    if (roots.length === 0) { new Notice("Nothing to copy."); return; }
-    const prefix = getSettings().prefixTimestampsOnCopy;
-    const lines: string[] = [];
-    const walk = async (node: TreeNode, depth: number): Promise<void> => {
-      if (node.file) {
-        const raw = await this.app.vault.cachedRead(node.file);
-        const body = this.stripFrontmatter(raw).trim().split(/\r?\n/).join(" ");
-        const ts = prefix ? `${this.formatTimeInline(node.created)} ` : "";
-        lines.push(`${"  ".repeat(depth)}- ${ts}${body}`);
-      }
-      for (const c of this.tree.getChildren(node.id)) await walk(c, depth + 1);
-    };
-    for (const r of roots) await walk(r, 0);
-    await navigator.clipboard.writeText(lines.join("\n"));
-    this.plugin.notifications.show({
-      message: `Copied tree of ${this.titleList(roots)} (${lines.length} entries)`,
-      kind: "success",
-      category: "system",
-      affectedIds: roots.map((r) => r.id),
-      folder: this.noteFolder,
-    });
-  }
-
-  /** Copy selection (or cursor row, or focused note) as a bullet list of
-   *  ![[embed]] links, indented by nesting depth. Useful for transcluding a
-   *  subtree into a regular Obsidian note. */
-  async cmdCopyOutline(): Promise<void> {
-    let roots = this.getActionTargets();
-    if (roots.length === 0) {
-      const focused = this.tree.get(this.focusId);
-      if (focused?.file) roots = [focused];
-    }
-    if (roots.length === 0) { new Notice("Nothing to copy."); return; }
-    const lines: string[] = [];
-    const walk = (node: TreeNode, depth: number) => {
-      if (!node.file) return;
-      const indent = "  ".repeat(depth);
-      lines.push(`${indent}- ![[${node.file.basename}]]`);
-      for (const c of this.tree.getChildren(node.id)) walk(c, depth + 1);
-    };
-    for (const r of roots) walk(r, 0);
-    await navigator.clipboard.writeText(lines.join("\n"));
-    this.plugin.notifications.show({
-      message: `Copied outline of ${this.titleList(roots)} (${lines.length} entr${lines.length === 1 ? "y" : "ies"})`,
-      kind: "success",
-      category: "system",
-      affectedIds: roots.map((r) => r.id),
-      folder: this.noteFolder,
-    });
-  }
+  // Clipboard commands — implementations live in commands/clipboard-cmds.ts.
+  // These thin delegators keep the public method names stable for the keydown
+  // dispatcher + main.ts's call("<method>") palette wiring.
+  cmdCopy(): Promise<void> { return clipboardCmds.cmdCopy(this); }
+  cmdCopyCodeBlock(): Promise<void> { return clipboardCmds.cmdCopyCodeBlock(this); }
+  cmdCopyTree(): Promise<void> { return clipboardCmds.cmdCopyTree(this); }
+  cmdCopyOutline(): Promise<void> { return clipboardCmds.cmdCopyOutline(this); }
 
   /** Toggle the "Show more / show less" clamp for the current target(s).
    *  Targets follow getActionTargets (selection > cursor row). Each
@@ -7098,7 +6740,7 @@ export class StashpadView extends ItemView {
     // 0.78.1: who is doing the assigning (the local user) — stamped as
     // assignedBy so the "assigned by me" filter works. Null if the user
     // hasn't set an author name.
-    const me = this.currentAuthorLink();
+    const me = this.authorship.currentAuthorLink();
     // Ensure an author stub exists in THIS folder for each assignee so
     // their wikilink resolves (free-entry names mint a fresh stub).
     for (const a of assignees) {
@@ -7182,7 +6824,7 @@ export class StashpadView extends ItemView {
    *  `due`), with undo. An empty list clears the assignment. Assigning
    *  also flips `task: true`. */
   private async applyAssignees(targets: TreeNode[], assignees: Array<{ id: string; name: string }>): Promise<void> {
-    const me = this.currentAuthorLink();
+    const me = this.authorship.currentAuthorLink();
     for (const a of assignees) {
       await this.plugin.ensureAuthorStubFor(this.noteFolder, a.id, a.name);
     }
@@ -7427,160 +7069,10 @@ export class StashpadView extends ItemView {
 
   // --- Drag-and-drop reordering ---
 
-  private dragSourceIds: StashpadId[] | null = null;
-  private dragPlaceholder: HTMLElement | null = null;
-  private dragRowHeight = 0;
   /** When set, the next render() will use this list of ids to compute cursor &
    *  selection (find their positions in currentChildren). Used by reorder/move/undo
    *  to stop the stale cursor lingering on the previous row's slot. */
   private pendingFocusIds: StashpadId[] | null = null;
-
-  private attachRowDnD(row: HTMLElement, node: TreeNode, _idx: number): void {
-    row.addEventListener("dragstart", (e: DragEvent) => {
-      const ids = this.selection.has(node.id) && this.selection.size > 1
-        ? [...this.selection]
-        : [node.id];
-      this.dragSourceIds = ids;
-      this.dragRowHeight = row.offsetHeight;
-      row.addClass("is-dragging");
-      // Pre-create the placeholder once per drag (kept detached until first dragover).
-      if (this.listEl) {
-        this.dragPlaceholder = this.listEl.createDiv({ cls: "stashpad-drop-placeholder" });
-        this.dragPlaceholder.style.height = "0px";
-        // Make the placeholder a valid drop target so dropping in the gap actually
-        // fires a drop event (without this it'd be inert and the drop would be lost).
-        this.dragPlaceholder.addEventListener("dragover", (de: DragEvent) => {
-          if (!this.dragSourceIds) return;
-          de.preventDefault();
-          if (de.dataTransfer) de.dataTransfer.dropEffect = "move";
-        });
-        this.dragPlaceholder.addEventListener("drop", (de: DragEvent) => {
-          if (!this.dragSourceIds || !this.dragPlaceholder) return;
-          de.preventDefault();
-          de.stopPropagation();
-          const sources = this.dragSourceIds.slice();
-          this.dragSourceIds = null;
-          // Determine the target by looking at the row that comes AFTER the placeholder
-          // (drop "before" that row). If placeholder is the last sibling, drop "after"
-          // the row before it.
-          const after = this.dragPlaceholder.nextElementSibling as HTMLElement | null;
-          const before = this.dragPlaceholder.previousElementSibling as HTMLElement | null;
-          this.removeDragPlaceholder();
-          let targetId: string | undefined;
-          let position: "before" | "after" = "before";
-          if (after && after.classList.contains("stashpad-note")) {
-            targetId = (after as HTMLElement).dataset.id;
-            position = "before";
-          } else if (before && before.classList.contains("stashpad-note")) {
-            targetId = (before as HTMLElement).dataset.id;
-            position = "after";
-          }
-          if (targetId) void this.reorderToTarget(sources, targetId, position);
-        });
-        this.dragPlaceholder.remove();
-      }
-      // Use text/plain — some Chromium versions don't initiate drag without a
-      // standard MIME type set on dataTransfer.
-      e.dataTransfer?.setData("text/plain", ids.join(","));
-      if (e.dataTransfer) {
-        e.dataTransfer.effectAllowed = "move";
-        // Use the whole row as the drag image (not just the grip when that's the source).
-        try { e.dataTransfer.setDragImage(row, 12, 12); } catch {}
-      }
-    });
-    row.addEventListener("dragend", () => {
-      row.removeClass("is-dragging");
-      this.clearDropIndicators();
-      this.removeDragPlaceholder();
-      this.dragSourceIds = null;
-    });
-    row.addEventListener("dragover", (e: DragEvent) => {
-      if (!this.dragSourceIds) return;
-      e.preventDefault();
-      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-      const zone = this.dropZone(e, row);
-      this.clearDropIndicators();
-      if (zone === "drop-into") {
-        this.removeDragPlaceholder();
-        row.addClass("drop-into");
-      } else {
-        row.removeClass("drop-into");
-        this.placePlaceholder(row, zone === "drop-above" ? "before" : "after");
-      }
-    });
-    row.addEventListener("dragleave", (e: DragEvent) => {
-      // Only clear if we've actually left the row (not just moved over a child).
-      const r = row.getBoundingClientRect();
-      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
-        row.removeClass("drop-into");
-      }
-    });
-    row.addEventListener("drop", (e: DragEvent) => {
-      if (!this.dragSourceIds) return;
-      e.preventDefault();
-      e.stopPropagation();
-      const sources = this.dragSourceIds.slice();
-      this.dragSourceIds = null;
-      const zone = this.dropZone(e, row);
-      this.clearDropIndicators();
-      this.removeDragPlaceholder();
-      row.removeClass("is-dragging");
-      if (zone === "drop-into") {
-        void this.reorderToTarget(sources, node.id, "into");
-      } else {
-        void this.reorderToTarget(sources, node.id, zone === "drop-above" ? "before" : "after");
-      }
-    });
-  }
-
-  private placePlaceholder(row: HTMLElement, where: "before" | "after"): void {
-    if (!this.dragPlaceholder || !this.listEl) return;
-    const sibling = where === "before" ? row : row.nextSibling;
-    // Avoid redundant DOM moves (which would re-trigger animations).
-    if (where === "before" && this.dragPlaceholder.nextSibling === row) return;
-    if (where === "after" && this.dragPlaceholder.previousSibling === row) return;
-    const wasMounted = !!this.dragPlaceholder.parentElement;
-    this.listEl.insertBefore(this.dragPlaceholder, sibling);
-    // Always restore visibility — drop-into → drop-above transitions had been
-    // leaving the placeholder at opacity 0 / height 0 from a previous animated remove.
-    this.dragPlaceholder.style.opacity = "1";
-    if (!wasMounted) {
-      this.dragPlaceholder.style.height = "0px";
-      // Force layout, then animate to full height.
-      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
-      this.dragPlaceholder.offsetHeight;
-      this.dragPlaceholder.style.height = `${this.dragRowHeight}px`;
-    } else {
-      this.dragPlaceholder.style.height = `${this.dragRowHeight}px`;
-    }
-  }
-
-  private removeDragPlaceholder(): void {
-    if (!this.dragPlaceholder?.parentElement) return;
-    const ph = this.dragPlaceholder;
-    // Animate collapse, then remove. Keep a reference so a fast next-drag isn't
-    // confused (we null out below regardless).
-    ph.style.height = "0px";
-    ph.style.opacity = "0";
-    setTimeout(() => { if (ph.parentElement) ph.remove(); }, 150);
-  }
-
-  /** Three-zone hit test for drop position relative to a row's vertical bounds:
-   *  top 30% → drop-above, middle 40% → drop-into, bottom 30% → drop-below. */
-  private dropZone(e: DragEvent, row: HTMLElement): "drop-above" | "drop-into" | "drop-below" {
-    const rect = row.getBoundingClientRect();
-    const y = e.clientY - rect.top;
-    if (y < rect.height * 0.3) return "drop-above";
-    if (y > rect.height * 0.7) return "drop-below";
-    return "drop-into";
-  }
-
-  private clearDropIndicators(): void {
-    if (!this.listEl) return;
-    for (const el of Array.from(this.listEl.querySelectorAll(".drop-into"))) {
-      (el as HTMLElement).removeClass("drop-into");
-    }
-  }
 
   /** True if `descId` is a descendant of `ancestorId` in the tree (used to prevent
    *  cycles when nesting via drag-into). */
@@ -7615,7 +7107,7 @@ export class StashpadView extends ItemView {
     affectedParents.add(targetParentId);
 
     // Capture author/contributor ids BEFORE the move so cross-author filtering picks it up.
-    const movedAuthorIds = this.collectAuthorIds(
+    const movedAuthorIds = this.authorship.collectAuthorIds(
       sourceIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n)
     );
 
@@ -7772,7 +7264,8 @@ export class StashpadView extends ItemView {
 
   /** Place sourceIds before/after targetId, OR nest them as children of targetId
    *  ("into"). Cross-parent + nest both prompt a confirm (unless disabled in settings). */
-  private async reorderToTarget(
+  /** public: called by ViewDnD (the host interface) from drop handlers. */
+  async reorderToTarget(
     sourceIds: StashpadId[],
     targetId: StashpadId,
     position: "before" | "after" | "into",
@@ -8101,7 +7594,7 @@ export class StashpadView extends ItemView {
         for (const n of allNotes) if (n.parent) orphanedParents.add(n.parent);
         // Capture author/contributor ids BEFORE deletion so cross-author
         // filtering can pick this up (resolver can't read deleted files).
-        const deletedAuthorIds = this.collectAuthorIds(allNotes);
+        const deletedAuthorIds = this.authorship.collectAuthorIds(allNotes);
         // 0.56.5: pick a surviving neighbour for cursor BEFORE the rebuild
         // wipes everything. Look forward from the topmost deleted position
         // for the first non-deleted sibling; fall back to looking backward.
@@ -8336,158 +7829,11 @@ export class StashpadView extends ItemView {
   }
 
   // --- Stash export / import ---
-
-  /** Export selected notes (or cursor row if no selection, or focused note as last resort) as .stash. */
-  async cmdExportStash(rootNode?: TreeNode): Promise<void> {
-    const roots = this.collectExportRoots(rootNode);
-    if (roots.length === 0) { new Notice("Nothing to export."); return; }
-    const all = this.collectExportSubtree(roots);
-    if (all.length === 0) { new Notice("No exportable notes (no files attached)."); return; }
-    try {
-      const buf = await buildStashZip(this.app, {
-        rootNotes: roots.filter((n) => !!n.file).map((n) => ({ id: n.id, file: n.file! })),
-        allDescendants: all
-          .filter((n) => !roots.some((r) => r.id === n.id))
-          .filter((n) => !!n.file)
-          .map((n) => ({ id: n.id, file: n.file! })),
-        sourceFolder: this.noteFolder,
-      });
-      const stamp = (moment as any)().format("YYYYMMDD-HHmmss");
-      // 0.59.0: multi-note exports include the source folder name so the
-      // exported filename tells you where it came from. Single-note
-      // exports still use the note's title since it's already unique.
-      const folderTag = (this.noteFolder.split("/").pop() || this.noteFolder).trim();
-      const baseName = roots.length === 1
-        ? this.titleForNode(roots[0])
-        : `${folderTag}-${roots.length}notes`;
-      const safe = baseName.replace(/[^\w.\-]+/g, "_").slice(0, 60) || "stash-export";
-      const exportSub = (this.plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
-      const exportFolder = `${this.noteFolder}/${exportSub}`;
-      await this.ensureFolder(exportFolder);
-      const outPath = `${exportFolder}/${safe}-${stamp}.${STASH_EXT}`;
-      await this.app.vault.createBinary(outPath, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
-      await this.log.append({
-        type: "stash_export",
-        id: roots[0].id,
-        payload: { path: outPath, noteCount: all.length, rootIds: roots.map((r) => r.id) },
-      });
-      this.plugin.notifications.show({
-        message: `Exported ${all.length} note${all.length === 1 ? "" : "s"} → \`${outPath}\``,
-        kind: "success",
-        category: "export",
-        affectedPaths: [outPath],
-        folder: this.noteFolder,
-        actions: this.actionsForFile(outPath),
-        // 0.59.0: export toast stays open until user dismisses. With
-        // keepOpen:true on the file actions, the user often wants to
-        // click Reveal, glance, come back, and click Show in OS. The
-        // 4s auto-dismiss was cutting that flow short.
-        duration: 0,
-      });
-    } catch (e) {
-      this.plugin.notifications.show({
-        message: `Stashpad: export failed\nError: ${(e as Error).message}\nCheck disk space + write permissions on the export folder.`,
-        kind: "error",
-        category: "export",
-      });
-      console.error(e);
-    }
-  }
-
-  private collectExportRoots(node?: TreeNode): TreeNode[] {
-    if (node?.file) return [node];
-    if (this.selection.size > 0) {
-      return [...this.selection]
-        .map((id) => this.tree.get(id))
-        .filter((n): n is TreeNode => !!n?.file);
-    }
-    if (this.cursorIdx >= 0 && this.currentChildren[this.cursorIdx]) {
-      return [this.currentChildren[this.cursorIdx]];
-    }
-    const focused = this.tree.get(this.focusId);
-    return focused?.file ? [focused] : [];
-  }
-
-  private collectExportSubtree(roots: TreeNode[]): TreeNode[] {
-    const seen = new Set<StashpadId>();
-    const out: TreeNode[] = [];
-    const walk = (n: TreeNode): void => {
-      if (seen.has(n.id)) return;
-      seen.add(n.id);
-      if (n.file) out.push(n);
-      for (const c of this.tree.getChildren(n.id)) walk(c);
-    };
-    for (const r of roots) walk(r);
-    return out;
-  }
-
-  /** Import a .stash file from anywhere in the vault into the current Stashpad folder. */
-  async cmdImportStash(): Promise<void> {
-    const files = this.app.vault.getFiles().filter((f) => f.extension === STASH_EXT);
-    if (files.length === 0) { new Notice("No .stash files found in this vault."); return; }
-    const view = this;
-    const modal = new (class extends FuzzySuggestModal<TFile> {
-      getItems(): TFile[] { return files; }
-      getItemText(f: TFile): string { return f.path; }
-      onChooseItem(f: TFile): void { void view.processStashFile(f); }
-    })(this.app);
-    modal.setPlaceholder("Pick a .stash file to import…");
-    modal.open();
-  }
-
-  async processStashFile(file: TFile): Promise<void> {
-    try {
-      const buf = await this.app.vault.readBinary(file);
-      const summary = await importStashZip(this.app, new Uint8Array(buf), this.noteFolder, this.collectExistingIds());
-      this.tree.rebuild(this.noteFolder);
-      this.render();
-      await this.log.append({
-        type: "stash_import",
-        id: ROOT_ID,
-        payload: {
-          from: file.path, into: this.noteFolder,
-          noteCount: summary.notesWritten,
-          attachmentsWritten: summary.attachmentsWritten,
-          collisionsRenamed: summary.collisionsRenamed,
-        },
-      });
-      // Send the source .stash to trash on success (respects user's deleted-files setting).
-      try { await this.app.fileManager.trashFile(file); } catch {}
-      const parts = [`Imported ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"}`];
-      if (summary.attachmentsWritten) parts.push(`+ ${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"}`);
-      if (summary.collisionsRenamed) parts.push(`(${summary.collisionsRenamed} id collision${summary.collisionsRenamed === 1 ? "" : "s"} renamed)`);
-      this.plugin.notifications.show({
-        message: parts.join(" "),
-        kind: "success",
-        category: "import",
-        folder: this.noteFolder,
-      });
-    } catch (e) {
-      this.plugin.notifications.show({
-        message: `Stashpad: import failed\nFile: \`${file.name}\`\nError: ${(e as Error).message}\nInspect with the buttons below — rename to .zip to crack it open in an archive tool.`,
-        kind: "error",
-        category: "import",
-        affectedPaths: [file.path],
-        // Reveal/Show actions on the source .stash so the user can
-        // inspect the bad bundle. Failure path doesn't trash the file
-        // (only success does), so it's still there to inspect.
-        actions: this.actionsForFile(file.path),
-      });
-      console.error(e);
-    }
-  }
-
-  private collectExistingIds(): Set<StashpadId> {
-    const out = new Set<StashpadId>();
-    const walk = (id: StashpadId): void => {
-      out.add(id);
-      const node = this.tree.get(id);
-      if (!node) return;
-      for (const c of this.tree.getChildren(id)) walk(c.id);
-    };
-    walk(ROOT_ID);
-    return out;
-  }
+  // Implementations live in commands/io-cmds.ts; these thin delegators keep
+  // the public method names stable for the keydown dispatcher + main.ts.
+  cmdExportStash(rootNode?: TreeNode): Promise<void> { return ioCmds.cmdExportStash(this, rootNode); }
+  cmdImportStash(): Promise<void> { return ioCmds.cmdImportStash(this); }
+  processStashFile(file: TFile): Promise<void> { return ioCmds.processStashFile(this, file); }
 
   // --- Note creation ---
 
@@ -8552,8 +7898,8 @@ export class StashpadView extends ItemView {
     // settings (otherwise leave authorship out so non-multiplayer
     // workflows aren't polluted). The author stub file is created
     // lazily so the wikilink resolves on click.
-    const author = this.currentAuthorLink();
-    if (author) { void this.ensureAuthorFile(author); }
+    const author = this.authorship.currentAuthorLink();
+    if (author) { void this.authorship.ensureAuthorFile(author); }
 
     const fmLines = [
       "---", `id: ${id}`, `parent: ${parentId}`, `created: ${created}`,
@@ -8686,7 +8032,8 @@ export class StashpadView extends ItemView {
     return out;
   }
 
-  private async ensureFolder(path: string): Promise<void> {
+  /** public: called by AuthorshipTracker (the host interface). */
+  async ensureFolder(path: string): Promise<void> {
     // 0.71.35: prefer the adapter (authoritative for on-disk state)
     // over getAbstractFileByPath, which races the metadataCache on
     // plugin reload — returning null for folders that actually exist,
@@ -8732,199 +8079,14 @@ export class StashpadView extends ItemView {
 
   // --- Multiplayer / authorship ---
 
-  /** Build the wikilink string Stashpad writes into author/contributors
-   *  frontmatter: "[[<noteFolder>/_authors/<safe-name>-<id>|<displayName>]]".
-   *  Falls back to null when the user hasn't set an author name (i.e.
-   *  they've opted out of stamping). The display alias means readers
-   *  see "Jane Doe", not the safe-slug-with-id. */
-  private currentAuthorLink(): { link: string; path: string; name: string; id: string } | null {
-    const name = (this.plugin.settings.authorName ?? "").trim();
-    const id = (this.plugin.settings.authorId ?? "").trim();
-    if (!name || !id) return null;
-    const safe = name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "author";
-    const path = `${this.noteFolder}/_authors/${safe}-${id}.md`;
-    // 0.77.11: strip characters that would break out of the wikilink alias
-    // (`|` starts a new alias segment, `[`/`]` close/extend the link). A
-    // name like `a|b]]x` would otherwise corrupt the author frontmatter.
-    const aliasSafe = name.replace(/[\[\]|]/g, "").trim() || safe;
-    const link = `[[${path}|${aliasSafe}]]`;
-    return { link, path, name, id };
-  }
-
-  // --- 0.77.8: Claim authorship (retroactive stamping) ---
-
-  /** Public entry points (called from main.ts command palette). */
-  claimSelectedAsAuthor(): void { void this.claimAuthorship({ scope: "selection", contributorMode: false }); }
-  claimFolderAsAuthor(): void { void this.claimAuthorship({ scope: "folder", contributorMode: false }); }
-  claimSelectedWithContributor(): void { void this.claimAuthorship({ scope: "selection", contributorMode: true }); }
-  claimFolderWithContributor(): void { void this.claimAuthorship({ scope: "folder", contributorMode: true }); }
-
-  /** All file-backed Stashpad notes (frontmatter `id`) under this view's
-   *  folder, excluding the _authors stubs. */
-  private fileBackedNotesInFolder(): TFile[] {
-    const folder = this.noteFolder.replace(/\/+$/, "");
-    return this.app.vault.getMarkdownFiles().filter((f) => {
-      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-      if (dir !== folder && !dir.startsWith(folder + "/")) return false;
-      if (f.path.includes("/_authors/")) return false;
-      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
-      return typeof fm?.id === "string" && !!fm.id;
-    });
-  }
-
-  /** Apply a frontmatter mutation across many files, paced in batches so
-   *  a bulk claim/unclaim doesn't choke the filesystem. Marks each as a
-   *  self-write so the multiplayer external-modify detector doesn't park
-   *  the change. */
-  private async pacedFrontmatter(paths: string[], mutate: (m: any, path: string) => void): Promise<void> {
-    const BATCH = 25, DELAY = 30;
-    for (let i = 0; i < paths.length; i++) {
-      const f = this.app.vault.getAbstractFileByPath(paths[i]);
-      if (f instanceof TFile) {
-        this.recentSelfWrites.set(f.path, Date.now());
-        try { await this.app.fileManager.processFrontMatter(f, (m) => mutate(m, paths[i])); }
-        catch (e) { console.warn("[Stashpad] claim: frontmatter write failed", paths[i], e); }
-      }
-      if ((i + 1) % BATCH === 0) await new Promise((r) => setTimeout(r, DELAY));
-    }
-  }
-
-  /** Retroactively stamp the local user onto notes that predate authorship
-   *  setup. SAFETY MODEL:
-   *    - Never overwrites an existing `author` (only fills blank ones).
-   *    - contributorMode=false: only blank-author notes are claimed.
-   *    - contributorMode=true: blank → authored; already-authored-by-
-   *      someone-else → we're added to `contributors` (original author
-   *      untouched). Notes already authored/contributed by us are skipped.
-   *    - Folder scope shows a counted confirmation first.
-   *    - Undo stores ONLY the changed paths (not content snapshots), so
-   *      undoing a big claim is cheap; undo guards against clobbering a
-   *      real author that landed after the claim. */
-  private async claimAuthorship(opts: { scope: "selection" | "folder"; contributorMode: boolean }): Promise<void> {
-    const author = this.currentAuthorLink();
-    if (!author) { new Notice("Set your author name in Stashpad settings first."); return; }
-    const idTag = `-${author.id}`;
-
-    const files = opts.scope === "selection"
-      ? this.getActionTargets().map((n) => n.file).filter((f): f is TFile => !!f)
-      : this.fileBackedNotesInFolder();
-    if (files.length === 0) { new Notice(opts.scope === "selection" ? "No notes selected." : "No notes in this folder."); return; }
-
-    const toAuthor: string[] = [];
-    const toContributor: string[] = [];
-    for (const f of files) {
-      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
-      const a = typeof fm?.author === "string" ? fm.author : "";
-      if (!a.trim()) { toAuthor.push(f.path); continue; }
-      if (a.includes(idTag)) continue;                       // already ours
-      if (!opts.contributorMode) continue;                   // skip authored
-      const contributors: string[] = Array.isArray(fm?.contributors)
-        ? fm.contributors.filter((c: any) => typeof c === "string") : [];
-      if (!contributors.some((c) => c.includes(idTag))) toContributor.push(f.path);
-    }
-
-    const total = toAuthor.length + toContributor.length;
-    if (total === 0) { new Notice("Nothing to claim — those notes are already authored by you."); return; }
-
-    if (opts.scope === "folder") {
-      const parts = [`Stamp yourself as author on ${toAuthor.length} unauthored note(s)`];
-      if (toContributor.length) parts.push(`and as a contributor on ${toContributor.length} already-authored note(s)`);
-      const ok = await new Promise<boolean>((resolve) => {
-        new ConfirmModal(this.app, "Claim authorship",
-          `${parts.join(" ")}?\nExisting authors are never overwritten. This can be undone.`,
-          "Claim", resolve).open();
-      });
-      if (!ok) return;
-    }
-
-    const folder = this.noteFolder;
-    const authorLink = author.link;
-    // 0.77.9: when we author-claim a note where we were ALSO a contributor,
-    // drop the (now-redundant) contributor entry — author supersedes. Track
-    // those paths so undo can faithfully restore the contributor entry.
-    const demotedFromContributor = new Set<string>();
-
-    // Forward apply, reused by redo.
-    const applyClaim = async () => {
-      await this.pacedFrontmatter(toAuthor, (m, path) => {
-        if (!(typeof m.author === "string" && m.author.trim())) m.author = authorLink;
-        if (Array.isArray(m.contributors) && m.contributors.some((c: any) => typeof c === "string" && c.includes(idTag))) {
-          m.contributors = m.contributors.filter((c: any) => !(typeof c === "string" && c.includes(idTag)));
-          demotedFromContributor.add(path);
-        }
-      });
-      await this.pacedFrontmatter(toContributor, (m) => {
-        const contributors: string[] = Array.isArray(m.contributors)
-          ? m.contributors.filter((c: any) => typeof c === "string") : [];
-        if (!contributors.some((c) => c.includes(idTag))) contributors.push(authorLink);
-        m.contributors = contributors;
-      });
-    };
-
-    void this.ensureAuthorFile(author);
-    await applyClaim();
-
-    this.plugin.getUndoStack(folder).push({
-      label: `Claim authorship (${total} note${total === 1 ? "" : "s"})`,
-      undo: async () => {
-        // Only strip what we added, and only if it's still ours (a real
-        // author/contributor that landed afterwards is left intact).
-        await this.pacedFrontmatter(toAuthor, (m, path) => {
-          if (typeof m.author === "string" && m.author.includes(idTag)) delete m.author;
-          // Restore a contributor entry we demoted during the claim.
-          if (demotedFromContributor.has(path)) {
-            const contributors: string[] = Array.isArray(m.contributors)
-              ? m.contributors.filter((c: any) => typeof c === "string") : [];
-            if (!contributors.some((c) => c.includes(idTag))) contributors.push(authorLink);
-            m.contributors = contributors;
-          }
-        });
-        await this.pacedFrontmatter(toContributor, (m) => {
-          if (Array.isArray(m.contributors)) {
-            m.contributors = m.contributors.filter((c: any) => !(typeof c === "string" && c.includes(idTag)));
-          }
-        });
-        this.debouncedRender();
-      },
-      redo: async () => { demotedFromContributor.clear(); await applyClaim(); this.debouncedRender(); },
-    });
-
-    const bits: string[] = [];
-    if (toAuthor.length) bits.push(`authored ${toAuthor.length}`);
-    if (toContributor.length) bits.push(`contributing to ${toContributor.length}`);
-    new Notice(`Claimed authorship: ${bits.join(", ")}. Undo available.`);
-    this.debouncedRender();
-  }
-
-  /** Lazily create the author stub file under <stashpad>/_authors/.
-   *  Idempotent: skips if the file already exists. The stub carries a
-   *  small frontmatter with id + display name + created stamp, plus a
-   *  level-1 heading so it reads cleanly when opened directly.
-   *  Failures are swallowed (we don't want author-stub creation to
-   *  block note creation) but logged for diagnosis. */
-  private async ensureAuthorFile(info: { path: string; name: string; id: string }): Promise<void> {
-    try {
-      // 0.77.1: register the author in the rebuildable registry (recovery
-      // cache + rename history). Cheap upsert; no-op if unchanged.
-      if (info.id) this.plugin.authorRegistry.record({ id: info.id, name: info.name });
-      const folder = `${this.noteFolder}/_authors`;
-      await this.ensureFolder(folder);
-      if (await this.app.vault.adapter.exists(info.path)) return;
-      // 0.77.4: stub uses the Obsidian-native `aliases` for the display
-      // name (so [[Name]] resolves + quick-switcher finds it). Role/dept
-      // come from the local user's settings when this stub is theirs.
-      const isSelf = info.id === (this.plugin.settings.authorId ?? "").trim();
-      const content = this.plugin.buildAuthorStub({
-        id: info.id,
-        name: info.name,
-        role: isSelf ? this.plugin.settings.authorRole : undefined,
-        department: isSelf ? this.plugin.settings.authorDepartment : undefined,
-      }, new Date().toISOString());
-      await this.app.vault.create(info.path, content);
-    } catch (e) {
-      console.warn("[Stashpad] ensureAuthorFile failed", e);
-    }
-  }
+  // 0.77.8: claim-authorship command-palette entry points (called from
+  // main.ts via call("<method>")). The implementation lives in
+  // AuthorshipTracker; these thin wrappers keep the view's public method
+  // names stable for main.ts.
+  claimSelectedAsAuthor(): void { this.authorship.claimSelectedAsAuthor(); }
+  claimFolderAsAuthor(): void { this.authorship.claimFolderAsAuthor(); }
+  claimSelectedWithContributor(): void { this.authorship.claimSelectedWithContributor(); }
+  claimFolderWithContributor(): void { this.authorship.claimFolderWithContributor(); }
 
   /** Render the author / contributors / last-edit footer at the bottom
    *  of a note body. Each piece is independently toggle-gated in
@@ -9002,71 +8164,13 @@ export class StashpadView extends ItemView {
 
   // --- File events ---
 
-  /** Body strings keyed by path. Populated on first sighting of a file
-   *  and on every modify; used to distinguish body-edits (a real user
-   *  change) from frontmatter-only writes (Stashpad's own
-   *  processFrontMatter calls for color, attachments, contributor
-   *  bumps, etc.). Only body-edits trigger contributor stamping, so
-   *  Stashpad's internal writes don't add the local user as a
-   *  contributor on every color change. */
-  private knownBodies = new Map<string, string>();
-  /** Per-path debouncers for the contributor-stamping pass. We batch
-   *  modify events so a continuous edit session ("user types for 30
-   *  seconds") produces ONE contribution write at the end, instead of
-   *  hammering processFrontMatter on every keystroke. The flush also
-   *  no-ops if the body matches what we already saw, so the
-   *  contribution write itself doesn't recurse. */
-  private contribTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** 0.72.4: timestamps of writes we INITIATED (processFrontMatter
-   *  calls inside maybeRecordContribution). A vault.modify event that
-   *  fires within EXTERNAL_WRITE_GRACE_MS of one of these is "ours" —
-   *  the rest are external (another client on the network share). */
-  private recentSelfWrites = new Map<string, number>();
-  /** 0.72.4: most recent external modify per path. Drives the "park
-   *  the stamp until external activity quiets down" logic — if
-   *  another client just touched the file, we don't write back over
-   *  them; we keep the contribution parked and retry. */
-  private lastExternalModify = new Map<string, number>();
-
-  /** 0.77.12: bound the per-file multiplayer-tracking maps during a long
-   *  session. recentSelfWrites / lastExternalModify entries are only
-   *  meaningful for a few seconds (the grace / quiescence windows), so
-   *  anything far older is dead weight — drop it. knownBodies holds full
-   *  body strings, so drop entries for paths no longer in this view's tree
-   *  (deleted / moved-away notes); live files stay (idForPath finds them),
-   *  so an in-progress edit's baseline is never lost. Fully cleared in
-   *  onClose; this just trims mid-session. Idempotent + cheap. */
-  private pruneContribMaps(): void {
-    const now = Date.now();
-    const SELF_TTL = StashpadView.EXTERNAL_WRITE_GRACE_MS * 20;  // ~30s
-    const EXT_TTL = StashpadView.EXTERNAL_QUIESCENCE_MS * 12;    // ~60s
-    for (const [path, ts] of this.recentSelfWrites) {
-      if (now - ts > SELF_TTL) this.recentSelfWrites.delete(path);
-    }
-    for (const [path, ts] of this.lastExternalModify) {
-      if (now - ts > EXT_TTL) this.lastExternalModify.delete(path);
-    }
-    if (this.knownBodies.size > 64) {
-      for (const path of this.knownBodies.keys()) {
-        if (!this.tree.idForPath(path)) this.knownBodies.delete(path);
-      }
-    }
-  }
-
   private onFileModify = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
-    // 0.72.4: classify the modify before any downstream handler reads
-    // it. If the modify arrived within the grace window after our own
-    // processFrontMatter, treat it as self; otherwise stamp it as
-    // external so the contribution scheduler can park its work.
-    const now = Date.now();
-    const self = this.recentSelfWrites.get(file.path);
-    const isSelf = self !== undefined && (now - self) < StashpadView.EXTERNAL_WRITE_GRACE_MS;
-    if (!isSelf) this.lastExternalModify.set(file.path, now);
     this.scheduleSlugRename(file);
     this.scheduleAttachmentSync(file);
-    this.scheduleContribution(file);
+    // 0.72.4: classify self vs external and queue the contributor stamp.
+    this.authorship.noteModify(file);
     // Re-render so any visible row of this file picks up new body
     // content (and re-evaluates the "Show more" overflow check). The
     // metadataCache hook only fires for metadata-affecting edits — pure
@@ -9074,135 +8178,6 @@ export class StashpadView extends ItemView {
     // otherwise trigger a re-render, leaving stale clamp state.
     this.debouncedRender();
   };
-
-  /** Queue (or re-queue) a contributor stamp for `file`, flushing
-   *  CONTRIB_DEBOUNCE_MS after the most recent modify. Continuous
-   *  typing keeps pushing the flush out, so a long edit session writes
-   *  one contribution at the end.
-   *
-   *  Quiescence threshold tuned to "slightly longer than the natural
-   *  pause between sentences" while also outliving Obsidian's editor
-   *  save debounce — short enough to feel timely, long enough that
-   *  the editor has fsync'd its in-flight content before our
-   *  processFrontMatter call reads + rewrites the file. The old 1.5s
-   *  threshold was tight enough on network drives (especially with
-   *  multiplayer racing two clients' writes) that we'd occasionally
-   *  read pre-save body content + clobber a few typed characters.
-   *  See 0.72.3.
-   *
-   *  Also: if a Markdown editor leaf for this file is currently the
-   *  active leaf, the user is probably still mid-thought even if they
-   *  paused; defer the stamp by an additional bump so we don't fire
-   *  while their cursor is in the doc. */
-  private static CONTRIB_DEBOUNCE_MS = 4000;
-  private static CONTRIB_ACTIVE_EDITOR_BONUS_MS = 2000;
-  /** 0.72.4: how long after a self-initiated processFrontMatter we
-   *  expect the resulting vault.modify event. Anything that arrives
-   *  inside this window is classified as our own write. */
-  private static EXTERNAL_WRITE_GRACE_MS = 1500;
-  /** 0.72.4: cooldown after an external (multiplayer) modify before
-   *  we'll fire our own contribution stamp on the same file. Picks
-   *  a value comfortably larger than typical network-share modify
-   *  echo time so two clients don't volley last-write-wins. */
-  private static EXTERNAL_QUIESCENCE_MS = 5000;
-  private scheduleContribution(file: TFile): void {
-    const existing = this.contribTimers.get(file.path);
-    if (existing) clearTimeout(existing);
-    const isActivelyEdited = this.isFileActivelyEdited(file);
-    const delay = StashpadView.CONTRIB_DEBOUNCE_MS
-      + (isActivelyEdited ? StashpadView.CONTRIB_ACTIVE_EDITOR_BONUS_MS : 0);
-    const t = setTimeout(() => {
-      this.contribTimers.delete(file.path);
-      // Double-check at flush time: if the file is STILL being edited
-      // (cursor in the editor, last keystroke very recent), defer
-      // again. Prevents the worst-case "user paused 4s mid-paragraph,
-      // we wrote, they resumed and lost their last typed run".
-      if (this.isFileActivelyEdited(file)) {
-        this.scheduleContribution(file);
-        return;
-      }
-      // 0.72.4: if another client wrote to this file recently, park
-      // the contribution stamp until external activity quiets down.
-      // The stamp stays scheduled — every onFileModify call reschedules
-      // — so once the cross-client volley dies down we eventually
-      // flush a single combined stamp. Prevents stomping over a
-      // teammate's in-flight save on a slow network share.
-      const lastExt = this.lastExternalModify.get(file.path);
-      if (lastExt !== undefined && (Date.now() - lastExt) < StashpadView.EXTERNAL_QUIESCENCE_MS) {
-        this.scheduleContribution(file);
-        return;
-      }
-      void this.maybeRecordContribution(file);
-    }, delay);
-    this.contribTimers.set(file.path, t);
-  }
-
-  /** True when the given file is open in the active Markdown leaf and
-   *  the editor (or its container) currently holds focus. Used to
-   *  guard the contribution stamp against racing in-flight typing. */
-  private isFileActivelyEdited(file: TFile): boolean {
-    try {
-      const active: any = this.app.workspace.activeLeaf;
-      if (!active) return false;
-      const view = active.view;
-      if (!view || view.getViewType?.() !== "markdown") return false;
-      if (view.file?.path !== file.path) return false;
-      // Editor focus check — if Obsidian's editor element contains the
-      // focused element, the user is actively typing.
-      const root = (view.containerEl ?? null) as HTMLElement | null;
-      return !!root && root.contains(document.activeElement);
-    } catch {
-      return false;
-    }
-  }
-
-  /** Compare the current file body against the last seen body for this
-   *  path. If it changed, treat it as a user edit: bump `modified` and
-   *  add the local user to `contributors` (unless they're the author
-   *  or already in the list). Frontmatter-only writes don't move the
-   *  body string, so they're skipped — keeping Stashpad's own
-   *  processFrontMatter calls (color tweaks, attachment sync, even
-   *  this very contribution write) from spuriously self-stamping. */
-  private async maybeRecordContribution(file: TFile): Promise<void> {
-    let raw = "";
-    try { raw = await this.app.vault.cachedRead(file); } catch { return; }
-    const body = this.stripFrontmatter(raw);
-    const prev = this.knownBodies.get(file.path);
-    this.knownBodies.set(file.path, body);
-    if (prev === undefined) return;       // first sighting — no contribution
-    if (prev === body) return;            // frontmatter-only write — skip
-    // 0.79.19: never stamp during rebootstrap — its frontmatter writes and
-    // the wikilink rewrites from slug-renames must not bump `modified` or
-    // add contributors. knownBodies is already updated above, so the next
-    // genuine edit is still detected correctly.
-    if (this.plugin.rebootstrapInProgress) return;
-    const author = this.currentAuthorLink();
-    if (!author) return;                  // user opted out of stamping
-    void this.ensureAuthorFile(author);
-    const now = new Date().toISOString();
-    // 0.72.4: stamp BEFORE the write so the resulting vault.modify
-    // event (which fires asynchronously) can be classified as ours
-    // instead of external. Without this, our own stamp would get
-    // logged as an external modify, parking the next stamp
-    // unnecessarily.
-    this.recentSelfWrites.set(file.path, Date.now());
-    try {
-      await this.app.fileManager.processFrontMatter(file, (m: any) => {
-        m.modified = now;
-        const a = typeof m.author === "string" ? m.author : "";
-        const contributors: string[] = Array.isArray(m.contributors)
-          ? m.contributors.filter((c: unknown): c is string => typeof c === "string")
-          : [];
-        const idTag = `-${author.id}`;
-        const isAuthor = a.includes(idTag);
-        const already = contributors.some((c) => c.includes(idTag));
-        if (!isAuthor && !already) contributors.push(author.link);
-        m.contributors = contributors;
-      });
-    } catch (e) {
-      console.warn("[Stashpad] maybeRecordContribution failed", e);
-    }
-  }
   private onFileCreate = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
@@ -9261,7 +8236,8 @@ export class StashpadView extends ItemView {
 
   // --- Helpers ---
 
-  private stripFrontmatter(md: string): string {
+  /** public: called by AuthorshipTracker (the host interface). */
+  stripFrontmatter(md: string): string {
     // Strip BOM if present so the opening-fence detection still works.
     const text = md.replace(/^﻿/, "");
     // Match: optional leading whitespace, "---", newline, anything (lazy),
@@ -9285,7 +8261,8 @@ export class StashpadView extends ItemView {
     }
     return `${d.format("YYYY.MM.DD")}\n${d.format("HH:mm A")}`;
   }
-  private formatTimeInline(iso: string): string {
+  /** public: read by extracted command modules (commands/*.ts). */
+  formatTimeInline(iso: string): string {
     // Used by Copy / Copy tree when prefixTimestampsOnCopy is on. Includes
     // seconds (display formatTime stops at minutes) so paste targets like
     // logs / chat threads keep ordering even within the same minute.
@@ -9489,7 +8466,7 @@ export class StashpadView extends ItemView {
     const uniqueAtts = [...new Set(attachments)];
 
     // Captured BEFORE deletion so cross-author filtering works after files are gone.
-    const deletedAuthorIds = this.collectAuthorIds(all);
+    const deletedAuthorIds = this.authorship.collectAuthorIds(all);
     const doDelete = async (alsoAtts: boolean) => {
       const snap = await this.snapshotNotes(all, alsoAtts);
       let attsRemoved = 0;
@@ -9895,7 +8872,7 @@ export class StashpadView extends ItemView {
       }
       return;
     }
-    const movedAuthorIds = this.collectAuthorIds([node]);
+    const movedAuthorIds = this.authorship.collectAuthorIds([node]);
     await this.app.fileManager.processFrontMatter(file, (fm) => { fm.parent = newParent; });
     // Background-sync the moved note + both parents' redundant fields.
     this.fmSync.scheduleParentChange(node.id, oldParent, newParent);
@@ -10001,141 +8978,7 @@ export class StashpadView extends ItemView {
   }
 }
 
-function matchKey(e: KeyboardEvent, key: string): boolean {
-  if (!key) return false;
-  if (e.metaKey || e.ctrlKey || e.altKey) return false;
-  return e.key.toLowerCase() === key.toLowerCase();
-}
-
-/** Try a chord regardless of whether it's a single key or a Mod combo. */
-function matchChord(e: KeyboardEvent, chord: string): boolean {
-  if (!chord) return false;
-  if (chord.includes("+")) return matchMod(e, chord);
-  return matchKey(e, chord);
-}
-
-/** Match a CommandBinding against the event, honoring preferRight when both
- *  primary and secondary are set. */
-export function matchBinding(e: KeyboardEvent, b?: { primary: string; secondary: string; preferRight: boolean; useBoth?: boolean }): boolean {
-  if (!b) return false;
-  const { primary, secondary, preferRight, useBoth } = b;
-  if (primary && secondary) {
-    // 0.59.1: useBoth overrides preferRight — both chords are active.
-    if (useBoth) return matchChord(e, primary) || matchChord(e, secondary);
-    return preferRight ? matchChord(e, secondary) : matchChord(e, primary);
-  }
-  return matchChord(e, primary) || matchChord(e, secondary);
-}
-
-function humanCombo(combo: string): string {
-  if (!combo) return "";
-  const isMac = (Platform as any).isMacOS ?? (navigator.platform.toLowerCase().includes("mac"));
-  return combo
-    .split("+")
-    .map((p) => {
-      const s = p.trim();
-      if (!s) return "";
-      if (s.toLowerCase() === "mod") return isMac ? "Cmd" : "Ctrl";
-      if (s.toLowerCase() === "alt") return isMac ? "Opt" : "Alt";
-      return s.length === 1 ? s.toUpperCase() : s;
-    })
-    .filter(Boolean)
-    .join("+");
-}
-
-function matchMod(e: KeyboardEvent, combo: string): boolean {
-  if (!combo) return false;
-  const parts = combo.split("+").map((p) => p.trim()).filter(Boolean);
-  if (parts.length < 2) return false;
-  const keyPart = parts[parts.length - 1].toLowerCase();
-  const mods = new Set(parts.slice(0, -1).map((m) => m.toLowerCase()));
-  const wantMod = mods.has("mod");
-  const wantCtrl = mods.has("ctrl") || mods.has("control");
-  const wantCmd = mods.has("cmd") || mods.has("meta") || mods.has("command");
-  const wantAlt = mods.has("alt") || mods.has("option");
-  const wantShift = mods.has("shift");
-  const isMac = (Platform as any).isMacOS ?? (navigator.platform.toLowerCase().includes("mac"));
-  const modPressed = isMac ? e.metaKey : e.ctrlKey;
-  if (wantMod && !modPressed) return false;
-  if (wantCtrl && !e.ctrlKey) return false;
-  if (wantCmd && !e.metaKey) return false;
-  if (wantAlt !== e.altKey) return false;
-  if (wantShift !== e.shiftKey) return false;
-  if (!wantMod) {
-    if (!wantCtrl && e.ctrlKey) return false;
-    if (!wantCmd && e.metaKey) return false;
-  }
-  return e.key.toLowerCase() === keyPart;
-}
-
-/** Capitalize the first letter of every space-separated word inside each "/"-separated
- *  segment, but never lowercase already-capitalized characters. So:
- *    "my health stuff/2026 notes" → "My Health Stuff/2026 Notes"
- *    "HealthMD/work-stuff"        → "HealthMD/Work-stuff"
- *    "BIG"                        → "BIG"
- */
-/** Extract fenced ```lang … ``` codeblocks from a markdown body. Returns
- *  one entry per block in document order with the language tag and
- *  inner content (no surrounding fences). Tildes (~~~) are not matched
- *  — Obsidian's writers always emit backtick fences. 0.61.0. */
-function extractCodeBlocks(body: string): Array<{ lang: string; code: string }> {
-  const out: Array<{ lang: string; code: string }> = [];
-  // ``` (optional info string) <newline> body <newline> ```.
-  // Use 3+ backticks to accommodate nested fences (Markdown spec).
-  const re = /^([ \t]*)(`{3,})[ \t]*([^\n`]*)\n([\s\S]*?)\n\1\2[ \t]*$/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) != null) {
-    out.push({ lang: m[3].trim(), code: m[4] });
-  }
-  return out;
-}
-
-export function properCaseFolderPath(path: string): string {
-  return path
-    .split("/")
-    .map((seg) => seg.split(" ").map((w) => (w && /^[a-z]/.test(w) ? w[0].toUpperCase() + w.slice(1) : w)).join(" "))
-    .join("/");
-}
-
-/** Compute a new child-order array for a parent, given the current order and
- *  the ids being moved (assumed contiguous-as-a-block in the result). */
-function computeReorder(all: string[], targetIds: string[], dir: "up" | "down" | "top" | "bottom"): string[] {
-  const targetSet = new Set(targetIds);
-  const others = all.filter((id) => !targetSet.has(id));
-  // Anchor: where the block currently sits (first target's index).
-  const firstIdx = all.findIndex((id) => targetSet.has(id));
-  if (firstIdx < 0) return all.slice();
-
-  switch (dir) {
-    case "top":
-      return [...targetIds, ...others];
-    case "bottom":
-      return [...others, ...targetIds];
-    case "up": {
-      // Insert the block one position earlier than the first target's current index.
-      const insertAt = Math.max(0, firstIdx - 1);
-      const result = others.slice();
-      result.splice(insertAt, 0, ...targetIds);
-      return result;
-    }
-    case "down": {
-      // Move past one non-target. lastIdx + 2 in the original space → new index in `others`.
-      const lastIdx = (() => { let i = -1; all.forEach((id, k) => { if (targetSet.has(id)) i = k; }); return i; })();
-      // Count non-targets before the position we want to land at (lastIdx + 2 in original space).
-      let othersBefore = 0;
-      for (let i = 0; i < Math.min(all.length, lastIdx + 2); i++) {
-        if (!targetSet.has(all[i])) othersBefore++;
-      }
-      const insertAt = Math.min(others.length, othersBefore);
-      const result = others.slice();
-      result.splice(insertAt, 0, ...targetIds);
-      return result;
-    }
-  }
-}
-
-function arraysEqual<T>(a: T[], b: T[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
+// matchBinding + properCaseFolderPath are re-exported for external importers
+// (main.ts); the implementations now live in view-keys.ts / view-helpers.ts.
+export { matchBinding } from "./view-keys";
+export { properCaseFolderPath } from "./view-helpers";

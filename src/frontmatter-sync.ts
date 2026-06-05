@@ -2,6 +2,7 @@ import { TFile, type App } from "obsidian";
 import { ROOT_ID, type StashpadId, type TreeNode } from "./types";
 import type { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
+import { getSettings } from "./settings";
 
 const PARENT_LINK_FIELD = "parentLink";
 const CHILDREN_FIELD = "children";
@@ -67,6 +68,12 @@ export class FrontmatterSyncQueue {
    *  computeParentLink will simply emit null for ROOT. */
   schedule(id: StashpadId): void {
     if (!id) return;
+    // 0.83.1: the recovery-link sync is pure overhead on slow/network
+    // drives (each parentLink/children write is a full round-trip, and a
+    // move enqueues several). When the user turns it off, skip entirely —
+    // the canonical id/parent is unaffected, and Rebootstrap backfills the
+    // recovery fields on demand.
+    if (!getSettings().writeRecoveryLinks) return;
     const before = this.pending.size;
     this.pending.add(id);
     if (this.pending.size !== before) this.emitActivity();

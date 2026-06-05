@@ -10,6 +10,7 @@ import {
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, STASH_EXT } from "./stash-package";
+import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { ROOT_ID } from "./types";
 import { UndoStack } from "./undo-stack";
@@ -19,6 +20,7 @@ import { AuthorRegistry } from "./author-registry";
 import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
 import { perf } from "./perf";
+import { RenderCacheStore } from "./render-cache-store";
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
@@ -78,6 +80,20 @@ export default class StashpadPlugin extends Plugin {
   get importLog(): ImportLog {
     if (!this._importLog) this._importLog = new ImportLog(this.app, this.pluginPrivatePath());
     return this._importLog;
+  }
+  /** 0.83.2: persisted render cache (rendered note bodies survive reload —
+   *  a cold open reads one cache file instead of N bodies over a slow
+   *  drive). Shared across views. */
+  private _renderCacheStore: RenderCacheStore | null = null;
+  get renderCacheStore(): RenderCacheStore {
+    if (!this._renderCacheStore) this._renderCacheStore = new RenderCacheStore(this.app, this.pluginPrivatePath());
+    return this._renderCacheStore;
+  }
+
+  async onunload(): Promise<void> {
+    // 0.83.2: flush any pending render-cache writes (the store's save is
+    // debounced, so a recent change could still be in the buffer).
+    try { await this._renderCacheStore?.save(); } catch { /* best-effort */ }
   }
 
   /** Vault-relative path to a file/dir inside the plugin's private
@@ -480,6 +496,10 @@ export default class StashpadPlugin extends Plugin {
     this.settingTab = new StashpadSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
+    // 0.83.2: load the persisted render cache before views open, so the
+    // first cold paint can hit it instead of reading every body over the
+    // (possibly slow) drive.
+    await this.renderCacheStore.load();
     // 0.77.1: load the author registry and seed it with the local user.
     await this.authorRegistry.load();
     {
@@ -509,6 +529,13 @@ export default class StashpadPlugin extends Plugin {
       // load). Until armed, enqueue() ignores events — so opening the vault
       // never looks like a mass "drop".
       window.setTimeout(() => this.importService.setArmed(true), 2500);
+      // 0.84.11: retroactive auto-import — a startup sweep (after arming) so
+      // items added while Obsidian was closed get imported, plus a 5-min
+      // interval so external Finder copies that never fired a vault event are
+      // eventually caught. Both no-op unless autoImport is on. registerInterval
+      // is auto-cleared on unload.
+      window.setTimeout(() => void this.runAutoImportSweep(), 5000);
+      this.registerInterval(window.setInterval(() => void this.runAutoImportSweep(), 5 * 60 * 1000));
     });
 
     this.registerView(
@@ -872,6 +899,19 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-import-files",
       name: "Import file(s) into Stashpad…",
       callback: () => this.openImportPicker(),
+    });
+    // 0.84.1: manual sweep of the current folder for loose files moved in
+    // from outside (the counterpart to auto-import, for when it's off or the
+    // live watcher didn't catch an external Finder/Explorer copy).
+    this.addCommand({
+      id: "stashpad-import-loose-files",
+      name: "Import loose files & folders in this folder (scan for moved-in / unprocessed items)",
+      checkCallback: (checking: boolean) => {
+        const folder = this.importService.defaultDestination();
+        if (checking) return !!folder;
+        if (folder) void this.runImportLooseFiles(folder);
+        return true;
+      },
     });
     this.addCommand({ id: "stashpad-select-all", name: "Select all visible notes", callback: () => call("cmdSelectAll") });
     this.addCommand({ id: "stashpad-copy-codeblock", name: "Copy code from codeblock", callback: () => call("cmdCopyCodeBlock") });
@@ -1262,16 +1302,31 @@ export default class StashpadPlugin extends Plugin {
       if (file.extension !== STASH_EXT) return;
       const dropSub = (this.settings.importDropFolder || "").trim().replace(/^\/+|\/+$/g, "");
       const exportSub = (this.settings.exportFolder || "").trim().replace(/^\/+|\/+$/g, "");
-      if (!dropSub) return;
       const parent = file.parent?.path || "";
-      // Parent must end with "/<dropSub>" (or BE "<dropSub>" if it lives at vault root).
       const parentBase = parent.split("/").pop() ?? "";
-      if (parentBase !== dropSub) return;
-      // Guard: ignore files that came from an export folder of the same Stashpad folder.
-      if (exportSub && parent.endsWith(`/${exportSub}`)) return;
-      // Destination = the parent of the dropSub (i.e. the actual Stashpad folder).
-      const destFolder = parent.slice(0, parent.length - dropSub.length).replace(/\/+$/, "") || this.settings.folder;
-      void this.autoImportStash(file, destFolder);
+      // Case 1: dropped into the configured `_imports` drop subfolder.
+      if (dropSub && parentBase === dropSub) {
+        // Guard: ignore files that came from an export folder of the same Stashpad folder.
+        if (exportSub && parent.endsWith(`/${exportSub}`)) return;
+        // Destination = the parent of the dropSub (i.e. the actual Stashpad folder).
+        const destFolder = parent.slice(0, parent.length - dropSub.length).replace(/\/+$/, "") || this.settings.folder;
+        void this.autoImportStash(file, destFolder);
+        return;
+      }
+      // Case 2 (0.84.10): with auto-import ON, a .stash dropped directly in a
+      // Stashpad folder ROOT auto-imports too — matching the manual loose-import
+      // command, so a blank importDropFolder no longer silently disables it.
+      // Reserved subfolders (incl. _exports, where our own exports land) are
+      // excluded so an export never gets re-imported.
+      if (!this.settings.autoImport) return;
+      // Skip Obsidian's startup `create` replay — otherwise every pre-existing
+      // root-level .stash would auto-import on each launch. Armed ~2.5s after
+      // layout-ready (shared with the loose-file watcher).
+      if (!this.importService.isArmed()) return;
+      if (isInReservedSubfolder(file.path)) return;
+      if (this.discoverStashpadFolders().includes(parent)) {
+        void this.autoImportStash(file, parent);
+      }
     };
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (file instanceof TFile) onMaybeDrop(file);
@@ -1623,7 +1678,19 @@ export default class StashpadPlugin extends Plugin {
 
   private async autoImportStash(file: TFile, destFolder: string): Promise<void> {
     try {
-      const buf = new Uint8Array(await this.app.vault.readBinary(file));
+      const raw = new Uint8Array(await this.app.vault.readBinary(file));
+      // 0.84.16: an encrypted .stash arriving via the live drop-watcher is NOT
+      // prompted inline anymore — park it and surface the same non-blocking
+      // "import?" notification as the sweep (notification-first; the password
+      // modal opens only when you click "Import now"). Don't trash the source.
+      if (isEncryptedStash(raw)) {
+        this.importService.parkEncrypted(file.path);
+        this.notifyPendingEncrypted();
+        return;
+      }
+      // Plain .stash imports straight away.
+      const buf = await resolveStashBytes(this.app, raw);
+      if (!buf) return;
       const view = getActiveView();
       const existingIds = new Set<string>();
       if (view && typeof (view as any).collectExistingIds === "function" && (view as any).noteFolder === destFolder) {
@@ -1774,9 +1841,15 @@ export default class StashpadPlugin extends Plugin {
         // on the autoImport setting so a user who turned it off isn't
         // surprised. Runs before the frontmatter backfill so the new notes
         // get stamped in the same pass.
+        // 0.84.7: now goes through the shared importLooseInto (files +
+        // folders), so rebootstrap also sweeps loose SUBFOLDERS into nested
+        // note trees and inherits the reserved-merge / identity-preserving
+        // adoption fixes — same code path as the standalone command.
         if (this.settings.autoImport) {
-          try { imported += await this.importService.importLooseFilesIn(folder); }
-          catch (e) { console.warn("Stashpad: loose-file sweep failed", folder, e); }
+          try {
+            const swept = await this.importService.importLooseInto(folder);
+            imported += swept.files + swept.folders + swept.stashes;
+          } catch (e) { console.warn("Stashpad: loose sweep failed", folder, e); }
         }
         // Standalone (no-view-required) frontmatter backfill: reads
         // metadata cache, skip-if-equal, writes only what's actually
@@ -2551,6 +2624,142 @@ export default class StashpadPlugin extends Plugin {
     if (folders.length === 1) { this.importService.pickFilesInto(folders[0]); return; }
     const def = this.importService.defaultDestination() ?? folders[0];
     new ImportTargetModal(this.app, def, folders, (folder) => this.importService.pickFilesInto(folder)).open();
+  }
+
+  /** 0.84.1: manual counterpart to auto-import. Scans the top level of a
+   *  Stashpad folder for loose files moved in from outside (Finder/Explorer
+   *  copy, etc.) that Stashpad hasn't processed — i.e. files with no Stashpad
+   *  `id` frontmatter — and imports them (md → note + archive original; other
+   *  → _attachments + linking note). Lighter than a full rebootstrap: just
+   *  this folder's direct children, no slug/frontmatter/registry sweep. Needed
+   *  because the live drop-watcher only catches `.stash` files via Obsidian
+   *  vault events; a plain file pasted in via Finder is otherwise only swept
+   *  on rebootstrap (and only when auto-import is on). */
+  async runImportLooseFiles(folder: string): Promise<void> {
+    const label = folder.split("/").pop() || folder;
+    let files = 0, folders = 0, stashes = 0;
+    try {
+      // Shared "sweep all loose content" primitive (files + folders + .stash) —
+      // the same one rebootstrap uses, so behavior stays in sync. 0.84.7/0.84.8.
+      ({ files, folders, stashes } = await this.importService.importLooseInto(folder));
+    } catch (e) {
+      this.notifications.show({
+        message: `Stashpad: import failed in \`${label}\`\nError: ${(e as Error).message}`,
+        kind: "error", category: "import", folder,
+      });
+      console.error("[Stashpad] runImportLooseFiles failed", folder, e);
+      return;
+    }
+    const total = files + folders + stashes;
+    // Refresh the active view if it's looking at this folder. New note files
+    // also fire vault create → the view's metadata hook repaints, but an
+    // explicit rebuild makes the result immediate on slow drives.
+    const view = this.lastActiveStashpadLeaf?.view as any;
+    if (total > 0 && view?.noteFolder === folder && view?.tree) {
+      view.tree.rebuild(folder);
+      view.render?.();
+    }
+    let message: string;
+    if (total === 0) {
+      message = `Nothing to import in \`${label}\` — everything here is already a Stashpad note.`;
+    } else {
+      const parts: string[] = [];
+      if (files) parts.push(`${files} loose file${files === 1 ? "" : "s"}`);
+      if (folders) parts.push(`${folders} folder${folders === 1 ? "" : "s"} (as nested notes)`);
+      if (stashes) parts.push(`${stashes} .stash bundle${stashes === 1 ? "" : "s"}`);
+      message = `Imported ${parts.join(" + ")} in \`${label}\`.`;
+    }
+    this.notifications.show({
+      message,
+      kind: total > 0 ? "success" : "info",
+      category: "import",
+      folder,
+    });
+  }
+
+  private autoSweepInProgress = false;
+  /** 0.84.11: retroactive auto-import. Periodically (and once at startup) sweep
+   *  EVERY Stashpad folder for non-imported loose content — the "watcher
+   *  occasionally going through every folder" users expect. Catches items added
+   *  while Obsidian was closed, and external Finder copies that never fired a
+   *  vault event (the live watchers only react to events). Gated on autoImport
+   *  + armed (so it doesn't fight the startup create-storm). Reuses the shared
+   *  importLooseInto (files + folders + .stash). 0.84.12 (option C): encrypted
+   *  .stash bundles are NOT decrypted inline — a background sweep never pops a
+   *  blocking password modal. They're parked and surfaced via a single
+   *  non-blocking "N waiting" toast with Import-now / snooze actions. */
+  async runAutoImportSweep(): Promise<void> {
+    if (!this.settings.autoImport) return;
+    if (!this.importService.isArmed()) return;
+    if (this.autoSweepInProgress) return; // a slow network-drive sweep may outlast the 5-min tick
+    this.autoSweepInProgress = true;
+    let files = 0, folders = 0, stashes = 0;
+    try {
+      for (const folder of this.discoverStashpadFolders()) {
+        try {
+          const r = await this.importService.importLooseInto(folder, { auto: true });
+          files += r.files; folders += r.folders; stashes += r.stashes;
+        } catch (e) { console.warn("[Stashpad] auto-import sweep failed", folder, e); }
+      }
+    } finally {
+      this.autoSweepInProgress = false;
+    }
+    const total = files + folders + stashes;
+    if (total > 0) {
+      const view = this.lastActiveStashpadLeaf?.view as any;
+      if (view?.tree && view?.noteFolder) { view.tree.rebuild(view.noteFolder); view.render?.(); }
+      const parts: string[] = [];
+      if (files) parts.push(`${files} file${files === 1 ? "" : "s"}`);
+      if (folders) parts.push(`${folders} folder${folders === 1 ? "" : "s"}`);
+      if (stashes) parts.push(`${stashes} .stash bundle${stashes === 1 ? "" : "s"}`);
+      this.notifications.show({
+        message: `Auto-imported ${parts.join(" + ")} (background sweep).`,
+        kind: "success",
+        category: "import",
+      });
+    }
+    this.notifyPendingEncrypted();
+  }
+
+  /** Surface the encrypted .stash bundles parked by the sweep OR the live
+   *  drop-watcher (0.84.16) as a single non-blocking, snoozeable toast —
+   *  notification-first, never an inline modal. "Import now" opens the password
+   *  prompt; the prompt itself also offers "Remind me later". Snoozed for an
+   *  hour each time it shows so it doesn't re-nag (a brand-new arrival resets
+   *  the snooze via parkEncrypted so it surfaces immediately). */
+  private notifyPendingEncrypted(): void {
+    const pending = this.importService.pendingEncryptedPaths();
+    if (pending.length === 0) return;
+    if (!this.importService.shouldNotifyEncrypted()) return;
+    this.importService.snoozeEncryptedNotify(60 * 60 * 1000); // default: don't re-nag for 1h
+    const n = pending.length;
+    this.notifications.show({
+      message: `${n} encrypted .stash bundle${n === 1 ? "" : "s"} waiting to import. Import ${n === 1 ? "it" : "them"} with the password?`,
+      kind: "info",
+      category: "import",
+      duration: 0,
+      actions: [
+        { label: "Import now", onClick: () => void this.importPendingEncryptedNow() },
+        { label: "Remind me later", onClick: () => this.importService.snoozeEncryptedNotify(60 * 60 * 1000) },
+        { label: "Not now (until next launch)", onClick: () => this.importService.snoozeEncryptedNotify(Infinity) },
+      ],
+    });
+  }
+
+  private async importPendingEncryptedNow(): Promise<void> {
+    const { imported, rescheduled } = await this.importService.importPendingEncrypted();
+    if (imported > 0) {
+      const view = this.lastActiveStashpadLeaf?.view as any;
+      if (view?.tree && view?.noteFolder) { view.tree.rebuild(view.noteFolder); view.render?.(); }
+      this.notifications.show({
+        message: `Imported ${imported} encrypted .stash bundle${imported === 1 ? "" : "s"}.`,
+        kind: "success",
+        category: "import",
+      });
+    }
+    // If the user picked "Remind me later" mid-prompt, the snooze is already
+    // set; nothing else to do — the reminder resurfaces on the next sweep.
+    void rescheduled;
   }
 
   /** 0.77.7: ensure the LOCAL user's author page exists in `folder`,

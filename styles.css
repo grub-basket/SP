@@ -2120,6 +2120,60 @@
 }
 .stashpad-color-add::before { content: "+"; }
 .stashpad-color-add:hover { color: var(--text-normal); }
+/* Export-to-.stash modal (0.84.2) */
+.stashpad-export-modal { width: min(440px, 92vw); }
+.stashpad-export-desc { color: var(--text-muted); margin: 0 0 12px; }
+.stashpad-export-field { display: flex; flex-direction: column; gap: 4px; }
+.stashpad-export-label { font-size: var(--font-ui-small); color: var(--text-muted); }
+.stashpad-export-name { width: 100%; }
+.stashpad-export-preview {
+  margin-top: 8px;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-export-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 16px;
+}
+.stashpad-export-encrypt {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.stashpad-export-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stashpad-export-toggle label { cursor: pointer; }
+.stashpad-export-pw-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.stashpad-export-pw-hint {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.stashpad-export-pw-hint.is-error { color: var(--text-error); }
+.stashpad-export-pw-suite {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+.stashpad-export-error {
+  color: var(--text-error);
+  font-size: var(--font-ui-small);
+  margin-bottom: 8px;
+}
+
 /* Custom-color submenu */
 .stashpad-custom-color-modal { width: min(380px, 90vw); }
 .stashpad-custom-color-row {
