@@ -1,6 +1,7 @@
-import { App, Modal, Platform, moment, Notice, setIcon } from "obsidian";
+import { App, Modal, Platform, moment, Notice, setIcon, type SecretStorage } from "obsidian";
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
+import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
 import type { ImportLogEntry } from "./import-log";
 
@@ -552,7 +553,11 @@ export class ExportStashModal extends Modal {
     app: App,
     private defaultBaseName: string,
     private noteCount: number,
-    private onConfirm: (baseName: string, password: string | null) => void,
+    private onConfirm: (baseName: string, password: string | null, remember: boolean) => void,
+    /** Probe (cached) for whether Argon2id can run here, so the modal can state
+     *  up front whether this export will use the strong suite or the fallback.
+     *  Optional so callers/tests can omit it (the text just stays generic). */
+    private kdfProbe?: () => Promise<boolean>,
   ) {
     super(app);
   }
@@ -586,17 +591,103 @@ export class ExportStashModal extends Modal {
 
     const pwArea = encWrap.createDiv({ cls: "stashpad-export-pw-area" });
     pwArea.style.display = "none";
-    const pw1 = pwArea.createEl("input", { type: "password" }) as HTMLInputElement;
-    pw1.addClass("stashpad-export-name"); pw1.placeholder = "Password";
-    const pw2 = pwArea.createEl("input", { type: "password" }) as HTMLInputElement;
-    pw2.addClass("stashpad-export-name"); pw2.placeholder = "Confirm password";
+    // 0.85.7: each field gets an inline button on its right; the passphrase
+    // stays hidden by default (Show reveals it). 0.85.8: the button is
+    // **Paste** while the field is empty (one-click drop-in from a password
+    // manager) and flips to **Copy** once it has a value — clearing the field
+    // flips it back. Copy works while masked.
+    const pwSyncers: Array<() => void> = [];
+    const makePwRow = (placeholder: string): HTMLInputElement => {
+      const row = pwArea.createDiv({ cls: "stashpad-export-pw-row" });
+      const inp = row.createEl("input", { type: "password" }) as HTMLInputElement;
+      inp.addClass("stashpad-export-name"); inp.placeholder = placeholder;
+      const btn = row.createEl("button", { cls: "stashpad-export-copy" });
+      const syncBtn = () => {
+        const empty = inp.value.length === 0;
+        btn.setText(empty ? "Paste" : "Copy");
+        btn.toggleClass("is-paste", empty);
+        btn.setAttr("aria-label", `${empty ? "Paste into" : "Copy"} ${placeholder.toLowerCase()}`);
+      };
+      btn.onclick = async (e) => {
+        e.preventDefault();
+        if (inp.value.length === 0) {
+          try {
+            const txt = (await navigator.clipboard?.readText())?.trim();
+            if (!txt) { new Notice("Clipboard is empty."); return; }
+            inp.value = txt;
+            inp.dispatchEvent(new Event("input")); // → refresh (validation, meter, button sync)
+            new Notice("Pasted from clipboard.");
+          } catch { new Notice("Couldn't read the clipboard."); }
+        } else {
+          void navigator.clipboard?.writeText(inp.value).then(
+            () => new Notice("Passphrase copied to clipboard."),
+            () => new Notice("Couldn't access the clipboard."),
+          );
+        }
+      };
+      syncBtn();
+      pwSyncers.push(syncBtn);
+      return inp;
+    };
+    const pw1 = makePwRow("Password");
+    const pw2 = makePwRow("Confirm password");
+
+    // 0.85.4: live strength meter (a nudge, never a gate) + a generate button.
+    const meter = pwArea.createDiv({ cls: "stashpad-export-strength" });
+    const meterBar = meter.createDiv({ cls: "stashpad-strength-bar" });
+    const meterSegs = [0, 1, 2, 3].map(() => meterBar.createDiv({ cls: "stashpad-strength-seg" }));
+    const meterLabel = meter.createEl("span", { cls: "stashpad-strength-label" });
+
+    const genRow = pwArea.createDiv({ cls: "stashpad-export-genrow" });
+    const genBtn = genRow.createEl("button", { cls: "stashpad-export-gen", text: "Generate strong passphrase" });
+    const showBtn = genRow.createEl("button", { cls: "stashpad-export-show", text: "Show" });
+
     const hint = pwArea.createEl("div", { cls: "stashpad-export-pw-hint" });
-    // 0.84.15: name the scheme so it's clear up front; the export toast then
-    // reports which KDF actually ran (Argon2id, or the weaker PBKDF2 fallback).
-    pwArea.createEl("div", {
-      cls: "stashpad-export-pw-suite",
-      text: "Encryption: Argon2id + AES-256-GCM (strongest). Falls back to PBKDF2 only if Argon2 can't run on this device.",
+    // 0.84.15: name the scheme so it's clear up front. 0.85.3: probe this device
+    // and state explicitly which suite WILL be used — the strong default or the
+    // fallback — rather than describing both abstractly.
+    const suite = pwArea.createEl("div", { cls: "stashpad-export-pw-suite" });
+    suite.setText("Encryption: AES-256-GCM. Checking key-derivation suite for this device…");
+    if (this.kdfProbe) {
+      void this.kdfProbe().then((argonOk) => {
+        suite.toggleClass("is-weak", !argonOk);
+        suite.setText(
+          argonOk
+            ? "Encryption: Argon2id + AES-256-GCM — the strongest suite (used on this device)."
+            : "⚠️ Argon2id can't run on this device, so this export will use the weaker PBKDF2 (600k) + AES-256-GCM fallback.",
+        );
+      }).catch(() => {
+        // Probe failed unexpectedly — keep the neutral text, don't over-claim.
+        suite.setText("Encryption: AES-256-GCM with a password-derived key.");
+      });
+    } else {
+      suite.setText("Encryption: Argon2id + AES-256-GCM (falls back to PBKDF2 if Argon2 can't run here).");
+    }
+
+    // 0.85.4: optional "remember in this vault" — saves the passphrase to
+    // Obsidian's secret storage (OS keychain) keyed by the export filename, so
+    // re-importing on THIS device skips the prompt. Only offered when the API
+    // exists (≥1.11.4); secrets are device-local, so recipients still need the
+    // passphrase typed/copied.
+    const secretStorage = (this.app as App & { secretStorage?: SecretStorage }).secretStorage;
+    const rememberRow = pwArea.createDiv({ cls: "stashpad-export-remember" });
+    const rememberCb = rememberRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    rememberCb.id = "stashpad-export-remember-cb";
+    const rememberLabel = rememberRow.createEl("label", {
+      text: "Remember in this vault (this device) — skips the prompt when you re-import here.",
     });
+    rememberLabel.htmlFor = rememberCb.id;
+    // Shown only while "remember" is ticked: make the device-local scope explicit
+    // so nobody assumes the saved passphrase travels with the file or syncs.
+    const rememberNote = pwArea.createDiv({ cls: "stashpad-export-remember-note" });
+    rememberNote.setText(
+      "Saved only in this device's keychain — it doesn't sync to your other devices and isn't shared with anyone you send this file to. Keep the passphrase somewhere safe if you'll open this export elsewhere.",
+    );
+    rememberNote.style.display = "none";
+    rememberCb.onchange = () => {
+      rememberNote.style.display = rememberCb.checked ? "" : "none";
+    };
+    if (!secretStorage) rememberRow.style.display = "none";
 
     // 0.84.13: encrypted exports get an "-encrypted" tag in the filename so
     // secure bundles are identifiable at a glance. The preview reflects it live
@@ -616,6 +707,14 @@ export class ExportStashModal extends Modal {
     // Gate the Export button on a valid (matching, non-empty) password when
     // encryption is enabled. People are warned that a lost password = lost
     // export, but the button itself only blocks the typo/empty cases.
+    const renderStrength = () => {
+      const s = estimatePasswordStrength(pw1.value);
+      meter.style.visibility = pw1.value ? "visible" : "hidden";
+      meterSegs.forEach((seg, i) => seg.toggleClass("is-on", pw1.value !== "" && i <= s.level));
+      meterBar.dataset.level = String(s.level);
+      meterLabel.setText(s.label);
+    };
+
     const refresh = () => {
       const enc = cb.checked;
       pwArea.style.display = enc ? "" : "none";
@@ -625,32 +724,58 @@ export class ExportStashModal extends Modal {
         else if (pw1.value !== pw2.value) { hint.setText("Passwords don't match."); hint.addClass("is-error"); ok = false; }
         else { hint.setText("⚠️ If you lose this password, the export can't be recovered."); hint.removeClass("is-error"); }
       }
+      renderStrength();
+      pwSyncers.forEach((fn) => fn()); // Paste↔Copy per field as values change
       go.disabled = !ok;
       go.toggleClass("is-disabled", !ok);
       renderPreview(); // keep the filename preview in sync with the toggle
     };
+
+    // Reveal/mask both fields together (so a generated passphrase is readable).
+    let shown = false;
+    const setShown = (v: boolean) => {
+      shown = v;
+      pw1.type = pw2.type = v ? "text" : "password";
+      showBtn.setText(v ? "Hide" : "Show");
+    };
+    showBtn.onclick = (e) => { e.preventDefault(); setShown(!shown); };
+
+    // Generate fills both fields but keeps them HIDDEN (0.85.7): the user
+    // reveals with Show or grabs it with a Copy button. Save it somewhere — you
+    // need it to open this export and it can't be recovered if lost.
+    genBtn.onclick = (e) => {
+      e.preventDefault();
+      pw1.value = pw2.value = generatePassphrase();
+      setShown(false);
+      new Notice("Passphrase generated (hidden) — Show to view, or Copy to save it.");
+      refresh();
+    };
+
     cb.onchange = refresh;
     pw1.oninput = refresh;
     pw2.oninput = refresh;
     refresh();
 
-    go.onclick = () => this.commit(effectiveBase(), cb.checked ? pw1.value : null);
+    const deliver = () =>
+      this.commit(effectiveBase(), cb.checked ? pw1.value : null, cb.checked && rememberCb.checked);
+    go.onclick = deliver;
 
     // Enter confirms (when not blocked); Esc / click-out cancels (modal
     // default). No Mod+Z registration → native input undo handles clears.
     this.scope.register([], "Enter", (e) => {
       e.preventDefault();
-      if (!go.disabled) this.commit(effectiveBase(), cb.checked ? pw1.value : null);
+      if (!go.disabled) deliver();
     });
 
     // Focus + select-all so the prefilled name is ready to type over.
     requestAnimationFrame(() => { input.focus(); input.select(); });
   }
-  private commit(raw: string, password: string | null): void {
+  private commit(raw: string, password: string | null, remember: boolean): void {
     const base = raw.trim() || this.defaultBaseName;
+    const pw = password && password.length ? password : null;
     this.delivered = true;
     this.close();
-    this.onConfirm(base, password && password.length ? password : null);
+    this.onConfirm(base, pw, !!pw && remember);
   }
   onClose(): void {
     // No delivery on cancel/Esc/click-out — the export simply doesn't run.

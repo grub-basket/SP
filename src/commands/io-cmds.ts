@@ -1,7 +1,8 @@
 import { FuzzySuggestModal, Notice, TFile, moment } from "obsidian";
 import { ROOT_ID, type StashpadId, type TreeNode } from "../types";
 import { buildStashZip, importStashZip, STASH_EXT } from "../stash-package";
-import { encryptStash, resolveStashBytes, STASH_KDF_INFO } from "../stash-crypto";
+import { argon2Available, encryptStash, resolveStashBytes, STASH_KDF_INFO } from "../stash-crypto";
+import { secretIdForStashName } from "../passphrase";
 import { ExportStashModal } from "../modals";
 import type { StashpadView } from "../view";
 
@@ -27,14 +28,14 @@ export async function cmdExportStash(view: StashpadView, rootNode?: TreeNode): P
     ? view.titleForNode(roots[0])
     : `${folderTag}-${roots.length}notes`;
   // 0.84.2: confirm name (+ later: optional encryption) in a modal first.
-  new ExportStashModal(view.app, defaultBase, all.length, (chosen, password) => {
-    void runExport(view, roots, all, chosen, password);
-  }).open();
+  new ExportStashModal(view.app, defaultBase, all.length, (chosen, password, remember) => {
+    void runExport(view, roots, all, chosen, password, remember);
+  }, argon2Available).open();
 }
 
 /** Build + write the .stash with the chosen base name, optionally encrypted,
  *  then notify. */
-async function runExport(view: StashpadView, roots: TreeNode[], all: TreeNode[], baseName: string, password: string | null): Promise<void> {
+async function runExport(view: StashpadView, roots: TreeNode[], all: TreeNode[], baseName: string, password: string | null, remember = false): Promise<void> {
   try {
     let buf = await buildStashZip(view.app, {
       rootNotes: roots.filter((n) => !!n.file).map((n) => ({ id: n.id, file: n.file! })),
@@ -61,8 +62,18 @@ async function runExport(view: StashpadView, roots: TreeNode[], all: TreeNode[],
     const exportSub = (view.plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
     const exportFolder = `${view.noteFolder}/${exportSub}`;
     await view.ensureFolder(exportFolder);
-    const outPath = `${exportFolder}/${safe}-${stamp}.${STASH_EXT}`;
+    const outBase = `${safe}-${stamp}`;
+    const outPath = `${exportFolder}/${outBase}.${STASH_EXT}`;
     await view.app.vault.createBinary(outPath, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
+    // 0.85.4: optionally remember the passphrase in this vault's secret storage
+    // (OS keychain), keyed deterministically by the filename so re-import on
+    // this device can look it up. Best-effort — a keychain failure must not
+    // fail the export (the file is already written + encrypted).
+    if (remember && password) {
+      const ss = (view.app as { secretStorage?: { setSecret(id: string, v: string): void } }).secretStorage;
+      try { ss?.setSecret(secretIdForStashName(outBase), password); }
+      catch (e) { console.warn("[Stashpad] couldn't save export passphrase to secret storage", e); }
+    }
     await view.log.append({
       type: "stash_export",
       id: roots[0].id,
@@ -135,7 +146,8 @@ export async function processStashFile(view: StashpadView, file: TFile): Promise
   try {
     const raw = new Uint8Array(await view.app.vault.readBinary(file));
     // 0.84.3: if encrypted, prompt + decrypt before the unchanged import path.
-    const buf = await resolveStashBytes(view.app, raw);
+    // 0.85.4: try a passphrase remembered for this filename first (silent).
+    const buf = await resolveStashBytes(view.app, raw, { secretId: secretIdForStashName(file.basename) });
     if (!buf) return; // user cancelled the password prompt — leave the file as-is
     const summary = await importStashZip(view.app, buf, view.noteFolder, collectExistingIds(view));
     view.tree.rebuild(view.noteFolder);

@@ -59,7 +59,8 @@ export type CommandId =
   | "swapWithParent"
   | "togglePin"
   | "toggleTask" | "setDue"
-  | "jumpToTop" | "jumpToBottom";
+  | "jumpToTop" | "jumpToBottom"
+  | "commandPalette";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
  *  When BOTH are set, `preferRight` decides which actually fires. */
@@ -122,6 +123,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
   { id: "jumpToTop",       label: "Jump to top of list",           desc: "Default: Home — move the cursor to the first note in the current list.", defaultPrimary: "Home" },
   { id: "jumpToBottom",    label: "Jump to bottom of list",        desc: "Default: End — move the cursor to the last note in the current list.", defaultPrimary: "End" },
+  { id: "commandPalette",  label: "Command palette (Stashpad only)", desc: "Default: Mod+K — open a command palette listing only Stashpad's commands, with Sift search.", defaultPrimary: "Mod+K" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -144,6 +146,9 @@ export interface StashpadSettings {
    *  honor Obsidian's "Excluded files" (userIgnoreFilters), so exclusions
    *  are managed in one place. `.edtz` is always excluded regardless. */
   inheritObsidianExclusions: boolean;
+  /** 0.86.2: folder panel — fraction of height given to the Pinned section
+   *  (the rest goes to Folders). Set by dragging the divider. 0.15–0.85. */
+  folderPanelPinnedFraction: number;
   /** 0.81.1: opt-in performance profiling — accumulates render/read/write
    *  timing so the "Dump performance profile" command reports where the
    *  time goes on a slow vault. Off by default. */
@@ -364,6 +369,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   exportFolder: "_exports",
   autoImport: false,
   inheritObsidianExclusions: true,
+  folderPanelPinnedFraction: 0.5,
   enablePerfProfiling: false,
   writeRecoveryLinks: true,
   useTemplatesFormat: false,

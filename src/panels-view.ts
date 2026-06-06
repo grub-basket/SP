@@ -70,6 +70,10 @@ export class StashpadPanelsView extends ItemView {
    *  Fixed buckets ("all"/"mine"/"others"/"byme"/"unassigned") or a
    *  per-person filter encoded as "person:<authorId>" (0.78.3). */
   private taskAssignFilter: string = "all";
+  /** 0.88.1: folder sub-filter for the Tasks panel, AND-combined with the
+   *  status + assignment filters. "all" = every Stashpad folder, else a
+   *  specific folder path. */
+  private taskFolderFilter: string = "all";
   /** 0.73.11: programmatic panel switch. Called by the per-panel
    *  command-palette entries so the sidebar lands on the right tab
    *  when invoked from the keyboard. */
@@ -184,7 +188,8 @@ export class StashpadPanelsView extends ItemView {
     homeRow.createSpan({ cls: "stashpad-pinned-label", text: "Home" });
     homeRow.onclick = () => this.openHomeFromPanel();
 
-    const pins = this.plugin.settings.pinnedNotes ?? [];
+    // 0.86.3: pins now come from note frontmatter (synced), ordered by pinnedAt.
+    const pins = this.plugin.listPinnedNotes();
     if (pins.length === 0) {
       const empty = list.createDiv({ cls: "stashpad-pinned-empty" });
       empty.setText("No pinned notes yet — right-click a note and choose “Pin to sidebar.”");
@@ -311,15 +316,24 @@ export class StashpadPanelsView extends ItemView {
     }
   }
 
-  /** Move a pin from one index to another, updating settings + re-rendering. */
+  /** Move a pin to a new position by rewriting its `pinnedAt` to fall between
+   *  the items it lands between (0.86.3 — order is the synced pinnedAt key). */
   private async reorderPin(fromIdx: number, toIdx: number): Promise<void> {
-    const list = (this.plugin.settings.pinnedNotes ?? []).slice();
+    const list = this.plugin.listPinnedNotes();
     if (fromIdx < 0 || fromIdx >= list.length) return;
-    const [moved] = list.splice(fromIdx, 1);
-    const adjusted = toIdx > fromIdx ? toIdx - 1 : toIdx;
-    list.splice(Math.max(0, Math.min(adjusted, list.length)), 0, moved);
-    this.plugin.settings.pinnedNotes = list;
-    await this.plugin.saveSettings();
+    const moved = list[fromIdx];
+    const without = list.filter((_, i) => i !== fromIdx);
+    const insertAt = Math.max(0, Math.min(toIdx > fromIdx ? toIdx - 1 : toIdx, without.length));
+    const prev = without[insertAt - 1];
+    const next = without[insertAt];
+    let at: number;
+    if (!prev && !next) at = Date.now();
+    else if (!prev) at = next.pinnedAt - 1000;
+    else if (!next) at = prev.pinnedAt + 1000;
+    else at = (prev.pinnedAt + next.pinnedAt) / 2;
+    try {
+      await this.app.fileManager.processFrontMatter(moved.file, (fm: any) => { fm.pinnedAt = at; });
+    } catch (e) { console.warn("[Stashpad] pin reorder failed", e); }
     this.render();
   }
 
@@ -806,10 +820,27 @@ export class StashpadPanelsView extends ItemView {
     }
     sel.onchange = () => { this.taskAssignFilter = sel.value; this.render(); };
 
-    const tasks = allTasks.filter(assignMatches);
+    // 0.88.1: Folder filter dropdown (AND-combined). Distinct folders across
+    // all tasks; "all" shows every folder. Reset to "all" if the previously
+    // selected folder no longer has any tasks.
+    const folders = [...new Set(allTasks.map((t) => t.folder))].sort((a, b) => a.localeCompare(b));
+    if (this.taskFolderFilter !== "all" && !folders.includes(this.taskFolderFilter)) this.taskFolderFilter = "all";
+    const folderBar = list.createDiv({ cls: "stashpad-task-assign-bar" });
+    folderBar.createSpan({ cls: "stashpad-task-assign-label", text: "Folder" });
+    const fsel = folderBar.createEl("select", { cls: "stashpad-task-assign-select" });
+    const allOpt = fsel.createEl("option", { text: "All folders", value: "all" });
+    if (this.taskFolderFilter === "all") allOpt.selected = true;
+    for (const f of folders) {
+      const o = fsel.createEl("option", { text: f.split("/").pop() || f, value: f });
+      if (this.taskFolderFilter === f) o.selected = true;
+    }
+    fsel.onchange = () => { this.taskFolderFilter = fsel.value; this.render(); };
+    const folderMatches = (t: TaskItem): boolean => this.taskFolderFilter === "all" || t.folder === this.taskFolderFilter;
+
+    const tasks = allTasks.filter((t) => assignMatches(t) && folderMatches(t));
     if (tasks.length === 0) {
       list.createDiv({ cls: "stashpad-tasks-empty" })
-        .setText(`No tasks match "${labelFor(this.taskAssignFilter)}".`);
+        .setText(`No tasks match the current filters.`);
       return;
     }
 

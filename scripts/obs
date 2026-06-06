@@ -1,0 +1,37 @@
+#!/bin/sh
+# Obsidian CLI wrapper for the Stashpad test harness.
+#
+# The CLI shipped in Obsidian 1.12.4 (GA Feb 2026). It's a remote control for a
+# RUNNING desktop instance (not headless) — if Obsidian isn't running, the first
+# command launches it. Enable once via Settings → General → Command line
+# interface → Register CLI (adds `obsidian` to PATH). This wrapper also works
+# BEFORE that registration by falling back to the macOS app-bundle binary.
+#
+# Usage:
+#   scripts/obs <command> [k=v ...]        # any Obsidian CLI command
+#   scripts/obs eval code='<js>'           # run JS, returns the result (awaits promises)
+#   scripts/obs eval-file path/to/test.js  # run a JS FILE's contents (no shell-escaping pain)
+#   scripts/obs plugin:reload id=stashpad  # reload the dev plugin after a deploy
+#   scripts/obs dev:screenshot path=/tmp/x.png
+#   scripts/obs dev:console                # captured console messages
+#
+# `eval` JS runs with `app` in scope. For UI-driving tests, dispatch synthetic
+# events inside the code (e.g. el.dispatchEvent(new KeyboardEvent(...))) — same
+# as the old cdp.mjs. Keep scripts/cdp.mjs as the fallback when the CLI is
+# unavailable (older Obsidian) or when a persistent CDP session is needed.
+
+BIN="$(command -v obsidian 2>/dev/null)"
+[ -n "$BIN" ] || BIN="/Applications/Obsidian.app/Contents/MacOS/obsidian-cli"
+if [ ! -x "$BIN" ]; then
+  echo "Obsidian CLI not found. Need Obsidian 1.12.4+; enable via Settings → General → Register CLI." >&2
+  exit 1
+fi
+
+if [ "$1" = "eval-file" ]; then
+  [ -n "$2" ] && [ -f "$2" ] || { echo "eval-file: missing/unreadable JS file: $2" >&2; exit 1; }
+  code="$(cat "$2")"
+  shift 2
+  exec "$BIN" eval code="$code" "$@"
+fi
+
+exec "$BIN" "$@"

@@ -3,6 +3,8 @@ import type { TFile } from "obsidian";
 export const STASHPAD_VIEW_TYPE = "stashpad-view";
 /** 0.68.0: sidebar panels view (Pinned Notes + future panels). */
 export const STASHPAD_PANELS_VIEW_TYPE = "stashpad-panels";
+/** 0.86.0: left-sidebar folder picker (pinned notes + folders, split). */
+export const STASHPAD_FOLDER_PANEL_VIEW_TYPE = "stashpad-folder-panel";
 /** 0.74.1: right-sidebar detail panel. Shows the currently-cursored
  *  note's body + metadata + children. Lives separately from the
  *  left-sidebar panels view (Pinned/Shared/Tasks). */
@@ -99,6 +101,12 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   // 0.78.1: task scheduling/assignment — Stashpad-managed, so clones /
   // templates must not carry someone else's due date or assignees.
   "due", "assignedTo", "assignedBy",
+  // 0.86.3: sidebar pin state lives on the note (so it SYNCS with the note
+  // across devices). Stashpad-managed; clones/templates must not inherit it.
+  "pinned", "pinnedAt",
+  // 0.88.0: marks a note that came in via import (used by the "imported only"
+  // view filter). Stashpad-managed; a clone of an imported note isn't imported.
+  "imported",
 ] as const;
 
 /** Reserved Stashpad subfolder names (machine-managed; not user notes).

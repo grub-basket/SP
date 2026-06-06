@@ -1,8 +1,9 @@
 import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
-import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, type PinnedNoteRef, type StashpadId } from "./types";
+import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, type PinnedNoteRef, type StashpadId } from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath } from "./view";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
+import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, type CommandId,
@@ -22,6 +23,10 @@ import { ImportLog } from "./import-log";
 import { perf } from "./perf";
 import { RenderCacheStore } from "./render-cache-store";
 
+/** 0.89.1: localStorage key — set right before an update-triggered app reload so
+ *  the next load knows to un-ghost the deferred Stashpad tabs. */
+const UNGHOST_FLAG = "stashpad:unghost-after-reload";
+
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
   private undoStacks = new Map<string, UndoStack>();
@@ -34,6 +39,11 @@ export default class StashpadPlugin extends Plugin {
    *  wikilink rewrites Obsidian does when slug-renames move files — never
    *  bump `modified` (or add the local user as a contributor). */
   rebootstrapInProgress = false;
+  /** 0.86.6: while `Date.now() < this`, a Stashpad view's activation
+   *  auto-focus skips grabbing the composer. Set by the folder panel before it
+   *  reveals/opens a leaf so tapping a pinned note on mobile doesn't pop the
+   *  keyboard. */
+  suppressComposerAutofocusUntil = 0;
   /** 0.73.10: keep a handle on the settings tab so command-palette
    *  entries can pre-select a specific tab when opening Settings. */
   settingTab: StashpadSettingTab | null = null;
@@ -536,6 +546,12 @@ export default class StashpadPlugin extends Plugin {
       // is auto-cleared on unload.
       window.setTimeout(() => void this.runAutoImportSweep(), 5000);
       this.registerInterval(window.setInterval(() => void this.runAutoImportSweep(), 5 * 60 * 1000));
+      // 0.86.3: migrate legacy per-device pinned list → note frontmatter (so
+      // pins sync). After the metadata cache has settled so fileForPin resolves.
+      window.setTimeout(() => void this.migratePinnedNotesToFrontmatter(), 3000);
+      // 0.89.1: if this load follows our update-reload, un-ghost the deferred
+      // Stashpad tabs so they render with the fresh code (no blank tabs/buttons).
+      window.setTimeout(() => void this.unghostStashpadTabsIfFlagged(), 1200);
     });
 
     this.registerView(
@@ -551,6 +567,10 @@ export default class StashpadPlugin extends Plugin {
     this.registerView(
       STASHPAD_PANELS_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadPanelsView(leaf, this),
+    );
+    this.registerView(
+      STASHPAD_FOLDER_PANEL_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadFolderPanelView(leaf, this),
     );
     // 0.68.1: track the most-recently-active Stashpad leaf so the
     // sidebar panel's Search / Home buttons target the leaf the user
@@ -720,6 +740,11 @@ export default class StashpadPlugin extends Plugin {
     this.addRibbonIcon("panel-left", "Open Stashpad panels (sidebar)", () => {
       void openStashpadPanelsView(this.app);
     });
+    // 0.86.1: folder panel ribbon entry — the main way to open it on mobile
+    // (commands are buried; the other sidebar panels are reached via ribbon).
+    this.addRibbonIcon("folders", "Open Stashpad folder panel (sidebar)", () => {
+      void openFolderPanelView(this.app);
+    });
     // 0.74.1: right-sidebar detail panel ribbon entry.
     this.addRibbonIcon("panel-right", "Open Stashpad detail panel (right sidebar)", () => {
       void openStashpadDetailView(this.app);
@@ -756,6 +781,11 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-toggle-split",
       name: "Toggle split-on-newlines",
       callback: () => call("toggleSplit"),
+    });
+    this.addCommand({
+      id: "stashpad-command-palette",
+      name: "Command palette (Stashpad only)",
+      callback: () => call("openStashpadCommandPalette"),
     });
     // 0.77.8: claim authorship retroactively (for notes created before the
     // user set their author name). Author-only variants only fill blank
@@ -913,6 +943,30 @@ export default class StashpadPlugin extends Plugin {
         return true;
       },
     });
+    // 0.85.2: per-step counterparts to rebootstrap, scoped to the current
+    // folder — so you can re-run just one repair pass without the heavy
+    // full-vault sweep. They call the SAME functions rebootstrap uses, so a
+    // fix in one place applies to both.
+    this.addCommand({
+      id: "stashpad-rerun-slug-pass",
+      name: "Re-run filename (slug) pass on this folder",
+      checkCallback: (checking: boolean) => {
+        const folder = this.importService.defaultDestination();
+        if (checking) return !!folder;
+        if (folder) void this.runFolderSlugPass(folder);
+        return true;
+      },
+    });
+    this.addCommand({
+      id: "stashpad-rerun-frontmatter-backfill",
+      name: "Re-run frontmatter backfill (recovery links) on this folder",
+      checkCallback: (checking: boolean) => {
+        const folder = this.importService.defaultDestination();
+        if (checking) return !!folder;
+        if (folder) void this.runFolderFrontmatterBackfill(folder);
+        return true;
+      },
+    });
     this.addCommand({ id: "stashpad-select-all", name: "Select all visible notes", callback: () => call("cmdSelectAll") });
     this.addCommand({ id: "stashpad-copy-codeblock", name: "Copy code from codeblock", callback: () => call("cmdCopyCodeBlock") });
     // 0.68.0: open the sidebar panels view (Pinned Notes + future panels).
@@ -920,6 +974,12 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-open-panels",
       name: "Open Stashpad panels (sidebar)",
       callback: () => void openStashpadPanelsView(this.app),
+    });
+    // 0.86.0: open the left-sidebar folder picker (pinned notes + folders).
+    this.addCommand({
+      id: "stashpad-open-folder-panel",
+      name: "Open folder panel (sidebar)",
+      callback: () => void openFolderPanelView(this.app),
     });
     // 0.74.1: open the right-sidebar detail panel.
     this.addCommand({
@@ -1373,6 +1433,15 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("rename", (file) => {
       if (file instanceof TFile) { onMaybeOrphan(file); onMaybeMarkdownImport(file); }
     }));
+    // 0.86.5: when a note's FILE moves to a DIFFERENT folder (e.g. dragged in
+    // Obsidian's file explorer), its `parent` still points at a note in the OLD
+    // folder — a dangling parent that orphans it in the new one. The
+    // missing-parent orphan-fix above doesn't catch this (the parent value is
+    // present, just invalid here), so re-home such notes to Home. Gated on a
+    // real cross-folder move, so in-folder reparents/renames are untouched.
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFile) this.maybeReHomeOnCrossFolderMove(file, oldPath);
+    }));
 
     // 0.79.1: auto-import — any file appearing directly in a Stashpad
     // folder root (not a reserved subfolder, not an existing note) gets
@@ -1411,8 +1480,10 @@ export default class StashpadPlugin extends Plugin {
    *  from manifest.json at launch) against the manifest.json currently
    *  on disk. If they differ, a different build has synced in since
    *  launch and the user is running stale code — surface a persistent
-   *  notice with a Reload action (disable+enable re-reads main.js,
-   *  works on mobile too). Notifies once per detected on-disk version. */
+   *  notice with a Reload action. 0.89.1: the action now runs the FULL app
+   *  reload ("Reload app without saving") — plugin disable/enable often left
+   *  the renderer on the cached old main.js, so the update "didn't take".
+   *  Notifies once per detected on-disk version. */
   private notifiedBuildVersion: string | null = null;
   private async checkForSyncedBuild(): Promise<void> {
     try {
@@ -1433,25 +1504,57 @@ export default class StashpadPlugin extends Plugin {
       if (this.notifiedBuildVersion === onDisk) return;
       this.notifiedBuildVersion = onDisk;
       this.notifications.show({
-        message: `A newer Stashpad build synced in (\`${loaded}\` → \`${onDisk}\`). Reload to apply.`,
+        message: `A newer Stashpad build synced in (\`${loaded}\` → \`${onDisk}\`). Reload the app to apply it.`,
         kind: "info",
         category: "system",
         duration: 0,
         actions: [{
-          label: "Reload Stashpad",
-          onClick: async () => {
-            const plugins = (this.app as any).plugins;
-            try {
-              await plugins?.disablePlugin?.(this.manifest.id);
-              await plugins?.enablePlugin?.(this.manifest.id);
-            } catch (e) {
-              new Notice(`Couldn't reload — toggle Stashpad off/on in settings. (${(e as Error).message})`);
-            }
-          },
+          label: "Reload app",
+          onClick: () => this.reloadAppForUpdate(),
         }],
       });
     } catch (e) {
       console.debug("[Stashpad] synced-build check failed", e);
+    }
+  }
+
+  /** 0.89.1: full app reload ("Reload app without saving") — the reliable way to
+   *  pick up a freshly-synced build. Plugin disable/enable often left the
+   *  renderer on the cached old main.js, so the update wouldn't take. Falls back
+   *  to a raw window reload if the command isn't available. */
+  private reloadAppForUpdate(): void {
+    // 0.89.1: leave a one-shot flag so the NEXT load un-ghosts deferred Stashpad
+    // tabs. Obsidian defers inactive leaves on launch; after an update reload
+    // they'd otherwise sit as blank "ghost" tabs (and dead buttons) until tapped.
+    // (We can't activate them here — app:reload tears down this JS context.)
+    try { window.localStorage?.setItem(UNGHOST_FLAG, "1"); } catch { /* private mode */ }
+    try {
+      if ((this.app as any).commands?.executeCommandById?.("app:reload")) return;
+    } catch (e) {
+      console.warn("[Stashpad] app:reload command failed", e);
+    }
+    try {
+      window.location.reload();
+    } catch {
+      new Notice("Reload Obsidian (close + reopen) to apply the Stashpad update.");
+    }
+  }
+
+  /** 0.89.1: if the last reload was our update-reload, load every deferred
+   *  Stashpad leaf so the tabs render with the fresh code instead of showing as
+   *  blank ghosts. One-shot (clears the flag); only un-ghosts OUR view type. */
+  private async unghostStashpadTabsIfFlagged(): Promise<void> {
+    let flagged = false;
+    try { flagged = window.localStorage?.getItem(UNGHOST_FLAG) === "1"; } catch { /* ignore */ }
+    if (!flagged) return;
+    try { window.localStorage?.removeItem(UNGHOST_FLAG); } catch { /* ignore */ }
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      try {
+        const l = leaf as any;
+        if (l.isDeferred && typeof l.loadIfDeferred === "function") await l.loadIfDeferred();
+      } catch (e) {
+        console.warn("[Stashpad] un-ghost leaf failed", e);
+      }
     }
   }
 
@@ -1673,6 +1776,57 @@ export default class StashpadPlugin extends Plugin {
       new Notice(`Adopted ${file.basename} → Home`);
     } catch (e) {
       console.warn("Stashpad: orphan auto-fix failed", e);
+    }
+  }
+
+  /** 0.86.5: paths with a pending re-home check (de-dupes burst rename events). */
+  private reHomePending = new Set<string>();
+
+  /** A markdown note's file just moved. If it landed in a DIFFERENT Stashpad
+   *  folder and its `parent` points at a note that isn't in the new folder,
+   *  re-home it to ROOT after a debounce (lets the metadata cache settle and
+   *  lets a Stashpad-initiated move stamp the correct parent first). */
+  private maybeReHomeOnCrossFolderMove(file: TFile, oldPath: string): void {
+    if (file.extension !== "md") return;
+    const newDir = file.parent?.path?.replace(/\/+$/, "") ?? "";
+    const slash = oldPath.lastIndexOf("/");
+    const oldDir = (slash >= 0 ? oldPath.slice(0, slash) : "").replace(/\/+$/, "");
+    if (newDir === oldDir) return;                                  // not a cross-folder move
+    if (!this.discoverStashpadFolders().includes(newDir)) return;   // not moved into a Stashpad
+    if (this.reHomePending.has(file.path)) return;
+    this.reHomePending.add(file.path);
+    setTimeout(() => {
+      this.reHomePending.delete(file.path);
+      void this.reHomeDanglingParent(file, newDir);
+    }, 900);
+  }
+
+  /** Set `parent` to ROOT iff the note's current parent is a non-ROOT id with
+   *  no matching note in `dir`. Conservative: a present, resolvable parent (and
+   *  one Stashpad's own move already fixed) is left alone. */
+  private async reHomeDanglingParent(file: TFile, dir: string): Promise<void> {
+    try {
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as
+        | { id?: unknown; parent?: unknown } | undefined;
+      const id = typeof fm?.id === "string" ? fm.id.trim() : "";
+      const parent = typeof fm?.parent === "string" ? fm.parent.trim() : "";
+      if (!id || !parent || parent === ROOT_ID) return;            // no id / no or home parent
+      const parentInFolder = this.app.vault.getMarkdownFiles().some((f) =>
+        (f.parent?.path?.replace(/\/+$/, "") ?? "") === dir
+        && this.app.metadataCache.getFileCache(f)?.frontmatter?.id === parent);
+      if (parentInFolder) return;                                  // parent resolves here — fine
+      await this.app.fileManager.processFrontMatter(file, (m: any) => {
+        // re-check against disk truth (cache may have lagged)
+        const cur = typeof m.parent === "string" ? m.parent.trim() : "";
+        if (cur && cur !== ROOT_ID) m.parent = ROOT_ID;
+      });
+      await this.newLog().append({
+        type: "parent_change", id,
+        payload: { from: parent, to: ROOT_ID, reason: "rehome_cross_folder_move", path: file.path },
+      });
+      new Notice(`Re-homed ${file.basename} → Home (its parent isn't in this folder)`);
+    } catch (e) {
+      console.warn("[Stashpad] re-home on cross-folder move failed", e);
     }
   }
 
@@ -1984,27 +2138,91 @@ export default class StashpadPlugin extends Plugin {
     return { folder, id: node.id, file: node.file };
   }
 
-  /** Pin a note to the sidebar panels' Pinned Notes list. Idempotent. */
+  /** 0.86.3: pin state lives in the NOTE'S frontmatter (`pinned: true` +
+   *  `pinnedAt` epoch-ms order key) so it syncs with the note across devices,
+   *  rather than in per-device plugin data. */
+  fileForPin(folder: string, id: string): TFile | null {
+    const dir = folder.replace(/\/+$/, "");
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dir) continue;
+      if (this.app.metadataCache.getFileCache(f)?.frontmatter?.id === id) return f;
+    }
+    return null;
+  }
+
+  /** Pin a note. Idempotent — writes `pinned: true` + `pinnedAt` to its FM. */
   async pinNote(pin: PinnedNoteRef): Promise<void> {
-    const list = this.settings.pinnedNotes ?? [];
-    if (list.some((p) => p.folder === pin.folder && p.id === pin.id)) return;
-    this.settings.pinnedNotes = [...list, pin];
-    await this.saveSettings();
+    const file = this.fileForPin(pin.folder, pin.id);
+    if (!file) return;
+    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned === true) return;
+    await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+      fm.pinned = true;
+      fm.pinnedAt = Date.now();
+    });
     this.refreshPanelsView();
   }
 
-  /** Remove a pin. Idempotent. */
+  /** Remove a pin (clears the frontmatter keys). Idempotent. */
   async unpinNote(pin: PinnedNoteRef): Promise<void> {
-    const list = this.settings.pinnedNotes ?? [];
-    const next = list.filter((p) => !(p.folder === pin.folder && p.id === pin.id));
-    if (next.length === list.length) return;
-    this.settings.pinnedNotes = next;
-    await this.saveSettings();
+    const file = this.fileForPin(pin.folder, pin.id);
+    if (!file) return;
+    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned !== true) return;
+    await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+      delete fm.pinned;
+      delete fm.pinnedAt;
+    });
     this.refreshPanelsView();
   }
 
   isPinned(pin: PinnedNoteRef): boolean {
-    return (this.settings.pinnedNotes ?? []).some((p) => p.folder === pin.folder && p.id === pin.id);
+    const file = this.fileForPin(pin.folder, pin.id);
+    if (!file) return false;
+    return this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned === true;
+  }
+
+  /** All pinned notes across discovered Stashpad folders, ordered by `pinnedAt`
+   *  (then path for stability). One metadata-cache scan — backs both the panels
+   *  Pinned section and the folder panel. */
+  listPinnedNotes(): Array<{ folder: string; id: string; pinnedAt: number; file: TFile }> {
+    const folders = new Set(this.discoverStashpadFolders());
+    const out: Array<{ folder: string; id: string; pinnedAt: number; file: TFile }> = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folders.has(dir)) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
+      if (!fm || fm.pinned !== true || typeof fm.id !== "string" || !fm.id) continue;
+      const at = typeof fm.pinnedAt === "number" ? fm.pinnedAt : 0;
+      out.push({ folder: dir, id: fm.id, pinnedAt: at, file: f });
+    }
+    out.sort((a, b) => a.pinnedAt - b.pinnedAt || a.file.path.localeCompare(b.file.path));
+    return out;
+  }
+
+  /** 0.86.3: one-time migration — convert the old per-device
+   *  `settings.pinnedNotes` list into `pinned`/`pinnedAt` frontmatter so pins
+   *  sync. Runs after layout-ready (metadata cache settled); clears the setting
+   *  when done so it never re-runs. */
+  private async migratePinnedNotesToFrontmatter(): Promise<void> {
+    const list = this.settings.pinnedNotes ?? [];
+    if (list.length === 0) return;
+    let stamp = Date.now() - list.length * 1000; // preserve order via increasing ts
+    for (const pin of list) {
+      const file = this.fileForPin(pin.folder, pin.id);
+      if (!file) { stamp += 1000; continue; }
+      try {
+        if (this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned !== true) {
+          const at = stamp;
+          await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+            fm.pinned = true;
+            fm.pinnedAt = at;
+          });
+        }
+      } catch (e) { console.warn("[Stashpad] pin migration failed for", pin, e); }
+      stamp += 1000;
+    }
+    this.settings.pinnedNotes = [];
+    await this.saveSettings();
+    this.refreshPanelsView();
   }
 
   /** Force any open panels view to re-render — used after pin/unpin. */
@@ -2353,8 +2571,28 @@ export default class StashpadPlugin extends Plugin {
       return;
     }
     await this.activateViewForFolder(folder);
-    const view = this.lastActiveStashpadLeaf?.view as any;
-    if (typeof view?.navigateTo === "function") view.navigateTo(id);
+    // 0.86.4: the freshly-opened view may still be loading its tree — navigate
+    // once it's actually ready, so a pinned note opens in ONE click instead of
+    // landing on Home (the first click) and only navigating on the second.
+    this.navigateWhenReady(folder, id);
+  }
+
+  /** Poll briefly for the folder's Stashpad view to have `id` in its tree, then
+   *  navigate. One-click open for a not-yet-open folder. */
+  private navigateWhenReady(folder: string, id: string, attempts = 15): void {
+    const clean = folder.replace(/\/+$/, "");
+    const view = (this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+      .find((l) => (((l.view as any)?.noteFolder ?? "").replace(/\/+$/, "")) === clean)?.view
+      ?? this.lastActiveStashpadLeaf?.view) as any;
+    if (view && typeof view.navigateTo === "function") {
+      const treeReady = !view.tree || typeof view.tree.get !== "function" || !!view.tree.get(id);
+      if (treeReady) { view.navigateTo(id); return; }
+    }
+    if (attempts > 0) {
+      window.setTimeout(() => this.navigateWhenReady(folder, id, attempts - 1), 90);
+    } else if (view && typeof view.navigateTo === "function") {
+      view.navigateTo(id); // last resort — navigate anyway
+    }
   }
 
   /** Walk vault markdown frontmatter for notes whose author or
@@ -2575,13 +2813,22 @@ export default class StashpadPlugin extends Plugin {
         if (isInReservedSubfolder(f.path)) continue; // skip _archive/_attachments/…
         const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
         if (!fm || typeof fm.id !== "string" || !fm.id) continue;
-        if (!Array.isArray(fm.attachments)) continue;
-        const needs = fm.attachments.some((a: any) => typeof a === "string" && a.trim() && !isLink(a));
+        const att: any = fm.attachments;
+        const isArr = Array.isArray(att);
+        const isScalar = typeof att === "string" && att.trim().length > 0;
+        if (!isArr && !isScalar) continue;
+        // 0.85.9: also handle a SCALAR `attachments:` (hand-edited / odd import)
+        // — normalize it to a one-item list of the canonical link form.
+        const needs = isScalar
+          ? !isLink(att as string)
+          : (att as any[]).some((a: any) => typeof a === "string" && a.trim() && !isLink(a));
         if (!needs) continue;
         try {
           await this.app.fileManager.processFrontMatter(f, (m: any) => {
             if (Array.isArray(m.attachments)) {
               m.attachments = m.attachments.map((a: any) => (typeof a === "string" && a.trim()) ? toAttachmentLink(a) : a);
+            } else if (typeof m.attachments === "string" && m.attachments.trim()) {
+              m.attachments = [toAttachmentLink(m.attachments)];
             }
           });
           converted++;
@@ -2674,6 +2921,53 @@ export default class StashpadPlugin extends Plugin {
       kind: total > 0 ? "success" : "info",
       category: "import",
       folder,
+    });
+  }
+
+  /** Refresh the active view if it's looking at `folder` (so per-step repairs
+   *  show immediately, like the loose-import command does). */
+  private refreshViewIfShowing(folder: string): void {
+    const view = this.lastActiveStashpadLeaf?.view as any;
+    if (view?.noteFolder === folder && view?.tree) { view.tree.rebuild(folder); view.render?.(); }
+  }
+
+  /** 0.85.2: re-run just the filename/slug pass on one folder — the same
+   *  `rebootstrapFolderSlugs` rebootstrap uses, without the full-vault sweep. */
+  async runFolderSlugPass(folder: string): Promise<void> {
+    const label = folder.split("/").pop() || folder;
+    let n = 0;
+    try { n = await this.rebootstrapFolderSlugs(folder); }
+    catch (e) {
+      this.notifications.show({ message: `Stashpad: slug pass failed in \`${label}\`\n${(e as Error).message}`, kind: "error", category: "system", folder });
+      console.error("[Stashpad] runFolderSlugPass failed", folder, e);
+      return;
+    }
+    this.refreshViewIfShowing(folder);
+    this.notifications.show({
+      message: n > 0
+        ? `Renamed ${n} stale filename${n === 1 ? "" : "s"} in \`${label}\`.`
+        : `No stale filenames in \`${label}\` — all slugs match their notes.`,
+      kind: n > 0 ? "success" : "info", category: "system", folder,
+    });
+  }
+
+  /** 0.85.2: re-run just the frontmatter backfill (redundant `parentLink` /
+   *  `children` recovery links) on one folder — the same
+   *  `rebootstrapFolderFrontmatter` rebootstrap uses. */
+  async runFolderFrontmatterBackfill(folder: string): Promise<void> {
+    const label = folder.split("/").pop() || folder;
+    let written = 0, checked = 0;
+    try { const s = await rebootstrapFolderFrontmatter(this.app, folder); written = s.written; checked = s.checked; }
+    catch (e) {
+      this.notifications.show({ message: `Stashpad: frontmatter backfill failed in \`${label}\`\n${(e as Error).message}`, kind: "error", category: "system", folder });
+      console.error("[Stashpad] runFolderFrontmatterBackfill failed", folder, e);
+      return;
+    }
+    this.notifications.show({
+      message: written > 0
+        ? `Backfilled recovery links on ${written} note${written === 1 ? "" : "s"} in \`${label}\` (${checked} checked).`
+        : `Recovery links already up to date in \`${label}\` (${checked} checked).`,
+      kind: written > 0 ? "success" : "info", category: "system", folder,
     });
   }
 
@@ -2988,6 +3282,47 @@ export default class StashpadPlugin extends Plugin {
       window.localStorage.setItem(this.LAST_CURSOR_LS_KEY, JSON.stringify(all));
     } catch (e) {
       console.warn("[Stashpad] failed to save last-cursor", e);
+    }
+  }
+
+  // 0.91.0: last MULTI-SELECTION per (folder, focus), persisted to
+  // localStorage. Mirrors the last-cursor store above. Lives in localStorage
+  // rather than view state because (a) it must survive even when the tab is
+  // lazy-loaded/deferred on reload, and (b) selection changes don't trigger a
+  // workspace-layout save, so getState() would capture stale state. Stamped on
+  // beforeunload/blur/onClose (eager), read back on view load.
+  private readonly LAST_SELECTION_LS_KEY = "stashpad:last-selection";
+  private readLastSelectionFile(): Record<string, Record<string, string[]>> {
+    try {
+      const raw = window.localStorage.getItem(this.LAST_SELECTION_LS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed as Record<string, Record<string, string[]>> : {};
+    } catch {
+      return {};
+    }
+  }
+  /** Map of <focusId> → <selected note ids> for the given folder. */
+  loadLastSelection(folder: string): Map<string, string[]> {
+    const all = this.readLastSelectionFile();
+    const slice = all[folder] ?? {};
+    const out = new Map<string, string[]>();
+    for (const [focusId, ids] of Object.entries(slice)) {
+      if (Array.isArray(ids)) out.set(focusId, ids.filter((x): x is string => typeof x === "string"));
+    }
+    return out;
+  }
+  /** Synchronously persist the selection for one (folder, focus). An empty
+   *  array clears it (so deselect-then-reload doesn't resurrect stale ids). */
+  saveLastSelection(folder: string, focusId: string, ids: string[]): void {
+    try {
+      const all = this.readLastSelectionFile();
+      if (!all[folder]) all[folder] = {};
+      if (ids.length) all[folder][focusId] = ids;
+      else delete all[folder][focusId];
+      window.localStorage.setItem(this.LAST_SELECTION_LS_KEY, JSON.stringify(all));
+    } catch (e) {
+      console.warn("[Stashpad] failed to save last-selection", e);
     }
   }
 

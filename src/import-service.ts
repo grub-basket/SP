@@ -5,6 +5,7 @@ import { newId } from "./id-service";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { splitFrontmatter, serializeNote, importStashZip, STASH_EXT } from "./stash-package";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
+import { secretIdForStashName } from "./passphrase";
 import { ConfirmModal, ImportDupChoiceModal } from "./modals";
 
 /** Reserved subfolders inside a Stashpad folder — never treated as drop
@@ -306,6 +307,12 @@ export class ImportService {
     cloneFm.created = t.created;
     if (t.modified) cloneFm.modified = t.modified;
     cloneFm.attachments = Array.isArray(fm.attachments) ? fm.attachments : [];
+    // 0.88.0: RETAIN the source's authorship on import. `author`/`contributors`
+    // are normally reserved/stripped, but an imported note should keep WHO
+    // wrote it — the importer only becomes a contributor once they edit it.
+    if (fm.author !== undefined) cloneFm.author = fm.author;
+    if (fm.contributors !== undefined) cloneFm.contributors = fm.contributors;
+    cloneFm.imported = true; // mark as imported (the "imported only" view filter)
 
     const slug = bodyToSlug(body) || file.basename;
     const notePath = await this.uniquePath(folder, buildFilename(slug, cloneFm.id));
@@ -331,6 +338,7 @@ export class ImportService {
       created: new Date().toISOString(),
       // 0.79.18: attachments stored as internal links (not plain text).
       attachments: [toAttachmentLink(attachmentPath)],
+      imported: true, // 0.88.0: mark as imported (the "imported only" view filter)
     };
     // 0.79.18: embed the attachment (! prefix) so it previews inline.
     const body = `${title}\n\n![[${attachmentPath}]]\n`;
@@ -827,7 +835,8 @@ export class ImportService {
         this.pendingEncryptedStashes.add(file.path); // defer — surfaced by the sweep
         return false;
       }
-      const buf = await resolveStashBytes(this.app, rawBytes, promptOpts); // prompts if encrypted
+      // 0.85.4: try a passphrase remembered for this filename before prompting.
+      const buf = await resolveStashBytes(this.app, rawBytes, { ...promptOpts, secretId: secretIdForStashName(file.basename) });
       if (!buf) return false; // cancelled / "remind me later" — leave the file
       const summary = await importStashZip(this.app, buf, root, existingIds);
       try { await this.app.fileManager.trashFile(file); } catch {}

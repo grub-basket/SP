@@ -216,6 +216,9 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       const cb = this.pendingCleanups.pop();
       try { if (cb) cb(); } catch {}
     }
+    // 0.85.10: notify the caller the picker closed (pick OR dismiss). The
+    // destination picker uses this to refocus the composer only on dismiss.
+    try { this.opts.onClose?.(); } catch {}
   }
 
   constructor(
@@ -228,6 +231,9 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       allowCreate?: boolean;
       onPick: (item: PickerItem) => void;
       onCreate?: (query: string) => void;
+      /** 0.85.10: fired from onClose (any close — pick or dismiss). The
+       *  destination picker uses it to refocus the composer on dismiss. */
+      onClose?: () => void;
       /** Optional source for cross-folder notes. Resolved lazily when
        *  the user starts typing — local results from `tree` are returned
        *  first, and this source is queried only after the local set is
@@ -253,17 +259,23 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
   }
 
   private loadAll(): void {
+    const rootNode = this.tree.getRoot();
+    // 0.85.15: label the LOCAL home like the cross-folder entries
+    // ("Home — <folder>") so searching a folder by name surfaces its home note
+    // whether you're inside that folder or not — consistent everywhere, and it
+    // becomes matchable by the folder name (so the home-pin floats it to top).
+    const folderName = rootNode.file?.parent?.name?.trim() ?? "";
+    const localHomeTitle = folderName ? `Home — ${folderName}` : "Home";
     const walk = (id: string, depth: number): void => {
       const node = this.tree.get(id);
       if (node?.file && id !== ROOT_ID) {
         this.notes.push({ node, title: `${"  ".repeat(depth)}${this.titleFn(node)}`, body: "" });
       } else if (node?.file && id === ROOT_ID) {
-        this.notes.push({ node, title: "Home", body: "" });
+        this.notes.push({ node, title: localHomeTitle, body: "" });
       }
       for (const c of this.tree.getChildren(id)) walk(c.id, depth + 1);
     };
-    const rootNode = this.tree.getRoot();
-    if (rootNode.file) this.notes.push({ node: rootNode, title: "Home", body: "" });
+    if (rootNode.file) this.notes.push({ node: rootNode, title: localHomeTitle, body: "" });
     for (const c of this.tree.getChildren(ROOT_ID)) walk(c.id, 1);
 
     // lazy-read bodies in background
@@ -502,30 +514,50 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // crowded by N folder rows on a vault with many Stashpads.
     if (this.opts.folderResults) {
       const folders = this.opts.folderResults();
-      // Show the collapsed entry when the query is empty (folder
-      // browsing) OR matches at least one folder name (same trigger
-      // condition as before, just collapsed to one row).
-      const anyMatch = !q || folders.some((folder) => {
-        const last = folder.split("/").pop() ?? folder;
-        return matchesAll(`${folder.toLowerCase()} ${last.toLowerCase()}`);
-      });
-      if (folders.length > 0 && anyMatch) {
-        const collapsed: PickerItem = {
-          id: `__folder_picker__`,
-          label: `Open folder in a new tab…`,
-          node: null,
-          kind: "folder-open",
-        };
-        // 0.64.7: filter-active queries push the folder shortcut down
-        // so real note rows lead the list.
-        const hasFilter = Object.keys(parsed.filters).length > 0;
-        if (hasFilter) items.push(collapsed);
-        else items.unshift(collapsed);
+      const collapsed: PickerItem = {
+        id: `__folder_picker__`,
+        label: `Open folder in a new tab…`,
+        node: null,
+        kind: "folder-open",
+      };
+      // 0.85.14: empty query → show it at the TOP (folder browsing). Once
+      // typing, only show it when the query matches a folder name, and place it
+      // at the BOTTOM so it's never the first result — real note hits lead, and
+      // the matching folder's home note still pins to the top (0.85.12).
+      if (folders.length > 0) {
+        if (!q) {
+          items.unshift(collapsed);
+        } else if (folders.some((folder) => {
+          const last = folder.split("/").pop() ?? folder;
+          return matchesAll(`${folder.toLowerCase()} ${last.toLowerCase()}`);
+        })) {
+          items.push(collapsed);
+        }
       }
     }
 
     if (this.opts.allowCreate && q && !items.some((i) => i.label.trim().toLowerCase() === q)) {
       items.push({ id: `__create__`, label: `Create new: "${query}"`, node: null, kind: "create" });
+    }
+
+    // 0.85.12: searching a Stashpad folder by name means you want its HOME
+    // note. Home notes are otherwise low-priority, but once there are ≥3
+    // characters of search text, any home note whose TITLE matches the query
+    // (local home label "Home", or a cross-folder "Home — <folder>" whose
+    // folder name you've typed) is floated to the very top — "no matter what".
+    // Title-match (not body) keeps it to genuine folder-name hits, and the ≥3
+    // gate keeps short/empty queries from surfacing every home. Backs every
+    // modal that uses this picker — find / destination / move / in-parent.
+    if (parsed.text.join("").length >= 3) {
+      const isHomeMatch = (i: PickerItem): boolean =>
+        i.kind === "note"
+        && (i.id === ROOT_ID || i.id === `cross:${ROOT_ID}`)
+        && matchesAll(i.label.toLowerCase());
+      const homes = items.filter(isHomeMatch);
+      if (homes.length > 0) {
+        const rest = items.filter((i) => !isHomeMatch(i));
+        items.splice(0, items.length, ...homes, ...rest);
+      }
     }
     return items;
   }

@@ -220,9 +220,23 @@ async function decryptV1(envelope: Uint8Array, password: string): Promise<Uint8A
 export async function resolveStashBytes(
   app: App,
   bytes: Uint8Array,
-  opts: { allowLater?: boolean; onLater?: () => void } = {},
+  opts: { allowLater?: boolean; onLater?: () => void; secretId?: string } = {},
 ): Promise<Uint8Array | null> {
   if (!isEncryptedStash(bytes)) return bytes;
+
+  // 0.85.4: if this export's passphrase was remembered in this vault's secret
+  // storage (keyed by filename), try it silently before prompting. This goes
+  // through the SAME decryptStash path — no bypass of the zip-slip / collision
+  // guards downstream. A stored-but-wrong secret just falls through to prompt.
+  if (opts.secretId) {
+    const ss = (app as App & { secretStorage?: { getSecret(id: string): string | null } }).secretStorage;
+    let stored: string | null = null;
+    try { stored = ss?.getSecret(opts.secretId) ?? null; } catch { stored = null; }
+    if (stored) {
+      try { return await decryptStash(bytes, stored); } catch { /* fall through to prompt */ }
+    }
+  }
+
   let errorMsg: string | undefined;
   for (;;) {
     const r = await new Promise<StashPasswordResult>((resolve) => {
