@@ -3968,7 +3968,10 @@ export class StashpadView extends ItemView {
     // 0.76.10: task checkbox at the leftmost edge of the row when the
     // note is a task. Reflects `completed`; click toggles it in place
     // (no need to open the Tasks panel). Sits before the meta column.
-    if (this.isTask(node)) {
+    // 0.96.1 (experiment): in COMPACT mode, show a checkbox on EVERY row so
+    // compact reads as a tight checklist — not just task-tagged notes.
+    const showCheckbox = this.isTask(node) || this.compactMode;
+    if (showCheckbox) {
       row.addClass("is-task"); // desktop: adds the leading checkbox grid column
       // 0.87.1: on mobile the checkbox moves into the meta column (left of the
       // children-count arrow) so the single right-side action button doesn't
@@ -3994,7 +3997,7 @@ export class StashpadView extends ItemView {
     // 0.87.1: the children-count arrow + (on mobile) the task checkbox share one
     // horizontal line below the timestamp — the mobile checkbox sits just to the
     // LEFT of the arrow (see the desktop addTaskCheckbox call above).
-    const mobileTask = this.isTask(node) && Platform.isMobile;
+    const mobileTask = showCheckbox && Platform.isMobile;
     if (childCount > 0 || mobileTask) {
       const metaBottom = meta.createDiv({ cls: "stashpad-note-meta-bottom" });
       if (mobileTask) this.addTaskCheckbox(metaBottom, node);

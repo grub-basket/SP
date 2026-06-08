@@ -1,4 +1,4 @@
-import { App, Notice, Platform, PluginSettingTab, Setting, SettingPage, TFile, setIcon, type SettingDefinitionItem } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting, SettingPage, TFile, requireApiVersion, setIcon, type SettingDefinitionItem } from "obsidian";
 
 /** Platform-correct OS file-manager name for button/notice labels. */
 function osFileManagerName(): string {
@@ -530,6 +530,36 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  by the existing `renderTabContent`, so behavior is unchanged and only the
    *  PAGE names are searchable. Phase 2 (follow-up versions) decomposes each
    *  page into `items` so individual settings become searchable too. */
+  /** 0.96.2: backwards compatibility for pre-1.13 Obsidian. Obsidian 1.13+ has
+   *  the declarative settings renderer + native search — let the base class
+   *  render from getSettingDefinitions() (and index it for search) by delegating
+   *  to super.display(). OLDER Obsidian has no declarative API: the base
+   *  display() is a no-op there, so without this override the Stashpad settings
+   *  tab renders BLANK. The fallback below renders the SAME settings imperatively
+   *  (one section per tab) — no native search there, which is fine. This is why
+   *  minAppVersion can sit below 1.13 again. */
+  display(): void {
+    if (requireApiVersion("1.13.0")) { super.display(); return; }
+    const { containerEl } = this;
+    containerEl.empty();
+    for (const t of SETTINGS_TABS) {
+      containerEl.createEl("h2", { text: t.label });
+      const items = this.itemsForTab(t.id);
+      if (items) {
+        for (const it of items as any[]) {
+          const s = new Setting(containerEl);
+          if (typeof it.render === "function") it.render(s);
+          else {
+            if (it.name) s.setName(it.name);
+            if (it.desc) s.setDesc(it.desc);
+          }
+        }
+      } else {
+        this.renderTabContent(containerEl, t.id);
+      }
+    }
+  }
+
   getSettingDefinitions(): SettingDefinitionItem[] {
     return SETTINGS_TABS.map((t) => {
       // Migrated tabs use declarative `items` (per-setting search). Unmigrated
