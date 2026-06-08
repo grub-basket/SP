@@ -1331,10 +1331,25 @@
 }
 .stashpad-composer-btn .svg-icon,
 .stashpad-folder-btn .svg-icon,
+.stashpad-search-btn .svg-icon,
 .stashpad-pencil .svg-icon,
 .stashpad-note-enter .svg-icon {
   width: 16px;
   height: 16px;
+}
+
+/* 0.93.1: GENERAL anti-collapse guard. An inline <svg> is a flex item with
+   the default min-width:auto; inside a flex container with flex-shrink:1 its
+   content-based minimum is 0, so the browser can squash it to width:0 while
+   height stays — leaving an icon-only button looking blank (the iPad missing-
+   icon reports: search button, mobile nav buttons, …). `flex: 0 0 auto`
+   forbids the shrink. Scoped to every Stashpad view root so we don't have to
+   patch each new icon button one at a time. No-op outside flex contexts. */
+.stashpad-view .svg-icon,
+.stashpad-panels-root .svg-icon,
+.stashpad-detail-root .svg-icon,
+.stashpad-folderpanel-root .svg-icon {
+  flex: 0 0 auto;
 }
 .stashpad-pencil { display: inline-flex; align-items: center; justify-content: center; }
 
@@ -1374,6 +1389,22 @@
 .stashpad-suggest-create {
   font-style: italic;
   color: var(--text-accent);
+}
+
+/* 0.92.1: "Search excluded Stashpad folders" bottom action. */
+.stashpad-search-excluded-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-accent);
+}
+.stashpad-search-excluded-icon {
+  display: inline-flex;
+  align-items: center;
+}
+.stashpad-search-excluded-icon .svg-icon {
+  width: 15px;
+  height: 15px;
 }
 
 .stashpad-log-modal { width: min(860px, 90vw); }
@@ -1478,11 +1509,6 @@
 .stashpad-split-line { cursor: pointer; }
 .stashpad-split-line:hover { background: var(--background-modifier-hover); }
 
-.stashpad-settings-title {
-  font-size: 1.8em !important;
-  font-weight: 700 !important;
-  margin: 0 0 18px !important;
-}
 .stashpad-settings-note {
   margin: 0 0 12px;
   padding-bottom: 8px;
@@ -1580,6 +1606,15 @@
   display: flex;
   flex-direction: column;
   padding: 4px 0 12px;
+}
+/* 0.95.2: placement overview group heading in settings */
+.stashpad-folder-placement-group {
+  margin-top: 10px;
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 .stashpad-folder-row {
   display: flex;
@@ -1785,6 +1820,9 @@
   justify-content: center;
   font-size: 15px;
   line-height: 1;
+  /* 0.92.4: don't let the flex parent shrink the glyph to nothing (same
+     zero-width collapse that hit the svg icons). */
+  flex: 0 0 auto;
 }
 .stashpad-mobile-action-btn {
   width: 32px;
@@ -1805,7 +1843,19 @@
   color: var(--text-on-accent);
   border-color: var(--interactive-accent);
 }
-.stashpad-mobile-action-btn .svg-icon { width: 16px; height: 16px; }
+/* 0.92.4: `flex: 0 0 auto` + min-width stop the flexbox from collapsing the
+   icon to ZERO width. The svg is a flex item with the default min-width:auto;
+   an inline svg's content-based minimum is 0, so flex-shrink:1 squashed it to
+   0px wide (height stayed 16px) — the buttons looked empty on iPad even though
+   the Lucide icon WAS injected (which is why setIconSafe's fallback never
+   fired). Affected iPad and not iPhone because the breadcrumb row's available
+   width differs. */
+.stashpad-mobile-action-btn .svg-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  min-width: 16px;
+}
 
 /* Bottom Home/Back/Bookmarks toolbar is redundant now that the
    breadcrumb has a house-icon Home button + Alt+Left for back. Hide
@@ -2000,6 +2050,33 @@
 .stashpad-binding-clear:hover {
   background: var(--background-modifier-error);
   color: var(--text-on-accent);
+}
+/* 0.92.0: revert-to-default icon — same footprint as the clear button, shown
+   only when the slot deviates from its shipped default. */
+.stashpad-binding-revert {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  color: var(--text-muted);
+}
+.stashpad-binding-revert .svg-icon {
+  width: 14px;
+  height: 14px;
+}
+.stashpad-binding-revert:hover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.stashpad-binding-revert.is-hidden {
+  display: none;
 }
 /* Pill toggle: a rounded track with a knob that slides L↔R. The knob
    shows "L" when on the left (primary active) or "R" when on the right
@@ -2547,23 +2624,6 @@
   background: var(--background-secondary);
   color: var(--text-faint);
   border: 1px solid var(--background-modifier-border);
-}
-
-/* Mute-category settings — collapsed by default. The <details> arrow
-   and label use the theme's defaults; the help line gets a muted color
-   so it doesn't compete with the section header. */
-.stashpad-notif-mute-details {
-  margin: 8px 0 12px;
-}
-.stashpad-notif-mute-details > summary {
-  cursor: pointer;
-  font-weight: 600;
-  padding: 4px 0;
-}
-.stashpad-notif-mute-help {
-  font-size: var(--font-ui-smaller);
-  color: var(--text-muted);
-  margin: 4px 0 8px;
 }
 
 /* Notification toast polish — wrap, truncate, monospace paths.
@@ -3215,59 +3275,6 @@
 .stashpad-detail-composer-send-icon { display: inline-flex; align-items: center; }
 .stashpad-detail-composer-send-icon svg { width: 15px; height: 15px; }
 
-/* 0.73.1: tabbed settings UI. Search box at top, tab bar below,
-   body underneath. Search mode dims the tab bar and shows every
-   section grouped under its tab label. */
-.stashpad-settings-search-wrap { margin: 8px 0 12px; }
-.stashpad-settings-search-input {
-  width: 100%;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--background-modifier-border);
-  background: var(--background-primary);
-  color: var(--text-normal);
-  font-size: var(--font-ui-small);
-}
-.stashpad-settings-tabs {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding: 4px 0 12px;
-  border-bottom: 1px solid var(--background-modifier-border);
-  margin-bottom: 12px;
-}
-.stashpad-settings-tab {
-  padding: 6px 12px;
-  border-radius: 6px 6px 0 0;
-  border: 1px solid transparent;
-  border-bottom: none;
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-  font-size: var(--font-ui-small);
-  font-weight: 500;
-}
-.stashpad-settings-tab:hover {
-  background: var(--background-modifier-hover);
-  color: var(--text-normal);
-}
-.stashpad-settings-tab.is-active {
-  background: var(--background-secondary);
-  color: var(--text-normal);
-  border-color: var(--background-modifier-border);
-  position: relative;
-  top: 1px;
-}
-.stashpad-settings-tabs.is-search-mode .stashpad-settings-tab { opacity: 0.65; }
-.stashpad-settings-search-group { margin-bottom: 16px; }
-.stashpad-settings-search-group-header {
-  font-size: 0.95em;
-  color: var(--text-accent);
-  border-bottom: 1px solid var(--background-modifier-border);
-  padding-bottom: 4px;
-  margin: 0 0 8px;
-}
-
 /* 0.71.24 — when the When-builder is open, grow the modal so a short
    results list can't clip the builder's mode tabs / inputs / buttons.
    `.suggestion-container` is Obsidian's scrollable results wrapper; we
@@ -3431,7 +3438,21 @@
   color: var(--text-muted);
 }
 .stashpad-pinned-icon svg { width: 14px; height: 14px; }
-.stashpad-pinned-row.has-color .stashpad-pinned-icon { color: inherit; }
+/* 0.95.2: stronger note-color carryover — a left accent bar + faint wash + a
+   tinted label, on top of the icon tint. Shared by the Pinned panel AND the
+   folder panel's Pinned list (both use .stashpad-pinned-row). */
+.stashpad-pinned-row.has-color {
+  border-left: 3px solid var(--stashpad-note-color);
+  padding-left: 5px;
+  background: color-mix(in srgb, var(--stashpad-note-color) 10%, transparent);
+}
+.stashpad-pinned-row.has-color:hover {
+  background: color-mix(in srgb, var(--stashpad-note-color) 18%, transparent);
+}
+.stashpad-pinned-row.has-color .stashpad-pinned-icon { color: var(--stashpad-note-color); }
+.stashpad-pinned-row.has-color .stashpad-pinned-label {
+  color: color-mix(in srgb, var(--stashpad-note-color) 55%, var(--text-normal));
+}
 .stashpad-pinned-label {
   flex: 1 1 auto;
   overflow: hidden;
@@ -3461,6 +3482,15 @@
 }
 .stashpad-pinned-group-header.is-active-folder { color: var(--text-accent); }
 .stashpad-panel-pinned .stashpad-pinned-folder { display: none; }
+/* flat (pin-order) mode in the Pinned panel keeps the folder badge for context */
+.stashpad-panel-pinned.is-flat .stashpad-pinned-folder { display: inline; }
+/* the folder panel's Pinned list never shows the per-row folder badge */
+.stashpad-folderpanel-pins .stashpad-pinned-folder { display: none; }
+/* 0.95.3: Pinned panel head row — Home shortcut tucked in, view-options button
+   to its right filling the rest of the line. */
+.stashpad-pinned-headrow { display: flex; align-items: center; gap: 4px; }
+.stashpad-pinned-headrow .stashpad-pinned-home { flex: 1 1 auto; width: auto; }
+.stashpad-pinned-opts { flex: 0 0 auto; }
 
 /* 0.71.30: Tasks panel — borrows pinned-row layout. Due date sits at
    the trailing edge; overdue gets a warning tint. Completed rows are
@@ -4120,6 +4150,22 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
   letter-spacing: 0.04em;
   color: var(--text-faint);
 }
+/* 0.95.1: Pinned heading carries a view-options button on the right */
+.stashpad-folderpanel-heading-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.stashpad-folderpanel-heading-title { flex: 1 1 auto; }
+.stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn { height: 20px; width: 20px; }
+/* 0.95.1: per-folder icon in the Folders list */
+.stashpad-folderpanel-folder-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+.stashpad-folderpanel-folder-icon svg { width: 15px; height: 15px; }
 .stashpad-folderpanel-list {
   flex: 1 1 auto;
   min-height: 0;
@@ -4206,6 +4252,35 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
 }
+/* 0.95.1: pin / downrank placement marks */
+.stashpad-folderpanel-pinmark {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-accent);
+}
+.stashpad-folderpanel-pinmark svg { width: 12px; height: 12px; }
+.stashpad-folderpanel-folder-row.is-downranked { opacity: 0.55; }
+.stashpad-folderpanel-folder-row.is-downranked:hover { opacity: 0.85; }
+
+/* 0.95.1: collapsible "Hidden (N)" group at the bottom of the Folders list */
+.stashpad-folderpanel-hidden { margin-top: 4px; border-top: 1px solid var(--background-modifier-border); }
+.stashpad-folderpanel-hidden-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 10px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-folderpanel-hidden-header:hover { color: var(--text-normal); }
+.stashpad-folderpanel-hidden-caret { display: inline-flex; align-items: center; }
+.stashpad-folderpanel-hidden-caret svg { width: 14px; height: 14px; }
+.stashpad-folderpanel-hidden-title { flex: 1 1 auto; }
+.stashpad-folderpanel-hidden-row { opacity: 0.75; }
+.stashpad-folderpanel-hidden-row .stashpad-folderpanel-iconbtn { opacity: 1; }
+
 /* rename modal */
 .stashpad-folderpanel-rename-input { width: 100%; margin-bottom: 12px; }
 .stashpad-folderpanel-rename-footer { display: flex; justify-content: flex-end; gap: 8px; }

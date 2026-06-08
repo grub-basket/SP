@@ -156,8 +156,10 @@ export interface PickerItem {
    *  - "note": ordinary local-or-cross-folder note pick.
    *  - "create": "Create new: <query>" virtual pick.
    *  - "folder-open": pick a Stashpad folder — caller opens it in a new
-   *    tab. Carries `folder` but no node. 0.57.3. */
-  kind: "note" | "create" | "folder-open";
+   *    tab. Carries `folder` but no node. 0.57.3.
+   *  - "search-excluded": bottom-of-list action that pulls notes from
+   *    Stashpad folders excluded from search into the result set. 0.92.1. */
+  kind: "note" | "create" | "folder-open" | "search-excluded";
   bodyPreview?: string; // for search mode
   matchLine?: number;
   /** For cross-folder results: the source folder + raw TFile so the
@@ -204,6 +206,9 @@ interface NoteBody {
 
 export class StashpadSuggest extends SuggestModal<PickerItem> {
   private notes: NoteBody[] = [];
+  /** 0.92.1: true once the user has opted into searching excluded folders
+   *  (their notes have been merged into `this.notes`). */
+  private includeExcluded = false;
   /** 0.69.33: Modal does NOT extend Component — it only `implements
    *  CloseableComponent`. So `this.register(...)` (the Component
    *  cleanup API I was using in 0.69.29+) doesn't exist and threw
@@ -239,6 +244,12 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
        *  first, and this source is queried only after the local set is
        *  exhausted (or to fill out short result lists). */
       crossFolderNotes?: () => CrossFolderNote[];
+      /** 0.92.1: source of notes from Stashpad folders EXCLUDED from search.
+       *  When provided (i.e. there ARE excluded folders), a "Search excluded
+       *  folders" action appears at the very bottom of the list; activating it
+       *  merges these into the result set on demand — so you can move notes
+       *  into/out of excluded folders without un-excluding them. */
+      excludedFolderNotes?: () => CrossFolderNote[];
       /** Optional source of Stashpad folder paths. When provided, folders
        *  whose name matches the query show up as their own "open this
        *  folder in a new tab" pick. Used by the search modal. 0.57.3. */
@@ -559,7 +570,41 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         items.splice(0, items.length, ...homes, ...rest);
       }
     }
+
+    // 0.92.1: bottom-of-list escape hatch — when there ARE excluded Stashpad
+    // folders and we haven't pulled them in yet, offer to search them. Appended
+    // LAST (after the home-pin reorder) so it always sits beneath the create
+    // row / all results, exactly where "there are no more results" lands.
+    if (this.opts.excludedFolderNotes && !this.includeExcluded) {
+      items.push({
+        id: `__search_excluded__`,
+        label: "Search excluded Stashpad folders",
+        node: null,
+        kind: "search-excluded",
+      });
+    }
     return items;
+  }
+
+  /** 0.92.1: merge notes from excluded folders into the result set (once), then
+   *  re-run the current query so they appear. Bodies fill in lazily; titles
+   *  match immediately. */
+  private loadExcludedNotes(): void {
+    if (this.includeExcluded || !this.opts.excludedFolderNotes) return;
+    this.includeExcluded = true;
+    for (const c of this.opts.excludedFolderNotes()) {
+      this.notes.push({ node: null, title: c.title, body: c.body, cross: c });
+    }
+    for (const n of this.notes) {
+      if (!n.cross || n.body || !n.cross.file) continue;
+      this.app.vault.cachedRead(n.cross.file).then((md) => { n.body = this.stripFm(md); });
+    }
+    const ie = (this as any).inputEl as HTMLInputElement | undefined;
+    if (ie) {
+      ie.dispatchEvent(new Event("input", { bubbles: true }));
+      // Bodies arrive async; re-run shortly so body matches surface too.
+      setTimeout(() => ie.dispatchEvent(new Event("input", { bubbles: true })), 250);
+    }
   }
 
   private previewFromBody(body: string, matchLine: number): string {
@@ -593,6 +638,15 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       el.createDiv({ cls: "stashpad-suggest-title", text: item.label });
       if (item.folder) el.createDiv({ cls: "stashpad-suggest-preview", text: item.folder });
       else el.createDiv({ cls: "stashpad-suggest-preview", text: "Click to choose a folder…" });
+      return;
+    }
+    if (item.kind === "search-excluded") {
+      el.addClass("is-search-excluded");
+      const row = el.createDiv({ cls: "stashpad-suggest-title stashpad-search-excluded-row" });
+      const icon = row.createSpan({ cls: "stashpad-search-excluded-icon" });
+      setIcon(icon, "folder-search");
+      row.createSpan({ text: item.label });
+      el.createDiv({ cls: "stashpad-suggest-preview", text: "Include folders you've excluded from search (e.g. to move a note there)." });
       return;
     }
     if (item.crossFolder) el.addClass("is-cross-folder");
@@ -1607,6 +1661,18 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     this.whenBuilderEl = null;
     const modalEl = (this as any).modalEl as HTMLElement | undefined;
     modalEl?.removeClass("is-when-builder-open");
+  }
+
+  /** 0.92.1: intercept the "search excluded folders" action BEFORE the base
+   *  class closes the modal — we want to stay open, merge the excluded notes,
+   *  and refresh the list in place. All other picks fall through to the normal
+   *  select-then-close path. */
+  selectSuggestion(value: PickerItem, evt: MouseEvent | KeyboardEvent): void {
+    if (value && value.kind === "search-excluded") {
+      this.loadExcludedNotes();
+      return;
+    }
+    super.selectSuggestion(value, evt);
   }
 
   onChooseSuggestion(item: PickerItem): void {

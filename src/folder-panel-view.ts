@@ -1,6 +1,7 @@
 import { App, ItemView, Menu, Modal, Notice, Platform, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
-import { STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE } from "./types";
+import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type StashpadId } from "./types";
+import { renderCountBadge } from "./panels-view";
 import { ConfirmModal } from "./modals";
 
 /** 0.86.0: a left-sidebar folder picker, designed for mobile (swipe the left
@@ -47,8 +48,13 @@ export class StashpadFolderPanelView extends ItemView {
     // --- top: pinned notes (height = saved fraction; resized via the divider) ---
     const pinnedSection = root.createDiv({ cls: "stashpad-folderpanel-section stashpad-folderpanel-pinned" });
     pinnedSection.style.flex = `0 0 ${(frac * 100).toFixed(2)}%`;
-    pinnedSection.createDiv({ cls: "stashpad-folderpanel-heading" }).setText("Pinned");
-    this.renderPinned(pinnedSection.createDiv({ cls: "stashpad-folderpanel-list" }));
+    const pinHeading = pinnedSection.createDiv({ cls: "stashpad-folderpanel-heading stashpad-folderpanel-heading-row" });
+    pinHeading.createSpan({ cls: "stashpad-folderpanel-heading-title", text: "Pinned" });
+    const optsBtn = pinHeading.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
+    setIcon(optsBtn, "list");
+    optsBtn.setAttr("aria-label", "Pinned view options");
+    optsBtn.onclick = (e) => { e.stopPropagation(); this.openPinnedOptionsMenu(e); };
+    this.renderPinned(pinnedSection.createDiv({ cls: "stashpad-folderpanel-list stashpad-folderpanel-pins" }));
 
     // --- draggable divider ---
     const divider = root.createDiv({ cls: "stashpad-folderpanel-divider" });
@@ -99,21 +105,205 @@ export class StashpadFolderPanelView extends ItemView {
 
   // ---------- pinned notes (top) ----------
 
+  /** Pin subtree expansion state (key = `folder|id`), kept across re-renders. */
+  private pinExpanded = new Set<string>();
+
+  private openPinnedOptionsMenu(e: MouseEvent): void {
+    const cur = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
+    const menu = new Menu();
+    menu.addItem((i) => i.setTitle("Sort by pin order").setChecked(cur === "pin-order")
+      .onClick(() => void this.setPinnedGrouping("pin-order")));
+    menu.addItem((i) => i.setTitle("Group by folder").setChecked(cur === "folder")
+      .onClick(() => void this.setPinnedGrouping("folder")));
+    menu.showAtMouseEvent(e);
+  }
+
+  private async setPinnedGrouping(mode: "pin-order" | "folder"): Promise<void> {
+    if ((this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order") === mode) return;
+    this.plugin.settings.folderPanelPinnedGrouping = mode;
+    await this.plugin.saveSettings();
+    this.render();
+  }
+
   private renderPinned(list: HTMLElement): void {
     const pins = this.plugin.listPinnedNotes();
     if (pins.length === 0) {
       list.createDiv({ cls: "stashpad-folderpanel-empty", text: "No pinned notes yet — pin a note from its right-click menu." });
       return;
     }
-    for (const pin of pins) {
-      const file = pin.file;
-      const row = list.createEl("button", { cls: "stashpad-folderpanel-row stashpad-folderpanel-pin-row" });
-      setIcon(row.createSpan({ cls: "stashpad-folderpanel-row-icon" }), "pin");
-      row.createSpan({ cls: "stashpad-folderpanel-row-label", text: this.titleFromFile(file) });
-      const folderName = pin.folder.split("/").pop() || pin.folder;
-      row.createSpan({ cls: "stashpad-folderpanel-row-sub", text: folderName });
-      row.onclick = () => { this.onNavigateAway(); void this.plugin.revealNoteInStashpad(file); };
+    const grouping = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
+    if (grouping === "folder") {
+      // Group by Stashpad, MRU folder floated to the top (mirrors the Pinned panel).
+      const groups = new Map<string, Array<{ folder: string; id: string; file: TFile; idx: number }>>();
+      pins.forEach((pin, idx) => {
+        let bucket = groups.get(pin.folder);
+        if (!bucket) { bucket = []; groups.set(pin.folder, bucket); }
+        bucket.push({ ...pin, idx });
+      });
+      const mru = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
+      const order = Array.from(groups.keys());
+      if (mru && groups.has(mru)) { order.splice(order.indexOf(mru), 1); order.unshift(mru); }
+      for (const folder of order) {
+        const header = list.createDiv({ cls: "stashpad-pinned-group-header" });
+        if (folder === mru) header.addClass("is-active-folder");
+        header.createSpan({ cls: "stashpad-pinned-group-name", text: folder.split("/").pop() || folder });
+        for (const p of groups.get(folder) ?? []) this.renderPinNote(list, p.folder, p.id, p.file, p.idx);
+      }
+    } else {
+      pins.forEach((pin, idx) => this.renderPinNote(list, pin.folder, pin.id, pin.file, idx));
     }
+  }
+
+  /** Drag-reorder a pin by rewriting its `pinnedAt` to fall between its new
+   *  neighbors (the synced ordering key). Mirrors the Pinned panel. */
+  private async reorderPin(fromIdx: number, toIdx: number): Promise<void> {
+    const list = this.plugin.listPinnedNotes();
+    if (fromIdx < 0 || fromIdx >= list.length) return;
+    const moved = list[fromIdx];
+    const without = list.filter((_, i) => i !== fromIdx);
+    const insertAt = Math.max(0, Math.min(toIdx > fromIdx ? toIdx - 1 : toIdx, without.length));
+    const prev = without[insertAt - 1];
+    const next = without[insertAt];
+    let at: number;
+    if (!prev && !next) at = Date.now();
+    else if (!prev) at = next.pinnedAt - 1000;
+    else if (!next) at = prev.pinnedAt + 1000;
+    else at = (prev.pinnedAt + next.pinnedAt) / 2;
+    try {
+      await this.app.fileManager.processFrontMatter(moved.file, (fm: any) => { fm.pinnedAt = at; });
+    } catch (e) { console.warn("[Stashpad] pin reorder failed", e); }
+    this.render();
+  }
+
+  /** One top-level pinned note: color tint, completed style, and an expandable
+   *  child-count badge (borrowed from the Pinned panel). Reuses the
+   *  `.stashpad-pinned-*` classes so styling + note colors stay identical. */
+  private renderPinNote(list: HTMLElement, folder: string, id: string, file: TFile, idx: number): void {
+    const fm = (this.app.metadataCache.getFileCache(file)?.frontmatter ?? {}) as any;
+    const color = typeof fm.color === "string" ? fm.color : null;
+    const completed = fm.completed === true;
+    const children = this.childrenOf(folder, id);
+    const hasChildren = children.length > 0;
+    const key = `${folder}|${id}`;
+    const isExpanded = this.pinExpanded.has(key);
+
+    const row = list.createDiv({ cls: "stashpad-pinned-row" });
+    if (color) { row.addClass("has-color"); row.style.setProperty("--stashpad-note-color", color); }
+    if (completed) row.addClass("is-completed");
+
+    // HTML5 drag-reorder (mirrors the Pinned panel). pinnedAt is the synced key.
+    row.draggable = true;
+    row.dataset.pinIdx = String(idx);
+    row.addEventListener("dragstart", (e) => {
+      e.dataTransfer?.setData("text/plain", String(idx));
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+      row.addClass("is-dragging");
+    });
+    row.addEventListener("dragend", () => row.removeClass("is-dragging"));
+    row.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+      const rect = row.getBoundingClientRect();
+      const before = (e.clientY - rect.top) < rect.height / 2;
+      row.toggleClass("drop-before", before);
+      row.toggleClass("drop-after", !before);
+    });
+    row.addEventListener("dragleave", () => { row.removeClass("drop-before"); row.removeClass("drop-after"); });
+    row.addEventListener("drop", (e) => {
+      e.preventDefault();
+      row.removeClass("drop-before"); row.removeClass("drop-after");
+      const fromIdx = parseInt(e.dataTransfer?.getData("text/plain") ?? "", 10);
+      if (!Number.isFinite(fromIdx) || fromIdx === idx) return;
+      const rect = row.getBoundingClientRect();
+      const before = (e.clientY - rect.top) < rect.height / 2;
+      void this.reorderPin(fromIdx, before ? idx : idx + 1);
+    });
+
+    const toggle = row.createSpan({ cls: "stashpad-pinned-toggle" });
+    if (hasChildren) {
+      renderCountBadge(toggle, children.length, isExpanded);
+      toggle.onclick = (e) => {
+        e.stopPropagation();
+        if (this.pinExpanded.has(key)) this.pinExpanded.delete(key);
+        else this.pinExpanded.add(key);
+        this.render();
+      };
+    }
+    const icon = row.createSpan({ cls: "stashpad-pinned-icon" });
+    setIcon(icon, hasChildren ? "folder-tree" : "file-text");
+    if (color) icon.style.color = color;
+    const label = row.createSpan({ cls: "stashpad-pinned-label", text: this.titleFromFile(file) });
+    label.onclick = () => { this.onNavigateAway(); void this.plugin.revealNoteInStashpad(file); };
+    // Folder subtitle is hidden by CSS (.stashpad-panel-pinned) but kept for the
+    // group-by-folder mode where headers already supply context.
+    row.createSpan({ cls: "stashpad-pinned-folder", text: folder.split("/").pop() || folder });
+    row.oncontextmenu = (e) => {
+      e.preventDefault();
+      const menu = new Menu();
+      menu.addItem((it) => it.setTitle("Unpin from sidebar").setIcon("pin-off")
+        .onClick(() => void this.plugin.unpinNote({ folder, id })));
+      menu.showAtMouseEvent(e);
+    };
+
+    if (hasChildren && isExpanded) {
+      const box = list.createDiv({ cls: "stashpad-pinned-children" });
+      this.renderPinSubtree(box, folder, id, 1);
+    }
+  }
+
+  private renderPinSubtree(parent: HTMLElement, folder: string, parentId: StashpadId, depth: number): void {
+    for (const child of this.childrenOf(folder, parentId)) {
+      const fm = (this.app.metadataCache.getFileCache(child)?.frontmatter ?? {}) as any;
+      const childId = typeof fm.id === "string" ? fm.id : null;
+      if (!childId) continue;
+      const color = typeof fm.color === "string" ? fm.color : null;
+      const completed = fm.completed === true;
+      const grandkids = this.childrenOf(folder, childId);
+      const hasGrandkids = grandkids.length > 0;
+      const key = `${folder}|${childId}`;
+      const isExpanded = this.pinExpanded.has(key);
+      const row = parent.createDiv({ cls: "stashpad-pinned-subrow" });
+      if (completed) row.addClass("is-completed");
+      row.style.paddingLeft = `${depth * 16}px`;
+      const toggle = row.createSpan({ cls: "stashpad-pinned-toggle" });
+      if (hasGrandkids) {
+        renderCountBadge(toggle, grandkids.length, isExpanded);
+        toggle.onclick = (e) => {
+          e.stopPropagation();
+          if (this.pinExpanded.has(key)) this.pinExpanded.delete(key);
+          else this.pinExpanded.add(key);
+          this.render();
+        };
+      }
+      const icon = row.createSpan({ cls: "stashpad-pinned-icon" });
+      setIcon(icon, "file-text");
+      if (color) icon.style.color = color;
+      const label = row.createSpan({ cls: "stashpad-pinned-label", text: this.titleFromFile(child) });
+      label.onclick = () => { this.onNavigateAway(); void this.plugin.revealNoteInStashpad(child); };
+      if (hasGrandkids && isExpanded) this.renderPinSubtree(parent, folder, childId, depth + 1);
+    }
+  }
+
+  /** Children of an id within a folder (frontmatter.parent matches), created-asc. */
+  private childrenOf(folder: string, parentId: StashpadId): TFile[] {
+    const out: TFile[] = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (dir !== folder) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
+      if (!fm || typeof fm.id !== "string") continue;
+      const p = fm.parent;
+      if (p === parentId || (parentId === ROOT_ID && (p == null || p === ROOT_ID))) {
+        if (fm.id === ROOT_ID) continue;
+        out.push(f);
+      }
+    }
+    out.sort((a, b) => {
+      const ca = (this.app.metadataCache.getFileCache(a)?.frontmatter as any)?.created ?? "";
+      const cb = (this.app.metadataCache.getFileCache(b)?.frontmatter as any)?.created ?? "";
+      return String(ca).localeCompare(String(cb));
+    });
+    return out;
   }
 
   /** On mobile, jumping out of the panel should reveal the destination — collapse
@@ -131,14 +321,69 @@ export class StashpadFolderPanelView extends ItemView {
   // ---------- folders (bottom) ----------
 
   /** Folder paths (trailing-slash-stripped) that currently have an open
-   *  Stashpad tab. */
+   *  Stashpad tab. 0.95.0: also counts DEFERRED tabs. After a reload Obsidian
+   *  lazy-loads inactive leaves — their `view` is a placeholder with no
+   *  `noteFolder`, so the old live-view-only check lit up just the focused tab.
+   *  The folder survives in the leaf's persisted view state (`folderOverride`,
+   *  empty/null = the default folder), so read that when the live view isn't
+   *  resolved yet. No caching needed — it's exact even right after reload. */
   private openFolders(): Set<string> {
     const set = new Set<string>();
+    const fallback = (this.plugin.settings.folder || "Stashpad").replace(/\/+$/, "");
     for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
-      const f = ((leaf.view as any)?.noteFolder ?? "").replace(/\/+$/, "");
+      let f = ((leaf.view as any)?.noteFolder ?? "").replace(/\/+$/, "");
+      if (!f) {
+        const st = ((leaf.getViewState?.() as any)?.state ?? {}) as { folderOverride?: string | null };
+        f = (((st.folderOverride ?? "") || fallback) as string).replace(/\/+$/, "");
+      }
       if (f) set.add(f);
     }
     return set;
+  }
+
+  // ---------- per-folder placement (pin / downrank / hide) ----------
+
+  private static clean(folder: string): string { return folder.replace(/\/+$/, ""); }
+
+  /** Current placement of a folder. "normal" = in none of the override lists. */
+  private folderState(folder: string): "pinned" | "downranked" | "hidden" | "normal" {
+    const c = StashpadFolderPanelView.clean(folder);
+    const s = this.plugin.settings;
+    if ((s.folderPanelPinned ?? []).includes(c)) return "pinned";
+    if ((s.folderPanelDownranked ?? []).includes(c)) return "downranked";
+    if ((s.folderPanelHidden ?? []).includes(c)) return "hidden";
+    return "normal";
+  }
+
+  /** Move a folder to a placement, clearing it from the other two lists first.
+   *  "normal" just removes it everywhere. Persists + re-renders. */
+  private async setFolderState(folder: string, state: "pinned" | "downranked" | "hidden" | "normal"): Promise<void> {
+    const c = StashpadFolderPanelView.clean(folder);
+    const s = this.plugin.settings;
+    s.folderPanelPinned = (s.folderPanelPinned ?? []).filter((f) => f !== c);
+    s.folderPanelDownranked = (s.folderPanelDownranked ?? []).filter((f) => f !== c);
+    s.folderPanelHidden = (s.folderPanelHidden ?? []).filter((f) => f !== c);
+    if (state === "pinned") s.folderPanelPinned.push(c);
+    else if (state === "downranked") s.folderPanelDownranked.push(c);
+    else if (state === "hidden") s.folderPanelHidden.push(c);
+    await this.plugin.saveSettings();
+    this.render();
+  }
+
+  /** folder path → its Home note's color (for the folder-row icon tint).
+   *  Rebuilt once per renderFolders in a single vault pass. */
+  private homeColorByFolder = new Map<string, string>();
+  private folderHomeColor(folder: string): string | null {
+    return this.homeColorByFolder.get(StashpadFolderPanelView.clean(folder)) ?? null;
+  }
+  private rebuildHomeColors(): void {
+    this.homeColorByFolder.clear();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
+      if (!fm || fm.id !== ROOT_ID || typeof fm.color !== "string" || !fm.color.trim()) continue;
+      const dir = (f.parent?.path ?? "").replace(/\/+$/, "");
+      if (dir) this.homeColorByFolder.set(dir, fm.color);
+    }
   }
 
   private renderFolders(list: HTMLElement): void {
@@ -147,33 +392,99 @@ export class StashpadFolderPanelView extends ItemView {
       list.createDiv({ cls: "stashpad-folderpanel-empty", text: "No Stashpad folders yet." });
       return;
     }
+    this.rebuildHomeColors();
     const open = this.openFolders();
+
+    // Partition by placement (discoverStashpadFolders is already alpha-sorted, so
+    // each group preserves alphabetical order). Hidden folders drop out of the
+    // main list and surface in the collapsible "Hidden" section below.
+    const pinned: string[] = [], normal: string[] = [], downranked: string[] = [], hidden: string[] = [];
     for (const folder of folders) {
-      const isOpen = open.has(folder.replace(/\/+$/, ""));
-      const row = list.createDiv({ cls: "stashpad-folderpanel-row stashpad-folderpanel-folder-row" });
-      if (isOpen) row.addClass("is-open");
+      switch (this.folderState(folder)) {
+        case "pinned": pinned.push(folder); break;
+        case "downranked": downranked.push(folder); break;
+        case "hidden": hidden.push(folder); break;
+        default: normal.push(folder);
+      }
+    }
 
-      const dot = row.createSpan({ cls: "stashpad-folderpanel-dot" });
-      dot.setAttr("aria-label", isOpen ? "Open in a tab" : "Not open");
-      if (isOpen) dot.setAttr("title", "Open in a tab");
+    const ordered = [...pinned, ...normal, ...downranked];
+    if (ordered.length === 0 && hidden.length === 0) {
+      list.createDiv({ cls: "stashpad-folderpanel-empty", text: "No Stashpad folders yet." });
+      return;
+    }
+    for (const folder of ordered) this.renderFolderRow(list, folder, open);
 
+    if (hidden.length > 0) this.renderHiddenSection(list, hidden);
+  }
+
+  private renderFolderRow(list: HTMLElement, folder: string, open: Set<string>): void {
+    const state = this.folderState(folder);
+    const isOpen = open.has(StashpadFolderPanelView.clean(folder));
+    const row = list.createDiv({ cls: "stashpad-folderpanel-row stashpad-folderpanel-folder-row" });
+    if (isOpen) row.addClass("is-open");
+    if (state === "downranked") row.addClass("is-downranked");
+    if (state === "pinned") row.addClass("is-pinned");
+
+    const dot = row.createSpan({ cls: "stashpad-folderpanel-dot" });
+    dot.setAttr("aria-label", isOpen ? "Open in a tab" : "Not open");
+    if (isOpen) dot.setAttr("title", "Open in a tab");
+
+    if (state === "pinned") {
+      const pin = row.createSpan({ cls: "stashpad-folderpanel-pinmark" });
+      setIcon(pin, "pin");
+      pin.setAttr("aria-label", "Pinned");
+    }
+
+    // 0.95.1: per-folder icon. Tinted by the folder's Home-note color when set,
+    // so the panel echoes the colors you assign in the list.
+    const folderIcon = row.createSpan({ cls: "stashpad-folderpanel-folder-icon" });
+    setIcon(folderIcon, "folder");
+    const homeColor = this.folderHomeColor(folder);
+    if (homeColor) folderIcon.style.color = homeColor;
+
+    const name = folder.split("/").pop() || folder;
+    row.createSpan({ cls: "stashpad-folderpanel-row-label", text: name });
+
+    const actions = row.createDiv({ cls: "stashpad-folderpanel-actions" });
+    const revealBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
+    setIcon(revealBtn, "folder-search");
+    revealBtn.setAttr("aria-label", "Reveal in file explorer");
+    revealBtn.onclick = (e) => { e.stopPropagation(); this.revealFolder(folder); };
+
+    const newTabBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
+    setIcon(newTabBtn, "plus-square");
+    newTabBtn.setAttr("aria-label", "Open in new tab");
+    newTabBtn.onclick = (e) => { e.stopPropagation(); this.onNavigateAway(); void this.plugin.activateViewForFolder(folder); };
+
+    // Tapping the row jumps to the folder (reusing an open tab if there is one).
+    row.onclick = () => { this.onNavigateAway(); this.jumpToFolder(folder); };
+    row.oncontextmenu = (e) => { e.preventDefault(); this.openFolderMenu(e, folder); };
+  }
+
+  /** Collapsible "Hidden (N)" group at the bottom of the Folders list, so hidden
+   *  folders are restorable in-context (also restorable from the settings tab). */
+  private renderHiddenSection(list: HTMLElement, hidden: string[]): void {
+    const wrap = list.createDiv({ cls: "stashpad-folderpanel-hidden" });
+    const header = wrap.createDiv({ cls: "stashpad-folderpanel-hidden-header" });
+    const caret = header.createSpan({ cls: "stashpad-folderpanel-hidden-caret" });
+    setIcon(caret, "chevron-right");
+    header.createSpan({ cls: "stashpad-folderpanel-hidden-title", text: `Hidden (${hidden.length})` });
+    const body = wrap.createDiv({ cls: "stashpad-folderpanel-hidden-body" });
+    body.style.display = "none";
+    header.onclick = () => {
+      const showing = body.style.display !== "none";
+      body.style.display = showing ? "none" : "";
+      setIcon(caret, showing ? "chevron-right" : "chevron-down");
+    };
+    for (const folder of hidden) {
+      const row = body.createDiv({ cls: "stashpad-folderpanel-row stashpad-folderpanel-hidden-row" });
       const name = folder.split("/").pop() || folder;
       row.createSpan({ cls: "stashpad-folderpanel-row-label", text: name });
-
-      const actions = row.createDiv({ cls: "stashpad-folderpanel-actions" });
-      const revealBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
-      setIcon(revealBtn, "folder-search");
-      revealBtn.setAttr("aria-label", "Reveal in file explorer");
-      revealBtn.onclick = (e) => { e.stopPropagation(); this.revealFolder(folder); };
-
-      const newTabBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
-      setIcon(newTabBtn, "plus-square");
-      newTabBtn.setAttr("aria-label", "Open in new tab");
-      newTabBtn.onclick = (e) => { e.stopPropagation(); this.onNavigateAway(); void this.plugin.activateViewForFolder(folder); };
-
-      // Tapping the row jumps to the folder (reusing an open tab if there is one).
-      row.onclick = () => { this.onNavigateAway(); this.jumpToFolder(folder); };
-      row.oncontextmenu = (e) => { e.preventDefault(); this.openFolderMenu(e, folder); };
+      const restore = row.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
+      setIcon(restore, "eye");
+      restore.setAttr("aria-label", "Unhide");
+      restore.onclick = (e) => { e.stopPropagation(); void this.setFolderState(folder, "normal"); };
     }
   }
 
@@ -202,6 +513,16 @@ export class StashpadFolderPanelView extends ItemView {
       .onClick(() => void this.plugin.activateViewForFolder(folder)));
     menu.addItem((i) => i.setTitle("Reveal in file explorer").setIcon("folder-search")
       .onClick(() => this.revealFolder(folder)));
+    menu.addSeparator();
+    // Placement (pin / downrank / hide). Each is a toggle; setFolderState clears
+    // the other two so a folder is in at most one state.
+    const state = this.folderState(folder);
+    menu.addItem((i) => i.setTitle(state === "pinned" ? "Unpin" : "Pin to top").setIcon("pin")
+      .onClick(() => void this.setFolderState(folder, state === "pinned" ? "normal" : "pinned")));
+    menu.addItem((i) => i.setTitle(state === "downranked" ? "Remove downrank" : "Downrank").setIcon("arrow-down")
+      .onClick(() => void this.setFolderState(folder, state === "downranked" ? "normal" : "downranked")));
+    menu.addItem((i) => i.setTitle("Hide from list").setIcon("eye-off")
+      .onClick(() => void this.setFolderState(folder, "hidden")));
     menu.addSeparator();
     menu.addItem((i) => i.setTitle("Rename…").setIcon("pencil")
       .onClick(() => this.renameFolder(folder)));
@@ -254,13 +575,10 @@ export class StashpadFolderPanelView extends ItemView {
       "Delete folder",
       async (confirmed) => {
         if (!confirmed) return;
-        try {
-          await this.app.fileManager.trashFile(tf);
-          new Notice(`Deleted "${name}".`);
-        } catch (err) {
-          console.warn("[Stashpad] folder delete failed", err);
-          new Notice("Delete failed (see console).");
-        }
+        // Closes open tabs, moves the folder to .trash, and posts a persistent
+        // notification with an Undo action (move-back). The vault "delete"
+        // listener is suppressed for this path so it won't double-notify.
+        await this.plugin.deleteStashpadFolderWithUndo(tf);
       },
     ).open();
   }

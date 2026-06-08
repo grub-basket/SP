@@ -1,4 +1,4 @@
-import { App, Notice, Platform, PluginSettingTab, Setting, TFile } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting, SettingPage, TFile, setIcon, type SettingDefinitionItem } from "obsidian";
 
 /** Platform-correct OS file-manager name for button/notice labels. */
 function osFileManagerName(): string {
@@ -82,6 +82,11 @@ export interface CommandMeta {
   desc: string;
   /** Default primary chord — what users get on a fresh install. */
   defaultPrimary: string;
+  /** Optional default SECONDARY chord. When set alongside defaultUseBoth,
+   *  a fresh install gets two simultaneously-active chords for the command. */
+  defaultSecondary?: string;
+  /** When true, the default binding has BOTH chords active (useBoth). */
+  defaultUseBoth?: boolean;
 }
 
 export const COMMAND_META: CommandMeta[] = [
@@ -101,7 +106,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "delete",          label: "Delete selection",              desc: "Default: Mod+Backspace",                                                                  defaultPrimary: "Mod+Backspace" },
   { id: "undo",            label: "Undo",                          desc: "Default: Mod+Z (Stashpad-only — won't fire while typing in the composer).",                defaultPrimary: "Mod+Z" },
   { id: "redo",            label: "Redo",                          desc: "Default: Mod+Shift+Z",                                                                    defaultPrimary: "Mod+Shift+Z" },
-  { id: "toggleComplete",  label: "Toggle complete (strikethrough)", desc: "Default: Mod+Enter — marks selected/focused notes as complete.",                       defaultPrimary: "Mod+Enter" },
+  { id: "toggleComplete",  label: "Toggle complete (strikethrough)", desc: "Default: Mod+Enter or X — marks selected/focused notes as complete (both chords active).", defaultPrimary: "Mod+Enter", defaultSecondary: "X", defaultUseBoth: true },
   { id: "moveUp",          label: "Move note up",                  desc: "Default: Mod+ArrowUp",                                                                    defaultPrimary: "Mod+ArrowUp" },
   { id: "moveDown",        label: "Move note down",                desc: "Default: Mod+ArrowDown",                                                                  defaultPrimary: "Mod+ArrowDown" },
   { id: "moveToTop",       label: "Move note to top",              desc: "Default: Mod+Shift+ArrowUp",                                                              defaultPrimary: "Mod+Shift+ArrowUp" },
@@ -129,7 +134,12 @@ export const COMMAND_META: CommandMeta[] = [
 export function buildDefaultBindings(): CommandBindingMap {
   const out: Partial<CommandBindingMap> = {};
   for (const m of COMMAND_META) {
-    out[m.id] = { primary: m.defaultPrimary, secondary: "", preferRight: false };
+    out[m.id] = {
+      primary: m.defaultPrimary,
+      secondary: m.defaultSecondary ?? "",
+      preferRight: false,
+      useBoth: !!m.defaultUseBoth,
+    };
   }
   return out as CommandBindingMap;
 }
@@ -149,6 +159,19 @@ export interface StashpadSettings {
   /** 0.86.2: folder panel — fraction of height given to the Pinned section
    *  (the rest goes to Folders). Set by dragging the divider. 0.15–0.85. */
   folderPanelPinnedFraction: number;
+  /** 0.95.1: folder-panel per-folder placement. Cleaned folder paths
+   *  (trailing-slash-stripped). A folder is in at most one of these; toggling
+   *  one clears it from the others. Pinned cluster at the top of the Folders
+   *  list, downranked sink to a dimmed group at the bottom, hidden are removed
+   *  from the list entirely (restorable from the panel's "Hidden" section or
+   *  the settings window). */
+  folderPanelPinned: string[];
+  folderPanelDownranked: string[];
+  folderPanelHidden: string[];
+  /** 0.95.1: how the folder-panel Pinned section orders its notes.
+   *  "pin-order" (default) = flat list in pin order; "folder" = grouped under
+   *  per-Stashpad headers. */
+  folderPanelPinnedGrouping: "pin-order" | "folder";
   /** 0.81.1: opt-in performance profiling — accumulates render/read/write
    *  timing so the "Dump performance profile" command reports where the
    *  time goes on a slow vault. Off by default. */
@@ -370,6 +393,10 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   autoImport: false,
   inheritObsidianExclusions: true,
   folderPanelPinnedFraction: 0.5,
+  folderPanelPinned: [],
+  folderPanelDownranked: [],
+  folderPanelHidden: [],
+  folderPanelPinnedGrouping: "pin-order",
   enablePerfProfiling: false,
   writeRecoveryLinks: true,
   useTemplatesFormat: false,
@@ -469,149 +496,73 @@ export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: "hotkeys",     label: "Hotkeys" },
 ];
 
-export class StashpadSettingTab extends PluginSettingTab {
-  /** Active tab. Persisted across re-renders WITHIN the same session
-   *  (not to disk — switching tabs on every Settings open would be
-   *  surprising). 0.73.1. */
-  private activeTab: SettingsTabId = "general";
-  /** Free-text search filter. When non-empty, the tab body switches
-   *  to "all sections grouped by tab" mode + hides non-matching
-   *  setting items. 0.73.1. */
-  private searchQuery = "";
+/** 0.94.0: a declarative sub-page that renders one of Stashpad's settings
+ *  tabs via the existing imperative `renderTabContent`. Used by
+ *  `getSettingDefinitions()` so the migration to Obsidian's native settings
+ *  (1.13.0+) reuses all existing rendering — Phase 1. Per-setting search
+ *  entries (decomposing each page into `items`) come in follow-up versions. */
+class StashpadSubPage extends SettingPage {
+  constructor(title: string, private renderFn: (el: HTMLElement) => void) {
+    super();
+    this.title = title;
+  }
+  display(): void {
+    this.containerEl.empty();
+    this.renderFn(this.containerEl);
+  }
+}
 
+export class StashpadSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: StashpadPlugin) { super(app, plugin); }
 
-  /** 0.73.10: programmatic tab switch. Used by the per-tab "Open
-   *  settings: X" palette commands so they land on the right page. */
-  openToTab(tab: SettingsTabId): void {
-    this.activeTab = tab;
-    this.searchQuery = "";
-    if (this.containerEl?.isShown?.() !== false) this.display();
-  }
-
-  /** 0.73.13: focus the settings search input. Called by the
-   *  "Stashpad settings: search" palette command after the modal has
-   *  opened so the user can start typing immediately. Caret lands at
-   *  the end if the input has prior content. */
-  focusSearchInput(): void {
-    const input = this.containerEl?.querySelector<HTMLInputElement>(".stashpad-settings-search-input");
-    if (!input) return;
-    input.focus();
-    input.setSelectionRange(input.value.length, input.value.length);
-  }
-
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
-    containerEl.addClass("stashpad-settings-tabbed");
-    containerEl.createEl("h2", { text: "Stashpad", cls: "stashpad-settings-title" });
-
-    // 0.73.1: search box. When the input has a query, the body
-    // switches to "all sections grouped by tab" mode + hides any
-    // setting whose name/desc doesn't match. Clearing the query
-    // reverts to the single-active-tab view.
-    const searchWrap = containerEl.createDiv({ cls: "stashpad-settings-search-wrap" });
-    const searchInput = searchWrap.createEl("input", {
-      type: "text",
-      placeholder: "Search settings…",
-      cls: "stashpad-settings-search-input",
-    });
-    searchInput.value = this.searchQuery;
-
-    const allMode = this.searchQuery.trim().length > 0;
-
-    // Tab bar. In search mode, no tab gets the is-active highlight —
-    // we're showing everything filtered. Clicking a tab from search
-    // mode clears the query and lands on that tab.
-    const tabBar = containerEl.createDiv({ cls: "stashpad-settings-tabs" });
-    if (allMode) tabBar.addClass("is-search-mode");
-    for (const t of SETTINGS_TABS) {
-      const btn = tabBar.createEl("button", { cls: "stashpad-settings-tab", text: t.label });
-      if (!allMode && this.activeTab === t.id) btn.addClass("is-active");
-      btn.onclick = () => {
-        this.searchQuery = "";
-        this.activeTab = t.id;
-        this.display();
-      };
-    }
-
-    const body = containerEl.createDiv({ cls: "stashpad-settings-body" });
-
-    if (allMode) {
-      for (const t of SETTINGS_TABS) {
-        const groupWrap = body.createDiv({ cls: "stashpad-settings-search-group" });
-        groupWrap.createEl("h3", { text: t.label, cls: "stashpad-settings-search-group-header" });
-        const groupBody = groupWrap.createDiv();
-        this.renderTabContent(groupBody, t.id);
-      }
-      this.applySearchFilter(body);
-    } else {
-      this.renderTabContent(body, this.activeTab);
-    }
-
-    let prevActive = allMode;
-    searchInput.oninput = () => {
-      this.searchQuery = searchInput.value;
-      const nowActive = this.searchQuery.trim().length > 0;
-      if (nowActive !== prevActive) {
-        // Mode transition — full re-render. Restore caret position
-        // on the freshly-rendered input.
-        const caret = searchInput.selectionStart ?? searchInput.value.length;
-        this.display();
-        const newInput = containerEl.querySelector<HTMLInputElement>(".stashpad-settings-search-input");
-        if (newInput) {
-          newInput.focus();
-          newInput.setSelectionRange(caret, caret);
-        }
-        return;
-      }
-      if (nowActive) this.applySearchFilter(body);
-    };
-    if (this.searchQuery) {
-      setTimeout(() => {
-        searchInput.focus();
-        searchInput.setSelectionRange(searchInput.value.length, searchInput.value.length);
-      }, 0);
-    }
-  }
-
-  /** Hide every .setting-item whose name + desc doesn't match the
-   *  current query, then collapse any group whose body has no
-   *  visible matches. Called after rendering in search mode.
+  /** 0.94.0: declarative settings (Obsidian 1.13.0+). The base
+   *  `SettingTab.display()` renders from this and indexes it for Obsidian's
+   *  NATIVE settings search — replacing the old custom tab-bar + in-plugin
+   *  search box (both now redundant).
    *
-   *  0.76.24: all-tokens, order-agnostic matching (same approach as
-   *  the composer's link/tag autocomplete) instead of a single
-   *  substring. The query is split on whitespace; EVERY token must
-   *  appear somewhere in the item's name+desc, in any order — so
-   *  "folder import" matches "Stash import subfolder" and "date tz"
-   *  matches "Display timezone" via the date-format neighbours, etc. */
-  private applySearchFilter(body: HTMLElement): void {
-    const q = this.searchQuery.trim().toLowerCase();
-    if (!q) return;
-    const tokens = q.split(/\s+/).filter(Boolean);
-    const matchesAll = (haystack: string): boolean => tokens.every((t) => haystack.includes(t));
-    const items = body.querySelectorAll<HTMLElement>(".setting-item");
-    items.forEach((el) => {
-      const name = el.querySelector(".setting-item-name")?.textContent?.toLowerCase() ?? "";
-      const desc = el.querySelector(".setting-item-description")?.textContent?.toLowerCase() ?? "";
-      el.style.display = matchesAll(`${name} ${desc}`) ? "" : "none";
-    });
-    body.querySelectorAll<HTMLElement>(".stashpad-settings-search-group").forEach((g) => {
-      const any = Array.from(g.querySelectorAll<HTMLElement>(".setting-item"))
-        .some((el) => el.style.display !== "none");
-      g.style.display = any ? "" : "none";
+   *  Phase 1: each former tab is a navigable `page` whose content is rendered
+   *  by the existing `renderTabContent`, so behavior is unchanged and only the
+   *  PAGE names are searchable. Phase 2 (follow-up versions) decomposes each
+   *  page into `items` so individual settings become searchable too. */
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return SETTINGS_TABS.map((t) => {
+      // Migrated tabs use declarative `items` (per-setting search). Unmigrated
+      // tabs still render imperatively via a SettingPage (searchable by page
+      // name only) — incremental Phase-2 migration, one tab per version.
+      const items = this.itemsForTab(t.id);
+      if (items) return { type: "page" as const, name: t.label, items };
+      return {
+        type: "page" as const,
+        name: t.label,
+        page: () => new StashpadSubPage(t.label, (el) => this.renderTabContent(el, t.id)),
+      };
     });
   }
 
-  /** Dispatch to the right render method for a given tab. */
+  /** 0.94.1+: per-tab declarative item builders. Returns null for tabs not yet
+   *  decomposed (those still render imperatively). */
+  private itemsForTab(tab: SettingsTabId): SettingDefinitionItem[] | null {
+    switch (tab) {
+      case "hotkeys": return this.hotkeyItems();
+      case "diagnostics": return this.diagnosticsItems();
+      case "general": return this.generalItems();
+      // authorship/templates/jdindex still render via the fresh-at-open `page:`
+      // path (searchable by page name). They're per-folder editors that don't
+      // decompose into clean per-setting entries; render-at-display via the page
+      // renderer keeps them correct. Returning null falls back to that path.
+      default: return null;
+    }
+  }
+
+  /** Dispatch to the right render method for a tab still on the imperative
+   *  `page:` path (authorship/templates/jdindex). general/diagnostics/hotkeys
+   *  are declarative `items` and never routed here. */
   private renderTabContent(parent: HTMLElement, tab: SettingsTabId): void {
     switch (tab) {
-      case "general":     this.renderGeneralTab(parent); break;
-      case "diagnostics": this.renderDiagnosticsTab(parent); break;
       case "authorship":  this.renderAuthorshipSection(parent); break;
       case "templates":   this.renderTemplatesTab(parent); break;
       case "jdindex":     this.renderJdIndexSection(parent); break;
-      case "hotkeys":     this.renderHotkeysTab(parent); break;
+      // hotkeys migrated to declarative items (itemsForTab) — never routed here.
     }
   }
 
@@ -619,41 +570,33 @@ export class StashpadSettingTab extends PluginSettingTab {
 
   /** Diagnostics tab: log + notification controls. Lifted verbatim
    *  from the pre-0.73.1 Log section. Inventory items A1–A4. */
-  private renderDiagnosticsTab(parent: HTMLElement): void {
-    new Setting(parent)
-      .setName("Write recovery navigation links")
-      .setDesc("Maintain the redundant parentLink/children frontmatter so you can walk the hierarchy from raw Markdown if the index ever breaks. On a slow / network drive this is a big per-move cost (several round-trips each); turn it off there for snappier moves — Rebootstrap rebuilds the fields on demand, and your notes' canonical structure (id/parent) is unaffected either way.")
-      .addToggle((t) => t.setValue(this.plugin.settings.writeRecoveryLinks).onChange(async (v) => {
-        this.plugin.settings.writeRecoveryLinks = v; await this.plugin.saveSettings();
-      }));
+  private diagnosticsItems(): SettingDefinitionItem[] {
+    const muted = new Set<NotificationCategory>(
+      (this.plugin.settings.mutedNotificationCategories ?? []) as NotificationCategory[],
+    );
+    const categories = Object.keys(CATEGORY_LABELS) as NotificationCategory[];
+    return [
+      this.renderDef("Write recovery navigation links", "Maintain the redundant parentLink/children frontmatter so you can walk the hierarchy from raw Markdown if the index ever breaks. On a slow / network drive this is a big per-move cost (several round-trips each); turn it off there for snappier moves — Rebootstrap rebuilds the fields on demand, and your notes' canonical structure (id/parent) is unaffected either way.", (s) =>
+        s.addToggle((t) => t.setValue(this.plugin.settings.writeRecoveryLinks).onChange(async (v) => {
+          this.plugin.settings.writeRecoveryLinks = v; await this.plugin.saveSettings();
+        })), ["recovery", "parentlink", "children", "frontmatter"]),
 
-    new Setting(parent)
-      .setName("Performance profiling")
-      .setDesc("Record timing for list rendering, body reads, and file writes. Turn on, use Stashpad normally (especially the slow operations), then run “Dump performance profile” from the command palette and share the result. Off = zero overhead.")
-      .addToggle((t) => t.setValue(this.plugin.settings.enablePerfProfiling).onChange(async (v) => {
-        this.plugin.settings.enablePerfProfiling = v; await this.plugin.saveSettings();
-      }));
+      this.renderDef("Performance profiling", "Record timing for list rendering, body reads, and file writes. Turn on, use Stashpad normally (especially the slow operations), then run “Dump performance profile” from the command palette and share the result. Off = zero overhead.", (s) =>
+        s.addToggle((t) => t.setValue(this.plugin.settings.enablePerfProfiling).onChange(async (v) => {
+          this.plugin.settings.enablePerfProfiling = v; await this.plugin.saveSettings();
+        })), ["perf", "profiling", "timing", "slow"]),
 
-    new Setting(parent)
-      .setName("Open log file")
-      .setDesc("Append-only history of creates, deletes, parent changes, renames. Stored alongside the plugin's other private files.")
-      .addButton((b) =>
-        b.setButtonText("Open log").onClick(async () => {
+      this.renderDef("Open log file", "Append-only history of creates, deletes, parent changes, renames. Stored alongside the plugin's other private files.", (s) =>
+        s.addButton((b) => b.setButtonText("Open log").onClick(async () => {
           const adapter = this.app.vault.adapter;
           const path = this.plugin.pluginPrivatePath("log.jsonl");
-          if (!(await adapter.exists(path))) {
-            new Notice("No log yet — make some changes first.");
-            return;
-          }
+          if (!(await adapter.exists(path))) { new Notice("No log yet — make some changes first."); return; }
           const data = await adapter.read(path);
           new LogModal(this.app, data, path).open();
-        }));
+        })), ["log", "history", "diagnostics"]),
 
-    new Setting(parent)
-      .setName("Notification history limit")
-      .setDesc("Maximum number of notifications kept in the persistent history. Set to 0 for unlimited (the file size grows with usage; expect a few hundred KB per ~5000 entries). Default: 5000.")
-      .addText((t) =>
-        t
+      this.renderDef("Notification history limit", "Maximum number of notifications kept in the persistent history. Set to 0 for unlimited (the file size grows with usage; expect a few hundred KB per ~5000 entries). Default: 5000.", (s) =>
+        s.addText((t) => t
           .setValue(String(this.plugin.settings.notificationHistoryLimit ?? 5000))
           .setPlaceholder("5000")
           .onChange(async (v) => {
@@ -662,49 +605,33 @@ export class StashpadSettingTab extends PluginSettingTab {
             this.plugin.settings.notificationHistoryLimit = n;
             this.plugin.notifications.setHistoryLimit(n);
             await this.plugin.saveSettings();
-          }));
+          })), ["notification", "history", "limit"]),
 
-    // Per-category mute settings — collapsed by default to keep the
-    // settings tab scannable.
-    const muteDetails = parent.createEl("details", { cls: "stashpad-notif-mute-details" });
-    muteDetails.createEl("summary", { text: "Mute notification categories" });
-    const muteHelp = muteDetails.createDiv({ cls: "stashpad-notif-mute-help" });
-    muteHelp.setText("Muted categories don't pop toasts but still appear in the history panel so you can review what was suppressed.");
-    const muted = new Set<NotificationCategory>(
-      (this.plugin.settings.mutedNotificationCategories ?? []) as NotificationCategory[],
-    );
-    const categories = Object.keys(CATEGORY_LABELS) as NotificationCategory[];
-    for (const cat of categories) {
-      const meta = CATEGORY_LABELS[cat];
-      new Setting(muteDetails)
-        .setName(meta.label)
-        .setDesc(meta.desc)
-        .addToggle((t) =>
-          t.setValue(!muted.has(cat)).onChange(async (showOn) => {
-            const muteOn = !showOn;
-            if (muteOn) muted.add(cat);
-            else muted.delete(cat);
-            this.plugin.settings.mutedNotificationCategories = Array.from(muted);
-            this.plugin.notifications.setMuted(cat, muteOn);
-            await this.plugin.saveSettings();
-          }));
-    }
+      {
+        type: "group",
+        heading: "Mute notification categories",
+        items: categories.map((cat) => {
+          const meta = CATEGORY_LABELS[cat];
+          return this.renderDef(meta.label, meta.desc, (s) =>
+            s.addToggle((t) => t.setValue(!muted.has(cat)).onChange(async (showOn) => {
+              const muteOn = !showOn;
+              if (muteOn) muted.add(cat); else muted.delete(cat);
+              this.plugin.settings.mutedNotificationCategories = Array.from(muted);
+              this.plugin.notifications.setMuted(cat, muteOn);
+              await this.plugin.saveSettings();
+            })), ["notification", "mute", "toast", "category"]);
+        }),
+      } as SettingDefinitionItem,
 
-    new Setting(parent)
-      .setName("Notification history")
-      .setDesc("Browse the last 200 toasts. Filter by category. Live-updates as new notifications arrive. Muted categories still appear here so you can review what was suppressed.")
-      .addButton((b) =>
-        b.setButtonText("View notification history").onClick(() => {
+      this.renderDef("Notification history", "Browse the last 200 toasts. Filter by category. Live-updates as new notifications arrive. Muted categories still appear here so you can review what was suppressed.", (s) =>
+        s.addButton((b) => b.setButtonText("View notification history").onClick(() => {
           new NotificationHistoryModal(
             this.app,
             this.plugin.notifications,
             async (folder) => {
               const adapter = this.app.vault.adapter;
               const path = this.plugin.pluginPrivatePath("log.jsonl");
-              if (!(await adapter.exists(path))) {
-                new Notice("No log yet — make some changes first.");
-                return;
-              }
+              if (!(await adapter.exists(path))) { new Notice("No log yet — make some changes first."); return; }
               const data = await adapter.read(path);
               new LogModal(this.app, data, path).open();
               void folder;
@@ -712,18 +639,66 @@ export class StashpadSettingTab extends PluginSettingTab {
             this.plugin.settings.authorId || null,
             (id) => this.plugin.lookupNoteAuthorIds(id),
           ).open();
-        }));
+        })), ["notification", "history", "panel"]),
+    ];
   }
 
-  /** General tab: folder paths + behavior toggles + slug stop-words +
-   *  search scope + create-new-Stashpad + composer/popout prefs.
-   *  Inventory items C1–C14, C17–C19. Color aliases (C15) and note
-   *  templates (C16) moved to the Templates tab. */
-  private renderGeneralTab(parent: HTMLElement): void {
-    new Setting(parent)
-      .setName("Stashpad notes folder")
-      .setDesc("Vault-relative folder where Stashpad stores its notes and attachments. Created on demand.")
-      .addText((t) => {
+  /** Templates tab: color aliases per Stashpad + note templates per
+   *  Stashpad. Inventory items C15, C16. */
+  private renderTemplatesTab(parent: HTMLElement): void {
+    this.renderColorAliasesSection(parent);
+    this.renderNoteTemplatesSection(parent);
+  }
+
+  /** 0.94.1: build a SettingDefinitionRender for a simple setting — the def's
+   *  name/desc/aliases feed Obsidian's native settings search; `build` reuses
+   *  the existing imperative row code on the Setting the API hands us. */
+  private renderDef(
+    name: string,
+    desc: string,
+    build: (s: Setting) => void,
+    aliases?: string[],
+  ): SettingDefinitionItem {
+    return { name, desc, aliases, render: (s: Setting) => { s.setName(name).setDesc(desc); build(s); } } as SettingDefinitionItem;
+  }
+
+  /** 0.94.3: a declarative item whose render builds a whole MULTI-element
+   *  section FRESH at display time (so folder-dependent content is never stale).
+   *  Searchable by the section name/aliases. Strips the default row chrome and
+   *  hands the section a plain host element to fill. */
+  private sectionDef(
+    name: string,
+    desc: string,
+    render: (host: HTMLElement) => void,
+    aliases?: string[],
+  ): SettingDefinitionItem {
+    return {
+      name, desc, aliases,
+      render: (s: Setting) => {
+        const host = s.settingEl;
+        host.empty();
+        host.removeClass("setting-item");
+        host.addClass("stashpad-settings-section");
+        render(host);
+      },
+    } as SettingDefinitionItem;
+  }
+
+  /** 0.94.3: General tab decomposed into per-setting items (render at DISPLAY
+   *  time, so values + the folder list are always fresh). Simple settings use
+   *  renderDef; the dynamic search-scope / create-Stashpad block is a
+   *  sectionDef. Replaces the imperative renderGeneralTab for search. */
+  private generalItems(): SettingDefinitionItem[] {
+    const set = async () => this.plugin.saveSettings();
+    const toggle = (
+      name: string, desc: string, get: () => boolean, put: (v: boolean) => void, aliases?: string[],
+    ): SettingDefinitionItem => this.renderDef(name, desc, (s) =>
+      s.addToggle((t) => t.setValue(get()).onChange(async (v) => { put(v); await set(); })), aliases);
+
+    const items: SettingDefinitionItem[] = [];
+
+    items.push(this.renderDef("Stashpad notes folder", "Vault-relative folder where Stashpad stores its notes and attachments. Created on demand.", (s) => {
+      s.addText((t) => {
         new FolderSuggest(this.app, t.inputEl);
         t.setValue(this.plugin.settings.folder).setPlaceholder("Stashpad").onChange(async (v) => {
           const cleaned = (v || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.folder;
@@ -733,53 +708,37 @@ export class StashpadSettingTab extends PluginSettingTab {
             this.plugin.settings.exportFolder,
             "_attachments",
             "_processed",
-          ].map((s) => (s ?? "").trim().replace(/^\/+|\/+$/g, "")).filter(Boolean));
+          ].map((x) => (x ?? "").trim().replace(/^\/+|\/+$/g, "")).filter(Boolean));
           if (reserved.has(last)) {
             new Notice(`"${cleaned}" uses a reserved Stashpad subfolder name. Pick something else.`);
             return;
           }
           this.plugin.settings.folder = cleaned;
-          await this.plugin.saveSettings();
+          await set();
         });
       });
+    }, ["folder", "path", "location", "notes"]));
 
-    new Setting(parent)
-      .setName("Auto-import dropped files")
-      .setDesc("When on, any file you drop directly into a Stashpad folder is imported automatically: markdown becomes a note (the original is archived to .archive); other files move to _attachments with a note that links to them. Large drops ask for confirmation first.")
-      .addToggle((t) => t.setValue(this.plugin.settings.autoImport).onChange(async (v) => {
-        this.plugin.settings.autoImport = v; await this.plugin.saveSettings();
-      }));
+    items.push(toggle("Auto-import dropped files", "When on, any file you drop directly into a Stashpad folder is imported automatically: markdown becomes a note (the original is archived to .archive); other files move to _attachments with a note that links to them. Large drops ask for confirmation first.",
+      () => this.plugin.settings.autoImport, (v) => { this.plugin.settings.autoImport = v; }, ["import", "drop", "auto"]));
 
-    new Setting(parent)
-      .setName("Inherit Obsidian's excluded files")
-      .setDesc("Also hide files matching Obsidian's “Excluded files” list (Settings → Files & Links) from Stashpad's link autocomplete and file surfaces — so you manage exclusions in one place. Plugin-internal formats like .edtz are always excluded regardless.")
-      .addToggle((t) => t.setValue(this.plugin.settings.inheritObsidianExclusions).onChange(async (v) => {
-        this.plugin.settings.inheritObsidianExclusions = v; await this.plugin.saveSettings();
-      }));
+    items.push(toggle("Inherit Obsidian's excluded files", "Also hide files matching Obsidian's “Excluded files” list (Settings → Files & Links) from Stashpad's link autocomplete and file surfaces — so you manage exclusions in one place. Plugin-internal formats like .edtz are always excluded regardless.",
+      () => this.plugin.settings.inheritObsidianExclusions, (v) => { this.plugin.settings.inheritObsidianExclusions = v; }, ["excluded", "ignore", "files"]));
 
-    new Setting(parent)
-      .setName("Dedicated import subfolder (optional)")
-      .setDesc("Optional. A subfolder (relative to each Stashpad folder) where dropped .stash files auto-import. Leave blank to just drop files into the Stashpad folder itself (recommended). Suggested name: _imports.")
-      .addText((t) =>
-        t.setValue(this.plugin.settings.importDropFolder).setPlaceholder("_imports (leave blank to use the folder root)").onChange(async (v) => {
-          this.plugin.settings.importDropFolder = (v || "").trim().replace(/^\/+|\/+$/g, "");
-          await this.plugin.saveSettings();
-        }));
+    items.push(this.renderDef("Dedicated import subfolder (optional)", "Optional. A subfolder (relative to each Stashpad folder) where dropped .stash files auto-import. Leave blank to just drop files into the Stashpad folder itself (recommended). Suggested name: _imports.", (s) =>
+      s.addText((t) => t.setValue(this.plugin.settings.importDropFolder).setPlaceholder("_imports (leave blank to use the folder root)").onChange(async (v) => {
+        this.plugin.settings.importDropFolder = (v || "").trim().replace(/^\/+|\/+$/g, "");
+        await set();
+      })), ["import", "subfolder"]));
 
-    new Setting(parent)
-      .setName("Stash export subfolder")
-      .setDesc("Subfolder name (relative to each Stashpad folder) where exports land. Must differ from the import subfolder above.")
-      .addText((t) =>
-        t.setValue(this.plugin.settings.exportFolder).setPlaceholder("_exports").onChange(async (v) => {
-          const cleaned = (v || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.exportFolder;
-          this.plugin.settings.exportFolder = cleaned;
-          await this.plugin.saveSettings();
-        }));
+    items.push(this.renderDef("Stash export subfolder", "Subfolder name (relative to each Stashpad folder) where exports land. Must differ from the import subfolder above.", (s) =>
+      s.addText((t) => t.setValue(this.plugin.settings.exportFolder).setPlaceholder("_exports").onChange(async (v) => {
+        this.plugin.settings.exportFolder = (v || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.exportFolder;
+        await set();
+      })), ["export", "stash", "subfolder"]));
 
-    new Setting(parent)
-      .setName("Rebootstrap existing Stashpad folders")
-      .setDesc("Walk every folder that has a home note: ensure infrastructure (_imports, _exports, drafts file), backfill the redundant parentLink + children frontmatter fields, AND rename any note whose filename slug no longer matches its body's first line. Safe to run anytime; skip-if-equal means already-synced notes are no-op writes.")
-      .addButton((b) =>
+    items.push(this.renderDef("Rebootstrap existing Stashpad folders", "Walk every folder that has a home note: ensure infrastructure (_imports, _exports, drafts file), backfill the redundant parentLink + children frontmatter fields, AND rename any note whose filename slug no longer matches its body's first line. Safe to run anytime; skip-if-equal means already-synced notes are no-op writes.", (s) =>
+      s.addButton((b) =>
         b.setButtonText("Rebootstrap now").onClick(async () => {
           b.setDisabled(true).setButtonText("Working…");
           try {
@@ -798,196 +757,108 @@ export class StashpadSettingTab extends PluginSettingTab {
           } finally {
             b.setDisabled(false).setButtonText("Rebootstrap now");
           }
-        }));
+        })), ["rebootstrap", "rebuild", "repair", "backfill", "slug"]));
 
-    new Setting(parent)
-      .setName("Use Templates plugin date/time formats")
-      .setDesc("When on, timestamps use the formats configured in the core Templates plugin. Off: YYYY.MM.DD + HH:mm A.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.useTemplatesFormat).onChange(async (v) => {
-          this.plugin.settings.useTemplatesFormat = v;
-          await this.plugin.saveSettings();
-        }));
+    items.push(this.renderDef("Use Templates plugin date/time formats", "When on, timestamps use the formats configured in the core Templates plugin. Off: YYYY.MM.DD + HH:mm A.", (s) => {
+      s.addToggle((t) => t.setValue(this.plugin.settings.useTemplatesFormat).onChange(async (v) => {
+        this.plugin.settings.useTemplatesFormat = v; await set();
+      }));
+      const fmt = getTemplatesFormats(this.app);
+      s.descEl.createDiv({ cls: "stashpad-settings-note" }).setText(fmt
+        ? `Templates plugin: date = "${fmt.dateFormat}", time = "${fmt.timeFormat}"`
+        : "Templates plugin not enabled.");
+    }, ["templates", "date", "time", "format"]));
 
-    const fmt = getTemplatesFormats(this.app);
-    const info = parent.createDiv({ cls: "setting-item-description stashpad-settings-note" });
-    info.setText(fmt
-      ? `Templates plugin: date = "${fmt.dateFormat}", time = "${fmt.timeFormat}"`
-      : "Templates plugin not enabled.");
-
-    // 0.76.6: how due dates + created/modified display in the Tasks
-    // and detail panels. A live sample updates as the user picks.
+    // Date display block — dropdown + timezone share a live sample element.
     {
-      let sample: HTMLElement | null = null;
+      let sampleEl: HTMLElement | null = null;
       const refreshSample = () => {
-        if (!sample) return;
-        const now = Date.now();
-        const f = formatDateTime(now, this.plugin.settings);
-        sample.setText(`Sample: ${f}`);
+        if (!sampleEl) return;
+        sampleEl.setText(`Sample: ${formatDateTime(Date.now(), this.plugin.settings)}`);
       };
-      new Setting(parent)
-        .setName("Date display format")
-        .setDesc("How due dates and created/modified times are shown in the Tasks and detail panels.")
-        .addDropdown((d) => {
+      items.push(this.renderDef("Date display format", "How due dates and created/modified times are shown in the Tasks and detail panels.", (s) => {
+        s.addDropdown((d) => {
           d.addOption("locale", "Locale, short (Mar 5, 9:00 AM)");
           d.addOption("long", "Locale, long (Thursday, March 5…)");
           d.addOption("iso", "ISO (2026-03-05 09:00)");
           d.addOption("us", "US (3/5/2026, 9:00 AM)");
           d.addOption("eu", "EU (5/3/2026, 09:00)");
           d.setValue(this.plugin.settings.dateDisplayFormat ?? "locale");
-          d.onChange(async (v) => {
-            this.plugin.settings.dateDisplayFormat = v as any;
-            await this.plugin.saveSettings();
-            refreshSample();
-          });
+          d.onChange(async (v) => { this.plugin.settings.dateDisplayFormat = v as any; await set(); refreshSample(); });
         });
-      new Setting(parent)
-        .setName("Display timezone")
-        .setDesc("IANA timezone name (e.g. America/New_York, Europe/London, Asia/Kolkata). Leave blank to use your system timezone.")
-        .addText((t) => {
+      }, ["date", "format", "display"]));
+      items.push(this.renderDef("Display timezone", "IANA timezone name (e.g. America/New_York, Europe/London, Asia/Kolkata). Leave blank to use your system timezone.", (s) => {
+        s.addText((t) => {
           t.setPlaceholder("(system timezone)");
           t.setValue(this.plugin.settings.dateDisplayTimezone ?? "");
-          t.onChange(async (v) => {
-            this.plugin.settings.dateDisplayTimezone = (v || "").trim();
-            await this.plugin.saveSettings();
-            refreshSample();
-          });
+          t.onChange(async (v) => { this.plugin.settings.dateDisplayTimezone = (v || "").trim(); await set(); refreshSample(); });
         });
-      sample = parent.createDiv({ cls: "setting-item-description stashpad-settings-note" });
-      refreshSample();
+      }, ["timezone", "tz", "date", "iana"]));
+      items.push({
+        name: "Date sample", searchable: false,
+        render: (s: Setting) => {
+          const host = s.settingEl; host.empty(); host.removeClass("setting-item");
+          sampleEl = host.createDiv({ cls: "setting-item-description stashpad-settings-note" });
+          refreshSample();
+        },
+      } as SettingDefinitionItem);
     }
 
-    new Setting(parent)
-      .setName("Navigate into parent after moving a note IN")
-      .setDesc("When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.autoNavOnMoveIn).onChange(async (v) => {
-          this.plugin.settings.autoNavOnMoveIn = v;
-          await this.plugin.saveSettings();
-        }));
+    items.push(toggle("Navigate into parent after moving a note IN", "When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.",
+      () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
+    items.push(toggle("Navigate to destination after moving a note OUT", "When you outdent a note, move it via the cross-parent picker, or send it to Home, automatically drill into the destination parent. Off = stay focused where you were.",
+      () => this.plugin.settings.autoNavOnMoveOut, (v) => { this.plugin.settings.autoNavOnMoveOut = v; }, ["navigate", "move", "out"]));
+    items.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",
+      () => this.plugin.settings.doubleClickToFocus, (v) => { this.plugin.settings.doubleClickToFocus = v; }, ["double", "click", "open", "focus"]));
+    items.push(toggle("Auto-open the detail panel", "Open the right-sidebar Stashpad detail panel automatically whenever a Stashpad view becomes active. The panel shows the cursored note's body, metadata, and children. Off = open manually via ribbon or command palette.",
+      () => this.plugin.settings.autoOpenDetailPanel, (v) => { this.plugin.settings.autoOpenDetailPanel = v; }, ["detail", "panel", "sidebar"]));
+    items.push(toggle("Expand the cursor row's body automatically", "As you arrow-key through the list, the row under the cursor temporarily un-clamps to show its full body. Moving away re-collapses it. Doesn't affect the persistent 'Show more' state — this is a transient view-only effect.",
+      () => this.plugin.settings.autoExpandCursorRow, (v) => { this.plugin.settings.autoExpandCursorRow = v; }, ["expand", "cursor", "body"]));
+    items.push(toggle("Confirm cross-parent drag-and-drop", "When dragging notes onto a note that has a different parent, ask before re-parenting (turn off to allow direct moves).",
+      () => this.plugin.settings.confirmCrossParentDrag, (v) => { this.plugin.settings.confirmCrossParentDrag = v; }, ["confirm", "drag", "drop", "reparent"]));
+    items.push(toggle("Confirm bulk deletes", "Warn before deletes that affect more than one note — multi-selection delete OR deleting a note that has descendants. A single childless note with no attachments never prompts. Off = those deletes apply immediately (undo still recovers everything).",
+      () => this.plugin.settings.confirmBulkDelete, (v) => { this.plugin.settings.confirmBulkDelete = v; }, ["confirm", "delete", "bulk"]));
+    items.push(toggle("Offer to delete attachments with note", "When a note references attachments, the delete modal includes an \"Also delete attachments\" checkbox so orphaned files don't pile up in your vault. Attachments are detected from both ![[…]] embeds in the body and the frontmatter attachments: list. Off = attachments are always preserved on delete (no checkbox shown), and a single childless note with attachments deletes silently.",
+      () => this.plugin.settings.confirmAttachmentDelete, (v) => { this.plugin.settings.confirmAttachmentDelete = v; }, ["delete", "attachment", "orphan"]));
 
-    new Setting(parent)
-      .setName("Navigate to destination after moving a note OUT")
-      .setDesc("When you outdent a note, move it via the cross-parent picker, or send it to Home, automatically drill into the destination parent. Off = stay focused where you were.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.autoNavOnMoveOut).onChange(async (v) => {
-          this.plugin.settings.autoNavOnMoveOut = v;
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(parent)
-      .setName("Double-click a note to open it")
-      .setDesc("Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.doubleClickToFocus).onChange(async (v) => {
-          this.plugin.settings.doubleClickToFocus = v;
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(parent)
-      .setName("Auto-open the detail panel")
-      .setDesc("Open the right-sidebar Stashpad detail panel automatically whenever a Stashpad view becomes active. The panel shows the cursored note's body, metadata, and children. Off = open manually via ribbon or command palette.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.autoOpenDetailPanel).onChange(async (v) => {
-          this.plugin.settings.autoOpenDetailPanel = v;
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(parent)
-      .setName("Expand the cursor row's body automatically")
-      .setDesc("As you arrow-key through the list, the row under the cursor temporarily un-clamps to show its full body. Moving away re-collapses it. Doesn't affect the persistent 'Show more' state — this is a transient view-only effect.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.autoExpandCursorRow).onChange(async (v) => {
-          this.plugin.settings.autoExpandCursorRow = v;
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(parent)
-      .setName("Confirm cross-parent drag-and-drop")
-      .setDesc("When dragging notes onto a note that has a different parent, ask before re-parenting (turn off to allow direct moves).")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.confirmCrossParentDrag).onChange(async (v) => {
-          this.plugin.settings.confirmCrossParentDrag = v;
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(parent)
-      .setName("Confirm bulk deletes")
-      .setDesc("Warn before deletes that affect more than one note — multi-selection delete OR deleting a note that has descendants. A single childless note with no attachments never prompts. Off = those deletes apply immediately (undo still recovers everything).")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.confirmBulkDelete).onChange(async (v) => {
-          this.plugin.settings.confirmBulkDelete = v;
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(parent)
-      .setName("Offer to delete attachments with note")
-      .setDesc("When a note references attachments, the delete modal includes an \"Also delete attachments\" checkbox so orphaned files don't pile up in your vault. Attachments are detected from both ![[…]] embeds in the body and the frontmatter attachments: list. Off = attachments are always preserved on delete (no checkbox shown), and a single childless note with attachments deletes silently.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.confirmAttachmentDelete).onChange(async (v) => {
-          this.plugin.settings.confirmAttachmentDelete = v;
-          await this.plugin.saveSettings();
-        }));
-
-    {
+    items.push(this.renderDef("Slug stop-words", "Words removed from auto-generated note titles (filenames). One per line.", (s) => {
       let textarea: HTMLTextAreaElement | null = null;
-      const initial = (this.plugin.settings.slugStopWords?.length
-        ? this.plugin.settings.slugStopWords
-        : DEFAULT_STOPWORDS).join("\n");
-      new Setting(parent)
-        .setName("Slug stop-words")
-        .setDesc("Words removed from auto-generated note titles (filenames). One per line.")
-        .addTextArea((t) => {
-          t.setValue(initial);
-          textarea = (t as any).inputEl as HTMLTextAreaElement;
-          textarea.rows = 6;
-          textarea.style.fontFamily = "var(--font-monospace)";
-          t.onChange(async (v) => {
-            const list = (v || "").split(/\r?\n/).map((s) => s.trim().toLowerCase()).filter(Boolean);
-            this.plugin.settings.slugStopWords = list;
-            await this.plugin.saveSettings();
-          });
-        })
-        .addExtraButton((b) =>
-          b.setIcon("rotate-ccw")
-            .setTooltip("Reset to defaults")
-            .onClick(async () => {
-              this.plugin.settings.slugStopWords = [...DEFAULT_STOPWORDS];
-              if (textarea) textarea.value = DEFAULT_STOPWORDS.join("\n");
-              await this.plugin.saveSettings();
-            }));
-    }
+      const initial = (this.plugin.settings.slugStopWords?.length ? this.plugin.settings.slugStopWords : DEFAULT_STOPWORDS).join("\n");
+      s.addTextArea((t) => {
+        t.setValue(initial);
+        textarea = (t as any).inputEl as HTMLTextAreaElement;
+        textarea.rows = 6;
+        textarea.style.fontFamily = "var(--font-monospace)";
+        t.onChange(async (v) => {
+          this.plugin.settings.slugStopWords = (v || "").split(/\r?\n/).map((x) => x.trim().toLowerCase()).filter(Boolean);
+          await set();
+        });
+      }).addExtraButton((b) =>
+        b.setIcon("rotate-ccw").setTooltip("Reset to defaults").onClick(async () => {
+          this.plugin.settings.slugStopWords = [...DEFAULT_STOPWORDS];
+          if (textarea) textarea.value = DEFAULT_STOPWORDS.join("\n");
+          await set();
+        }));
+    }, ["slug", "stopwords", "filename", "title"]));
 
-    {
+    items.push(this.sectionDef("Cross-Stashpad search scope", "Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations. Also: create a new Stashpad.", (host) => {
       const folders = this.plugin.discoverStashpadFolders();
-      new Setting(parent)
+      new Setting(host)
         .setName("Cross-Stashpad search scope")
         .setDesc("Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations — their notes just don't appear in search results from elsewhere.");
-
       if (folders.length === 0) {
-        const empty = parent.createEl("p", { cls: "setting-item-description" });
-        empty.setText(
-          "No Stashpads found in this vault yet. A Stashpad is just a folder " +
-          "that contains a Stashpad-shaped note (frontmatter has both `id` and " +
-          "`parent`). Easiest way: open Stashpad (ribbon icon or command " +
-          '"Reveal or open Stashpad") — it auto-creates the default folder ' +
-          'on first use. Or create one below.',
+        host.createEl("p", { cls: "setting-item-description" }).setText(
+          "No Stashpads found in this vault yet. A Stashpad is just a folder that contains a Stashpad-shaped note (frontmatter has both `id` and `parent`). Easiest way: open Stashpad (ribbon icon or command \"Reveal or open Stashpad\") — it auto-creates the default folder on first use. Or create one below.",
         );
       } else {
-        const list = parent.createDiv({ cls: "stashpad-folder-list" });
-        for (const folder of folders) {
-          this.renderFolderScopeRow(list, folder);
-        }
+        const list = host.createDiv({ cls: "stashpad-folder-list" });
+        for (const folder of folders) this.renderFolderScopeRow(list, folder);
       }
-
       let nameInput: HTMLInputElement | null = null;
-      new Setting(parent)
+      new Setting(host)
         .setName("Create a new Stashpad")
         .setDesc("Type a vault-relative folder path. The folder is created (with intermediates) and seeded with a Home note so Stashpad recognizes it.")
-        .addText((t) => {
-          t.setPlaceholder("my-stashpad");
-          nameInput = (t as any).inputEl as HTMLInputElement;
-        })
+        .addText((t) => { t.setPlaceholder("my-stashpad"); nameInput = (t as any).inputEl as HTMLInputElement; })
         .addButton((b) =>
           b.setButtonText("Create").setCta().onClick(async () => {
             const raw = (nameInput?.value ?? "").trim().replace(/^\/+|\/+$/g, "");
@@ -997,59 +868,46 @@ export class StashpadSettingTab extends PluginSettingTab {
               new Notice(`Created Stashpad "${raw}".`);
               if (nameInput) nameInput.value = "";
               await this.plugin.waitForStashpadFolder(raw, 2000);
-              this.display();
+              this.update?.();
             } catch (e) {
               new Notice(`Couldn't create: ${(e as Error).message}`);
             }
           }));
-    }
+    }, ["search", "scope", "exclude", "include", "create", "new", "stashpad", "folder"]));
 
-    new Setting(parent)
-      .setName("Autofocus composer after sending")
-      .setDesc("After Enter-submitting a note, return focus to the composer so you can keep typing. Off keeps focus in the list — useful if you want arrow keys to work without an extra click.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.autofocusComposerAfterSend).onChange(async (v) => {
-          this.plugin.settings.autofocusComposerAfterSend = v;
-          await this.plugin.saveSettings();
-        }));
+    items.push(this.sectionDef("Folder panel placement", "Pin, downrank, or hide folders in the Stashpad folder panel. Restore hidden folders here or from the panel's “Hidden” section.", (host) => {
+      new Setting(host)
+        .setName("Folder panel placement")
+        .setDesc("Folders you've pinned, downranked, or hidden in the Stashpad folder panel. Pin/downrank from a folder's right-click menu in the panel; restore here or from the panel's “Hidden” section.");
+      this.renderFolderPlacementList(host);
+    }, ["folder", "panel", "pin", "pinned", "downrank", "hide", "hidden", "restore", "placement"]));
 
-    new Setting(parent)
-      .setName("Open in new window — duplicate tab")
-      .setDesc("ON: the new-window button (in the time-filter row) duplicates the current Stashpad tab — original stays open in the main window. OFF: the leaf is MOVED to the new window, closing the original tab.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.popoutDuplicates).onChange(async (v) => {
-          this.plugin.settings.popoutDuplicates = v;
-          await this.plugin.saveSettings();
-        }));
+    items.push(toggle("Autofocus composer after sending", "After Enter-submitting a note, return focus to the composer so you can keep typing. Off keeps focus in the list — useful if you want arrow keys to work without an extra click.",
+      () => this.plugin.settings.autofocusComposerAfterSend, (v) => { this.plugin.settings.autofocusComposerAfterSend = v; }, ["composer", "focus", "send"]));
+    items.push(toggle("Open in new window — duplicate tab", "ON: the new-window button (in the time-filter row) duplicates the current Stashpad tab — original stays open in the main window. OFF: the leaf is MOVED to the new window, closing the original tab.",
+      () => this.plugin.settings.popoutDuplicates, (v) => { this.plugin.settings.popoutDuplicates = v; }, ["popout", "window", "duplicate"]));
+    items.push(toggle("Prefix timestamps when copying", "Include each note's timestamp before its body when copying with C or Y.",
+      () => this.plugin.settings.prefixTimestampsOnCopy, (v) => { this.plugin.settings.prefixTimestampsOnCopy = v; }, ["copy", "timestamp", "prefix"]));
 
-    new Setting(parent)
-      .setName("Prefix timestamps when copying")
-      .setDesc("Include each note's timestamp before its body when copying with C or Y.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.prefixTimestampsOnCopy).onChange(async (v) => {
-          this.plugin.settings.prefixTimestampsOnCopy = v;
-          await this.plugin.saveSettings();
-        }));
+    return items;
   }
 
-  /** Templates tab: color aliases per Stashpad + note templates per
-   *  Stashpad. Inventory items C15, C16. */
-  private renderTemplatesTab(parent: HTMLElement): void {
-    this.renderColorAliasesSection(parent);
-    this.renderNoteTemplatesSection(parent);
-  }
-
-  /** Hotkeys tab: help text + one row per COMMAND_META entry.
-   *  Inventory items E1, E2. */
-  private renderHotkeysTab(parent: HTMLElement): void {
-    parent.createEl("p", {
-      cls: "setting-item-description",
-      text: "Each command has up to two slots. Click a slot and press a key (or chord) to bind it; press Backspace (delete on Mac) to cancel without binding; or click ✕ to clear an existing binding. When both slots are set, the pill on the right decides which one is active.",
-    });
-
-    for (const meta of COMMAND_META) {
-      this.renderBindingRow(parent, meta);
-    }
+  /** 0.94.1: Hotkeys tab as declarative items — ONE searchable entry per
+   *  command (so native settings search finds e.g. "toggle complete" or
+   *  "command palette" by name). Each renders the existing binding row. */
+  private hotkeyItems(): SettingDefinitionItem[] {
+    const intro: SettingDefinitionItem = {
+      name: "Hotkeys",
+      desc: "Each command has up to two slots. Click a slot and press a key (or chord) to bind it; press Backspace (delete on Mac) to cancel without binding; or click ✕ to clear an existing binding. A ↺ icon appears on any slot that differs from its shipped default — click it to revert that slot. When both slots are set, the pill on the right decides which one is active.",
+      searchable: false,
+    } as SettingDefinitionItem;
+    const rows = COMMAND_META.map((meta) => ({
+      name: meta.label,
+      desc: meta.desc,
+      aliases: ["hotkey", "shortcut", "keybind", "binding", "key"],
+      render: (s: Setting) => this.renderBindingRow(s, meta),
+    } as SettingDefinitionItem));
+    return [intro, ...rows];
   }
 
   /** 0.71.0: JD Index Builder settings section.
@@ -1742,9 +1600,48 @@ export class StashpadSettingTab extends PluginSettingTab {
     refresh();
   }
 
+  /** 0.95.2: settings-window mirror of the folder panel's pin/downrank/hide
+   *  placements — lists each customized folder grouped by state with a control
+   *  to restore it to normal. The panel's right-click menu is where you SET
+   *  these; this is the at-a-glance overview + a second place to restore. */
+  private renderFolderPlacementList(host: HTMLElement): void {
+    const s = this.plugin.settings;
+    const groups: Array<{ key: "folderPanelPinned" | "folderPanelDownranked" | "folderPanelHidden"; label: string; action: string }> = [
+      { key: "folderPanelPinned", label: "Pinned", action: "Unpin" },
+      { key: "folderPanelDownranked", label: "Downranked", action: "Reset" },
+      { key: "folderPanelHidden", label: "Hidden", action: "Unhide" },
+    ];
+    const any = groups.some((g) => (s[g.key] ?? []).length > 0);
+    if (!any) {
+      host.createEl("p", { cls: "setting-item-description" }).setText(
+        "No folders customized yet. Right-click a folder in the Stashpad folder panel to pin, downrank, or hide it.",
+      );
+      return;
+    }
+    const restore = async (folder: string) => {
+      s.folderPanelPinned = (s.folderPanelPinned ?? []).filter((f) => f !== folder);
+      s.folderPanelDownranked = (s.folderPanelDownranked ?? []).filter((f) => f !== folder);
+      s.folderPanelHidden = (s.folderPanelHidden ?? []).filter((f) => f !== folder);
+      await this.plugin.saveSettings();
+      this.update?.();
+    };
+    for (const g of groups) {
+      const folders = [...(s[g.key] ?? [])].sort();
+      if (folders.length === 0) continue;
+      host.createEl("div", { cls: "stashpad-folder-placement-group", text: `${g.label} (${folders.length})` });
+      const list = host.createDiv({ cls: "stashpad-folder-list" });
+      for (const folder of folders) {
+        const row = list.createDiv({ cls: "stashpad-folder-row" });
+        row.createSpan({ cls: "stashpad-folder-row-label", text: folder });
+        const btn = row.createEl("button", { text: g.action });
+        btn.onclick = () => void restore(folder);
+      }
+    }
+  }
+
   /** One settings row: label + 2 chord recorders + active-slot toggle. */
-  private renderBindingRow(parent: HTMLElement, meta: CommandMeta): void {
-    const row = new Setting(parent).setName(meta.label).setDesc(meta.desc);
+  private renderBindingRow(row: Setting, meta: CommandMeta): void {
+    row.setName(meta.label).setDesc(meta.desc);
     const get = () => this.plugin.settings.bindings[meta.id];
 
     let primaryInput: HTMLInputElement;
@@ -1765,6 +1662,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       // builds without field-sizing support still grow with content.
       const syncSize = () => { input.size = Math.max(3, input.value.length || input.placeholder.length); };
       syncSize();
+      // This slot's default chord (primary → defaultPrimary; secondary →
+      // defaultSecondary, which is "" for most commands).
+      const slotDefault = which === "primary" ? meta.defaultPrimary : (meta.defaultSecondary ?? "");
       input.onclick = () => {
         startHotkeyRecording(input, async (chord) => {
           this.plugin.settings.bindings[meta.id][which] = chord;
@@ -1772,6 +1672,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           syncSize();
           await this.plugin.saveSettings();
           refreshToggle();
+          syncRevert();
         });
       };
       const clearBtn = wrap.createEl("button", { cls: "stashpad-binding-clear", text: "×" });
@@ -1782,7 +1683,33 @@ export class StashpadSettingTab extends PluginSettingTab {
         syncSize();
         await this.plugin.saveSettings();
         refreshToggle();
+        syncRevert();
       };
+      // 0.92.0: revert-to-default icon. Shown whenever this slot differs from
+      // its shipped default — most usefully after the ✕ clears a slot that HAD
+      // a default (e.g. cleared "Mod+Enter"), so the user can put it back with
+      // one click. Hidden when the slot already matches its default (nothing to
+      // revert). A slot with no default ("") only shows it after the user binds
+      // something, and reverting then clears the slot.
+      const revertBtn = wrap.createEl("button", { cls: "stashpad-binding-revert" });
+      setIcon(revertBtn, "rotate-ccw");
+      const syncRevert = (): void => {
+        const cur = get()[which];
+        const differs = cur !== slotDefault;
+        revertBtn.toggleClass("is-hidden", !differs);
+        revertBtn.title = slotDefault
+          ? `Revert to default (${prettifyChord(slotDefault)})`
+          : "Revert to default (no binding)";
+      };
+      revertBtn.onclick = async () => {
+        this.plugin.settings.bindings[meta.id][which] = slotDefault;
+        input.value = prettifyChord(slotDefault);
+        syncSize();
+        await this.plugin.saveSettings();
+        refreshToggle();
+        syncRevert();
+      };
+      syncRevert();
       return input;
     };
 

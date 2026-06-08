@@ -169,6 +169,14 @@ export class StashpadView extends ItemView {
    *  wrongly collapses the selection. Stamping this lets the collapse paths
    *  skip when a picker-cancel just happened (within ~350ms). */
   private pickerEscapeAt = 0;
+  /** 0.92.3: timestamp of the Escape that just blurred the composer back to the
+   *  list. A single Escape to exit the composer already keeps the selection
+   *  (composerScope preempts the collapse), but a SECOND quick Escape — the
+   *  common "I hit space by accident, mash Escape to get out" fumble — would
+   *  hit the list-level collapse and drop the multi-selection to one. Within
+   *  this grace window the collapse is skipped so the selection survives the
+   *  round-trip; a deliberate, later Escape still deselects as before. */
+  private composerExitAt = 0;
   /** public: read by ViewDnD (the host interface). */
   listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
@@ -390,6 +398,9 @@ export class StashpadView extends ItemView {
         // inListPicker before we ran), don't treat this same keypress as a
         // selection-collapse. 0.91.2.
         if (Date.now() - this.pickerEscapeAt < 350) return false;
+        // 0.92.3: just Escaped out of the composer — keep the selection through
+        // the round-trip (a fumbled double-Escape shouldn't deselect).
+        if (Date.now() - this.composerExitAt < 400) return false;
         // List-mode Escape: collapse multi-selection if any. Otherwise
         // a no-op — but we still return false so the workspace's
         // "Escape returns to last leaf" never fires.
@@ -4328,6 +4339,10 @@ export class StashpadView extends ItemView {
       if (composerScope) return;
       composerScope = new Scope((this.app as any).scope);
       composerScope.register([], "Escape", () => {
+        // 0.92.3: mark that Escape just took us OUT of the composer, so a quick
+        // follow-up Escape doesn't collapse the multi-selection (see the
+        // composerExitAt guard in the list-level Escape handlers).
+        this.composerExitAt = Date.now();
         ta.blur();
         this.viewRoot?.focus({ preventScroll: true } as any);
         return false;
@@ -5091,6 +5106,9 @@ export class StashpadView extends ItemView {
       // handler (it nulled inListPicker before this ran), don't also collapse
       // the multi-selection on the same keypress.
       if (Date.now() - this.pickerEscapeAt < 350) return;
+      // 0.92.3: just Escaped out of the composer — preserve the selection
+      // through the round-trip (don't let a quick second Escape deselect).
+      if (Date.now() - this.composerExitAt < 400) return;
       // Multi-selection → collapse down to the FIRST note that was
       // added (not the last). The last-was-anchor behavior was awkward
       // because shift-click extends FROM the original anchor — losing
@@ -5329,6 +5347,12 @@ export class StashpadView extends ItemView {
         }
       },
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
+      // 0.92.1: only offer "Search excluded folders" when there actually are
+      // excluded Stashpad folders (else the callback stays undefined and the
+      // bottom action never renders).
+      excludedFolderNotes: this.excludedSearchFolders().length > 0
+        ? () => this.collectExcludedFolderNotes()
+        : undefined,
       onClose: () => {
         // Only when the picker was dismissed WITHOUT a pick: hop focus (and
         // the mobile keyboard) back to the composer. This fires inside the
@@ -5453,6 +5477,12 @@ export class StashpadView extends ItemView {
           placeholder: `Create "${trimmed}" under which note?`,
           allowCreate: false,
           crossFolderNotes: () => this.collectCrossFolderDestinations(),
+      // 0.92.1: only offer "Search excluded folders" when there actually are
+      // excluded Stashpad folders (else the callback stays undefined and the
+      // bottom action never renders).
+      excludedFolderNotes: this.excludedSearchFolders().length > 0
+        ? () => this.collectExcludedFolderNotes()
+        : undefined,
           folderResults: () => this.plugin.discoverStashpadFolders().filter((f) => f !== this.noteFolder),
           localFolder: this.noteFolder,
           // 0.69.26: always spawn a NEW Stashpad tab on the picked
@@ -5506,6 +5536,12 @@ export class StashpadView extends ItemView {
         if (item.node) this.navigateTo(item.node.id);
       },
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
+      // 0.92.1: only offer "Search excluded folders" when there actually are
+      // excluded Stashpad folders (else the callback stays undefined and the
+      // bottom action never renders).
+      excludedFolderNotes: this.excludedSearchFolders().length > 0
+        ? () => this.collectExcludedFolderNotes()
+        : undefined,
       folderResults: () => this.plugin.discoverStashpadFolders().filter((f) => f !== this.noteFolder),
       // 0.64.0: search modal gets the filter chips row.
       showFilterChips: true,
@@ -5525,9 +5561,41 @@ export class StashpadView extends ItemView {
   /** Walk the vault for every Stashpad note that lives in a folder
    *  eligible for cross-Stashpad search (per settings), excluding the
    *  active folder (those are already in the local tier). */
-  private collectCrossFolderNotes(): import("./note-picker").CrossFolderNote[] {
+  /** 0.92.1: the discovered Stashpad folders currently EXCLUDED from search
+   *  (via searchExcludedFolders or the include-allowlist), minus the active
+   *  folder. Cheap — used to decide whether to offer "Search excluded folders". */
+  private excludedSearchFolders(): string[] {
+    const searchable = new Set(this.plugin.searchableFolders(this.noteFolder));
+    return this.plugin.discoverStashpadFolders()
+      .filter((f) => f !== this.noteFolder && !searchable.has(f));
+  }
+
+  /** 0.92.1: notes (+ synthetic home roots) from the EXCLUDED folders — the
+   *  on-demand source behind the picker's "Search excluded folders" action. */
+  private collectExcludedFolderNotes(): import("./note-picker").CrossFolderNote[] {
+    const folders = this.excludedSearchFolders();
+    if (!folders.length) return [];
+    const notes = this.collectCrossFolderNotes(folders);
+    const homeFileByFolder = new Map<string, TFile>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folders.includes(dir)) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: string } | undefined;
+      if (fm?.id === ROOT_ID) homeFileByFolder.set(dir, f);
+    }
+    const roots = folders.map((folder) => ({
+      file: homeFileByFolder.get(folder),
+      folder,
+      id: ROOT_ID,
+      title: `Home — ${folder.split("/").pop() || folder}`,
+      body: "",
+    }));
+    return [...roots, ...notes];
+  }
+
+  private collectCrossFolderNotes(folderList?: string[]): import("./note-picker").CrossFolderNote[] {
     const out: import("./note-picker").CrossFolderNote[] = [];
-    const folders = this.plugin.searchableFolders(this.noteFolder)
+    const folders = (folderList ?? this.plugin.searchableFolders(this.noteFolder))
       .filter((f) => f !== this.noteFolder);
     if (!folders.length) return out;
     const folderSet = new Set(folders);
@@ -5765,6 +5833,12 @@ export class StashpadView extends ItemView {
       // destination picker uses, so a move can target "Home of folder X"
       // as a one-shot result without searching for it.
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
+      // 0.92.1: only offer "Search excluded folders" when there actually are
+      // excluded Stashpad folders (else the callback stays undefined and the
+      // bottom action never renders).
+      excludedFolderNotes: this.excludedSearchFolders().length > 0
+        ? () => this.collectExcludedFolderNotes()
+        : undefined,
       // 0.64.1: move picker also gets the advanced filter chips — same
       // in:/before:/after:/on: syntax helps narrow long destination lists.
       showFilterChips: true,

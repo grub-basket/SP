@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      hash-wasm:
+        specifier: ^4.12.0
+        version: 4.12.0
       jszip:
         specifier: ^3.10.1
         version: 3.10.1
@@ -20,7 +23,7 @@ importers:
         version: 0.21.5
       obsidian:
         specifier: latest
-        version: 1.12.3(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
+        version: 1.13.0(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
       typescript:
         specifier: ^5.4.0
         version: 5.9.3
@@ -197,6 +200,9 @@ packages:
     engines: {node: '>=12'}
     hasBin: true
 
+  hash-wasm@4.12.0:
+    resolution: {integrity: sha512-+/2B2rYLb48I/evdOIhP+K/DD2ca2fgBjp6O+GBEnCDk2e4rpeXIK8GvIyRPjTezgmWn9gmKwkQjjx6BtqDHVQ==}
+
   immediate@3.0.6:
     resolution: {integrity: sha512-XXOFtyqDjNDAQxVfYxuF7g9Il/IbWmmlQg2MYKOH8ExIT1qg6xc4zyS3HaEEATgs1btfzxq15ciUiY7gjSXRGQ==}
 
@@ -215,8 +221,8 @@ packages:
   moment@2.29.4:
     resolution: {integrity: sha512-5LC9SOxjSc2HF6vO2CyuTDNivEdoz2IvyJJGj6X8DJ0eFyfszE0QiEd+iXmBvUP3WHxSjFH/vIsA0EN00cgr8w==}
 
-  obsidian@1.12.3:
-    resolution: {integrity: sha512-HxWqe763dOqzXjnNiHmAJTRERN8KILBSqxDSEqbeSr7W8R8Jxezzbca+nz1LiiqXnMpM8lV2jzAezw3CZ4xNUw==}
+  obsidian@1.13.0:
+    resolution: {integrity: sha512-PHw5+SAPlJ0S3leFvJ0wgFg63Z3DavxL6+d1ll+8toXR2ZlYKc1rMWqdUv9LgUbTwPQUyY6yfhOMMivampRRiQ==}
     peerDependencies:
       '@codemirror/state': 6.5.0
       '@codemirror/view': 6.38.6
@@ -384,6 +390,8 @@ snapshots:
       '@esbuild/win32-ia32': 0.21.5
       '@esbuild/win32-x64': 0.21.5
 
+  hash-wasm@4.12.0: {}
+
   immediate@3.0.6: {}
 
   inherits@2.0.4: {}
@@ -403,7 +411,7 @@ snapshots:
 
   moment@2.29.4: {}
 
-  obsidian@1.12.3(@codemirror/state@6.5.0)(@codemirror/view@6.38.6):
+  obsidian@1.13.0(@codemirror/state@6.5.0)(@codemirror/view@6.38.6):
     dependencies:
       '@codemirror/state': 6.5.0
       '@codemirror/view': 6.38.6

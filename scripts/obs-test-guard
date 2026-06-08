@@ -1,0 +1,85 @@
+#!/bin/sh
+# In-Obsidian "Claude is testing" banner + countdown, so the user gets a loud,
+# in-app heads-up even when they're not watching the Claude chat.
+#
+# Why: automated Obsidian looks identical to a normal one. If the user pokes the
+# UI mid-test, their clicks collide with the automation. The chat 🔴/✅ handshake
+# only helps if they're looking at the chat — this pushes the warning into
+# Obsidian itself, with a grace period to back off.
+#
+# Usage:
+#   scripts/obs-test-guard start [seconds]   # show banner, wait N s (default 10), then "testing now"
+#   scripts/obs-test-guard ensure            # INSTANT banner (no wait) — re-raise it before any
+#                                            #   driving eval if you're unsure it's still up
+#   scripts/obs-test-guard end               # clear banner, show transient "safe to use" notice
+#   scripts/obs-test-guard note 'message'    # ad-hoc persistent banner with a custom message
+#
+# PROTOCOL: run `start` ONCE at the beginning of a testing session and `end`
+# ONLY when you're completely done and handing control back. Keep the banner up
+# across EVERY intervening eval/screenshot/reload — do NOT `end` then keep
+# testing. If you already ended (or aren't sure), call `ensure` (instant, no
+# countdown — the user was already warned) before the next driving eval.
+#
+# The banner Notice is persistent (duration 0) and tracked on
+# window.__claudeTestBanner so `end` can dismiss it. `start` does the wait in the
+# SHELL (not inside eval — obs eval has a ~1s ceiling).
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+OBS="$DIR/obs"
+
+show() {
+  # show <js-string-literal-message> — (re)uses the single tracked banner Notice.
+  "$OBS" eval code="(() => {
+    const msg = $1;
+    if (window.__claudeTestBanner && typeof window.__claudeTestBanner.setMessage === 'function') {
+      window.__claudeTestBanner.setMessage(msg);
+    } else {
+      window.__claudeTestBanner = new Notice(msg, 0);
+    }
+    return 'shown';
+  })()" >/dev/null 2>&1
+}
+
+case "$1" in
+  start)
+    secs="${2:-10}"
+    show "'🤖 Claude is about to run an automated Stashpad test.\n✋ Please STOP interacting — starting in about ${secs} seconds…'"
+    i="$secs"
+    while [ "$i" -gt 0 ]; do
+      sleep 1
+      i=$((i - 1))
+      show "'🤖 Claude is testing Stashpad.\n✋ Please don\\'t touch — starting in ${i}s…'"
+    done
+    show "'🤖 Claude is TESTING Stashpad now.\n✋ Please don\\'t touch until you see the all-clear.'"
+    echo "guard: banner up, ${secs}s grace elapsed — safe to drive"
+    ;;
+  ensure)
+    # Instant re-raise (no countdown) — for follow-up driving evals when the
+    # banner may have been ended. The user was already warned by the session's
+    # initial `start`, so no grace period is needed.
+    show "'🤖 Claude is TESTING Stashpad now.\n✋ Please don\\'t touch until you see the all-clear.'"
+    echo "guard: banner ensured (instant)"
+    ;;
+  end)
+    "$OBS" eval code="(() => {
+      if (window.__claudeTestBanner && typeof window.__claudeTestBanner.hide === 'function') {
+        try { window.__claudeTestBanner.hide(); } catch (e) {}
+      }
+      window.__claudeTestBanner = null;
+      new Notice('✅ Safe to use Stashpad again — Claude has finished testing.', 6000);
+      return 'cleared';
+    })()" >/dev/null 2>&1
+    echo "guard: banner cleared, all-clear shown"
+    ;;
+  note)
+    [ -n "$2" ] || { echo "usage: obs-test-guard note 'message'" >&2; exit 1; }
+    # Escape single quotes in the user message for the JS string literal.
+    esc="$(printf '%s' "$2" | sed "s/'/\\\\'/g")"
+    show "'$esc'"
+    echo "guard: custom banner shown"
+    ;;
+  *)
+    echo "usage: obs-test-guard {start [seconds]|ensure|end|note 'message'}" >&2
+    exit 1
+    ;;
+esac

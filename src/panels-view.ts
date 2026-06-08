@@ -178,21 +178,56 @@ export class StashpadPanelsView extends ItemView {
 
   // ---------- Pinned Notes panel ----------
 
+  private openPinnedOptionsMenu(e: MouseEvent): void {
+    const cur = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
+    const menu = new Menu();
+    menu.addItem((i: any) => i.setTitle("Sort by pin order").setChecked(cur === "pin-order")
+      .onClick(() => void this.setPinnedGrouping("pin-order")));
+    menu.addItem((i: any) => i.setTitle("Group by folder").setChecked(cur === "folder")
+      .onClick(() => void this.setPinnedGrouping("folder")));
+    menu.showAtMouseEvent(e);
+  }
+
+  private async setPinnedGrouping(mode: "pin-order" | "folder"): Promise<void> {
+    if ((this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order") === mode) return;
+    this.plugin.settings.folderPanelPinnedGrouping = mode;
+    await this.plugin.saveSettings();
+    this.render();
+  }
+
   private renderPinnedPanel(parent: HTMLElement): void {
     const list = parent.createDiv({ cls: "stashpad-panel-pinned" });
+    // Flat mode wants the per-row folder badge (no headers for context); grouped
+    // mode hides it (the group header already names the folder).
+    if ((this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order") !== "folder") list.addClass("is-flat");
 
-    // Home row — always first, before pinned items.
-    const homeRow = list.createEl("button", { cls: "stashpad-pinned-row stashpad-pinned-home" });
+    // Home row + view-options button on one line: Home tucks to its content
+    // width, the options button (sort by pin order / group by folder) sits to
+    // its right and fills the rest of the row.
+    const headRow = list.createDiv({ cls: "stashpad-pinned-headrow" });
+    const homeRow = headRow.createEl("button", { cls: "stashpad-pinned-row stashpad-pinned-home" });
     const hIcon = homeRow.createSpan({ cls: "stashpad-pinned-icon" });
     setIcon(hIcon, "home");
     homeRow.createSpan({ cls: "stashpad-pinned-label", text: "Home" });
     homeRow.onclick = () => this.openHomeFromPanel();
+    const optsBtn = headRow.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-pinned-opts" });
+    setIcon(optsBtn, "list");
+    optsBtn.setAttr("aria-label", "Pinned view options");
+    optsBtn.onclick = (e) => { e.stopPropagation(); this.openPinnedOptionsMenu(e); };
 
     // 0.86.3: pins now come from note frontmatter (synced), ordered by pinnedAt.
     const pins = this.plugin.listPinnedNotes();
     if (pins.length === 0) {
       const empty = list.createDiv({ cls: "stashpad-pinned-empty" });
       empty.setText("No pinned notes yet — right-click a note and choose “Pin to sidebar.”");
+      return;
+    }
+
+    // 0.95.2: "Sort by pin order" = flat list; "Group by folder" = the original
+    // per-Stashpad grouping (shared setting with the folder panel's Pinned list).
+    const grouping = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
+    if (grouping !== "folder") {
+      pins.forEach((pin, idx) => this.renderPinnedRow(list, pin, idx));
       return;
     }
 

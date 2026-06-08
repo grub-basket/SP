@@ -1,8 +1,8 @@
 {
   "id": "stashpad",
   "name": "Stashpad",
-  "version": "0.91.2",
-  "minAppVersion": "1.7.0",
+  "version": "0.95.4",
+  "minAppVersion": "1.13.0",
   "description": "Chat-style nested-notes view: rapid capture, outliner navigation, in-place editing.",
   "author": "Human",
   "isDesktopOnly": false

@@ -367,6 +367,11 @@ export default class StashpadPlugin extends Plugin {
    *  BOTH a string `id` AND a `parent` field (even if `parent` is null
    *  or ROOT_ID). This avoids false-positives from other plugins or
    *  templates that happen to write a generic `id:` field. */
+  /** 0.95.1: snapshot of the most recent discoverStashpadFolders() result, so a
+   *  vault "delete" event (which fires AFTER the folder's notes are gone) can
+   *  still tell whether the deleted folder was a Stashpad. */
+  knownStashpadFolders = new Set<string>();
+
   discoverStashpadFolders(): string[] {
     const folders = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -380,7 +385,123 @@ export default class StashpadPlugin extends Plugin {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (dir) folders.add(dir);
     }
-    return [...folders].sort();
+    const sorted = [...folders].sort();
+    this.knownStashpadFolders = new Set(sorted);
+    return sorted;
+  }
+
+  /** Folder paths whose delete WE initiated (panel delete with undo). The vault
+   *  "delete" listener skips these so it doesn't double-notify. Cleared after a
+   *  short window. */
+  private suppressedFolderDeletes = new Set<string>();
+
+  /** Detach any open Stashpad tab on `cleaned` (or nested under it). Returns the
+   *  count closed. Reads deferred leaves' persisted folder too. */
+  private closeStashpadTabsFor(cleaned: string): number {
+    let closed = 0;
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      let f = ((leaf.view as any)?.noteFolder ?? "") as string;
+      if (!f) {
+        const st = ((leaf.getViewState?.() as any)?.state ?? {}) as { folderOverride?: string | null };
+        f = (st.folderOverride ?? "") || this.settings.folder || "Stashpad";
+      }
+      f = (f || "").replace(/\/+$/, "");
+      if (f === cleaned || f.startsWith(cleaned + "/")) { leaf.detach(); closed++; }
+    }
+    return closed;
+  }
+
+  /** Drop a folder (and anything nested under it) from the folder-panel
+   *  placement lists. Persists only if something changed. */
+  private async prunePlacementFor(cleaned: string): Promise<void> {
+    const s = this.settings;
+    const prune = (arr: string[] | undefined): string[] =>
+      (arr ?? []).filter((p) => p !== cleaned && !p.startsWith(cleaned + "/"));
+    const before = (s.folderPanelPinned?.length ?? 0) + (s.folderPanelDownranked?.length ?? 0) + (s.folderPanelHidden?.length ?? 0);
+    s.folderPanelPinned = prune(s.folderPanelPinned);
+    s.folderPanelDownranked = prune(s.folderPanelDownranked);
+    s.folderPanelHidden = prune(s.folderPanelHidden);
+    const after = s.folderPanelPinned.length + s.folderPanelDownranked.length + s.folderPanelHidden.length;
+    if (after !== before) await this.saveSettings();
+  }
+
+  /** 0.95.2: delete a Stashpad folder from the panel WITH undo. We move it into
+   *  the vault's `.trash` ourselves (rather than fileManager.trashFile, whose
+   *  destination depends on the user's trash setting and may be unrecoverable)
+   *  so Undo is always a simple move-back. Closes open tabs + posts a PERSISTENT
+   *  notification carrying the Undo action. */
+  async deleteStashpadFolderWithUndo(tf: TFolder): Promise<void> {
+    const cleaned = tf.path.replace(/\/+$/, "");
+    const name = tf.name;
+    const adapter = this.app.vault.adapter;
+    const trashDir = ".trash";
+    try { if (!(await adapter.exists(trashDir))) await adapter.mkdir(trashDir); }
+    catch (e) { console.warn("[Stashpad] couldn't ensure .trash", e); }
+    let dest = `${trashDir}/${name}`;
+    for (let n = 1; await adapter.exists(dest); n++) dest = `${trashDir}/${name} (${n})`;
+
+    this.suppressedFolderDeletes.add(cleaned);
+    window.setTimeout(() => this.suppressedFolderDeletes.delete(cleaned), 5000);
+    const closed = this.closeStashpadTabsFor(cleaned);
+    await this.prunePlacementFor(cleaned);
+    this.knownStashpadFolders.delete(cleaned);
+    try {
+      await adapter.rename(cleaned, dest);
+    } catch (e) {
+      console.warn("[Stashpad] folder delete failed", e);
+      this.suppressedFolderDeletes.delete(cleaned);
+      new Notice("Delete failed (see console).");
+      return;
+    }
+
+    const msg = closed > 0
+      ? `Deleted “${name}” — closed ${closed} open tab${closed === 1 ? "" : "s"}.`
+      : `Deleted “${name}”.`;
+    this.notifications.show({
+      message: msg,
+      kind: "warning",
+      category: "delete",
+      duration: 0,
+      folder: cleaned,
+      actions: [{
+        label: "Undo",
+        onClick: async () => {
+          try {
+            if (await adapter.exists(cleaned)) { new Notice(`Can't undo — “${name}” already exists.`); return; }
+            this.suppressedFolderDeletes.add(cleaned);
+            window.setTimeout(() => this.suppressedFolderDeletes.delete(cleaned), 5000);
+            await adapter.rename(dest, cleaned);
+            new Notice(`Restored “${name}”.`);
+            void this.activateViewForFolder(cleaned);
+          } catch (e) {
+            console.warn("[Stashpad] folder undo failed", e);
+            new Notice("Undo failed (see console).");
+          }
+        },
+      }],
+    });
+  }
+
+  /** 0.95.1: a Stashpad folder was deleted from OUTSIDE the panel (file
+   *  explorer, sync, …) — we didn't trash it, so no undo, but still close any
+   *  open tabs on it, drop it from placement lists, and notify so a vanished tab
+   *  isn't a surprise. Skips folders we just deleted ourselves (those already
+   *  notified with Undo). */
+  async handleStashpadFolderDeleted(path: string): Promise<void> {
+    const cleaned = path.replace(/\/+$/, "");
+    if (!cleaned || this.suppressedFolderDeletes.has(cleaned)) return;
+    const closed = this.closeStashpadTabsFor(cleaned);
+    await this.prunePlacementFor(cleaned);
+    this.knownStashpadFolders.delete(cleaned);
+    const name = cleaned.split("/").pop() || cleaned;
+    this.notifications.show({
+      message: closed > 0
+        ? `Stashpad “${name}” was deleted — closed ${closed} open tab${closed === 1 ? "" : "s"}.`
+        : `Stashpad “${name}” was deleted.`,
+      kind: "warning",
+      category: "delete",
+      folder: cleaned,
+    });
   }
 
   /** The folders eligible for cross-Stashpad search results, derived from
@@ -655,6 +776,22 @@ export default class StashpadPlugin extends Plugin {
       const doc = win?.doc ?? win?.win?.document ?? null;
       if (doc) injectStashpadStyles(doc);
     }));
+
+    // 0.93.0: file-explorer context menu → "Open folder in Stashpad", but ONLY
+    // for folders that are ALREADY Stashpad folders (have at least one Stashpad
+    // note). Lets you jump into an existing Stashpad from the file nav without
+    // turning every folder's menu into a Stashpad entry-point.
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (!(file instanceof TFolder)) return;
+      const path = file.path.replace(/\/+$/, "");
+      if (!this.discoverStashpadFolders().includes(path)) return;
+      menu.addItem((item) => {
+        item
+          .setTitle("Open folder in Stashpad")
+          .setIcon("layout-list")
+          .onClick(() => void this.openFolderInStashpad(path));
+      });
+    }));
     // Existing popouts at plugin-load time (e.g. after a reload while
     // a tiny window was open) — walk all known windows and inject.
     setTimeout(() => {
@@ -770,6 +907,19 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-reveal",
       name: "Reveal or open Stashpad",
       callback: () => void this.activateView({ reveal: true }),
+    });
+    // 0.95.3: bounce focus between the Stashpad side panels and your work.
+    // Layout-independent (no left/right/up/down geometry): "focus tab" snaps to
+    // the Stashpad tab you were last in; "focus panel" reveals the folder panel.
+    this.addCommand({
+      id: "stashpad-focus-last-tab",
+      name: "Focus last Stashpad tab",
+      callback: () => void this.focusLastStashpadTab(),
+    });
+    this.addCommand({
+      id: "stashpad-focus-folder-panel",
+      name: "Focus folder panel",
+      callback: () => void this.focusFolderPanel(),
     });
 
     const call = (method: string) => {
@@ -1235,9 +1385,13 @@ export default class StashpadPlugin extends Plugin {
         if (!setting?.open || !setting?.openTabById) return;
         setting.open();
         setting.openTabById(this.manifest.id);
-        // Defer one tick so display() has rebuilt the input by the
-        // time we focus.
-        setTimeout(() => this.settingTab?.focusSearchInput?.(), 0);
+        // 0.94.4: focus Obsidian's NATIVE settings search input (the old
+        // in-plugin search box is gone — settings are indexed via
+        // getSettingDefinitions now).
+        setTimeout(() => {
+          const inp = setting?.modalEl?.querySelector?.("input[type='search']") as HTMLInputElement | undefined;
+          inp?.focus();
+        }, 0);
       },
     });
     // 0.73.10: per-tab settings shortcuts. Each opens the Settings
@@ -1249,10 +1403,8 @@ export default class StashpadPlugin extends Plugin {
         callback: () => {
           const setting = (this.app as any).setting;
           if (!setting?.open || !setting?.openTabById) return;
-          // Pre-select the tab BEFORE opening so display() renders on
-          // the correct page from the first paint (no flash of the
-          // previous tab).
-          this.settingTab?.openToTab(t.id);
+          // 0.94.4: native settings own page navigation; we can't deep-link to
+          // a specific sub-page, so this lands on Stashpad's settings page list.
           setting.open();
           setting.openTabById(this.manifest.id);
         },
@@ -1433,6 +1585,15 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("rename", (file) => {
       if (file instanceof TFile) { onMaybeOrphan(file); onMaybeMarkdownImport(file); }
     }));
+    // 0.95.1: a Stashpad folder was deleted (panel button OR file explorer OR
+    // anywhere) — close its open tabs + notify. The "delete" event fires after
+    // the folder's notes are gone, so we rely on the knownStashpadFolders
+    // snapshot (refreshed on every discoverStashpadFolders) to recognize it.
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (!(file instanceof TFolder)) return;
+      const cleaned = file.path.replace(/\/+$/, "");
+      if (this.knownStashpadFolders.has(cleaned)) void this.handleStashpadFolderDeleted(cleaned);
+    }));
     // 0.86.5: when a note's FILE moves to a DIFFERENT folder (e.g. dragged in
     // Obsidian's file explorer), its `parent` still points at a note in the OLD
     // folder — a dangling parent that orphans it in the new one. The
@@ -1474,6 +1635,13 @@ export default class StashpadPlugin extends Plugin {
     // stale code (the "old UI after opening the app" report).
     this.registerDomEvent(window, "focus", () => void this.checkForSyncedBuild());
     setTimeout(() => void this.checkForSyncedBuild(), 5000);
+    // 0.92.2: also poll periodically. Focus + one-shot-at-5s missed the case
+    // where a newer build lands WHILE the window stays focused (a fresh deploy,
+    // or Sync pushing a build mid-session) — without a refocus nothing
+    // re-checked, so the reload nudge never appeared. A 45s poll catches it.
+    // (checkForSyncedBuild dedupes on version, so a quiet vault costs one cheap
+    // manifest read per tick and shows the toast at most once per new version.)
+    this.registerInterval(window.setInterval(() => void this.checkForSyncedBuild(), 45_000));
   }
 
   /** 0.76.31: compare the version Obsidian LOADED (this.manifest, read
@@ -2526,6 +2694,29 @@ export default class StashpadPlugin extends Plugin {
     workspace.revealLeaf(leaf);
   }
 
+  /** 0.95.3: snap focus to the Stashpad tab you were last working in — the
+   *  layout-independent way to get OUT of a side panel and back to your notes.
+   *  Prefers the tracked last-active leaf; falls back to any open Stashpad tab,
+   *  then to opening/revealing the default Stashpad. */
+  async focusLastStashpadTab(): Promise<void> {
+    const ws = this.app.workspace;
+    const leaves = ws.getLeavesOfType(STASHPAD_VIEW_TYPE);
+    let leaf = this.lastActiveStashpadLeaf && leaves.includes(this.lastActiveStashpadLeaf)
+      ? this.lastActiveStashpadLeaf
+      : leaves[0] ?? null;
+    if (!leaf) { await this.activateView({ reveal: true }); return; }
+    ws.revealLeaf(leaf);
+    ws.setActiveLeaf(leaf, { focus: true });
+  }
+
+  /** 0.95.3: reveal + focus the folder panel (opening it if needed). The
+   *  return-trip companion to focusLastStashpadTab. */
+  async focusFolderPanel(): Promise<void> {
+    await openFolderPanelView(this.app);
+    const leaf = this.app.workspace.getLeavesOfType(STASHPAD_FOLDER_PANEL_VIEW_TYPE)[0];
+    if (leaf) this.app.workspace.setActiveLeaf(leaf, { focus: true });
+  }
+
   /** Open a fresh Stashpad tab focused on a specific folder via the
    *  per-leaf folderOverride mechanism. Used by the Authorship settings
    *  section's "folders you've contributed to" list. */
@@ -2539,6 +2730,19 @@ export default class StashpadPlugin extends Plugin {
       state: { folderOverride: cleaned } as any,
     });
     this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** 0.93.0: open `folder` in Stashpad — reusing an existing Stashpad tab
+   *  already on that folder (reveal it) instead of opening a duplicate, else
+   *  opening a fresh tab. Backs the file-explorer "Open folder in Stashpad"
+   *  context-menu item. */
+  async openFolderInStashpad(folder: string): Promise<void> {
+    const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
+    if (!cleaned) return;
+    const existing = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+      .find((leaf) => ((leaf.view as any)?.noteFolder ?? "") === cleaned);
+    if (existing) { this.app.workspace.revealLeaf(existing); return; }
+    await this.activateViewForFolder(cleaned);
   }
 
   /** 0.76.19: true when `file` is a Stashpad note — lives in a known
@@ -3632,6 +3836,18 @@ function mergeBindings(
         // always reset it to undefined → unchecked.
         useBoth: !!r.useBoth,
       };
+    }
+  }
+  // 0.91.3: one-time upgrade to a NEW default secondary/useBoth (e.g.
+  // toggleComplete gaining "X" + both-active). Only applies when the saved
+  // binding is the UNTOUCHED old default — same primary, no secondary, not
+  // useBoth — so a user who deliberately cleared/changed it is never clobbered.
+  for (const m of COMMAND_META) {
+    if (!m.defaultSecondary && !m.defaultUseBoth) continue;
+    const b = out[m.id];
+    if (b.primary === m.defaultPrimary && !b.secondary && !b.useBoth) {
+      b.secondary = m.defaultSecondary ?? "";
+      b.useBoth = !!m.defaultUseBoth;
     }
   }
   return out;
