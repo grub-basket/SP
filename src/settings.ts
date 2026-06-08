@@ -112,7 +112,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "moveToTop",       label: "Move note to top",              desc: "Default: Mod+Shift+ArrowUp",                                                              defaultPrimary: "Mod+Shift+ArrowUp" },
   { id: "moveToBottom",    label: "Move note to bottom",           desc: "Default: Mod+Shift+ArrowDown",                                                            defaultPrimary: "Mod+Shift+ArrowDown" },
   { id: "outdent",         label: "Outdent (move to grandparent)", desc: "Default: Mod+[ — re-parents the selection one level up.",                                defaultPrimary: "Mod+[" },
-  { id: "setColor",        label: "Set note color",                desc: "Default: Shift+: — open the color picker for the selection.",                              defaultPrimary: "Shift+:" },
+  { id: "setColor",        label: "Set note color",                desc: "Default: Shift+: or ; — open the color picker for the selection (both chords active).",   defaultPrimary: "Shift+:", defaultSecondary: ";", defaultUseBoth: true },
   { id: "clone",           label: "Clone (duplicate / copy) selection", desc: "Default: Mod+Shift+D — clone selected notes (with their subtrees) as siblings.",   defaultPrimary: "Mod+Shift+D" },
   { id: "insertTemplate",  label: "Insert template (clone an existing note)", desc: "Pick any note in this Stashpad; clone it (with subtree + attachments) into the current view, retimestamped.", defaultPrimary: "" },
   { id: "toggleExpand",    label: "Show more / show less (expand toggle)", desc: "Default: Shift+? — toggle the clamp on the cursor row (or every selected row).", defaultPrimary: "Shift+?" },
@@ -208,6 +208,11 @@ export interface StashpadSettings {
    *  main window). When false, the leaf is moved — the original tab
    *  closes. 0.61.3. */
   popoutDuplicates: boolean;
+  /** 0.96.0: when true (default), picking a result in the Search modal opens
+   *  it in a NEW Stashpad tab instead of navigating the current tab. Applies to
+   *  both same-folder and cross-Stashpad results. Folder-open picks always open
+   *  a new tab regardless. */
+  searchOpensInNewTab: boolean;
   /** 0.68.0: notes the user has pinned to the sidebar Pinned Notes
    *  panel. Cross-folder; rendered in array order. */
   pinnedNotes: Array<{ folder: string; id: string }>;
@@ -407,6 +412,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   confirmAttachmentDelete: true,
   autofocusComposerAfterSend: true,
   popoutDuplicates: true,
+  searchOpensInNewTab: true,
   pinnedNotes: [],
   hideMobileToolbarInStashpad: true,
   slugStopWords: [],  // empty → DEFAULT_STOPWORDS used at runtime
@@ -886,6 +892,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.autofocusComposerAfterSend, (v) => { this.plugin.settings.autofocusComposerAfterSend = v; }, ["composer", "focus", "send"]));
     items.push(toggle("Open in new window — duplicate tab", "ON: the new-window button (in the time-filter row) duplicates the current Stashpad tab — original stays open in the main window. OFF: the leaf is MOVED to the new window, closing the original tab.",
       () => this.plugin.settings.popoutDuplicates, (v) => { this.plugin.settings.popoutDuplicates = v; }, ["popout", "window", "duplicate"]));
+    items.push(toggle("Search results open in a new tab", "When you pick a result in the Search modal, open it in a new Stashpad tab instead of navigating the current tab. Applies to same-folder and cross-Stashpad results alike. On by default.",
+      () => this.plugin.settings.searchOpensInNewTab, (v) => { this.plugin.settings.searchOpensInNewTab = v; }, ["search", "new tab", "results", "open"]));
     items.push(toggle("Prefix timestamps when copying", "Include each note's timestamp before its body when copying with C or Y.",
       () => this.plugin.settings.prefixTimestampsOnCopy, (v) => { this.plugin.settings.prefixTimestampsOnCopy = v; }, ["copy", "timestamp", "prefix"]));
 

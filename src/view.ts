@@ -5525,15 +5525,22 @@ export class StashpadView extends ItemView {
           void this.openFolderInNewTab(item.folder);
           return;
         }
+        // 0.96.0: when "Search results open in a new tab" is on (default), pick
+        // opens the result in a fresh tab; off = the old in-place navigation.
+        const newTab = this.plugin.settings.searchOpensInNewTab !== false;
         if (item.crossFolder && item.crossFile) {
           // Cross-Stashpad result: switch this view's folder and focus
           // the picked note. The setState path rebuilds the tree, so by
           // the time render runs we can navigate to the picked id.
           const targetId = item.id.replace(/^cross:/, "");
-          void this.switchToFolderAndFocus(item.crossFolder, targetId);
+          if (newTab) void this.openNoteInNewTab(item.crossFolder, targetId);
+          else void this.switchToFolderAndFocus(item.crossFolder, targetId);
           return;
         }
-        if (item.node) this.navigateTo(item.node.id);
+        if (item.node) {
+          if (newTab) void this.openNoteInNewTab(this.noteFolder, item.node.id);
+          else this.navigateTo(item.node.id);
+        }
       },
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
       // 0.92.1: only offer "Search excluded folders" when there actually are
@@ -6830,6 +6837,28 @@ export class StashpadView extends ItemView {
    *  as `openFileAtEnd` — when the spawned tab closes, the originating
    *  Stashpad tab regains focus instead of whatever tab Obsidian's
    *  default would pick (usually the tab to the right). */
+  /** 0.96.0: open a search result in a NEW Stashpad tab, focused on the picked
+   *  note (in its own folder). Mirrors openFolderInNewTab but lands on a note
+   *  instead of the folder root. Used by the search modal when
+   *  searchOpensInNewTab is on. */
+  private async openNoteInNewTab(folder: string, noteId: string): Promise<void> {
+    const cleaned = (folder || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!cleaned || !noteId) return;
+    const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
+    const ws = this.app.workspace;
+    const leaf = ws.getLeaf("tab");
+    await leaf.setViewState({
+      type: STASHPAD_VIEW_TYPE,
+      active: true,
+      state: {
+        focusId: noteId,
+        folderOverride: cleaned === settingsFolder ? null : cleaned,
+      },
+    });
+    ws.setActiveLeaf(leaf, { focus: true } as any);
+    ws.revealLeaf(leaf);
+  }
+
   private async openFolderInNewTab(folder: string): Promise<void> {
     const cleaned = (folder || "").trim().replace(/^\/+|\/+$/g, "");
     if (!cleaned) return;
