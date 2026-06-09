@@ -1,4 +1,4 @@
-import { App, Notice, Platform, PluginSettingTab, Setting, SettingPage, TFile, requireApiVersion, setIcon, type SettingDefinitionItem } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting, SettingPage, TFile, setIcon, type SettingDefinitionItem } from "obsidian";
 
 /** Platform-correct OS file-manager name for button/notice labels. */
 function osFileManagerName(): string {
@@ -502,20 +502,35 @@ export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: "hotkeys",     label: "Hotkeys" },
 ];
 
-/** 0.94.0: a declarative sub-page that renders one of Stashpad's settings
- *  tabs via the existing imperative `renderTabContent`. Used by
- *  `getSettingDefinitions()` so the migration to Obsidian's native settings
- *  (1.13.0+) reuses all existing rendering — Phase 1. Per-setting search
- *  entries (decomposing each page into `items`) come in follow-up versions. */
-class StashpadSubPage extends SettingPage {
-  constructor(title: string, private renderFn: (el: HTMLElement) => void) {
-    super();
-    this.title = title;
+/** 0.94.0: a declarative sub-page that renders one of Stashpad's settings tabs
+ *  via the existing imperative `renderTabContent`. Used by
+ *  `getSettingDefinitions()` so the 1.13.0+ native-settings migration reuses all
+ *  existing rendering.
+ *
+ *  0.96.3 — CRITICAL: `SettingPage` is a 1.13-only export. A top-level
+ *  `class ... extends SettingPage` evaluates at MODULE LOAD, so on pre-1.13
+ *  Obsidian (`SettingPage` === undefined) it threw `extends undefined` and the
+ *  WHOLE PLUGIN failed to load. The subclass is now built LAZILY — only when the
+ *  declarative `page:` callback fires, which only happens on 1.13+ (where
+ *  `SettingPage` exists). On older Obsidian this factory is never called, so the
+ *  module loads clean and the imperative `display()` fallback renders settings. */
+let SubPageCtor: (new (title: string, renderFn: (el: HTMLElement) => void) => any) | null = null;
+function makeStashpadSubPage(title: string, renderFn: (el: HTMLElement) => void): any {
+  if (!SubPageCtor) {
+    SubPageCtor = class extends (SettingPage as any) {
+      _renderFn: (el: HTMLElement) => void;
+      constructor(t: string, fn: (el: HTMLElement) => void) {
+        super();
+        (this as any).title = t;
+        this._renderFn = fn;
+      }
+      display(): void {
+        (this as any).containerEl.empty();
+        this._renderFn((this as any).containerEl);
+      }
+    } as any;
   }
-  display(): void {
-    this.containerEl.empty();
-    this.renderFn(this.containerEl);
-  }
+  return new (SubPageCtor as any)(title, renderFn);
 }
 
 export class StashpadSettingTab extends PluginSettingTab {
@@ -530,16 +545,16 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  by the existing `renderTabContent`, so behavior is unchanged and only the
    *  PAGE names are searchable. Phase 2 (follow-up versions) decomposes each
    *  page into `items` so individual settings become searchable too. */
-  /** 0.96.2: backwards compatibility for pre-1.13 Obsidian. Obsidian 1.13+ has
-   *  the declarative settings renderer + native search — let the base class
-   *  render from getSettingDefinitions() (and index it for search) by delegating
-   *  to super.display(). OLDER Obsidian has no declarative API: the base
-   *  display() is a no-op there, so without this override the Stashpad settings
-   *  tab renders BLANK. The fallback below renders the SAME settings imperatively
-   *  (one section per tab) — no native search there, which is fine. This is why
-   *  minAppVersion can sit below 1.13 again. */
+  /** 0.96.2/0.96.3: backwards compatibility for pre-1.13 Obsidian. When the
+   *  declarative settings API is present (gated on the `SettingPage` export
+   *  existing — a precise capability check, not a version guess), let the base
+   *  class render from getSettingDefinitions() and index it for native search by
+   *  delegating to super.display(). On OLDER Obsidian there's no declarative API
+   *  (and super.display() is a no-op), so render the SAME settings imperatively
+   *  (one section per tab) — no native search there, which is fine. Without this
+   *  the Stashpad settings tab renders BLANK on older Obsidian. */
   display(): void {
-    if (requireApiVersion("1.13.0")) { super.display(); return; }
+    if (SettingPage) { super.display(); return; }
     const { containerEl } = this;
     containerEl.empty();
     for (const t of SETTINGS_TABS) {
@@ -570,7 +585,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       return {
         type: "page" as const,
         name: t.label,
-        page: () => new StashpadSubPage(t.label, (el) => this.renderTabContent(el, t.id)),
+        page: () => makeStashpadSubPage(t.label, (el) => this.renderTabContent(el, t.id)),
       };
     });
   }
