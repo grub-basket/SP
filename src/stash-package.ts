@@ -111,6 +111,7 @@ export async function importStashZip(
   buf: ArrayBuffer | Uint8Array,
   destFolder: string,
   existingIds: Set<StashpadId>,
+  opts: { dedupeExisting?: boolean } = {},
 ): Promise<ImportSummary> {
   const zip = await JSZip.loadAsync(buf as any);
   const manifestFile = zip.file("manifest.json");
@@ -161,14 +162,50 @@ export async function importStashZip(
   const attEntries = Object.values(zip.files).filter(
     (f) => !f.dir && f.name.startsWith("attachments/"),
   );
-  if (attEntries.length > 0) await ensureFolder(app, attachmentsFolder);
+  // basename -> the path the note links should point at. We dedupe by CONTENT,
+  // not just name: an existing same-named file is reused ONLY if its bytes match
+  // (a real shared attachment). A same-named-but-DIFFERENT file is a genuine
+  // collision — we write the bundled copy under a unique name (foo-1.png, foo-2…)
+  // so the note links to the CORRECT content. (dedupeExisting widens the "already
+  // here?" check to the whole vault, e.g. a shared original left in place on lock.)
+  const attRoute = new Map<string, string>();
+  let existingByName: Map<string, string> | null = null;
+  if (opts.dedupeExisting) {
+    existingByName = new Map();
+    for (const tf of app.vault.getFiles()) {
+      if (!existingByName.has(tf.name)) existingByName.set(tf.name, tf.path);
+    }
+  }
+  const sameBytes = (a: Uint8Array, b: Uint8Array) => {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  };
+  let folderEnsured = false;
   for (const f of attEntries) {
     const basename = safeZipEntryName(f.name.slice("attachments/".length));
     if (!basename) continue;  // empty or traversal attempt → skip
-    const destPath = `${attachmentsFolder}/${basename}`;
-    if (await app.vault.adapter.exists(destPath)) continue; // dedup by name
-    const buf = await f.async("arraybuffer");
-    await app.vault.createBinary(destPath, buf);
+    const zipBytes = new Uint8Array(await f.async("arraybuffer"));
+    // Candidate same-named files already on disk: a vault-wide match (unlock) and
+    // the default _attachments slot. Reuse the first whose CONTENT is identical.
+    const candidates: string[] = [];
+    const vaultMatch = existingByName?.get(basename);
+    if (vaultMatch) candidates.push(vaultMatch);
+    const defaultPath = `${attachmentsFolder}/${basename}`;
+    if (await app.vault.adapter.exists(defaultPath)) candidates.push(defaultPath);
+    let reused: string | null = null;
+    for (const cand of candidates) {
+      try {
+        if (sameBytes(new Uint8Array(await app.vault.adapter.readBinary(cand)), zipBytes)) { reused = cand; break; }
+      } catch { /* unreadable candidate — fall through to writing a copy */ }
+    }
+    if (reused) { attRoute.set(basename, reused); continue; } // identical → reuse, no copy
+    // Different content (or nothing on disk yet): write to a unique _attachments path.
+    let destPath = defaultPath;
+    for (let n = 1; await app.vault.adapter.exists(destPath); n++) destPath = `${attachmentsFolder}/${uniqueAttachmentName(basename, n)}`;
+    attRoute.set(basename, destPath);
+    if (!folderEnsured) { await ensureFolder(app, attachmentsFolder); folderEnsured = true; }
+    await app.vault.createBinary(destPath, zipBytes.buffer as ArrayBuffer);
     attachmentsWritten++;
   }
 
@@ -184,12 +221,15 @@ export async function importStashZip(
     if (oldParent && oldParent !== ROOT_ID && idRemap.has(oldParent)) {
       newParent = idRemap.get(oldParent)!;
     } else if (oldParent && oldParent !== ROOT_ID && !idRemap.has(oldParent)) {
-      // Parent isn't part of this export — pin to ROOT for safety.
-      newParent = ROOT_ID;
+      // Parent isn't in this bundle. If it already EXISTS in the destination
+      // (e.g. UNLOCK: the locked subtree's parent stayed in the vault), keep the
+      // link so nesting is restored; otherwise pin to ROOT for safety.
+      newParent = existingIds.has(oldParent) ? oldParent : ROOT_ID;
     }
 
-    // Rewrite body: ![[basename]] -> ![[<attachmentsFolder>/basename]]
-    const rewrittenBody = rewriteImportedAttachmentLinks(p.body, attachmentsFolder);
+    // Rewrite body: ![[basename]] -> ![[<routed path>]] (the _attachments copy,
+    // or a reused existing file when deduping).
+    const rewrittenBody = rewriteImportedAttachmentLinks(p.body, attRoute, attachmentsFolder);
 
     const newFm: Record<string, any> = {
       ...p.fm,
@@ -200,9 +240,10 @@ export async function importStashZip(
     if (Array.isArray(newFm.attachments)) {
       // 0.79.18: attachments may be wikilinks now — normalize to a path,
       // re-root into the export's attachments folder, re-wrap as a link.
-      newFm.attachments = (newFm.attachments as string[]).map((a) =>
-        toAttachmentLink(`${attachmentsFolder}/${baseFileName(attachmentLinkPath(a))}`),
-      );
+      newFm.attachments = (newFm.attachments as string[]).map((a) => {
+        const bn = baseFileName(attachmentLinkPath(a));
+        return toAttachmentLink(attRoute.get(bn) ?? `${attachmentsFolder}/${bn}`);
+      });
     }
 
     const finalContent = serializeNote(newFm, rewrittenBody);
@@ -243,17 +284,41 @@ function extractAttachmentRefs(md: string): string[] {
   return [...out];
 }
 
+/** Resolve the attachment files a note's body references — the SAME set the
+ *  exporter bundles into the zip. Used by encryption to decide which attachment
+ *  files are safe to trash on lock (they live inside the encrypted blob). */
+export async function resolveNoteAttachmentFiles(app: App, file: TFile): Promise<TFile[]> {
+  const md = await app.vault.read(file);
+  const out: TFile[] = [];
+  const seen = new Set<string>();
+  for (const ref of extractAttachmentRefs(md)) {
+    const af = app.metadataCache.getFirstLinkpathDest(ref, file.path);
+    if (af && !seen.has(af.path)) { seen.add(af.path); out.push(af); }
+  }
+  return out;
+}
+
 function rewriteAttachmentRef(md: string, oldRef: string, basename: string): string {
   // Replace exactly inside ![[...]] occurrences only.
   return md.replace(new RegExp(`!\\[\\[${escapeRegex(oldRef)}(\\|[^\\]]+)?\\]\\]`, "g"),
     (_m, alias) => `![[${basename}${alias ?? ""}]]`);
 }
 
-function rewriteImportedAttachmentLinks(body: string, attachmentsFolder: string): string {
+/** Insert `-<n>` before the extension: `foo.png` + 2 -> `foo-2.png`. Used to give
+ *  a same-named-but-different-content attachment a unique slot on unlock/import. */
+function uniqueAttachmentName(basename: string, n: number): string {
+  const dot = basename.lastIndexOf(".");
+  return dot > 0 ? `${basename.slice(0, dot)}-${n}${basename.slice(dot)}` : `${basename}-${n}`;
+}
+
+function rewriteImportedAttachmentLinks(body: string, attRoute: Map<string, string>, attachmentsFolder: string): string {
   return body.replace(ATTACHMENT_LINK_RE, (match, ref: string, _aliasRaw) => {
     // If ref already contains a slash, leave it alone (assume the importer wants a specific path).
     if (ref.includes("/")) return match;
-    return match.replace(ref, `${attachmentsFolder}/${ref}`);
+    // Point at the routed path (reused existing file when deduping, else the
+    // _attachments copy). Fall back to _attachments for a ref that wasn't bundled.
+    const target = attRoute.get(ref) ?? `${attachmentsFolder}/${ref}`;
+    return match.replace(ref, target);
   });
 }
 

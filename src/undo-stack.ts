@@ -1,7 +1,10 @@
 export interface UndoAction {
   label: string;
   undo: () => Promise<void>;
-  redo: () => Promise<void>;
+  /** Optional: some actions are undo-only (no forward re-apply). redo() no-ops
+   *  for those instead of crashing on a missing handler (was a latent bug — a few
+   *  push sites omit redo, so redoing them called `undefined()`). */
+  redo?: () => Promise<void>;
 }
 
 export class UndoStack {
@@ -26,7 +29,9 @@ export class UndoStack {
   async redo(): Promise<UndoAction | null> {
     const a = this.redoStack.pop();
     if (!a) return null;
-    try { await a.redo(); } catch (e) { console.error("Stashpad: redo failed", e); throw e; }
+    // Undo-only actions have no redo handler — moving them back to the undo
+    // stack without re-applying is correct (and was previously a crash).
+    if (a.redo) { try { await a.redo(); } catch (e) { console.error("Stashpad: redo failed", e); throw e; } }
     this.undoStack.push(a);
     return a;
   }

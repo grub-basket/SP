@@ -2208,6 +2208,83 @@
 /* Export-to-.stash modal (0.84.2) */
 .stashpad-export-modal { width: min(440px, 92vw); }
 .stashpad-export-desc { color: var(--text-muted); margin: 0 0 12px; }
+/* 0.97.2: roomier encryption modal fields + a slightly wider modal */
+.stashpad-encryption-modal { width: min(480px, 94vw); }
+.stashpad-encryption-field {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  margin-bottom: 10px;
+  font-size: var(--font-ui-medium);
+}
+.stashpad-encryption-row { margin-bottom: 10px; }
+.stashpad-encryption-row .stashpad-encryption-field { margin-bottom: 0; }
+.stashpad-encryption-counter { font-size: var(--font-ui-smaller); color: var(--text-muted); margin: -4px 0 10px; }
+.stashpad-encryption-counter.is-weak { color: var(--text-warning); }
+.stashpad-strength-seg.is-on { background: var(--interactive-accent); }
+/* 0.98.1/0.98.4: locked-subtree placeholder row in the list. Self-contained
+   (NOT a .stashpad-note — that class's layout fought this one). svgs get
+   flex:0 0 auto so flexbox doesn't collapse them to width:0 (the iPad-icon bug). */
+.stashpad-locked-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 7px 10px;
+  margin: 2px 0;
+  border-radius: 6px;
+  border: 1px dashed var(--background-modifier-border-hover, var(--interactive-accent));
+  background: var(--background-secondary);
+}
+.stashpad-locked-row:hover { background: var(--background-modifier-hover); }
+/* Obsidian sizes .svg-icon via --icon-size; set that (raw width on the svg loses
+   the cascade battle and collapses to 0). */
+/* 0.98.11: locked-stub timestamp — left-hand `created` time like a note row. */
+.stashpad-locked-time { flex: 0 0 auto; color: var(--text-muted); }
+.stashpad-locked-icon { flex: 0 0 auto; display: inline-flex; align-items: center; color: var(--text-accent); --icon-size: 16px; }
+.stashpad-locked-icon .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+.stashpad-locked-title { flex: 1 1 auto; font-weight: var(--font-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-locked-count { flex: 0 0 auto; font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.stashpad-locked-unlock {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px;
+  font-size: var(--font-ui-smaller); padding: 3px 10px; cursor: pointer; --icon-size: 14px;
+}
+.stashpad-locked-unlock .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+/* 0.98.35: encrypted-trash TAB (reuses the row/group classes below). */
+.stashpad-trash-view-body { padding: 4px 12px 16px; }
+.stashpad-trash-view-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.stashpad-trash-view-header h3 { flex: 1 1 auto; margin: 0; }
+.stashpad-trash-iconbtn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; padding: 4px 6px; cursor: pointer; --icon-size: 15px; background: transparent; border: none; box-shadow: none; color: var(--text-muted); }
+.stashpad-trash-iconbtn:hover { color: var(--text-normal); }
+.stashpad-trash-iconbtn .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+.stashpad-trash-group-head { display: flex; align-items: center; gap: 6px; --icon-size: 14px; }
+.stashpad-trash-group-icon { display: inline-flex; align-items: center; color: var(--text-faint); }
+.stashpad-trash-group-icon .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+.stashpad-trash-group-count { margin-left: auto; font-size: var(--font-ui-smaller); color: var(--text-faint); }
+/* 0.98.31: encrypted-trash modal. */
+.stashpad-trash-modal .stashpad-trash-intro { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-bottom: 10px; }
+.stashpad-trash-modal .stashpad-trash-empty { color: var(--text-muted); padding: 12px 0; }
+.stashpad-trash-group { margin-bottom: 12px; }
+.stashpad-trash-group-head { font-size: var(--font-ui-smaller); font-weight: var(--font-medium); color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; margin: 6px 0 4px; }
+.stashpad-trash-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; background: var(--background-secondary); margin: 3px 0; }
+.stashpad-trash-row-main { flex: 1 1 auto; display: flex; flex-direction: column; gap: 1px; overflow: hidden; }
+.stashpad-trash-title { font-weight: var(--font-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-trash-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-trash-restore { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; font-size: var(--font-ui-smaller); padding: 3px 10px; cursor: pointer; --icon-size: 13px; }
+.stashpad-trash-restore .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+/* 0.98.24: mobile ⋮ menu button on locked stubs (desktop uses right-click). */
+.stashpad-locked-menu {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  padding: 3px 6px; cursor: pointer; --icon-size: 16px;
+  background: transparent; box-shadow: none; border: none; color: var(--text-muted);
+}
+.stashpad-locked-menu:hover { color: var(--text-normal); }
+.stashpad-locked-menu .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+
+/* 0.97.2/0.97.4: keep the Encryption section's intro text off the left edge and
+   below the page's top fade (it was clipping the first line). */
+.stashpad-encryption-section { padding: 12px 2px 0; }
+.stashpad-encryption-section > .setting-item-description { padding: 4px 14px 10px; line-height: 1.4; }
 .stashpad-export-field { display: flex; flex-direction: column; gap: 4px; }
 .stashpad-export-label { font-size: var(--font-ui-small); color: var(--text-muted); }
 .stashpad-export-name { width: 100%; }
@@ -4158,6 +4235,9 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
 }
 .stashpad-folderpanel-heading-title { flex: 1 1 auto; }
 .stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn { height: 20px; width: 20px; }
+/* 0.98.37: the Folders heading doubles as the folder-switcher button. */
+.stashpad-folderpanel-heading-switch { cursor: pointer; border-radius: 4px; padding: 1px 4px; margin: -1px -4px; }
+.stashpad-folderpanel-heading-switch:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
 /* 0.95.1: per-folder icon in the Folders list */
 .stashpad-folderpanel-folder-icon {
   flex: 0 0 auto;
@@ -4260,6 +4340,12 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
   color: var(--text-accent);
 }
 .stashpad-folderpanel-pinmark svg { width: 12px; height: 12px; }
+/* 0.98.25: archive-folder badge (auto-encrypt incoming). */
+.stashpad-folderpanel-archive-badge {
+  flex: 0 0 auto; display: inline-flex; align-items: center;
+  color: var(--text-accent); margin-left: 2px;
+}
+.stashpad-folderpanel-archive-badge svg { width: 12px; height: 12px; }
 .stashpad-folderpanel-folder-row.is-downranked { opacity: 0.55; }
 .stashpad-folderpanel-folder-row.is-downranked:hover { opacity: 0.85; }
 

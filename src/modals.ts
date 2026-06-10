@@ -14,6 +14,8 @@ export interface DuePickerOptions {
   currentAssignees?: AssigneeRef[];
 }
 import type { NotificationCategory, NotificationKind, NotificationRecord, NotificationService } from "./notifications";
+// Obsidian types `moment` as the namespace (not callable); a callable view.
+const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
 interface LogEv { ts: string; type: string; id: string; payload?: any; author?: string; }
 
@@ -845,6 +847,268 @@ export class StashPasswordModal extends Modal {
     if (!this.delivered) { this.delivered = true; this.onResult({ kind: "cancel" }); }
     this.contentEl.empty();
   }
+}
+
+/** 0.97.0 / 0.97.2: set / unlock / change the vault encryption password. One
+ *  modal, three modes. The caller passes an async `onSubmit` that does the actual
+ *  crypto and returns an error string to show IN the modal (keeping it open for a
+ *  retry) or null on success (closes). setup/change also get a generate button,
+ *  a live strength meter + length counter, and an optional "remember in this
+ *  device's keychain" checkbox. */
+export type EncryptionPromptMode = "setup" | "unlock" | "change";
+export interface EncryptionPromptOpts {
+  mode: EncryptionPromptMode;
+  /** Show the "remember in this device's keychain" checkbox (setup/change). */
+  offerKeychain?: boolean;
+  /** Probe whether Argon2id runs here, to name the suite. */
+  kdfProbe?: () => Promise<boolean>;
+  /** Do the crypto. Return an error string → show in modal + keep open for retry;
+   *  return null → success, close the modal. */
+  onSubmit: (vals: { current?: string; next?: string; remember: boolean }) => Promise<string | null>;
+  /** Called if the modal closes without a successful submit (Cancel/Esc). */
+  onCancel?: () => void;
+}
+
+export class EncryptionPasswordModal extends Modal {
+  private succeeded = false;
+  constructor(app: App, private opts: EncryptionPromptOpts) { super(app); }
+
+  onOpen(): void {
+    const { mode } = this.opts;
+    this.contentEl.empty();
+    this.modalEl.addClass("stashpad-export-modal", "stashpad-encryption-modal");
+    this.titleEl.setText(
+      mode === "setup" ? "Set up encryption password"
+        : mode === "change" ? "Change encryption password"
+          : "Unlock encryption",
+    );
+
+    if (mode === "setup") {
+      this.contentEl.createEl("p", {
+        cls: "stashpad-export-desc",
+        text: "This single password protects everything you encrypt in this vault. It is stored only on this device. There is NO recovery — if you lose it, anything you've encrypted is gone for good.",
+      });
+    }
+
+    // Each field gets an inline Copy/Paste button (Paste while empty, Copy once
+    // it has a value), matching the .stash export modal.
+    const pwSyncers: Array<() => void> = [];
+    const field = (placeholder: string): HTMLInputElement => {
+      const row = this.contentEl.createDiv({ cls: "stashpad-export-pw-row stashpad-encryption-row" });
+      const i = row.createEl("input", { type: "password" }) as HTMLInputElement;
+      i.addClass("stashpad-export-name", "stashpad-encryption-field");
+      i.placeholder = placeholder;
+      const btn = row.createEl("button", { cls: "stashpad-export-copy" });
+      const sync = () => {
+        const empty = i.value.length === 0;
+        btn.setText(empty ? "Paste" : "Copy");
+        btn.toggleClass("is-paste", empty);
+        btn.setAttr("aria-label", `${empty ? "Paste into" : "Copy"} ${placeholder.toLowerCase()}`);
+      };
+      btn.onclick = async (e) => {
+        e.preventDefault();
+        if (i.value.length === 0) {
+          try {
+            const txt = (await navigator.clipboard?.readText())?.trim();
+            if (!txt) { new Notice("Clipboard is empty."); return; }
+            i.value = txt; i.dispatchEvent(new Event("input")); new Notice("Pasted from clipboard.");
+          } catch { new Notice("Couldn't read the clipboard."); }
+        } else {
+          void navigator.clipboard?.writeText(i.value).then(
+            () => new Notice("Copied to clipboard."),
+            () => new Notice("Couldn't access the clipboard."),
+          );
+        }
+      };
+      i.addEventListener("input", sync);
+      sync();
+      pwSyncers.push(sync);
+      return i;
+    };
+    let currentEl: HTMLInputElement | null = null;
+    let nextEl: HTMLInputElement | null = null;
+    let confirmEl: HTMLInputElement | null = null;
+    if (mode === "unlock" || mode === "change") currentEl = field("Current password");
+    if (mode === "setup" || mode === "change") {
+      nextEl = field(mode === "change" ? "New password" : "Password");
+      confirmEl = field("Confirm password");
+    }
+
+    // setup/change extras: strength meter + length counter, generate + show, suite.
+    if (nextEl) {
+      const meter = this.contentEl.createDiv({ cls: "stashpad-export-strength" });
+      const bar = meter.createDiv({ cls: "stashpad-strength-bar" });
+      const segs = [0, 1, 2, 3].map(() => bar.createDiv({ cls: "stashpad-strength-seg" }));
+      const label = meter.createEl("span", { cls: "stashpad-strength-label" });
+      const counter = this.contentEl.createDiv({ cls: "stashpad-encryption-counter" });
+
+      const refresh = () => {
+        const v = nextEl!.value;
+        const s = estimatePasswordStrength(v);
+        segs.forEach((seg, i) => seg.toggleClass("is-on", i < s.level));
+        label.setText(v ? s.label : "");
+        counter.setText(`${v.length} character${v.length === 1 ? "" : "s"}${v.length > 0 && v.length < 6 ? " — use at least 6" : ""}`);
+        counter.toggleClass("is-weak", v.length > 0 && v.length < 6);
+      };
+      nextEl.addEventListener("input", refresh);
+      refresh();
+
+      const genRow = this.contentEl.createDiv({ cls: "stashpad-export-genrow" });
+      genRow.createEl("button", { cls: "stashpad-export-gen", text: "Generate strong passphrase" }).onclick = (e) => {
+        e.preventDefault();
+        const pw = generatePassphrase(5);
+        nextEl!.value = pw;
+        if (confirmEl) confirmEl.value = pw;
+        // Keep it masked — the user reveals with Show if they want; it's already
+        // copied to the clipboard below, and Copy works while masked.
+        refresh();
+        pwSyncers.forEach((s) => s()); // flip Copy/Paste buttons
+        new Notice("Generated — copy it somewhere safe; there's no recovery.");
+        void navigator.clipboard?.writeText(pw).catch(() => {});
+      };
+      const showBtn = genRow.createEl("button", { cls: "stashpad-export-show", text: "Show" });
+      showBtn.onclick = (e) => {
+        e.preventDefault();
+        const show = nextEl!.type === "password";
+        nextEl!.type = show ? "text" : "password";
+        if (confirmEl) confirmEl.type = show ? "text" : "password";
+        showBtn.setText(show ? "Hide" : "Show");
+      };
+
+      const suite = this.contentEl.createEl("div", { cls: "stashpad-export-pw-suite" });
+      suite.setText("Encryption: AES-256-GCM. Checking key-derivation suite…");
+      if (this.opts.kdfProbe) {
+        void this.opts.kdfProbe().then((ok) => {
+          suite.toggleClass("is-weak", !ok);
+          suite.setText(ok
+            ? "Encryption: Argon2id + AES-256-GCM — the strongest suite (used on this device)."
+            : "⚠️ Argon2id can't run here, so this will use the weaker PBKDF2 (600k) + AES-256-GCM fallback.");
+        }).catch(() => suite.setText("Encryption: AES-256-GCM with a password-derived key."));
+      } else {
+        suite.setText("Encryption: Argon2id + AES-256-GCM (PBKDF2 fallback if Argon2 can't run here).");
+      }
+    }
+
+    // Optional: remember in this device's keychain.
+    let rememberCb: HTMLInputElement | null = null;
+    const secretStorage = (this.app as App & { secretStorage?: SecretStorage }).secretStorage;
+    if (this.opts.offerKeychain && secretStorage) {
+      const row = this.contentEl.createDiv({ cls: "stashpad-export-remember" });
+      rememberCb = row.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+      rememberCb.id = "stashpad-enc-remember";
+      const lbl = row.createEl("label", { text: "Remember on this device (keychain) — auto-unlock here without re-typing." });
+      lbl.htmlFor = rememberCb.id;
+      const note = this.contentEl.createDiv({ cls: "stashpad-export-remember-note" });
+      note.setText("Stored only in this device's keychain — doesn't sync to your other devices. Anyone with access to this unlocked device + keychain could decrypt.");
+      note.style.display = "none";
+      rememberCb.onchange = () => { note.style.display = rememberCb!.checked ? "" : "none"; };
+    }
+
+    const errEl = this.contentEl.createEl("div", { cls: "stashpad-export-error" });
+    errEl.style.display = "none";
+    const showErr = (m: string) => { errEl.setText(m); errEl.style.display = ""; };
+
+    const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
+    footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    const go = footer.createEl("button", {
+      cls: "mod-cta",
+      text: mode === "setup" ? "Set up" : mode === "change" ? "Change" : "Unlock",
+    });
+
+    let busy = false;
+    const submit = async () => {
+      if (busy) return;
+      const current = currentEl?.value ?? undefined;
+      const next = nextEl?.value ?? undefined;
+      if ((mode === "unlock" || mode === "change") && !current) { showErr("Enter your current password."); return; }
+      if (mode === "setup" || mode === "change") {
+        if (!next) { showErr("Enter a password."); return; }
+        if (next.length < 6) { showErr("Use at least 6 characters."); return; }
+        if (next !== confirmEl?.value) { showErr("Passwords don't match."); return; }
+      }
+      busy = true; go.disabled = true; errEl.style.display = "none";
+      const prevLabel = go.textContent;
+      go.setText("Working…");
+      try {
+        const err = await this.opts.onSubmit({ current, next, remember: !!rememberCb?.checked });
+        if (err) { showErr(err); busy = false; go.disabled = false; go.setText(prevLabel ?? "OK"); return; }
+        this.succeeded = true;
+        this.close(); // success
+      } catch (e) {
+        showErr(`Failed: ${(e as Error).message}`);
+        busy = false; go.disabled = false; go.setText(prevLabel ?? "OK");
+      }
+    };
+    go.onclick = () => void submit();
+    this.scope.register([], "Enter", (e) => { e.preventDefault(); void submit(); });
+    requestAnimationFrame(() => (currentEl ?? nextEl)?.focus());
+  }
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.succeeded) this.opts.onCancel?.();
+  }
+}
+
+/** 0.97.2: a destructive-action confirm that requires typing an exact phrase
+ *  (game/GitHub-style) before the action button enables. */
+export class TypeToConfirmModal extends Modal {
+  constructor(
+    app: App,
+    private opts: {
+      title: string; body: string; phrase: string; confirmText: string;
+      /** When set, the user must ALSO enter a password that this verifies before
+       *  the action runs (proves they know it, not just that the session's open). */
+      requirePassword?: (pw: string) => Promise<boolean>;
+      onConfirm: () => void | Promise<void>;
+    },
+  ) { super(app); }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.modalEl.addClass("stashpad-export-modal", "stashpad-encryption-modal");
+    this.titleEl.setText(this.opts.title);
+    this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: this.opts.body });
+
+    let pwInput: HTMLInputElement | null = null;
+    if (this.opts.requirePassword) {
+      this.contentEl.createEl("p", { cls: "stashpad-export-desc" }).setText("Enter your encryption password:");
+      pwInput = this.contentEl.createEl("input", { type: "password" }) as HTMLInputElement;
+      pwInput.addClass("stashpad-export-name", "stashpad-encryption-field");
+      pwInput.placeholder = "Password";
+    }
+
+    this.contentEl.createEl("p", { cls: "stashpad-export-desc" }).setText(`Type "${this.opts.phrase}" to confirm.`);
+    const input = this.contentEl.createEl("input", { type: "text" }) as HTMLInputElement;
+    input.addClass("stashpad-export-name", "stashpad-encryption-field");
+    input.placeholder = this.opts.phrase;
+
+    const errEl = this.contentEl.createEl("div", { cls: "stashpad-export-error" });
+    errEl.style.display = "none";
+
+    const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
+    footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    const go = footer.createEl("button", { cls: "mod-cta mod-warning", text: this.opts.confirmText });
+    const phraseOk = () => input.value.trim() === this.opts.phrase;
+    const sync = () => { go.disabled = !phraseOk() || (!!this.opts.requirePassword && !pwInput?.value); };
+    input.addEventListener("input", sync);
+    pwInput?.addEventListener("input", sync);
+    sync();
+
+    let busy = false;
+    const run = async () => {
+      if (busy || !phraseOk()) return;
+      if (this.opts.requirePassword) {
+        busy = true; go.disabled = true; errEl.style.display = "none";
+        const ok = await this.opts.requirePassword(pwInput!.value);
+        if (!ok) { errEl.setText("Wrong password."); errEl.style.display = ""; busy = false; sync(); return; }
+      }
+      this.close();
+      await this.opts.onConfirm();
+    };
+    go.onclick = () => void run();
+    this.scope.register([], "Enter", (e) => { e.preventDefault(); void run(); });
+    requestAnimationFrame(() => (pwInput ?? input).focus());
+  }
+  onClose(): void { this.contentEl.empty(); }
 }
 
 export class CustomColorModal extends Modal {
@@ -1702,7 +1966,7 @@ export class NotificationHistoryModal extends Modal {
     const row = parent.createDiv({ cls: `stashpad-notif-row stashpad-notif-row-${r.kind}` });
     const meta = row.createDiv({ cls: "stashpad-notif-meta" });
     const time = meta.createSpan({ cls: "stashpad-notif-time" });
-    const m = moment(r.ts);
+    const m = momentFn(r.ts);
     time.setText(m.fromNow());
     time.title = m.format("YYYY-MM-DD HH:mm:ss");
     const cat = meta.createSpan({ cls: `stashpad-notif-cat stashpad-notif-cat-${r.category}` });

@@ -36,6 +36,10 @@ const VERSION = 2;
 
 const KDF_PBKDF2 = 1;
 const KDF_ARGON2ID = 2;
+// 0.98.0: raw-key envelope — the 32-byte key is used DIRECTLY as the AES key (no
+// password, no derivation). Used for in-vault locked bundles encrypted with the
+// session DEK (the password only ever unwraps the DEK). Same envelope/AAD/magic.
+const KDF_RAW = 3;
 
 const SALT_LEN = 32;
 const IV_LEN = 12;
@@ -209,6 +213,47 @@ async function decryptV1(envelope: Uint8Array, password: string): Promise<Uint8A
     baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"],
   );
   const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bs(iv) }, key, bs(ct));
+  return new Uint8Array(pt);
+}
+
+/** 0.98.0: encrypt with a RAW 32-byte key (the session DEK), no password/KDF.
+ *  Same `STASHENC` envelope (so isEncryptedStash + the double-encryption guard
+ *  still recognize it), with kdfId=RAW and a 0-length salt. Used for in-vault
+ *  `.stashenc` locked bundles. */
+export async function encryptWithKey(plaintext: Uint8Array, keyBytes: Uint8Array): Promise<Uint8Array> {
+  if (keyBytes.length !== KEY_LEN) throw new Error("Encryption key must be 32 bytes.");
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LEN));
+  const kdf: KdfSpec = { id: KDF_RAW, a: 0, b: 0, c: 0 };
+  const header = buildHeaderV2(kdf, new Uint8Array(0), iv);
+  const key = await importAesKey(keyBytes);
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: bs(iv), additionalData: bs(header) }, key, bs(plaintext),
+  ));
+  const out = new Uint8Array(header.length + ct.length);
+  out.set(header, 0);
+  out.set(ct, header.length);
+  return out;
+}
+
+/** 0.98.0: decrypt a raw-key (`KDF_RAW`) envelope with the 32-byte key. Throws on
+ *  wrong key / tampering (GCM auth) or if the envelope isn't a raw-key one. */
+export async function decryptWithKey(envelope: Uint8Array, keyBytes: Uint8Array): Promise<Uint8Array> {
+  if (!isEncryptedStash(envelope)) throw new Error("Not an encrypted Stashpad file.");
+  const version = envelope[MAGIC.length];
+  if (version !== VERSION) throw new Error(`Unsupported encrypted version (${version}).`);
+  let o = MAGIC.length + 1;
+  const kdfId = envelope[o++];
+  if (kdfId !== KDF_RAW) throw new Error("Not a raw-key (.stashenc) envelope.");
+  o += 4 + 4 + 1; // skip kdf params a, b, c
+  const saltLen = envelope[o++];
+  o += saltLen; // raw → 0-length salt
+  const iv = envelope.slice(o, o + IV_LEN); o += IV_LEN;
+  const header = envelope.slice(0, o);
+  const ct = envelope.slice(o);
+  const key = await importAesKey(keyBytes);
+  const pt = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: bs(iv), additionalData: bs(header) }, key, bs(ct),
+  );
   return new Uint8Array(pt);
 }
 

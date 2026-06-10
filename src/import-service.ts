@@ -24,7 +24,10 @@ const ARCHIVE_DIR = "_archive";
  *  `.edtz` (Obsidian's encrypted export bundle) must always be skipped — at the
  *  top level AND nested inside an imported folder. Centralized so every import
  *  entry point honors it. 0.84.9. */
-const NON_NOTE_EXTENSIONS = new Set([STASH_EXT, "edtz"]);
+// 0.98.0: `.stashenc` = an in-vault LOCKED bundle — must NEVER be adopted as a
+// note or auto-imported (unlike `.stash`, which is an export to import). It just
+// sits locked until the user explicitly unlocks it.
+const NON_NOTE_EXTENSIONS = new Set([STASH_EXT, "edtz", "stashenc", "stashmeta"]);
 
 /** One processed import, kept so the batch can be undone. */
 type ImportRecord =

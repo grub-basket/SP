@@ -9,6 +9,9 @@ export const STASHPAD_FOLDER_PANEL_VIEW_TYPE = "stashpad-folder-panel";
  *  note's body + metadata + children. Lives separately from the
  *  left-sidebar panels view (Pinned/Shared/Tasks). */
 export const STASHPAD_DETAIL_VIEW_TYPE = "stashpad-detail";
+/** 0.98.35: dedicated encrypted-trash tab (recoverable deleted notes, grouped by
+ *  the folder they came from). */
+export const STASHPAD_TRASH_VIEW_TYPE = "stashpad-trash";
 export const ROOT_ID = "__root__";
 
 /** A user's pinned-note record. Cross-folder by design — the panel

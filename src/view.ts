@@ -1,5 +1,5 @@
 import {
-  ItemView, MarkdownRenderer, Menu, Notice, Platform,
+  App, ItemView, MarkdownRenderer, Menu, Notice, Platform,
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce,
   moment, setIcon,
 } from "obsidian";
@@ -147,6 +147,10 @@ export class StashpadView extends ItemView {
   private lastSelected: StashpadId | null = null;
   /** public: read by extracted command modules (commands/*.ts). */
   cursorIdx = -1;
+  /** 0.98.6: after an async restore (e.g. decrypt → importStashZip → tree
+   *  rebuild), cursor + select this id once it appears in the list. Cleared when
+   *  applied. Survives the intermediate render where the note isn't in the tree yet. */
+  private pendingCursorId: StashpadId | null = null;
   /** public: read by extracted command modules (commands/*.ts). */
   currentChildren: TreeNode[] = [];
   private modeSplit: boolean | null = null;
@@ -1328,6 +1332,18 @@ export class StashpadView extends ItemView {
    *  children. Structural (applies to the top of the displayed list,
    *  not recursively into descendants) — see settings jsdoc. Default
    *  off. */
+  /** 0.98.26: per-folder encryption filter — "all" | "locked" | "unlocked". */
+  private currentEncryptionFilter(): "all" | "locked" | "unlocked" {
+    return this.plugin.settings.encryptionFilter?.[this.noteFolder] ?? "all";
+  }
+  private async setEncryptionFilter(v: "all" | "locked" | "unlocked"): Promise<void> {
+    const map = { ...(this.plugin.settings.encryptionFilter ?? {}) };
+    if (v === "all") delete map[this.noteFolder];
+    else map[this.noteFolder] = v;
+    this.plugin.settings.encryptionFilter = map;
+    await this.plugin.saveSettings();
+  }
+
   private currentHideChildless(): boolean {
     return !!this.plugin.settings.hideChildlessNotes?.[this.noteFolder];
   }
@@ -1493,6 +1509,20 @@ export class StashpadView extends ItemView {
     // viewport — the profile showed body reads at full-list scale were
     // ~97% of the time.
     this.bodyRenderer.arm();
+    // 0.98.6: a pending cursor target (e.g. a just-decrypted note) — apply it
+    // once the note actually appears in the list, then clear. Until then it
+    // survives intermediate renders (the restored note arrives a tick later via
+    // the metadataCache → tree rebuild).
+    if (this.pendingCursorId) {
+      const idx = this.currentChildren.findIndex((n) => n.id === this.pendingCursorId);
+      if (idx >= 0) {
+        this.cursorIdx = idx;
+        this.selection.clear();
+        this.selection.add(this.pendingCursorId);
+        this.lastSelected = this.pendingCursorId;
+        this.pendingCursorId = null;
+      }
+    }
     if (focused.file && Platform.isMobile) {
       this.renderFocusedHeaderMini(list, focused);
       this.renderFocusedHeader(list, focused);
@@ -1505,29 +1535,211 @@ export class StashpadView extends ItemView {
     //     cursor / keyboard-nav model.
     const mode = this.currentViewMode();
     const fileItems = mode === "everything" ? this.collectFileItems(focused.id) : [];
-    if (this.currentChildren.length === 0 && fileItems.length === 0) {
+    // 0.98.1/0.98.4: locked-subtree placeholders, interleaved by the locked
+    // note's `created` so a locked note keeps its slot (no jarring sink-to-bottom).
+    // A scan-only blob with no recorded created sorts to the end.
+    type Lk = { blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null };
+    const lockTs = (lk: Lk) => (lk.created && Number.isFinite(Date.parse(lk.created)) ? Date.parse(lk.created) : Number.POSITIVE_INFINITY);
+    // Nested: stubs directly under the focus. Flat/Everything show the WHOLE
+    // subtree flattened, so gather stubs anchored to the focus OR any currently-
+    // shown descendant (a locked stub always anchors to a visible note — a locked
+    // parent keeps its children inside its own blob). Otherwise a deeply-nested
+    // locked note would vanish from the flat list entirely. (0.98.20)
+    // 0.98.26: encryption filter — "unlocked" hides locked stubs entirely.
+    const encFilter = this.currentEncryptionFilter();
+    let lockSource: Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }>;
+    if (encFilter === "unlocked") {
+      lockSource = [];
+    } else if (mode === "nested") {
+      lockSource = this.plugin.lockedSubtreesFor(this.noteFolder, focused.id);
+    } else {
+      const ids = new Set<StashpadId>([focused.id, ...this.currentChildren.map((n) => n.id)]);
+      const seen = new Set<string>();
+      lockSource = [];
+      for (const id of ids) {
+        for (const lk of this.plugin.lockedSubtreesFor(this.noteFolder, id)) {
+          if (!seen.has(lk.blob)) { seen.add(lk.blob); lockSource.push(lk); }
+        }
+      }
+    }
+    const lockItems = lockSource
+      .map((lk) => ({ lk, ts: lockTs(lk) }))
+      .sort((a, b) => a.ts - b.ts);
+
+    // 0.98.9: in MANUAL sort, a locked placeholder keeps the exact slot its note
+    // occupied — anchored after its `prevSibling` (the left-neighbor captured at
+    // lock), NOT by `created`. Otherwise locking a reordered note would jump the
+    // placeholder to its creation-time slot (usually the top). Matches the
+    // unlock-side restore so lock→unlock is positionally stable.
+    // Manual prevSibling-anchoring only applies in nested view (flat/everything
+    // synthesize a created-sorted list and ignore manual sort).
+    const manual = mode === "nested" && this.sortStore.getMode(this.noteFolder, focused.id) === "manual";
+
+    if (this.currentChildren.length === 0 && fileItems.length === 0 && lockItems.length === 0) {
       list.createDiv({ cls: "stashpad-empty", text: "No notes here yet. Type below to add one." });
+    } else if (manual && lockItems.length > 0) {
+      // Build the full sibling sequence (unlocked notes + locked placeholders),
+      // inserting each placeholder after its `prevSibling`. CHAIN-RESOLVING: a
+      // prevSibling can be another LOCKED note (when you lock note B then note C
+      // whose left-neighbor was B) — so we iterate until every placeholder whose
+      // anchor is already placed gets inserted. Without this, the 2nd lock's
+      // anchor wouldn't resolve and the placeholder floated to the top.
+      const idxOfNote = new Map<StashpadId, number>(this.currentChildren.map((n, i) => [n.id, i]));
+      const lockByRoot = new Map<StashpadId, Lk>();
+      for (const { lk } of lockItems) if (lk.rootId) lockByRoot.set(lk.rootId, lk);
+      const seq: StashpadId[] = this.currentChildren.map((n) => n.id);
+      // Newest-first so multiple placeholders sharing one anchor end up oldest-
+      // closest-to-anchor after repeated insert-at(anchor+1).
+      const pending = lockItems.map(({ lk }) => lk).filter((lk) => lk.rootId)
+        .sort((a, b) => lockTs(b) - lockTs(a));
+      let progress = true;
+      while (pending.length && progress) {
+        progress = false;
+        for (let i = 0; i < pending.length; i++) {
+          const lk = pending[i];
+          const prev = lk.prevSibling ?? null;
+          let at: number;
+          if (prev == null) at = 0;                       // genuinely first → top
+          else { const p = seq.indexOf(prev); if (p < 0) continue; at = p + 1; }
+          seq.splice(at, 0, lk.rootId!);
+          pending.splice(i, 1); i--; progress = true;
+        }
+      }
+      // Anchor pointed at something no longer present → trail at the end.
+      for (const lk of pending) seq.push(lk.rootId!);
+      for (const id of seq) {
+        const ni = idxOfNote.get(id);
+        if (ni !== undefined) this.renderNote(list, this.currentChildren[ni], ni);
+        else { const lk = lockByRoot.get(id); if (lk) this.renderLockedPlaceholder(list, lk); }
+      }
+      // Loose files (everything mode) trail the manual list, oldest first.
+      for (const f of fileItems.slice().sort((a, b) => a.stat.ctime - b.stat.ctime)) this.renderFileRow(list, f);
     } else if (fileItems.length === 0) {
-      for (let i = 0; i < this.currentChildren.length; i++) this.renderNote(list, this.currentChildren[i], i);
+      // Notes keep their tree order; each placeholder is inserted before the
+      // first note whose created is later than the placeholder's.
+      let pi = 0;
+      for (let i = 0; i < this.currentChildren.length; i++) {
+        const nts = Number.isFinite(Date.parse(this.currentChildren[i].created)) ? Date.parse(this.currentChildren[i].created) : 0;
+        while (pi < lockItems.length && lockItems[pi].ts <= nts) { this.renderLockedPlaceholder(list, lockItems[pi].lk); pi++; }
+        this.renderNote(list, this.currentChildren[i], i);
+      }
+      while (pi < lockItems.length) { this.renderLockedPlaceholder(list, lockItems[pi].lk); pi++; }
     } else {
       type Item =
         | { kind: "note"; ts: number; idx: number }
-        | { kind: "file"; ts: number; file: TFile };
-      const noteItems: Item[] = this.currentChildren.map((n, idx) => {
-        const t = Number.isFinite(Date.parse(n.created)) ? Date.parse(n.created) : 0;
-        return { kind: "note", ts: t, idx };
-      });
+        | { kind: "file"; ts: number; file: TFile }
+        | { kind: "lock"; ts: number; lk: Lk };
       const items: Item[] = [
-        ...noteItems,
+        ...this.currentChildren.map((n, idx) => ({ kind: "note" as const, ts: Number.isFinite(Date.parse(n.created)) ? Date.parse(n.created) : 0, idx })),
         ...fileItems.map((f) => ({ kind: "file" as const, ts: f.stat.ctime, file: f })),
+        ...lockItems.map((l) => ({ kind: "lock" as const, ts: l.ts, lk: l.lk })),
       ];
       items.sort((a, b) => a.ts - b.ts);
       for (const it of items) {
         if (it.kind === "note") this.renderNote(list, this.currentChildren[it.idx], it.idx);
-        else this.renderFileRow(list, it.file);
+        else if (it.kind === "file") this.renderFileRow(list, it.file);
+        else this.renderLockedPlaceholder(list, it.lk);
       }
     }
     if (focused.file && Platform.isMobile) this.installFocusedMiniObserver(list);
+  }
+
+  /** 0.98.1: a locked-subtree placeholder row. Click → unlock (prompts for the
+   *  password if needed) → decrypt back. Delete-guarded: no delete affordance,
+   *  and it's not a tree node so the delete commands never target it. */
+  private renderLockedPlaceholder(list: HTMLElement, lk: { blob: string; title: string; count: number; created?: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }): void {
+    const row = list.createDiv({ cls: "stashpad-locked-row" });
+    // 0.98.11: left-hand timestamp, matching a normal note row's `created` time,
+    // so a locked stub still reads on the same timeline as the notes around it.
+    if (lk.created) row.createSpan({ cls: "stashpad-note-time stashpad-locked-time", text: this.formatTime(lk.created) });
+    const icon = row.createSpan({ cls: "stashpad-locked-icon" });
+    setIcon(icon, "lock");
+    // 0.98.14: optionally hide the real title (privacy) — show a generic label.
+    // Also fall back to generic when the on-disk title is empty (it was locked with
+    // hide-titles on, so the real title lives only inside the blob).
+    const hideTitle = (this.plugin.settings.hideLockedTitles ?? false) || !lk.title;
+    row.createSpan({ cls: "stashpad-locked-title", text: hideTitle ? "Locked note" : lk.title });
+    row.createSpan({ cls: "stashpad-locked-count", text: lk.count > 1 ? `${lk.count} notes · locked` : "locked" });
+    const unlockBtn = row.createEl("button", { cls: "stashpad-locked-unlock", text: "Unlock" });
+    setIcon(unlockBtn.createSpan({ cls: "stashpad-btn-icon" }), "unlock");
+    const doUnlock = async (e: Event) => {
+      e.preventDefault(); e.stopPropagation();
+      // Positional fields come straight from the placeholder (sidecar-backed via
+      // lockedSubtreesFor), so the restore survives a lost in-memory registry.
+      // Fall back to the registry entry only if the scan didn't carry them.
+      const entry = (this.plugin.settings.lockedSubtrees ?? []).find((x) => x.blob === lk.blob);
+      const rootId = lk.rootId ?? entry?.rootId ?? null;
+      const parentId = (lk.parentId ?? entry?.parentId ?? ROOT_ID) as StashpadId;
+      const prevSibling = (lk.prevSibling ?? entry?.prevSibling ?? null) as StashpadId | null;
+      const ok = await this.plugin.unlockBundleAt(lk.blob);
+      if (ok) {
+        this.selection.clear();
+        this.lastSelected = null;
+        if (rootId) {
+          // Restore the note's manual slot. If the parent has no explicit order
+          // yet but IS in manual sort, seed one from the current display order
+          // (incl. the just-restored note) so prevSibling reinsert can take hold —
+          // otherwise a reordered note would fall back to created-asc (its
+          // ORIGINAL position), which is the bug this fixes.
+          let order = this.order.getOrder(this.noteFolder, parentId);
+          const manual = this.sortStore.getMode(this.noteFolder, parentId) === "manual";
+          if (order.length === 0 && manual) {
+            order = this.tree.getChildren(parentId).map((n) => n.id);
+          }
+          if (order.length > 0) {
+            const without = order.filter((id) => id !== rootId);
+            const at = prevSibling && without.includes(prevSibling) ? without.indexOf(prevSibling) + 1 : 0;
+            without.splice(Math.max(0, at), 0, rootId);
+            this.order.setOrder(this.noteFolder, parentId, without);
+            void this.order.flush(this.noteFolder);
+          }
+          // Cursor + select the decrypted note once it re-appears in the list.
+          this.pendingCursorId = rootId;
+        }
+        this.render();
+      }
+    };
+    unlockBtn.onclick = doUnlock;
+    // 0.98.24: context menu for locked stubs — right-click on desktop, ⋮ button on
+    // mobile (no right-click there). Locked stubs aren't tree nodes, so the normal
+    // note menu (openNoteMenu) can't serve them; this is their own small menu.
+    const openLockedMenu = (e: MouseEvent) => {
+      e.preventDefault(); e.stopPropagation();
+      const menu = new Menu();
+      menu.addItem((i: any) => i.setTitle("Decrypt (unlock)").setIcon("unlock")
+        .onClick(() => void doUnlock(e)));
+      if (!Platform.isMobile) {
+        const osManager = Platform.isMacOS ? "Finder" : Platform.isWin ? "File Explorer" : "file manager";
+        menu.addItem((i: any) => i.setTitle(`Show in ${osManager}`).setIcon("folder-search").onClick(() => {
+          try {
+            const shell = (window as any).require?.("electron")?.shell;
+            const fullPath = (this.app.vault.adapter as any)?.getFullPath?.(lk.blob);
+            if (fullPath && shell?.showItemInFolder) shell.showItemInFolder(fullPath);
+          } catch (err) { console.warn("[Stashpad] showItemInFolder failed", err); }
+        }));
+      }
+      menu.addItem((i: any) => i.setTitle("Copy encrypted file path").setIcon("copy").onClick(() => {
+        // 0.98.32: full absolute path on desktop (pasteable into Finder/Explorer);
+        // mobile has no usable filesystem path, so fall back to the vault-relative one.
+        let path = lk.blob;
+        if (!Platform.isMobile) {
+          try { path = (this.app.vault.adapter as any)?.getFullPath?.(lk.blob) || lk.blob; } catch { /* keep relative */ }
+        }
+        void navigator.clipboard.writeText(path);
+        new Notice("Path copied.");
+      }));
+      menu.showAtMouseEvent(e);
+    };
+    row.oncontextmenu = openLockedMenu;
+    if (Platform.isMobile) {
+      const menuBtn = row.createEl("button", { cls: "stashpad-locked-menu" });
+      setIcon(menuBtn, "more-vertical");
+      menuBtn.setAttr("aria-label", "Locked note menu");
+      menuBtn.onclick = (e) => openLockedMenu(e);
+    }
+    // 0.98.8: only the Unlock button decrypts — clicking elsewhere on the row
+    // must NOT trigger the (heavyweight, password-prompting) decrypt by accident.
+    row.setAttr("aria-label", `${hideTitle ? "Locked note" : `Locked: ${lk.title}`}. Use the Unlock button to decrypt.`);
   }
 
   /** Re-paint just the list. Used after a filter / view-toggle setting
@@ -1557,6 +1769,8 @@ export class StashpadView extends ItemView {
   }
 
   private renderFileRow(parent: HTMLElement, file: TFile): void {
+    // 0.98.26: "locked" filter hides non-Stashpad file rows too (not encrypted).
+    if (this.currentEncryptionFilter() === "locked") return;
     const row = parent.createDiv({ cls: "stashpad-file-row" });
     row.dataset.path = file.path;
     const meta = row.createDiv({ cls: "stashpad-file-meta" });
@@ -2898,7 +3112,7 @@ export class StashpadView extends ItemView {
     setIcon(icon, mode === "flat" ? "list" : mode === "everything" ? "layout-grid" : "list-tree");
     const label = btn.createSpan({ cls: "stashpad-view-label" });
     label.setText(VIEW_MODE_LABELS[mode]);
-    if (mode !== "nested") btn.addClass("is-active");
+    if (mode !== "nested" || this.currentEncryptionFilter() !== "all") btn.addClass("is-active");
     btn.title = mode === "nested"
       ? "View: Nested (the default). Click to switch to Flat or Everything."
       : mode === "flat"
@@ -2972,6 +3186,28 @@ export class StashpadView extends ItemView {
     addRow("everything", "All descendants PLUS non-Stashpad files in the folder.");
 
     container.createDiv({ cls: "stashpad-view-popover-divider" });
+
+    // 0.98.26: encryption filter — show all / only locked stubs / only decrypted.
+    // Only shown once encryption is set up (otherwise nothing is ever locked).
+    if (this.plugin.encryption?.isConfigured?.()) {
+      const encNow = this.currentEncryptionFilter();
+      const addEncRow = (val: "all" | "locked" | "unlocked", label: string, desc: string): void => {
+        const row = container.createDiv({ cls: "stashpad-view-popover-row" });
+        if (val === encNow) row.addClass("is-active");
+        row.createDiv({ cls: "stashpad-view-popover-main" })
+          .createSpan({ cls: "stashpad-view-popover-label", text: label });
+        row.createDiv({ cls: "stashpad-view-popover-desc", text: desc });
+        row.onclick = async (e) => {
+          e.preventDefault(); e.stopPropagation();
+          if (val !== encNow) { await this.setEncryptionFilter(val); this.refreshList(); }
+          onPicked();
+        };
+      };
+      addEncRow("all", "Encryption: show all", "Both locked 🔒 and decrypted notes.");
+      addEncRow("locked", "Encryption: locked only", "Show only locked 🔒 stubs.");
+      addEncRow("unlocked", "Encryption: decrypted only", "Hide locked 🔒 stubs.");
+      container.createDiv({ cls: "stashpad-view-popover-divider" });
+    }
 
     const hcRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
     const hcCheck = hcRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
@@ -3924,6 +4160,8 @@ export class StashpadView extends ItemView {
 
   private renderNote(parent: HTMLElement, node: TreeNode, idx: number): void {
     if (!node.file) return;
+    // 0.98.26: "locked" encryption filter hides normal (decrypted) note rows.
+    if (this.currentEncryptionFilter() === "locked") return;
     const file = node.file;
     const childCount = this.tree.getChildren(node.id).length;
     const isSelected = this.selection.has(node.id);
@@ -4278,8 +4516,8 @@ export class StashpadView extends ItemView {
     // It also caused the "draft keeps coming back after Enter" bug across
     // multiple Stashpad tabs sharing the default folder. Removed entirely;
     // the textarea now reflects only what loadDraftsForFolder put into
-    // composerDraft. If composerDraft is wrong, fix it at the source.
-    const restoredText: string | null = null;
+    // composerDraft. If composerDraft is wrong, fix it at the source. (The old
+    // post-restore "clear-X" button went with it — 0.97.x removed the dead code.)
 
     const composer = parent.createDiv({ cls: "stashpad-composer" });
 
@@ -4291,31 +4529,6 @@ export class StashpadView extends ItemView {
     }) as HTMLTextAreaElement;
     ta.value = this.composerDraft;
 
-    // Clear-X button: only shown right after auto-restore. Hides on input or click.
-    let clearBtn: HTMLButtonElement | null = null;
-    const removeClearBtn = () => {
-      if (clearBtn) { clearBtn.remove(); clearBtn = null; }
-    };
-    if (restoredText !== null && restoredText.length > 0) {
-      clearBtn = taWrap.createEl("button", { cls: "stashpad-composer-clear" }) as HTMLButtonElement;
-      setIcon(clearBtn, "x");
-      clearBtn.title = "Clear restored draft";
-      clearBtn.onmousedown = (e) => e.preventDefault(); // don't steal focus from textarea
-      clearBtn.onclick = (e) => {
-        e.preventDefault();
-        ta.value = "";
-        this.composerDraft = "";
-        void this.saveDraft("");
-        removeClearBtn();
-        ta.focus();
-      };
-      // Select all on next frame so the user can type-to-replace.
-      requestAnimationFrame(() => {
-        ta.focus();
-        ta.setSelectionRange(0, ta.value.length);
-      });
-    }
-
     // Debounce non-empty saves so fast typing doesn't queue a disk write
     // per keystroke (a real issue on slow / network drives). Empty/clear
     // saves still go through immediately on submit/blur for promptness.
@@ -4325,7 +4538,6 @@ export class StashpadView extends ItemView {
     ta.addEventListener("input", () => {
       this.composerDraft = ta.value;
       this.debouncedSaveDraft!(ta.value);
-      removeClearBtn(); // any keystroke means the user is past the "restored" state
     });
     ta.addEventListener("blur", () => { void this.saveDraft(ta.value); });
 
@@ -4923,6 +5135,8 @@ export class StashpadView extends ItemView {
     if (matchBinding(e, b.pickDestination)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openDestinationPicker(); return; }
     if (matchBinding(e, b.search)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openSearchModal(); return; }
     if (matchBinding(e, b.commandPalette)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openStashpadCommandPalette(); return; }
+    if (matchBinding(e, b.lockSelection)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdLockSelection(); return; }
+    if (matchBinding(e, b.unlockAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdUnlockAll(); return; }
     if (matchBinding(e, b.searchInParent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openSearchInParentModal(); return; }
     // Folder switch / .stash import-export bindings — fire from anywhere
     // in the view (composer or list). Default chord is empty; user binds
@@ -5285,6 +5499,243 @@ export class StashpadView extends ItemView {
 
   // --- Public commands (used by main.ts addCommand too) ---
 
+  /** 0.98.10: lock (encrypt) the selected note(s) — or the cursor row if nothing
+   *  is selected — into `.stashenc` bundle(s) in place. Command-palette /
+   *  keybind counterpart of the context-menu "Encrypt (lock) note + children".
+   *  If a parent AND one of its descendants are both selected, only the parent
+   *  is locked (its subtree already subsumes the descendant). */
+  async cmdLockSelection(): Promise<void> {
+    if (!this.plugin.encryption?.isConfigured?.()) {
+      new Notice("Set up encryption first (Settings → Encryption).");
+      return;
+    }
+    const targets = this.getActionTargets();
+    if (targets.length === 0) return;
+    const ids = new Set(targets.map((t) => t.id));
+    // Drop targets nested under another target (a parent lock already subsumes its
+    // descendants) AND any target already represented by a locked bundle — both
+    // would otherwise double-process a subtree.
+    const alreadyLocked = new Set((this.plugin.settings.lockedSubtrees ?? []).map((e) => e.rootId).filter((x): x is StashpadId => !!x));
+    const roots = targets.filter((t) => {
+      if (alreadyLocked.has(t.id)) return false;
+      let p = t.parent;
+      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      return true;
+    });
+    if (roots.length === 0) { new Notice("Nothing to lock (already locked)."); return; }
+    let locked = 0;
+    for (const t of roots) {
+      // Capture the preceding sibling in any explicit manual order, so unlock can
+      // drop the note back into the same slot (mirrors the context-menu handler).
+      const order = this.order.getOrder(this.noteFolder, t.parent ?? ROOT_ID);
+      const idx = order.indexOf(t.id);
+      const prevSibling = idx > 0 ? order[idx - 1] : null;
+      // Silent per-item; one summary toast below (a batch shouldn't spam).
+      const r = await this.plugin.lockNoteSubtree(this.noteFolder, t.id, prevSibling, { silent: true });
+      if (r) locked++;
+    }
+    if (locked > 0) {
+      this.selection.clear();
+      this.lastSelected = null;
+      this.render();
+      this.plugin.notifications.show({ message: `Locked ${locked} stash${locked === 1 ? "" : "es"}.`, kind: "success", category: "system", folder: this.noteFolder });
+    }
+  }
+
+  /** 0.98.28 (Phase 4): move the selected note(s) into an archive folder, which
+   *  auto-encrypts them on arrival. Uses the default archive folder if set; else
+   *  the only archive folder if there's just one; else offers a pick-list. */
+  async cmdMoveToArchive(): Promise<void> {
+    if (!this.plugin.encryption?.isConfigured?.()) {
+      new Notice("Set up encryption first (Settings → Encryption)."); return;
+    }
+    const archives = (this.plugin.settings.archiveFolders ?? []).filter((f) => f !== this.noteFolder);
+    if (archives.length === 0) {
+      new Notice("No archive folder available. Mark a folder as archive first (folder panel → right-click → “Mark as archive”).", 8000);
+      return;
+    }
+    const targets = this.getActionTargets();
+    if (targets.length === 0) return;
+    const def = this.plugin.settings.defaultArchiveFolder;
+    const dest = (def && archives.includes(def)) ? def : (archives.length === 1 ? archives[0] : null);
+    const go = (folder: string) => { void this.archiveSources(targets, folder); };
+    if (dest) { go(dest); return; }
+    // Several archives, no default → pick one.
+    new ArchiveFolderSuggestModal(this.app, archives, go).open();
+  }
+
+  /** 0.98.34 (Phase 4): archive the given notes into `dest` — encrypt each root's
+   *  subtree with the BLOB written into the archive folder (so the 🔒 stub appears
+   *  there) while reading + deleting the plaintext from THIS source folder. Pushes
+   *  ONE undo entry that restores them to the source folder (Ctrl+Z). Clicking the
+   *  stub's Unlock later restores in the archive folder, as before. No file move +
+   *  no async hook, so undo is a clean self-contained reversal. */
+  private async archiveSources(sources: TreeNode[], dest: string): Promise<void> {
+    const src = this.noteFolder;
+    const ids = new Set(sources.map((t) => t.id));
+    const roots = sources.filter((t) => {
+      let p = t.parent;
+      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      return true;
+    });
+    if (roots.length === 0) return;
+    const rootIds = roots.map((r) => r.id);
+    let blobs: string[] = [];
+    for (const t of roots) {
+      const order = this.order.getOrder(src, t.parent ?? ROOT_ID);
+      const idx = order.indexOf(t.id);
+      const prevSibling = idx > 0 ? order[idx - 1] : null;
+      const r = await this.plugin.lockNoteSubtree(src, t.id, prevSibling, { silent: true, blobFolder: dest });
+      if (r) blobs.push(r.blobPath);
+    }
+    if (blobs.length === 0) return;
+    this.selection.clear(); this.lastSelected = null; this.tree.rebuild(src); this.render();
+    const name = dest.split("/").pop() || dest;
+    this.plugin.notifications.show({ message: `Archived ${blobs.length} note${blobs.length === 1 ? "" : "s"} → “${name}”. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder: src });
+    this.plugin.getUndoStack(src).push({
+      label: `Archive (${blobs.length})`,
+      undo: async () => {
+        // Restore the blobs back to the SOURCE folder (not the archive folder).
+        for (const b of blobs) { try { await this.plugin.unlockBundleAt(b, { silent: true, destFolder: src }); } catch (e) { console.warn("[Stashpad] archive undo failed", b, e); } }
+        blobs = [];
+        this.tree.rebuild(src); this.render();
+      },
+      redo: async () => {
+        blobs = [];
+        for (const id of rootIds) { const r = await this.plugin.lockNoteSubtree(src, id, null, { silent: true, blobFolder: dest }); if (r) blobs.push(r.blobPath); }
+        this.tree.rebuild(src); this.render();
+      },
+    });
+  }
+
+  /** 0.98.29 (Phase 5): encrypt the selected note(s) + children and move them to
+   *  Stashpad's encrypted trash (`_deleted/`), permanently removing the plaintext.
+   *  Recoverable via "Restore from encrypted trash". Confirm-gated. */
+  async cmdEncryptDelete(): Promise<void> {
+    if (!this.plugin.encryption?.isConfigured?.()) {
+      new Notice("Set up encryption first (Settings → Encryption)."); return;
+    }
+    const targets = this.getActionTargets();
+    if (targets.length === 0) return;
+    const ids = new Set(targets.map((t) => t.id));
+    const roots = targets.filter((t) => {
+      let p = t.parent;
+      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      return true;
+    });
+    if (roots.length === 0) return;
+    const n = roots.length;
+    new ConfirmModal(
+      this.app,
+      `Encrypt & delete ${n} note${n === 1 ? "" : "s"}?`,
+      [
+        `The selected note${n === 1 ? "" : "s"} (and any children) will be encrypted and moved to Stashpad's encrypted trash.`,
+        ``,
+        `• The readable copy is permanently removed from the folder.`,
+        `• You can restore ${n === 1 ? "it" : "them"} later from the encrypted trash — you'll need your encryption password.`,
+        `• If you lose your password, ${n === 1 ? "it's" : "they're"} gone for good.`,
+      ].join("\n"),
+      "Encrypt & delete",
+      async (ok) => {
+        // Route through secureDeleteSources so it pushes a Ctrl+Z undo entry
+        // (previously this manual loop left nothing for Undo to grab — Mod+Z fell
+        // through to the composer).
+        if (ok) await this.secureDeleteSources(roots);
+      },
+    ).open();
+  }
+
+  /** 0.98.30 (Phase 5): securely delete the given source notes from THIS folder
+   *  (encrypt → `_deleted/`, plaintext gone), recording this folder as the origin,
+   *  and push ONE undo entry that restores them right back here. Called by the
+   *  trash-folder move divert. No confirm (the trash-folder gesture is the intent;
+   *  Undo is the safety net). */
+  private async secureDeleteSources(sources: TreeNode[]): Promise<void> {
+    if (!this.plugin.encryption?.isConfigured?.()) {
+      new Notice("Set up encryption first (Settings → Encryption)."); return;
+    }
+    const ids = new Set(sources.map((t) => t.id));
+    const roots = sources.filter((t) => {
+      let p = t.parent;
+      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      return true;
+    });
+    if (roots.length === 0) return;
+    const folder = this.noteFolder;
+    const rootIds = roots.map((r) => r.id);
+    let blobs: string[] = [];
+    for (const id of rootIds) { const b = await this.plugin.encryptDeleteSubtree(folder, id); if (b) blobs.push(b); }
+    if (blobs.length === 0) return;
+    this.selection.clear(); this.lastSelected = null; this.tree.rebuild(folder); this.render();
+    this.plugin.notifications.show({ message: `Securely deleted ${blobs.length} note${blobs.length === 1 ? "" : "s"} → encrypted trash. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder });
+    this.plugin.getUndoStack(folder).push({
+      label: `Secure delete (${blobs.length})`,
+      undo: async () => {
+        for (const b of blobs) { try { await this.plugin.restoreDeletedAt(b, { silent: true }); } catch (e) { console.warn("[Stashpad] secure-delete undo failed", b, e); } }
+        blobs = [];
+        this.tree.rebuild(folder); this.render();
+      },
+      redo: async () => {
+        blobs = [];
+        for (const id of rootIds) { const b = await this.plugin.encryptDeleteSubtree(folder, id); if (b) blobs.push(b); }
+        this.tree.rebuild(folder); this.render();
+      },
+    });
+  }
+
+  /** 0.98.12: decrypt (unlock) locked stashes back into place. Counterpart to
+   *  cmdLockSelection. Recursively unlocks every locked stash under the action
+   *  target's subtree (0.98.12.02), falling back to the focused view's locked set.
+   *  Each blob is independent — we unlock them one by one, SKIPPING any that fail
+   *  the encrypted-envelope check or have already been removed (so a half-finished
+   *  batch never corrupts or double-imports). */
+  async cmdUnlockAll(): Promise<void> {
+    if (!this.plugin.encryption?.isConfigured?.()) {
+      new Notice("Set up encryption first (Settings → Encryption).");
+      return;
+    }
+    // Target-aware + RECURSIVE: point at a DECRYPTED parent note and unlock
+    // decrypts every locked stash anywhere in its subtree (you can't cursor a
+    // locked stub itself). We expand each target to itself + all descendant
+    // notes, then collect the locked stashes hanging off any of them. (A locked
+    // parent keeps its children INSIDE its blob, so locked entries only ever
+    // anchor to currently-decrypted notes — the live tree walk reaches them all.)
+    // If a target's subtree has no locked stashes — e.g. the stubs are top-level
+    // siblings you can't put a cursor on — fall back to the focused view's set.
+    const blobs = new Set<string>();
+    const scope = new Set<StashpadId>();
+    const stack = this.getActionTargets().map((t) => t.id);
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (scope.has(id)) continue;
+      scope.add(id);
+      for (const c of this.tree.getChildren(id)) stack.push(c.id);
+    }
+    for (const id of scope) {
+      for (const lk of this.plugin.lockedSubtreesFor(this.noteFolder, id)) blobs.add(lk.blob);
+    }
+    if (blobs.size === 0) {
+      const focusedId = (this.tree.get(this.focusId) ?? this.tree.getRoot()).id;
+      for (const lk of this.plugin.lockedSubtreesFor(this.noteFolder, focusedId)) blobs.add(lk.blob);
+    }
+    if (blobs.size === 0) { new Notice("No locked notes to unlock here."); return; }
+    if (!(await this.plugin.ensureEncryptionUnlocked())) return;
+    let unlocked = 0;
+    for (const blob of blobs) {
+      // unlockBundleAt re-checks the file exists + is a valid encrypted envelope
+      // (isEncryptedStash) and returns false / throws otherwise — so a stale or
+      // bad path is skipped, not fatal to the rest of the batch.
+      try { if (await this.plugin.unlockBundleAt(blob, { silent: true })) unlocked++; }
+      catch (e) { console.warn("[Stashpad] batch unlock skipped", blob, e); }
+    }
+    if (unlocked > 0) {
+      this.selection.clear();
+      this.lastSelected = null;
+      this.render();
+      this.plugin.notifications.show({ message: `Unlocked ${unlocked} stash${unlocked === 1 ? "" : "es"}.`, kind: "success", category: "system", folder: this.noteFolder });
+    }
+  }
+
   toggleSplit(): void {
     const cur = this.modeSplit ?? getSettings().splitOnLines;
     this.modeSplit = !cur;
@@ -5316,7 +5767,7 @@ export class StashpadView extends ItemView {
       onPick: async (item) => {
         picked = true;
         if (item.crossFolder) {
-          const targetId = item.id.replace(/^cross:/, "");
+          const targetId = item.crossId ?? item.id.replace(/^cross:/, "");
           // 0.76.15: DON'T switch folders. Record the cross-folder
           // destination; the next submit ships the note there while
           // this view stays exactly where it is. Composer content is
@@ -5494,7 +5945,7 @@ export class StashpadView extends ItemView {
           // identically for local and cross-folder parent picks.
           onPick: async (picked) => {
             const parentId = picked.crossFolder
-              ? picked.id.replace(/^cross:/, "")
+              ? (picked.crossId ?? picked.id.replace(/^cross:/, ""))
               : picked.node?.id;
             const folder = picked.crossFolder ?? this.noteFolder;
             if (!parentId) return;
@@ -5535,7 +5986,7 @@ export class StashpadView extends ItemView {
           // Cross-Stashpad result: switch this view's folder and focus
           // the picked note. The setState path rebuilds the tree, so by
           // the time render runs we can navigate to the picked id.
-          const targetId = item.id.replace(/^cross:/, "");
+          const targetId = item.crossId ?? item.id.replace(/^cross:/, "");
           if (newTab) void this.openNoteInNewTab(item.crossFolder, targetId);
           else void this.switchToFolderAndFocus(item.crossFolder, targetId);
           return;
@@ -5688,16 +6139,19 @@ export class StashpadView extends ItemView {
     }
     this.render();
     if (skipped.length) {
-      const outdentedNodes = moved.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+      // 0.97.x fix: `moved` already holds the outdented TreeNodes — the old code
+      // ran them back through tree.get() (which wants an id), getting undefined
+      // for every entry so the message listed nothing; and passed node objects
+      // as affectedIds. Use the nodes directly + map to ids.
       this.plugin.notifications.show({
         message: this.bulkActionMessage({
           verb: "Outdented",
-          nodes: outdentedNodes,
+          nodes: moved,
           suffix: skipped.length ? `(${skipped.length} already at root)` : undefined,
         }),
         kind: "success",
         category: "move",
-        affectedIds: moved,
+        affectedIds: moved.map((n) => n.id),
         folder: this.noteFolder,
       });
     }
@@ -5804,7 +6258,7 @@ export class StashpadView extends ItemView {
       onPick: async (item) => {
         if (item.crossFolder) {
           // Picked a parent in another Stashpad → cross-folder move.
-          const newParentId = item.id.replace(/^cross:/, "");
+          const newParentId = item.crossId ?? item.id.replace(/^cross:/, "");
           await this.moveAcrossFolders(targets, item.crossFolder, newParentId);
           this.selection.clear(); this.render();
           return;
@@ -7997,6 +8451,13 @@ export class StashpadView extends ItemView {
       if (focused?.file) targets = [focused];
     }
     if (targets.length === 0) { new Notice("Nothing selected to delete."); return; }
+    // 0.98.32: secure-delete override — when "Encrypt items sent to trash" is ON,
+    // a normal delete routes to the encrypted trash (recoverable + Ctrl+Z) instead
+    // of plaintext-trashing. Scoped to Stashpad's own delete (per the agreed design).
+    if ((this.plugin.settings.encryptTrash ?? false) && this.plugin.encryption?.isConfigured?.()) {
+      await this.secureDeleteSources(targets);
+      return;
+    }
     if (targets.length === 1) { await this.deleteNote(targets[0]); return; }
 
     // Multi-delete: gather totals and confirm once.
@@ -8877,6 +9338,19 @@ export class StashpadView extends ItemView {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       void this.cmdExportStash();
     }));
+    // 0.98.1: encrypt (lock) this note + its whole subtree into one .stashenc
+    // bundle, in place. Only shown once a vault encryption password is set up.
+    if (this.plugin.encryption?.isConfigured?.()) {
+      menu.addItem((it: any) => it.setTitle("Encrypt (lock) note + children").setIcon("lock").onClick(async () => {
+        // Capture the note's preceding sibling in any explicit manual order, so
+        // unlock can drop it back into the same slot.
+        const order = this.order.getOrder(this.noteFolder, node.parent ?? ROOT_ID);
+        const idx = order.indexOf(node.id);
+        const prevSibling = idx > 0 ? order[idx - 1] : null;
+        const r = await this.plugin.lockNoteSubtree(this.noteFolder, node.id, prevSibling);
+        if (r) this.render();
+      }));
+    }
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => this.cmdMovePicker()));
     menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => {
@@ -9512,3 +9986,40 @@ export class StashpadView extends ItemView {
 // (main.ts); the implementations now live in view-keys.ts / view-helpers.ts.
 export { matchBinding } from "./view-keys";
 export { properCaseFolderPath } from "./view-helpers";
+
+/** 0.98.28: tiny fuzzy picker over archive folders, for "Move to archive" when
+ *  more than one archive exists and no default is set. */
+class ArchiveFolderSuggestModal extends SuggestModal<string> {
+  constructor(app: App, private folders: string[], private onPick: (folder: string) => void) {
+    super(app);
+    this.setPlaceholder("Move to which archive folder?");
+  }
+  getSuggestions(query: string): string[] {
+    const q = query.toLowerCase();
+    return this.folders.filter((f) => f.toLowerCase().includes(q));
+  }
+  renderSuggestion(folder: string, el: HTMLElement): void {
+    el.createDiv({ text: folder.split("/").pop() || folder });
+    el.createEl("small", { text: folder, cls: "stashpad-suggest-path" });
+  }
+  onChooseSuggestion(folder: string): void { this.onPick(folder); }
+}
+
+/** 0.98.29: minimal restore picker over the encrypted trash. The richer grouped
+ *  trash VIEW is separate; this is the keyboard/command path. Entries are
+ *  pre-loaded {blob, label, folder}. */
+export class DeletedTrashSuggestModal extends SuggestModal<{ blob: string; label: string; folder: string }> {
+  constructor(app: App, private entries: { blob: string; label: string; folder: string }[], private onPick: (blob: string) => void) {
+    super(app);
+    this.setPlaceholder("Restore which deleted note?");
+  }
+  getSuggestions(query: string): { blob: string; label: string; folder: string }[] {
+    const q = query.toLowerCase();
+    return this.entries.filter((e) => `${e.label} ${e.folder}`.toLowerCase().includes(q));
+  }
+  renderSuggestion(e: { blob: string; label: string; folder: string }, el: HTMLElement): void {
+    el.createDiv({ text: e.label });
+    el.createEl("small", { text: `from ${e.folder}`, cls: "stashpad-suggest-path" });
+  }
+  onChooseSuggestion(e: { blob: string; label: string; folder: string }): void { this.onPick(e.blob); }
+}

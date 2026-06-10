@@ -64,7 +64,18 @@ export class StashpadFolderPanelView extends ItemView {
     // --- bottom: folders (takes the rest; kept low for thumb reach on mobile) ---
     const folderSection = root.createDiv({ cls: "stashpad-folderpanel-section stashpad-folderpanel-folders" });
     folderSection.style.flex = "1 1 0";
-    folderSection.createDiv({ cls: "stashpad-folderpanel-heading" }).setText("Folders");
+    // 0.98.37: the "Folders" heading is itself the folder-switcher button, with a
+    // dedicated encrypted-trash button beside it.
+    const head = folderSection.createDiv({ cls: "stashpad-folderpanel-heading stashpad-folderpanel-heading-row" });
+    const he:HTMLElement = head.createSpan({ cls: "stashpad-folderpanel-heading-title stashpad-folderpanel-heading-switch", text: "Folders" });
+    he.setAttr("aria-label", "Open folder switcher");
+    he.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); this.plugin.openFolderPicker(); } };
+    if (this.plugin.encryption?.isConfigured?.()) {
+      const trashBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-trash" });
+      setIcon(trashBtn, "trash-2");
+      trashBtn.setAttr("aria-label", "Open encrypted trash");
+      trashBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); this.plugin.openEncryptedTrash(); } };
+    }
     this.renderFolders(folderSection.createDiv({ cls: "stashpad-folderpanel-list" }));
   }
 
@@ -436,29 +447,44 @@ export class StashpadFolderPanelView extends ItemView {
       pin.setAttr("aria-label", "Pinned");
     }
 
-    // 0.95.1: per-folder icon. Tinted by the folder's Home-note color when set,
-    // so the panel echoes the colors you assign in the list.
+    // 0.95.1: per-folder icon. Tinted by the folder's Home-note color when set.
+    // 0.98.37: archive folders show the ARCHIVE icon in place of the folder icon
+    // (one icon instead of folder + a separate badge).
+    const isArchive = this.plugin.isArchiveFolder(folder);
     const folderIcon = row.createSpan({ cls: "stashpad-folderpanel-folder-icon" });
-    setIcon(folderIcon, "folder");
+    setIcon(folderIcon, isArchive ? "archive" : "folder");
+    if (isArchive) folderIcon.setAttr("aria-label", "Archive folder — notes moved in are auto-encrypted");
     const homeColor = this.folderHomeColor(folder);
     if (homeColor) folderIcon.style.color = homeColor;
 
     const name = folder.split("/").pop() || folder;
     row.createSpan({ cls: "stashpad-folderpanel-row-label", text: name });
 
+    // 0.98.37: reveal-in-file-explorer moved to the context menu only; keep the
+    // open-in-new-tab quick button.
     const actions = row.createDiv({ cls: "stashpad-folderpanel-actions" });
-    const revealBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
-    setIcon(revealBtn, "folder-search");
-    revealBtn.setAttr("aria-label", "Reveal in file explorer");
-    revealBtn.onclick = (e) => { e.stopPropagation(); this.revealFolder(folder); };
-
     const newTabBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
     setIcon(newTabBtn, "plus-square");
     newTabBtn.setAttr("aria-label", "Open in new tab");
-    newTabBtn.onclick = (e) => { e.stopPropagation(); this.onNavigateAway(); void this.plugin.activateViewForFolder(folder); };
+    // 0.98.38: fire on mousedown, not click. Opening a tab moves focus to it, so
+    // the NEXT click on the (now-unfocused) sidebar button was getting swallowed by
+    // Obsidian re-focusing the panel — only every other click registered. mousedown
+    // fires regardless of focus, so you can spam it and get a tab per click.
+    newTabBtn.onmousedown = (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation();
+      this.onNavigateAway(); void this.plugin.activateViewForFolder(folder);
+    };
 
-    // Tapping the row jumps to the folder (reusing an open tab if there is one).
-    row.onclick = () => { this.onNavigateAway(); this.jumpToFolder(folder); };
+    // 0.98.37: open on a SINGLE click. Use mousedown (not click) so it fires even
+    // when the sidebar panel wasn't focused yet — Obsidian's "first click focuses
+    // the sidebar, second click acts" behavior was forcing a double-click. Ignore
+    // non-left buttons and clicks landing on the action buttons.
+    row.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      if ((e.target as HTMLElement)?.closest?.(".stashpad-folderpanel-actions")) return;
+      this.onNavigateAway(); this.jumpToFolder(folder);
+    });
     row.oncontextmenu = (e) => { e.preventDefault(); this.openFolderMenu(e, folder); };
   }
 
@@ -526,6 +552,59 @@ export class StashpadFolderPanelView extends ItemView {
     menu.addSeparator();
     menu.addItem((i) => i.setTitle("Rename…").setIcon("pencil")
       .onClick(() => this.renameFolder(folder)));
+    // Encryption (Phase 3): lock every top-level note in the folder into separate
+    // .stashenc bundles, or unlock them all back. Only when encryption is set up.
+    if (this.plugin.encryption?.isConfigured?.()) {
+      menu.addSeparator();
+      menu.addItem((i) => i.setTitle("Encrypt (lock) all notes in folder").setIcon("lock")
+        .onClick(() => void this.plugin.lockFolder(folder)));
+      if (this.app.vault.getFiles().some((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") === folder.replace(/\/+$/, ""))) {
+        menu.addItem((i) => i.setTitle("Decrypt (unlock) all notes in folder").setIcon("unlock")
+          .onClick(() => void this.plugin.unlockFolder(folder)));
+      }
+      // 0.98.25 (Phase 4): archive folder toggle. Marking requires an explicit
+      // confirm — auto-lock permanently deletes the arriving note's plaintext.
+      const cleaned = folder.replace(/\/+$/, "");
+      const isArchive = this.plugin.isArchiveFolder(cleaned);
+      menu.addItem((i) => i.setTitle(isArchive ? "Unmark archive folder" : "Mark as archive folder…").setIcon("archive")
+        .onClick(async () => {
+          if (isArchive) {
+            this.plugin.settings.archiveFolders = (this.plugin.settings.archiveFolders ?? []).filter((f) => f !== cleaned);
+            await this.plugin.saveSettings();
+            new Notice(`"${cleaned.split("/").pop()}" is no longer an archive folder. Existing locked notes stay locked.`, 0);
+            this.render();
+            return;
+          }
+          new ConfirmModal(
+            this.app,
+            `Make "${cleaned.split("/").pop()}" an archive folder?`,
+            [
+              `An archive folder automatically LOCKS (encrypts) any note you move into it.`,
+              ``,
+              `What that means in plain terms:`,
+              `• "Encrypting" scrambles the note with your encryption password so its text can't be read by anyone — or any app — without that password.`,
+              `• The normal, readable copy is permanently removed from your vault. What's left is an unreadable, locked 🔒 placeholder.`,
+              `• To read or edit the note again, you unlock it with your encryption password (one click on the placeholder). Then you can re-archive it later.`,
+              `• If you ever lose your encryption password, the locked notes are gone for good — there is no backdoor or recovery, on purpose.`,
+              `• Notes ALREADY in this folder are not touched — only notes moved in from now on. (To lock the ones already here, use "Encrypt all notes in folder".)`,
+              ``,
+              `Good for folders of things you want kept private at rest: finished or sensitive material you'd rather not have readable if someone opened your vault.`,
+            ].join("\n"),
+            "Make it an archive folder",
+            async (ok) => {
+              if (!ok) return;
+              this.plugin.settings.archiveFolders = [...(this.plugin.settings.archiveFolders ?? []), cleaned];
+              await this.plugin.saveSettings();
+              new Notice(`"${cleaned.split("/").pop()}" is now an archive folder — notes moved in will be encrypted.`, 0);
+              this.render();
+            },
+          ).open();
+        }));
+
+      // 0.98.31: open the encrypted-trash tab (recoverable secure-deleted notes).
+      menu.addItem((i) => i.setTitle("Open encrypted trash").setIcon("rotate-ccw")
+        .onClick(() => this.plugin.openEncryptedTrash()));
+    }
     menu.addSeparator();
     menu.addItem((i) => {
       i.setTitle("Delete folder…").setIcon("trash").onClick(() => this.deleteFolder(folder));

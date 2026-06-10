@@ -1,19 +1,25 @@
 import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
 import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, type PinnedNoteRef, type StashpadId } from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
-import { StashpadView, properCaseFolderPath } from "./view";
+import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
+import { StashpadTrashView, openTrashView } from "./trash-view";
+import { STASHPAD_TRASH_VIEW_TYPE } from "./types";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
+import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, type DeletedMeta } from "./encryption-ops";
+import { EncryptionPasswordModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, type CommandId,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
-import { importStashZip, STASH_EXT } from "./stash-package";
+import { importStashZip, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { ROOT_ID } from "./types";
+import { OrderStore } from "./order-store";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { NotificationService, buildFileActions } from "./notifications";
@@ -34,6 +40,9 @@ export default class StashpadPlugin extends Plugin {
    *  Used by sidebar panel actions (Search, Home) so they target the
    *  user's actual current tab rather than getLeavesOfType()[0]. */
   lastActiveStashpadLeaf: WorkspaceLeaf | null = null;
+  /** 0.97.0: vault encryption key-management service (Phase 1). Holds the
+   *  wrapped master key + session key; no file ops yet. */
+  encryption!: EncryptionService;
   /** 0.79.19: true while rebootstrap is running. Suppresses the
    *  contribution stamp so rebootstrap's own frontmatter writes — and the
    *  wikilink rewrites Obsidian does when slug-renames move files — never
@@ -101,6 +110,8 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    // 0.97.0: wipe the in-memory encryption key on unload.
+    try { this.encryption?.dispose(); } catch { /* best-effort */ }
     // 0.83.2: flush any pending render-cache writes (the store's save is
     // debounced, so a recent change could still be in the buffer).
     try { await this._renderCacheStore?.save(); } catch { /* best-effort */ }
@@ -515,8 +526,16 @@ export default class StashpadPlugin extends Plugin {
   searchableFolders(activeFolder: string): string[] {
     const allowed = new Set(this.settings.searchIncludedFolders);
     const excluded = new Set(this.settings.searchExcludedFolders);
+    // 0.98.32: archive folders are auto-excluded from CROSS-folder search — their
+    // contents are private-at-rest, so they shouldn't surface as search hits or
+    // move targets elsewhere. (The active folder is still searched within itself —
+    // it's unshifted back below.)
+    const autoExcluded = new Set(
+      (this.settings.archiveFolders ?? []).map((s) => (s ?? "").replace(/\/+$/, "")),
+    );
     const all = this.discoverStashpadFolders();
     const filtered = all.filter((f) => {
+      if (autoExcluded.has(f)) return false;
       if (allowed.size > 0) return allowed.has(f);
       return !excluded.has(f);
     });
@@ -624,6 +643,17 @@ export default class StashpadPlugin extends Plugin {
     await this.migrateLegacyPaths();
     await this.loadSettings();
     perf.enabled = !!this.settings.enablePerfProfiling;
+    this.encryption = new EncryptionService(
+      this.app,
+      () => this.settings.encryption ?? defaultEncryptionConfig(),
+      async (cfg) => { this.settings.encryption = cfg; await this.saveSettings(); },
+      () => this.settings.encryptionIdleLockMinutes ?? 0,
+    );
+    // If a vault password was remembered in this device's keychain, unlock now.
+    void this.encryption.tryAutoUnlock();
+    // Reconcile the locked-subtree registry from on-disk `.stashmeta` sidecars
+    // (recovers placeholder placement after a settings desync or cross-device sync).
+    void this.reconcileLockedRegistry();
     this.settingTab = new StashpadSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
@@ -688,6 +718,11 @@ export default class StashpadPlugin extends Plugin {
     this.registerView(
       STASHPAD_PANELS_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadPanelsView(leaf, this),
+    );
+    // 0.98.35: encrypted-trash tab (recoverable deleted notes, grouped by origin).
+    this.registerView(
+      STASHPAD_TRASH_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadTrashView(leaf, this),
     );
     this.registerView(
       STASHPAD_FOLDER_PANEL_VIEW_TYPE,
@@ -921,6 +956,17 @@ export default class StashpadPlugin extends Plugin {
       name: "Focus folder panel",
       callback: () => void this.focusFolderPanel(),
     });
+    // 0.97.2: forget the in-memory encryption key (re-prompt on next use). The
+    // explicit alternative to background auto-relock.
+    this.addCommand({
+      id: "stashpad-lock-encryption",
+      name: "Lock encryption (forget password)",
+      callback: () => {
+        if (!this.encryption.isConfigured()) { new Notice("Encryption isn't set up."); return; }
+        this.encryption.lock();
+        new Notice("Encryption locked.");
+      },
+    });
 
     const call = (method: string) => {
       const v = getActiveView();
@@ -936,6 +982,36 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-command-palette",
       name: "Command palette (Stashpad only)",
       callback: () => call("openStashpadCommandPalette"),
+    });
+    this.addCommand({
+      id: "stashpad-lock-selection",
+      name: "Encrypt (lock) selection (notes + children)",
+      callback: () => call("cmdLockSelection"),
+    });
+    this.addCommand({
+      id: "stashpad-unlock-all",
+      name: "Decrypt (unlock) locked notes in view",
+      callback: () => call("cmdUnlockAll"),
+    });
+    this.addCommand({
+      id: "stashpad-unlock-all-vault",
+      name: "Decrypt (unlock) ALL locked notes in the vault",
+      callback: () => void this.unlockAllInVault(),
+    });
+    this.addCommand({
+      id: "stashpad-move-to-archive",
+      name: "Move selection to archive (encrypt)",
+      callback: () => call("cmdMoveToArchive"),
+    });
+    this.addCommand({
+      id: "stashpad-encrypt-delete",
+      name: "Encrypt & delete selection (to encrypted trash)",
+      callback: () => call("cmdEncryptDelete"),
+    });
+    this.addCommand({
+      id: "stashpad-restore-trash",
+      name: "Open encrypted trash (restore deleted)…",
+      callback: () => this.openEncryptedTrash(),
     });
     // 0.77.8: claim authorship retroactively (for notes created before the
     // user set their author name). Author-only variants only fill blank
@@ -1602,6 +1678,13 @@ export default class StashpadPlugin extends Plugin {
     // real cross-folder move, so in-folder reparents/renames are untouched.
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (file instanceof TFile) this.maybeReHomeOnCrossFolderMove(file, oldPath);
+    }));
+
+    // 0.98.25 (Phase 4): archive folders — a note MOVED into a marked folder is
+    // auto-encrypted after a settle window. Move-in only (rename event), never
+    // create/edit, so a note being written can't be locked out from under you.
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFile) this.maybeArchiveOnMoveIn(file, oldPath);
     }));
 
     // 0.79.1: auto-import — any file appearing directly in a Stashpad
@@ -2402,6 +2485,15 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** Re-render every open Stashpad list view — used after a setting that changes
+   *  how rows render (e.g. hide-locked-titles) so the change shows immediately. */
+  refreshAllStashpadViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const v = leaf.view as any;
+      if (v && typeof v.render === "function") v.render();
+    }
+  }
+
   /** Unified folder picker / switcher / creator — the single entry
    *  point for the ribbon button, the view's switch-folder button, and
    *  the `pickFolder` keybinding / command-palette entry. 0.65.0.
@@ -2426,7 +2518,8 @@ export default class StashpadPlugin extends Plugin {
       | { kind: "open-anyway"; folder: string; label: string; icon: string }
       | { kind: "switch-current"; folder: string; label: string; icon: string }
       | { kind: "create"; folder: string; label: string; icon: string }
-      | { kind: "convert"; folder: string; label: string; icon: string };
+      | { kind: "convert"; folder: string; label: string; icon: string }
+      | { kind: "trash"; label: string; icon: string };
 
     const folderForLeaf = (leaf: WorkspaceLeaf): string => {
       const state = leaf.getViewState();
@@ -2458,7 +2551,7 @@ export default class StashpadPlugin extends Plugin {
       const last = p.split("/").filter(Boolean).pop() ?? "";
       if (!last) return false;
       const reserved = new Set(
-        [this.settings.importDropFolder, this.settings.exportFolder, "_attachments", "_processed", "_authors", "_exports", "_imports", "_archive", ".archive"]
+        [this.settings.importDropFolder, this.settings.exportFolder, "_attachments", "_processed", "_authors", "_exports", "_imports", "_archive", ".archive", "_deleted"]
           .map((s) => (s ?? "").trim().replace(/^\/+|\/+$/g, ""))
           .filter(Boolean),
       );
@@ -2486,12 +2579,13 @@ export default class StashpadPlugin extends Plugin {
       seenLeafFolders.add(folder);
       seenOpen.add(folder);
       const label = folder.split("/").pop() || folder;
-      baseItems.push({ kind: "reveal", folder, label: `Reveal "${label}" tab`, leaf, icon: "layout-grid" });
+      // 0.98.37: archive folders carry the archive icon so they read at a glance.
+      baseItems.push({ kind: "reveal", folder, label: `Reveal "${label}" tab`, leaf, icon: this.isArchiveFolder(folder) ? "archive" : "layout-grid" });
       openAnywayItems.push({ kind: "open-anyway", folder, label: `Open "${label}" in another new tab`, icon: "layout-template" });
     }
     for (const folder of stashpadFolders.filter((f) => !seenOpen.has(f))) {
       const label = folder.split("/").pop() || folder;
-      baseItems.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: "layout-template" });
+      baseItems.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: this.isArchiveFolder(folder) ? "archive" : "layout-template" });
     }
 
     const plugin = this;
@@ -2559,8 +2653,13 @@ export default class StashpadPlugin extends Plugin {
         // 0.65.1: open-anyway entries pinned to the very bottom — one
         // per currently-open folder, in case the user wants a second
         // tab on the same folder (e.g., main + tiny side by side).
-        const openAnywayFiltered = openAnywayItems.filter((it) => matchesAll(it.label) || matchesAll(it.folder));
+        const openAnywayFiltered = openAnywayItems.filter((it) => matchesAll(it.label) || matchesAll("folder" in it ? it.folder : ""));
         filtered.push(...openAnywayFiltered);
+        // 0.98.37: encrypted-trash entry, pinned to the very bottom. Only when
+        // encryption is set up; matches on "trash"/"deleted"/"encrypted".
+        if (plugin.encryption?.isConfigured?.() && matchesAll("trash deleted encrypted")) {
+          filtered.push({ kind: "trash", label: "Open encrypted trash", icon: "trash-2" });
+        }
         return filtered;
       }
       renderSuggestion(item: Item, el: HTMLElement): void {
@@ -2576,6 +2675,7 @@ export default class StashpadPlugin extends Plugin {
         }
       }
       async onChooseSuggestion(item: Item): Promise<void> {
+        if (item.kind === "trash") { plugin.openEncryptedTrash(); return; }
         if (item.kind === "reveal") {
           plugin.app.workspace.revealLeaf(item.leaf);
           return;
@@ -2715,6 +2815,379 @@ export default class StashpadPlugin extends Plugin {
     await openFolderPanelView(this.app);
     const leaf = this.app.workspace.getLeavesOfType(STASHPAD_FOLDER_PANEL_VIEW_TYPE)[0];
     if (leaf) this.app.workspace.setActiveLeaf(leaf, { focus: true });
+  }
+
+  /** 0.98.0 (Phase 2): lock a note subtree into one `.stashenc` bundle. Requires
+   *  encryption set up + unlocked (prompts via Notice otherwise). Returns the
+   *  lock result, or null if not unlocked / it failed. */
+  /** 0.98.7: rebuild the in-memory locked-subtree registry from the `.stashmeta`
+   *  sidecars on disk. The registry (settings) is a sync cache for rendering; the
+   *  sidecars are the durable source of truth. This recovers placeholder metadata
+   *  (parent/title/order) when the settings registry is lost (desync) or when a
+   *  blob was synced in from another device with no local registry entry. Adds an
+   *  entry for any `.stashenc` missing one; drops entries whose blob is gone. */
+  async reconcileLockedRegistry(): Promise<void> {
+    const blobs = this.app.vault.getFiles().filter((f) => f.extension === "stashenc");
+    const blobPaths = new Set(blobs.map((f) => f.path));
+    let reg = (this.settings.lockedSubtrees ?? []).filter((e) => blobPaths.has(e.blob));
+    const have = new Set(reg.map((e) => e.blob));
+    let changed = reg.length !== (this.settings.lockedSubtrees ?? []).length;
+    for (const f of blobs) {
+      if (have.has(f.path)) continue;
+      const m = await readLockedMeta(this.app, f.path);
+      if (!m) continue; // no sidecar → the scan still shows it at root (never stranded)
+      const folder = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      reg = [...reg, { folder, blob: f.path, parentId: m.parentId, title: m.title, count: m.count, created: m.created, rootId: m.rootId, prevSibling: m.prevSibling }];
+      changed = true;
+    }
+    if (changed) { this.settings.lockedSubtrees = reg; await this.saveSettings(); }
+  }
+
+  /** Locked-subtree placeholders attached under `parentId` in `folder` (for the
+   *  list to render 🔒 stubs where the notes were). SCANS the `.stashenc` files
+   *  on disk (the source of truth — survives a desynced registry or a blob synced
+   *  from another device); the `lockedSubtrees` registry only ENRICHES with the
+   *  parent/title/count. A blob with no registry entry shows under the folder root
+   *  with its filename as the title, so it's never stranded/unreachable. */
+  lockedSubtreesFor(folder: string, parentId: StashpadId): Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const byBlob = new Map((this.settings.lockedSubtrees ?? []).map((e) => [e.blob, e]));
+    const out: Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }> = [];
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension !== "stashenc") continue;
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
+      const e = byBlob.get(f.path);
+      if ((e?.parentId ?? ROOT_ID) !== parentId) continue;
+      // Carry the positional fields so the placeholder + unlock restore the
+      // reordered slot WITHOUT depending on the in-memory registry being intact.
+      out.push({ blob: f.path, title: e?.title ?? f.basename, count: e?.count ?? 0, created: e?.created ?? "", rootId: e?.rootId, parentId: e?.parentId ?? ROOT_ID, prevSibling: e?.prevSibling ?? null });
+    }
+    return out;
+  }
+
+  /** Ensure encryption is configured + unlocked, prompting for the password if
+   *  locked. Returns true once the session key is available. */
+  async ensureEncryptionUnlocked(): Promise<boolean> {
+    if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Encryption)."); return false; }
+    if (this.encryption.isUnlocked()) return true;
+    // Try the password remembered in this device's keychain BEFORE prompting —
+    // so an idle auto-lock (or any post-load lock) silently re-unlocks instead of
+    // asking again. Only prompt if there's no remembered password (or it fails).
+    if (await this.encryption.tryAutoUnlock()) return true;
+    return new Promise<boolean>((resolve) => {
+      new EncryptionPasswordModal(this.app, {
+        mode: "unlock", offerKeychain: true,
+        onSubmit: async ({ current, remember }) => {
+          const ok = await this.encryption.unlock(current!, remember);
+          if (!ok) return "Wrong password. Try again.";
+          resolve(true);
+          return null;
+        },
+        onCancel: () => resolve(false),
+      }).open();
+    });
+  }
+
+  async lockNoteSubtree(folder: string, rootId: StashpadId, prevSibling: StashpadId | null = null, opts: { silent?: boolean; blobFolder?: string } = {}): Promise<LockResult | null> {
+    if (!(await this.ensureEncryptionUnlocked())) return null;
+    const dek = this.encryption.getSessionKey();
+    if (!dek) return null;
+    try {
+      const hideTitle = this.settings.hideLockedTitles ?? false;
+      const r = await lockSubtree(this.app, folder, rootId, dek, prevSibling, hideTitle, opts.blobFolder);
+      // Record a placeholder registry entry so the list shows a 🔒 stub where
+      // the note was. The blob may live in a different folder than the note's
+      // source (archive) — register it under the blob's actual folder.
+      const blobFolder = (opts.blobFolder ?? folder).replace(/\/+$/, "");
+      this.settings.lockedSubtrees = [
+        ...(this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== r.blobPath),
+        { folder: blobFolder, blob: r.blobPath, parentId: r.parentId, title: r.title, count: r.noteCount, created: r.created, rootId: r.rootId, prevSibling },
+      ];
+      await this.saveSettings();
+      if (!opts.silent) this.notifications.show({ message: `Locked ${r.title ? `“${r.title}”` : "a note"} (${r.noteCount} note${r.noteCount === 1 ? "" : "s"}).`, kind: "success", category: "system", folder });
+      return r;
+    } catch (e) {
+      console.warn("[Stashpad] lock failed", e);
+      new Notice(`Couldn't lock: ${(e as Error).message}`);
+      return null;
+    }
+  }
+
+  /** 0.98.0 (Phase 2): unlock a `.stashenc` bundle back into its folder. */
+  async unlockBundleAt(blobPath: string, opts: { silent?: boolean; destFolder?: string } = {}): Promise<boolean> {
+    if (!(await this.ensureEncryptionUnlocked())) return false;
+    const dek = this.encryption.getSessionKey();
+    if (!dek) return false;
+    const folder = (opts.destFolder ?? blobPath.replace(/\/[^/]*$/, "")).replace(/\/+$/, "");
+    const existing = new Set<StashpadId>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== folder) continue;
+      const id = (this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown } | undefined)?.id;
+      if (typeof id === "string") existing.add(id);
+    }
+    try {
+      const r = await unlockBundle(this.app, blobPath, dek, existing, opts.destFolder);
+      this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== blobPath);
+      await this.saveSettings();
+      if (!opts.silent) this.notifications.show({ message: `Unlocked ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"}.`, kind: "success", category: "system", folder });
+      return true;
+    } catch (e) {
+      console.warn("[Stashpad] unlock failed", e);
+      new Notice(`Couldn't unlock: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  /** 0.98.13 (Phase 3): lock every top-level note in a folder — each root note's
+   *  subtree becomes its OWN `.stashenc` bundle (children ride along inside their
+   *  root's bundle, so we only iterate root-level notes). Already-locked roots and
+   *  the `__root__` Home note are skipped. Best-effort position preservation via the
+   *  OrderStore. Returns how many bundles were created. */
+  async lockFolder(folder: string): Promise<number> {
+    if (!(await this.ensureEncryptionUnlocked())) return 0;
+    const cleaned = folder.replace(/\/+$/, "");
+    // Enumerate root-level notes from disk (frontmatter), excluding the Home note.
+    const roots: StashpadId[] = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; parent?: unknown } | undefined;
+      const id = fm?.id;
+      if (typeof id !== "string" || id === ROOT_ID) continue;
+      const parent = typeof fm?.parent === "string" ? fm.parent : ROOT_ID;
+      if (parent !== ROOT_ID) continue; // children ride along inside their root's bundle
+      roots.push(id);
+    }
+    const alreadyLocked = new Set((this.settings.lockedSubtrees ?? []).map((e) => e.rootId).filter((x): x is StashpadId => !!x));
+    const todo = roots.filter((id) => !alreadyLocked.has(id));
+    if (todo.length === 0) { new Notice("Nothing to lock in this folder."); return 0; }
+    // Best-effort: read the explicit manual order so each stub keeps its slot.
+    const order = new OrderStore(this.app);
+    const rootOrder = (await order.load(cleaned))[ROOT_ID] ?? [];
+    // Progress for big folders: a persistent Notice we update each step (a long
+    // lock shouldn't look hung). Only for >3 items so small ops stay quiet.
+    const prog = todo.length > 3 ? new Notice("", 0) : null;
+    let count = 0;
+    for (let i = 0; i < todo.length; i++) {
+      const id = todo[i];
+      prog?.setMessage(`🔒 Encrypting ${i + 1}/${todo.length}…`);
+      const idx = rootOrder.indexOf(id);
+      const prevSibling = idx > 0 ? rootOrder[idx - 1] : null;
+      if (await this.lockNoteSubtree(cleaned, id, prevSibling, { silent: true })) count++;
+    }
+    prog?.hide();
+    if (count > 0) this.notifications.show({ message: `Locked ${count} note${count === 1 ? "" : "s"} in “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned });
+    return count;
+  }
+
+  /** 0.98.13 (Phase 3): unlock every locked stash in a folder, back into place.
+   *  Each blob is independent — skip any that fail the encrypted-envelope check or
+   *  were already removed, so a bad one never aborts the batch. Returns the count. */
+  async unlockFolder(folder: string): Promise<number> {
+    if (!(await this.ensureEncryptionUnlocked())) return 0;
+    const cleaned = folder.replace(/\/+$/, "");
+    const blobs = this.app.vault.getFiles()
+      .filter((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned)
+      .map((f) => f.path);
+    if (blobs.length === 0) { new Notice("No locked notes in this folder."); return 0; }
+    const prog = blobs.length > 3 ? new Notice("", 0) : null;
+    let count = 0;
+    for (let i = 0; i < blobs.length; i++) {
+      prog?.setMessage(`🔓 Decrypting ${i + 1}/${blobs.length}…`);
+      try { if (await this.unlockBundleAt(blobs[i], { silent: true })) count++; }
+      catch (e) { console.warn("[Stashpad] folder unlock skipped", blobs[i], e); }
+    }
+    prog?.hide();
+    if (count > 0) this.notifications.show({ message: `Unlocked ${count} note${count === 1 ? "" : "s"} in “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned });
+    return count;
+  }
+
+  /** 0.98.21 (Phase 3): decrypt EVERY locked stash across the whole vault, back
+   *  into place. Non-destructive (unlock only reverses a lock) — a "decrypt
+   *  everything" safety valve. Each blob is independent + skip-on-error. */
+  async unlockAllInVault(): Promise<number> {
+    if (!(await this.ensureEncryptionUnlocked())) return 0;
+    // Exclude the `_deleted/` trash store — those are DELETED notes, not locked
+    // ones; "unlocking" them would wrongly restore them into _deleted/. Use the
+    // trash-restore flow for those.
+    const blobs = this.app.vault.getFiles()
+      .filter((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") !== "_deleted")
+      .map((f) => f.path);
+    if (blobs.length === 0) { new Notice("No locked notes anywhere in the vault."); return 0; }
+    const prog = blobs.length > 3 ? new Notice("", 0) : null;
+    let count = 0;
+    for (let i = 0; i < blobs.length; i++) {
+      prog?.setMessage(`🔓 Decrypting ${i + 1}/${blobs.length}…`);
+      try { if (await this.unlockBundleAt(blobs[i], { silent: true })) count++; }
+      catch (e) { console.warn("[Stashpad] vault unlock skipped", blobs[i], e); }
+    }
+    prog?.hide();
+    const folder = blobs[0].replace(/\/[^/]*$/, "");
+    if (count > 0) this.notifications.show({ message: `Unlocked ${count} note${count === 1 ? "" : "s"} across the vault.`, kind: "success", category: "system", folder });
+    return count;
+  }
+
+  // --- 0.98.29 (Phase 5): encrypted trash (`_deleted/`) ---
+
+  /** Encrypt-delete a subtree into `_deleted/` (recoverable, encrypted) and
+   *  permanently remove the plaintext. Returns the blob path, or null on failure. */
+  async encryptDeleteSubtree(folder: string, rootId: StashpadId): Promise<string | null> {
+    if (!(await this.ensureEncryptionUnlocked())) return null;
+    const dek = this.encryption.getSessionKey();
+    if (!dek) return null;
+    try {
+      // Plugin runtime (not a workflow script) — Date is available.
+      const deletedAt = new Date().toISOString();
+      const hideTitle = this.settings.hideLockedTitles ?? false;
+      const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle);
+      return r.blobPath;
+    } catch (e) {
+      console.warn("[Stashpad] encrypt-delete failed", e);
+      new Notice(`Couldn't encrypt-delete: ${(e as Error).message}`, 0);
+      return null;
+    }
+  }
+
+  /** Restore an encrypted-deleted blob back into its original folder. */
+  async restoreDeletedAt(blobPath: string, opts: { silent?: boolean } = {}): Promise<boolean> {
+    if (!(await this.ensureEncryptionUnlocked())) return false;
+    const dek = this.encryption.getSessionKey();
+    if (!dek) return false;
+    const meta = await readDeletedMeta(this.app, blobPath);
+    const dest = (meta?.originalFolder && await this.app.vault.adapter.exists(meta.originalFolder))
+      ? meta.originalFolder : blobPath.replace(/\/[^/]*$/, "");
+    const existing = new Set<StashpadId>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dest.replace(/\/+$/, "")) continue;
+      const id = (this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown } | undefined)?.id;
+      if (typeof id === "string") existing.add(id);
+    }
+    try {
+      const r = await restoreDeleted(this.app, blobPath, dek, existing);
+      if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo });
+      return true;
+    } catch (e) {
+      console.warn("[Stashpad] restore-from-trash failed", e);
+      new Notice(`Couldn't restore: ${(e as Error).message}`, 0);
+      return false;
+    }
+  }
+
+  /** List the encrypted-trash contents (blob path + sidecar metadata). */
+  async listDeletedTrash(): Promise<Array<{ blob: string; meta: DeletedMeta | null }>> {
+    const blobs = await listDeletedBlobs(this.app);
+    const out: Array<{ blob: string; meta: DeletedMeta | null }> = [];
+    for (const b of blobs) out.push({ blob: b, meta: await readDeletedMeta(this.app, b) });
+    return out;
+  }
+
+  /** v2: restore EVERY encrypted-trash note back to its origin folder (or just the
+   *  ones from `scopeFolder`). Returns how many were restored. */
+  async restoreAllTrash(scopeFolder?: string): Promise<number> {
+    if (!(await this.ensureEncryptionUnlocked())) return 0;
+    let items = await this.listDeletedTrash();
+    if (scopeFolder) { const s = scopeFolder.replace(/\/+$/, ""); items = items.filter((it) => (it.meta?.originalFolder ?? "") === s); }
+    if (items.length === 0) { new Notice("Nothing to restore."); return 0; }
+    const prog = items.length > 3 ? new Notice("", 0) : null;
+    let count = 0;
+    for (let i = 0; i < items.length; i++) {
+      prog?.setMessage(`🔓 Restoring ${i + 1}/${items.length}…`);
+      try { if (await this.restoreDeletedAt(items[i].blob, { silent: true })) count++; }
+      catch (e) { console.warn("[Stashpad] restore-all skipped", items[i].blob, e); }
+    }
+    prog?.hide();
+    if (count > 0) this.notifications.show({ message: `Restored ${count} note${count === 1 ? "" : "s"} from encrypted trash.`, kind: "success", category: "system", folder: scopeFolder || "" });
+    return count;
+  }
+
+  /** Open the recoverable encrypted-trash TAB. (The `_` arg keeps the old
+   *  per-folder call sites working; the tab groups by origin folder anyway.) */
+  openEncryptedTrash(_scopeFolder?: string): void {
+    if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Encryption)."); return; }
+    void openTrashView(this);
+  }
+
+  /** Open a picker over the encrypted trash; restore the chosen note in place. */
+  async openRestoreTrashPicker(): Promise<void> {
+    if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Encryption)."); return; }
+    const items = await this.listDeletedTrash();
+    if (items.length === 0) { new Notice("Encrypted trash is empty."); return; }
+    const entries = items.map(({ blob, meta }) => ({
+      blob,
+      label: meta?.title || blob.split("/").pop()?.replace(/\.stashenc$/, "") || "Locked note",
+      folder: meta?.originalFolder || "(unknown)",
+    }));
+    new DeletedTrashSuggestModal(this.app, entries, (blob) => { void this.restoreDeletedAt(blob); }).open();
+  }
+
+  // --- 0.98.25 (Phase 4): archive folders — auto-encrypt notes moved in ---
+
+  isArchiveFolder(folder: string): boolean {
+    const cleaned = folder.replace(/\/+$/, "");
+    return (this.settings.archiveFolders ?? []).includes(cleaned);
+  }
+
+  /** Batches arrivals per archive folder: each move-in (re)arms a settle timer so
+   *  a multi-file move (a whole subtree dragged in) is swept ONCE, after the
+   *  re-home debounce (900ms) and metadata indexing have settled. */
+  private archivePending = new Map<string, { paths: Set<string>; timer: number }>();
+
+  private maybeArchiveOnMoveIn(file: TFile, oldPath: string): void {
+    if (file.extension !== "md") return;
+    const newDir = file.parent?.path?.replace(/\/+$/, "") ?? "";
+    const slash = oldPath.lastIndexOf("/");
+    const oldDir = (slash >= 0 ? oldPath.slice(0, slash) : "").replace(/\/+$/, "");
+    if (newDir === oldDir) return;                      // in-folder rename, not a move-in
+    if (!this.isArchiveFolder(newDir)) return;
+    if (!this.encryption.isConfigured()) return;
+    let pending = this.archivePending.get(newDir);
+    if (!pending) { pending = { paths: new Set(), timer: 0 }; this.archivePending.set(newDir, pending); }
+    pending.paths.add(file.path);
+    window.clearTimeout(pending.timer);
+    pending.timer = window.setTimeout(() => {
+      this.archivePending.delete(newDir);
+      void this.archiveSweep(newDir, [...pending!.paths]);
+    }, 1800);
+  }
+
+  /** Lock the notes that just arrived in an archive folder. Among the arrivals,
+   *  only subtree ROOTS are locked (a child whose parent also arrived rides
+   *  inside the parent's bundle). Skips the Home note, already-locked roots, and
+   *  anything that disappeared during the settle window. Loud when the vault is
+   *  locked and the user declines to unlock — silent failure here would mean
+   *  plaintext sitting in a folder the user believes is encrypted. */
+  private async archiveSweep(folder: string, arrivedPaths: string[]): Promise<void> {
+    if (!this.isArchiveFolder(folder)) return; // unmarked while settling
+    const cleaned = folder.replace(/\/+$/, "");
+    type Arr = { id: StashpadId; parent: StashpadId | null };
+    const arrived: Arr[] = [];
+    for (const p of arrivedPaths) {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) continue;               // moved away/deleted meanwhile
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
+      // Read from DISK, not metadataCache — the cache lags right after a
+      // cross-folder move (+ the 900ms re-home rewrite), and a stale/empty read
+      // here would SILENTLY skip the note, leaving plaintext in a folder the user
+      // believes auto-encrypts. Disk is authoritative.
+      let fm: Record<string, unknown>;
+      try { fm = splitFrontmatter(await this.app.vault.read(f)).fm; } catch { continue; }
+      const id = typeof fm.id === "string" ? fm.id : null;
+      if (!id || id === ROOT_ID) continue;
+      arrived.push({ id, parent: typeof fm.parent === "string" ? fm.parent : null });
+    }
+    if (arrived.length === 0) return;
+    const arrivedIds = new Set(arrived.map((a) => a.id));
+    const alreadyLocked = new Set((this.settings.lockedSubtrees ?? []).map((e) => e.rootId).filter((x): x is StashpadId => !!x));
+    const roots = arrived.filter((a) => !alreadyLocked.has(a.id) && !(a.parent && arrivedIds.has(a.parent)));
+    if (roots.length === 0) return;
+    if (!(await this.ensureEncryptionUnlocked())) {
+      new Notice(`⚠️ Archive folder "${cleaned.split("/").pop()}": ${roots.length} arriving note${roots.length === 1 ? "" : "s"} NOT encrypted (vault is locked). Unlock encryption and lock them manually.`, 0);
+      return;
+    }
+    let count = 0;
+    for (const r of roots) {
+      if (await this.lockNoteSubtree(cleaned, r.id, null, { silent: true })) count++;
+    }
+    if (count > 0) this.notifications.show({ message: `Archived (encrypted) ${count} note${count === 1 ? "" : "s"} moved into “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned });
   }
 
   /** Open a fresh Stashpad tab focused on a specific folder via the

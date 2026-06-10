@@ -216,11 +216,14 @@ export class StashpadDetailView extends ItemView {
     this.renderComposer(root, sel);
 
     // Restore composer focus + caret if the rebuild interrupted typing.
-    if (composerHadFocus && this.composerInputEl) {
-      this.composerInputEl.focus();
+    // (Capture into a local — renderComposer reassigns the field, which TS's
+    // flow analysis loses across the call, narrowing it to `never`.)
+    const input = this.composerInputEl as HTMLTextAreaElement | null;
+    if (composerHadFocus && input) {
+      input.focus();
       if (composerCaret != null) {
-        const c = Math.min(composerCaret, this.composerInputEl.value.length);
-        try { this.composerInputEl.setSelectionRange(c, c); } catch { /* noop */ }
+        const c = Math.min(composerCaret, input.value.length);
+        try { input.setSelectionRange(c, c); } catch { /* noop */ }
       }
     }
   }

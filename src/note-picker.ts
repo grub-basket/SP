@@ -3,6 +3,9 @@ import type { TreeIndex } from "./tree-index";
 import type { TreeNode } from "./types";
 import { ROOT_ID } from "./types";
 import { buildTimePickerInto, formatWhenTime } from "./time-picker";
+// Obsidian types `moment` as the namespace (not callable); a callable view for
+// the call sites. Type usage like `moment.unitOfTime` keeps using `moment`.
+const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
 /** Parsed shape of a search query string. The original free-text tokens
  *  go into `text` (token-order-agnostic match against title/body); each
@@ -34,7 +37,7 @@ function parseDateToken(raw: string): number | null {
   const t = raw.trim().toLowerCase();
   if (!t) return null;
   const now = Date.now();
-  const startOfDay = (ts: number): number => moment(ts).startOf("day").valueOf();
+  const startOfDay = (ts: number): number => momentFn(ts).startOf("day").valueOf();
   // Try to extract a time-of-day component first so it doesn't confuse
   // the date keyword/ISO parsers below. Matches "10am", "10:30am",
   // "14:00", "9pm" etc.
@@ -71,7 +74,7 @@ function parseDateToken(raw: string): number | null {
   const shortDays = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
   const dayIdx = dayNames.indexOf(dateStr) >= 0 ? dayNames.indexOf(dateStr) : shortDays.indexOf(dateStr);
   if (dayIdx >= 0) {
-    const today = moment().startOf("day");
+    const today = momentFn().startOf("day");
     const todayIdx = today.day();
     const back = (todayIdx - dayIdx + 7) % 7;
     return applyTime(today.subtract(back, "days").valueOf());
@@ -81,10 +84,10 @@ function parseDateToken(raw: string): number | null {
   if (rel) {
     const n = parseInt(rel[1], 10);
     const unit = { d: "days", w: "weeks", m: "months", y: "years" }[rel[2]] as moment.unitOfTime.DurationConstructor;
-    return applyTime(moment().subtract(n, unit).startOf("day").valueOf());
+    return applyTime(momentFn().subtract(n, unit).startOf("day").valueOf());
   }
   // ISO-like date attempt via moment.
-  const m = moment(dateStr, ["YYYY-MM-DD", "YYYY/MM/DD", "MM-DD-YYYY", "MM/DD/YYYY", "M-D-YYYY", "M/D/YYYY"], true);
+  const m = momentFn(dateStr, ["YYYY-MM-DD", "YYYY/MM/DD", "MM-DD-YYYY", "MM/DD/YYYY", "M-D-YYYY", "M/D/YYYY"], true);
   if (m.isValid()) return applyTime(m.startOf("day").valueOf());
   return null;
 }
@@ -133,7 +136,7 @@ export function parseSearchQuery(query: string): ParsedQuery {
         if (hasTime) {
           out.filters.on = { start: ts - 60_000, end: ts + 60_000 };
         } else {
-          const start = moment(ts).startOf("day").valueOf();
+          const start = momentFn(ts).startOf("day").valueOf();
           out.filters.on = { start, end: start + 86_400_000 };
         }
       }
@@ -167,6 +170,11 @@ export interface PickerItem {
    *  local (current-tree) results. */
   crossFolder?: string;
   crossFile?: TFile;
+  /** Raw note id of a cross-folder result (e.g. ROOT_ID for a home note). The
+   *  `id` field is folder-qualified (`cross:<folder>:<rawId>`) so home notes from
+   *  different folders — which all share ROOT_ID — don't collide; lookups that
+   *  need the underlying note id use this instead of parsing `id`. */
+  crossId?: string;
   /** For "folder-open" items: the folder path to open in a new tab. */
   folder?: string;
 }
@@ -442,7 +450,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     const cross = this.notes.filter((n) => n.cross);
 
     const buildItem = (n: NoteBody, matchLine: number): PickerItem => ({
-      id: n.cross ? `cross:${n.cross.id}` : n.node!.id,
+      // Folder-qualify cross-folder ids: home notes all share ROOT_ID, so a bare
+      // `cross:${id}` collided across folders (one home borrowed another's body/
+      // title). The raw id rides along in `crossId` for lookups.
+      id: n.cross ? `cross:${n.cross.folder}:${n.cross.id}` : n.node!.id,
       label: n.title,
       node: n.node,
       kind: "note",
@@ -450,6 +461,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       matchLine,
       crossFolder: n.cross?.folder,
       crossFile: n.cross?.file,
+      crossId: n.cross?.id,
     });
 
     const matchTier = (tier: NoteBody[]): PickerItem[] => {
@@ -562,7 +574,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     if (parsed.text.join("").length >= 3) {
       const isHomeMatch = (i: PickerItem): boolean =>
         i.kind === "note"
-        && (i.id === ROOT_ID || i.id === `cross:${ROOT_ID}`)
+        && (i.id === ROOT_ID || i.crossId === ROOT_ID)
         && matchesAll(i.label.toLowerCase());
       const homes = items.filter(isHomeMatch);
       if (homes.length > 0) {
@@ -658,7 +670,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
 
     // Locate the underlying NoteBody so we can render body + parent body.
     const note = this.notes.find((n) => {
-      if (item.crossFolder) return n.cross?.id === item.id.replace(/^cross:/, "");
+      // Match folder AND id — home notes across folders all share ROOT_ID, so id
+      // alone would resolve every cross-folder home to the first one (the
+      // "Beta home shows Alpha's title/body" bug).
+      if (item.crossFolder) return n.cross?.folder === item.crossFolder && n.cross?.id === item.crossId;
       return n.node?.id === item.id;
     });
     // 0.69.3: re-parse the current input each render so we know which
@@ -716,7 +731,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       if (ms != null) {
         const tEl = rail.createDiv({ cls: "stashpad-suggest-time" });
         tEl.setText(this.formatRelativeTime(ms));
-        tEl.title = moment(ms).format("YYYY-MM-DD HH:mm");
+        tEl.title = momentFn(ms).format("YYYY-MM-DD HH:mm");
       }
       if (badgeFolder) {
         rail.createDiv({
@@ -733,8 +748,8 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
    *  then formatted the now-midnight m as h:mm a → every same-day
    *  result rendered as "12:00 am". Use a fresh moment for the diff. */
   private formatRelativeTime(ms: number): string {
-    const m = moment(ms);
-    const days = moment().startOf("day").diff(moment(ms).startOf("day"), "days");
+    const m = momentFn(ms);
+    const days = momentFn().startOf("day").diff(momentFn(ms).startOf("day"), "days");
     if (days === 0) return m.format("h:mm a");
     if (days === 1) return "yesterday";
     if (days > 1 && days < 7) return `${days}d ago`;
@@ -787,7 +802,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       if (seen.has(cur.id)) break; // cycle detected
       seen.add(cur.id);
       chain.unshift(this.titleFn(cur));
-      cur = cur.parent && cur.parent !== ROOT_ID ? this.tree.get(cur.parent) : null;
+      cur = cur.parent && cur.parent !== ROOT_ID ? this.tree.get(cur.parent) : undefined;
     }
     return chain.join(" › ");
   }
@@ -809,7 +824,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     }
     const byId = this.crossFolderIndex.get(item.crossFolder);
     if (!byId) return "";
-    const startId = item.id.replace(/^cross:/, "");
+    const startId = item.crossId ?? item.id.replace(/^cross:/, "");
     const start = byId.get(startId);
     if (!start) return "";
     const chain: string[] = [];
@@ -1133,7 +1148,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // Mode tabs row.
     const tabs = document.createElement("div");
     tabs.className = "stashpad-when-tabs";
-    const modes: Array<{ id: typeof this.whenMode; label: string }> = [
+    const modes: Array<{ id: "before" | "on" | "after" | "between"; label: string }> = [
       { id: "before", label: "Before" },
       { id: "on", label: "On" },
       { id: "after", label: "After" },
@@ -1157,21 +1172,13 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         //    start (single) is empty, fall back to end so the user
         //    doesn't lose what they typed.
         if (prev !== "between" && m.id === "between") {
-          // single is already set; just ensure end is empty (text + date/time).
+          // single is already set; just ensure the end text is empty.
           this.whenBetweenEndText = "";
-          this.whenBetweenEndDate = "";
-          this.whenBetweenEndTime = "";
         } else if (prev === "between" && m.id !== "between") {
           if (!this.whenSingleText && this.whenBetweenEndText) {
             this.whenSingleText = this.whenBetweenEndText;
           }
-          if (!this.whenSingleDate && this.whenBetweenEndDate) {
-            this.whenSingleDate = this.whenBetweenEndDate;
-            this.whenSingleTime = this.whenBetweenEndTime;
-          }
           this.whenBetweenEndText = "";
-          this.whenBetweenEndDate = "";
-          this.whenBetweenEndTime = "";
         }
         this.whenMode = m.id;
         for (const k in tabBtns) tabBtns[k].toggleClass("is-active", k === m.id);
@@ -1199,14 +1206,14 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       precedingDate: string | null,
       slot: "single" | "betweenStart" | "betweenEnd" = "single",
     ): string => {
-      const today = moment().format("YYYY-MM-DD");
+      const today = momentFn().format("YYYY-MM-DD");
       const isToday = !precedingDate || precedingDate === today;
       if (slot === "betweenStart") return "00:00";
       if (slot === "betweenEnd") return "23:59";
       switch (mode) {
         case "after": return "00:00";
-        case "on": return isToday ? moment().format("HH:mm") : "23:59";
-        case "before": return isToday ? moment().format("HH:mm") : "23:59";
+        case "on": return isToday ? momentFn().format("HH:mm") : "23:59";
+        case "before": return isToday ? momentFn().format("HH:mm") : "23:59";
         default: return "23:59";
       }
     };
@@ -1404,7 +1411,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           const compileValue = (n: number, unit: "d" | "w" | "m" | "y"): string => {
             if (!isOnMode) return `${n}${unit}`;
             const mUnit = { d: "days", w: "weeks", m: "months", y: "years" }[unit] as moment.unitOfTime.DurationConstructor;
-            return moment().subtract(n, mUnit).format("YYYY-MM-DD");
+            return momentFn().subtract(n, mUnit).format("YYYY-MM-DD");
           };
 
           // Preset chips — common windows.
@@ -1505,7 +1512,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           }
           const days = pop.createDiv({ cls: "stashpad-when-pop-row stashpad-when-pop-days" });
           const dayNames = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-          const todayIdx = moment().day(); // 0=Sun .. 6=Sat
+          const todayIdx = momentFn().day(); // 0=Sun .. 6=Sat
           // Map to monday-first index (monday=0 .. sunday=6).
           const todayMondayFirst = (todayIdx + 6) % 7;
           for (let i = 0; i < dayNames.length; i++) {
@@ -1528,7 +1535,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
               // recent past occurrence otherwise).
               if (slot === "betweenEnd") {
                 const targetIdx = i; // monday-first idx
-                const today = moment().startOf("day");
+                const today = momentFn().startOf("day");
                 const todayMF = (today.day() + 6) % 7;
                 let add = (targetIdx - todayMF + 7) % 7;
                 if (add === 0) add = 7; // today's weekday → next week
@@ -1556,7 +1563,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       };
       calBtn.addEventListener("click", (e) => {
         e.preventDefault();
-        openPicker(calNative, moment().format("YYYY-MM-DD"));
+        openPicker(calNative, momentFn().format("YYYY-MM-DD"));
       });
       calNative.addEventListener("change", () => {
         if (!calNative.value) return;

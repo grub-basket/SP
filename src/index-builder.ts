@@ -382,8 +382,8 @@ function filterByScope(files: TFile[], settings: StashpadSettings): TFile[] {
 
 function compareEntries(a: IndexEntry, b: IndexEntry, mode: "natural" | "created"): number {
   if (mode === "created") {
-    const aMs = a.file.stat?.ctime ?? 0;
-    const bMs = b.file.stat?.ctime ?? 0;
+    const aMs = a.file?.stat?.ctime ?? 0;
+    const bMs = b.file?.stat?.ctime ?? 0;
     if (aMs !== bMs) return aMs - bMs;
   }
   return compareSegments(a.segments, b.segments);
