@@ -59,6 +59,17 @@ export class RenderCacheStore implements RenderCacheLike {
     }
   }
 
+  /** Drop a path's entry and flush promptly. Wired to vault delete/rename:
+   *  entries hold the FULL note body + rendered HTML, so a deleted file's
+   *  cache row is leftover plaintext on disk — for encryption's lock /
+   *  secure-delete (which permanently remove the readable note) it would
+   *  silently defeat "the encrypted blob is the only surviving copy". */
+  evict(path: string): void {
+    if (!this.map.delete(path)) return;
+    this.dirty = true;
+    void this.save();
+  }
+
   get(path: string): RenderEntry | undefined { return this.map.get(path); }
   has(path: string): boolean { return this.map.has(path); }
   set(path: string, entry: RenderEntry): void {

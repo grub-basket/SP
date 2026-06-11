@@ -52,7 +52,9 @@ const WORDS = (
   "turtle tusk twig umber unicorn valley vanilla velvet vermil violet viper vista vivid vortex " +
   "waffle walnut warbler wasp water weasel wharf wheat whisk willow window winter wisp wombat " +
   "wonder woven yam yarn yeast yew yodel yonder zebra zenith zephyr zigzag zinc zircon"
-).split(/\s+/).filter(Boolean);
+  // De-duped: the raw list repeats a few words (eagle, ember), which would
+  // overstate `passphraseBits`' advertised entropy and skew word odds.
+).split(/\s+/).filter(Boolean).filter((w, i, a) => a.indexOf(w) === i);
 
 /** Unbiased random integer in [0, n) via rejection sampling. */
 function randIndex(n: number): number {

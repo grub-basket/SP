@@ -15,6 +15,7 @@ import { DEFAULT_STOPWORDS } from "./slug-service";
 import { newId } from "./id-service";
 import { formatDateTime } from "./format";
 import { type EncryptionConfig, defaultEncryptionConfig } from "./encryption-service";
+import { anyStashencOnDisk } from "./encryption-ops";
 import { getActiveView } from "./active-view";
 
 export interface ShortcutMap {
@@ -61,7 +62,8 @@ export type CommandId =
   | "togglePin"
   | "toggleTask" | "setDue"
   | "jumpToTop" | "jumpToBottom"
-  | "lockSelection" | "unlockAll"
+  | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
+  | "copyNotes" | "cutNotes" | "pasteNotes"
   | "commandPalette";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
@@ -133,6 +135,11 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "commandPalette",  label: "Command palette (Stashpad only)", desc: "Default: Mod+K — open a command palette listing only Stashpad's commands, with Sift search.", defaultPrimary: "Mod+K" },
   { id: "lockSelection",   label: "Encrypt (lock) selection",      desc: "Encrypt the selected note(s) + their children into a locked .stashenc bundle in place (prompts to unlock first if needed). No default chord.", defaultPrimary: "" },
   { id: "unlockAll",       label: "Decrypt (unlock) locked notes in view", desc: "Decrypt every locked stash shown in the current view back into place, skipping any that can't be read. No default chord.", defaultPrimary: "" },
+  { id: "moveToArchive",   label: "Move selection to archive (encrypt)", desc: "Move the selected note(s) to the default archive folder, encrypted on arrival. Undoable. No default chord.", defaultPrimary: "" },
+  { id: "encryptDelete",   label: "Encrypt & delete selection",     desc: "Send the selected note(s) to the encrypted trash (recoverable with your password, Ctrl/Cmd+Z undoable). No default chord.", defaultPrimary: "" },
+  { id: "copyNotes",       label: "Copy notes (note clipboard)",    desc: "Copy the selected note(s) as NOTES: paste in the list to duplicate them (new ids), or anywhere else to paste their text. Skipped when text is highlighted (normal copy wins).", defaultPrimary: "Mod+C" },
+  { id: "cutNotes",        label: "Cut notes",                      desc: "Cut the selected note(s): paste in the list to MOVE them, or in the composer to extract their text and delete the originals (undoable).", defaultPrimary: "Mod+X" },
+  { id: "pasteNotes",      label: "Paste notes",                    desc: "Paste previously copied/cut notes at the cursor row (after it, same parent). Does nothing if the note clipboard is empty.", defaultPrimary: "Mod+V" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -1075,14 +1082,16 @@ export class StashpadSettingTab extends PluginSettingTab {
         }));
 
       new Setting(host).setName("Remove encryption").setDesc("Erases the key from this vault. Refused while any locked notes exist — decrypt everything first (locked notes have NO plaintext copy; losing the key loses them forever).").addButton((b) => {
-        b.setButtonText("Remove…").onClick(() => {
+        b.setButtonText("Remove…").onClick(async () => {
           // 0.98.23: HARD GUARD — locked blobs are the ONLY copy of their notes
           // (lock permanently deletes the plaintext). Erasing the key with blobs
           // still on disk = permanent data loss. Refuse until everything is
           // decrypted; offer the vault-wide unlock as the way out.
-          const lockedBlobs = this.app.vault.getFiles().filter((f) => f.extension === "stashenc");
-          if (lockedBlobs.length > 0) {
-            new Notice(`Can't remove encryption: ${lockedBlobs.length} locked note${lockedBlobs.length === 1 ? " is" : "s are"} still encrypted and would be lost forever. Run "Decrypt (unlock) ALL locked notes in the vault" first.`, 10000);
+          // 0.98.42: scan the ADAPTER, not vault.getFiles — blobs are written
+          // via the adapter and can be invisible to the vault index for a
+          // while (and `_deleted/` / `.trash` blobs aren't indexed at all).
+          if (await anyStashencOnDisk(this.app)) {
+            new Notice(`Can't remove encryption: locked/encrypted-deleted notes still exist and would be lost forever. Run "Decrypt (unlock) ALL locked notes in the vault" and empty the encrypted trash first.`, 10000);
             return;
           }
           new TypeToConfirmModal(this.app, {
@@ -1094,7 +1103,7 @@ export class StashpadSettingTab extends PluginSettingTab {
             onConfirm: async () => {
               // Re-check at confirm time — a lock could have happened while the
               // modal sat open (another device syncing, another window).
-              if (this.app.vault.getFiles().some((f) => f.extension === "stashenc")) {
+              if (await anyStashencOnDisk(this.app)) {
                 new Notice("Locked notes appeared while this dialog was open — removal cancelled. Decrypt everything first.", 10000);
                 return;
               }
@@ -1106,11 +1115,11 @@ export class StashpadSettingTab extends PluginSettingTab {
       });
     }, ["encryption", "encrypt", "password", "passphrase", "lock", "unlock", "key", "security", "private"]));
 
-    items.push(this.renderDef("Encrypt items sent to trash", "When ON, deleted notes/folders are encrypted in the trash using your vault password. Default OFF. (Takes effect once the delete-encryption phase ships.)", (s) =>
+    items.push(this.renderDef("Encrypt items sent to trash", "When ON, deleting a note sends it to Stashpad's encrypted trash (recoverable with your password) instead of a plaintext trash. Default OFF.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.encryptTrash).onChange(async (v) => {
         this.plugin.settings.encryptTrash = v; await this.plugin.saveSettings();
       })), ["trash", "delete", "encrypt"]));
-    items.push(this.renderDef("Encrypt trash filenames", "Also encrypt the FILENAMES of trashed items. Default OFF so you can still tell what to restore when working outside the app.", (s) =>
+    items.push(this.renderDef("Encrypt trash filenames", "Hide the filename + origin folder of encrypted-trashed items (opaque names on disk; shown under “Hidden” in the trash tab). Default OFF so you can still tell what to restore when working outside the app.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.encryptTrashFilenames).onChange(async (v) => {
         this.plugin.settings.encryptTrashFilenames = v; await this.plugin.saveSettings();
       })), ["trash", "filename", "encrypt"]));

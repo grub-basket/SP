@@ -4644,6 +4644,14 @@ export class StashpadView extends ItemView {
       void importAndAppend(files);
     });
     ta.addEventListener("paste", (e) => {
+      // 0.99.0: pasting CUT notes into the composer completes the cut — the
+      // text lands via the native paste; the originals are then deleted
+      // (undoable). Only fires when the pasted text IS the cut text — if the
+      // user copied something else after cutting, the cut stays pending.
+      const clip = this.plugin.noteClipboard;
+      if (clip?.mode === "cut" && clip.text && e.clipboardData?.getData("text/plain") === clip.text) {
+        setTimeout(() => void this.completeCutIntoComposer(), 0);
+      }
       // clipboardData.files covers explicit file copies (Finder/Explorer);
       // .items covers screenshot pastes (image/png with no .files entry
       // on some platforms). Iterating items and grabbing kind:"file" is
@@ -5137,6 +5145,8 @@ export class StashpadView extends ItemView {
     if (matchBinding(e, b.commandPalette)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openStashpadCommandPalette(); return; }
     if (matchBinding(e, b.lockSelection)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdLockSelection(); return; }
     if (matchBinding(e, b.unlockAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdUnlockAll(); return; }
+    if (matchBinding(e, b.moveToArchive)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdMoveToArchive(); return; }
+    if (matchBinding(e, b.encryptDelete)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdEncryptDelete(); return; }
     if (matchBinding(e, b.searchInParent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openSearchInParentModal(); return; }
     // Folder switch / .stash import-export bindings — fire from anywhere
     // in the view (composer or list). Default chord is empty; user binds
@@ -5354,6 +5364,12 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.pickMove)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInListPicker(); return; }
       if (matchBinding(e, sb.merge)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdMerge(); return; }
       if (matchBinding(e, sb.copy)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopy(); return; }
+      // 0.99.0 note clipboard. Copy/cut defer to the native clipboard when
+      // text is highlighted (Mod+C on a text selection must stay normal copy);
+      // paste only intercepts when the note clipboard actually holds notes.
+      if (matchBinding(e, sb.copyNotes) && !window.getSelection()?.toString()) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyNotes(); return; }
+      if (matchBinding(e, sb.cutNotes) && !window.getSelection()?.toString()) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCutNotes(); return; }
+      if (matchBinding(e, sb.pasteNotes) && this.plugin.noteClipboard) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
       if (matchBinding(e, sb.copyTree)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyTree(); return; }
       if (matchBinding(e, sb.copyOutline)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyOutline(); return; }
       if (matchBinding(e, sb.copyCodeBlock)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyCodeBlock(); return; }
@@ -6860,6 +6876,146 @@ export class StashpadView extends ItemView {
       category: "clone",
       affectedIds: newRootIds,
       folder: this.noteFolder,
+    });
+  }
+
+  // ---- 0.99.0: note clipboard — copy / cut / paste of note BLOCKS ----
+  // Runs in parallel with the system clipboard: copy/cut also put the bodies
+  // on the system clipboard as text (so pasting in the composer or any app
+  // works normally); paste IN THE LIST operates on the notes themselves.
+
+  async cmdCopyNotes(): Promise<void> {
+    const targets = this.getActionTargets();
+    if (!targets.length) { new Notice("Nothing to copy."); return; }
+    await clipboardCmds.cmdCopy(this); // bodies → system clipboard (+ toast)
+    this.plugin.noteClipboard = { mode: "copy", folder: this.noteFolder, ids: targets.map((t) => t.id) };
+  }
+
+  async cmdCutNotes(): Promise<void> {
+    const targets = this.getActionTargets();
+    if (!targets.length) { new Notice("Nothing to cut."); return; }
+    const out: string[] = [];
+    for (const t of targets) {
+      if (!t.file) continue;
+      out.push(this.stripFrontmatter(await this.app.vault.cachedRead(t.file)).trim());
+    }
+    const cutText = out.join("\n\n");
+    await navigator.clipboard.writeText(cutText);
+    this.plugin.noteClipboard = { mode: "cut", folder: this.noteFolder, ids: targets.map((t) => t.id), text: cutText };
+    // Persistent: a pending cut is a MODE — the user should see it until
+    // they paste (nothing is deleted until then).
+    this.plugin.notifications.show({
+      message: `Cut ${this.titleList(targets)} — paste in the list to move, or in the composer to extract the text (deletes the originals, undoable). Nothing happens until you paste.`,
+      kind: "info", category: "system", affectedIds: targets.map((t) => t.id), folder: this.noteFolder, duration: 0,
+    });
+  }
+
+  async cmdPasteNotes(): Promise<void> {
+    const clip = this.plugin.noteClipboard;
+    if (!clip) { new Notice("The note clipboard is empty — copy or cut notes first."); return; }
+    if (clip.folder !== this.noteFolder) { new Notice("Those notes were cut/copied in another folder — cross-folder paste isn't supported yet."); return; }
+    const nodes = clip.ids.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
+    if (!nodes.length) { this.plugin.noteClipboard = null; new Notice("Those notes no longer exist."); return; }
+    // Paste position: after the cursor row (same parent); fall back to the
+    // focused subtree root when there's no cursor.
+    const cursor = this.currentChildren[this.cursorIdx] ?? null;
+    const parentId = ((cursor?.parent ?? this.focusId) ?? ROOT_ID) as StashpadId;
+
+    if (clip.mode === "cut") {
+      // Cycle guard: never paste a subtree under itself/its own descendant.
+      const cutIds = new Set(clip.ids);
+      for (let p: StashpadId | null = parentId; p && p !== ROOT_ID; p = this.tree.get(p)?.parent ?? null) {
+        if (cutIds.has(p)) { new Notice("Can't paste cut notes under themselves."); return; }
+      }
+      // moveAcrossThenReorder pushes the undo entry + persistent notification.
+      const anchor = cursor && !cutIds.has(cursor.id) ? cursor.id : "";
+      await this.moveAcrossThenReorder(nodes.map((n) => n.id), parentId, anchor, "after");
+      this.plugin.noteClipboard = null;
+      return;
+    }
+
+    // copy → duplicate with fresh ids at the paste target (same machinery as
+    // cmdClone, but parented where the user pasted; clipboard stays loaded so
+    // repeated pastes make repeated duplicates).
+    const folder = this.noteFolder;
+    const createdPaths: string[] = [];
+    const newRootIds: StashpadId[] = [];
+    for (const n of nodes) {
+      const id = await this.cloneSubtree(n, parentId, createdPaths);
+      if (id) newRootIds.push(id);
+    }
+    if (!newRootIds.length) return;
+    this.tree.rebuild(folder);
+    this.pendingFocusIds = newRootIds.slice();
+    this.render();
+    const snapNodes: TreeNode[] = createdPaths
+      .map((p) => this.app.vault.getAbstractFileByPath(p))
+      .filter((f): f is TFile => !!f && (f as any).extension === "md")
+      .map((file) => ({ id: parseIdFromFilename(file.basename) ?? file.basename, parent: null, children: [], file, created: new Date().toISOString() }));
+    const snap = await this.snapshotNotes(snapNodes, false);
+    this.plugin.getUndoStack(folder).push({
+      label: `Paste ${newRootIds.length} note${newRootIds.length === 1 ? "" : "s"}`,
+      undo: async () => {
+        for (const p of [...createdPaths].reverse()) {
+          const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
+          if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+      redo: async () => { await this.restoreSnapshots(snap, newRootIds); },
+    });
+    const pastedRoots = newRootIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({ verb: "Pasted (duplicated)", nodes: pastedRoots, suffix: `(${createdPaths.length} file${createdPaths.length === 1 ? "" : "s"} total)` }),
+      kind: "success", category: "clone", affectedIds: newRootIds, folder, duration: 0,
+    });
+  }
+
+  /** Composer paste of CUT notes: the textarea's native paste already inserted
+   *  the bodies (they're on the system clipboard); this completes the cut by
+   *  deleting the original notes + their subtrees (snapshot-undoable). */
+  async completeCutIntoComposer(): Promise<void> {
+    const clip = this.plugin.noteClipboard;
+    if (!clip || clip.mode !== "cut" || clip.folder !== this.noteFolder) return;
+    this.plugin.noteClipboard = null;
+    const roots = clip.ids.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
+    if (!roots.length) return;
+    // Gather subtrees children-first (safe delete order), dedup overlaps.
+    const allNotes: TreeNode[] = [];
+    const seen = new Set<StashpadId>();
+    const walk = (n: TreeNode): void => {
+      if (seen.has(n.id)) return;
+      seen.add(n.id);
+      for (const c of this.tree.getChildren(n.id)) walk(c);
+      allNotes.push(n);
+    };
+    for (const r of roots) walk(r);
+    const folder = this.noteFolder;
+    const snap = await this.snapshotNotes(allNotes, false);
+    for (const n of allNotes) {
+      if (!n.file) continue;
+      try { await this.app.fileManager.trashFile(n.file); } catch (e) { console.warn("[Stashpad] cut-paste delete failed", n.file.path, e); }
+    }
+    this.selection.clear();
+    this.tree.rebuild(folder);
+    this.render();
+    const rootIds = roots.map((r) => r.id);
+    this.plugin.getUndoStack(folder).push({
+      label: `Cut ${roots.length} note${roots.length === 1 ? "" : "s"} into composer`,
+      undo: async () => { await this.restoreSnapshots(snap, rootIds); },
+      redo: async () => {
+        for (const sn of [...snap.notes]) {
+          const f = this.app.vault.getAbstractFileByPath(sn.path) as TFile | null;
+          if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+    this.plugin.notifications.show({
+      message: `Pasted the text of ${this.titleList(roots)} into the composer and deleted the original${roots.length === 1 ? "" : "s"} (${allNotes.length} note${allNotes.length === 1 ? "" : "s"}). Undo (in the list) restores them.`,
+      kind: "warning", category: "delete", affectedIds: rootIds, folder, duration: 0,
     });
   }
 
@@ -8454,7 +8610,13 @@ export class StashpadView extends ItemView {
     // 0.98.32: secure-delete override — when "Encrypt items sent to trash" is ON,
     // a normal delete routes to the encrypted trash (recoverable + Ctrl+Z) instead
     // of plaintext-trashing. Scoped to Stashpad's own delete (per the agreed design).
-    if ((this.plugin.settings.encryptTrash ?? false) && this.plugin.encryption?.isConfigured?.()) {
+    // ("Follow Obsidian's trash setting" opts back out of the override.)
+    if ((this.plugin.settings.encryptTrash ?? false) && !(this.plugin.settings.encryptTrashFollowObsidian ?? false)) {
+      if (!this.plugin.encryption?.isConfigured?.()) {
+        // Don't silently fall back to the plaintext trash the user asked to avoid.
+        new Notice("“Encrypt items sent to trash” is ON but encryption isn't set up (Settings → Encryption). Nothing was deleted.");
+        return;
+      }
       await this.secureDeleteSources(targets);
       return;
     }
@@ -9386,7 +9548,11 @@ export class StashpadView extends ItemView {
     }));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Delete").setIcon("trash").onClick(async () => {
-      await this.deleteNote(node);
+      // Route through cmdDelete (not deleteNote directly) so the encryptTrash
+      // override applies here too — otherwise right-click Delete sends
+      // plaintext to the system trash with "Encrypt items sent to trash" ON.
+      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      await this.cmdDelete();
     }));
     menu.addSeparator();
     // 0.87.0: "more commands" escape hatch (parity with the ⚡ menu).

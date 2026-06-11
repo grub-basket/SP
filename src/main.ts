@@ -7,7 +7,7 @@ import { STASHPAD_TRASH_VIEW_TYPE } from "./types";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, type DeletedMeta } from "./encryption-ops";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, OBSIDIAN_TRASH_DIR, type DeletedMeta } from "./encryption-ops";
 import { EncryptionPasswordModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
@@ -103,6 +103,12 @@ export default class StashpadPlugin extends Plugin {
   /** 0.83.2: persisted render cache (rendered note bodies survive reload —
    *  a cold open reads one cache file instead of N bodies over a slow
    *  drive). Shared across views. */
+  /** 0.99.0: the note clipboard (copy/cut/paste of note BLOCKS — runs in
+   *  parallel with the system text clipboard, which gets the bodies as text).
+   *  Plugin-level so it survives view re-renders; ids resolve against the
+   *  source folder's tree at paste time (stale ids just shrink the paste). */
+  noteClipboard: { mode: "copy" | "cut"; folder: string; ids: StashpadId[]; text?: string } | null = null;
+
   private _renderCacheStore: RenderCacheStore | null = null;
   get renderCacheStore(): RenderCacheStore {
     if (!this._renderCacheStore) this._renderCacheStore = new RenderCacheStore(this.app, this.pluginPrivatePath());
@@ -112,6 +118,9 @@ export default class StashpadPlugin extends Plugin {
   async onunload(): Promise<void> {
     // 0.97.0: wipe the in-memory encryption key on unload.
     try { this.encryption?.dispose(); } catch { /* best-effort */ }
+    // Cancel pending archive-sweep timers — firing after unload would run
+    // lockNoteSubtree against disposed services (key just wiped).
+    try { for (const p of this.archivePending.values()) window.clearTimeout(p.timer); this.archivePending.clear(); } catch { /* best-effort */ }
     // 0.83.2: flush any pending render-cache writes (the store's save is
     // debounced, so a recent change could still be in the buffer).
     try { await this._renderCacheStore?.save(); } catch { /* best-effort */ }
@@ -661,6 +670,11 @@ export default class StashpadPlugin extends Plugin {
     // first cold paint can hit it instead of reading every body over the
     // (possibly slow) drive.
     await this.renderCacheStore.load();
+    // Evict cache rows when their file goes away — an entry holds the full
+    // body + HTML, and after an encryption lock/secure-delete it would be the
+    // last readable plaintext copy, sitting in render-cache.json.
+    this.registerEvent(this.app.vault.on("delete", (f) => this.renderCacheStore.evict(f.path)));
+    this.registerEvent(this.app.vault.on("rename", (_f, oldPath) => this.renderCacheStore.evict(oldPath)));
     // 0.77.1: load the author registry and seed it with the local user.
     await this.authorRegistry.load();
     {
@@ -998,6 +1012,22 @@ export default class StashpadPlugin extends Plugin {
       name: "Decrypt (unlock) ALL locked notes in the vault",
       callback: () => void this.unlockAllInVault(),
     });
+    // 0.99.0: note clipboard — copy/cut/paste of note blocks.
+    this.addCommand({
+      id: "stashpad-copy-notes",
+      name: "Copy notes (note clipboard — paste to duplicate)",
+      callback: () => call("cmdCopyNotes"),
+    });
+    this.addCommand({
+      id: "stashpad-cut-notes",
+      name: "Cut notes (paste in list to move, in composer to extract text)",
+      callback: () => call("cmdCutNotes"),
+    });
+    this.addCommand({
+      id: "stashpad-paste-notes",
+      name: "Paste notes (from the note clipboard)",
+      callback: () => call("cmdPasteNotes"),
+    });
     this.addCommand({
       id: "stashpad-move-to-archive",
       name: "Move selection to archive (encrypt)",
@@ -1012,6 +1042,13 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-restore-trash",
       name: "Open encrypted trash (restore deleted)…",
       callback: () => this.openEncryptedTrash(),
+    });
+    // v2 backfill: "Encrypt items sent to trash" only covers going-forward
+    // deletes — this sweeps what's ALREADY sitting in plaintext in `.trash/`.
+    this.addCommand({
+      id: "stashpad-encrypt-existing-trash",
+      name: "Encrypt existing Obsidian trash (backfill .trash into encrypted trash)",
+      callback: () => void this.encryptExistingTrash(),
     });
     // 0.77.8: claim authorship retroactively (for notes created before the
     // user set their author name). Author-only variants only fill blank
@@ -2904,7 +2941,13 @@ export default class StashpadPlugin extends Plugin {
         { folder: blobFolder, blob: r.blobPath, parentId: r.parentId, title: r.title, count: r.noteCount, created: r.created, rootId: r.rootId, prevSibling },
       ];
       await this.saveSettings();
-      if (!opts.silent) this.notifications.show({ message: `Locked ${r.title ? `“${r.title}”` : "a note"} (${r.noteCount} note${r.noteCount === 1 ? "" : "s"}).`, kind: "success", category: "system", folder });
+      if (r.unpurged.length > 0) {
+        // The blob is good but readable plaintext is STILL on disk (delete
+        // failed, or the file was edited mid-lock). Never report a clean lock.
+        new Notice(`⚠️ Locked, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the lock):\n${r.unpurged.join("\n")}`, 0);
+      } else if (!opts.silent) {
+        this.notifications.show({ message: `Locked ${r.title ? `“${r.title}”` : "a note"} (${r.noteCount} note${r.noteCount === 1 ? "" : "s"}).`, kind: "success", category: "system", folder });
+      }
       return r;
     } catch (e) {
       console.warn("[Stashpad] lock failed", e);
@@ -2919,11 +2962,15 @@ export default class StashpadPlugin extends Plugin {
     const dek = this.encryption.getSessionKey();
     if (!dek) return false;
     const folder = (opts.destFolder ?? blobPath.replace(/\/[^/]*$/, "")).replace(/\/+$/, "");
+    // Disk frontmatter, not metadataCache (lags after lock churn) — a stale
+    // miss here re-pins an unlocked nested note to ROOT in importStashZip.
     const existing = new Set<StashpadId>();
     for (const f of this.app.vault.getMarkdownFiles()) {
       if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== folder) continue;
-      const id = (this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown } | undefined)?.id;
-      if (typeof id === "string") existing.add(id);
+      try {
+        const id = splitFrontmatter(await this.app.vault.read(f)).fm.id;
+        if (typeof id === "string") existing.add(id);
+      } catch { /* unreadable — skip */ }
     }
     try {
       const r = await unlockBundle(this.app, blobPath, dek, existing, opts.destFolder);
@@ -2950,10 +2997,13 @@ export default class StashpadPlugin extends Plugin {
     const roots: StashpadId[] = [];
     for (const f of this.app.vault.getMarkdownFiles()) {
       if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
-      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; parent?: unknown } | undefined;
-      const id = fm?.id;
+      // Disk frontmatter, not metadataCache — a stale `parent` here reads a
+      // child as a root, giving it its own bundle orphaned from its parent's.
+      let fm: Record<string, unknown>;
+      try { fm = splitFrontmatter(await this.app.vault.read(f)).fm; } catch { continue; }
+      const id = fm.id;
       if (typeof id !== "string" || id === ROOT_ID) continue;
-      const parent = typeof fm?.parent === "string" ? fm.parent : ROOT_ID;
+      const parent = typeof fm.parent === "string" ? fm.parent : ROOT_ID;
       if (parent !== ROOT_ID) continue; // children ride along inside their root's bundle
       roots.push(id);
     }
@@ -3037,8 +3087,13 @@ export default class StashpadPlugin extends Plugin {
     try {
       // Plugin runtime (not a workflow script) — Date is available.
       const deletedAt = new Date().toISOString();
-      const hideTitle = this.settings.hideLockedTitles ?? false;
+      // "Encrypt trash filenames" hides the trash blob's name/origin even when
+      // the general hide-locked-titles setting is off.
+      const hideTitle = (this.settings.hideLockedTitles ?? false) || (this.settings.encryptTrashFilenames ?? false);
       const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle);
+      if (r.unpurged.length > 0) {
+        new Notice(`⚠️ Sent to encrypted trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
+      }
       return r.blobPath;
     } catch (e) {
       console.warn("[Stashpad] encrypt-delete failed", e);
@@ -3053,15 +3108,35 @@ export default class StashpadPlugin extends Plugin {
     const dek = this.encryption.getSessionKey();
     if (!dek) return false;
     const meta = await readDeletedMeta(this.app, blobPath);
-    const dest = (meta?.originalFolder && await this.app.vault.adapter.exists(meta.originalFolder))
-      ? meta.originalFolder : blobPath.replace(/\/[^/]*$/, "");
-    const existing = new Set<StashpadId>();
-    for (const f of this.app.vault.getMarkdownFiles()) {
-      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dest.replace(/\/+$/, "")) continue;
-      const id = (this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown } | undefined)?.id;
-      if (typeof id === "string") existing.add(id);
+    // Backfill blobs are raw `.trash/` zips, not Stashpad bundles — different
+    // restore path (plain unzip back into `.trash/`).
+    if (meta?.kind === "rawtrash") {
+      try {
+        const r = await restoreRawTrash(this.app, blobPath, dek);
+        if (!opts.silent) this.notifications.show({ message: `Restored ${r.filesWritten} file${r.filesWritten === 1 ? "" : "s"} to Obsidian's trash (${OBSIDIAN_TRASH_DIR}/).`, kind: "success", category: "system", folder: "" });
+        return true;
+      } catch (e) {
+        console.warn("[Stashpad] trash-backfill restore failed", e);
+        new Notice(`Couldn't restore: ${(e as Error).message}`, 0);
+        return false;
+      }
     }
     try {
+      // Sanitized; decrypts the origin for hidden-title deletes; throws (blob
+      // kept) when a trash blob's origin is unknowable instead of dumping
+      // plaintext into `_deleted/`.
+      const dest = await deletedRestoreDest(this.app, blobPath, meta, dek);
+      // Existing ids from DISK frontmatter, not metadataCache — the cache lags
+      // after lock/restore churn, and a stale miss makes importStashZip re-pin
+      // a restored child to ROOT.
+      const existing = new Set<StashpadId>();
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dest.replace(/\/+$/, "")) continue;
+        try {
+          const id = splitFrontmatter(await this.app.vault.read(f)).fm.id;
+          if (typeof id === "string") existing.add(id);
+        } catch { /* unreadable — skip */ }
+      }
       const r = await restoreDeleted(this.app, blobPath, dek, existing);
       if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo });
       return true;
@@ -3080,12 +3155,13 @@ export default class StashpadPlugin extends Plugin {
     return out;
   }
 
-  /** v2: restore EVERY encrypted-trash note back to its origin folder (or just the
-   *  ones from `scopeFolder`). Returns how many were restored. */
-  async restoreAllTrash(scopeFolder?: string): Promise<number> {
+  /** v2: restore EVERY encrypted-trash note back to its origin folder.
+   *  (The old `scopeFolder` filter was dropped: no caller passed it, and it
+   *  matched plaintext `originalFolder` — silently skipping hidden-title items
+   *  whose origin lives only in `originalFolderEnc`.) */
+  async restoreAllTrash(): Promise<number> {
     if (!(await this.ensureEncryptionUnlocked())) return 0;
-    let items = await this.listDeletedTrash();
-    if (scopeFolder) { const s = scopeFolder.replace(/\/+$/, ""); items = items.filter((it) => (it.meta?.originalFolder ?? "") === s); }
+    const items = await this.listDeletedTrash();
     if (items.length === 0) { new Notice("Nothing to restore."); return 0; }
     const prog = items.length > 3 ? new Notice("", 0) : null;
     let count = 0;
@@ -3095,8 +3171,31 @@ export default class StashpadPlugin extends Plugin {
       catch (e) { console.warn("[Stashpad] restore-all skipped", items[i].blob, e); }
     }
     prog?.hide();
-    if (count > 0) this.notifications.show({ message: `Restored ${count} note${count === 1 ? "" : "s"} from encrypted trash.`, kind: "success", category: "system", folder: scopeFolder || "" });
+    if (count > 0) this.notifications.show({ message: `Restored ${count} note${count === 1 ? "" : "s"} from encrypted trash.`, kind: "success", category: "system", folder: "" });
     return count;
+  }
+
+  /** v2 backfill: sweep Obsidian's plaintext `.trash/` into one encrypted blob
+   *  in `_deleted/` (restorable from the trash tab like everything else). */
+  async encryptExistingTrash(): Promise<boolean> {
+    if (!(await this.ensureEncryptionUnlocked())) return false;
+    const dek = this.encryption.getSessionKey();
+    if (!dek) return false;
+    try {
+      const hideTitle = (this.settings.hideLockedTitles ?? false) || (this.settings.encryptTrashFilenames ?? false);
+      const r = await backfillTrashEncrypt(this.app, dek, new Date().toISOString(), hideTitle);
+      if (!r) { new Notice(`Obsidian's vault trash (${OBSIDIAN_TRASH_DIR}/) is empty — nothing to encrypt. (Files in the system/OS trash can't be reached.)`, 8000); return false; }
+      if (r.unpurged.length > 0) {
+        new Notice(`⚠️ Encrypted the trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed):\n${r.unpurged.join("\n")}`, 0);
+      } else {
+        this.notifications.show({ message: `Encrypted ${r.fileCount} trash file${r.fileCount === 1 ? "" : "s"} into the encrypted trash. Restore from the trash tab puts them back in ${OBSIDIAN_TRASH_DIR}/.`, kind: "success", category: "system", folder: "" });
+      }
+      return true;
+    } catch (e) {
+      console.warn("[Stashpad] trash backfill failed", e);
+      new Notice(`Couldn't encrypt the existing trash: ${(e as Error).message}`, 0);
+      return false;
+    }
   }
 
   /** Open the recoverable encrypted-trash TAB. (The `_` arg keeps the old

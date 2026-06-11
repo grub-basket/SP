@@ -172,6 +172,7 @@ export class EncryptionService {
     }
     const wrapped = await encryptStash(dek, newPassword);
     await this.save({ wrappedKey: toB64(wrapped.data), kdf: wrapped.kdf });
+    if (this.sessionKey) this.sessionKey.fill(0); // wipe the old buffer before replacing
     this.sessionKey = dek; // stay unlocked
     if (remember) await this.remember(newPassword); else await this.forgetKeychain();
     this.armIdle();
@@ -183,8 +184,11 @@ export class EncryptionService {
   async verifyPassword(password: string): Promise<boolean> {
     const cfg = this.load();
     if (!cfg.wrappedKey) return false;
-    try { await decryptStash(fromB64(cfg.wrappedKey), password); return true; }
-    catch { return false; }
+    try {
+      const dek = await decryptStash(fromB64(cfg.wrappedKey), password);
+      dek.fill(0); // verification only — don't leave a key copy for the GC
+      return true;
+    } catch { return false; }
   }
 
   /** Drop the master key from memory (re-prompt needed for the next op). */
@@ -204,10 +208,16 @@ export class EncryptionService {
   }
 
   /** The session master key, or null if locked. Later phases call this to
-   *  encrypt/decrypt bundles; a null result means "prompt to unlock first". */
+   *  encrypt/decrypt bundles; a null result means "prompt to unlock first".
+   *  Returns a COPY, never the live buffer: the idle auto-lock zeroes
+   *  `sessionKey` in place, and a long-running lock op holding the live
+   *  reference could otherwise end up encrypting with an all-zeros key
+   *  mid-operation — its self-check would even pass (same zeroed buffer on
+   *  both sides) and the plaintext would be purged behind an unrecoverable,
+   *  publicly-decryptable blob. A copy makes in-flight ops immune. */
   getSessionKey(): Uint8Array | null {
     if (this.sessionKey) this.armIdle(); // any use resets the idle clock
-    return this.sessionKey;
+    return this.sessionKey ? this.sessionKey.slice() : null;
   }
 
   // ---- idle auto-lock ----

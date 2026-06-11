@@ -34,7 +34,13 @@ export class StashpadTrashView extends ItemView {
     window.setTimeout(() => { this.renderPending = false; void this.render(); }, 150);
   }
 
+  /** Bumped per render; an interleaved newer render aborts the older one after
+   *  each await (render is async + called from buttons/events — two in flight
+   *  would each empty-then-append, duplicating rows). */
+  private renderGen = 0;
+
   async render(): Promise<void> {
+    const gen = ++this.renderGen;
     const root = this.contentEl;
     root.empty();
     root.addClass("stashpad-trash-view-body");
@@ -51,6 +57,7 @@ export class StashpadTrashView extends ItemView {
       return;
     }
     const items = await this.plugin.listDeletedTrash();
+    if (gen !== this.renderGen) return; // a newer render superseded this one
     if (items.length === 0) {
       root.createDiv({ cls: "stashpad-trash-empty", text: "Nothing in the encrypted trash. Notes you securely delete land here, recoverable with your password." });
       return;
@@ -82,7 +89,7 @@ export class StashpadTrashView extends ItemView {
         const main = row.createDiv({ cls: "stashpad-trash-row-main" });
         main.createSpan({ cls: "stashpad-trash-title", text: hidden ? "Locked note" : (it.meta?.title || "Locked note") });
         const when = it.meta?.deletedAt ? `deleted ${momentFn(it.meta.deletedAt).fromNow()}` : "deleted";
-        const count = it.meta && it.meta.count > 1 ? ` · ${it.meta.count} notes` : "";
+        const count = it.meta && it.meta.count > 1 ? ` · ${it.meta.count} ${it.meta.kind === "rawtrash" ? "files" : "notes"}` : "";
         main.createSpan({ cls: "stashpad-trash-sub", text: when + count });
         const btn = row.createEl("button", { cls: "stashpad-trash-restore", text: "Restore" });
         setIcon(btn.createSpan({ cls: "stashpad-btn-icon" }), "rotate-ccw");

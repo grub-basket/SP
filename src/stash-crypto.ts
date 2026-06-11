@@ -183,7 +183,20 @@ export async function decryptStash(envelope: Uint8Array, password: string): Prom
   kdf.a = readU32BE(envelope, o); o += 4;
   kdf.b = readU32BE(envelope, o); o += 4;
   kdf.c = envelope[o++];
+  // The KDF necessarily runs BEFORE the GCM tag can authenticate the header
+  // (the key comes from the KDF), so these parameters are attacker-controlled
+  // on a received file. Clamp them or a crafted envelope (e.g. memorySize =
+  // 4 TiB, iterations = 2^32) hangs/OOM-kills Obsidian the moment a password
+  // is entered. Legitimate files only ever use the constants above.
+  if (kdf.id === KDF_ARGON2ID) {
+    if (kdf.a > 2_097_152 /* 2 GiB in KiB */ || kdf.b > 64 || kdf.c < 1 || kdf.c > 8) {
+      throw new Error("Unsupported KDF parameters (file may be corrupted or malicious).");
+    }
+  } else if (kdf.id === KDF_PBKDF2) {
+    if (kdf.a > 10_000_000) throw new Error("Unsupported KDF parameters (file may be corrupted or malicious).");
+  }
   const saltLen = envelope[o++];
+  if (saltLen < 8 || saltLen > 64) throw new Error("Unsupported KDF parameters (file may be corrupted or malicious).");
   const salt = envelope.slice(o, o + saltLen); o += saltLen;
   const iv = envelope.slice(o, o + IV_LEN); o += IV_LEN;
   const header = envelope.slice(0, o); // everything before the ciphertext = AAD
