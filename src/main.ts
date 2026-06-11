@@ -672,8 +672,10 @@ export default class StashpadPlugin extends Plugin {
     // If a vault password was remembered in this device's keychain, unlock now.
     void this.encryption.tryAutoUnlock();
     // Reconcile the locked-subtree registry from on-disk `.stashmeta` sidecars
-    // (recovers placeholder placement after a settings desync or cross-device sync).
-    void this.reconcileLockedRegistry();
+    // (recovers placeholder placement after a settings desync or cross-device
+    // sync). Deferred to onLayoutReady (below) so it runs AFTER the vault has
+    // finished indexing the `.stashenc` blobs — running it during onload once
+    // wiped the registry against an empty file index.
     this.settingTab = new StashpadSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
 
@@ -705,6 +707,9 @@ export default class StashpadPlugin extends Plugin {
     // are accurate (avoids creating a duplicate before the cache lists
     // the existing one). New folders are seeded at creation time instead.
     this.app.workspace.onLayoutReady(() => {
+      // Vault is fully indexed now — safe to reconcile locked placeholders
+      // (drop entries whose blob is truly gone, add cross-device blobs).
+      void this.reconcileLockedRegistry();
       window.setTimeout(() => { void this.seedLocalAuthorStubsEverywhere(); }, 4000);
       // 0.79.12: register each Stashpad folder's _archive in Obsidian's
       // "Excluded files" so native search / quick switcher / graph / link
@@ -2880,20 +2885,38 @@ export default class StashpadPlugin extends Plugin {
    *  blob was synced in from another device with no local registry entry. Adds an
    *  entry for any `.stashenc` missing one; drops entries whose blob is gone. */
   async reconcileLockedRegistry(): Promise<void> {
-    const blobs = this.app.vault.getFiles().filter((f) => f.extension === "stashenc");
-    const blobPaths = new Set(blobs.map((f) => f.path));
-    let reg = (this.settings.lockedSubtrees ?? []).filter((e) => blobPaths.has(e.blob));
+    const orig = this.settings.lockedSubtrees ?? [];
+    // DROP entries via the ADAPTER (disk truth), NOT vault.getFiles() — the vault
+    // index lags on startup, and filtering against it once wiped the whole
+    // registry when this ran before indexing finished (encrypted notes vanished
+    // on restart). adapter.exists reads disk directly, so it's accurate even
+    // mid-startup. (Unlock already removes its own entry, so a surviving entry
+    // whose blob is genuinely gone is the rare external-deletion case.)
+    let reg: typeof orig = [];
+    for (const e of orig) {
+      const ef = (e.folder ?? "").replace(/\/+$/, "");
+      if (ef === "_deleted" || ef.startsWith("_deleted/")) continue; // encrypted-trash blobs aren't locked placeholders
+      try { if (await this.app.vault.adapter.exists(e.blob)) reg.push(e); }
+      catch { reg.push(e); } // unknown → keep (never wipe on an I/O hiccup)
+    }
+    let changed = reg.length !== orig.length;
     const have = new Set(reg.map((e) => e.blob));
-    let changed = reg.length !== (this.settings.lockedSubtrees ?? []).length;
-    for (const f of blobs) {
-      if (have.has(f.path)) continue;
+    // ADD entries for `.stashenc` blobs with no registry entry (synced from
+    // another device). Skip the `_deleted/` encrypted-trash store.
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension !== "stashenc" || have.has(f.path)) continue;
+      const folder = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (folder === "_deleted" || folder.startsWith("_deleted/")) continue;
       const m = await readLockedMeta(this.app, f.path);
       if (!m) continue; // no sidecar → the scan still shows it at root (never stranded)
-      const folder = f.parent?.path?.replace(/\/+$/, "") ?? "";
-      reg = [...reg, { folder, blob: f.path, parentId: m.parentId, title: m.title, count: m.count, created: m.created, rootId: m.rootId, prevSibling: m.prevSibling }];
+      reg.push({ folder, blob: f.path, parentId: m.parentId, title: m.title, count: m.count, created: m.created, rootId: m.rootId, prevSibling: m.prevSibling });
       changed = true;
     }
-    if (changed) { this.settings.lockedSubtrees = reg; await this.saveSettings(); }
+    if (changed) {
+      this.settings.lockedSubtrees = reg;
+      await this.saveSettings();
+      this.refreshAllStashpadViews?.(); // repaint placeholders that were added/dropped
+    }
   }
 
   /** Locked-subtree placeholders attached under `parentId` in `folder` (for the
@@ -2904,16 +2927,28 @@ export default class StashpadPlugin extends Plugin {
    *  with its filename as the title, so it's never stranded/unreachable. */
   lockedSubtreesFor(folder: string, parentId: StashpadId): Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }> {
     const cleaned = folder.replace(/\/+$/, "");
-    const byBlob = new Map((this.settings.lockedSubtrees ?? []).map((e) => [e.blob, e]));
     const out: Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }> = [];
+    const seen = new Set<string>();
+    // REGISTRY FIRST — the registry (settings) loads synchronously at startup, so
+    // locked placeholders render immediately on app restart, BEFORE the vault
+    // finishes indexing the `.stashenc` blobs (vault.getFiles() lags there, which
+    // is what made encrypted notes "disappear" on restart until 0.99.14).
+    for (const e of this.settings.lockedSubtrees ?? []) {
+      if ((e.folder ?? "").replace(/\/+$/, "") !== cleaned) continue;
+      if ((e.parentId ?? ROOT_ID) !== parentId) continue;
+      out.push({ blob: e.blob, title: e.title ?? "", count: e.count ?? 0, created: e.created ?? "", rootId: e.rootId, parentId: e.parentId ?? ROOT_ID, prevSibling: e.prevSibling ?? null });
+      seen.add(e.blob);
+    }
+    // Then any `.stashenc` blob on disk with NO registry entry (e.g. synced in
+    // from another device) — shown at ROOT with the filename as title so it's
+    // never stranded. Skips the `_deleted/` encrypted-trash store.
     for (const f of this.app.vault.getFiles()) {
       if (f.extension !== "stashenc") continue;
-      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
-      const e = byBlob.get(f.path);
-      if ((e?.parentId ?? ROOT_ID) !== parentId) continue;
-      // Carry the positional fields so the placeholder + unlock restore the
-      // reordered slot WITHOUT depending on the in-memory registry being intact.
-      out.push({ blob: f.path, title: e?.title ?? f.basename, count: e?.count ?? 0, created: e?.created ?? "", rootId: e?.rootId, parentId: e?.parentId ?? ROOT_ID, prevSibling: e?.prevSibling ?? null });
+      if (seen.has(f.path)) continue;
+      const fdir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (fdir !== cleaned || fdir === "_deleted" || fdir.startsWith("_deleted/")) continue;
+      if (parentId !== ROOT_ID) continue; // unregistered → attach at root only
+      out.push({ blob: f.path, title: f.basename, count: 0, created: "", rootId: undefined, parentId: ROOT_ID, prevSibling: null });
     }
     return out;
   }

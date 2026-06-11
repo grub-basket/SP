@@ -14,6 +14,14 @@
   }
   // wipe every note in F EXCEPT the Home note
   for (const f of app.vault.getMarkdownFiles().filter((f) => (f.parent?.path || "") === F && f.basename !== `Home-${F}`)) await app.vault.delete(f);
+  // clear encryption artifacts (.stashenc blobs + .stashmeta sidecars) + registry entries
+  try { const li = await ad.list(F); for (const path of li.files) if (/\.(stashenc|stashmeta)$/.test(path)) await ad.remove(path); } catch (e) {}
+  const p = app.plugins.plugins["stashpad"];
+  if (p?.settings?.lockedSubtrees) {
+    const before = p.settings.lockedSubtrees.length;
+    p.settings.lockedSubtrees = p.settings.lockedSubtrees.filter((e) => (e.folder || "").replace(/\/+$/, "") !== F);
+    if (p.settings.lockedSubtrees.length !== before) await p.saveSettings();
+  }
   if (!(await ad.exists(F))) await ad.mkdir(F);
   if (!app.vault.getAbstractFileByPath(`${F}/Home-${F}.md`)) {
     await app.vault.create(`${F}/Home-${F}.md`, `---\nid: __root__\nparent: __root__\ncreated: 2026-06-08T12:00:00\nattachments: []\n---\n# ${F} Home\n`);
