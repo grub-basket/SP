@@ -514,13 +514,11 @@ export class StashpadFolderPanelView extends ItemView {
     }
   }
 
-  /** Reuse an existing Stashpad tab on this folder if present; else open one. */
+  /** Reuse an existing Stashpad tab on this folder if present; else open one.
+   *  (Routes through openFolderInStashpad so DEFERRED tabs count as existing —
+   *  the local live-view-only check spawned duplicates for backgrounded tabs.) */
   private jumpToFolder(folder: string): void {
-    const cleaned = folder.replace(/\/+$/, "");
-    const existing = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-      .find((l) => (((l.view as any)?.noteFolder ?? "").replace(/\/+$/, "")) === cleaned);
-    if (existing) { this.app.workspace.revealLeaf(existing); return; }
-    void this.plugin.activateViewForFolder(folder);
+    void this.plugin.openFolderInStashpad(folder);
   }
 
   private revealFolder(folder: string): void {

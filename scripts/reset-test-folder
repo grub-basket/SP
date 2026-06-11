@@ -1,0 +1,13 @@
+#!/bin/sh
+# Reset a Claude Dev Vault TEST folder to its canonical state — fast vault reset
+# between tests. ONLY Alpha/Beta; NEVER the "Stashpad" folder (real data) or
+# "_deleted". Usage: scripts/reset-test-folder {Alpha|Beta}
+DIR="$(cd "$(dirname "$0")" && pwd)"
+OBS="$DIR/obs"
+F="$1"
+case "$F" in
+  Alpha|Beta) ;;
+  *) echo "usage: reset-test-folder {Alpha|Beta}  (never touches Stashpad)" >&2; exit 1;;
+esac
+"$OBS" eval code="window.__resetFolder='$F'" >/dev/null 2>&1
+"$OBS" eval-file "$DIR/reset-test-folder.js"

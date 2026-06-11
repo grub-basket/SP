@@ -30,6 +30,10 @@ export interface StashManifest {
   sourceFolder: string;
   noteCount: number;
   rootIds: StashpadId[];
+  /** Optional hex→friendly-name map (e.g. from the web importer). Merged into
+   *  the destination folder's color aliases on import so the names show in the
+   *  plugin's color UI. Keys are lowercase `#rrggbb`. */
+  colorAliases?: Record<string, string>;
 }
 
 export interface ExportInput {
@@ -46,6 +50,9 @@ export interface ImportSummary {
   attachmentsWritten: number;
   collisionsRenamed: number;
   warnings: string[];
+  /** Hex→name aliases from the manifest, for the caller to merge into the
+   *  destination folder's color aliases (importStashZip has no settings access). */
+  colorAliases?: Record<string, string>;
 }
 
 interface ParsedNote {
@@ -260,7 +267,20 @@ export async function importStashZip(
     notesWritten++;
   }
 
-  return { notesWritten, attachmentsWritten, collisionsRenamed, warnings };
+  // Surface sanitized hex→name aliases (lowercase #rrggbb keys) for the caller
+  // to merge into the destination folder's color settings.
+  let colorAliases: Record<string, string> | undefined;
+  if (manifest.colorAliases && typeof manifest.colorAliases === "object") {
+    const clean: Record<string, string> = {};
+    for (const [hex, name] of Object.entries(manifest.colorAliases)) {
+      const h = String(hex).trim().toLowerCase();
+      const n = String(name ?? "").trim();
+      if (/^#([0-9a-f]{6})$/.test(h) && n) clean[h] = n.slice(0, 60);
+    }
+    if (Object.keys(clean).length) colorAliases = clean;
+  }
+
+  return { notesWritten, attachmentsWritten, collisionsRenamed, warnings, colorAliases };
 }
 
 // ---------------- Helpers ----------------

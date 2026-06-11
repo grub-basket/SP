@@ -127,9 +127,17 @@ export async function cmdCopyTree(view: StashpadView): Promise<void> {
     for (const c of view.tree.getChildren(node.id)) await walk(c, depth + 1);
   };
   for (const r of roots) await walk(r, 0);
-  await navigator.clipboard.writeText(lines.join("\n"));
+  const outline = lines.join("\n");
+  await navigator.clipboard.writeText(outline);
+  // 0.99.13: also load the note clipboard (copy mode) with the whole stack, so
+  // Copy tree participates in paste like Mod+C does — paste in the LIST clones
+  // the stack(s), paste in a COMPOSER drops the outline text in. (Mod+C copies
+  // the selection; Copy tree copies the selected note + all its descendants.)
+  view.plugin.clearNoteClipboard();
+  view.plugin.noteClipboard = { mode: "copy", folder: view.noteFolder, ids: roots.map((r) => r.id), text: outline };
+  view.render(); // paint the copy-pending tint
   view.plugin.notifications.show({
-    message: `Copied tree of ${view.titleList(roots)} (${lines.length} entries)`,
+    message: `Copied tree of ${view.titleList(roots)} (${lines.length} entries) — paste in the list to clone, in a note to drop the outline in`,
     kind: "success",
     category: "system",
     affectedIds: roots.map((r) => r.id),

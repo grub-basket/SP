@@ -501,20 +501,12 @@ export class StashpadPanelsView extends ItemView {
     }
   }
 
-  /** Click on a pin → ALWAYS open in a new tab on the pin's folder,
-   *  then navigate to the pinned note. 0.68.1: was reveal-or-open;
-   *  user wanted new-tab consistently so the existing tab they were
-   *  on doesn't get repurposed. */
+  /** Click on a pin → REUSE an existing tab on the pin's folder if there is
+   *  one (deferred included), else open a new tab; then navigate to the note.
+   *  0.99.2: unified with the folder-panel pins + file reveals via
+   *  revealNoteByRef (reverses 0.68.1's always-new-tab, per user request). */
   private async openPinFromPanel(pin: PinnedNoteRef): Promise<void> {
-    await this.plugin.activateViewForFolder(pin.folder);
-    // After activate the most-recently-active stashpad should be the
-    // new tab. Use the plugin's MRU pointer first; fall back to the
-    // active leaf.
-    const target = this.plugin.lastActiveStashpadLeaf?.view as any
-      ?? this.findActiveStashpad();
-    if (target && typeof target.navigateTo === "function") {
-      target.navigateTo(pin.id);
-    }
+    await this.plugin.revealNoteByRef(pin.folder, pin.id);
   }
 
   /** Resolve a Stashpad view to target for sidebar actions:
@@ -774,12 +766,7 @@ export class StashpadPanelsView extends ItemView {
   /** Navigate to a shared note: open the folder (in a new tab if it's
    *  not the active one) and navigate to the note. */
   private async openSharedFromPanel(folder: string, id: StashpadId): Promise<void> {
-    await this.plugin.activateViewForFolder(folder);
-    const target = this.plugin.lastActiveStashpadLeaf?.view as any
-      ?? this.findActiveStashpad();
-    if (target && typeof target.navigateTo === "function") {
-      target.navigateTo(id);
-    }
+    await this.plugin.revealNoteByRef(folder, id); // reuse-or-open, unified
   }
 
   // ---------- Tasks panel (0.71.30) ----------
@@ -1026,10 +1013,7 @@ export class StashpadPanelsView extends ItemView {
   }
 
   private async openTaskFromPanel(folder: string, id: StashpadId): Promise<void> {
-    await this.plugin.activateViewForFolder(folder);
-    const target = this.plugin.lastActiveStashpadLeaf?.view as any
-      ?? this.findActiveStashpad();
-    if (target && typeof target.navigateTo === "function") target.navigateTo(id);
+    await this.plugin.revealNoteByRef(folder, id); // reuse-or-open, unified
   }
 
   /** 0.76.3: flip a task's `completed` field straight from the panel

@@ -108,6 +108,17 @@ export default class StashpadPlugin extends Plugin {
    *  Plugin-level so it survives view re-renders; ids resolve against the
    *  source folder's tree at paste time (stale ids just shrink the paste). */
   noteClipboard: { mode: "copy" | "cut"; folder: string; ids: StashpadId[]; text?: string } | null = null;
+  /** The persistent "cut pending" notice, kept so it can be dismissed when the
+   *  cut resolves (paste) or is cancelled (Escape / replaced by a new copy). */
+  noteClipboardNotice: Notice | null = null;
+
+  /** Clear the note clipboard + dismiss its notice. Callers re-render to drop
+   *  the .is-cut-pending / .is-copy-pending row styling. */
+  clearNoteClipboard(): void {
+    try { this.noteClipboardNotice?.hide(); } catch { /* already gone */ }
+    this.noteClipboardNotice = null;
+    this.noteClipboard = null;
+  }
 
   private _renderCacheStore: RenderCacheStore | null = null;
   get renderCacheStore(): RenderCacheStore {
@@ -1049,6 +1060,11 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-encrypt-existing-trash",
       name: "Encrypt existing Obsidian trash (backfill .trash into encrypted trash)",
       callback: () => void this.encryptExistingTrash(),
+    });
+    this.addCommand({
+      id: "stashpad-close-duplicate-tabs",
+      name: "Close duplicate & orphaned Stashpad tabs (tidy up)",
+      callback: () => void this.closeDuplicateStashpadTabs(),
     });
     // 0.77.8: claim authorship retroactively (for notes created before the
     // user set their author name). Author-only variants only fill blank
@@ -3292,9 +3308,13 @@ export default class StashpadPlugin extends Plugin {
   /** Open a fresh Stashpad tab focused on a specific folder via the
    *  per-leaf folderOverride mechanism. Used by the Authorship settings
    *  section's "folders you've contributed to" list. */
-  async activateViewForFolder(folder: string): Promise<void> {
+  /** Open `folder` in a NEW Stashpad tab. Returns the leaf so callers can
+   *  navigate IT — navigating via `lastActiveStashpadLeaf` right after this
+   *  raced the MRU update and could navigate the PREVIOUS tab instead (the
+   *  "current tab hijacked into the pinned note + duplicate tab" bug). */
+  async activateViewForFolder(folder: string): Promise<WorkspaceLeaf | null> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
-    if (!cleaned) return;
+    if (!cleaned) return null;
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({
       type: STASHPAD_VIEW_TYPE,
@@ -3302,6 +3322,14 @@ export default class StashpadPlugin extends Plugin {
       state: { folderOverride: cleaned } as any,
     });
     this.app.workspace.revealLeaf(leaf);
+    return leaf;
+  }
+
+  /** Navigate a (possibly still-loading) Stashpad leaf to a note id. */
+  navigateLeafTo(leaf: WorkspaceLeaf | null, folder: string, id: StashpadId): void {
+    const view = leaf?.view as { navigateTo?: (id: StashpadId) => void; tree?: { get(id: StashpadId): unknown } } | undefined;
+    if (view?.navigateTo && (!view.tree || view.tree.get(id))) { view.navigateTo(id); return; }
+    this.navigateWhenReady(folder, id);
   }
 
   /** 0.93.0: open `folder` in Stashpad — reusing an existing Stashpad tab
@@ -3311,10 +3339,33 @@ export default class StashpadPlugin extends Plugin {
   async openFolderInStashpad(folder: string): Promise<void> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
     if (!cleaned) return;
-    const existing = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-      .find((leaf) => ((leaf.view as any)?.noteFolder ?? "") === cleaned);
-    if (existing) { this.app.workspace.revealLeaf(existing); return; }
+    const existing = await this.findStashpadLeafForFolder(cleaned);
+    if (existing) {
+      this.app.workspace.revealLeaf(existing);
+      this.app.workspace.setActiveLeaf(existing, { focus: true });
+      return;
+    }
     await this.activateViewForFolder(cleaned);
+  }
+
+  /** Find an existing Stashpad leaf showing `folder` — INCLUDING deferred
+   *  leaves (Obsidian defers background tabs; their `view` is a stub with no
+   *  `noteFolder`, so the old live-view-only check missed them and every
+   *  pinned-note / folder click spawned a DUPLICATE tab next to the active
+   *  one — the "current tab hijacked + cloned" bug). Deferred matches are
+   *  loaded before being returned, so callers can navigate them. */
+  private async findStashpadLeafForFolder(folder: string): Promise<WorkspaceLeaf | null> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
+    const live = leaves.find((l) => !(l as any).isDeferred && (((l.view as any)?.noteFolder ?? "").replace(/\/+$/, "")) === cleaned);
+    if (live) return live;
+    const deferred = leaves.find((l) => (l as any).isDeferred
+      && ((l.getViewState()?.state as { folderOverride?: string } | undefined)?.folderOverride ?? "").replace(/\/+$/, "") === cleaned);
+    if (deferred) {
+      try { await (deferred as any).loadIfDeferred?.(); } catch { /* fall through — reveal still works */ }
+      return deferred;
+    }
+    return null;
   }
 
   /** 0.76.19: true when `file` is a Stashpad note — lives in a known
@@ -3337,20 +3388,125 @@ export default class StashpadPlugin extends Plugin {
       new Notice("That note isn't a Stashpad note.");
       return;
     }
-    // Reuse an existing Stashpad tab already viewing this folder.
-    const existing = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-      .find((leaf) => ((leaf.view as any)?.noteFolder ?? "") === folder);
+    await this.revealNoteByRef(folder, id);
+  }
+
+  /** Open a note by folder+id: REUSE an existing Stashpad tab on that folder
+   *  (deferred ones included) and navigate it; only open a NEW tab when there
+   *  isn't one. The single entry point for every "jump to this note" click —
+   *  file reveals AND pinned/shared/task panel rows — so they all behave the
+   *  same (0.99.2: unified; the Pinned panel used to always open a new tab). */
+  async revealNoteByRef(folder: string, id: StashpadId): Promise<void> {
+    const clean = folder.replace(/\/+$/, "");
+    const existing = await this.findStashpadLeafForFolder(clean);
     if (existing) {
       this.app.workspace.revealLeaf(existing);
-      const view = existing.view as any;
-      if (typeof view?.navigateTo === "function") view.navigateTo(id);
+      // Focus follows the click — revealLeaf alone leaves the old tab active.
+      this.app.workspace.setActiveLeaf(existing, { focus: true });
+      this.navigateLeafTo(existing, clean, id);
       return;
     }
-    await this.activateViewForFolder(folder);
-    // 0.86.4: the freshly-opened view may still be loading its tree — navigate
-    // once it's actually ready, so a pinned note opens in ONE click instead of
-    // landing on Home (the first click) and only navigating on the second.
-    this.navigateWhenReady(folder, id);
+    // 0.86.4: the freshly-opened view may still be loading its tree —
+    // navigateLeafTo polls until ready, so it opens in ONE click instead of
+    // landing on Home and navigating only on the second.
+    const leaf = await this.activateViewForFolder(clean);
+    this.navigateLeafTo(leaf, clean, id);
+  }
+
+  /** Tidy Stashpad tabs: PRUNE orphans (focused on a note that no longer
+   *  exists) + collapse DUPLICATES (same folder + focused note). Returns the
+   *  total tabs closed and shows a multi-line summary tally (7s).
+   *
+   *  Orphan detection reads the vault file list (deferred tabs checked without
+   *  waking; a loaded tab whose own tree still has the note is spared). Dedupe
+   *  keys on folder + `focusId` from each leaf's SERIALIZED state, so two tabs
+   *  on the same folder but DIFFERENT notes are intentional and both kept. The
+   *  keeper is active > loaded > deferred but WOKEN + verified healthy first, so
+   *  a corrupt tab is never the survivor when a healthy one exists. */
+  async closeDuplicateStashpadTabs(): Promise<number> {
+    const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
+    const active = this.app.workspace.activeLeaf;
+
+    // Warm up EVERY tab first so the dedupe/orphan checks run against live views
+    // (real noteFolder/focusId, not just serialized state) and any tab that
+    // can't initialize surfaces as unhealthy here rather than being kept blind.
+    for (const l of leaves) {
+      try { await (l as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.(); } catch { /* corrupt — handled by the healthy() check */ }
+    }
+
+    const stateOf = (l: WorkspaceLeaf) => (l.getViewState()?.state ?? {}) as { folderOverride?: string; focusId?: string };
+    const folderOf = (l: WorkspaceLeaf): string => {
+      const st = stateOf(l);
+      return ((l as any).isDeferred ? (st.folderOverride ?? "") : ((l.view as any)?.noteFolder ?? st.folderOverride ?? "")).replace(/\/+$/, "");
+    };
+    const focusOf = (l: WorkspaceLeaf): string => {
+      const st = stateOf(l);
+      return ((l as any).isDeferred ? st.focusId : ((l.view as any)?.focusId ?? st.focusId)) || ROOT_ID;
+    };
+    const healthy = (l: WorkspaceLeaf): boolean => {
+      const v = l.view as { getViewType?: () => string; navigateTo?: unknown; noteFolder?: unknown } | undefined;
+      return !!v && v.getViewType?.() === STASHPAD_VIEW_TYPE && typeof v.navigateTo === "function" && typeof v.noteFolder === "string";
+    };
+
+    // Existing note ids per folder, for orphan detection (no tab waking needed).
+    const idsByFolder = new Map<string, Set<string>>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const folder = (f.parent?.path ?? "").replace(/\/+$/, "");
+      const id = (this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown } | undefined)?.id;
+      if (typeof id === "string" && id) (idsByFolder.get(folder) ?? idsByFolder.set(folder, new Set()).get(folder)!).add(id);
+    }
+
+    // Pass 1 - prune orphans: a tab focused on a note that no longer exists
+    // (deleted note, or its whole folder gone). Root-focused tabs are never
+    // orphans. Closing a tab is non-destructive, so cache lag at worst closes a
+    // reopenable tab - and a loaded tab whose tree still has the note is spared.
+    let pruned = 0;
+    const survivors: WorkspaceLeaf[] = [];
+    for (const l of leaves) {
+      const folder = folderOf(l);
+      const focus = focusOf(l);
+      if (folder && focus && focus !== ROOT_ID) {
+        const loadedHas = !(l as any).isDeferred && !!(l.view as any)?.tree?.get?.(focus);
+        const cacheHas = idsByFolder.get(folder)?.has(focus) ?? false;
+        if (!loadedHas && !cacheHas) { l.detach(); pruned++; continue; }
+      }
+      survivors.push(l);
+    }
+
+    // Pass 2 - collapse duplicates (same folder + focused note) among survivors.
+    const groups = new Map<string, WorkspaceLeaf[]>();
+    for (const l of survivors) {
+      const folder = folderOf(l);
+      if (!folder) continue;
+      const k = folder + " " + focusOf(l);
+      (groups.get(k) ?? groups.set(k, []).get(k)!).push(l);
+    }
+    let closed = 0;
+    for (const group of groups.values()) {
+      if (group.length <= 1) continue;
+      group.sort((a, b) => {
+        const score = (l: WorkspaceLeaf) => (l === active ? 2 : (!(l as any).isDeferred ? 1 : 0));
+        return score(b) - score(a);
+      });
+      // Wake candidates in rank order until one is a working Stashpad view.
+      let keeper: WorkspaceLeaf | null = null;
+      for (const cand of group) {
+        try { await (cand as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.(); } catch { /* try next */ }
+        if (healthy(cand)) { keeper = cand; break; }
+      }
+      if (!keeper) keeper = group[0]; // all unhealthy - keep best-ranked anyway
+      for (const l of group) { if (l !== keeper) { l.detach(); closed++; } }
+    }
+
+    // Multi-line summary tally, lingering a few seconds so it's readable.
+    const remaining = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE).length;
+    const frag = document.createDocumentFragment() as unknown as { createEl: (t: string, o?: { text?: string }) => HTMLElement };
+    frag.createEl("div", { text: closed + pruned > 0 ? "Stashpad tabs cleaned up:" : "Stashpad tabs - nothing to clean up:" });
+    frag.createEl("div", { text: `\u2022  ${closed} duplicate tab${closed === 1 ? "" : "s"} closed` });
+    frag.createEl("div", { text: `\u2022  ${pruned} orphaned tab${pruned === 1 ? "" : "s"} pruned (note no longer exists)` });
+    frag.createEl("div", { text: `\u2022  ${remaining} Stashpad tab${remaining === 1 ? "" : "s"} remaining` });
+    new Notice(frag as unknown as DocumentFragment, 7000);
+    return closed + pruned;
   }
 
   /** Poll briefly for the folder's Stashpad view to have `id` in its tree, then

@@ -499,9 +499,9 @@ export class StashpadDetailView extends ItemView {
 
   private async openInStashpad(folder: string, id: StashpadId): Promise<void> {
     try {
-      await this.plugin.activateViewForFolder(folder);
-      const view = this.plugin.lastActiveStashpadLeaf?.view as any;
-      if (view?.navigateTo && id !== ROOT_ID) view.navigateTo(id);
+      // Navigate the returned leaf — the MRU pointer can still be the old tab.
+      const leaf = await this.plugin.activateViewForFolder(folder);
+      if (id !== ROOT_ID) this.plugin.navigateLeafTo(leaf, folder, id);
     } catch (e) {
       new Notice(`Couldn't open: ${(e as Error).message}`);
     }

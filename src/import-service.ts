@@ -842,6 +842,13 @@ export class ImportService {
       const buf = await resolveStashBytes(this.app, rawBytes, { ...promptOpts, secretId: secretIdForStashName(file.basename) });
       if (!buf) return false; // cancelled / "remind me later" — leave the file
       const summary = await importStashZip(this.app, buf, root, existingIds);
+      // Merge any hex→name color aliases the bundle carried (e.g. from the web
+      // importer) into the destination folder, so the names show in the color UI.
+      if (summary.colorAliases) {
+        for (const [hex, name] of Object.entries(summary.colorAliases)) {
+          try { await this.plugin.setColorAlias(root, hex, name); } catch { /* non-fatal */ }
+        }
+      }
       try { await this.app.fileManager.trashFile(file); } catch {}
       this.pendingEncryptedStashes.delete(file.path);
       try {

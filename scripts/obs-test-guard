@@ -40,9 +40,41 @@ show() {
   })()" >/dev/null 2>&1
 }
 
+# verify — confirm the CLI is talking to the THROWAWAY dev vault before any
+# driving/destructive test, so a misrouted CLI (wrong window focused, multiple
+# vaults open) can never run against a real vault. Two independent checks:
+#   1. vault name === "Claude Dev Vault"
+#   2. the sentinel note exists AND carries its unique token
+# The sentinel makes this robust even if the vault is renamed again — a real
+# vault would have to deliberately contain the token to be mistaken for this one.
+# Prints "verify: OK" + exits 0 on match; LOUD error + exits 1 otherwise.
+EXPECT_VAULT="Claude Dev Vault"
+SENTINEL_TOKEN="claude-dev-vault-7f3a9c2e-do-not-delete"
+verify() {
+  out="$("$OBS" eval code="(async () => {
+    const name = app.vault.getName();
+    let token = '';
+    try { token = await app.vault.adapter.read('CLAUDE-DEV-VAULT-SENTINEL.md'); } catch (e) {}
+    const ok = name === '$EXPECT_VAULT' && token.indexOf('$SENTINEL_TOKEN') !== -1;
+    return JSON.stringify({ ok, name, sentinel: token.indexOf('$SENTINEL_TOKEN') !== -1 });
+  })()" 2>/dev/null)"
+  case "$out" in
+    *'"ok":true'*) echo "verify: OK — $EXPECT_VAULT (name + sentinel confirmed)"; return 0 ;;
+    *)
+      echo "✋ GUARD ABORT: the running Obsidian is NOT the throwaway dev vault." >&2
+      echo "   Expected \"$EXPECT_VAULT\" + sentinel note; got: ${out:-<no response from CLI>}" >&2
+      echo "   Refusing to drive — focus the Claude Dev Vault window (or restore the sentinel) and retry." >&2
+      return 1 ;;
+  esac
+}
+
 case "$1" in
+  verify)
+    verify; exit $?
+    ;;
   start)
-    secs="${2:-10}"
+    verify || exit 1
+    secs="${2:-5}"
     show "'🤖 Claude is about to run an automated Stashpad test.\n✋ Please STOP interacting — starting in about ${secs} seconds…'"
     i="$secs"
     while [ "$i" -gt 0 ]; do
@@ -56,7 +88,9 @@ case "$1" in
   ensure)
     # Instant re-raise (no countdown) — for follow-up driving evals when the
     # banner may have been ended. The user was already warned by the session's
-    # initial `start`, so no grace period is needed.
+    # initial `start`, so no grace period is needed. Still re-verifies the vault
+    # (the user could have switched windows between evals).
+    verify || exit 1
     show "'🤖 Claude is TESTING Stashpad now.\n✋ Please don\\'t touch until you see the all-clear.'"
     echo "guard: banner ensured (instant)"
     ;;
@@ -79,7 +113,7 @@ case "$1" in
     echo "guard: custom banner shown"
     ;;
   *)
-    echo "usage: obs-test-guard {start [seconds]|ensure|end|note 'message'}" >&2
+    echo "usage: obs-test-guard {verify|start [seconds]|ensure|end|note 'message'}" >&2
     exit 1
     ;;
 esac

@@ -327,7 +327,10 @@ export class StashpadView extends ItemView {
       if (node) {
         const title = this.titleForNode(node).trim();
         const truncated = title.length > 40 ? title.slice(0, 40) + "…" : title;
-        if (truncated) return `${name} — ${truncated}`;
+        // Append the note id so two tabs on notes with the SAME title (or same
+        // folder) stay distinguishable in the tab bar — and the title is unique
+        // enough to tell duplicates apart at a glance. 0.99.3.
+        if (truncated) return `${name} — ${truncated} · ${this.focusId}`;
       }
     }
     return name;
@@ -4176,6 +4179,10 @@ export class StashpadView extends ItemView {
     if (isCursor && this.plugin.settings.autoExpandCursorRow) row.addClass("is-cursor-expanded");
     if (isPickTarget) row.addClass("is-pick-target");
     if (this.isCompleted(node)) row.addClass("is-completed");
+    // 0.99.5: ghost rows that are sitting on a pending CUT (note clipboard),
+    // mirroring a file manager — they're about to move/be-extracted on paste.
+    if (this.isCutPending(node.id)) row.addClass("is-cut-pending");
+    else if (this.isCopyPending(node.id)) row.addClass("is-copy-pending");
     row.dataset.idx = String(idx);
     row.dataset.id = node.id;
     // Drag-reorder is only meaningful when we're showing immediate children
@@ -4644,13 +4651,26 @@ export class StashpadView extends ItemView {
       void importAndAppend(files);
     });
     ta.addEventListener("paste", (e) => {
-      // 0.99.0: pasting CUT notes into the composer completes the cut — the
-      // text lands via the native paste; the originals are then deleted
-      // (undoable). Only fires when the pasted text IS the cut text — if the
-      // user copied something else after cutting, the cut stays pending.
       const clip = this.plugin.noteClipboard;
+      // 0.99.9: composer paste = TEXT. The cut/copied note's body drops into the
+      // composer so you can fold it into what you're writing — same as pasting a
+      // plain copy. (Structural move/duplicate is the LIST paste — cmdPasteNotes,
+      // when the list, not the composer, has focus.) A COPY rides the native
+      // text paste below. A CUT we insert ourselves — so the text survives the
+      // re-render the delete triggers — then delete the original(s).
       if (clip?.mode === "cut" && clip.text && e.clipboardData?.getData("text/plain") === clip.text) {
-        setTimeout(() => void this.completeCutIntoComposer(), 0);
+        if (this.focusedInsideCut(clip.ids)) {
+          // Can't paste a cut note into ITSELF or a descendant — you'd delete the
+          // note you're inside. (The list paste guards this too.)
+          e.preventDefault();
+          new Notice("Can't paste a cut note into the note you're cutting.");
+          return;
+        }
+        e.preventDefault();
+        // Gathers the FULL subtree text (note + all children), inserts it, then
+        // deletes the originals.
+        void this.completeCutIntoComposer();
+        return;
       }
       // clipboardData.files covers explicit file copies (Finder/Explorer);
       // .items covers screenshot pastes (image/png with no .files entry
@@ -5336,6 +5356,14 @@ export class StashpadView extends ItemView {
       // 0.92.3: just Escaped out of the composer — preserve the selection
       // through the round-trip (don't let a quick second Escape deselect).
       if (Date.now() - this.composerExitAt < 400) return;
+      // 0.99.6: a pending note-clipboard cut/copy in THIS folder is a mode —
+      // Escape cancels it (drops the ghost/tint + dismisses the cut notice)
+      // before touching the selection. A second Escape then collapses as usual.
+      if (this.plugin.noteClipboard && this.plugin.noteClipboard.folder === this.noteFolder) {
+        this.plugin.clearNoteClipboard();
+        this.render();
+        return;
+      }
       // Multi-selection → collapse down to the FIRST note that was
       // added (not the last). The last-was-anchor behavior was awkward
       // because shift-click extends FROM the original anchor — losing
@@ -5359,6 +5387,12 @@ export class StashpadView extends ItemView {
     }
 
     const sb = getSettings().bindings;
+    // 0.99.12: PASTE fires regardless of selection/cursor — you can paste into
+    // an empty parent, or right after navigating in with no cursor row. (Copy
+    // and cut need a target, so they stay in the selection/cursor-gated block
+    // below; paste used to be trapped there too, which is why pasting inside a
+    // parent only worked when a child happened to be selected/under the cursor.)
+    if (matchBinding(e, sb.pasteNotes) && this.plugin.noteClipboard) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
     if (this.selection.size > 0 || (this.cursorIdx >= 0 && this.currentChildren[this.cursorIdx])) {
       if (matchBinding(e, sb.move)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdMovePicker(); return; }
       if (matchBinding(e, sb.pickMove)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInListPicker(); return; }
@@ -5369,7 +5403,7 @@ export class StashpadView extends ItemView {
       // paste only intercepts when the note clipboard actually holds notes.
       if (matchBinding(e, sb.copyNotes) && !window.getSelection()?.toString()) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyNotes(); return; }
       if (matchBinding(e, sb.cutNotes) && !window.getSelection()?.toString()) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCutNotes(); return; }
-      if (matchBinding(e, sb.pasteNotes) && this.plugin.noteClipboard) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
+      // (pasteNotes is handled above the block — it doesn't need a target.)
       if (matchBinding(e, sb.copyTree)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyTree(); return; }
       if (matchBinding(e, sb.copyOutline)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyOutline(); return; }
       if (matchBinding(e, sb.copyCodeBlock)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyCodeBlock(); return; }
@@ -6572,9 +6606,16 @@ export class StashpadView extends ItemView {
     const guardKey = this.selectionGuardKey;
     const tryReselect = () => {
       if (this.selectionGuardKey !== guardKey) return;
-      if (this.selection.has(target.id)) return;
       const idx = this.currentChildren.findIndex((n) => n.id === target.id);
-      if (idx < 0) return;
+      if (idx < 0) return; // destination not in the list yet — a later pass catches it
+      // Re-assert BOTH selection AND cursor on the destination only. After the
+      // move the list shifts up (the moved note vanished), so the initial render
+      // can leave the cursor on the destination's STALE index — which now points
+      // at the NEXT note. (Previously this bailed as soon as the selection
+      // matched, so it never corrected that stale cursor.) Bail only when both
+      // selection and cursor are already exactly the destination.
+      if (this.selection.size === 1 && this.selection.has(target.id) && this.cursorIdx === idx) return;
+      this.selection.clear();
       this.selection.add(target.id);
       this.cursorIdx = idx;
       this.render({ kind: "follow-cursor" });
@@ -6888,7 +6929,49 @@ export class StashpadView extends ItemView {
     const targets = this.getActionTargets();
     if (!targets.length) { new Notice("Nothing to copy."); return; }
     await clipboardCmds.cmdCopy(this); // bodies → system clipboard (+ toast)
+    this.plugin.clearNoteClipboard(); // drop any prior cut/copy (+ its notice)
     this.plugin.noteClipboard = { mode: "copy", folder: this.noteFolder, ids: targets.map((t) => t.id) };
+    this.render(); // paint the .is-copy-pending tint
+  }
+
+  /** True when `id` is on a pending CUT in THIS folder — drives the ghosted
+   *  `.is-cut-pending` row style until the cut is pasted, replaced, or cancelled. */
+  isCutPending(id: StashpadId): boolean {
+    const clip = this.plugin.noteClipboard;
+    return !!clip && clip.mode === "cut" && clip.folder === this.noteFolder && clip.ids.includes(id);
+  }
+  /** True when `id` is on a pending COPY in THIS folder — drives the subtle
+   *  `.is-copy-pending` tint (lighter than cut; nothing moves on paste). */
+  isCopyPending(id: StashpadId): boolean {
+    const clip = this.plugin.noteClipboard;
+    return !!clip && clip.mode === "copy" && clip.folder === this.noteFolder && clip.ids.includes(id);
+  }
+
+  /** Insert text into the composer at the caret (or append), updating the
+   *  persisted draft so it survives a re-render (the new textarea seeds from
+   *  `composerDraft`). Used by cut-paste-into-composer. */
+  private insertIntoComposer(text: string): void {
+    const ta = this.composerInputEl;
+    if (!ta) { this.composerDraft = this.composerDraft ? `${this.composerDraft}\n\n${text}` : text; return; }
+    const start = ta.selectionStart ?? ta.value.length;
+    const end = ta.selectionEnd ?? ta.value.length;
+    ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+    const caret = start + text.length;
+    try { ta.setSelectionRange(caret, caret); } catch { /* detached */ }
+    this.composerDraft = ta.value;
+  }
+
+  /** True when the note you're focused INTO is one of `ids` (or a descendant of
+   *  one) — i.e. pasting that cut here would delete the note you're viewing. */
+  private focusedInsideCut(ids: StashpadId[]): boolean {
+    const set = new Set(ids);
+    let cur: StashpadId | null = this.focusId;
+    let hops = 0;
+    while (cur && cur !== ROOT_ID && hops++ < 1000) {
+      if (set.has(cur)) return true;
+      cur = this.tree.get(cur)?.parent ?? null;
+    }
+    return false;
   }
 
   async cmdCutNotes(): Promise<void> {
@@ -6901,11 +6984,13 @@ export class StashpadView extends ItemView {
     }
     const cutText = out.join("\n\n");
     await navigator.clipboard.writeText(cutText);
+    this.plugin.clearNoteClipboard(); // drop any prior cut/copy (+ its notice)
     this.plugin.noteClipboard = { mode: "cut", folder: this.noteFolder, ids: targets.map((t) => t.id), text: cutText };
-    // Persistent: a pending cut is a MODE — the user should see it until
-    // they paste (nothing is deleted until then).
-    this.plugin.notifications.show({
-      message: `Cut ${this.titleList(targets)} — paste in the list to move, or in the composer to extract the text (deletes the originals, undoable). Nothing happens until you paste.`,
+    this.render(); // paint the ghosted .is-cut-pending rows immediately
+    // Persistent: a pending cut is a MODE — the user should see it until they
+    // paste or cancel (Escape). Stored so it can be dismissed on resolve.
+    this.plugin.noteClipboardNotice = this.plugin.notifications.show({
+      message: `Cut ${this.titleList(targets)} — paste in the LIST to move it there as a note; paste in a note's COMPOSER to drop its text in and delete the original (undoable). Esc cancels. Nothing happens until you paste.`,
       kind: "info", category: "system", affectedIds: targets.map((t) => t.id), folder: this.noteFolder, duration: 0,
     });
   }
@@ -6915,7 +7000,7 @@ export class StashpadView extends ItemView {
     if (!clip) { new Notice("The note clipboard is empty — copy or cut notes first."); return; }
     if (clip.folder !== this.noteFolder) { new Notice("Those notes were cut/copied in another folder — cross-folder paste isn't supported yet."); return; }
     const nodes = clip.ids.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
-    if (!nodes.length) { this.plugin.noteClipboard = null; new Notice("Those notes no longer exist."); return; }
+    if (!nodes.length) { this.plugin.clearNoteClipboard(); this.render(); new Notice("Those notes no longer exist."); return; }
     // Paste position: after the cursor row (same parent); fall back to the
     // focused subtree root when there's no cursor.
     const cursor = this.currentChildren[this.cursorIdx] ?? null;
@@ -6929,8 +7014,10 @@ export class StashpadView extends ItemView {
       }
       // moveAcrossThenReorder pushes the undo entry + persistent notification.
       const anchor = cursor && !cutIds.has(cursor.id) ? cursor.id : "";
+      // Clear the clipboard BEFORE the move so its re-render doesn't re-apply
+      // the .is-cut-pending ghost to the just-moved rows (ids already captured).
+      this.plugin.clearNoteClipboard();
       await this.moveAcrossThenReorder(nodes.map((n) => n.id), parentId, anchor, "after");
-      this.plugin.noteClipboard = null;
       return;
     }
 
@@ -6978,22 +7065,39 @@ export class StashpadView extends ItemView {
   async completeCutIntoComposer(): Promise<void> {
     const clip = this.plugin.noteClipboard;
     if (!clip || clip.mode !== "cut" || clip.folder !== this.noteFolder) return;
-    this.plugin.noteClipboard = null;
+    this.plugin.clearNoteClipboard();
     const roots = clip.ids.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
     if (!roots.length) return;
-    // Gather subtrees children-first (safe delete order), dedup overlaps.
-    const allNotes: TreeNode[] = [];
+    // PRE-order (parent → children) WITH depth so the text reads as an indented
+    // outline; dedup overlaps.
+    const pre: { node: TreeNode; depth: number }[] = [];
     const seen = new Set<StashpadId>();
-    const walk = (n: TreeNode): void => {
+    const walk = (n: TreeNode, depth: number): void => {
       if (seen.has(n.id)) return;
       seen.add(n.id);
-      for (const c of this.tree.getChildren(n.id)) walk(c);
-      allNotes.push(n);
+      pre.push({ node: n, depth });
+      for (const c of this.tree.getChildren(n.id)) walk(c, depth + 1);
     };
-    for (const r of roots) walk(r);
+    for (const r of roots) walk(r, 0);
     const folder = this.noteFolder;
+    // Drop the WHOLE subtree into the composer as an INDENTED BULLET OUTLINE —
+    // same format as the "Copy tree" command (2-space indent per depth, "- "
+    // bullet, body flattened to one line, optional time prefix) — then delete
+    // the originals (children-first = reverse pre-order).
+    const prefixTs = getSettings().prefixTimestampsOnCopy;
+    const lines: string[] = [];
+    for (const { node, depth } of pre) {
+      if (!node.file) continue;
+      try {
+        const body = this.stripFrontmatter(await this.app.vault.cachedRead(node.file)).trim().split(/\r?\n/).join(" ");
+        const ts = prefixTs ? `${this.formatTimeInline(node.created)} ` : "";
+        lines.push(`${"  ".repeat(depth)}- ${ts}${body}`);
+      } catch { /* skip unreadable */ }
+    }
+    this.insertIntoComposer(lines.join("\n"));
+    const allNotes = pre.map((x) => x.node);
     const snap = await this.snapshotNotes(allNotes, false);
-    for (const n of allNotes) {
+    for (const n of [...allNotes].reverse()) {
       if (!n.file) continue;
       try { await this.app.fileManager.trashFile(n.file); } catch (e) { console.warn("[Stashpad] cut-paste delete failed", n.file.path, e); }
     }
