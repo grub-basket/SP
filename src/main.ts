@@ -16,6 +16,7 @@ import {
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, STASH_EXT, splitFrontmatter } from "./stash-package";
+import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { ROOT_ID } from "./types";
@@ -291,6 +292,9 @@ export default class StashpadPlugin extends Plugin {
     // 0.77.7: seed the local user's author page into the new folder so
     // their links resolve everywhere from the start.
     try { await this.seedLocalAuthorStub(cleaned); } catch {}
+    // 0.99.17 (#2): also seed every KNOWN author (coworkers from other folders)
+    // so a new folder auto-populates and you can assign anyone immediately.
+    try { await this.seedKnownAuthorsInFolder(cleaned); } catch {}
   }
 
   /** Tally per-note colors found in EVERY markdown file under `folder`.
@@ -710,6 +714,11 @@ export default class StashpadPlugin extends Plugin {
       // Vault is fully indexed now — safe to reconcile locked placeholders
       // (drop entries whose blob is truly gone, add cross-device blobs).
       void this.reconcileLockedRegistry();
+      // 0.99.19: fire reminders for tasks that came due while Obsidian was
+      // closed (delay so the metadata cache is populated), then re-check on an
+      // interval so tasks coming due while it's open also surface.
+      window.setTimeout(() => void this.checkDueReminders(), 6000);
+      this.registerInterval(window.setInterval(() => void this.checkDueReminders(), 5 * 60 * 1000));
       window.setTimeout(() => { void this.seedLocalAuthorStubsEverywhere(); }, 4000);
       // 0.79.12: register each Stashpad folder's _archive in Obsidian's
       // "Excluded files" so native search / quick switcher / graph / link
@@ -1408,6 +1417,11 @@ export default class StashpadPlugin extends Plugin {
     // 0.58.0: rebootstrap as a command palette entry — mirrors the
     // "Rebootstrap now" button in settings. Useful when troubleshooting
     // / migrating without opening Settings.
+    this.addCommand({
+      id: "stashpad-sync-authors",
+      name: "Sync authors across all folders (multiplayer)",
+      callback: () => void this.syncAuthorsAcrossFolders(),
+    });
     this.addCommand({
       id: "stashpad-rebootstrap-all",
       name: "Rebootstrap all Stashpad folders (backfill metadata + rename stale titles)",
@@ -3620,27 +3634,148 @@ export default class StashpadPlugin extends Plugin {
    *  Used when assigning a task to someone so the assignee wikilink
    *  resolves. No-op if a stub for this id already exists in the dir
    *  (under any name). Also registers the author. */
-  async ensureAuthorStubFor(folder: string, id: string, name: string): Promise<void> {
-    if (!id || !name) return;
+  async ensureAuthorStubFor(folder: string, id: string, name: string): Promise<boolean> {
+    if (!id || !name) return false;
     this.authorRegistry.record({ id, name });
     const dir = `${folder.replace(/\/+$/, "")}/_authors`;
     const exists = this.app.vault.getMarkdownFiles().some(
       (f) => f.path.startsWith(dir + "/") && this.parseAuthorFilePath(f.path)?.id === id,
     );
-    if (exists) return;
+    if (exists) return false;
     const rec = this.authorRegistry.get(id);
     const safe = this.authorNameToSafe(name);
     const path = `${dir}/${safe}-${id}.md`;
     try {
       await this.ensureFolderPath(dir);
-      if (await this.app.vault.adapter.exists(path)) return;
+      if (await this.app.vault.adapter.exists(path)) return false;
       await this.app.vault.create(path, this.buildAuthorStub(
         { id, name, role: rec?.role, department: rec?.department },
         new Date().toISOString(),
       ));
+      return true;
     } catch (e) {
       console.warn("[Stashpad] ensureAuthorStubFor failed", path, e);
+      return false;
     }
+  }
+
+  /** 0.99.17 (#2): seed EVERY known author (vault-wide) into `folder`'s
+   *  `_authors/`, not just the local user — so a new folder auto-populates with
+   *  coworkers and assignment works without waiting for them to contribute. Each
+   *  stub reuses the author's real id. Returns how many stubs were created. */
+  async seedKnownAuthorsInFolder(folder: string): Promise<number> {
+    let created = 0;
+    for (const a of this.collectKnownAuthors()) {
+      if (await this.ensureAuthorStubFor(folder, a.id, a.name)) created++;
+    }
+    return created;
+  }
+
+  /** 0.99.19: Task due-date reminders. Obsidian plugins can't fire while the app
+   *  is closed, so this runs at LAUNCH (onLayoutReady) and on an interval while
+   *  running: it finds tasks whose `due` has passed and that haven't been
+   *  reminded yet (tracked by `<id>@<dueRaw>` in settings.notifiedDueKeys, so the
+   *  same task+due never re-fires — a changed due date re-keys and reminds again),
+   *  shows a PERSISTENT notification under the "reminder" category (so it lands in
+   *  the history log + respects mute), then records it. */
+  async checkDueReminders(): Promise<void> {
+    const now = Date.now();
+    const notified = new Set(this.settings.notifiedDueKeys ?? []);
+    const due: Array<{ id: string; folder: string; file: TFile; dueMs: number; key: string }> = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (f.path.includes("/_authors/")) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown } | undefined;
+      if (!fm || fm.due == null) continue;
+      const id = typeof fm.id === "string" ? fm.id : "";
+      if (!id) continue;
+      const dueRaw = String(fm.due);
+      const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(dueRaw);
+      if (!Number.isFinite(dueMs) || dueMs > now) continue; // not due yet
+      const key = `${id}@${dueRaw}`;
+      if (notified.has(key)) continue;
+      due.push({ id, folder: (f.parent?.path ?? "").replace(/\/+$/, ""), file: f, dueMs, key });
+    }
+    if (due.length === 0) return;
+    // Record up front so the interval / a fast re-entry can't double-fire.
+    this.settings.notifiedDueKeys = [...(this.settings.notifiedDueKeys ?? []), ...due.map((d) => d.key)].slice(-2000);
+    await this.saveSettings();
+    const titleOf = async (file: TFile): Promise<string> => {
+      try {
+        const body = splitFrontmatter(await this.app.vault.cachedRead(file)).body;
+        const line = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+        if (line) return line.replace(/^[#>\-*\s]+/, "").slice(0, 60);
+      } catch { /* fall through to filename */ }
+      return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+    };
+    if (due.length <= 3) {
+      for (const d of due) {
+        const title = await titleOf(d.file);
+        this.notifications.show({
+          message: `⏰ Task due: “${title}” (${formatDateTime(d.dueMs, this.settings)})`,
+          kind: "warning", category: "reminder", duration: 0, folder: d.folder, affectedIds: [d.id],
+          actions: [{ label: "Open", onClick: () => void this.revealNoteByRef(d.folder, d.id) }],
+        });
+      }
+    } else {
+      this.notifications.show({
+        message: `⏰ ${due.length} tasks are due — open the Tasks panel to review.`,
+        kind: "warning", category: "reminder", duration: 0, folder: "",
+      });
+    }
+  }
+
+  /** 0.99.17 (#3): the "centralized sync" — rebuild the registry from the whole
+   *  vault, then ensure every known author has a stub in every Stashpad folder.
+   *  Backfills existing folders (new folders are handled at creation). */
+  async syncAuthorsAcrossFolders(): Promise<void> {
+    await this.rebuildAuthorRegistry(); // learn every author from the vault first
+    const authors = this.collectKnownAuthors();
+    const folders = this.discoverStashpadFolders();
+    if (!authors.length || !folders.length) { new Notice("No authors or Stashpad folders to sync."); return; }
+    const prog = folders.length * authors.length > 8 ? new Notice("", 0) : null;
+    let created = 0;
+    for (const folder of folders) {
+      prog?.setMessage(`Syncing authors → ${folder.split("/").pop()}…`);
+      for (const a of authors) {
+        if (await this.ensureAuthorStubFor(folder, a.id, a.name)) created++;
+      }
+    }
+    prog?.hide();
+    this.notifications.show({
+      message: `Synced authors across ${folders.length} folder${folders.length === 1 ? "" : "s"} — ${created} new stub${created === 1 ? "" : "s"} (${authors.length} author${authors.length === 1 ? "" : "s"} known).`,
+      kind: "success", category: "system", folder: "",
+    });
+  }
+
+  /** 0.99.16: VAULT-WIDE list of known authors for the assignee pickers — the
+   *  union of the LOCAL registry (per-config, so in a shared vault it mostly
+   *  knows just this user) AND a scan of every folder's `_authors/` stub files
+   *  (id from the filename, display name from the stub's aliases/name). This is
+   *  what surfaces COWORKERS who exist in shared folders but aren't in this
+   *  device's registry — the reason only the local user showed up before.
+   *  Deduped by id (registry name wins); the local user is listed first. Also
+   *  warms the registry with anything new it finds (idempotent after the first). */
+  collectKnownAuthors(): Array<{ id: string; name: string }> {
+    const byId = new Map<string, string>();
+    // The local user is always "known" (from settings), even before they have a
+    // stub or any authored notes — and listed first.
+    const myId = (this.settings.authorId ?? "").trim();
+    const myName = (this.settings.authorName ?? "").trim();
+    if (myId && myName) byId.set(myId, myName);
+    for (const a of this.authorRegistry.all()) if (!byId.has(a.id)) byId.set(a.id, a.name);
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (!f.path.includes("/_authors/")) continue;
+      const parsed = this.parseAuthorFilePath(f.path);
+      if (!parsed) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { aliases?: unknown; name?: unknown } | undefined;
+      const aliasName = Array.isArray(fm?.aliases)
+        ? ((fm!.aliases as unknown[]).find((x) => typeof x === "string") as string | undefined ?? "")
+        : (typeof fm?.aliases === "string" ? fm.aliases : "");
+      const name = (aliasName || (typeof fm?.name === "string" ? fm.name : "") || parsed.name).trim();
+      if (!byId.has(parsed.id)) byId.set(parsed.id, name);
+      this.authorRegistry.record({ id: parsed.id, name }); // warm the registry (no-op if unchanged)
+    }
+    return [...byId.entries()].map(([id, name]) => ({ id, name }));
   }
 
   /** 0.77.2: rebuild the author registry from scratch by scanning the
@@ -4141,6 +4276,9 @@ export default class StashpadPlugin extends Plugin {
       notificationHistoryLimit: (typeof data?.notificationHistoryLimit === "number" && Number.isFinite(data.notificationHistoryLimit))
         ? data.notificationHistoryLimit
         : 5000,
+      notifiedDueKeys: Array.isArray(data?.notifiedDueKeys)
+        ? data.notifiedDueKeys.filter((x: unknown): x is string => typeof x === "string").slice(-2000)
+        : [],
       drafts: normalizeDrafts(data?.drafts),
       lastSubmitted: data?.lastSubmitted && typeof data.lastSubmitted === "object" ? data.lastSubmitted : {},
       // Migrate: when slugStopWords has never been set on this install

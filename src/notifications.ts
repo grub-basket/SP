@@ -24,6 +24,7 @@ export type NotificationCategory =
   | "attachment"
   | "color" | "reorder"
   | "multiplayer"
+  | "reminder"
   | "system";
 
 /** Human-readable labels for each category, used by the settings UI
@@ -45,6 +46,7 @@ export const CATEGORY_LABELS: Record<NotificationCategory, { label: string; desc
   color:       { label: "Color",         desc: "Per-note color changes." },
   reorder:     { label: "Reorder",       desc: "Drag-reorder and keyboard moveUp/Down/Top/Bottom." },
   multiplayer: { label: "Multiplayer",   desc: "Cross-author activity (someone else touched your notes or vice versa)." },
+  reminder:    { label: "Reminder",      desc: "Task due-date reminders — surfaced when a task comes due (fired at launch / periodically)." },
   system:      { label: "System",        desc: "Plumbing toasts: backfill progress, integrity warnings, errors not tied to a verb." },
 };
 

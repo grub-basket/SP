@@ -100,7 +100,7 @@ case "$1" in
         try { window.__claudeTestBanner.hide(); } catch (e) {}
       }
       window.__claudeTestBanner = null;
-      new Notice('✅ Safe to use Stashpad again — Claude has finished testing.', 6000);
+      new Notice('✅ Safe to use Stashpad again — Claude has finished testing.', 0);
       return 'cleared';
     })()" >/dev/null 2>&1
     echo "guard: banner cleared, all-clear shown"

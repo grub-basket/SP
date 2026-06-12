@@ -1,0 +1,18 @@
+#!/bin/sh
+# Back up a Claude Dev Vault folder to a timestamped zip BEFORE running tests
+# that might touch it (especially the real "Stashpad" folder, or vault-wide
+# commands). Stored OUTSIDE the vault so it isn't indexed/imported.
+# Usage: scripts/backup-dev-folder <FolderName>   (e.g. Stashpad)
+# Paths are relative to this script (scripts/ inside the dev repo): the dev vault
+# is a sibling of the dev repo, under the parent project dir.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$DIR/../.." && pwd)"   # parent of the dev repo (the project dir)
+VAULT="$ROOT/Claude Dev Vault"
+DEST="$ROOT/Claude Dev Vault Backups"
+F="$1"
+[ -n "$F" ] || { echo "usage: backup-dev-folder <FolderName>" >&2; exit 1; }
+[ -d "$VAULT/$F" ] || { echo "no such folder: $VAULT/$F" >&2; exit 1; }
+mkdir -p "$DEST"
+TS=$(date "+%Y-%m-%d-%H%M%S")
+OUT="$DEST/$F-$TS.zip"
+( cd "$VAULT" && zip -rq "$OUT" "$F" ) && echo "backed up '$F' -> $OUT"

@@ -4077,6 +4077,19 @@
   background: var(--background-primary);
   color: var(--text-normal);
 }
+/* 0.99.18: explicit selection + focus highlight so the auto-selected HH/MM text
+   reads clearly in BOTH the search "when" popover AND the due-date modal — the
+   modal context was swallowing the default text-selection highlight. Same class
+   in both pickers, so this fixes both. */
+.stashpad-when-time-field::selection {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.stashpad-when-time-field:focus {
+  outline: none;
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+}
 .stashpad-when-time-colon { font-size: 1.15em; color: var(--text-muted); }
 .stashpad-when-time-period {
   display: inline-flex;

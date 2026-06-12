@@ -406,6 +406,9 @@ export interface StashpadSettings {
    *  Default 5000. Persisted alongside the live history in
    *  `<pluginDir>/notifications.json`. */
   notificationHistoryLimit: number;
+  /** Keys (`<id>@<dueRaw>`) of task due-reminders already fired, so they don't
+   *  re-fire on every launch. Bounded; pruned when it grows. */
+  notifiedDueKeys: string[];
   /** 0.71.0 / 0.71.2: JD Index Builder. Two flavors:
    *    - "Preview" → writes a single Index.md inside the designated
    *      Stashpad folder, showing the would-be hierarchy + non-matches.
@@ -503,6 +506,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   attachmentsOnlyNotes: {},
   mutedNotificationCategories: [],
   notificationHistoryLimit: 5000,
+  notifiedDueKeys: [],
   autoNavOnMoveIn: false,
   autoNavOnMoveOut: false,
   autoExpandCursorRow: false,
@@ -657,10 +661,12 @@ export class StashpadSettingTab extends PluginSettingTab {
       case "diagnostics": return this.diagnosticsItems();
       case "general": return this.generalItems();
       case "encryption": return this.encryptionItems();
-      // authorship/templates/jdindex still render via the fresh-at-open `page:`
-      // path (searchable by page name). They're per-folder editors that don't
-      // decompose into clean per-setting entries; render-at-display via the page
-      // renderer keeps them correct. Returning null falls back to that path.
+      // 0.99.15: authorship/templates/jdindex decomposed too — static fields as
+      // per-setting items, the per-folder editors as sectionDefs (rendered fresh
+      // at display) — so individual settings are searchable, not just page names.
+      case "authorship": return this.authorshipItems();
+      case "templates": return this.templatesItems();
+      case "jdindex": return this.jdIndexItems();
       default: return null;
     }
   }
@@ -1449,6 +1455,89 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  unique links). The id never changes once set, so already-stamped
    *  notes keep referring to the right person even if they rename
    *  themselves later. */
+  /** 0.99.15: Authorship tab decomposed for native settings search — static
+   *  fields as per-setting renderDefs; the dynamic "folders worked in" + "known
+   *  authors" lists as sectionDefs (rendered fresh at display). */
+  private authorshipItems(): SettingDefinitionItem[] {
+    const items: SettingDefinitionItem[] = [];
+    items.push(this.renderDef("Author name",
+      "Your display name. Used in the note footer + as the author/contributor link target. Leave blank to opt out (notes won't be stamped).",
+      (s) => s.addText((t) => t.setValue(this.plugin.settings.authorName).onChange(async (v) => {
+        this.plugin.settings.authorName = v.trim();
+        if (this.plugin.settings.authorName && !this.plugin.settings.authorId) this.plugin.settings.authorId = newId();
+        await this.plugin.saveSettings();
+        await this.plugin.syncAuthorFilesToName();
+      })), ["author", "name", "identity", "stamp"]));
+    items.push(this.renderDef("Author id (auto-assigned)",
+      "Stable id appended to your name on links so coworkers with the same name don't collide. Generated once and shouldn't change. To reset it, clear and retype your author name.",
+      (s) => s.addText((t) => t.setValue(this.plugin.settings.authorId).setDisabled(true)), ["author", "id"]));
+    items.push(this.renderDef("Title / role",
+      "Optional. Shown on your author page (e.g. \"Engineer\", \"PM\", \"Designer\").",
+      (s) => s.addText((t) => t.setValue(this.plugin.settings.authorRole).onChange(async (v) => {
+        this.plugin.settings.authorRole = v.trim(); await this.plugin.saveSettings(); await this.plugin.syncAuthorFilesToName();
+      })), ["role", "title", "job"]));
+    items.push(this.renderDef("Department / team",
+      "Optional. Shown on your author page (e.g. \"Engineering\", \"Growth\").",
+      (s) => s.addText((t) => t.setValue(this.plugin.settings.authorDepartment).onChange(async (v) => {
+        this.plugin.settings.authorDepartment = v.trim(); await this.plugin.saveSettings(); await this.plugin.syncAuthorFilesToName();
+      })), ["department", "team"]));
+    const footerToggle = (name: string, get: () => boolean, put: (v: boolean) => void, aliases: string[]): SettingDefinitionItem =>
+      this.renderDef(name, "", (s) => s.addToggle((t) => t.setValue(get()).onChange(async (v) => { put(v); await this.plugin.saveSettings(); })), aliases);
+    items.push(footerToggle("Show author in note footer", () => this.plugin.settings.showAuthor, (v) => { this.plugin.settings.showAuthor = v; }, ["author", "footer", "show"]));
+    items.push(footerToggle("Show contributors in note footer", () => this.plugin.settings.showContributors, (v) => { this.plugin.settings.showContributors = v; }, ["contributors", "footer", "show"]));
+    items.push(footerToggle("Show last edit time in note footer", () => this.plugin.settings.showLastEdit, (v) => { this.plugin.settings.showLastEdit = v; }, ["last edit", "modified", "footer", "time"]));
+    items.push(this.sectionDef("Folders you've worked in",
+      "Folders where you've authored or contributed notes. Click one to open it.",
+      (host) => this.renderAuthoredFolders(host),
+      ["folders", "authored", "contributed", "worked"]));
+    items.push(this.sectionDef("Known authors",
+      "Everyone the plugin has seen, with role/department + rename history; rebuild/restore the registry.",
+      (host) => this.renderKnownAuthorsSection(host),
+      ["authors", "registry", "rename", "known", "rebuild"]));
+    return items;
+  }
+
+  /** The "folders you've worked in" list, extracted so the authorship sectionDef
+   *  can render it fresh at display time. */
+  private renderAuthoredFolders(parent: HTMLElement): void {
+    const folders = this.plugin.collectAuthoredFolders();
+    if (folders.length === 0) { parent.createEl("p", { cls: "setting-item-description", text: "No authored or contributed folders yet." }); return; }
+    const list = parent.createDiv({ cls: "stashpad-authored-folders-list" });
+    for (const f of folders) {
+      const row = list.createDiv({ cls: "stashpad-authored-folder-row" });
+      const a = row.createEl("a", { cls: "stashpad-authored-folder-link", text: f.folder });
+      a.onclick = (e) => { e.preventDefault(); void this.plugin.activateViewForFolder(f.folder); };
+      const counts: string[] = [];
+      if (f.authored > 0) counts.push(`authored ${f.authored}`);
+      if (f.contributed > 0) counts.push(`contributed to ${f.contributed}`);
+      row.createSpan({ cls: "stashpad-authored-folder-counts", text: ` · ${counts.join(", ")}` });
+    }
+  }
+
+  /** 0.99.15: Templates tab — the two per-folder editors as searchable sections. */
+  private templatesItems(): SettingDefinitionItem[] {
+    return [
+      this.sectionDef("Color aliases",
+        "Give your note colors friendly names, per Stashpad folder.",
+        (host) => this.renderColorAliasesSection(host),
+        ["color", "colour", "alias", "name", "swatch", "palette", "label"]),
+      this.sectionDef("Note templates",
+        "Per-Stashpad note templates — content stamped into new notes.",
+        (host) => this.renderNoteTemplatesSection(host),
+        ["template", "note", "default", "boilerplate", "snippet"]),
+    ];
+  }
+
+  /** 0.99.15: JD Index tab as a searchable section (scope/preview/build inside). */
+  private jdIndexItems(): SettingDefinitionItem[] {
+    return [
+      this.sectionDef("JD Index (Johnny Decimal)",
+        "Build a Johnny-Decimal-style index from dotted-prefix note titles — set the scope, preview, then build.",
+        (host) => this.renderJdIndexSection(host),
+        ["jd", "johnny", "decimal", "index", "scope", "build", "preview", "hierarchy", "folder"]),
+    ];
+  }
+
   private renderAuthorshipSection(parent: HTMLElement): void {
     parent.createEl("h3", { text: "Authorship" });
     parent.createEl("p", {

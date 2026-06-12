@@ -7889,7 +7889,7 @@ export class StashpadView extends ItemView {
     const current = curFm && (typeof curFm.due === "string" || typeof curFm.due === "number") ? String(curFm.due) : null;
     // 0.78.1: offer known authors (registry, newest-first) for assignment,
     // and pre-fill any assignees already on the first target.
-    const knownAuthors = this.plugin.authorRegistry.all().map((a) => ({ id: a.id, name: a.name }));
+    const knownAuthors = this.plugin.collectKnownAuthors();
     const currentAssignees = parseAssignees(curFm ?? {});
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees);
@@ -7984,7 +7984,7 @@ export class StashpadView extends ItemView {
     if (targets.length === 0) { new Notice("Nothing to assign."); return; }
     const first = targets[0];
     const curFm = first.file ? this.app.metadataCache.getFileCache(first.file)?.frontmatter as any : null;
-    const knownAuthors = this.plugin.authorRegistry.all().map((a) => ({ id: a.id, name: a.name }));
+    const knownAuthors = this.plugin.collectKnownAuthors();
     const currentAssignees = parseAssignees(curFm ?? {});
     new AssignModal(this.app, { knownAuthors, currentAssignees }, (assignees) => {
       void this.applyAssignees(targets, assignees);
