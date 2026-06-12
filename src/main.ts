@@ -19,7 +19,7 @@ import { importStashZip, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
-import { ROOT_ID } from "./types";
+import { ROOT_ID, parseAssignees } from "./types";
 import { OrderStore } from "./order-store";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
@@ -3681,6 +3681,7 @@ export default class StashpadPlugin extends Plugin {
   async checkDueReminders(): Promise<void> {
     const now = Date.now();
     const notified = new Set(this.settings.notifiedDueKeys ?? []);
+    const myId = (this.settings.authorId ?? "").trim();
     const due: Array<{ id: string; folder: string; file: TFile; dueMs: number; key: string }> = [];
     for (const f of this.app.vault.getMarkdownFiles()) {
       if (f.path.includes("/_authors/")) continue;
@@ -3691,6 +3692,11 @@ export default class StashpadPlugin extends Plugin {
       const dueRaw = String(fm.due);
       const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(dueRaw);
       if (!Number.isFinite(dueMs) || dueMs > now) continue; // not due yet
+      // Assignee scoping: a task assigned to specific people only reminds THOSE
+      // people (so I only get a reminder for a task assigned to me). An
+      // UNASSIGNED task reminds everyone (i.e. me too).
+      const assignees = parseAssignees(fm);
+      if (assignees.length > 0 && !(myId && assignees.some((a) => a.id === myId))) continue;
       const key = `${id}@${dueRaw}`;
       if (notified.has(key)) continue;
       due.push({ id, folder: (f.parent?.path ?? "").replace(/\/+$/, ""), file: f, dueMs, key });
