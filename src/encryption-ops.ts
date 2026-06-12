@@ -37,7 +37,7 @@ interface SubtreeNode { id: StashpadId; file: TFile; parent: StashpadId | null; 
 
 /** Collect a note + all its descendants within `folder` by walking frontmatter
  *  `parent` links. Returns the root note and the rest, plus the root's parent. */
-async function collectSubtree(app: App, folder: string, rootId: StashpadId): Promise<{
+export async function collectSubtree(app: App, folder: string, rootId: StashpadId): Promise<{
   rootNote: SubtreeNode; descendants: SubtreeNode[]; parentId: StashpadId | null;
 } | null> {
   const cleaned = folder.replace(/\/+$/, "");

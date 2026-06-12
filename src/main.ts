@@ -7,7 +7,7 @@ import { STASHPAD_TRASH_VIEW_TYPE } from "./types";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, OBSIDIAN_TRASH_DIR, type DeletedMeta } from "./encryption-ops";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree } from "./encryption-ops";
 import { EncryptionPasswordModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
@@ -15,7 +15,7 @@ import {
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
-import { importStashZip, STASH_EXT, splitFrontmatter } from "./stash-package";
+import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
@@ -33,6 +33,9 @@ import { RenderCacheStore } from "./render-cache-store";
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
  *  the next load knows to un-ghost the deferred Stashpad tabs. */
 const UNGHOST_FLAG = "stashpad:unghost-after-reload";
+
+/** A captured file's content, for snapshot-backed undo/redo of file operations. */
+interface FileSnapshot { path: string; binary: boolean; text?: string; data?: ArrayBuffer; }
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
@@ -3288,6 +3291,252 @@ export default class StashpadPlugin extends Plugin {
   isArchiveFolder(folder: string): boolean {
     const cleaned = folder.replace(/\/+$/, "");
     return (this.settings.archiveFolders ?? []).includes(cleaned);
+  }
+
+  /** Ids of the markdown notes living directly in `folder` (read from DISK — the
+   *  metadata cache can lag and an under-read here would miss a real id collision
+   *  on import). */
+  async idsInFolder(folder: string): Promise<Set<StashpadId>> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const out = new Set<StashpadId>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
+      try { const id = splitFrontmatter(await this.app.vault.read(f)).fm.id; if (typeof id === "string") out.add(id); } catch { /* skip unreadable */ }
+    }
+    return out;
+  }
+
+  /** Cross-folder note paste engine (cut = move, copy = clone). Routes the source
+   *  subtree(s) through the `.stash` bundle path so ATTACHMENTS travel into the
+   *  destination's `_attachments` folder, then (for a cut) trashes the source
+   *  notes and their EXCLUSIVE attachments. Refuses an archive / auto-encrypting
+   *  destination — a missing on-device key could strand the move — so that path
+   *  is left to the explicit "Move to archive" command (which checks the key
+   *  first). Returns the destination root ids, total note count, and reversible
+   *  `undo` / `redo` closures (file-level — the caller adds tree rebuild + render).
+   *  Undo is snapshot-backed: we capture the created destination files and (for a
+   *  cut) the source files BEFORE trashing them, so undo fully restores either
+   *  direction. Null on refusal / no-op. */
+  async crossFolderPaste(
+    srcFolder: string, rootIds: StashpadId[], destFolder: string,
+    destParent: StashpadId, mode: "cut" | "copy",
+  ): Promise<{ rootIds: StashpadId[]; noteCount: number; undo: () => Promise<void>; redo: () => Promise<void> } | null> {
+    const cleanDest = destFolder.replace(/\/+$/, "");
+    if (this.isArchiveFolder(cleanDest)) {
+      new Notice(`"${cleanDest.split("/").pop()}" auto-encrypts notes moved in, so cross-folder paste is disabled there. Use the "Move to archive" command — it checks the encryption key first.`);
+      return null;
+    }
+    // Gather source subtree(s) from DISK (authoritative; the source folder's view
+    // may be closed, so we can't rely on an in-memory tree).
+    const rootNotes: { id: StashpadId; file: TFile }[] = [];
+    const allDescendants: { id: StashpadId; file: TFile }[] = [];
+    const srcRootOldIds: StashpadId[] = [];
+    const srcNoteFiles: TFile[] = [];
+    for (const rid of rootIds) {
+      const sub = await collectSubtree(this.app, srcFolder, rid);
+      if (!sub) continue;
+      srcRootOldIds.push(sub.rootNote.id);
+      rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
+      srcNoteFiles.push(sub.rootNote.file);
+      for (const d of sub.descendants) { allDescendants.push({ id: d.id, file: d.file }); srcNoteFiles.push(d.file); }
+    }
+    if (!rootNotes.length) return null;
+    const noteCount = rootNotes.length + allDescendants.length;
+
+    // For a CUT, snapshot the source (notes + EXCLUSIVE attachments) BEFORE we
+    // touch anything, so undo can recreate it byte-for-byte.
+    let srcExclusiveAtts: TFile[] = [];
+    let srcSnapshot: FileSnapshot[] = [];
+    if (mode === "cut") {
+      srcExclusiveAtts = await this.exclusiveAttachmentsOf(srcNoteFiles);
+      srcSnapshot = await this.snapshotPaths([...srcNoteFiles.map((f) => f.path), ...srcExclusiveAtts.map((f) => f.path)]);
+    }
+
+    // Bundle the subtree (collects referenced attachments) → import into dest
+    // (writes attachments into dest/_attachments). Copy → fresh ids; cut → keep
+    // ids so the moved notes retain their identity. Roots reparent to the paste
+    // target. dedupeExisting:false on purpose — the vault-wide reuse would route
+    // the pasted note's attachment link back to the SOURCE folder's copy (and for
+    // a cut, that copy then gets trashed → a dangling link). We want the
+    // attachment physically in THIS folder's _attachments so the subtree is
+    // self-contained. (An identical file already in dest's _attachments is still
+    // reused — only the cross-folder reuse is dropped.)
+    const zip = await buildStashZip(this.app, { rootNotes, allDescendants, sourceFolder: srcFolder });
+    const destExistingIds = await this.idsInFolder(cleanDest);
+    const beforePaths = new Set(this.filesUnder(cleanDest));
+    const summary = await importStashZip(this.app, zip, cleanDest, destExistingIds, {
+      dedupeExisting: false,
+      forceNewIds: mode === "copy",
+      reparentRootsTo: destParent,
+    });
+    const createdPaths = this.filesUnder(cleanDest).filter((p) => !beforePaths.has(p));
+    const destSnapshot = await this.snapshotPaths(createdPaths);
+    const newRootIds = srcRootOldIds.map((old) => summary.idRemap[old]).filter((x): x is StashpadId => !!x);
+
+    // CUT: the notes + attachments now live in dest, so trash the source subtree.
+    if (mode === "cut") {
+      for (const f of srcNoteFiles) { try { await this.app.fileManager.trashFile(f); } catch (e) { console.warn("[Stashpad] cross-folder move: couldn't trash source note", f.path, e); } }
+      for (const f of srcExclusiveAtts) { try { await this.app.fileManager.trashFile(f); } catch (e) { console.warn("[Stashpad] cross-folder move: couldn't trash source attachment", f.path, e); } }
+    }
+
+    const removeCreated = async () => {
+      for (const p of [...createdPaths].reverse()) {
+        const f = this.app.vault.getAbstractFileByPath(p);
+        if (f) { try { await this.app.fileManager.trashFile(f as TFile); } catch { /* already gone */ } }
+      }
+    };
+    const undo = mode === "cut"
+      ? async () => { await removeCreated(); await this.restoreSnapshot(srcSnapshot); }
+      : async () => { await removeCreated(); };
+    const redo = mode === "cut"
+      ? async () => { await this.restoreSnapshot(destSnapshot); for (const s of srcSnapshot) { const f = this.app.vault.getAbstractFileByPath(s.path); if (f) { try { await this.app.fileManager.trashFile(f as TFile); } catch { /* gone */ } } } }
+      : async () => { await this.restoreSnapshot(destSnapshot); };
+
+    return { rootIds: newRootIds, noteCount, undo, redo };
+  }
+
+  /** Trash (recoverable) the given subtrees in `folder`: every note file plus the
+   *  attachments referenced ONLY by those subtrees — shared attachments stay put.
+   *  Returns the files it trashed (for the caller's undo snapshot). */
+  async trashSubtrees(folder: string, rootIds: StashpadId[]): Promise<TFile[]> {
+    const files: TFile[] = [];
+    for (const rid of rootIds) {
+      const sub = await collectSubtree(this.app, folder, rid);
+      if (!sub) continue;
+      files.push(sub.rootNote.file, ...sub.descendants.map((d) => d.file));
+    }
+    if (!files.length) return [];
+    const exclusiveAtts = await this.exclusiveAttachmentsOf(files);
+    const trashed: TFile[] = [];
+    for (const f of [...files, ...exclusiveAtts]) {
+      try { await this.app.fileManager.trashFile(f); trashed.push(f); }
+      catch (e) { console.warn("[Stashpad] trashSubtrees: couldn't trash", f.path, e); }
+    }
+    return trashed;
+  }
+
+  /** Attachments referenced ONLY by `noteFiles` (not by any note outside the set).
+   *  Exclusivity is read from the live resolvedLinks graph — call while the notes
+   *  are still present. */
+  async exclusiveAttachmentsOf(noteFiles: TFile[]): Promise<TFile[]> {
+    const subtreePaths = new Set(noteFiles.map((f) => f.path));
+    const subtreeAtts = new Map<string, TFile>();
+    for (const f of noteFiles) for (const af of await resolveNoteAttachmentFiles(this.app, f)) subtreeAtts.set(af.path, af);
+    const resolved = this.app.metadataCache.resolvedLinks ?? {};
+    for (const notePath of Object.keys(resolved)) {
+      if (subtreePaths.has(notePath)) continue;
+      for (const target of Object.keys(resolved[notePath] ?? {})) subtreeAtts.delete(target); // referenced elsewhere → not exclusive
+    }
+    return [...subtreeAtts.values()];
+  }
+
+  /** Paths of every file (notes + their exclusive attachments) in the given
+   *  subtrees — for an undo snapshot taken before trashing. */
+  async subtreeFilePaths(folder: string, rootIds: StashpadId[]): Promise<string[]> {
+    const files: TFile[] = [];
+    for (const rid of rootIds) {
+      const sub = await collectSubtree(this.app, folder, rid);
+      if (!sub) continue;
+      files.push(sub.rootNote.file, ...sub.descendants.map((d) => d.file));
+    }
+    if (!files.length) return [];
+    const atts = await this.exclusiveAttachmentsOf(files);
+    return [...files.map((f) => f.path), ...atts.map((f) => f.path)];
+  }
+
+  /** Pre-ordered (parent → children, depth-tagged) nodes of the given subtrees,
+   *  read from disk — for building the indented outline of a CROSS-folder cut
+   *  pasted into a composer (the source folder's tree isn't loaded in the
+   *  destination view). Siblings are ordered by `position` frontmatter (then
+   *  `created`) to match the list's visual order. */
+  async orderedSubtreeNodes(folder: string, rootIds: StashpadId[]): Promise<Array<{ file: TFile; created: string; depth: number }>> {
+    const out: Array<{ file: TFile; created: string; depth: number }> = [];
+    const seen = new Set<StashpadId>();
+    const posOf = (f: TFile): number => { const v = (this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined)?.position; return typeof v === "number" ? v : Number.MAX_SAFE_INTEGER; };
+    type N = { id: StashpadId; file: TFile; created: string };
+    for (const rid of rootIds) {
+      const sub = await collectSubtree(this.app, folder, rid);
+      if (!sub) continue;
+      const childrenOf = new Map<StashpadId, N[]>();
+      for (const d of sub.descendants) {
+        if (!d.parent) continue;
+        const arr = childrenOf.get(d.parent as StashpadId) ?? [];
+        arr.push({ id: d.id, file: d.file, created: d.created });
+        childrenOf.set(d.parent as StashpadId, arr);
+      }
+      for (const arr of childrenOf.values()) arr.sort((a, b) => (posOf(a.file) - posOf(b.file)) || a.created.localeCompare(b.created));
+      const walk = (node: N, depth: number): void => {
+        if (seen.has(node.id)) return; // cycle / overlap guard
+        seen.add(node.id);
+        out.push({ file: node.file, created: node.created, depth });
+        for (const c of childrenOf.get(node.id) ?? []) walk(c, depth + 1);
+      };
+      walk({ id: sub.rootNote.id, file: sub.rootNote.file, created: sub.rootNote.created }, 0);
+    }
+    return out;
+  }
+
+  /** All file paths under `folder` (notes directly in it + its `_attachments`). */
+  filesUnder(folder: string): string[] {
+    const prefix = folder.replace(/\/+$/, "") + "/";
+    return this.app.vault.getFiles().filter((f) => f.path.startsWith(prefix)).map((f) => f.path);
+  }
+
+  /** Capture content for a set of paths (text for `.md`, binary otherwise) so an
+   *  undo/redo can recreate them exactly. Missing paths are skipped. */
+  async snapshotPaths(paths: string[]): Promise<FileSnapshot[]> {
+    const out: FileSnapshot[] = [];
+    for (const path of paths) {
+      const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+      if (!f) continue;
+      const binary = !path.toLowerCase().endsWith(".md");
+      try {
+        if (binary) out.push({ path, binary, data: await this.app.vault.readBinary(f) });
+        else out.push({ path, binary, text: await this.app.vault.read(f) });
+      } catch (e) { console.warn("[Stashpad] snapshotPaths: couldn't read", path, e); }
+    }
+    return out;
+  }
+
+  /** Recreate files from a snapshot (parents are created as needed). Overwrites an
+   *  existing file at the same path. */
+  async restoreSnapshot(snaps: FileSnapshot[]): Promise<void> {
+    for (const s of snaps) {
+      const dir = s.path.split("/").slice(0, -1).join("/");
+      await this.ensureVaultFolder(dir);
+      const existing = this.app.vault.getAbstractFileByPath(s.path) as TFile | null;
+      try {
+        if (s.binary) {
+          if (existing) await this.app.vault.adapter.writeBinary(s.path, s.data as ArrayBuffer);
+          else await this.app.vault.createBinary(s.path, s.data as ArrayBuffer);
+        } else {
+          if (existing) await this.app.vault.modify(existing, s.text ?? "");
+          else await this.app.vault.create(s.path, s.text ?? "");
+        }
+      } catch (e) { console.warn("[Stashpad] restoreSnapshot: couldn't write", s.path, e); }
+    }
+  }
+
+  /** Ensure a (possibly nested) vault folder exists. */
+  async ensureVaultFolder(dir: string): Promise<void> {
+    if (!dir) return;
+    let acc = "";
+    for (const seg of dir.split("/")) {
+      acc = acc ? `${acc}/${seg}` : seg;
+      if (!(await this.app.vault.adapter.exists(acc))) { try { await this.app.vault.createFolder(acc); } catch { /* race / exists */ } }
+    }
+  }
+
+  /** Rebuild + re-render every open Stashpad view showing `folder` — after an
+   *  out-of-band change to its files (e.g. a cross-folder move that removed notes
+   *  from the source folder, whose view isn't the one that ran the command). */
+  refreshOpenViewsForFolder(folder: string): void {
+    const cleaned = folder.replace(/\/+$/, "");
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const v = leaf.view as any;
+      if ((v?.noteFolder?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
+      try { v.tree?.rebuild?.(folder); v.render?.(); } catch (e) { console.warn("[Stashpad] refresh view failed", e); }
+    }
   }
 
   /** Batches arrivals per archive folder: each move-in (re)arms a settle timer so

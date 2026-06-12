@@ -53,6 +53,9 @@ export interface ImportSummary {
   /** Hex→name aliases from the manifest, for the caller to merge into the
    *  destination folder's color aliases (importStashZip has no settings access). */
   colorAliases?: Record<string, string>;
+  /** Old id → new id mapping applied on import (identity for kept ids). Lets a
+   *  caller (e.g. cross-folder paste) locate the written roots by their source id. */
+  idRemap: Record<string, string>;
 }
 
 interface ParsedNote {
@@ -118,7 +121,7 @@ export async function importStashZip(
   buf: ArrayBuffer | Uint8Array,
   destFolder: string,
   existingIds: Set<StashpadId>,
-  opts: { dedupeExisting?: boolean } = {},
+  opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null } = {},
 ): Promise<ImportSummary> {
   const zip = await JSZip.loadAsync(buf as any);
   const manifestFile = zip.file("manifest.json");
@@ -152,7 +155,9 @@ export async function importStashZip(
   for (const p of parsed) {
     const oldId = p.fm.id as string | undefined;
     if (!oldId) continue;
-    if (existingIds.has(oldId) || idRemap.has(oldId) /* dup within zip */) {
+    if (opts.forceNewIds) {
+      idRemap.set(oldId, newId(6)); // cross-folder COPY → a fresh identity (not a same-id twin)
+    } else if (existingIds.has(oldId) || idRemap.has(oldId) /* dup within zip */) {
       idRemap.set(oldId, `${oldId}-${newId(4)}-Imported`);
       collisionsRenamed++;
     } else {
@@ -225,13 +230,18 @@ export async function importStashZip(
 
     const oldParent = (p.fm.parent ?? null) as string | null;
     let newParent: string | null = oldParent;
-    if (oldParent && oldParent !== ROOT_ID && idRemap.has(oldParent)) {
-      newParent = idRemap.get(oldParent)!;
-    } else if (oldParent && oldParent !== ROOT_ID && !idRemap.has(oldParent)) {
+    if (!oldParent || oldParent === ROOT_ID) {
+      // Top-level in the source → a bundle root. Honor reparentRootsTo (cross-
+      // folder paste nests the pasted root where the cursor was); otherwise keep
+      // it at ROOT as before.
+      newParent = opts.reparentRootsTo ?? oldParent ?? ROOT_ID;
+    } else if (idRemap.has(oldParent)) {
+      newParent = idRemap.get(oldParent)!; // internal edge — remap to the moved parent
+    } else {
       // Parent isn't in this bundle. If it already EXISTS in the destination
       // (e.g. UNLOCK: the locked subtree's parent stayed in the vault), keep the
-      // link so nesting is restored; otherwise pin to ROOT for safety.
-      newParent = existingIds.has(oldParent) ? oldParent : ROOT_ID;
+      // link so nesting is restored; otherwise it's a bundle root → reparent/ROOT.
+      newParent = existingIds.has(oldParent) ? oldParent : (opts.reparentRootsTo ?? ROOT_ID);
     }
 
     // Rewrite body: ![[basename]] -> ![[<routed path>]] (the _attachments copy,
@@ -280,7 +290,7 @@ export async function importStashZip(
     if (Object.keys(clean).length) colorAliases = clean;
   }
 
-  return { notesWritten, attachmentsWritten, collisionsRenamed, warnings, colorAliases };
+  return { notesWritten, attachmentsWritten, collisionsRenamed, warnings, colorAliases, idRemap: Object.fromEntries(idRemap) };
 }
 
 // ---------------- Helpers ----------------

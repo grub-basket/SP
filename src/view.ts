@@ -6998,7 +6998,40 @@ export class StashpadView extends ItemView {
   async cmdPasteNotes(): Promise<void> {
     const clip = this.plugin.noteClipboard;
     if (!clip) { new Notice("The note clipboard is empty — copy or cut notes first."); return; }
-    if (clip.folder !== this.noteFolder) { new Notice("Those notes were cut/copied in another folder — cross-folder paste isn't supported yet."); return; }
+    // Cross-folder paste: the source notes live in another Stashpad folder, so
+    // route through the plugin's bundle-based engine — it carries ATTACHMENTS
+    // into this folder's _attachments, mints fresh ids for a copy (keeps them for
+    // a cut), and refuses an archive/auto-encrypting destination.
+    if (clip.folder !== this.noteFolder) {
+      const cursorX = this.currentChildren[this.cursorIdx] ?? null;
+      const destParent = ((cursorX?.parent ?? this.focusId) ?? ROOT_ID) as StashpadId;
+      const mode = clip.mode;
+      const srcFolder = clip.folder;
+      const result = await this.plugin.crossFolderPaste(srcFolder, clip.ids, this.noteFolder, destParent, mode);
+      if (!result || !result.rootIds.length) return; // refused (archive) / nothing found — Notice already shown
+      if (mode === "cut") this.plugin.clearNoteClipboard();
+      const folder = this.noteFolder;
+      this.tree.rebuild(folder);
+      this.pendingFocusIds = result.rootIds.slice();
+      this.render();
+      if (mode === "cut") this.plugin.refreshOpenViewsForFolder(srcFolder); // source lost notes
+      const srcLabel = srcFolder.split("/").pop();
+      const n = result.rootIds.length;
+      // Undo/redo: the engine returns reversible file-level closures; we wrap them
+      // with a rebuild + render of THIS folder and a refresh of the source folder.
+      const refreshBoth = () => { this.tree.rebuild(folder); this.render(); this.plugin.refreshOpenViewsForFolder(srcFolder); };
+      this.plugin.getUndoStack(folder).push({
+        label: `${mode === "cut" ? "Move" : "Paste"} ${n} note${n === 1 ? "" : "s"} from ${srcLabel}`,
+        undo: async () => { await result.undo(); refreshBoth(); },
+        redo: async () => { await result.redo(); refreshBoth(); },
+      });
+      const verb = mode === "cut" ? "Moved" : "Pasted (copied)";
+      this.plugin.notifications.show({
+        message: `${verb} ${n} note${n === 1 ? "" : "s"} (${result.noteCount} total) from "${srcLabel}" into this folder. Undo (in the list) reverses it.`,
+        kind: "success", category: mode === "cut" ? "move" : "clone", affectedIds: result.rootIds, folder, duration: 0,
+      });
+      return;
+    }
     const nodes = clip.ids.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
     if (!nodes.length) { this.plugin.clearNoteClipboard(); this.render(); new Notice("Those notes no longer exist."); return; }
     // Paste position: after the cursor row (same parent); fall back to the
@@ -7064,7 +7097,45 @@ export class StashpadView extends ItemView {
    *  deleting the original notes + their subtrees (snapshot-undoable). */
   async completeCutIntoComposer(): Promise<void> {
     const clip = this.plugin.noteClipboard;
-    if (!clip || clip.mode !== "cut" || clip.folder !== this.noteFolder) return;
+    if (!clip || clip.mode !== "cut") return;
+    if (clip.folder !== this.noteFolder) {
+      // Cross-folder cut → composer: the cut text is on the system clipboard
+      // (clip.text); insert it here, then trash the source subtree(s). This is the
+      // "fold the text into what I'm writing" path — no structural move.
+      const srcFolder = clip.folder;
+      const rootIds = clip.ids.slice();
+      this.plugin.clearNoteClipboard();
+      // Build the SAME indented bullet outline as the same-folder path (note +
+      // all children, 2-space indent per depth, optional time prefix), reading
+      // the source subtree from disk since it isn't in this view's tree.
+      const ordered = await this.plugin.orderedSubtreeNodes(srcFolder, rootIds);
+      const prefixTs = getSettings().prefixTimestampsOnCopy;
+      const outline: string[] = [];
+      for (const { file, created, depth } of ordered) {
+        try {
+          const body = this.stripFrontmatter(await this.app.vault.cachedRead(file)).trim().split(/\r?\n/).join(" ");
+          const ts = prefixTs ? `${this.formatTimeInline(created)} ` : "";
+          outline.push(`${"  ".repeat(depth)}- ${ts}${body}`);
+        } catch { /* skip unreadable */ }
+      }
+      this.insertIntoComposer(outline.length ? outline.join("\n") : (clip.text ?? ""));
+      // Snapshot the source BEFORE trashing so undo can restore it.
+      const snapPaths = await this.plugin.subtreeFilePaths(srcFolder, rootIds);
+      const snap = await this.plugin.snapshotPaths(snapPaths);
+      const trashed = await this.plugin.trashSubtrees(srcFolder, rootIds);
+      this.plugin.refreshOpenViewsForFolder(srcFolder);
+      const noteN = trashed.filter((f) => f.extension === "md").length;
+      this.plugin.getUndoStack(srcFolder).push({
+        label: `Cut ${rootIds.length} note${rootIds.length === 1 ? "" : "s"} into composer (from ${srcFolder.split("/").pop()})`,
+        undo: async () => { await this.plugin.restoreSnapshot(snap); this.plugin.refreshOpenViewsForFolder(srcFolder); },
+        redo: async () => { await this.plugin.trashSubtrees(srcFolder, rootIds); this.plugin.refreshOpenViewsForFolder(srcFolder); },
+      });
+      this.plugin.notifications.show({
+        message: `Pasted the text of ${rootIds.length} cut note${rootIds.length === 1 ? "" : "s"} from "${srcFolder.split("/").pop()}" into the composer and removed the original${noteN === 1 ? "" : "s"} (${noteN} note${noteN === 1 ? "" : "s"}). Undo restores them.`,
+        kind: "warning", category: "delete", affectedIds: rootIds, folder: srcFolder, duration: 0,
+      });
+      return;
+    }
     this.plugin.clearNoteClipboard();
     const roots = clip.ids.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
     if (!roots.length) return;
