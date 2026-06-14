@@ -110,4 +110,3 @@ folder knows how Stashpad's `okf*` fields map to OKF's standard keys.
 - **Bundle** — a folder of concepts + `index.md`, optionally zipped/tarred.
 - **`index.md`** — the per-folder table of contents OKF expects (Stashpad generates it).
 - **Rebuild** — Stashpad's pass that (re)writes the OKF fields + `index.md`.
-</content>

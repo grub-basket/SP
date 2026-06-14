@@ -5,24 +5,31 @@ the bottom, your notes stack and nest, and you drill in and out of the tree, wit
 optional **Open Knowledge Format (OKF)** export so your notes can be shared with
 LLMs and agents.
 
+<!-- TODO: add a screenshot or short GIF here — e.g. ![Stashpad](docs/screenshot.png).
+     A README with a visual converts far better than one without. -->
+
 > ⚠️ **Alpha software.** Stashpad does a lot and is usable daily, but it's young.
 > Keep backups of anything important.
-
-> **On how this was made:** the project was designed and directed by its maintainer,
-> but the code was written by an AI assistant. That's stated plainly here so no one
-> assumes hand-authored, human-reviewed code.
-
-## A tribute
-
-Stashpad is a homage to **Stashpad Notes**, a lovely app discontinued in 2024. This
-plugin exists to bring its chat-style, jot-it-down feeling into Obsidian. Sincere
-thanks to its founders, **Cara and Theo**, for the original that inspired it.
+>
+> The project was designed and directed by its maintainer, but the **code was
+> written by an AI assistant** — it is not hand-authored or human-reviewed.
 
 ## Install (via BRAT)
 
 1. Install the **BRAT** community plugin in Obsidian.
-2. In BRAT, "Add beta plugin" with this repository: `https://github.com/grub-basket/SP`
+2. In BRAT, choose "Add beta plugin" and paste: `https://github.com/grub-basket/SP`
 3. Enable **Stashpad** in Community Plugins.
+
+## Quick start
+
+1. Open the command palette and run **"Reveal or open Stashpad"** (or click the
+   ribbon icon). The first run creates a `Stashpad` folder.
+2. **Type in the composer at the bottom and press Enter** to capture a note. It
+   appears in the list above.
+3. **Click a note (or press →)** to drill into it; new notes you add now nest under
+   it. Press **←** or the back arrow to come back out.
+4. Explore from there: search, move/clone, set colors, pin, make tasks, or turn on
+   OKF (below) to export.
 
 ## What it does
 
@@ -76,7 +83,12 @@ encrypted trash, and shared-key collaboration.
 
 Bug reports and "this felt weird" notes are very welcome via the repo's Issues.
 
+## Credits & thanks
+
+Stashpad is a homage to **Stashpad Notes**, a lovely app discontinued in 2024. This
+plugin brings its chat-style, jot-it-down feeling into Obsidian. Sincere thanks to
+its founders, **Cara and Theo**, for the original that inspired it.
+
 ## License
 
-See [`LICENSE`](LICENSE).
-</content>
+[MIT](LICENSE) © grub-basket.
