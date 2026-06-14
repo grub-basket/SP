@@ -17,12 +17,9 @@
  *   stop(); // cancel without committing
  */
 
-const isMac = (() => {
-  try {
-    return typeof navigator !== "undefined"
-      && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
-  } catch { return false; }
-})();
+import { Platform } from "obsidian";
+
+const isMac = Platform.isMacOS;
 
 /** Render a chord for display in inputs / labels. Same format as the stored
  *  value, since we store the canonical form. */

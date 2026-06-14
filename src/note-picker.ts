@@ -20,8 +20,6 @@ interface ParsedQuery {
   };
 }
 
-/** Tokens we recognise as filter prefixes. */
-const FILTER_KEYS = new Set(["in", "before", "after", "on"]);
 
 /** Parse a date/timeframe string into epoch ms.
  *  Supports:

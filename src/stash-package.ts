@@ -1,5 +1,5 @@
-import JSZip from "jszip";
 import { App, TFile, parseYaml, stringifyYaml } from "obsidian";
+import { bytesToStr, unzipFiles, zipFiles, type ZipEntry } from "./zip";
 import { newId } from "./id-service";
 import { ROOT_ID, attachmentLinkPath, toAttachmentLink, type StashpadId } from "./types";
 
@@ -67,7 +67,7 @@ interface ParsedNote {
 // ---------------- Export ----------------
 
 export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8Array> {
-  const zip = new JSZip();
+  const entries: ZipEntry[] = [];
   const allNotes = dedupeById([...input.rootNotes, ...input.allDescendants]);
   const collectedAtts = new Map<string, ArrayBuffer>(); // basename -> binary
   const warnings: string[] = [];
@@ -91,11 +91,11 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
     }
     // Also normalize attachments: list in frontmatter to bare basenames.
     rewritten = rewriteFrontmatterAttachmentList(rewritten, app, n.file.path);
-    zip.file(`notes/${n.file.name}`, rewritten);
+    entries.push({ name: `notes/${n.file.name}`, data: rewritten });
   }
 
   for (const [name, buf] of collectedAtts) {
-    zip.file(`attachments/${name}`, buf);
+    entries.push({ name: `attachments/${name}`, data: buf });
   }
 
   const manifest: StashManifest = {
@@ -105,13 +105,13 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
     noteCount: allNotes.length,
     rootIds: input.rootNotes.map((n) => n.id),
   };
-  zip.file("manifest.json", JSON.stringify(manifest, null, 2));
+  entries.push({ name: "manifest.json", data: JSON.stringify(manifest, null, 2) });
 
   if (warnings.length) {
-    zip.file("warnings.txt", warnings.join("\n"));
+    entries.push({ name: "warnings.txt", data: warnings.join("\n") });
   }
 
-  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE", compressionOptions: { level: 6 } });
+  return zipFiles(entries, 6);
 }
 
 // ---------------- Import ----------------
@@ -123,10 +123,10 @@ export async function importStashZip(
   existingIds: Set<StashpadId>,
   opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null } = {},
 ): Promise<ImportSummary> {
-  const zip = await JSZip.loadAsync(buf as any);
-  const manifestFile = zip.file("manifest.json");
-  if (!manifestFile) throw new Error("Not a valid .stash package: missing manifest.json");
-  const manifest = JSON.parse(await manifestFile.async("string")) as StashManifest;
+  const zip = await unzipFiles(buf);
+  const manifestBytes = zip["manifest.json"];
+  if (!manifestBytes) throw new Error("Not a valid .stash package: missing manifest.json");
+  const manifest = JSON.parse(bytesToStr(manifestBytes)) as StashManifest;
   if (typeof manifest.stashSchema !== "number" || manifest.stashSchema > SCHEMA_VERSION) {
     throw new Error(`Unsupported .stash schema: v${manifest.stashSchema}`);
   }
@@ -134,17 +134,17 @@ export async function importStashZip(
   await ensureFolder(app, destFolder);
 
   // Read all note entries.
-  const noteEntries = Object.values(zip.files).filter(
-    (f) => !f.dir && f.name.startsWith("notes/") && f.name.endsWith(".md"),
+  const noteEntries = Object.entries(zip).filter(
+    ([name]) => name.startsWith("notes/") && name.endsWith(".md"),
   );
   const parsed: ParsedNote[] = [];
-  for (const f of noteEntries) {
-    const content = await f.async("string");
+  for (const [name, bytes] of noteEntries) {
+    const content = bytesToStr(bytes);
     const { fm, body } = splitFrontmatter(content);
     // Security: flatten to a safe single-segment name (zip-slip defense).
     // Fall back to the note id (or a generated name) if the entry name is
     // empty/traversal-only; a later collision check still de-dupes.
-    const safeName = safeZipEntryName(f.name.slice("notes/".length))
+    const safeName = safeZipEntryName(name.slice("notes/".length))
       || `${(fm.id as string) || "imported-" + newId(4)}.md`;
     parsed.push({ originalName: safeName, fm, body });
   }
@@ -171,8 +171,8 @@ export async function importStashZip(
 
   // Write attachments first so notes referencing them land on disk first.
   let attachmentsWritten = 0;
-  const attEntries = Object.values(zip.files).filter(
-    (f) => !f.dir && f.name.startsWith("attachments/"),
+  const attEntries = Object.entries(zip).filter(
+    ([name]) => name.startsWith("attachments/"),
   );
   // basename -> the path the note links should point at. We dedupe by CONTENT,
   // not just name: an existing same-named file is reused ONLY if its bytes match
@@ -194,10 +194,10 @@ export async function importStashZip(
     return true;
   };
   let folderEnsured = false;
-  for (const f of attEntries) {
-    const basename = safeZipEntryName(f.name.slice("attachments/".length));
+  for (const [name, bytes] of attEntries) {
+    const basename = safeZipEntryName(name.slice("attachments/".length));
     if (!basename) continue;  // empty or traversal attempt → skip
-    const zipBytes = new Uint8Array(await f.async("arraybuffer"));
+    const zipBytes = bytes;
     // Candidate same-named files already on disk: a vault-wide match (unlock) and
     // the default _attachments slot. Reuse the first whose CONTENT is identical.
     const candidates: string[] = [];

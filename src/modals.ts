@@ -13,7 +13,7 @@ export interface DuePickerOptions {
   /** Assignees already on the note, to pre-fill the chips. */
   currentAssignees?: AssigneeRef[];
 }
-import type { NotificationCategory, NotificationKind, NotificationRecord, NotificationService } from "./notifications";
+import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
 const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
@@ -176,7 +176,7 @@ export class LogModal extends Modal {
     try {
       const full = (this.app.vault.adapter as any).getFullPath?.(this.jsonlPath);
       if (!full) throw new Error("no full path");
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- Electron's shell is only reachable via the runtime window.require; there is no ES import for it in the Obsidian sandbox.
       const { shell } = (window as any).require("electron");
       if (kind === "reveal") shell.showItemInFolder(full);
       else shell.openPath(full);
@@ -519,9 +519,9 @@ export class SplitNoteModal extends Modal {
     const maxLines = Platform.isMobile ? 3 : 12;
     const minLines = 2;
     const fit = (): void => {
-      ta.style.height = "auto";
+      ta.setCssStyles({ height: "auto" });
       const needed = Math.min(ta.scrollHeight, lineHeight * maxLines + 16);
-      ta.style.height = `${Math.max(needed, lineHeight * minLines + 16)}px`;
+      ta.setCssStyles({ height: `${Math.max(needed, lineHeight * minLines + 16)}px` });
     };
     requestAnimationFrame(() => {
       fit();
@@ -592,7 +592,7 @@ export class ExportStashModal extends Modal {
     cbLabel.htmlFor = cb.id;
 
     const pwArea = encWrap.createDiv({ cls: "stashpad-export-pw-area" });
-    pwArea.style.display = "none";
+    pwArea.setCssStyles({ display: "none" });
     // 0.85.7: each field gets an inline button on its right; the passphrase
     // stays hidden by default (Show reveals it). 0.85.8: the button is
     // **Paste** while the field is empty (one-click drop-in from a password
@@ -685,11 +685,11 @@ export class ExportStashModal extends Modal {
     rememberNote.setText(
       "Saved only in this device's keychain — it doesn't sync to your other devices and isn't shared with anyone you send this file to. Keep the passphrase somewhere safe if you'll open this export elsewhere.",
     );
-    rememberNote.style.display = "none";
+    rememberNote.setCssStyles({ display: "none" });
     rememberCb.onchange = () => {
-      rememberNote.style.display = rememberCb.checked ? "" : "none";
+      rememberNote.setCssStyles({ display: rememberCb.checked ? "" : "none" });
     };
-    if (!secretStorage) rememberRow.style.display = "none";
+    if (!secretStorage) rememberRow.setCssStyles({ display: "none" });
 
     // 0.84.13: encrypted exports get an "-encrypted" tag in the filename so
     // secure bundles are identifiable at a glance. The preview reflects it live
@@ -719,7 +719,7 @@ export class ExportStashModal extends Modal {
 
     const refresh = () => {
       const enc = cb.checked;
-      pwArea.style.display = enc ? "" : "none";
+      pwArea.setCssStyles({ display: enc ? "" : "none" });
       let ok = true;
       if (enc) {
         if (!pw1.value) { hint.setText("Enter a password to encrypt this export."); hint.removeClass("is-error"); ok = false; }
@@ -1007,13 +1007,13 @@ export class EncryptionPasswordModal extends Modal {
       lbl.htmlFor = rememberCb.id;
       const note = this.contentEl.createDiv({ cls: "stashpad-export-remember-note" });
       note.setText("Stored only in this device's keychain — doesn't sync to your other devices. Anyone with access to this unlocked device + keychain could decrypt.");
-      note.style.display = "none";
-      rememberCb.onchange = () => { note.style.display = rememberCb!.checked ? "" : "none"; };
+      note.setCssStyles({ display: "none" });
+      rememberCb.onchange = () => { note.setCssStyles({ display: rememberCb!.checked ? "" : "none" }); };
     }
 
     const errEl = this.contentEl.createEl("div", { cls: "stashpad-export-error" });
-    errEl.style.display = "none";
-    const showErr = (m: string) => { errEl.setText(m); errEl.style.display = ""; };
+    errEl.setCssStyles({ display: "none" });
+    const showErr = (m: string) => { errEl.setText(m); errEl.setCssStyles({ display: "" }); };
 
     const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
     footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
@@ -1033,7 +1033,7 @@ export class EncryptionPasswordModal extends Modal {
         if (next.length < 6) { showErr("Use at least 6 characters."); return; }
         if (next !== confirmEl?.value) { showErr("Passwords don't match."); return; }
       }
-      busy = true; go.disabled = true; errEl.style.display = "none";
+      busy = true; go.disabled = true; errEl.setCssStyles({ display: "none" });
       const prevLabel = go.textContent;
       go.setText("Working…");
       try {
@@ -1089,7 +1089,7 @@ export class TypeToConfirmModal extends Modal {
     input.placeholder = this.opts.phrase;
 
     const errEl = this.contentEl.createEl("div", { cls: "stashpad-export-error" });
-    errEl.style.display = "none";
+    errEl.setCssStyles({ display: "none" });
 
     const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
     footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
@@ -1107,9 +1107,9 @@ export class TypeToConfirmModal extends Modal {
     const run = async () => {
       if (busy || !phraseOk()) return;
       if (this.opts.requirePassword) {
-        busy = true; go.disabled = true; errEl.style.display = "none";
+        busy = true; go.disabled = true; errEl.setCssStyles({ display: "none" });
         const ok = await this.opts.requirePassword(pwInput!.value);
-        if (!ok) { errEl.setText("Wrong password."); errEl.style.display = ""; busy = false; sync(); return; }
+        if (!ok) { errEl.setText("Wrong password."); errEl.setCssStyles({ display: "" }); busy = false; sync(); return; }
       }
       this.close();
       await this.opts.onConfirm();
@@ -1436,7 +1436,7 @@ export function buildAssigneePicker(
     attr: { placeholder: "Add a person — type a name…" },
   }) as HTMLInputElement;
   const sugg = inputWrap.createDiv({ cls: "stashpad-assign-suggest" });
-  sugg.style.display = "none";
+  sugg.setCssStyles({ display: "none" });
 
   const commit = () => opts.onChange([...assignees]);
   const renderChips = (): void => {
@@ -1453,7 +1453,7 @@ export function buildAssigneePicker(
   const addAssignee = (a: AssigneeRef): void => {
     if (!a.name.trim()) return;
     if (!assignees.some((p) => p.id === a.id)) assignees.push(a);
-    input.value = ""; sugg.style.display = "none"; commit(); renderChips(); input.focus();
+    input.value = ""; sugg.setCssStyles({ display: "none" }); commit(); renderChips(); input.focus();
   };
   const refresh = (): void => {
     const q = input.value.trim();
@@ -1466,8 +1466,8 @@ export function buildAssigneePicker(
     if (q && !known.some((a) => a.name.toLowerCase() === q.toLowerCase())) {
       rows.push({ label: `Create “${q}”`, onPick: () => addAssignee({ id: newId(6), name: q }) });
     }
-    if (rows.length === 0) { sugg.style.display = "none"; return; }
-    sugg.style.display = "";
+    if (rows.length === 0) { sugg.setCssStyles({ display: "none" }); return; }
+    sugg.setCssStyles({ display: "" });
     for (const r of rows) {
       const item = sugg.createDiv({ cls: "stashpad-assign-suggest-item", text: r.label });
       item.onmousedown = (e) => { e.preventDefault(); r.onPick(); };
@@ -1481,10 +1481,10 @@ export function buildAssigneePicker(
       const first = sugg.querySelector(".stashpad-assign-suggest-item") as HTMLElement | null;
       if (first) first.dispatchEvent(new MouseEvent("mousedown"));
     } else if (e.key === "Escape" && sugg.style.display !== "none") {
-      e.stopPropagation(); sugg.style.display = "none";
+      e.stopPropagation(); sugg.setCssStyles({ display: "none" });
     }
   });
-  input.addEventListener("blur", () => { window.setTimeout(() => { sugg.style.display = "none"; }, 120); });
+  input.addEventListener("blur", () => { window.setTimeout(() => { sugg.setCssStyles({ display: "none" }); }, 120); });
   renderChips();
 }
 
@@ -1675,9 +1675,8 @@ export class DueDatePickerModal extends Modal {
     const seedH = h24 === 0 ? 12 : (h24 > 12 ? h24 - 12 : h24);
 
     const pop = document.body.createDiv({ cls: "stashpad-when-popover stashpad-due-time-pop" });
-    pop.style.position = "fixed";
     // Above the modal (Obsidian modals sit ~var(--layer-modal)).
-    pop.style.zIndex = "9999";
+    pop.setCssStyles({ position: "fixed", zIndex: "9999" });
 
     let onEnter: (() => void) | null = null;
     const close = (): void => {
@@ -1705,8 +1704,10 @@ export class DueDatePickerModal extends Modal {
     });
 
     const rect = anchor.getBoundingClientRect();
-    pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 220))}px`;
-    pop.style.top = `${rect.bottom + 4}px`;
+    pop.setCssStyles({
+      left: `${Math.max(8, Math.min(rect.left, window.innerWidth - 220))}px`,
+      top: `${rect.bottom + 4}px`,
+    });
     setTimeout(() => {
       document.addEventListener("mousedown", outside, true);
       document.addEventListener("keydown", onKey, true);

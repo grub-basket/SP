@@ -63,7 +63,7 @@ export class StashpadFolderPanelView extends ItemView {
 
     // --- bottom: folders (takes the rest; kept low for thumb reach on mobile) ---
     const folderSection = root.createDiv({ cls: "stashpad-folderpanel-section stashpad-folderpanel-folders" });
-    folderSection.style.flex = "1 1 0";
+    folderSection.setCssStyles({ flex: "1 1 0" });
     // 0.98.37: the "Folders" heading is itself the folder-switcher button, with a
     // dedicated encrypted-trash button beside it.
     const head = folderSection.createDiv({ cls: "stashpad-folderpanel-heading stashpad-folderpanel-heading-row" });
@@ -506,10 +506,10 @@ export class StashpadFolderPanelView extends ItemView {
     setIcon(caret, "chevron-right");
     header.createSpan({ cls: "stashpad-folderpanel-hidden-title", text: `Hidden (${hidden.length})` });
     const body = wrap.createDiv({ cls: "stashpad-folderpanel-hidden-body" });
-    body.style.display = "none";
+    body.setCssStyles({ display: "none" });
     header.onclick = () => {
       const showing = body.style.display !== "none";
-      body.style.display = showing ? "none" : "";
+      body.setCssStyles({ display: showing ? "none" : "" });
       setIcon(caret, showing ? "chevron-right" : "chevron-down");
     };
     for (const folder of hidden) {

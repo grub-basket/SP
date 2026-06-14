@@ -1,4 +1,4 @@
-import { App, Notice, Platform, PluginSettingTab, Setting, SettingPage, TFile, setIcon, type SettingDefinitionItem } from "obsidian";
+import { App, Notice, Platform, PluginSettingTab, Setting, SettingPage, setIcon, type SettingDefinitionItem } from "obsidian";
 
 /** Platform-correct OS file-manager name for button/notice labels. */
 function osFileManagerName(): string {
@@ -8,7 +8,7 @@ import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmM
 import { FolderSuggest } from "./folder-suggest";
 import type StashpadPlugin from "./main";
 import { RESERVED_FRONTMATTER, type ViewMode } from "./types";
-import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal } from "./modals";
+import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal } from "./modals";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
 import { DEFAULT_STOPWORDS } from "./slug-service";
@@ -631,7 +631,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     for (const t of SETTINGS_TABS) {
-      containerEl.createEl("h2", { text: t.label });
+      new Setting(containerEl).setName(t.label).setHeading();
       const items = this.itemsForTab(t.id);
       if (items) {
         for (const it of items as any[]) {
@@ -956,7 +956,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         t.setValue(initial);
         textarea = (t as any).inputEl as HTMLTextAreaElement;
         textarea.rows = 6;
-        textarea.style.fontFamily = "var(--font-monospace)";
+        textarea.setCssStyles({ fontFamily: "var(--font-monospace)" });
         t.onChange(async (v) => {
           this.plugin.settings.slugStopWords = (v || "").split(/\r?\n/).map((x) => x.trim().toLowerCase()).filter(Boolean);
           await set();
@@ -1330,8 +1330,8 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  recorded inside the index itself so the user can see what didn't
    *  match. */
   private renderJdIndexSection(containerEl: HTMLElement): void {
-    const header = containerEl.createEl("h3", { text: "JD Index Builder" });
-    header.id = "stashpad-jd-index-section";
+    const header = new Setting(containerEl).setName("JD Index Builder").setHeading();
+    header.settingEl.id = "stashpad-jd-index-section";
     const blurb = containerEl.createEl("p", { cls: "setting-item-description" });
     blurb.innerHTML =
       'Builds a Johnny-Decimal-style index inside a designated Stashpad folder. Two commands:' +
@@ -1799,7 +1799,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
 
   private renderAuthorshipSection(parent: HTMLElement): void {
-    parent.createEl("h3", { text: "Authorship" });
+    new Setting(parent).setName("Authorship").setHeading();
     parent.createEl("p", {
       cls: "setting-item-description",
       text: "Stamp each new note with your name. If the vault is later shared (e.g. a coworker opens it with --config pointing at their own settings folder), every modification automatically tracks contributors on top of the original author. Names link to per-user pages in <stashpad>/_authors/.",
@@ -1876,7 +1876,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     // Stashpad tab via the per-leaf folderOverride mechanism.
     const folders = this.plugin.collectAuthoredFolders();
     if (folders.length > 0) {
-      parent.createEl("h4", { text: "Folders you've worked in" });
+      new Setting(parent).setName("Folders you've worked in").setHeading();
       const list = parent.createDiv({ cls: "stashpad-authored-folders-list" });
       for (const f of folders) {
         const row = list.createDiv({ cls: "stashpad-authored-folder-row" });
@@ -1898,7 +1898,7 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  The registry is NOT authoritative (the id baked into note frontmatter
    *  is); this is recovery + an audit trail. */
   private renderKnownAuthorsSection(parent: HTMLElement): void {
-    parent.createEl("h4", { text: "Known authors (registry)" });
+    new Setting(parent).setName("Known authors (registry)").setHeading();
     parent.createEl("div", {
       cls: "setting-item-description",
       text: "A rebuildable cache of every author Stashpad has seen, with rename history. Not a source of truth — the author id stored in each note is authoritative. Use it to recover deleted author pages or audit name changes.",
@@ -1984,7 +1984,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       // file list rather than AbstractInputSuggest so this works on every
       // Obsidian version that ships with the plugin.
       const sugg = inputWrap.createDiv({ cls: "stashpad-note-template-suggest" });
-      sugg.style.display = "none";
+      sugg.setCssStyles({ display: "none" });
       let currentMatches: string[] = [];
       let itemEls: HTMLElement[] = [];
       let activeIdx = -1;
@@ -1994,14 +1994,14 @@ export class StashpadSettingTab extends PluginSettingTab {
         itemEls.forEach((el, idx) => el.toggleClass("is-active", idx === i));
         if (i >= 0 && itemEls[i]) itemEls[i].scrollIntoView({ block: "nearest" });
       };
-      const closeSugg = (): void => { sugg.style.display = "none"; activeIdx = -1; };
+      const closeSugg = (): void => { sugg.setCssStyles({ display: "none" }); activeIdx = -1; };
       const choose = async (m: string): Promise<void> => { input.value = m; await save(); closeSugg(); };
 
       // Inline warning area — surfaces overlap with Stashpad's
       // auto-managed frontmatter so the user can fix the template before
       // it produces surprising notes.
       const warn = row.createDiv({ cls: "stashpad-note-template-warn" });
-      warn.style.display = "none";
+      warn.setCssStyles({ display: "none" });
 
       const allMd = (): string[] =>
         this.app.vault.getMarkdownFiles()
@@ -2023,7 +2023,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         };
         currentMatches = allMd().filter((p) => sift(p)).slice(0, 12);
         if (currentMatches.length === 0) { closeSugg(); return; }
-        sugg.style.display = "";
+        sugg.setCssStyles({ display: "" });
         currentMatches.forEach((m, idx) => {
           const item = sugg.createDiv({ cls: "stashpad-note-template-suggest-item", text: m });
           itemEls.push(item);
@@ -2052,14 +2052,14 @@ export class StashpadSettingTab extends PluginSettingTab {
       // probably be surprised when those values vanish from new notes.
       const validateTemplate = (): void => {
         warn.empty();
-        warn.style.display = "none";
+        warn.setCssStyles({ display: "none" });
         const path = input.value.trim();
         if (!path) return;
         // Wrap in a microtask to give the metadataCache a beat to catch
         // up if the user just typed in a path.
         const tplFile = this.app.vault.getAbstractFileByPath(path);
         if (!tplFile || (tplFile as any).extension !== "md") {
-          warn.style.display = "";
+          warn.setCssStyles({ display: "" });
           warn.setText(`⚠ "${path}" is not a markdown file in this vault.`);
           return;
         }
@@ -2073,7 +2073,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           return true;
         });
         if (conflicts.length === 0) return;
-        warn.style.display = "";
+        warn.setCssStyles({ display: "" });
         warn.setText(
           `⚠ Template defines ${conflicts.join(", ")} — Stashpad always sets ${conflicts.length === 1 ? "this" : "these"} on new notes, so the template value${conflicts.length === 1 ? "" : "s"} will be ignored.`,
         );
@@ -2143,7 +2143,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     if (count === 0) row.addClass("is-unused");
 
     const swatch = row.createSpan({ cls: "stashpad-color-alias-swatch" });
-    swatch.style.background = hex;
+    swatch.setCssStyles({ background: hex });
     swatch.title = "Click to bulk-recolor every note of this color in this Stashpad";
     swatch.onclick = () => {
       const palette = this.plugin.settings.customPalette ?? [];
@@ -2210,13 +2210,13 @@ export class StashpadSettingTab extends PluginSettingTab {
       text: "×",
       attr: { title: "Delete alias" },
     });
-    if (!input.value) del.style.visibility = "hidden";
+    if (!input.value) del.setCssStyles({ visibility: "hidden" });
     del.onclick = async () => {
       await this.plugin.setColorAlias(folder, hex, "");
       // If the row was unused AND we just removed its alias, the row
       // has no reason to exist anymore — refresh to drop it.
       if (count === 0) refresh();
-      else { input.value = ""; del.style.visibility = "hidden"; }
+      else { input.value = ""; del.setCssStyles({ visibility: "hidden" }); }
     };
   }
 

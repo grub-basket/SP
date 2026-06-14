@@ -11,7 +11,7 @@ import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncry
 import { EncryptionPasswordModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
-  buildDefaultBindings, COMMAND_META, type CommandBindingMap, type CommandId,
+  buildDefaultBindings, COMMAND_META, type CommandBindingMap,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";

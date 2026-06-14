@@ -5,9 +5,6 @@ the bottom, your notes stack and nest, and you drill in and out of the tree, wit
 optional **Open Knowledge Format (OKF)** export so your notes can be shared with
 LLMs and agents.
 
-<!-- TODO: add a screenshot or short GIF here — e.g. ![Stashpad](docs/screenshot.png).
-     A README with a visual converts far better than one without. -->
-
 > ⚠️ **Alpha software.** Stashpad does a lot and is usable daily, but it's young.
 > Keep backups of anything important.
 >

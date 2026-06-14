@@ -1,3 +1,25 @@
+/* ───────────────────────────────────────────────────────────────────────
+   Deliberate CSS-lint exceptions (Obsidian community-plugin review)
+
+   The plugin-store CSS linter raises a few advisory WARNINGS (not errors).
+   Each is intentional; documented here so future edits don't "fix" them blindly:
+
+   • !important — used only to override Obsidian's OWN built-in rules: hiding
+     view-header / tab-header / nav-buttons chrome for Stashpad leaves, and the
+     compact-confirm-modal sizing. These beat Obsidian's base styles on purpose.
+   • :has() — `.workspace-leaf:has(> [data-type=stashpad-view])` (chrome-hide
+     fallback for DOM variants the plain descendant selector can miss) and
+     `.is-mobile:has(.stashpad-composer-input:focus)` (the obvious alternative,
+     :focus-within, caught unrelated focus shifts and hid the composer — see the
+     comment at that rule). Both are narrowly scoped (per-leaf / mobile-only).
+   • display: contents — desktop-only; dissolves the composer button-group
+     wrapper so its buttons sit flat in the rail's flex. A nested flex would
+     cluster them instead. Fully supported in Obsidian's Electron; the linter's
+     "partial in 1.6.5" is a fixed baseline and our minAppVersion is 1.7.0.
+
+   The one false positive (grid `column-gap` flagged as "multicolumn") was real
+   to fix and is folded into the `gap` shorthand below.
+   ─────────────────────────────────────────────────────────────────────── */
 .stashpad-scroll-host {
   overflow: hidden !important;
   position: relative !important;
@@ -468,8 +490,9 @@
 .stashpad-view-popover-toggle {
   display: grid;
   grid-template-columns: auto 1fr;
-  column-gap: 8px;
-  row-gap: 2px;
+  /* grid row/column gap (NOT multicolumn) — combined shorthand to avoid
+     the CSS linter's column-gap → multicolumn false positive. */
+  gap: 2px 8px;
   align-items: center;
   padding: 8px 12px;
 }

@@ -554,18 +554,15 @@ export function buildJdPreviewNotice(
   const frag = document.createDocumentFragment();
   // Heading-style title row.
   const title = frag.createEl("div", { text: "Home note updated" });
-  title.style.fontWeight = "600";
-  title.style.marginBottom = "6px";
+  title.setCssStyles({ fontWeight: "600", marginBottom: "6px" });
   // Bulleted summary.
   const ul = frag.createEl("ul");
-  ul.style.margin = "0 0 8px 0";
-  ul.style.paddingLeft = "18px";
+  ul.setCssStyles({ margin: "0 0 8px 0", paddingLeft: "18px" });
   ul.createEl("li", { text: `${result.indexed.length} indexed` });
   ul.createEl("li", { text: `${result.nonIndex.length + result.skippedStashpadNotes.length} excluded` });
   // Small Open button.
   const openBtn = frag.createEl("button", { text: "Open", cls: "mod-cta" });
-  openBtn.style.padding = "2px 10px";
-  openBtn.style.fontSize = "var(--font-ui-smaller)";
+  openBtn.setCssStyles({ padding: "2px 10px", fontSize: "var(--font-ui-smaller)" });
   let notice: Notice;
   openBtn.onclick = async (ev) => {
     ev.stopPropagation();

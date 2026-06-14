@@ -2,6 +2,7 @@ import { App, TFile } from "obsidian";
 import { buildStashZip, importStashZip, splitFrontmatter, resolveNoteAttachmentFiles } from "./stash-package";
 import { encryptWithKey, decryptWithKey, isEncryptedStash } from "./stash-crypto";
 import { type StashpadId } from "./types";
+import { unzipFiles, zipFiles } from "./zip";
 
 /** In-vault locked-bundle extension (NOT `.stash` — `.stash` is an export to
  *  import; `.stashenc` is locked-in-place and must never auto-import). */
@@ -454,15 +455,14 @@ export async function backfillTrashEncrypt(
   const files = await listFilesRecursive(app, OBSIDIAN_TRASH_DIR);
   if (files.length === 0) return null;
 
-  const { default: JSZip } = await import("jszip");
-  const zip = new JSZip();
+  const zipEntries: { name: string; data: ArrayBuffer }[] = [];
   const mtimes = new Map<string, number>();
   for (const path of files) {
     const rel = path.slice(OBSIDIAN_TRASH_DIR.length + 1);
-    zip.file(`files/${rel}`, await app.vault.adapter.readBinary(path));
+    zipEntries.push({ name: `files/${rel}`, data: await app.vault.adapter.readBinary(path) });
     try { const st = await app.vault.adapter.stat(path); if (st) mtimes.set(path, st.mtime); } catch { /* no baseline */ }
   }
-  const zipBytes = new Uint8Array(await zip.generateAsync({ type: "arraybuffer" }));
+  const zipBytes = await zipFiles(zipEntries);
   const blob = await encryptWithKey(zipBytes, dek);
   const back = await decryptWithKey(blob, dek);
   if (back.length !== zipBytes.length) throw new Error("Encryption self-check failed (size).");
@@ -504,11 +504,10 @@ export async function restoreRawTrash(app: App, blobPath: string, dek: Uint8Arra
   const blob = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
   if (!isEncryptedStash(blob)) throw new Error("Not an encrypted bundle.");
   const zipBytes = await decryptWithKey(blob, dek);
-  const { default: JSZip } = await import("jszip");
-  const zip = await JSZip.loadAsync(zipBytes);
+  const zip = await unzipFiles(zipBytes);
   let written = 0;
-  for (const [name, entry] of Object.entries(zip.files)) {
-    if (entry.dir || !name.startsWith("files/")) continue;
+  for (const [name, entry] of Object.entries(zip)) {
+    if (!name.startsWith("files/")) continue;
     const rel = safeTrashRelPath(name.slice("files/".length));
     if (!rel) { console.warn("[Stashpad] skipped unsafe trash entry", name); continue; }
     const dir = `${OBSIDIAN_TRASH_DIR}/${rel}`.split("/").slice(0, -1).join("/");
@@ -521,7 +520,7 @@ export async function restoreRawTrash(app: App, blobPath: string, dek: Uint8Arra
     for (let n = 1; await app.vault.adapter.exists(dest); n++) {
       dest = `${OBSIDIAN_TRASH_DIR}/${rel.replace(/(\.[^./]*)?$/, ` (${n})$1`)}`;
     }
-    await app.vault.adapter.writeBinary(dest, await entry.async("arraybuffer"));
+    await app.vault.adapter.writeBinary(dest, entry.buffer as ArrayBuffer);
     written++;
   }
   await app.vault.adapter.remove(blobPath);

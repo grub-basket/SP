@@ -7,9 +7,9 @@ import { okfTitleFromFile, buildOkfIndex, OKF_LEGEND } from "./okf";
  *  (`type`/`title`/`description`/`tags`/`timestamp`) mapped from our `okf*` fields,
  *  while KEEPING `id`/`okf*` redundantly so the bundle re-imports into Stashpad
  *  losslessly — plus a scope-adjusted `index.md`, a `_okf.md` legend, and the
- *  referenced attachments. Packaged as .zip and/or .tar.gz (no new dependency:
- *  JSZip for zip, a tiny tar writer + the platform `CompressionStream` for
- *  .tar.gz). The Stashpad-native `.stash` remains a separate option. */
+ *  referenced attachments. Packaged as .zip and/or .tar.gz (fflate for zip,
+ *  a tiny tar writer + the platform `CompressionStream` for .tar.gz). The
+ *  Stashpad-native `.stash` remains a separate option. */
 
 export interface BundleFile { name: string; data: Uint8Array; }
 
@@ -67,12 +67,10 @@ export async function buildOkfBundleFiles(
   return out;
 }
 
-/** Zip the bundle (JSZip, already a dependency). */
+/** Zip the bundle (fflate, dependency-free). */
 export async function zipBundle(files: BundleFile[]): Promise<Uint8Array> {
-  const { default: JSZip } = await import("jszip");
-  const zip = new JSZip();
-  for (const f of files) zip.file(f.name, f.data);
-  return zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+  const { zipFiles } = await import("./zip");
+  return zipFiles(files.map((f) => ({ name: f.name, data: f.data })));
 }
 
 // ---- minimal tar (ustar) + gzip, no dependency ----

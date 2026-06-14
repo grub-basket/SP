@@ -1,4 +1,4 @@
-import { TFile, TFolder, type App, type CachedMetadata } from "obsidian";
+import { TFile, TFolder, type App } from "obsidian";
 import { ROOT_ID, RESERVED_SUBFOLDER_NAMES, isInReservedSubfolder, type StashpadId, type TreeNode } from "./types";
 
 /** Walk a Stashpad folder's TFolder subtree and return every .md file under

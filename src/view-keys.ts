@@ -28,7 +28,7 @@ export function matchBinding(e: KeyboardEvent, b?: { primary: string; secondary:
 
 export function humanCombo(combo: string): string {
   if (!combo) return "";
-  const isMac = (Platform as any).isMacOS ?? (navigator.platform.toLowerCase().includes("mac"));
+  const isMac = Platform.isMacOS;
   return combo
     .split("+")
     .map((p) => {
@@ -53,7 +53,7 @@ export function matchMod(e: KeyboardEvent, combo: string): boolean {
   const wantCmd = mods.has("cmd") || mods.has("meta") || mods.has("command");
   const wantAlt = mods.has("alt") || mods.has("option");
   const wantShift = mods.has("shift");
-  const isMac = (Platform as any).isMacOS ?? (navigator.platform.toLowerCase().includes("mac"));
+  const isMac = Platform.isMacOS;
   const modPressed = isMac ? e.metaKey : e.ctrlKey;
   if (wantMod && !modPressed) return false;
   if (wantCtrl && !e.ctrlKey) return false;

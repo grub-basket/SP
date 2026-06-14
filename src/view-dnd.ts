@@ -37,7 +37,7 @@ export class ViewDnD {
       // Pre-create the placeholder once per drag (kept detached until first dragover).
       if (this.host.listEl) {
         this.dragPlaceholder = this.host.listEl.createDiv({ cls: "stashpad-drop-placeholder" });
-        this.dragPlaceholder.style.height = "0px";
+        this.dragPlaceholder.setCssStyles({ height: "0px" });
         // Make the placeholder a valid drop target so dropping in the gap actually
         // fires a drop event (without this it'd be inert and the drop would be lost).
         this.dragPlaceholder.addEventListener("dragover", (de: DragEvent) => {
@@ -181,15 +181,15 @@ export class ViewDnD {
     this.host.listEl.insertBefore(this.dragPlaceholder, sibling);
     // Always restore visibility — drop-into → drop-above transitions had been
     // leaving the placeholder at opacity 0 / height 0 from a previous animated remove.
-    this.dragPlaceholder.style.opacity = "1";
+    this.dragPlaceholder.setCssStyles({ opacity: "1" });
     if (!wasMounted) {
-      this.dragPlaceholder.style.height = "0px";
+      this.dragPlaceholder.setCssStyles({ height: "0px" });
       // Force layout, then animate to full height.
-      // eslint-disable-next-line @typescript-eslint/no-unused-expressions
+      // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reading offsetHeight is an intentional synchronous reflow so the height transition animates from 0.
       this.dragPlaceholder.offsetHeight;
-      this.dragPlaceholder.style.height = `${this.dragRowHeight}px`;
+      this.dragPlaceholder.setCssStyles({ height: `${this.dragRowHeight}px` });
     } else {
-      this.dragPlaceholder.style.height = `${this.dragRowHeight}px`;
+      this.dragPlaceholder.setCssStyles({ height: `${this.dragRowHeight}px` });
     }
   }
 
@@ -198,8 +198,7 @@ export class ViewDnD {
     const ph = this.dragPlaceholder;
     // Animate collapse, then remove. Keep a reference so a fast next-drag isn't
     // confused (we null out below regardless).
-    ph.style.height = "0px";
-    ph.style.opacity = "0";
+    ph.setCssStyles({ height: "0px", opacity: "0" });
     setTimeout(() => { if (ph.parentElement) ph.remove(); }, 150);
   }
 

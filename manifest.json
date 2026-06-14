@@ -1,9 +1,9 @@
 {
   "id": "stashpad",
   "name": "Stashpad",
-  "version": "0.102.12",
+  "version": "0.102.16",
   "minAppVersion": "1.7.0",
-  "description": "Chat-style nested-notes view: rapid capture, outliner navigation, in-place editing.",
+  "description": "A chat-style, nested-notes workspace: rapid capture, outliner navigation, in-place editing, fast search, tasks, and per-folder templates, with one-click Open Knowledge Format (OKF) export so your notes are readable by LLMs and agents.",
   "author": "Human",
   "isDesktopOnly": false
 }

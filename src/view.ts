@@ -11,7 +11,7 @@ import { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
 import { formatDateTime } from "./format";
 import { OrderStore } from "./order-store";
-import { SortStore, type SortMode, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
+import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { buildFileActions } from "./notifications";
 import { newId } from "./id-service";
@@ -31,7 +31,7 @@ import { NoteBodyRenderer } from "./note-body-renderer";
 import { computeSortedIds } from "./view-sort";
 import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
-import { setIconSafe, isAnyModalOpen, extractCodeBlocks, properCaseFolderPath, computeReorder, arraysEqual } from "./view-helpers";
+import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -2777,7 +2777,7 @@ export class StashpadView extends ItemView {
       const label = btn.createSpan({ cls: "stashpad-color-filter-label" });
       if (this.colorFilter) {
         const hex = this.colorFilter.toLowerCase();
-        swatch.style.background = hex;
+        swatch.setCssStyles({ background: hex });
         // Show alias if the user set one for this Stashpad; fall back
         // to the hex code when no alias exists.
         const alias = this.plugin.getColorAlias(this.noteFolder, hex);
@@ -2825,12 +2825,14 @@ export class StashpadView extends ItemView {
 
     const pop = doc.body.createDiv({ cls: "stashpad-color-filter-popover" });
     const r = anchor.getBoundingClientRect();
-    pop.style.left = `${Math.max(8, r.left)}px`;
-    pop.style.top = `${r.bottom + 4}px`;
     // Size to content; cap so very long aliases don't run off-screen.
-    pop.style.minWidth = `${r.width}px`;
-    pop.style.maxWidth = "min(280px, calc(100vw - 16px))";
-    pop.style.width = "max-content";
+    pop.setCssStyles({
+      left: `${Math.max(8, r.left)}px`,
+      top: `${r.bottom + 4}px`,
+      minWidth: `${r.width}px`,
+      maxWidth: "min(280px, calc(100vw - 16px))",
+      width: "max-content",
+    });
 
     // 0.69.13: `close` was being referenced before its `const close =`
     // declaration (TDZ ReferenceError) — populateColorMenuBody and the
@@ -2923,11 +2925,13 @@ export class StashpadView extends ItemView {
 
     const pop = doc.body.createDiv({ cls: "stashpad-sort-popover" });
     const r = anchor.getBoundingClientRect();
-    pop.style.left = `${Math.max(8, r.left)}px`;
-    pop.style.top = `${r.bottom + 4}px`;
-    pop.style.minWidth = `${r.width}px`;
-    pop.style.maxWidth = "min(280px, calc(100vw - 16px))";
-    pop.style.width = "max-content";
+    pop.setCssStyles({
+      left: `${Math.max(8, r.left)}px`,
+      top: `${r.bottom + 4}px`,
+      minWidth: `${r.width}px`,
+      maxWidth: "min(280px, calc(100vw - 16px))",
+      width: "max-content",
+    });
 
     const close = (): void => {
       pop.remove();
@@ -3003,14 +3007,16 @@ export class StashpadView extends ItemView {
     // instead of off the right side of the screen. Min 8px gutter
     // from the viewport right edge as a safety margin if the button
     // is itself off-screen for any reason.
-    pop.style.right = `${Math.max(8, win.innerWidth - r.right)}px`;
-    pop.style.left = "auto";
-    pop.style.top = `${r.bottom + 4}px`;
-    // Wider than the per-button popovers so accordion section headers +
-    // option rows have room to breathe. Capped to viewport width.
-    pop.style.maxWidth = "min(360px, calc(100vw - 16px))";
-    pop.style.width = "max-content";
-    pop.style.minWidth = "260px";
+    pop.setCssStyles({
+      right: `${Math.max(8, win.innerWidth - r.right)}px`,
+      left: "auto",
+      top: `${r.bottom + 4}px`,
+      // Wider than the per-button popovers so accordion section headers +
+      // option rows have room to breathe. Capped to viewport width.
+      maxWidth: "min(360px, calc(100vw - 16px))",
+      width: "max-content",
+      minWidth: "260px",
+    });
 
     const close = (): void => {
       pop.remove();
@@ -3153,11 +3159,13 @@ export class StashpadView extends ItemView {
     // on mobile for a compact layout.
     if (Platform.isMobile) pop.addClass("is-mobile");
     const r = anchor.getBoundingClientRect();
-    pop.style.left = `${Math.max(8, r.left)}px`;
-    pop.style.top = `${r.bottom + 4}px`;
-    pop.style.minWidth = `${r.width}px`;
-    pop.style.maxWidth = "min(320px, calc(100vw - 16px))";
-    pop.style.width = "max-content";
+    pop.setCssStyles({
+      left: `${Math.max(8, r.left)}px`,
+      top: `${r.bottom + 4}px`,
+      minWidth: `${r.width}px`,
+      maxWidth: "min(320px, calc(100vw - 16px))",
+      width: "max-content",
+    });
 
     const close = (): void => {
       pop.remove();
@@ -3423,7 +3431,7 @@ export class StashpadView extends ItemView {
     const addRow = (label: string, swatchHex: string | null, onPick: () => void): void => {
       const row = container.createDiv({ cls: "stashpad-color-filter-popover-row" });
       const sw = row.createSpan({ cls: "stashpad-color-filter-swatch" });
-      if (swatchHex) sw.style.background = swatchHex;
+      if (swatchHex) sw.setCssStyles({ background: swatchHex });
       else sw.addClass("is-empty");
       const txt = row.createSpan({ cls: "stashpad-color-filter-popover-label" });
       txt.setText(label);
@@ -3636,8 +3644,10 @@ export class StashpadView extends ItemView {
     this.viewRoot.appendChild(pop);
     const r = anchor.getBoundingClientRect();
     const rootR = this.viewRoot.getBoundingClientRect();
-    pop.style.top = `${r.bottom - rootR.top + 4}px`;
-    pop.style.left = `${Math.max(4, Math.min(r.left - rootR.left, rootR.width - 180))}px`;
+    pop.setCssStyles({
+      top: `${r.bottom - rootR.top + 4}px`,
+      left: `${Math.max(4, Math.min(r.left - rootR.left, rootR.width - 180))}px`,
+    });
     // Close on click-outside / Escape. Added next tick so the opening
     // click doesn't immediately dismiss it.
     const onDoc = (ev: Event) => {
@@ -4407,14 +4417,18 @@ export class StashpadView extends ItemView {
         textEl.addClass("is-plain");
         textEl.textContent = text;
       } else {
-        // Re-hydrate the cached markdown HTML by assigning innerHTML. Obsidian
-        // uses event delegation for internal links / tags / embeds, so the
-        // restored DOM still wires up correctly without needing a fresh
-        // MarkdownRenderer pass. (Live-rendered widgets like Mermaid/MathJax
-        // are the one weak spot — those won't re-execute from cached HTML,
-        // but they're rare in chat-style notes and re-render on next mtime
-        // change anyway.)
-        textEl.innerHTML = html;
+        // Re-hydrate the cached markdown HTML. The string was produced by
+        // Obsidian's own MarkdownRenderer from the user's note and persisted in
+        // the render cache; we parse it back into nodes and append them to the
+        // (freshly emptied) text element rather than assigning innerHTML
+        // (Obsidian lint: no-unsafe-innerHTML). createContextualFragment yields
+        // identical DOM — and, like innerHTML, never executes <script> — so
+        // event delegation for internal links / tags / embeds still wires up
+        // without a fresh MarkdownRenderer pass. (Live-rendered widgets like
+        // Mermaid/MathJax are the one weak spot — they won't re-execute from
+        // cached HTML, but they're rare in chat-style notes and re-render on
+        // the next mtime change anyway.)
+        textEl.append(document.createRange().createContextualFragment(html));
       }
       if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
       // Multiplayer footer: author / contributors / last-edit. Each
@@ -4708,7 +4722,7 @@ export class StashpadView extends ItemView {
     const fileInput = composer.createEl("input", {
       cls: "stashpad-composer-file-input", type: "file", attr: { multiple: "true" },
     }) as HTMLInputElement;
-    fileInput.style.display = "none";
+    fileInput.setCssStyles({ display: "none" });
 
     const btnRail = composer.createDiv({ cls: "stashpad-composer-btn-rail" });
     // Mobile: secondary buttons (split/dest/enter/clip) live inside a

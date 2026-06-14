@@ -624,7 +624,7 @@ export class ImportService {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
-    input.style.display = "none";
+    input.setCssStyles({ display: "none" });
     input.onchange = async () => {
       const picked = Array.from(input.files ?? []);
       input.remove();
