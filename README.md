@@ -81,7 +81,7 @@ encrypted trash, and shared-key collaboration.
 
 ## Feedback
 
-Bug reports and "this felt weird" notes are very welcome via the repo's Issues.
+Report anything buggy or strange on the [issues](https://github.com/grub-basket/SP/issues) tab.
 
 ## Credits & thanks
 
