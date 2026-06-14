@@ -1,7 +1,7 @@
 import {
   App, ItemView, MarkdownRenderer, Menu, Notice, Platform,
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce,
-  moment, setIcon,
+  moment, sanitizeHTMLToDom, setIcon,
 } from "obsidian";
 import {
   ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
@@ -4419,16 +4419,16 @@ export class StashpadView extends ItemView {
       } else {
         // Re-hydrate the cached markdown HTML. The string was produced by
         // Obsidian's own MarkdownRenderer from the user's note and persisted in
-        // the render cache; we parse it back into nodes and append them to the
-        // (freshly emptied) text element rather than assigning innerHTML
-        // (Obsidian lint: no-unsafe-innerHTML). createContextualFragment yields
-        // identical DOM — and, like innerHTML, never executes <script> — so
-        // event delegation for internal links / tags / embeds still wires up
-        // without a fresh MarkdownRenderer pass. (Live-rendered widgets like
-        // Mermaid/MathJax are the one weak spot — they won't re-execute from
-        // cached HTML, but they're rare in chat-style notes and re-render on
-        // the next mtime change anyway.)
-        textEl.append(document.createRange().createContextualFragment(html));
+        // the render cache; we parse it back into DOM with Obsidian's own
+        // sanitizeHTMLToDom() and append the fragment to the (freshly emptied)
+        // text element. This is the API the plugin-review linter blesses for
+        // "HTML string → DOM" (vs. innerHTML / createContextualFragment, both
+        // flagged). Event delegation for internal links / tags / embeds still
+        // wires up without a fresh MarkdownRenderer pass. (Live-rendered widgets
+        // like Mermaid/MathJax are the one weak spot — they won't re-execute from
+        // cached HTML, but they're rare in chat-style notes and re-render on the
+        // next mtime change anyway.)
+        textEl.append(sanitizeHTMLToDom(html));
       }
       if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
       // Multiplayer footer: author / contributors / last-edit. Each
@@ -9548,7 +9548,7 @@ export class StashpadView extends ItemView {
   /** public: called by AuthorshipTracker (the host interface). */
   stripFrontmatter(md: string): string {
     // Strip BOM if present so the opening-fence detection still works.
-    const text = md.replace(/^﻿/, "");
+    const text = md.replace(/^\uFEFF/, "");
     // Match: optional leading whitespace, "---", newline, anything (lazy),
     // newline, "---", optional trailing whitespace, then either a newline
     // or end-of-string. This covers \r\n line endings, missing trailing
