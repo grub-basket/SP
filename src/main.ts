@@ -16,6 +16,8 @@ import {
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
+import { ensureOkfTemplate, okfFolders, rebuildOkfForFolder, OKF_DEFAULT_TEMPLATE_PATH } from "./okf";
+import { buildOkfBundleFiles, zipBundle, tarGzBundle } from "./okf-export";
 import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
@@ -699,6 +701,14 @@ export default class StashpadPlugin extends Plugin {
     // last readable plaintext copy, sitting in render-cache.json.
     this.registerEvent(this.app.vault.on("delete", (f) => this.renderCacheStore.evict(f.path)));
     this.registerEvent(this.app.vault.on("rename", (_f, oldPath) => this.renderCacheStore.evict(oldPath)));
+    // 0.102.x: OKF auto-rebuild — when a note is added/deleted/moved in an OKF
+    // folder, refresh that folder's OKF frontmatter + index.md (debounced). Gated
+    // through okfActiveFolders so it never runs when OKF is off / for non-OKF /
+    // archive folders. Frontmatter writes are "modify" events (not listened here),
+    // so this can't loop on its own work; index.md is ignored explicitly.
+    this.registerEvent(this.app.vault.on("create", (f) => this.onOkfFileEvent(f.path)));
+    this.registerEvent(this.app.vault.on("delete", (f) => this.onOkfFileEvent(f.path)));
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => { this.onOkfFileEvent(f.path); this.onOkfFileEvent(oldPath); }));
     // 0.77.1: load the author registry and seed it with the local user.
     await this.authorRegistry.load();
     {
@@ -1347,6 +1357,11 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-export-stash",
       name: "Export selection to .stash",
       callback: () => call("cmdExportStash"),
+    });
+    this.addCommand({
+      id: "stashpad-export-okf",
+      name: "Export selection as OKF bundle (.zip / .tar.gz / .stash)",
+      callback: () => call("cmdExportOkf"),
     });
     this.addCommand({
       id: "stashpad-import-stash",
@@ -2316,6 +2331,7 @@ export default class StashpadPlugin extends Plugin {
     let fmWritten = 0;
     let slugsRenamed = 0;
     let imported = 0;
+    const okfSet = new Set(this.okfActiveFolders());
     for (const folder of seen) {
       try {
         if (importSub) await ensureFolder(`${folder}/${importSub}`);
@@ -2347,6 +2363,13 @@ export default class StashpadPlugin extends Plugin {
         // landed (and any whose body was edited without the per-view
         // scheduleSlugRename firing).
         slugsRenamed += await this.rebootstrapFolderSlugs(folder);
+        // 0.102.x: rebootstrap also fixes OKF frontmatter + regenerates index.md
+        // for OKF-enabled folders (those using the OKF template). The OKF-section
+        // "Rebuild" button is just a scoped shortcut to this same pass — not an
+        // alias for the whole rebootstrap.
+        if (okfSet.has(folder.replace(/\/+$/, ""))) {
+          try { await rebuildOkfForFolder(this.app, folder); } catch (e) { console.warn("Stashpad: OKF rebuild during rebootstrap failed", folder, e); }
+        }
         touched.push(folder);
       } catch (e) {
         console.warn(`Stashpad: rebootstrap skipped ${folder}`, e);
@@ -3316,6 +3339,111 @@ export default class StashpadPlugin extends Plugin {
   isArchiveFolder(folder: string): boolean {
     const cleaned = folder.replace(/\/+$/, "");
     return (this.settings.archiveFolders ?? []).includes(cleaned);
+  }
+
+  /** Ensure the OKF template note exists and remember its path (called when OKF
+   *  is enabled). */
+  async ensureOkfTemplate(): Promise<string> {
+    const path = await ensureOkfTemplate(this.app, this.settings.okfTemplatePath || undefined);
+    if (this.settings.okfTemplatePath !== path) { this.settings.okfTemplatePath = path; await this.saveSettings(); }
+    return path;
+  }
+
+  /** The OKF template path, defaulting to the standard name when the setting is
+   *  empty (e.g. OKF was enabled in an older build before create-on-enable). */
+  okfTemplatePathOrDefault(): string {
+    return this.settings.okfTemplatePath || OKF_DEFAULT_TEMPLATE_PATH;
+  }
+
+  /** Folders the OKF process should ACTUALLY touch: only when OKF is on, only
+   *  folders assigned the OKF template, and NEVER archive folders (their whole
+   *  point is private-at-rest — OKF would make them browsable/exportable). This
+   *  is the single guard every OKF run goes through, so OKF-off / no-folders /
+   *  excluded-folders can never accidentally trigger the process. */
+  okfActiveFolders(): string[] {
+    if (!this.settings.okfEnabled) return [];
+    return okfFolders(this.settings.noteTemplates, this.okfTemplatePathOrDefault())
+      .filter((f) => !this.isArchiveFolder(f));
+  }
+
+  /** Per-folder debounce timers for OKF auto-rebuild. */
+  private okfRebuildTimers = new Map<string, number>();
+
+  /** A vault file changed (create/delete/rename) — if it's a real note in an
+   *  active OKF folder, schedule a debounced rebuild of that folder. Ignores
+   *  index.md (our own generated artifact, to avoid a write→event→rebuild loop)
+   *  and reserved subfolders. */
+  private onOkfFileEvent(path: string): void {
+    if (!this.settings.okfEnabled) return;
+    if (!path.toLowerCase().endsWith(".md")) return;
+    const slash = path.lastIndexOf("/");
+    const folder = (slash >= 0 ? path.slice(0, slash) : "").replace(/\/+$/, "");
+    const name = slash >= 0 ? path.slice(slash + 1) : path;
+    if (name === "index.md") return;
+    if (/(^|\/)(_imports|_exports|_attachments|_deleted|\.stashpad)(\/|$)/.test(path)) return;
+    if (!this.okfActiveFolders().includes(folder)) return;
+    this.scheduleOkfRebuild(folder);
+  }
+
+  /** Debounced per-folder OKF rebuild (coalesces bursts like imports/resets). */
+  private scheduleOkfRebuild(folder: string): void {
+    const prev = this.okfRebuildTimers.get(folder);
+    if (prev != null) window.clearTimeout(prev);
+    this.okfRebuildTimers.set(folder, window.setTimeout(() => {
+      this.okfRebuildTimers.delete(folder);
+      if (!this.okfActiveFolders().includes(folder)) return; // re-check at fire time
+      void rebuildOkfForFolder(this.app, folder).catch((e) => console.warn("[Stashpad] OKF auto-rebuild failed", folder, e));
+    }, 2500));
+  }
+
+  /** Rebuild OKF frontmatter (relative-markdown links + defaults) + index.md for
+   *  every active OKF folder. No-op when OKF is off / no folders use the template. */
+  async rebuildAllOkf(): Promise<{ folders: number; checked: number; written: number }> {
+    const folders = this.okfActiveFolders();
+    let checked = 0, written = 0;
+    for (const f of folders) { const r = await rebuildOkfForFolder(this.app, f); checked += r.checked; written += r.written; }
+    return { folders: folders.length, checked, written };
+  }
+
+  /** Export the subtree(s) rooted at `rootIds` in `folder` as OKF bundle(s) and/or
+   *  a Stashpad .stash, written into the folder's export subfolder. Returns the
+   *  paths written. zip/tar.gz are OKF bundles (spec keys mapped, scoped index.md);
+   *  .stash is the native round-trip format. Reachable for tests + the command. */
+  async exportOkf(folder: string, rootIds: StashpadId[], baseName: string, formats: { zip?: boolean; targz?: boolean; stash?: boolean }): Promise<string[]> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const rootNotes: { id: StashpadId; file: TFile }[] = [];
+    const allDescendants: { id: StashpadId; file: TFile }[] = [];
+    const files: TFile[] = [];
+    const scopeIds = new Set<string>();
+    for (const rid of rootIds) {
+      const sub = await collectSubtree(this.app, cleaned, rid);
+      if (!sub) continue;
+      rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
+      files.push(sub.rootNote.file); scopeIds.add(sub.rootNote.id);
+      for (const d of sub.descendants) { allDescendants.push({ id: d.id, file: d.file }); files.push(d.file); scopeIds.add(d.id); }
+    }
+    if (!files.length) return [];
+    const safe = (baseName || "okf-export").replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "okf-export";
+    const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+    const exportSub = (this.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
+    const exportFolder = `${cleaned}/${exportSub}`;
+    for (const seg of [cleaned, exportFolder]) { try { if (!(await this.app.vault.adapter.exists(seg))) await this.app.vault.adapter.mkdir(seg); } catch { /* */ } }
+    const written: string[] = [];
+    const write = async (name: string, data: Uint8Array) => {
+      const path = `${exportFolder}/${name}`;
+      await this.app.vault.createBinary(path, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
+      written.push(path);
+    };
+    if (formats.zip || formats.targz) {
+      const bundle = await buildOkfBundleFiles(this.app, files, cleaned, scopeIds);
+      if (formats.zip) await write(`${safe}-${stamp}.okf.zip`, await zipBundle(bundle));
+      if (formats.targz) await write(`${safe}-${stamp}.okf.tar.gz`, await tarGzBundle(bundle));
+    }
+    if (formats.stash) {
+      const buf = await buildStashZip(this.app, { rootNotes, allDescendants, sourceFolder: cleaned });
+      await write(`${safe}-${stamp}.${STASH_EXT}`, buf);
+    }
+    return written;
   }
 
   /** Ids of the markdown notes living directly in `folder` (read from DISK — the

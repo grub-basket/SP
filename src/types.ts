@@ -110,6 +110,10 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   // 0.88.0: marks a note that came in via import (used by the "imported only"
   // view filter). Stashpad-managed; a clone of an imported note isn't imported.
   "imported",
+  // 0.101.x: OKF relative-markdown cross-links, derived from the tree and
+  // Stashpad-managed (rebuilt by the OKF pass). The user-editable OKF fields
+  // (okfType/okfTitle/okfTimestamp) are intentionally NOT reserved.
+  "okfParent", "okfChildren",
 ] as const;
 
 /** Reserved Stashpad subfolder names (machine-managed; not user notes).

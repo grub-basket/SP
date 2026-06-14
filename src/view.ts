@@ -9114,6 +9114,7 @@ export class StashpadView extends ItemView {
   // Implementations live in commands/io-cmds.ts; these thin delegators keep
   // the public method names stable for the keydown dispatcher + main.ts.
   cmdExportStash(rootNode?: TreeNode): Promise<void> { return ioCmds.cmdExportStash(this, rootNode); }
+  cmdExportOkf(rootNode?: TreeNode): Promise<void> { return ioCmds.cmdExportOkf(this, rootNode); }
   cmdImportStash(): Promise<void> { return ioCmds.cmdImportStash(this); }
   processStashFile(file: TFile): Promise<void> { return ioCmds.processStashFile(this, file); }
 
@@ -9686,6 +9687,12 @@ export class StashpadView extends ItemView {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       void this.cmdExportStash();
     }));
+    if (this.plugin.settings.okfEnabled) {
+      menu.addItem((it: any) => it.setTitle("Export as OKF…").setIcon("book-marked").onClick(() => {
+        if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+        void this.cmdExportOkf();
+      }));
+    }
     // 0.98.1: encrypt (lock) this note + its whole subtree into one .stashenc
     // bundle, in place. Only shown once a vault encryption password is set up.
     if (this.plugin.encryption?.isConfigured?.()) {

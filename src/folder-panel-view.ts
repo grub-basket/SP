@@ -137,11 +137,20 @@ export class StashpadFolderPanelView extends ItemView {
   }
 
   private renderPinned(list: HTMLElement): void {
+    // 0.102.x: pinned FOLDERS mix into the top "Pinned" section (above the pinned
+    // notes), using the same folder rows as the list below. The bottom Folders
+    // subsection is unchanged — pinned folders still appear there ranked-first.
+    const pinnedFolders = this.plugin.discoverStashpadFolders().filter((f) => this.folderState(f) === "pinned");
     const pins = this.plugin.listPinnedNotes();
-    if (pins.length === 0) {
-      list.createDiv({ cls: "stashpad-folderpanel-empty", text: "No pinned notes yet — pin a note from its right-click menu." });
+    if (pinnedFolders.length === 0 && pins.length === 0) {
+      list.createDiv({ cls: "stashpad-folderpanel-empty", text: "Nothing pinned yet — pin a note or folder from its right-click menu." });
       return;
     }
+    if (pinnedFolders.length > 0) {
+      const open = this.openFolders();
+      for (const folder of pinnedFolders) this.renderFolderRow(list, folder, open);
+    }
+    if (pins.length === 0) return;
     const grouping = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
     if (grouping === "folder") {
       // Group by Stashpad, MRU folder floated to the top (mirrors the Pinned panel).

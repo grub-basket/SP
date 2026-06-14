@@ -438,6 +438,13 @@ export interface StashpadSettings {
    *  before that — and to step back to the terser confirm once the
    *  user has built once and presumably knows what they're doing. */
   jdIndexHasBuilt: boolean;
+  /** OKF (Open Knowledge Format) support — master toggle. When on, folders using
+   *  the OKF template get OKF frontmatter + a generated index.md (see
+   *  docs/branches/okf.md). */
+  okfEnabled: boolean;
+  /** Vault path of the auto-created OKF template note (assigned per-folder via the
+   *  Templates section). Empty until OKF is first enabled. */
+  okfTemplatePath: string;
   /** Per-folder composer draft text. Stored in the plugin's data.json. */
   drafts: Record<string, string>;
   /** Per-folder: the text most recently sent via Enter, used to suppress
@@ -521,6 +528,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   jdIndexIncludeStashpadFolders: false,
   jdIndexSort: "natural",
   jdIndexHasBuilt: false,
+  okfEnabled: false,
+  okfTemplatePath: "",
   drafts: {},
   lastSubmitted: {},
   bindings: buildDefaultBindings(),
@@ -554,7 +563,7 @@ export function getTemplatesFormats(app: App): { dateFormat: string; timeFormat:
 /** 0.73.1: settings tab redesigned into a tabbed UI. SETTINGS_TABS
  *  is the source of truth for both the bar at the top and the
  *  search-mode group order. Order here = display order. */
-export type SettingsTabId = "general" | "encryption" | "diagnostics" | "authorship" | "templates" | "jdindex" | "hotkeys";
+export type SettingsTabId = "general" | "encryption" | "diagnostics" | "authorship" | "templates" | "jdindex" | "okf" | "hotkeys";
 export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: "general",     label: "General" },
   { id: "encryption",  label: "Encryption" },
@@ -562,6 +571,7 @@ export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: "authorship",  label: "Authorship" },
   { id: "templates",   label: "Templates" },
   { id: "jdindex",     label: "JD Index" },
+  { id: "okf",         label: "Open Knowledge Format (OKF)" },
   { id: "hotkeys",     label: "Hotkeys" },
 ];
 
@@ -667,6 +677,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       case "authorship": return this.authorshipItems();
       case "templates": return this.templatesItems();
       case "jdindex": return this.jdIndexItems();
+      case "okf": return this.okfItems();
       default: return null;
     }
   }
@@ -1023,6 +1034,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       const betaRow = host.createDiv({ cls: "stashpad-beta-row" });
       betaRow.createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
       betaRow.createEl("span", { cls: "stashpad-beta-note", text: "Encryption is in beta — keep your own backups of anything important." });
+      host.createEl("div", { cls: "stashpad-ai-disclaimer" }).setText(
+        "⚠️ AI-built, NOT human-audited. This encryption was written by an AI assistant — not designed, reviewed, or security-audited by a human, and not tested by any security professional. It may carry real security, privacy, and DATA-LOSS risks. Treat it as a best-effort nice-to-have that might buy a little time against a casual snoop — nothing is guaranteed. Do NOT rely on it for anything sensitive, and always keep your own unencrypted backups of anything important.",
+      );
       host.createEl("p", { cls: "setting-item-description" }).setText(
         "⚠️ Encryption protects what you lock in this vault. Each device unlocks with its own password (which never leaves the device); the vault key is shared with collaborators by approving their device — no shared password. If everyone with access loses their password, anything encrypted is gone for good. While encrypting, avoid a sync/cloud service writing the vault mid-operation — it can corrupt files.",
       );
@@ -1518,7 +1532,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     const stashpads = this.plugin.discoverStashpadFolders();
     if (stashpads.length === 0) {
       new Setting(parent)
-        .setName("Color Aliases per Stashpad")
+        .setName("Color aliases per Stashpad")
         .setDesc("No Stashpads discovered yet — create one above first.");
       return;
     }
@@ -1532,7 +1546,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     })();
 
     new Setting(parent)
-      .setName("Color Aliases per Stashpad")
+      .setName("Color aliases per Stashpad")
       .setDesc("Which Stashpad's colors to label.")
       .addDropdown((dd) => {
         for (const f of stashpads) dd.addOption(f, f);
@@ -1667,6 +1681,121 @@ export class StashpadSettingTab extends PluginSettingTab {
         (host) => this.renderJdIndexSection(host),
         ["jd", "johnny", "decimal", "index", "scope", "build", "preview", "hierarchy", "folder"]),
     ];
+  }
+
+  /** OKF (Open Knowledge Format) tab. Phase 1: master toggle + docs + how-to.
+   *  Frontmatter/index.md/export land in later phases (docs/branches/okf.md). */
+  private okfItems(): SettingDefinitionItem[] {
+    return [
+      this.sectionDef("Open Knowledge Format (OKF)",
+        "Turn a Stashpad folder into a browsable OKF bundle — markdown concept files with OKF frontmatter, a generated index.md, and relative-markdown cross-links — that LLMs/agents can read. Complements (never replaces) Stashpad's own frontmatter and links.",
+        (host) => this.renderOkfSection(host),
+        ["okf", "open knowledge format", "knowledge", "catalog", "index", "export", "bundle", "tarball", "agent", "google"]),
+    ];
+  }
+
+  /** Append `text` to an element/fragment, rendering `backtick` spans as <code>
+   *  (monospace) via text nodes — safe for interpolated values (no innerHTML). */
+  private appendCode(el: HTMLElement | DocumentFragment, text: string): void {
+    text.split(/`([^`]+)`/g).forEach((part, i) => {
+      if (i % 2 === 1) el.createEl("code", { text: part });
+      else if (part) el.appendText(part);
+    });
+  }
+  /** A setting-description fragment with `backtick` → <code>, for setDesc(). */
+  private codeDesc(text: string): DocumentFragment {
+    const f = document.createDocumentFragment();
+    this.appendCode(f, text);
+    return f;
+  }
+
+  private renderOkfSection(parent: HTMLElement): void {
+    parent.createDiv({ cls: "stashpad-beta-row" }).createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
+
+    new Setting(parent)
+      .setName("Enable OKF")
+      .setDesc(this.codeDesc("Master switch. When on, you choose which folders use OKF by assigning the OKF template to them in Settings → Templates (all / some / none — your call). Those folders then get OKF frontmatter and a maintained `index.md`. Turning this off leaves existing OKF files in place; it just stops maintaining them."))
+      .addToggle((t) => t.setValue(this.plugin.settings.okfEnabled).onChange(async (v) => {
+        this.plugin.settings.okfEnabled = v;
+        await this.plugin.saveSettings();
+        if (v) { try { await this.plugin.ensureOkfTemplate(); } catch (e) { console.warn("[Stashpad] OKF template create failed", e); } }
+        new Notice(v
+          ? `OKF on. Next: assign the template "${this.plugin.okfTemplatePathOrDefault()}" to a folder — use “Create template + open Templates” below. Heads-up: OKF frontmatter + index.md refresh automatically but NOT instantly (a few seconds after changes); hit Rebuild for an immediate pass.`
+          : "OKF disabled.", v ? 0 : 4000); // persistent CTA on enable (stays until dismissed)
+        this.update?.();
+      }));
+
+    if (this.plugin.settings.okfEnabled) {
+      const okfPath = this.plugin.okfTemplatePathOrDefault();
+      const okfCount = this.plugin.okfActiveFolders().length;
+      const steps = parent.createEl("div", { cls: "setting-item-description stashpad-okf-howto" });
+      steps.createEl("p", { text: "How to use OKF in a folder:" });
+      const ol = steps.createEl("ol");
+      this.appendCode(ol.createEl("li"), `Open Templates and set a folder's template to \`${okfPath}\` (archive folders are skipped).`);
+      this.appendCode(ol.createEl("li"), "Hit Rebuild below to write OKF frontmatter (`okfParent`/`okfChildren` + `okfType`/`okfTitle`/`okfTimestamp`) and generate that folder's `index.md`.");
+      this.appendCode(ol.createEl("li"), "Right-click a note (or a selection) → “Export as OKF…” to save a `.zip` / `.tar.gz` bundle (or `.stash`).");
+      steps.createEl("p", { cls: "stashpad-okf-soon", text: "OKF frontmatter + index.md refresh automatically a few seconds after you add, move, or delete notes — NOT instantly. Use Rebuild for an immediate pass." });
+      if (okfCount === 0) {
+        const cta = parent.createEl("p", { cls: "stashpad-okf-cta" });
+        this.appendCode(cta, "👉 No folder is using OKF yet. Click “Create template + open Templates” below, then set a folder's template to `" + okfPath + "`.");
+      } else {
+        steps.createEl("p", { cls: "stashpad-okf-soon", text: `Currently ${okfCount} folder${okfCount === 1 ? "" : "s"} actively using OKF.` });
+      }
+
+      new Setting(parent)
+        .setName("Assign OKF to folders")
+        .setDesc(this.codeDesc(`Creates the OKF template if needed (never duplicates it), then opens Templates — set a folder's template to \`${okfPath}\` there.`))
+        .addButton((b) => { b.setButtonText("Create template + open Templates").setCta(); b.onClick(async () => {
+          let path: string;
+          try { path = await this.plugin.ensureOkfTemplate(); }
+          catch (e) { new Notice(`Couldn't create the OKF template: ${(e as Error).message}`); return; }
+          new Notice(`OKF template ready at "${path}" — set a folder's template to that path.`);
+          this.update?.();
+          this.openSettingsPage("Templates");
+        }); });
+
+      new Setting(parent)
+        .setName("Rebuild OKF frontmatter")
+        .setDesc(this.codeDesc("Write/refresh OKF fields for every folder using the OKF template — `okfParent`/`okfChildren` relative links (managed) plus `okfType`/`okfTitle`/`okfTimestamp` defaults (yours to edit after). Heads-up: adding, moving, or deleting notes already auto-refreshes the folder, but NOT instantly — it waits ~a few seconds after you stop. Use this button for an immediate rebuild (e.g. right after first assigning the template). Complements Stashpad's own links; nothing is removed."))
+        .addButton((b) => b.setButtonText("Rebuild now").onClick(async () => {
+          const r = await this.plugin.rebuildAllOkf();
+          new Notice(r.folders === 0
+            ? "No folders use the OKF template yet — assign it in Templates first."
+            : `OKF: updated ${r.written} of ${r.checked} notes across ${r.folders} folder${r.folders === 1 ? "" : "s"}.`);
+          this.update?.();
+        }));
+    }
+
+    // Docs
+    const docs = new Setting(parent).setName("Learn about OKF").setDesc("Google's open, vendor-neutral spec for sharing curated knowledge with agents.");
+    docs.addButton((b) => b.setButtonText("Spec / repo").onClick(() => window.open("https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf")));
+    docs.addButton((b) => b.setButtonText("Announcement").onClick(() => window.open("https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing/")));
+  }
+
+  /** Best-effort jump to another Stashpad settings sub-page by its visible name.
+   *  Obsidian exposes no public sub-page nav, so we reset to the Stashpad page
+   *  list (openTabById) then click the matching entry; falls back to a hint. */
+  private openSettingsPage(pageName: string): void {
+    // Obsidian has no public API to open a plugin's own settings SUB-PAGE (see
+    // docs/obsidian-limitations.md). Best-effort: reset to the Stashpad page list,
+    // then click the matching entry — but ONLY inside the active tab's CONTENT
+    // pane, never the left sidebar (whose core/community plugin tabs, e.g. the core
+    // "Templates" plugin, would otherwise match by name and mis-navigate). If we
+    // can't find it in-content, we DON'T guess — we just point the way.
+    const hint = () => new Notice(`Open Settings → Stashpad → ${pageName}.`);
+    try {
+      const setting = (this.app as App & { setting?: { openTabById?: (id: string) => void; modalEl?: HTMLElement } }).setting;
+      if (!setting?.openTabById) { hint(); return; }
+      setting.openTabById("stashpad");
+      window.setTimeout(() => {
+        const content = setting.modalEl?.querySelector<HTMLElement>(".vertical-tab-content");
+        if (!content) { hint(); return; }
+        const hit = Array.from(content.querySelectorAll<HTMLElement>("*"))
+          .find((e) => e.childElementCount === 0 && e.textContent?.trim() === pageName && !e.closest(".vertical-tab-header"));
+        const link = hit?.closest<HTMLElement>("[class*='nav'], .setting-item, button, a");
+        if (link && !link.closest(".vertical-tab-header")) link.click(); else hint();
+      }, 60);
+    } catch { hint(); }
   }
 
   private renderAuthorshipSection(parent: HTMLElement): void {
@@ -1827,6 +1956,13 @@ export class StashpadSettingTab extends PluginSettingTab {
       .setName("Note templates per Stashpad")
       .setDesc("Pick a markdown file to use as the default template for new notes in each Stashpad. The template's frontmatter becomes the new note's frontmatter (id/parent/created/attachments are always set by Stashpad). If the body contains {{body}}, that's where the user-typed body goes; otherwise the user body is followed by the template body.");
 
+    if (this.plugin.settings.okfEnabled) {
+      const okfPath = this.plugin.okfTemplatePathOrDefault();
+      this.appendCode(parent.createEl("p", { cls: "setting-item-description" }),
+        `💡 OKF tip: type \`${okfPath}\` into a folder's template field below to turn that folder into an OKF bundle (OKF frontmatter + a maintained \`index.md\`). Assign it to all, some, or none of your folders — it's per-folder. Manage OKF itself in Settings → OKF.`,
+      );
+    }
+
     const list = parent.createDiv({ cls: "stashpad-note-templates-list" });
 
     const renderRow = (folder: string): void => {
@@ -1849,6 +1985,17 @@ export class StashpadSettingTab extends PluginSettingTab {
       // Obsidian version that ships with the plugin.
       const sugg = inputWrap.createDiv({ cls: "stashpad-note-template-suggest" });
       sugg.style.display = "none";
+      let currentMatches: string[] = [];
+      let itemEls: HTMLElement[] = [];
+      let activeIdx = -1;
+      const isOpen = (): boolean => sugg.style.display !== "none" && currentMatches.length > 0;
+      const highlight = (i: number): void => {
+        activeIdx = i;
+        itemEls.forEach((el, idx) => el.toggleClass("is-active", idx === i));
+        if (i >= 0 && itemEls[i]) itemEls[i].scrollIntoView({ block: "nearest" });
+      };
+      const closeSugg = (): void => { sugg.style.display = "none"; activeIdx = -1; };
+      const choose = async (m: string): Promise<void> => { input.value = m; await save(); closeSugg(); };
 
       // Inline warning area — surfaces overlap with Stashpad's
       // auto-managed frontmatter so the user can fix the template before
@@ -1867,28 +2014,26 @@ export class StashpadSettingTab extends PluginSettingTab {
 
       const renderSuggestions = (): void => {
         sugg.empty();
+        itemEls = [];
         // 0.76.26: Sift — all-tokens, any-order match (see docs/sift.md).
         const tokens = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
         const sift = (p: string): boolean => {
           const h = p.toLowerCase();
           return tokens.every((t) => h.includes(t));
         };
-        const matches = allMd()
-          .filter((p) => sift(p))
-          .slice(0, 12);
-        if (matches.length === 0) { sugg.style.display = "none"; return; }
+        currentMatches = allMd().filter((p) => sift(p)).slice(0, 12);
+        if (currentMatches.length === 0) { closeSugg(); return; }
         sugg.style.display = "";
-        for (const m of matches) {
+        currentMatches.forEach((m, idx) => {
           const item = sugg.createDiv({ cls: "stashpad-note-template-suggest-item", text: m });
+          itemEls.push(item);
+          item.addEventListener("mousemove", () => highlight(idx));
           // mousedown (not click) so the input's blur doesn't close the
           // popover before the click registers.
-          item.addEventListener("mousedown", async (ev) => {
-            ev.preventDefault();
-            input.value = m;
-            await save();
-            sugg.style.display = "none";
-          });
-        }
+          item.addEventListener("mousedown", async (ev) => { ev.preventDefault(); await choose(m); });
+        });
+        activeIdx = activeIdx >= 0 && activeIdx < currentMatches.length ? activeIdx : -1;
+        if (activeIdx >= 0) highlight(activeIdx);
       };
 
       const save = async (): Promise<void> => {
@@ -1935,9 +2080,46 @@ export class StashpadSettingTab extends PluginSettingTab {
       };
 
       input.addEventListener("focus", renderSuggestions);
-      input.addEventListener("input", renderSuggestions);
-      input.addEventListener("blur", () => { setTimeout(() => { sugg.style.display = "none"; }, 150); });
+      input.addEventListener("input", () => { activeIdx = -1; renderSuggestions(); });
+      input.addEventListener("blur", () => { setTimeout(closeSugg, 150); });
       input.addEventListener("change", () => { void save(); });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          if (!isOpen()) { renderSuggestions(); if (currentMatches.length) highlight(0); }
+          else highlight((activeIdx + 1) % currentMatches.length);
+        } else if (e.key === "ArrowUp") {
+          if (!isOpen()) return;
+          e.preventDefault();
+          highlight((activeIdx - 1 + currentMatches.length) % currentMatches.length);
+        } else if (e.key === "Enter") {
+          if (isOpen() && activeIdx >= 0) { e.preventDefault(); void choose(currentMatches[activeIdx]); }
+        } else if (e.key === "Escape") {
+          if (isOpen()) { e.preventDefault(); closeSugg(); }
+        } else if (e.key === "Tab" && !e.shiftKey) {
+          // Per-segment ("per word") completion: extend the input toward the
+          // active (or first) match by one path segment, narrowing the list.
+          // Only swallow Tab when we actually complete — otherwise let it move
+          // focus as usual.
+          if (!isOpen()) return;
+          const target = currentMatches[activeIdx >= 0 ? activeIdx : 0];
+          const cur = input.value;
+          let next: string;
+          if (target.toLowerCase().startsWith(cur.toLowerCase())) {
+            const slash = target.indexOf("/", cur.length);
+            next = slash >= 0 ? target.slice(0, slash + 1) : target;
+          } else {
+            next = target; // token (non-prefix) match — complete it fully
+          }
+          if (next && next !== cur) {
+            e.preventDefault();
+            input.value = next;
+            activeIdx = -1;
+            renderSuggestions();
+            if (currentMatches.length === 1) highlight(0);
+          }
+        }
+      });
       // Initial validation on render so existing saved templates show
       // warnings without requiring a re-edit.
       validateTemplate();

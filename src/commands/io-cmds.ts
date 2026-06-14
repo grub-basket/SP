@@ -3,7 +3,7 @@ import { ROOT_ID, type StashpadId, type TreeNode } from "../types";
 import { buildStashZip, importStashZip, STASH_EXT } from "../stash-package";
 import { argon2Available, encryptStash, resolveStashBytes, STASH_KDF_INFO } from "../stash-crypto";
 import { secretIdForStashName } from "../passphrase";
-import { ExportStashModal } from "../modals";
+import { ExportStashModal, OkfExportModal } from "../modals";
 import type { StashpadView } from "../view";
 
 /** .stash import/export command group extracted from StashpadView
@@ -31,6 +31,30 @@ export async function cmdExportStash(view: StashpadView, rootNode?: TreeNode): P
   new ExportStashModal(view.app, defaultBase, all.length, (chosen, password, remember) => {
     void runExport(view, roots, all, chosen, password, remember);
   }, argon2Available).open();
+}
+
+/** Export the selection/cursor subtree as an OKF bundle (.zip / .tar.gz) and/or a
+ *  Stashpad .stash, via plugin.exportOkf. */
+export async function cmdExportOkf(view: StashpadView, rootNode?: TreeNode): Promise<void> {
+  const roots = collectExportRoots(view, rootNode);
+  if (roots.length === 0) { new Notice("Nothing to export."); return; }
+  const all = collectExportSubtree(view, roots);
+  if (all.length === 0) { new Notice("No exportable notes."); return; }
+  const folderTag = (view.noteFolder.split("/").pop() || view.noteFolder).trim();
+  const defaultBase = roots.length === 1 ? view.titleForNode(roots[0]) : `${folderTag}-okf`;
+  new OkfExportModal(view.app, defaultBase, all.length, (base, formats) => {
+    void (async () => {
+      try {
+        const written = await view.plugin.exportOkf(view.noteFolder, roots.map((r) => r.id), base, formats);
+        if (!written.length) { new Notice("Nothing exported."); return; }
+        view.plugin.notifications.show({
+          message: `Exported OKF — ${written.length} file${written.length === 1 ? "" : "s"} → \`${view.noteFolder}/${(view.plugin.settings.exportFolder || "_exports")}\``,
+          kind: "success", category: "export", affectedPaths: written, folder: view.noteFolder, duration: 0,
+        });
+        await view.log.append({ type: "stash_export", id: roots[0].id, payload: { okf: true, paths: written, noteCount: all.length, rootIds: roots.map((r) => r.id) } });
+      } catch (e) { new Notice(`OKF export failed: ${(e as Error).message}`); console.error(e); }
+    })();
+  }).open();
 }
 
 /** Build + write the .stash with the chosen base name, optionally encrypted,

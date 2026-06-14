@@ -2068,3 +2068,39 @@ export class ImportDupChoiceModal extends Modal {
   }
   onClose(): void { if (!this.chose) this.onChoose("skip"); this.contentEl.empty(); }
 }
+
+/** OKF export: pick a name + one or more container formats. Delegates the actual
+ *  bundle build to plugin.exportOkf (see okf-export.ts). */
+export class OkfExportModal extends Modal {
+  private base: string;
+  constructor(app: App, defaultBase: string, private noteCount: number, private onConfirm: (base: string, formats: { zip: boolean; targz: boolean; stash: boolean }) => void) {
+    super(app); this.base = defaultBase;
+  }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.modalEl.addClass("stashpad-export-modal");
+    this.titleEl.setText("Export as OKF");
+    this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: `Export ${this.noteCount} note${this.noteCount === 1 ? "" : "s"} as an Open Knowledge Format bundle. Pick one or more formats.` });
+    const name = this.contentEl.createEl("input", { type: "text" }) as HTMLInputElement;
+    name.addClass("stashpad-export-name"); name.value = this.base; name.placeholder = "Export name";
+    const mk = (label: string, checked: boolean): HTMLInputElement => {
+      const row = this.contentEl.createDiv({ cls: "stashpad-okf-fmt" });
+      const cb = row.createEl("input", { type: "checkbox" }) as HTMLInputElement; cb.checked = checked;
+      row.createEl("label", { text: label });
+      return cb;
+    };
+    const zip = mk(".zip — OKF bundle (portable)", true);
+    const targz = mk(".tar.gz — OKF bundle (tarball)", false);
+    const stash = mk(".stash — Stashpad format (re-importable)", false);
+    const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
+    footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    const go = footer.createEl("button", { cls: "mod-cta", text: "Export" });
+    go.onclick = () => {
+      if (!zip.checked && !targz.checked && !stash.checked) { new Notice("Pick at least one format."); return; }
+      this.close();
+      this.onConfirm(name.value.trim() || this.base, { zip: zip.checked, targz: targz.checked, stash: stash.checked });
+    };
+    requestAnimationFrame(() => name.focus());
+  }
+  onClose(): void { this.contentEl.empty(); }
+}

@@ -131,7 +131,7 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 4px 0 12px;
+  padding: 4px 14px 12px;
 }
 .stashpad-color-alias-row {
   display: flex;
@@ -191,7 +191,7 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 4px 0 12px;
+  padding: 4px 14px 12px;
 }
 .stashpad-note-template-row {
   display: flex;
@@ -243,8 +243,12 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.stashpad-note-template-suggest-item:hover {
+.stashpad-note-template-suggest-item:hover,
+.stashpad-note-template-suggest-item.is-active {
   background: var(--background-modifier-hover);
+}
+.stashpad-note-template-suggest-item.is-active {
+  background: var(--background-modifier-active-hover, var(--background-modifier-hover));
 }
 .stashpad-note-template-warn {
   flex: 1 0 100%;
@@ -2300,9 +2304,43 @@
 
 /* 0.97.2/0.97.4: keep the Encryption section's intro text off the left edge and
    below the page's top fade (it was clipping the first line). */
+/* PROVISION — text flushing in custom-rendered settings sections.
+   sectionDef() removes `.setting-item` from its host, so raw createEl text /
+   headings / lists rendered directly into a `.stashpad-settings-section` lose the
+   horizontal inset that Obsidian's Setting rows have and sit flush against the
+   modal edge. This rule re-insets all such DIRECT children to 14px (matching the
+   Setting rows). GOING FORWARD: render plain text/headings into a
+   `.stashpad-settings-section` host and they align automatically — don't hand-pad
+   per element, and don't render naked text outside a section host. (Setting rows
+   are untouched — they're `.setting-item`, not selected here.) */
+.stashpad-settings-section > p,
+.stashpad-settings-section > h2,
+.stashpad-settings-section > h3,
+.stashpad-settings-section > h4,
+.stashpad-settings-section > ol,
+.stashpad-settings-section > ul,
+.stashpad-settings-section > .setting-item-description {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+.stashpad-ai-disclaimer {
+  margin: 4px 14px 12px; padding: 10px 12px; border-radius: var(--radius-m, 6px);
+  border: 1px solid var(--color-red, #e24b4a);
+  background: var(--background-modifier-error, rgba(226, 75, 74, 0.1));
+  color: var(--text-normal); font-size: 13px; line-height: 1.5;
+}
 .stashpad-encryption-section { padding: 12px 2px 0; }
 .stashpad-encryption-section > .setting-item-description { padding: 4px 14px 10px; line-height: 1.4; }
 .stashpad-beta-row { display: flex; align-items: center; gap: 8px; padding: 2px 14px 6px; }
+.stashpad-okf-howto { padding: 4px 14px 8px; }
+.stashpad-okf-fmt { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.stashpad-okf-cta {
+  margin: 2px 14px 12px; padding: 9px 12px; border-radius: var(--radius-m, 6px);
+  border: 1px solid var(--interactive-accent); background: var(--background-modifier-hover);
+  font-size: 13px; line-height: 1.5;
+}
+.stashpad-okf-fmt label { cursor: pointer; }
+.stashpad-okf-howto ol { margin: 4px 0 0; padding-left: 1.4em; }
 .stashpad-beta-badge {
   display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
   line-height: 1; padding: 3px 6px; border-radius: 4px; text-transform: uppercase;

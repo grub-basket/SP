@@ -23,15 +23,20 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const ARTIFACTS = ["main.js", "manifest.json", "styles.css"];
 
-function resolveTarget() {
+function resolveTargets() {
+  // Multiple targets supported: STASHPAD_DEPLOY or `.deploy-target` may list ONE
+  // PATH PER LINE (blank lines + `#` comments ignored). EVERY target is updated on
+  // each deploy — keep the Plugin Test vault and the Claude Dev Vault in sync so
+  // live testing never runs a stale build.
+  const fromText = (raw) => raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#")).map((l) => resolve(l));
   const envTarget = process.env.STASHPAD_DEPLOY?.trim();
-  if (envTarget) return resolve(envTarget);
+  if (envTarget) return fromText(envTarget);
   const cfgPath = join(ROOT, ".deploy-target");
   if (existsSync(cfgPath)) {
-    const raw = readFileSync(cfgPath, "utf8").trim();
-    if (raw) return resolve(raw);
+    const targets = fromText(readFileSync(cfgPath, "utf8"));
+    if (targets.length) return targets;
   }
-  return null;
+  return [];
 }
 
 function fail(msg) {
@@ -39,41 +44,39 @@ function fail(msg) {
   process.exit(1);
 }
 
-const target = resolveTarget();
-if (!target) {
+const targets = resolveTargets();
+if (targets.length === 0) {
   fail(
     "No deploy target configured. Set STASHPAD_DEPLOY env var or create a\n" +
-    ".deploy-target file at the project root with the destination path.\n" +
+    ".deploy-target file at the project root with one destination path per line.\n" +
     "Example: /Users/you/MyVault/.obsidian/plugins/stashpad",
   );
 }
 
-// Sanity-check: refuse to write to a path that doesn't look like a
-// plugin folder (avoids accidental misconfigurations clobbering things).
-const targetParent = dirname(target);
-if (!existsSync(target)) {
-  try {
-    mkdirSync(target, { recursive: true });
-  } catch (e) {
-    fail(`Couldn't create destination folder: ${target}\n${e.message}`);
+let totalCopied = 0;
+const allMissing = new Set();
+for (const target of targets) {
+  const targetParent = dirname(target);
+  if (!existsSync(target)) {
+    try { mkdirSync(target, { recursive: true }); }
+    catch (e) { fail(`Couldn't create destination folder: ${target}\n${e.message}`); }
   }
-}
-if (!existsSync(targetParent)) {
-  fail(`Parent of destination doesn't exist: ${targetParent}`);
-}
+  if (!existsSync(targetParent)) fail(`Parent of destination doesn't exist: ${targetParent}`);
 
-let copied = 0;
-let missing = [];
-for (const name of ARTIFACTS) {
-  const src = join(ROOT, name);
-  if (!existsSync(src)) { missing.push(name); continue; }
-  const dst = join(target, name);
-  copyFileSync(src, dst);
-  const sz = statSync(dst).size;
-  console.log(`[deploy] ${name.padEnd(14)} → ${dst}  (${sz} bytes)`);
-  copied++;
+  let copied = 0;
+  for (const name of ARTIFACTS) {
+    const src = join(ROOT, name);
+    if (!existsSync(src)) { allMissing.add(name); continue; }
+    const dst = join(target, name);
+    copyFileSync(src, dst);
+    const sz = statSync(dst).size;
+    console.log(`[deploy] ${name.padEnd(14)} → ${dst}  (${sz} bytes)`);
+    copied++;
+  }
+  console.log(`[deploy] copied ${copied}/${ARTIFACTS.length} → ${target}`);
+  totalCopied += copied;
 }
-if (missing.length) {
-  console.warn(`[deploy] WARNING: missing artifacts: ${missing.join(", ")} — did you build?`);
+if (allMissing.size) {
+  console.warn(`[deploy] WARNING: missing artifacts: ${[...allMissing].join(", ")} — did you build?`);
 }
-console.log(`[deploy] copied ${copied}/${ARTIFACTS.length} → ${target}`);
+console.log(`[deploy] done — ${targets.length} target${targets.length === 1 ? "" : "s"}, ${totalCopied} file copies`);
