@@ -8,6 +8,7 @@ import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmM
 import { FolderSuggest } from "./folder-suggest";
 import type StashpadPlugin from "./main";
 import { RESERVED_FRONTMATTER, type ViewMode } from "./types";
+import { type SplitMode } from "./view-helpers";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal } from "./modals";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
@@ -196,6 +197,9 @@ export interface StashpadSettings {
   useTemplatesFormat: boolean;
   prefixTimestampsOnCopy: boolean;
   splitOnLines: boolean;
+  /** Delimiter used when split-on-submit is on (and the Split modal's default
+   *  preset): each line, blank-line paragraphs, or Markdown headings. */
+  splitMode: SplitMode;
   confirmCrossParentDrag: boolean;
   /** When true (default), warn before deletes that affect more than one
    *  note — i.e. a multi-selection delete OR deleting a note that has
@@ -468,6 +472,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
   splitOnLines: false,
+  splitMode: "lines",
   confirmCrossParentDrag: true,
   confirmBulkDelete: true,
   confirmAttachmentDelete: true,

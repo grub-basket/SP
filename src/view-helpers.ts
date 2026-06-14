@@ -1,5 +1,43 @@
 import { setIcon } from "obsidian";
 
+/** How a block of text is broken into multiple notes — for the composer's
+ *  split-on-submit and the per-note Split modal's "Split by…" presets. */
+export type SplitMode = "lines" | "paragraphs" | "headings";
+
+export const SPLIT_MODE_LABELS: Record<SplitMode, string> = {
+  lines: "Each line",
+  paragraphs: "Paragraphs (blank line)",
+  headings: "Headings",
+};
+
+/** Break `text` into trimmed, non-empty chunks per the chosen mode:
+ *   - lines: one chunk per newline (the original split behavior)
+ *   - paragraphs: split on blank lines (one or more)
+ *   - headings: start a new chunk at each Markdown heading line (`#`..`######`);
+ *               any preamble before the first heading is its own chunk. */
+export function splitIntoChunks(text: string, mode: SplitMode): string[] {
+  const norm = text.replace(/\r\n/g, "\n");
+  if (mode === "lines") {
+    return norm.split("\n").map((s) => s.trim()).filter(Boolean);
+  }
+  if (mode === "paragraphs") {
+    return norm.split(/\n[ \t]*\n+/).map((s) => s.trim()).filter(Boolean);
+  }
+  // headings
+  const chunks: string[] = [];
+  let cur: string[] = [];
+  const isHeading = (line: string) => /^#{1,6}\s/.test(line);
+  for (const line of norm.split("\n")) {
+    if (isHeading(line) && cur.some((l) => l.trim())) {
+      chunks.push(cur.join("\n").trim());
+      cur = [];
+    }
+    cur.push(line);
+  }
+  if (cur.some((l) => l.trim())) chunks.push(cur.join("\n").trim());
+  return chunks.filter(Boolean);
+}
+
 /** 0.76.33: setIcon that never leaves a blank button. If `name` isn't
  *  in this Obsidian build's bundled Lucide set (older iPad/iOS app
  *  versions lag desktop, so some names that resolve on desktop don't

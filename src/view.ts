@@ -31,7 +31,7 @@ import { NoteBodyRenderer } from "./note-body-renderer";
 import { computeSortedIds } from "./view-sort";
 import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
-import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual } from "./view-helpers";
+import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -140,6 +140,12 @@ export class StashpadView extends ItemView {
   private attachmentDebouncers = new Map<string, ReturnType<typeof debounce>>();
   /** public: called by AuthorshipTracker (the host interface). */
   debouncedRender: ReturnType<typeof debounce>;
+  // Bulk-render suppression: while a bulk op runs (a long split paste,
+  // rebootstrap), metadata-driven re-renders are dropped so the list doesn't
+  // flicker per-note as files parse and fmSync writes recovery fields. One
+  // render happens after the writes settle (endBulkRender / forceReconcileRender).
+  private bulkRenderDepth = 0;
+  private bulkSettleTimer: number | null = null;
   private bootstrappedFolders = new Set<string>();
 
   /** public: read by ViewDnD (the host interface). */
@@ -307,7 +313,7 @@ export class StashpadView extends ItemView {
       if (mode === "manual") return this.order.getOrder(folder, parentId);
       return computeSortedIds(this, parentId, mode);
     });
-    this.debouncedRender = debounce(() => this.render(), 80);
+    this.debouncedRender = debounce(() => { if (this.renderSuppressed()) return; this.render(); }, 80);
     this.authorship = new AuthorshipTracker(this);
     this.dnd = new ViewDnD(this);
     // 0.83.2: back the body render cache with the plugin's persisted store
@@ -633,7 +639,47 @@ export class StashpadView extends ItemView {
    *  post-sync burst) self-heals without a manual reload. No-op when
    *  the counts already match. */
   private treeReconcileTimer: number | null = null;
+  /** True while a bulk op (long split paste, rebootstrap) is writing, so
+   *  metadata-driven re-renders are dropped to avoid per-note flicker. */
+  private renderSuppressed(): boolean {
+    return this.bulkRenderDepth > 0
+      || this.bulkSettleTimer != null
+      || this.plugin.rebootstrapInProgress
+      || this.plugin.okfRebuildingFolders.has(this.noteFolder);
+  }
+
+  /** Open a bulk-render window: metadata-driven renders are suppressed until the
+   *  matching endBulkRender (+ settle). Nestable. */
+  private beginBulkRender(): void {
+    this.bulkRenderDepth++;
+    if (this.bulkSettleTimer != null) { window.clearTimeout(this.bulkSettleTimer); this.bulkSettleTimer = null; }
+  }
+
+  /** Close a bulk-render window. Keeps suppressing through a short settle delay
+   *  (so trailing metadata-parse events don't each repaint), then rebuilds +
+   *  renders ONCE. */
+  private endBulkRender(settleMs = 500): void {
+    if (this.bulkRenderDepth > 0) this.bulkRenderDepth--;
+    if (this.bulkRenderDepth > 0) return;
+    if (this.bulkSettleTimer != null) window.clearTimeout(this.bulkSettleTimer);
+    this.bulkSettleTimer = window.setTimeout(() => {
+      this.bulkSettleTimer = null;
+      if (!this.viewRoot?.isConnected) return;
+      this.tree.rebuild(this.noteFolder);
+      this.render();
+    }, settleMs);
+  }
+
+  /** Public: a one-shot rebuild + render. Used by the plugin after rebootstrap
+   *  clears `rebootstrapInProgress` to repaint the (suppressed) view once. */
+  forceReconcileRender(): void {
+    if (!this.viewRoot?.isConnected) return;
+    this.tree.rebuild(this.noteFolder);
+    this.render();
+  }
+
   private scheduleTreeReconcile(): void {
+    if (this.renderSuppressed()) return;
     if (this.treeReconcileTimer != null) return;
     this.treeReconcileTimer = window.setTimeout(() => {
       this.treeReconcileTimer = null;
@@ -4732,10 +4778,30 @@ export class StashpadView extends ItemView {
     const expandedGroup = btnRail.createDiv({ cls: "stashpad-composer-btn-group" });
     const splitBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn" });
     setIcon(splitBtn, "list-end");
-    splitBtn.title = splitMode ? "Split on newlines: ON (Mod+/)" : "Split on newlines (Mod+/)";
+    const splitModeLabel = SPLIT_MODE_LABELS[getSettings().splitMode].toLowerCase();
+    splitBtn.title = splitMode
+      ? `Split: ON — ${splitModeLabel} (Mod+/ to toggle, right-click to change)`
+      : `Split into notes (Mod+/) — right-click to choose: ${splitModeLabel}`;
     if (splitMode) splitBtn.addClass("is-active");
     splitBtn.onmousedown = (e) => e.preventDefault();
     splitBtn.onclick = (e) => { e.preventDefault(); this.toggleSplit(); };
+    // Right-click → choose how the paste is split (each line / paragraphs / headings).
+    splitBtn.oncontextmenu = (e) => {
+      e.preventDefault();
+      const menu = new Menu();
+      const current = getSettings().splitMode;
+      (["lines", "paragraphs", "headings"] as SplitMode[]).forEach((m) => {
+        menu.addItem((it: any) => it
+          .setTitle(SPLIT_MODE_LABELS[m])
+          .setChecked(m === current)
+          .onClick(async () => {
+            this.plugin.settings.splitMode = m;
+            await this.plugin.saveSettings();
+            this.render();
+          }));
+      });
+      menu.showAtMouseEvent(e);
+    };
 
     const destBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn" });
     setIcon(destBtn, "map-pin");
@@ -4884,13 +4950,21 @@ export class StashpadView extends ItemView {
       this.autoSelectNewest = !remote;
       this.scrollToBottomOnNextRender = !remote;
       const createOpts = remote ? { targetFolder: destFolder! } : undefined;
+      // Bind the parent ONCE, here at submit time. A split otherwise reads
+      // this.focusId on each per-note await, so navigating mid-paste reparents
+      // the remaining notes into whatever level you moved to (the "looks
+      // broken" bug). dest covers explicit/remote destinations; otherwise it's
+      // the level we're submitting from.
+      const parent = dest ?? this.focusId;
       if (split) {
-        for (const line of text.split(/\r?\n/)) {
-          const t = line.trim();
-          if (t) await this.createNoteUnder(t, dest, createOpts);
+        const lines = splitIntoChunks(text, getSettings().splitMode);
+        if (lines.length === 1) {
+          await this.createNoteUnder(lines[0], parent, createOpts);
+        } else if (lines.length > 1) {
+          await this.createNotesBatch(lines, parent, createOpts, text, remote ? destFolder! : this.noteFolder);
         }
       } else {
-        await this.createNoteUnder(text, dest, createOpts);
+        await this.createNoteUnder(text, parent, createOpts);
       }
       // Keep focus in the composer so the user can keep typing without
       // re-clicking — unless the user disabled this in settings.
@@ -9083,6 +9157,72 @@ export class StashpadView extends ItemView {
       }
     };
 
+    // Multi-split: the original keeps part 1; parts 2..N become new siblings
+    // (in order, via incrementing createdOverride). One bulk-render window + one
+    // grouped undo, same as the composer batch.
+    const performMultiSplit = async (parts: string[]): Promise<void> => {
+      if (parts.length < 2) return;
+      try {
+        const fm = md.startsWith("---") ? md.slice(0, md.indexOf("\n---", 3) + 4) : "";
+        const firstBody = parts[0].replace(/\s+$/, "");
+        if (!firstBody.trim()) { new Notice("Split would leave the first part empty."); return; }
+        const newOriginal = fm + (fm ? "\n" : "") + firstBody + "\n";
+        await this.app.vault.modify(file, newOriginal);
+        const parentId = target.parent ?? ROOT_ID;
+        const baseTime = Date.parse(target.created || "");
+        const base = Number.isFinite(baseTime) ? baseTime : Date.now();
+        const collected: Array<{ path: string; content: string }> = [];
+        this.beginBulkRender();
+        try {
+          for (let i = 1; i < parts.length; i++) {
+            await this.createNoteUnder(parts[i], parentId, {
+              record: false,
+              createdOverride: new Date(base + i).toISOString(),
+              deferRender: true,
+              collectInto: collected,
+            });
+          }
+        } finally {
+          try { await this.fmSync.flush(); } catch { /* best effort */ }
+          this.endBulkRender();
+        }
+        await this.log.append({ type: "rename", id: target.id, payload: { action: "split-many", parts: parts.length } });
+        this.suppressComposerFocusUntil = Date.now() + 500;
+        this.viewRoot?.focus({ preventScroll: true } as any);
+        this.plugin.notifications.show({
+          message: `Split "${this.titleForNode(target)}" into ${parts.length}`,
+          kind: "success", category: "split", affectedIds: [target.id], folder: this.noteFolder,
+        });
+        const created = collected.slice();
+        const folder = this.noteFolder;
+        this.plugin.getUndoStack(folder).push({
+          label: `Split note into ${parts.length}`,
+          undo: async () => {
+            for (const { path } of created) {
+              const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+              if (nf) { try { await this.app.fileManager.trashFile(nf); } catch {} }
+            }
+            const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
+            if (of) await this.app.vault.modify(of, originalContent);
+            this.tree.rebuild(folder);
+            this.render();
+          },
+          redo: async () => {
+            const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
+            if (of) await this.app.vault.modify(of, newOriginal);
+            for (const { path, content } of created) {
+              if (!(await this.app.vault.adapter.exists(path))) await this.app.vault.create(path, content);
+            }
+            this.tree.rebuild(folder);
+            this.render();
+          },
+        });
+      } catch (e) {
+        new Notice(`Stashpad: split failed (${(e as Error).message})`);
+        console.error(e);
+      }
+    };
+
     new SplitNoteModal(
       this.app,
       body,
@@ -9096,6 +9236,7 @@ export class StashpadView extends ItemView {
         const secondBody = body.slice(charIdx).replace(/^\s+|\s+$/g, "");
         await performSplit(firstBody, secondBody, { mode: "cursor", splitAtChar: charIdx });
       },
+      async (parts) => { await performMultiSplit(parts); },
     ).open();
   }
 
@@ -9134,7 +9275,7 @@ export class StashpadView extends ItemView {
 
   // --- Note creation ---
 
-  private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string } = { record: true }): Promise<StashpadId | null> {
+  private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string; deferRender?: boolean; deferUndo?: boolean; collectInto?: Array<{ path: string; content: string }> } = { record: true }): Promise<StashpadId | null> {
     // 0.76.15: targetFolder lets the destination picker SHIP a note to
     // another Stashpad folder without switching this view there. When
     // it differs from the current folder we skip the synthetic insert
@@ -9221,6 +9362,7 @@ export class StashpadView extends ItemView {
       // id and "import" the note into Home. Long TTL covers a laggy create.
       this.plugin.importService.suppress(path, 60000);
       await perf.timeAsync("write.createNote.file", () => this.app.vault.create(path, fullContent));
+      opts.collectInto?.push({ path, content: fullContent });
       try {
         const f = this.app.vault.getAbstractFileByPath(path);
         if (f && (f as any).extension === "md") {
@@ -9231,17 +9373,20 @@ export class StashpadView extends ItemView {
             this.tree.insertSynthetic({
               id, parent: parentId, children: [], file: f as TFile, created,
             });
-            this.render();
+            // Batched splits defer the render to a single pass at the end
+            // (see createNotesBatch) so a long paste doesn't repaint per note.
+            if (!opts.deferRender) this.render();
             this.fmSync.scheduleParentChange(id, null, parentId);
           } else {
             // 0.76.15: remote send — the note belongs to another
             // folder's tree, not this view's. Just refresh the local
             // view (clears the destination badge) and tell the user
-            // where it went, with a Jump action.
-            this.render();
+            // where it went, with a Jump action. (Batched splits defer
+            // both: createNotesBatch renders once + shows one summary.)
+            if (!opts.deferRender) this.render();
             const folderName = folder.split("/").pop() || folder;
             const noteTitle = (body.split("\n").find((s) => s.trim()) ?? "note").trim().slice(0, 60);
-            this.plugin.notifications.show({
+            if (!opts.deferUndo) this.plugin.notifications.show({
               // 0.76.16: persistent so it waits for you to act, and the
               // Jump action targets the NOTE itself (not just its parent).
               message: `"${noteTitle}" landed in \`${folderName}\``,
@@ -9275,11 +9420,12 @@ export class StashpadView extends ItemView {
       } catch {}
       // log.append is fire-and-forget — no actual await happens, but we keep `await` for symmetry.
       await this.log.append({ type: "create", id, payload: { path, parent: parentId } });
-      if (opts.record !== false) {
+      if (opts.record !== false && !opts.deferUndo) {
         // 0.76.15: push the undo onto the TARGET folder's stack (so it
         // belongs with that folder's history), and only rebuild THIS
         // view's tree when the create was local — a remote create
-        // mustn't repoint this.tree at the remote folder.
+        // mustn't repoint this.tree at the remote folder. (deferUndo:
+        // batched splits push ONE grouped undo in createNotesBatch.)
         const originalBody = body;
         this.plugin.getUndoStack(folder).push({
           label: remote ? "Send note" : "Create note",
@@ -9318,6 +9464,107 @@ export class StashpadView extends ItemView {
     } catch (e) {
       new Notice(`Stashpad: failed to create note (${(e as Error).message})`);
       return null;
+    }
+  }
+
+  /** Create many notes from a split paste as ONE batch. The parent is fixed by
+   *  the caller (so mid-paste navigation can't reparent them), rendering happens
+   *  once at the end instead of per note, a progress bar shows for long pastes,
+   *  and the whole set collapses into a single undo. */
+  private async createNotesBatch(
+    lines: string[],
+    parent: StashpadId | null,
+    createOpts: { targetFolder?: string } | undefined,
+    originalText: string,
+    folder: string,
+  ): Promise<void> {
+    const total = lines.length;
+    const collected: Array<{ path: string; content: string }> = [];
+    const remote = !!createOpts?.targetFolder && createOpts.targetFolder !== this.noteFolder;
+
+    // Progress bar only for long pastes — short ones finish before it'd register.
+    const SHOW_BAR_AT = 8;
+    let bar: { notice: Notice; fill: HTMLElement; label: HTMLElement } | null = null;
+    if (total >= SHOW_BAR_AT) {
+      const notice = new Notice("", 0);
+      const el = notice.noticeEl;
+      el.empty();
+      el.createDiv({ cls: "stashpad-split-progress-title", text: `Splitting into ${total} notes…` });
+      const wrap = el.createDiv({ cls: "stashpad-split-progress-bar" });
+      const fill = wrap.createDiv({ cls: "stashpad-split-progress-fill" });
+      const label = el.createDiv({ cls: "stashpad-split-progress-label", text: `0 / ${total}` });
+      bar = { notice, fill, label };
+    }
+
+    this.beginBulkRender();
+    try {
+      for (let i = 0; i < total; i++) {
+        await this.createNoteUnder(lines[i], parent, {
+          ...(createOpts ?? {}),
+          deferRender: true,
+          deferUndo: true,
+          collectInto: collected,
+        });
+        if (bar) {
+          const done = i + 1;
+          bar.label.setText(`${done} / ${total}`);
+          bar.fill.setCssStyles({ width: `${Math.round((done / total) * 100)}%` });
+          // Yield every few notes so the bar paints and the UI stays responsive.
+          if (done % 5 === 0) await new Promise((r) => window.setTimeout(r, 0));
+        }
+      }
+    } finally {
+      bar?.notice.hide();
+      // Drain the recovery-field writes NOW (instead of one-per-100ms over
+      // several seconds), so they don't trickle in and repaint the list note
+      // by note. Then endBulkRender renders once after a short settle.
+      try { await this.fmSync.flush(); } catch { /* best effort */ }
+      this.endBulkRender();
+    }
+
+    // Single grouped undo for the whole paste.
+    if (collected.length) {
+      const created = collected.slice();
+      this.plugin.getUndoStack(folder).push({
+        label: `Create ${created.length} notes`,
+        undo: async () => {
+          for (const { path } of created) {
+            const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+            if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+          }
+          this.composerDraft = originalText;
+          void this.saveDraft(originalText);
+          void this.recordLastSubmitted("");
+          if (this.composerInputEl) {
+            this.composerInputEl.value = originalText;
+            const end = originalText.length;
+            this.composerInputEl.setSelectionRange(end, end);
+            this.composerInputEl.focus();
+          }
+          if (!remote) this.tree.rebuild(this.noteFolder);
+          this.render();
+        },
+        redo: async () => {
+          for (const { path, content } of created) {
+            if (!(await this.app.vault.adapter.exists(path))) {
+              await this.app.vault.create(path, content);
+            }
+          }
+          this.composerDraft = "";
+          void this.saveDraft("");
+          if (this.composerInputEl) this.composerInputEl.value = "";
+          if (!remote) this.tree.rebuild(this.noteFolder);
+          this.render();
+        },
+      });
+    }
+
+    if (total >= SHOW_BAR_AT) {
+      this.plugin.notifications.show({
+        message: `Created ${collected.length} notes${remote ? ` in \`${folder.split("/").pop()}\`` : ""}.`,
+        kind: "success",
+        category: "create",
+      });
     }
   }
 

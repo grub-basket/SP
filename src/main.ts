@@ -2301,7 +2301,16 @@ export default class StashpadPlugin extends Plugin {
     try {
       return await this.rebootstrapAllFoldersInner();
     } finally {
-      window.setTimeout(() => { this.rebootstrapInProgress = false; }, 2500);
+      window.setTimeout(() => {
+        this.rebootstrapInProgress = false;
+        // Suppression is lifted — repaint open Stashpad views ONCE so they
+        // reflect the rebootstrapped tree (the per-note metadata renders were
+        // dropped while rebootstrapInProgress was true).
+        for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+          const v = leaf.view as { forceReconcileRender?: () => void };
+          v?.forceReconcileRender?.();
+        }
+      }, 2500);
     }
   }
 
@@ -3368,6 +3377,29 @@ export default class StashpadPlugin extends Plugin {
 
   /** Per-folder debounce timers for OKF auto-rebuild. */
   private okfRebuildTimers = new Map<string, number>();
+  /** Folders whose OKF frontmatter is being rewritten right now. Stashpad views
+   *  on these folders suppress metadata-driven re-renders during the rewrite
+   *  (the okf* fields aren't shown in the list) and repaint once when it ends —
+   *  otherwise a 25-note split's OKF rebuild repaints the list ~once per note. */
+  okfRebuildingFolders = new Set<string>();
+
+  /** Run an OKF rebuild for one folder with render suppression on its views. */
+  private async rebuildOkfSuppressed(folder: string): Promise<{ checked: number; written: number }> {
+    this.okfRebuildingFolders.add(folder);
+    try {
+      return await rebuildOkfForFolder(this.app, folder);
+    } finally {
+      // Short tail so trailing metadata-parse events stay suppressed, then
+      // release + repaint the folder's views once.
+      window.setTimeout(() => {
+        this.okfRebuildingFolders.delete(folder);
+        for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+          const v = leaf.view as { noteFolder?: string; forceReconcileRender?: () => void };
+          if (v?.noteFolder === folder) v.forceReconcileRender?.();
+        }
+      }, 600);
+    }
+  }
 
   /** A vault file changed (create/delete/rename) — if it's a real note in an
    *  active OKF folder, schedule a debounced rebuild of that folder. Ignores
@@ -3392,7 +3424,7 @@ export default class StashpadPlugin extends Plugin {
     this.okfRebuildTimers.set(folder, window.setTimeout(() => {
       this.okfRebuildTimers.delete(folder);
       if (!this.okfActiveFolders().includes(folder)) return; // re-check at fire time
-      void rebuildOkfForFolder(this.app, folder).catch((e) => console.warn("[Stashpad] OKF auto-rebuild failed", folder, e));
+      void this.rebuildOkfSuppressed(folder).catch((e) => console.warn("[Stashpad] OKF auto-rebuild failed", folder, e));
     }, 2500));
   }
 
@@ -3401,7 +3433,7 @@ export default class StashpadPlugin extends Plugin {
   async rebuildAllOkf(): Promise<{ folders: number; checked: number; written: number }> {
     const folders = this.okfActiveFolders();
     let checked = 0, written = 0;
-    for (const f of folders) { const r = await rebuildOkfForFolder(this.app, f); checked += r.checked; written += r.written; }
+    for (const f of folders) { const r = await this.rebuildOkfSuppressed(f); checked += r.checked; written += r.written; }
     return { folders: folders.length, checked, written };
   }
 

@@ -1,4 +1,5 @@
 import { App, Modal, Platform, moment, Notice, setIcon, type SecretStorage } from "obsidian";
+import { splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
@@ -381,6 +382,7 @@ export class SplitNoteModal extends Modal {
     private body: string,
     private onSplitAtLine: (firstLineOfSecondPart: number) => void,
     private onSplitAtChar: (charIndex: number) => void,
+    private onSplitMany: (parts: string[]) => void,
   ) {
     super(app);
     this.lines = body.replace(/\r\n/g, "\n").split("\n");
@@ -448,6 +450,27 @@ export class SplitNoteModal extends Modal {
   private render(): void {
     this.contentEl.empty();
 
+    // Quick multi-split: break the whole note into many parts at once, instead
+    // of placing a single divider. One button per delimiter; disabled when it
+    // wouldn't yield 2+ parts. The count preview shows how many you'd get.
+    const quick = this.contentEl.createDiv({ cls: "stashpad-split-quick" });
+    quick.createSpan({ cls: "stashpad-split-quick-label", text: "Split by:" });
+    (["lines", "paragraphs", "headings"] as SplitMode[]).forEach((m) => {
+      const parts = splitIntoChunks(this.body, m);
+      const btn = quick.createEl("button", {
+        cls: "stashpad-split-quick-btn",
+        text: `${SPLIT_MODE_LABELS[m]} (${parts.length})`,
+      });
+      btn.disabled = parts.length < 2;
+      btn.onmousedown = (e) => e.preventDefault();
+      btn.onclick = () => {
+        const chunks = splitIntoChunks(this.body, m);
+        if (chunks.length < 2) { new Notice("That delimiter wouldn't split this note."); return; }
+        this.close();
+        this.onSplitMany(chunks);
+      };
+    });
+
     // Top bar: mode toggle on the left, Confirm button on the right.
     // The confirm button is essential on mobile where Enter is hijacked
     // by the textarea (cursor mode) or doesn't have a physical key
@@ -488,23 +511,29 @@ export class SplitNoteModal extends Modal {
 
   private renderLineMode(): void {
     const list = this.contentEl.createDiv({ cls: "stashpad-split-list" });
+    let divider: HTMLElement | null = null;
     for (let i = 0; i < this.lines.length; i++) {
       if (i === this.lineCursorIdx) {
-        list.createDiv({ cls: "stashpad-split-divider", text: "── split here ──" });
+        divider = list.createDiv({ cls: "stashpad-split-divider", text: "── split here ──" });
       }
       const ln = list.createDiv({ cls: "stashpad-split-line" });
       ln.createSpan({ cls: "stashpad-split-lineno", text: String(i + 1) });
       ln.createSpan({ cls: "stashpad-split-text", text: this.lines[i] || " " });
-      // Tap-to-position on mobile: tapping a line moves the divider to
-      // start of THAT line (it becomes the first line of the second
-      // part). On desktop this is also a nicer UX than only arrows.
+      // Tap-to-position: clicking a line puts the divider BELOW it — the
+      // clicked line ends the first part, so the second part starts at the
+      // next line (i + 1). Nicer than only arrows on desktop, and the natural
+      // reading on mobile ("split after this line").
       ln.onclick = () => {
-        const target = Math.max(1, Math.min(this.lines.length - 1, i));
+        const target = Math.max(1, Math.min(this.lines.length - 1, i + 1));
         if (target === this.lineCursorIdx) return;
         this.lineCursorIdx = target;
         this.render();
       };
     }
+    // Center the divider in the list after a (re)render so you see context both
+    // above AND below the split point — and so moving it with ↑/↓ or a click
+    // doesn't snap scroll to the top and push the divider off-screen.
+    if (divider) window.requestAnimationFrame(() => divider!.scrollIntoView({ block: "center" }));
   }
 
   private renderCursorMode(): void {

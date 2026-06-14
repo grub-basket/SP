@@ -4477,3 +4477,15 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
 
 /* 0.88.1: by-author select inside the View popover */
 .stashpad-view-author-select { margin-left: 8px; max-width: 160px; font-size: var(--font-ui-smaller); }
+
+/* Composer split-on-newlines batch progress (createNotesBatch). */
+.stashpad-split-progress-title { font-weight: 600; margin-bottom: 6px; }
+.stashpad-split-progress-bar { height: 6px; border-radius: 3px; background: var(--background-modifier-border); overflow: hidden; }
+.stashpad-split-progress-fill { height: 100%; width: 0%; background: var(--interactive-accent); transition: width 0.15s ease; }
+.stashpad-split-progress-label { margin-top: 4px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+
+/* Split modal: quick multi-split presets. */
+.stashpad-split-quick { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 10px; }
+.stashpad-split-quick-label { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-right: 2px; }
+.stashpad-split-quick-btn { font-size: var(--font-ui-smaller); padding: 2px 8px; }
+.stashpad-split-quick-btn:disabled { opacity: 0.5; cursor: default; }
