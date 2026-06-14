@@ -672,12 +672,16 @@ export default class StashpadPlugin extends Plugin {
     perf.enabled = !!this.settings.enablePerfProfiling;
     this.encryption = new EncryptionService(
       this.app,
-      () => this.settings.encryption ?? defaultEncryptionConfig(),
+      // Merge defaults so a settings blob written by an older (v1) version still
+      // satisfies the v2 identity fields (they read as null until set up).
+      () => ({ ...defaultEncryptionConfig(), ...(this.settings.encryption ?? {}) }),
       async (cfg) => { this.settings.encryption = cfg; await this.saveSettings(); },
       () => this.settings.encryptionIdleLockMinutes ?? 0,
     );
-    // If a vault password was remembered in this device's keychain, unlock now.
-    void this.encryption.tryAutoUnlock();
+    // Load the synced keyfile into the service's cache FIRST (isConfigured /
+    // accessState / tryAutoUnlock all read it), then auto-unlock if a password is
+    // remembered on this device.
+    void this.encryption.init().then(() => this.encryption.tryAutoUnlock());
     // Reconcile the locked-subtree registry from on-disk `.stashmeta` sidecars
     // (recovers placeholder placement after a settings desync or cross-device
     // sync). Deferred to onLayoutReady (below) so it runs AFTER the vault has
@@ -3025,11 +3029,12 @@ export default class StashpadPlugin extends Plugin {
   }
 
   /** 0.98.0 (Phase 2): unlock a `.stashenc` bundle back into its folder. */
-  async unlockBundleAt(blobPath: string, opts: { silent?: boolean; destFolder?: string } = {}): Promise<boolean> {
-    if (!(await this.ensureEncryptionUnlocked())) return false;
-    const dek = this.encryption.getSessionKey();
-    if (!dek) return false;
-    const folder = (opts.destFolder ?? blobPath.replace(/\/[^/]*$/, "")).replace(/\/+$/, "");
+  /** Decrypt ONE bundle into its folder and return the unlock result. Does NOT
+   *  touch `lockedSubtrees` / settings — the caller updates them — so bulk callers
+   *  can batch a single save instead of one `data.json` write per bundle. Throws
+   *  on failure (caller decides how loud). */
+  private async unlockBundleCore(blobPath: string, dek: Uint8Array, destFolder?: string): Promise<{ notesWritten: number; restoredTo: string }> {
+    const folder = (destFolder ?? blobPath.replace(/\/[^/]*$/, "")).replace(/\/+$/, "");
     // Disk frontmatter, not metadataCache (lags after lock churn) — a stale
     // miss here re-pins an unlocked nested note to ROOT in importStashZip.
     const existing = new Set<StashpadId>();
@@ -3040,8 +3045,16 @@ export default class StashpadPlugin extends Plugin {
         if (typeof id === "string") existing.add(id);
       } catch { /* unreadable — skip */ }
     }
+    return unlockBundle(this.app, blobPath, dek, existing, destFolder);
+  }
+
+  async unlockBundleAt(blobPath: string, opts: { silent?: boolean; destFolder?: string } = {}): Promise<boolean> {
+    if (!(await this.ensureEncryptionUnlocked())) return false;
+    const dek = this.encryption.getSessionKey();
+    if (!dek) return false;
+    const folder = (opts.destFolder ?? blobPath.replace(/\/[^/]*$/, "")).replace(/\/+$/, "");
     try {
-      const r = await unlockBundle(this.app, blobPath, dek, existing, opts.destFolder);
+      const r = await this.unlockBundleCore(blobPath, dek, opts.destFolder);
       this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== blobPath);
       await this.saveSettings();
       if (!opts.silent) this.notifications.show({ message: `Unlocked ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"}.`, kind: "success", category: "system", folder });
@@ -3131,17 +3144,29 @@ export default class StashpadPlugin extends Plugin {
       .filter((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") !== "_deleted")
       .map((f) => f.path);
     if (blobs.length === 0) { new Notice("No locked notes anywhere in the vault."); return 0; }
+    const dek = this.encryption.getSessionKey();
+    if (!dek) return 0;
     const prog = blobs.length > 3 ? new Notice("", 0) : null;
-    let count = 0;
+    // Decrypt each bundle, collecting the ones that succeeded; update
+    // `lockedSubtrees` + write data.json ONCE at the end instead of per bundle
+    // (this used to call unlockBundleAt → saveSettings for every bundle, an
+    // O(n) pile of redundant data.json writes on top of the per-bundle import).
+    let notes = 0;
+    const unlockedBlobs: string[] = [];
     for (let i = 0; i < blobs.length; i++) {
       prog?.setMessage(`🔓 Decrypting ${i + 1}/${blobs.length}…`);
-      try { if (await this.unlockBundleAt(blobs[i], { silent: true })) count++; }
+      try { const r = await this.unlockBundleCore(blobs[i], dek); notes += r.notesWritten; unlockedBlobs.push(blobs[i]); }
       catch (e) { console.warn("[Stashpad] vault unlock skipped", blobs[i], e); }
+    }
+    if (unlockedBlobs.length > 0) {
+      const done = new Set(unlockedBlobs);
+      this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => !done.has(e.blob));
+      await this.saveSettings();
     }
     prog?.hide();
     const folder = blobs[0].replace(/\/[^/]*$/, "");
-    if (count > 0) this.notifications.show({ message: `Unlocked ${count} note${count === 1 ? "" : "s"} across the vault.`, kind: "success", category: "system", folder });
-    return count;
+    if (notes > 0) this.notifications.show({ message: `Unlocked ${notes} note${notes === 1 ? "" : "s"} across the vault.`, kind: "success", category: "system", folder });
+    return notes;
   }
 
   // --- 0.98.29 (Phase 5): encrypted trash (`_deleted/`) ---

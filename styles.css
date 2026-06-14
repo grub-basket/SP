@@ -2302,6 +2302,14 @@
    below the page's top fade (it was clipping the first line). */
 .stashpad-encryption-section { padding: 12px 2px 0; }
 .stashpad-encryption-section > .setting-item-description { padding: 4px 14px 10px; line-height: 1.4; }
+.stashpad-beta-row { display: flex; align-items: center; gap: 8px; padding: 2px 14px 6px; }
+.stashpad-beta-badge {
+  display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+  line-height: 1; padding: 3px 6px; border-radius: 4px; text-transform: uppercase;
+  color: var(--text-on-accent, #fff); background: var(--color-orange, #e07b39);
+}
+.stashpad-beta-note { font-size: 12px; color: var(--text-muted); }
+.stashpad-encryption-modal .stashpad-beta-row { padding: 0 0 10px; }
 .stashpad-export-field { display: flex; flex-direction: column; gap: 4px; }
 .stashpad-export-label { font-size: var(--font-ui-small); color: var(--text-muted); }
 .stashpad-export-name { width: 100%; }

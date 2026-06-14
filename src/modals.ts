@@ -867,6 +867,10 @@ export interface EncryptionPromptOpts {
   onSubmit: (vals: { current?: string; next?: string; remember: boolean }) => Promise<string | null>;
   /** Called if the modal closes without a successful submit (Cancel/Esc). */
   onCancel?: () => void;
+  /** Override the modal title (e.g. "Set shared password"). */
+  title?: string;
+  /** Override / add an intro paragraph (replaces the default setup blurb). */
+  intro?: string;
 }
 
 export class EncryptionPasswordModal extends Modal {
@@ -878,12 +882,15 @@ export class EncryptionPasswordModal extends Modal {
     this.contentEl.empty();
     this.modalEl.addClass("stashpad-export-modal", "stashpad-encryption-modal");
     this.titleEl.setText(
-      mode === "setup" ? "Set up encryption password"
+      this.opts.title ?? (mode === "setup" ? "Set up encryption password"
         : mode === "change" ? "Change encryption password"
-          : "Unlock encryption",
+          : "Unlock encryption"),
     );
+    this.contentEl.createDiv({ cls: "stashpad-beta-row" }).createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
 
-    if (mode === "setup") {
+    if (this.opts.intro) {
+      this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: this.opts.intro });
+    } else if (mode === "setup") {
       this.contentEl.createEl("p", {
         cls: "stashpad-export-desc",
         text: "This single password protects everything you encrypt in this vault. It is stored only on this device. There is NO recovery — if you lose it, anything you've encrypted is gone for good.",
@@ -1087,7 +1094,10 @@ export class TypeToConfirmModal extends Modal {
     const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
     footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
     const go = footer.createEl("button", { cls: "mod-cta mod-warning", text: this.opts.confirmText });
-    const phraseOk = () => input.value.trim() === this.opts.phrase;
+    // Phrase match is case-INSENSITIVE (typing "remove encryption" is as good as
+    // "REMOVE ENCRYPTION") — the phrase is a speed-bump, not a secret. The
+    // password (when required) is still matched exactly by requirePassword().
+    const phraseOk = () => input.value.trim().toLowerCase() === this.opts.phrase.trim().toLowerCase();
     const sync = () => { go.disabled = !phraseOk() || (!!this.opts.requirePassword && !pwInput?.value); };
     input.addEventListener("input", sync);
     pwInput?.addEventListener("input", sync);

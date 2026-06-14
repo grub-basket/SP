@@ -1020,20 +1020,29 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     items.push(this.sectionDef("Vault encryption", "Set one password to encrypt content in this vault. Stored only on this device — there is no recovery if you lose it.", (host) => {
       host.addClass("stashpad-encryption-section");
+      const betaRow = host.createDiv({ cls: "stashpad-beta-row" });
+      betaRow.createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
+      betaRow.createEl("span", { cls: "stashpad-beta-note", text: "Encryption is in beta — keep your own backups of anything important." });
       host.createEl("p", { cls: "setting-item-description" }).setText(
-        "⚠️ One password protects everything you encrypt in this vault, and it's stored ONLY on this device — if you forget it, anything encrypted with it is gone for good. While encrypting, don't run a sync/cloud service over the vault and avoid working in Stashpad mid-operation — either can corrupt files. (File-encryption actions aren't enabled in this version yet — this screen sets up the key.)",
+        "⚠️ Encryption protects what you lock in this vault. Each device unlocks with its own password (which never leaves the device); the vault key is shared with collaborators by approving their device — no shared password. If everyone with access loses their password, anything encrypted is gone for good. While encrypting, avoid a sync/cloud service writing the vault mid-operation — it can corrupt files.",
       );
 
       const kdfProbe = () => enc.argonProbe();
+      const deviceLabel = () => (this.plugin.settings.authorName?.trim() || "This device");
+      // Pull the latest synced keyfile, then re-render once if our access state
+      // changed (e.g. a collaborator approved this device since the page opened).
+      const state0 = enc.accessState();
+      void enc.refresh().then(() => { if (enc.accessState() !== state0) this.update?.(); });
+      const state = state0;
 
-      if (!enc.isConfigured()) {
-        new Setting(host).setName("Encryption").setDesc("Not set up yet.").addButton((b) =>
+      if (state === "none") {
+        new Setting(host).setName("Encryption").setDesc("Not set up yet in this vault.").addButton((b) =>
           b.setButtonText("Set up password…").setCta().onClick(() => {
             new EncryptionPasswordModal(this.app, {
               mode: "setup", offerKeychain: true, kdfProbe,
               onSubmit: async ({ next, remember }) => {
                 if (!next) return "Enter a password.";
-                try { await enc.setup(next, remember); } catch (e) { return (e as Error).message; }
+                try { await enc.setup(next, remember, deviceLabel()); } catch (e) { return (e as Error).message; }
                 new Notice("Encryption set up — unlocked for this session.");
                 this.update?.();
                 return null;
@@ -1043,6 +1052,64 @@ export class StashpadSettingTab extends PluginSettingTab {
         return;
       }
 
+      // Outsider with NO way in yet (no shared password, not already unlocked):
+      // offer both join methods — type the shared password if the vault has one,
+      // or request device approval.
+      if (state === "outsider" && !enc.isUnlocked()) {
+        if (enc.hasSharedPassword()) {
+          new Setting(host).setName("This vault is encrypted")
+            .setDesc("Enter the shared password (ask whoever set it up — they'll send it via a password manager or secure message).")
+            .addButton((b) => b.setButtonText("Unlock with shared password…").setCta().onClick(() => {
+              new EncryptionPasswordModal(this.app, {
+                mode: "unlock", offerKeychain: true,
+                onSubmit: async ({ current, remember }) => {
+                  const ok = await enc.unlock(current!, remember);
+                  if (!ok) return "Wrong password (or the keyfile hasn't synced here yet).";
+                  new Notice("Encryption unlocked."); this.update?.(); return null;
+                },
+              }).open();
+            }));
+        }
+        new Setting(host).setName(enc.hasSharedPassword() ? "Or request device approval" : "This vault is encrypted by a collaborator")
+          .setDesc("Request access — pick a password for THIS device, then ask an existing member to approve it. Once approved (and the keyfile syncs to you), you'll unlock with that password. No shared secret.")
+          .addButton((b) => b.setButtonText("Request access…").onClick(() => {
+            new EncryptionPasswordModal(this.app, {
+              mode: "setup", offerKeychain: true, kdfProbe,
+              onSubmit: async ({ next, remember }) => {
+                if (!next) return "Choose a password for this device.";
+                try { await enc.requestAccess(deviceLabel(), next, remember); } catch (e) { return (e as Error).message; }
+                new Notice("Access requested. An existing member can now approve this device.");
+                this.update?.();
+                return null;
+              },
+            }).open();
+          }));
+        return;
+      }
+
+      if (state === "pending") {
+        new Setting(host).setName("Access requested — waiting for approval")
+          .setDesc("An existing member needs to approve this device. After they do and the keyfile syncs here, reopen this page to unlock with the password you chose.")
+          .addButton((b) => b.setButtonText("Try unlock now").setCta().onClick(() => {
+            new EncryptionPasswordModal(this.app, {
+              mode: "unlock", offerKeychain: true,
+              onSubmit: async ({ current, remember }) => {
+                const ok = await enc.unlock(current!, remember);
+                if (!ok) return "Not approved yet (or wrong password). Ask a member to approve this device, then try again.";
+                new Notice("Encryption unlocked.");
+                this.update?.();
+                return null;
+              },
+            }).open();
+          }))
+          .addButton((b) => b.setButtonText("Cancel request").onClick(async () => {
+            const myId = enc.myIdentityId(); if (myId) await enc.denyJoinRequest(myId);
+            new Notice("Access request cancelled."); this.update?.();
+          }));
+        return;
+      }
+
+      // state === "member"
       const kdfLabel = enc.kdf() === "argon2id" ? "Argon2id" : enc.kdf() === "pbkdf2" ? "PBKDF2 (fallback)" : "";
       const remembered = enc.isRemembered() ? " · remembered on this device" : "";
       new Setting(host).setName("Status").setDesc(
@@ -1069,24 +1136,27 @@ export class StashpadSettingTab extends PluginSettingTab {
       }
 
       if (enc.keychainAvailable() && enc.isRemembered()) {
-        new Setting(host).setName("Forget remembered password").setDesc("Remove the saved password from this device's keychain (you'll re-type it next session).").addButton((b) =>
-          b.setButtonText("Forget").onClick(async () => { await enc.forgetKeychain(); new Notice("Removed from keychain."); this.update?.(); }));
+        new Setting(host).setName("Forget password on this device").setDesc("Drops ONLY the copy saved in this device's keychain — your encryption stays set up and nothing is decrypted or deleted. You'll just re-type the password next session. (To turn encryption off entirely, use “Remove encryption” below.)").addButton((b) =>
+          b.setButtonText("Forget on this device").onClick(async () => { await enc.forgetKeychain(); new Notice("Removed from this device's keychain — encryption still set up."); this.update?.(); }));
       }
 
-      new Setting(host).setName("Change password").setDesc("Re-wraps the same key under a new password — does not re-encrypt your files.").addButton((b) =>
-        b.setButtonText("Change…").onClick(() => {
-          new EncryptionPasswordModal(this.app, {
-            mode: "change", offerKeychain: true, kdfProbe,
-            onSubmit: async ({ current, next, remember }) => {
-              const ok = await enc.changePassword(current!, next!, remember);
-              if (!ok) return "Wrong current password. Try again.";
-              new Notice("Password changed.");
-              this.update?.();
-              return null;
-            },
-          }).open();
-        }));
+      if (enc.amIMember()) {
+        new Setting(host).setName("Change this device's password").setDesc("Re-wraps THIS device's key under a new password — doesn't re-encrypt files or affect other people.").addButton((b) =>
+          b.setButtonText("Change…").onClick(() => {
+            new EncryptionPasswordModal(this.app, {
+              mode: "change", offerKeychain: true, kdfProbe,
+              onSubmit: async ({ current, next, remember }) => {
+                const ok = await enc.changePassword(current!, next!, remember);
+                if (!ok) return "Wrong current password. Try again.";
+                new Notice("Password changed.");
+                this.update?.();
+                return null;
+              },
+            }).open();
+          }));
+      }
 
+      if (enc.amIMember()) {
       new Setting(host).setName("Remove encryption").setDesc("Erases the key from this vault. Refused while any locked notes exist — decrypt everything first (locked notes have NO plaintext copy; losing the key loses them forever).").addButton((b) => {
         b.setButtonText("Remove…").onClick(async () => {
           // 0.98.23: HARD GUARD — locked blobs are the ONLY copy of their notes
@@ -1119,7 +1189,68 @@ export class StashpadSettingTab extends PluginSettingTab {
         });
         (b as unknown as { setWarning?: (v: boolean) => void }).setWarning?.(true);
       });
-    }, ["encryption", "encrypt", "password", "passphrase", "lock", "unlock", "key", "security", "private"]));
+      }
+
+      // ---- Sharing method 1: shared password (Model 1) ----
+      new Setting(host).setName("Sharing").setHeading();
+      if (!enc.isUnlocked()) {
+        host.createEl("p", { cls: "setting-item-description" }).setText("Unlock encryption above to manage how this vault is shared.");
+      } else {
+        if (enc.hasSharedPassword()) {
+          new Setting(host).setName("Shared password").setDesc("ON — anyone who knows it can unlock this vault (no approval). Share it via a password manager or secure message; don't send it in the clear.")
+            .addButton((b) => b.setButtonText("Change…").onClick(() => {
+              new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: false, kdfProbe, title: "Change shared password", intro: "Everyone who unlocks with the shared password will need the new one. Re-share it securely after changing.",
+                onSubmit: async ({ next }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next); } catch (e) { return (e as Error).message; } new Notice("Shared password updated."); this.update?.(); return null; } }).open();
+            }))
+            .addButton((b) => { b.setButtonText("Turn off").onClick(async () => { await enc.removeSharedPassword(); new Notice("Shared password turned off."); this.update?.(); }); (b as unknown as { setWarning?: (v: boolean) => void }).setWarning?.(true); });
+        } else {
+          new Setting(host).setName("Shared password").setDesc("OFF — set one passphrase that everyone types to unlock (the simplest way to share). Anyone who knows it can unlock; turning it off later doesn't claw back copies already synced elsewhere.")
+            .addButton((b) => b.setButtonText("Set shared password…").onClick(() => {
+              new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: false, kdfProbe, title: "Set shared password", intro: "One passphrase everyone types to unlock this vault. Anyone who knows it gets in — share it ONLY through a password manager or secure message, never in the clear. You can turn it off later.",
+                onSubmit: async ({ next }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next); } catch (e) { return (e as Error).message; } new Notice("Shared password set — share it securely with your collaborators."); this.update?.(); return null; } }).open();
+            }));
+        }
+      }
+
+      // ---- Sharing method 2: device approval (Model 3) — members + requests ----
+      new Setting(host).setName("Collaborators (device approval)").setHeading();
+      host.createEl("p", { cls: "setting-item-description" }).setText(
+        "Everyone who can unlock this vault, and devices waiting for access. Approving a request shares the vault key with that device — it never sees a password. Removing a member revokes future access (existing synced copies they already hold aren't clawed back — rotate the key for that, a future feature).",
+      );
+      const refreshBtn = new Setting(host).setName("Synced from the vault keyfile");
+      refreshBtn.addButton((b) => b.setButtonText("Refresh").onClick(async () => { await enc.refresh(); this.update?.(); }));
+
+      if (!enc.isUnlocked()) {
+        host.createEl("p", { cls: "setting-item-description" }).setText("Unlock encryption above to approve or remove collaborators.");
+      } else {
+        const myId = enc.myIdentityId();
+        for (const m of enc.members()) {
+          const isMe = m.id === myId;
+          const s = new Setting(host).setName(`${m.label}${isMe ? " — this device" : ""}`).setDesc(isMe ? "You" : "Member");
+          if (!isMe) {
+            s.addButton((b) => { b.setButtonText("Remove").onClick(async () => {
+              await enc.removeMember(m.id);
+              new Notice(`Removed ${m.label}. (Not full revocation without rotating the key.)`);
+              this.update?.();
+            }); (b as unknown as { setWarning?: (v: boolean) => void }).setWarning?.(true); });
+          }
+        }
+        const reqs = enc.pendingJoinRequests();
+        if (reqs.length === 0) {
+          host.createEl("p", { cls: "setting-item-description" }).setText("No pending access requests.");
+        } else {
+          for (const r of reqs) {
+            new Setting(host).setName(r.label).setDesc("Wants access to this vault")
+              .addButton((b) => b.setButtonText("Approve").setCta().onClick(async () => {
+                try { await enc.approveJoinRequest(r.id); } catch (e) { new Notice((e as Error).message); return; }
+                new Notice(`Approved ${r.label} — they can unlock once the keyfile syncs to them.`);
+                this.update?.();
+              }))
+              .addButton((b) => b.setButtonText("Deny").onClick(async () => { await enc.denyJoinRequest(r.id); new Notice("Request denied."); this.update?.(); }));
+          }
+        }
+      }
+    }, ["encryption", "encrypt", "password", "passphrase", "lock", "unlock", "key", "security", "private", "collaborator", "share", "team", "member", "approve"]));
 
     items.push(this.renderDef("Encrypt items sent to trash", "When ON, deleting a note sends it to Stashpad's encrypted trash (recoverable with your password) instead of a plaintext trash. Default OFF.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.encryptTrash).onChange(async (v) => {

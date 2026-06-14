@@ -481,6 +481,17 @@ export class StashpadView extends ItemView {
     this.registerEvent(this.app.vault.on("delete", (file) => {
       this.completedState.delete(file.path);
       this.taskTaggedState.delete(file.path);
+      // Refresh the list when a note in THIS folder is deleted on the filesystem
+      // (sync client, another device, OS-level delete) — the map cleanup above
+      // doesn't redraw, and the metadataCache "resolved" reconcile can lag or not
+      // fire for a lone delete. Scoped to this folder; rebuild is cheap + render
+      // is debounced, so it's a no-op for unrelated deletes.
+      const slash = file.path.lastIndexOf("/");
+      const dir = (slash >= 0 ? file.path.slice(0, slash) : "").replace(/\/+$/, "");
+      if (file.path.endsWith(".md") && dir === this.noteFolder.replace(/\/+$/, "")) {
+        this.tree.rebuild(this.noteFolder);
+        this.debouncedRender();
+      }
     }));
     this.detachSettings = onSettingsChange(() => {
       this.loadConfig();
