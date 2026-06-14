@@ -16,7 +16,7 @@ LLMs and agents.
 
 ## Install (via BRAT)
 
-1. Install the **BRAT** community plugin in Obsidian.
+1. Install **BRAT** ([Obsidian community page](https://obsidian.md/plugins?id=obsidian42-brat) / [GitHub](https://github.com/TfTHacker/obsidian42-brat)), the beta-plugin manager.
 2. In BRAT, choose "Add beta plugin" and paste: `https://github.com/grub-basket/SP`
 3. Enable **Stashpad** in Community Plugins.
 
@@ -87,7 +87,7 @@ Bug reports and "this felt weird" notes are very welcome via the repo's Issues.
 
 Stashpad is a homage to **Stashpad Notes**, a lovely app discontinued in 2024. This
 plugin brings its chat-style, jot-it-down feeling into Obsidian. Sincere thanks to
-its founders, **Cara and Theo**, for the original that inspired it.
+its founders, **Cara and Theo, and the rest of the Stashpad team**, for the original that inspired it.
 
 ## License
 
