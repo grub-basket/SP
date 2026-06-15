@@ -85,7 +85,7 @@ async function deriveKeyBytes(password: string, salt: Uint8Array, kdf: KdfSpec):
       hashLength: KEY_LEN,
       outputType: "binary",
     });
-    return out as Uint8Array;
+    return out;
   }
   if (kdf.id === KDF_PBKDF2) {
     const baseKey = await crypto.subtle.importKey(

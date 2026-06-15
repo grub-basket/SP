@@ -43,10 +43,10 @@ export function formatDateTime(ms: number, prefs: DateDisplayPrefs): string {
     case "eu":
       return fmt(ms, { ...tz, day: "numeric", month: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
     case "long":
-      return fmt(ms, { ...tz, dateStyle: "full", timeStyle: "short" } as Intl.DateTimeFormatOptions);
+      return fmt(ms, { ...tz, dateStyle: "full", timeStyle: "short" });
     case "locale":
     default:
-      return fmt(ms, { ...tz, dateStyle: "medium", timeStyle: "short" } as Intl.DateTimeFormatOptions);
+      return fmt(ms, { ...tz, dateStyle: "medium", timeStyle: "short" });
   }
 }
 
@@ -61,7 +61,7 @@ export function formatDateOnly(ms: number, prefs: DateDisplayPrefs): string {
     case "eu":
       return fmt(ms, { ...tz, day: "numeric", month: "numeric", year: "numeric" });
     case "long":
-      return fmt(ms, { ...tz, dateStyle: "full" } as Intl.DateTimeFormatOptions);
+      return fmt(ms, { ...tz, dateStyle: "full" });
     case "locale":
     default: {
       // Drop the year when it's the current year for compactness.

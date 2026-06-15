@@ -346,7 +346,7 @@ export class StashpadView extends ItemView {
    *  since updateHeader() doesn't always refresh the visible view-header DOM. */
   private refreshHeaderTitle(): void {
     const text = this.getDisplayText();
-    try { (this.leaf as any).updateHeader?.(); } catch {}
+    try { (this.leaf as any).updateHeader?.(); } catch { /* ignore */ }
     // Direct DOM update for the in-view title — reads from the leaf's view-header.
     const headerEl: HTMLElement | undefined = (this as any).headerEl ?? (this as any).containerEl?.querySelector?.(".view-header");
     const titleEl = headerEl?.querySelector?.(".view-header-title") as HTMLElement | null
@@ -438,7 +438,7 @@ export class StashpadView extends ItemView {
     };
     const popViewScope = (): void => {
       if (!viewScope) return;
-      try { (this.app as any).keymap?.popScope(viewScope); } catch {}
+      try { (this.app as any).keymap?.popScope(viewScope); } catch { /* ignore */ }
       viewScope = null;
     };
     this.viewRoot.addEventListener("focusin", pushViewScope);
@@ -568,7 +568,7 @@ export class StashpadView extends ItemView {
       for (const [focusId, noteId] of loaded) this.lastCursorByFocus.set(focusId, noteId);
       // 0.91.0: hydrate the persisted multi-selection alongside the cursor.
       this.lastSelectionByFocus = this.plugin.loadLastSelection(this.noteFolder);
-    } catch {}
+    } catch { /* ignore */ }
     // On a fresh mount (app reload, tab restore, first-ever open), scroll
     // to the end of the list so the newest notes are visible. Once the
     // user navigates into / out of a parent, scrollByFocus has a saved
@@ -743,7 +743,7 @@ export class StashpadView extends ItemView {
         // …unless it was just Obsidian's auto-focus to a default button (which lands during open).
         // We only respect button focus if it's been there for >150ms (handled by skipping later attempts).
       }
-      this.composerInputEl?.focus({ preventScroll: true } as any);
+      this.composerInputEl?.focus({ preventScroll: true });
     };
     requestAnimationFrame(tryFocus);
     setTimeout(tryFocus, 50);
@@ -778,17 +778,17 @@ export class StashpadView extends ItemView {
     this.authorship.dispose();
     // Persist any in-flight draft text before tear-down. Await so Obsidian
     // doesn't unload the view before saveData() resolves.
-    try { await this.flushDrafts(); } catch {}
+    try { await this.flushDrafts(); } catch { /* ignore */ }
     // Same idea for the order + sort stores, which debounce their writes
     // by 150ms. A close mid-window would otherwise drop the latest
     // reorder/sort-mode change. Both flushes are idempotent + safe to
     // call when nothing's pending.
-    try { await this.order.flush(this.noteFolder); } catch {}
-    try { await this.sortStore.flush(this.noteFolder); } catch {}
+    try { await this.order.flush(this.noteFolder); } catch { /* ignore */ }
+    try { await this.sortStore.flush(this.noteFolder); } catch { /* ignore */ }
     // Drain any pending frontmatter sync writes so the recovery fields
     // (parentLink / children) don't lag behind tree state across a
     // close + reopen.
-    try { await this.fmSync.flush(); } catch {}
+    try { await this.fmSync.flush(); } catch { /* ignore */ }
     // 0.56.17: eager-stamp last-selected cursor; sync localStorage means
     // it survives the reload that follows close.
     this.stampSelectedCursor(true); // 0.91.1: also persists the selection (piggybacked)
@@ -809,7 +809,7 @@ export class StashpadView extends ItemView {
 
   // Persisted in workspace.json — survives reloads and app restarts.
   getState(): Record<string, unknown> {
-    const base = (super.getState() as Record<string, unknown>) ?? {};
+    const base = (super.getState()) ?? {};
     return {
       ...base,
       folderOverride: this.folderOverride,
@@ -898,7 +898,7 @@ export class StashpadView extends ItemView {
         for (const [focusId, noteId] of loaded) this.lastCursorByFocus.set(focusId, noteId);
         // 0.91.0: re-hydrate the persisted multi-selection for the new folder.
         this.lastSelectionByFocus = this.plugin.loadLastSelection(this.noteFolder);
-      } catch {}
+      } catch { /* ignore */ }
       const savedCursorId = this.lastCursorByFocus.get(this.focusId);
       let policy: ScrollPolicy;
       if (savedCursorId && this.tree.get(savedCursorId)) {
@@ -1111,7 +1111,7 @@ export class StashpadView extends ItemView {
    *  loses the new focus. requestSaveLayout is debounced by Obsidian so
    *  rapid navigation won't thrash disk. */
   private persistFocus(): void {
-    try { this.app.workspace.requestSaveLayout(); } catch {}
+    try { this.app.workspace.requestSaveLayout(); } catch { /* ignore */ }
   }
 
   // --- Undo / Redo ---
@@ -1222,14 +1222,14 @@ export class StashpadView extends ItemView {
         if (!(await this.app.vault.adapter.exists(a.path))) {
           await this.app.vault.createBinary(a.path, a.data);
         }
-      } catch {}
+      } catch { /* ignore */ }
     }
     for (const n of snap.notes) {
       try {
         if (!(await this.app.vault.adapter.exists(n.path))) {
           await this.app.vault.create(n.path, n.content);
         }
-      } catch {}
+      } catch { /* ignore */ }
     }
     // Re-apply pendingFocusIds on every pass so the cursor lands on the restored
     // notes once the metadata cache catches up. Stop once they're found.
@@ -1274,11 +1274,11 @@ export class StashpadView extends ItemView {
     // Trash notes (children before parents — already in that order from our delete walk).
     for (const n of snap.notes) {
       const f = this.app.vault.getAbstractFileByPath(n.path) as TFile | null;
-      if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+      if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
     }
     for (const a of snap.attachments) {
       const f = this.app.vault.getAbstractFileByPath(a.path) as TFile | null;
-      if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+      if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
     }
     this.tree.rebuild(this.noteFolder);
     this.render();
@@ -1325,7 +1325,7 @@ export class StashpadView extends ItemView {
       all[this.noteFolder] = text;
       this.plugin.settings.lastSubmitted = all;
       await this.plugin.persistSettingsQuiet();
-    } catch {}
+    } catch { /* ignore */ }
   }
 
   /** True if there's a saved draft for this folder that's worth offering to restore. */
@@ -1729,8 +1729,8 @@ export class StashpadView extends ItemView {
       // Fall back to the registry entry only if the scan didn't carry them.
       const entry = (this.plugin.settings.lockedSubtrees ?? []).find((x) => x.blob === lk.blob);
       const rootId = lk.rootId ?? entry?.rootId ?? null;
-      const parentId = (lk.parentId ?? entry?.parentId ?? ROOT_ID) as StashpadId;
-      const prevSibling = (lk.prevSibling ?? entry?.prevSibling ?? null) as StashpadId | null;
+      const parentId = (lk.parentId ?? entry?.parentId ?? ROOT_ID);
+      const prevSibling = (lk.prevSibling ?? entry?.prevSibling ?? null);
       const ok = await this.plugin.unlockBundleAt(lk.blob);
       if (ok) {
         this.selection.clear();
@@ -2117,7 +2117,7 @@ export class StashpadView extends ItemView {
     const list = this.listEl;
     if (!list) return;
     if (anchor) {
-      const row = list.querySelector(`[data-id="${anchor.id}"]`) as HTMLElement | null;
+      const row = list.querySelector(`[data-id="${anchor.id}"]`);
       if (row) {
         const listTop = list.getBoundingClientRect().top;
         const rowTop = row.getBoundingClientRect().top - listTop;
@@ -2205,12 +2205,12 @@ export class StashpadView extends ItemView {
     // a global style recalc on every DOM change inside the leaf —
     // which on each arrow-key cursor move (toggles is-cursor on rows)
     // re-validated every selector. Direct classes have zero recalc cost.
-    const leafEl = this.containerEl.closest(".workspace-leaf") as HTMLElement | null;
+    const leafEl = this.containerEl.closest(".workspace-leaf");
     if (leafEl) {
       leafEl.classList.toggle("stashpad-is-tiny", this.tinyMode);
       leafEl.classList.toggle("stashpad-is-compact", this.compactMode);
     }
-    const tabsEl = this.containerEl.closest(".workspace-tabs") as HTMLElement | null;
+    const tabsEl = this.containerEl.closest(".workspace-tabs");
     if (tabsEl) {
       tabsEl.classList.toggle("stashpad-has-tiny", this.tinyMode);
     }
@@ -2311,7 +2311,7 @@ export class StashpadView extends ItemView {
         ta.focus({ preventScroll: true });
         if (caret != null) {
           const c = Math.min(caret, ta.value.length);
-          try { ta.setSelectionRange(c, c); } catch {}
+          try { ta.setSelectionRange(c, c); } catch { /* ignore */ }
         }
       } else {
         requestAnimationFrame(() => {
@@ -2320,7 +2320,7 @@ export class StashpadView extends ItemView {
           t.focus({ preventScroll: true });
           if (caret != null) {
             const c = Math.min(caret, t.value.length);
-            try { t.setSelectionRange(c, c); } catch {}
+            try { t.setSelectionRange(c, c); } catch { /* ignore */ }
           }
         });
       }
@@ -2412,7 +2412,7 @@ export class StashpadView extends ItemView {
           const listForScroll = this.listEl;
           const apply = () => {
             this.suppressScrollSave = true;
-            const row = listForScroll.querySelector(`[data-id="${targetId}"]`) as HTMLElement | null;
+            const row = listForScroll.querySelector(`[data-id="${targetId}"]`);
             if (row) row.scrollIntoView({ block: align, behavior: "auto" });
             Promise.resolve().then(() => { this.suppressScrollSave = false; });
           };
@@ -2491,14 +2491,14 @@ export class StashpadView extends ItemView {
       // with typing-into-composer-then-submitting flows: the submit
       // path explicitly calls scrollListToBottom, re-arming the flag.
       targetList.addEventListener("wheel", (e) => {
-        if ((e as WheelEvent).deltaY < 0) this.stickToListBottom = false;
+        if ((e).deltaY < 0) this.stickToListBottom = false;
       }, { passive: true });
       let lastTouchY = 0;
       targetList.addEventListener("touchstart", (e) => {
-        lastTouchY = (e as TouchEvent).touches[0]?.clientY ?? 0;
+        lastTouchY = (e).touches[0]?.clientY ?? 0;
       }, { passive: true });
       targetList.addEventListener("touchmove", (e) => {
-        const y = (e as TouchEvent).touches[0]?.clientY ?? lastTouchY;
+        const y = (e).touches[0]?.clientY ?? lastTouchY;
         if (y > lastTouchY) this.stickToListBottom = false; // finger moved DOWN → list scrolls UP
         lastTouchY = y;
       }, { passive: true });
@@ -2647,7 +2647,7 @@ export class StashpadView extends ItemView {
   toggleCompactMode(): void {
     this.compactMode = !this.compactMode;
     this.render();
-    try { (this.app.workspace as any).requestSaveLayout?.(); } catch {}
+    try { (this.app.workspace as any).requestSaveLayout?.(); } catch { /* ignore */ }
   }
 
   /** Select-mode toggle + ⋯ actions menu. Rendered at the START of the
@@ -2893,7 +2893,7 @@ export class StashpadView extends ItemView {
     const close = (): void => {
       pop.remove();
       doc.removeEventListener("mousedown", outside, true);
-      try { (this.app as any).keymap?.popScope(scope); } catch {}
+      try { (this.app as any).keymap?.popScope(scope); } catch { /* ignore */ }
     };
     const outside = (ev: MouseEvent): void => {
       if (!pop.contains(ev.target as Node) && ev.target !== anchor && !anchor.contains(ev.target as Node)) {
@@ -2986,7 +2986,7 @@ export class StashpadView extends ItemView {
     const close = (): void => {
       pop.remove();
       doc.removeEventListener("mousedown", outside, true);
-      try { (this.app as any).keymap?.popScope(scope); } catch {}
+      try { (this.app as any).keymap?.popScope(scope); } catch { /* ignore */ }
     };
     const outside = (ev: MouseEvent): void => {
       if (!pop.contains(ev.target as Node) && ev.target !== anchor && !anchor.contains(ev.target as Node)) {
@@ -3071,7 +3071,7 @@ export class StashpadView extends ItemView {
     const close = (): void => {
       pop.remove();
       doc.removeEventListener("mousedown", outside, true);
-      try { (this.app as any).keymap?.popScope(scope); } catch {}
+      try { (this.app as any).keymap?.popScope(scope); } catch { /* ignore */ }
     };
     const outside = (ev: MouseEvent): void => {
       if (!pop.contains(ev.target as Node) && ev.target !== anchor && !anchor.contains(ev.target as Node)) close();
@@ -3220,7 +3220,7 @@ export class StashpadView extends ItemView {
     const close = (): void => {
       pop.remove();
       doc.removeEventListener("mousedown", outside, true);
-      try { (this.app as any).keymap?.popScope(scope); } catch {}
+      try { (this.app as any).keymap?.popScope(scope); } catch { /* ignore */ }
     };
     const outside = (ev: MouseEvent): void => {
       if (!pop.contains(ev.target as Node) && ev.target !== anchor && !anchor.contains(ev.target as Node)) close();
@@ -3282,7 +3282,7 @@ export class StashpadView extends ItemView {
     }
 
     const hcRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
-    const hcCheck = hcRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const hcCheck = hcRow.createEl("input", { type: "checkbox" });
     hcCheck.checked = this.currentHideChildless();
     hcRow.createDiv({ cls: "stashpad-view-popover-main" })
       .createSpan({ cls: "stashpad-view-popover-label", text: "Hide childless notes" });
@@ -3303,7 +3303,7 @@ export class StashpadView extends ItemView {
     };
 
     const hdRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
-    const hdCheck = hdRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const hdCheck = hdRow.createEl("input", { type: "checkbox" });
     hdCheck.checked = this.currentHideCompleted();
     hdRow.createDiv({ cls: "stashpad-view-popover-main" })
       .createSpan({ cls: "stashpad-view-popover-label", text: "Hide completed notes" });
@@ -3319,7 +3319,7 @@ export class StashpadView extends ItemView {
 
     // 0.79.8: hide notes without attachments (works in every view mode).
     const haRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
-    const haCheck = haRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const haCheck = haRow.createEl("input", { type: "checkbox" });
     haCheck.checked = this.currentAttachmentsOnly();
     haRow.createDiv({ cls: "stashpad-view-popover-main" })
       .createSpan({ cls: "stashpad-view-popover-label", text: "Hide notes without attachments" });
@@ -3337,7 +3337,7 @@ export class StashpadView extends ItemView {
 
     const attRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
     if (current !== "everything") attRow.addClass("is-disabled");
-    const attCheck = attRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const attCheck = attRow.createEl("input", { type: "checkbox" });
     attCheck.checked = this.currentIncludeAttachments();
     attCheck.disabled = current !== "everything";
     attRow.createDiv({ cls: "stashpad-view-popover-main" })
@@ -3360,7 +3360,7 @@ export class StashpadView extends ItemView {
     container.createDiv({ cls: "stashpad-view-popover-divider" });
 
     const impRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
-    const impCheck = impRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const impCheck = impRow.createEl("input", { type: "checkbox" });
     impCheck.checked = this.importedOnly;
     impRow.createDiv({ cls: "stashpad-view-popover-main" })
       .createSpan({ cls: "stashpad-view-popover-label", text: "Imported notes only" });
@@ -3437,7 +3437,7 @@ export class StashpadView extends ItemView {
    *  rows' labels (Today vs 24h, etc.) on the next open. */
   private populateTimeMenuBody(container: HTMLElement, onPicked: () => void): void {
     const calRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
-    const calCheck = calRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const calCheck = calRow.createEl("input", { type: "checkbox" });
     calCheck.checked = this.timeFilterCalendar;
     calRow.createDiv({ cls: "stashpad-view-popover-main" })
       .createSpan({ cls: "stashpad-view-popover-label", text: "Calendar mode" });
@@ -3616,7 +3616,7 @@ export class StashpadView extends ItemView {
 
     // Sticky-on-top checkbox.
     const stickyWrap = bar.createDiv({ cls: "stashpad-tiny-sticky" });
-    const stickyCb = stickyWrap.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const stickyCb = stickyWrap.createEl("input", { type: "checkbox" });
     stickyCb.checked = this.tinyAlwaysOnTop;
     stickyWrap.createSpan({ text: "Sticky" });
     stickyCb.onchange = () => {
@@ -3676,7 +3676,7 @@ export class StashpadView extends ItemView {
     const pop = document.createElement("div");
     pop.className = "stashpad-tiny-opacity-popover";
     pop.createSpan({ cls: "stashpad-tiny-opacity-label", text: "Transparency" });
-    const slider = pop.createEl("input", { type: "range" }) as HTMLInputElement;
+    const slider = pop.createEl("input", { type: "range" });
     slider.min = "30"; slider.max = "100"; slider.step = "1";
     slider.value = String(Math.round(this.tinyOpacity * 100));
     const pct = pop.createSpan({ cls: "stashpad-tiny-opacity-pct", text: `${slider.value}%` });
@@ -3732,12 +3732,12 @@ export class StashpadView extends ItemView {
         ?? (window as any).require?.("electron");
       const remote = electron?.remote
         ?? ownerWindow?.electron?.remote
-        ?? (ownerWindow as any)?.["@electron/remote"];
+        ?? (ownerWindow)?.["@electron/remote"];
       // First try: getCurrentWindow from the owner-document's renderer
       // context. If require is sandboxed away in the popout, this is
       // null and we fall through.
       let win = remote?.getCurrentWindow?.()
-        ?? (ownerWindow as any)?.electronWindow
+        ?? (ownerWindow)?.electronWindow
         ?? null;
       // 0.61.5 fallback: enumerate every BrowserWindow and match the one
       // whose webContents ID equals the owner window's webContents ID.
@@ -3817,12 +3817,12 @@ export class StashpadView extends ItemView {
         try {
           const cur = win.getBounds?.();
           if (cur && typeof cur.x === "number") { x = cur.x; y = cur.y; }
-        } catch {}
-        try { win.setBounds?.({ x, y, width: targetW, height: targetH }); } catch {}
-        try { win.setSize?.(targetW, targetH); } catch {}
+        } catch { /* ignore */ }
+        try { win.setBounds?.({ x, y, width: targetW, height: targetH }); } catch { /* ignore */ }
+        try { win.setSize?.(targetW, targetH); } catch { /* ignore */ }
         win.setAlwaysOnTop?.(!!this.tinyAlwaysOnTop);
         // 0.77.0-feat: restore the saved opacity when entering tiny.
-        try { win.setOpacity?.(Math.min(1, Math.max(0.3, this.tinyOpacity))); } catch {}
+        try { win.setOpacity?.(Math.min(1, Math.max(0.3, this.tinyOpacity))); } catch { /* ignore */ }
       } else {
         win.setAlwaysOnTop?.(false);
       }
@@ -3840,7 +3840,7 @@ export class StashpadView extends ItemView {
     // 0.77.0-feat: restore full opacity on the way out so the
     // expanded window isn't left see-through.
     this.tinyOpacity = 1;
-    try { this.getOwnElectronWindow()?.setOpacity?.(1); } catch {}
+    try { this.getOwnElectronWindow()?.setOpacity?.(1); } catch { /* ignore */ }
     // 0.61.10: also clear compact when leaving tiny. The user expected
     // expand-out to restore the full chrome, not retain the compact
     // row-stripping. (They can still toggle compact back on via the
@@ -3868,10 +3868,10 @@ export class StashpadView extends ItemView {
       } else {
         win?.maximize?.();
       }
-    } catch {}
+    } catch { /* ignore */ }
     this.render();
     // Persist state so reload doesn't snap back to tiny.
-    try { await (this.app.workspace as any).requestSaveLayout?.(); } catch {}
+    try { await (this.app.workspace as any).requestSaveLayout?.(); } catch { /* ignore */ }
   }
 
   /** Enter tiny mode (called by the command or right after the popout
@@ -3880,7 +3880,7 @@ export class StashpadView extends ItemView {
     this.tinyMode = true;
     this.applyTinyWindow();
     this.render();
-    try { (this.app.workspace as any).requestSaveLayout?.(); } catch {}
+    try { (this.app.workspace as any).requestSaveLayout?.(); } catch { /* ignore */ }
   }
 
   private renderBreadcrumb(parent: HTMLElement): void {
@@ -4063,8 +4063,8 @@ export class StashpadView extends ItemView {
    *  focused header is in view; show it when the full one scrolls past
    *  the top of the list. */
   private installFocusedMiniObserver(list: HTMLElement): void {
-    const full = list.querySelector(".stashpad-focused") as HTMLElement | null;
-    const mini = list.querySelector(".stashpad-focused-mini") as HTMLElement | null;
+    const full = list.querySelector(".stashpad-focused");
+    const mini = list.querySelector(".stashpad-focused-mini");
     if (!full || !mini) return;
     if (this.focusedMiniObserver) this.focusedMiniObserver.disconnect();
     this.focusedMiniObserver = new IntersectionObserver(
@@ -4369,7 +4369,7 @@ export class StashpadView extends ItemView {
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
       setIcon(moreBtn, "ellipsis-vertical");
       moreBtn.title = "Actions";
-      moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e as unknown as MouseEvent, node); };
+      moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = moreBtn;
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil" });
@@ -4608,7 +4608,7 @@ export class StashpadView extends ItemView {
     const ta = taWrap.createEl("textarea", {
       cls: "stashpad-composer-input",
       attr: { rows: "2", placeholder: this.composerPlaceholder(enterSubmits, splitMode) },
-    }) as HTMLTextAreaElement;
+    });
     ta.value = this.composerDraft;
 
     // Debounce non-empty saves so fast typing doesn't queue a disk write
@@ -4641,7 +4641,7 @@ export class StashpadView extends ItemView {
         // composerExitAt guard in the list-level Escape handlers).
         this.composerExitAt = Date.now();
         ta.blur();
-        this.viewRoot?.focus({ preventScroll: true } as any);
+        this.viewRoot?.focus({ preventScroll: true });
         return false;
       });
       // 0.69.39: Mod+Z / Mod+Shift+Z must reach the textarea's native
@@ -4657,7 +4657,7 @@ export class StashpadView extends ItemView {
     };
     const popComposerScope = (): void => {
       if (!composerScope) return;
-      try { (this.app as any).keymap?.popScope(composerScope); } catch {}
+      try { (this.app as any).keymap?.popScope(composerScope); } catch { /* ignore */ }
       composerScope = null;
     };
     ta.addEventListener("focus", pushComposerScope);
@@ -4716,7 +4716,7 @@ export class StashpadView extends ItemView {
       if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
       e.preventDefault();
       e.stopPropagation();
-      try { e.dataTransfer.dropEffect = "copy"; } catch {}
+      try { e.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
     });
     ta.addEventListener("drop", (e) => {
       const files = Array.from(e.dataTransfer?.files ?? []);
@@ -4771,7 +4771,7 @@ export class StashpadView extends ItemView {
 
     const fileInput = composer.createEl("input", {
       cls: "stashpad-composer-file-input", type: "file", attr: { multiple: "true" },
-    }) as HTMLInputElement;
+    });
     fileInput.setCssStyles({ display: "none" });
 
     const btnRail = composer.createDiv({ cls: "stashpad-composer-btn-rail" });
@@ -4937,8 +4937,8 @@ export class StashpadView extends ItemView {
       // reload (or beforeunload race) right after Enter can't see a stale
       // draft on disk. Earlier this was fire-and-forget, which let the
       // draft re-appear on reload if writes were still in flight.
-      try { await this.saveDraft(""); } catch {}
-      try { await this.recordLastSubmitted(text); } catch {}
+      try { await this.saveDraft(""); } catch { /* ignore */ }
+      try { await this.recordLastSubmitted(text); } catch { /* ignore */ }
       const split = this.modeSplit ?? getSettings().splitOnLines;
       const dest = this.nextDestination;
       // 0.76.15: capture the cross-folder target (if any) before
@@ -4953,7 +4953,7 @@ export class StashpadView extends ItemView {
       // row is in this view). Remote sends leave the local list alone.
       this.autoSelectNewest = !remote;
       this.scrollToBottomOnNextRender = !remote;
-      const createOpts = remote ? { targetFolder: destFolder! } : undefined;
+      const createOpts = remote ? { targetFolder: destFolder } : undefined;
       // Bind the parent ONCE, here at submit time. A split otherwise reads
       // this.focusId on each per-note await, so navigating mid-paste reparents
       // the remaining notes into whatever level you moved to (the "looks
@@ -4965,7 +4965,7 @@ export class StashpadView extends ItemView {
         if (lines.length === 1) {
           await this.createNoteUnder(lines[0], parent, createOpts);
         } else if (lines.length > 1) {
-          await this.createNotesBatch(lines, parent, createOpts, text, remote ? destFolder! : this.noteFolder);
+          await this.createNotesBatch(lines, parent, createOpts, text, remote ? destFolder : this.noteFolder);
         }
       } else {
         await this.createNoteUnder(text, parent, createOpts);
@@ -5231,7 +5231,7 @@ export class StashpadView extends ItemView {
       // be hidden. Clamp the visible bottom to just above the composer so the
       // tapped/selected row scrolls into the area you can actually see.
       if (Platform.isMobile && document.body.classList.contains("stashpad-keyboard-open")) {
-        const comp = this.viewRoot?.querySelector(".stashpad-composer") as HTMLElement | null;
+        const comp = this.viewRoot?.querySelector(".stashpad-composer");
         if (comp) bottomBound = Math.min(bottomBound, comp.getBoundingClientRect().top - pad);
       }
       if (rr.top < topBound) list.scrollTop += rr.top - topBound;
@@ -6038,7 +6038,7 @@ export class StashpadView extends ItemView {
         }
         return (target as any)[prop];
       },
-    }) as unknown as typeof this.tree;
+    });
     new StashpadSuggest(this.app, subtreeTree, (n) => this.titleForNode(n), {
       mode: "search",
       placeholder: `Search in "${this.titleForNode(this.tree.get(focusId) ?? this.tree.getRoot()).trim()}"…`,
@@ -6379,7 +6379,7 @@ export class StashpadView extends ItemView {
                 if (m.col) fm.color = m.col;
                 else delete fm.color;
               });
-            } catch {}
+            } catch { /* ignore */ }
           }
           this.tree.rebuild(undoFolder);
           this.render();
@@ -6613,7 +6613,7 @@ export class StashpadView extends ItemView {
             if (p.isRoot) {
               await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = p.oldParent; });
             }
-          } catch {}
+          } catch { /* ignore */ }
         }
         this.tree.rebuild(this.noteFolder);
         this.render();
@@ -6627,7 +6627,7 @@ export class StashpadView extends ItemView {
             if (p.isRoot) {
               await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = newParentId; });
             }
-          } catch {}
+          } catch { /* ignore */ }
         }
         this.tree.rebuild(this.noteFolder);
         this.render();
@@ -6941,7 +6941,7 @@ export class StashpadView extends ItemView {
         this.tree.insertSynthetic({
           id: cloneId, parent: newParent, children: [], file: newFile, created,
         });
-      } catch {}
+      } catch { /* ignore */ }
       // Background-sync the new clone's recovery fields + bump the new
       // parent's children list. Cheap enqueue; the queue drains in the
       // background, not blocking the clone loop.
@@ -7000,7 +7000,7 @@ export class StashpadView extends ItemView {
         // depth-first parent → child, so reverse it for safe deletion.
         for (const p of [...createdPaths].reverse()) {
           const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -7107,7 +7107,7 @@ export class StashpadView extends ItemView {
     // a cut), and refuses an archive/auto-encrypting destination.
     if (clip.folder !== this.noteFolder) {
       const cursorX = this.currentChildren[this.cursorIdx] ?? null;
-      const destParent = ((cursorX?.parent ?? this.focusId) ?? ROOT_ID) as StashpadId;
+      const destParent = ((cursorX?.parent ?? this.focusId) ?? ROOT_ID);
       const mode = clip.mode;
       const srcFolder = clip.folder;
       const result = await this.plugin.crossFolderPaste(srcFolder, clip.ids, this.noteFolder, destParent, mode);
@@ -7140,7 +7140,7 @@ export class StashpadView extends ItemView {
     // Paste position: after the cursor row (same parent); fall back to the
     // focused subtree root when there's no cursor.
     const cursor = this.currentChildren[this.cursorIdx] ?? null;
-    const parentId = ((cursor?.parent ?? this.focusId) ?? ROOT_ID) as StashpadId;
+    const parentId = ((cursor?.parent ?? this.focusId) ?? ROOT_ID);
 
     if (clip.mode === "cut") {
       // Cycle guard: never paste a subtree under itself/its own descendant.
@@ -7181,7 +7181,7 @@ export class StashpadView extends ItemView {
       undo: async () => {
         for (const p of [...createdPaths].reverse()) {
           const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -7285,7 +7285,7 @@ export class StashpadView extends ItemView {
       redo: async () => {
         for (const sn of [...snap.notes]) {
           const f = this.app.vault.getAbstractFileByPath(sn.path) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -7333,7 +7333,7 @@ export class StashpadView extends ItemView {
           undo: async () => {
             for (const p of [...createdPaths].reverse()) {
               const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-              if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+              if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
             }
             this.tree.rebuild(folder);
             this.render();
@@ -7695,7 +7695,7 @@ export class StashpadView extends ItemView {
         folderOverride: this.folderOverride,
       },
     });
-    ws.setActiveLeaf(leaf, { focus: true } as any);
+    ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
     // 0.57.5: same return-to-origin one-shot as openFolderInNewTab /
     // openFileAtEnd — when this spawned tab closes, the originating
@@ -7714,7 +7714,7 @@ export class StashpadView extends ItemView {
         return found;
       })();
       if (originStillOpen) {
-        ws.setActiveLeaf(originLeaf, { focus: true } as any);
+        ws.setActiveLeaf(originLeaf, { focus: true });
         ws.revealLeaf(originLeaf);
       }
     });
@@ -7746,7 +7746,7 @@ export class StashpadView extends ItemView {
         folderOverride: cleaned === settingsFolder ? null : cleaned,
       },
     });
-    ws.setActiveLeaf(leaf, { focus: true } as any);
+    ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
   }
 
@@ -7767,7 +7767,7 @@ export class StashpadView extends ItemView {
         folderOverride: cleaned === settingsFolder ? null : cleaned,
       },
     });
-    ws.setActiveLeaf(leaf, { focus: true } as any);
+    ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
 
     // One-shot: when the spawned leaf closes, restore focus to the
@@ -7786,7 +7786,7 @@ export class StashpadView extends ItemView {
         return found;
       })();
       if (originStillOpen) {
-        ws.setActiveLeaf(originLeaf, { focus: true } as any);
+        ws.setActiveLeaf(originLeaf, { focus: true });
         ws.revealLeaf(originLeaf);
       }
     });
@@ -7828,7 +7828,7 @@ export class StashpadView extends ItemView {
     const originLeaf = this.leaf;
     const leaf = ws.getLeaf("tab");
     await leaf.openFile(file, { active: true });
-    ws.setActiveLeaf(leaf, { focus: true } as any);
+    ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
 
     // One-shot listener: when the active leaf changes AND our edit leaf is
@@ -7850,7 +7850,7 @@ export class StashpadView extends ItemView {
         return found;
       })();
       if (originStillOpen) {
-        ws.setActiveLeaf(originLeaf, { focus: true } as any);
+        ws.setActiveLeaf(originLeaf, { focus: true });
         ws.revealLeaf(originLeaf);
       }
     });
@@ -7866,7 +7866,7 @@ export class StashpadView extends ItemView {
         editor.setCursor({ line: last, ch });
         editor.scrollIntoView({ from: { line: last, ch }, to: { line: last, ch } }, true);
         editor.focus();
-      } catch {}
+      } catch { /* ignore */ }
     });
   }
 
@@ -8463,7 +8463,7 @@ export class StashpadView extends ItemView {
       const n = this.tree.get(id);
       if (!n?.file) continue;
       priorParents.push({ id, path: n.file.path, oldParent: n.parent });
-      affectedParents.add((n.parent ?? ROOT_ID) as StashpadId);
+      affectedParents.add((n.parent ?? ROOT_ID));
     }
     affectedParents.add(targetParentId);
 
@@ -8528,7 +8528,7 @@ export class StashpadView extends ItemView {
     // and wipes the highlight. tryReselect bails as soon as the row is
     // visibly selected, so it's a no-op if the first render stuck.
     const targetIsFocused = this.focusId === targetParentId;
-    const focusTarget: StashpadId = targetIsFocused ? sourceIds[0]! : targetParentId;
+    const focusTarget: StashpadId = targetIsFocused ? sourceIds[0] : targetParentId;
     const focusIdsForRender = targetIsFocused ? sourceIds.slice() : [targetParentId];
     if (targetIsFocused) {
       this.pendingFocusIds = focusIdsForRender;
@@ -8958,7 +8958,7 @@ export class StashpadView extends ItemView {
                   folder: this.noteFolder,
                 });
                 attsRemoved += 1;
-              } catch {}
+              } catch { /* ignore */ }
             }
           }
         }
@@ -8996,7 +8996,7 @@ export class StashpadView extends ItemView {
         }
         for (const n of allNotes) {
           if (!n.file) continue;
-          try { await this.app.fileManager.trashFile(n.file); } catch {}
+          try { await this.app.fileManager.trashFile(n.file); } catch { /* ignore */ }
           await this.log.append({ type: "delete", id: n.id, payload: { path: n.file.path, attachmentsRemoved: alsoAtts ? uniqueAtts : [] } });
         }
         this.selection.clear();
@@ -9117,7 +9117,7 @@ export class StashpadView extends ItemView {
         // with autofocus-after-send OFF. Suppress that activation
         // focus briefly and land on the list instead.
         this.suppressComposerFocusUntil = Date.now() + 500;
-        this.viewRoot?.focus({ preventScroll: true } as any);
+        this.viewRoot?.focus({ preventScroll: true });
         this.plugin.notifications.show({
           message: `Split "${this.titleForNode(target)}" into two`,
           kind: "success",
@@ -9129,7 +9129,7 @@ export class StashpadView extends ItemView {
         // Find the new note's path so undo/redo can locate it.
         const newNode = newId ? this.tree.get(newId) : undefined;
         const newPath = newNode?.file?.path;
-        const newContentForRedo = newPath ? await this.app.vault.read(newNode!.file!) : null;
+        const newContentForRedo = newPath ? await this.app.vault.read(newNode.file!) : null;
 
         const folder = this.noteFolder;
         this.plugin.getUndoStack(folder).push({
@@ -9138,7 +9138,7 @@ export class StashpadView extends ItemView {
             // Trash the new note, restore the original's full body.
             if (newPath) {
               const nf = this.app.vault.getAbstractFileByPath(newPath) as TFile | null;
-              if (nf) { try { await this.app.fileManager.trashFile(nf); } catch {} }
+              if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
             }
             const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
             if (of) await this.app.vault.modify(of, originalContent);
@@ -9192,7 +9192,7 @@ export class StashpadView extends ItemView {
         }
         await this.log.append({ type: "rename", id: target.id, payload: { action: "split-many", parts: parts.length } });
         this.suppressComposerFocusUntil = Date.now() + 500;
-        this.viewRoot?.focus({ preventScroll: true } as any);
+        this.viewRoot?.focus({ preventScroll: true });
         this.plugin.notifications.show({
           message: `Split "${this.titleForNode(target)}" into ${parts.length}`,
           kind: "success", category: "split", affectedIds: [target.id], folder: this.noteFolder,
@@ -9204,7 +9204,7 @@ export class StashpadView extends ItemView {
           undo: async () => {
             for (const { path } of created) {
               const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-              if (nf) { try { await this.app.fileManager.trashFile(nf); } catch {} }
+              if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
             }
             const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
             if (of) await this.app.vault.modify(of, originalContent);
@@ -9411,7 +9411,7 @@ export class StashpadView extends ItemView {
           if (templateFm) {
             try {
               await this.app.fileManager.processFrontMatter(f as TFile, (m: any) => {
-                for (const [k, v] of Object.entries(templateFm!)) {
+                for (const [k, v] of Object.entries(templateFm)) {
                   if (RESERVED_FRONTMATTER.includes(k)) continue;
                   if (m[k] === undefined) m[k] = v;
                 }
@@ -9421,7 +9421,7 @@ export class StashpadView extends ItemView {
             }
           }
         }
-      } catch {}
+      } catch { /* ignore */ }
       // log.append is fire-and-forget — no actual await happens, but we keep `await` for symmetry.
       await this.log.append({ type: "create", id, payload: { path, parent: parentId } });
       if (opts.record !== false && !opts.deferUndo) {
@@ -9435,7 +9435,7 @@ export class StashpadView extends ItemView {
           label: remote ? "Send note" : "Create note",
           undo: async () => {
             const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-            if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
             // Restore the body to the composer so the send/create can be
             // re-typed. (For remote sends the destination is gone after
             // submit, but the text returning is still the useful part.)
@@ -9534,7 +9534,7 @@ export class StashpadView extends ItemView {
         undo: async () => {
           for (const { path } of created) {
             const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-            if (f) { try { await this.app.fileManager.trashFile(f); } catch {} }
+            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
           }
           this.composerDraft = originalText;
           void this.saveDraft(originalText);
@@ -9761,7 +9761,7 @@ export class StashpadView extends ItemView {
     try {
       await this.app.fileManager.renameFile(file, newPath);
       await this.log.append({ type: "rename", id, payload: { from: oldPath, to: newPath } });
-    } catch {}
+    } catch { /* ignore */ }
   }
 
   private scheduleAttachmentSync(file: TFile): void {
@@ -9776,7 +9776,7 @@ export class StashpadView extends ItemView {
     const body = this.stripFrontmatter(raw);
     const found = this.extractAttachments(body); // bare paths from ![[...]]
     const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-    const currentRaw = Array.isArray(fm?.attachments) ? (fm!.attachments as unknown[]) : [];
+    const currentRaw = Array.isArray(fm?.attachments) ? (fm.attachments as unknown[]) : [];
     // 0.85.9: compare by BARE PATH so a canonical `[[link]]` that already
     // matches the body embed counts as equal. Comparing raw strings made the
     // link form (written by import + the rebootstrap convert pass) look
@@ -10075,7 +10075,7 @@ export class StashpadView extends ItemView {
                 folder: this.noteFolder,
               });
               attsRemoved += 1;
-            } catch {}
+            } catch { /* ignore */ }
           }
         }
       }
@@ -10108,7 +10108,7 @@ export class StashpadView extends ItemView {
       }
       for (const n of all) {
         if (!n.file) continue;
-        try { await this.app.fileManager.trashFile(n.file); } catch {}
+        try { await this.app.fileManager.trashFile(n.file); } catch { /* ignore */ }
         await this.log.append({ type: "delete", id: n.id, payload: { path: n.file.path, attachmentsRemoved: alsoAtts ? uniqueAtts : [] } });
       }
       this.selection.clear();

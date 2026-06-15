@@ -606,7 +606,7 @@ function makeStashpadSubPage(title: string, renderFn: (el: HTMLElement) => void)
         (this as any).containerEl.empty();
         this._renderFn((this as any).containerEl);
       }
-    } as any;
+    };
   }
   return new (SubPageCtor as any)(title, renderFn);
 }
@@ -792,7 +792,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     build: (s: Setting) => void,
     aliases?: string[],
   ): SettingDefinitionItem {
-    return { name, desc, aliases, render: (s: Setting) => { s.setName(name).setDesc(desc); build(s); } } as SettingDefinitionItem;
+    return { name, desc, aliases, render: (s: Setting) => { s.setName(name).setDesc(desc); build(s); } };
   }
 
   /** 0.94.3: a declarative item whose render builds a whole MULTI-element
@@ -814,7 +814,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         host.addClass("stashpad-settings-section");
         render(host);
       },
-    } as SettingDefinitionItem;
+    };
   }
 
   /** 0.94.3: General tab decomposed into per-setting items (render at DISPLAY
@@ -934,7 +934,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           sampleEl = host.createDiv({ cls: "setting-item-description stashpad-settings-note" });
           refreshSample();
         },
-      } as SettingDefinitionItem);
+      });
     }
 
     items.push(toggle("Navigate into parent after moving a note IN", "When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.",
@@ -1316,13 +1316,13 @@ export class StashpadSettingTab extends PluginSettingTab {
       name: "Hotkeys",
       desc: "Each command has up to two slots. Click a slot and press a key (or chord) to bind it; press Backspace (delete on Mac) to cancel without binding; or click ✕ to clear an existing binding. A ↺ icon appears on any slot that differs from its shipped default — click it to revert that slot. When both slots are set, the pill on the right decides which one is active.",
       searchable: false,
-    } as SettingDefinitionItem;
+    };
     const rows = COMMAND_META.map((meta) => ({
       name: meta.label,
       desc: meta.desc,
       aliases: ["hotkey", "shortcut", "keybind", "binding", "key"],
       render: (s: Setting) => this.renderBindingRow(s, meta),
-    } as SettingDefinitionItem));
+    }));
     return [intro, ...rows];
   }
 
@@ -1545,7 +1545,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     // Default the picker to the active view's folder when there is one,
     // otherwise the first discovered folder.
     let chosen = (() => {
-      const active = (getActiveView() as any)?.noteFolder as string | undefined;
+      const active = (getActiveView())?.noteFolder as string | undefined;
       if (active && stashpads.includes(active)) return active;
       return stashpads[0];
     })();
@@ -2201,7 +2201,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       type: "text",
       cls: "stashpad-color-alias-input",
       attr: { placeholder: "Alias (optional)" },
-    }) as HTMLInputElement;
+    });
     input.value = this.plugin.getColorAlias(folder, hex) ?? "";
     input.onchange = async () => {
       await this.plugin.setColorAlias(folder, hex, input.value);
@@ -2318,7 +2318,7 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     const renderSlot = (which: "primary" | "secondary"): HTMLInputElement => {
       const wrap = row.controlEl.createDiv({ cls: "stashpad-binding-slot" });
-      const input = wrap.createEl("input", { type: "text" }) as HTMLInputElement;
+      const input = wrap.createEl("input", { type: "text" });
       input.readOnly = true;
       input.placeholder = "Click & press a key";
       input.value = prettifyChord(get()[which]);
@@ -2396,7 +2396,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     // the L/R pill becomes a no-op (visually greyed). Only meaningful
     // when both slots are filled.
     const bothWrap = row.controlEl.createDiv({ cls: "stashpad-binding-useboth" });
-    const bothCb = bothWrap.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const bothCb = bothWrap.createEl("input", { type: "checkbox" });
     bothCb.title = "Use both bindings simultaneously (overrides the L/R toggle)";
     bothWrap.createSpan({ text: "Use both" });
     bothCb.onchange = async () => {

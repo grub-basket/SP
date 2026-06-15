@@ -354,7 +354,7 @@ export class StashpadFolderPanelView extends ItemView {
       let f = ((leaf.view as any)?.noteFolder ?? "").replace(/\/+$/, "");
       if (!f) {
         const st = ((leaf.getViewState?.() as any)?.state ?? {}) as { folderOverride?: string | null };
-        f = (((st.folderOverride ?? "") || fallback) as string).replace(/\/+$/, "");
+        f = (((st.folderOverride ?? "") || fallback)).replace(/\/+$/, "");
       }
       if (f) set.add(f);
     }
@@ -680,7 +680,7 @@ class RenameFolderModal extends Modal {
     this.modalEl.addClass("stashpad-compact-modal");
     this.contentEl.empty();
     this.titleEl.setText("Rename folder");
-    const input = this.contentEl.createEl("input", { type: "text" }) as HTMLInputElement;
+    const input = this.contentEl.createEl("input", { type: "text" });
     input.addClass("stashpad-folderpanel-rename-input");
     input.value = this.current;
     const footer = this.contentEl.createDiv({ cls: "stashpad-folderpanel-rename-footer" });

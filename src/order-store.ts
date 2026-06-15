@@ -24,7 +24,7 @@ export class OrderStore {
         const parsed = JSON.parse(text);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           for (const [k, v] of Object.entries(parsed)) {
-            if (Array.isArray(v) && v.every((x) => typeof x === "string")) map[k] = v as string[];
+            if (Array.isArray(v) && v.every((x) => typeof x === "string")) map[k] = v;
           }
         }
       }

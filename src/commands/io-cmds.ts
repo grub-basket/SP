@@ -187,7 +187,7 @@ export async function processStashFile(view: StashpadView, file: TFile): Promise
       },
     });
     // Send the source .stash to trash on success (respects user's deleted-files setting).
-    try { await view.app.fileManager.trashFile(file); } catch {}
+    try { await view.app.fileManager.trashFile(file); } catch { /* ignore */ }
     // 0.84.17: if this bundle was parked + a "Remind me later" reminder is
     // pending for it, drop it from the queue so the reminder never resurfaces.
     view.plugin.importService.clearPendingEncrypted(file.path);

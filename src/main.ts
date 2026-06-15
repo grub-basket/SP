@@ -296,10 +296,10 @@ export default class StashpadPlugin extends Plugin {
     await this.app.vault.create(homePath, body);
     // 0.77.7: seed the local user's author page into the new folder so
     // their links resolve everywhere from the start.
-    try { await this.seedLocalAuthorStub(cleaned); } catch {}
+    try { await this.seedLocalAuthorStub(cleaned); } catch { /* ignore */ }
     // 0.99.17 (#2): also seed every KNOWN author (coworkers from other folders)
     // so a new folder auto-populates and you can assign anyone immediately.
-    try { await this.seedKnownAuthorsInFolder(cleaned); } catch {}
+    try { await this.seedKnownAuthorsInFolder(cleaned); } catch { /* ignore */ }
   }
 
   /** Tally per-note colors found in EVERY markdown file under `folder`.
@@ -620,7 +620,7 @@ export default class StashpadPlugin extends Plugin {
           | { id?: string; parent?: string | null } | undefined;
         const id = typeof fm?.id === "string" ? fm.id.trim() : "";
         if (!id) continue;
-        const parent = (fm && "parent" in fm ? (fm.parent ?? null) : null) as string | null;
+        const parent = (fm && "parent" in fm ? (fm.parent ?? null) : null);
         cur[id] = { parent, path: f.path };
       }
 
@@ -894,7 +894,7 @@ export default class StashpadPlugin extends Plugin {
             if (d && d !== document) injectStashpadStyles(d);
           });
         }
-      } catch {}
+      } catch { /* ignore */ }
     }, 200);
     refreshActiveClass();
     // Re-evaluate when settings change (the toggle could have flipped).
@@ -1210,7 +1210,7 @@ export default class StashpadPlugin extends Plugin {
         }
         const report = perf.report();
         console.log(report);
-        try { await navigator.clipboard.writeText(report); } catch {}
+        try { await navigator.clipboard.writeText(report); } catch { /* ignore */ }
         new Notice("Performance profile copied to clipboard (also in the console).");
       },
     });
@@ -1382,7 +1382,7 @@ export default class StashpadPlugin extends Plugin {
       name: "Run integrity check on active Stashpad folder",
       checkCallback: (checking) => {
         const v = getActiveView();
-        const folder = (v && (v as any).noteFolder) as string | undefined;
+        const folder = (v && (v).noteFolder) as string | undefined;
         if (!folder) return false;
         if (checking) return true;
         new Notice(`Running integrity check on "${folder}"…`);
@@ -1965,7 +1965,7 @@ export default class StashpadPlugin extends Plugin {
         }
         // Always refresh the stub's H1 + name/role/department frontmatter
         // even when no rename was needed (e.g. user only changed role).
-        try { await this.refreshAuthorStub(target); } catch {}
+        try { await this.refreshAuthorStub(target); } catch { /* ignore */ }
       }
     }
   }
@@ -2192,9 +2192,9 @@ export default class StashpadPlugin extends Plugin {
       if (!buf) return;
       const view = getActiveView();
       const existingIds = new Set<string>();
-      if (view && typeof (view as any).collectExistingIds === "function" && (view as any).noteFolder === destFolder) {
+      if (view && typeof (view).collectExistingIds === "function" && (view).noteFolder === destFolder) {
         // Reuse the active view's tree if it already points at the destination folder.
-        for (const id of (view as any).collectExistingIds() as Set<string>) existingIds.add(id);
+        for (const id of (view).collectExistingIds() as Set<string>) existingIds.add(id);
       } else {
         // Otherwise scan the destination folder ourselves.
         for (const f of this.app.vault.getMarkdownFiles()) {
@@ -2216,9 +2216,9 @@ export default class StashpadPlugin extends Plugin {
             auto: true,
           },
         });
-      } catch {}
+      } catch { /* ignore */ }
       // Send the processed file to trash (respects the user's "Deleted files" setting in Obsidian).
-      try { await this.app.fileManager.trashFile(file); } catch {}
+      try { await this.app.fileManager.trashFile(file); } catch { /* ignore */ }
       const parts = [`Auto-imported ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"} from ${file.name}`];
       if (summary.attachmentsWritten) parts.push(`+ ${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"}`);
       if (summary.collisionsRenamed) parts.push(`(${summary.collisionsRenamed} renamed)`);
@@ -2228,7 +2228,7 @@ export default class StashpadPlugin extends Plugin {
         category: "import",
         folder: destFolder,
       });
-      if (view && typeof (view as any).debouncedRender === "function") (view as any).debouncedRender();
+      if (view && typeof (view).debouncedRender === "function") (view).debouncedRender();
     } catch (e) {
       this.notifications.show({
         message: `Stashpad: auto-import failed\nFile: \`${file.name}\`\nError: ${(e as Error).message}\nInspect with the buttons below — rename to .zip to crack it open in an archive tool.`,
@@ -2644,7 +2644,7 @@ export default class StashpadPlugin extends Plugin {
     const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
     const stashpadFolders = this.discoverStashpadFolders();
     const activeView = getActiveView();
-    const activeFolder = activeView ? ((activeView as any).noteFolder ?? "").trim().replace(/^\/+|\/+$/g, "") : "";
+    const activeFolder = activeView ? ((activeView).noteFolder ?? "").trim().replace(/^\/+|\/+$/g, "") : "";
 
     // Collect every folder path in the vault (for the create guard:
     // don't offer "Create" if the path already exists as a vanilla
@@ -2797,7 +2797,7 @@ export default class StashpadPlugin extends Plugin {
         }
         if (item.kind === "switch-current") {
           // Caller already checked activeView exists when emitting.
-          const v = activeView as any;
+          const v = activeView;
           if (v && typeof v.setFolderOverride === "function") {
             await v.setFolderOverride(item.folder);
             plugin.app.workspace.revealLeaf(v.leaf);
@@ -2868,12 +2868,12 @@ export default class StashpadPlugin extends Plugin {
    *  you in that folder. 0.61.1. */
   async openTinyWindow(): Promise<void> {
     const active = getActiveView();
-    const folderOverride = (active as any)?.folderOverride ?? null;
-    const focusId = (active as any)?.focusId ?? "__root__";
+    const folderOverride = (active)?.folderOverride ?? null;
+    const focusId = (active)?.focusId ?? "__root__";
     // 0.61.8: carry over compactMode from the active tab so the tiny
     // window inherits the user's chrome preference. The exit-compact
     // button in the tiny header then has something to toggle.
-    const compactMode = !!(active as any)?.compactMode;
+    const compactMode = !!(active)?.compactMode;
     const popLeaf = (this.app.workspace as any).openPopoutLeaf?.();
     if (!popLeaf) {
       new Notice("Stashpad: couldn't open popout window on this build.");
@@ -2892,7 +2892,7 @@ export default class StashpadPlugin extends Plugin {
     });
     // The view's onOpen path will detect tinyMode and apply the window
     // shrink + always-on-top. Reveal to be safe.
-    try { this.app.workspace.revealLeaf(popLeaf); } catch {}
+    try { this.app.workspace.revealLeaf(popLeaf); } catch { /* ignore */ }
   }
 
   async activateView(opts: { reveal: boolean } = { reveal: true }): Promise<void> {
@@ -3571,14 +3571,14 @@ export default class StashpadPlugin extends Plugin {
     const removeCreated = async () => {
       for (const p of [...createdPaths].reverse()) {
         const f = this.app.vault.getAbstractFileByPath(p);
-        if (f) { try { await this.app.fileManager.trashFile(f as TFile); } catch { /* already gone */ } }
+        if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* already gone */ } }
       }
     };
     const undo = mode === "cut"
       ? async () => { await removeCreated(); await this.restoreSnapshot(srcSnapshot); }
       : async () => { await removeCreated(); };
     const redo = mode === "cut"
-      ? async () => { await this.restoreSnapshot(destSnapshot); for (const s of srcSnapshot) { const f = this.app.vault.getAbstractFileByPath(s.path); if (f) { try { await this.app.fileManager.trashFile(f as TFile); } catch { /* gone */ } } } }
+      ? async () => { await this.restoreSnapshot(destSnapshot); for (const s of srcSnapshot) { const f = this.app.vault.getAbstractFileByPath(s.path); if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* gone */ } } } }
       : async () => { await this.restoreSnapshot(destSnapshot); };
 
     return { rootIds: newRootIds, noteCount, undo, redo };
@@ -3641,7 +3641,7 @@ export default class StashpadPlugin extends Plugin {
   async orderedSubtreeNodes(folder: string, rootIds: StashpadId[]): Promise<Array<{ file: TFile; created: string; depth: number }>> {
     const out: Array<{ file: TFile; created: string; depth: number }> = [];
     const seen = new Set<StashpadId>();
-    const posOf = (f: TFile): number => { const v = (this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined)?.position; return typeof v === "number" ? v : Number.MAX_SAFE_INTEGER; };
+    const posOf = (f: TFile): number => { const v = (this.app.metadataCache.getFileCache(f)?.frontmatter)?.position; return typeof v === "number" ? v : Number.MAX_SAFE_INTEGER; };
     type N = { id: StashpadId; file: TFile; created: string };
     for (const rid of rootIds) {
       const sub = await collectSubtree(this.app, folder, rid);
@@ -3649,9 +3649,9 @@ export default class StashpadPlugin extends Plugin {
       const childrenOf = new Map<StashpadId, N[]>();
       for (const d of sub.descendants) {
         if (!d.parent) continue;
-        const arr = childrenOf.get(d.parent as StashpadId) ?? [];
+        const arr = childrenOf.get(d.parent) ?? [];
         arr.push({ id: d.id, file: d.file, created: d.created });
-        childrenOf.set(d.parent as StashpadId, arr);
+        childrenOf.set(d.parent, arr);
       }
       for (const arr of childrenOf.values()) arr.sort((a, b) => (posOf(a.file) - posOf(b.file)) || a.created.localeCompare(b.created));
       const walk = (node: N, depth: number): void => {
@@ -3747,7 +3747,7 @@ export default class StashpadPlugin extends Plugin {
     window.clearTimeout(pending.timer);
     pending.timer = window.setTimeout(() => {
       this.archivePending.delete(newDir);
-      void this.archiveSweep(newDir, [...pending!.paths]);
+      void this.archiveSweep(newDir, [...pending.paths]);
     }, 1800);
   }
 
@@ -3806,7 +3806,7 @@ export default class StashpadPlugin extends Plugin {
     await leaf.setViewState({
       type: STASHPAD_VIEW_TYPE,
       active: true,
-      state: { folderOverride: cleaned } as any,
+      state: { folderOverride: cleaned },
     });
     this.app.workspace.revealLeaf(leaf);
     return leaf;
@@ -4213,7 +4213,7 @@ export default class StashpadPlugin extends Plugin {
       if (!parsed) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { aliases?: unknown; name?: unknown } | undefined;
       const aliasName = Array.isArray(fm?.aliases)
-        ? ((fm!.aliases as unknown[]).find((x) => typeof x === "string") as string | undefined ?? "")
+        ? ((fm.aliases as unknown[]).find((x) => typeof x === "string") ?? "")
         : (typeof fm?.aliases === "string" ? fm.aliases : "");
       const name = (aliasName || (typeof fm?.name === "string" ? fm.name : "") || parsed.name).trim();
       if (!byId.has(parsed.id)) byId.set(parsed.id, name);
@@ -4366,7 +4366,7 @@ export default class StashpadPlugin extends Plugin {
         // 0.85.9: also handle a SCALAR `attachments:` (hand-edited / odd import)
         // — normalize it to a one-item list of the canonical link form.
         const needs = isScalar
-          ? !isLink(att as string)
+          ? !isLink(att)
           : (att as any[]).some((a: any) => typeof a === "string" && a.trim() && !isLink(a));
         if (!needs) continue;
         try {
@@ -4676,9 +4676,9 @@ export default class StashpadPlugin extends Plugin {
     // (0.71.2 rename). Without this, users who configured the field
     // before the rename would silently lose their value and the
     // preview would land in no-dest territory.
-    if (typeof (data as any)?.jdIndexDestFolder === "string"
-        && typeof (data as any)?.jdIndexStashpadFolder !== "string") {
-      (data as any).jdIndexStashpadFolder = (data as any).jdIndexDestFolder;
+    if (typeof (data)?.jdIndexDestFolder === "string"
+        && typeof (data)?.jdIndexStashpadFolder !== "string") {
+      (data).jdIndexStashpadFolder = (data).jdIndexDestFolder;
     }
     this.settings = {
       ...DEFAULT_SETTINGS,
@@ -5142,7 +5142,7 @@ export default class StashpadPlugin extends Plugin {
           payload: { path: file.path, parent: fmAfter?.parent ?? ROOT_ID, source: "adopt", added },
         });
       }
-    } catch {}
+    } catch { /* ignore */ }
   }
 }
 

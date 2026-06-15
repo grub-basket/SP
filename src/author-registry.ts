@@ -70,7 +70,7 @@ export class AuthorRegistry {
         if (parsed && typeof parsed === "object" && parsed.authors) {
           this.data = {
             version: typeof parsed.version === "number" ? parsed.version : REGISTRY_VERSION,
-            authors: parsed.authors as Record<string, AuthorRecord>,
+            authors: parsed.authors,
           };
         }
       }

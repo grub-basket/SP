@@ -197,7 +197,7 @@ export class FrontmatterSyncQueue {
     const childrenLinks = this.computeChildrenLinks(node);
     const currentFm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
     const currentParent = (currentFm && typeof currentFm[PARENT_LINK_FIELD] === "string")
-      ? currentFm[PARENT_LINK_FIELD] as string : null;
+      ? currentFm[PARENT_LINK_FIELD] : null;
     const currentChildrenRaw = currentFm?.[CHILDREN_FIELD];
     const currentChildren = Array.isArray(currentChildrenRaw)
       ? currentChildrenRaw.filter((x: unknown): x is string => typeof x === "string")
@@ -327,7 +327,7 @@ export async function rebootstrapFolderFrontmatter(
     const desiredChildren = computeChildren(entry);
     const fm = app.metadataCache.getFileCache(entry.file)?.frontmatter;
     const currentParent = (fm && typeof fm[PARENT_LINK_FIELD] === "string")
-      ? fm[PARENT_LINK_FIELD] as string : null;
+      ? fm[PARENT_LINK_FIELD] : null;
     const currentChildrenRaw = fm?.[CHILDREN_FIELD];
     const currentChildren = Array.isArray(currentChildrenRaw)
       ? currentChildrenRaw.filter((x: unknown): x is string => typeof x === "string")

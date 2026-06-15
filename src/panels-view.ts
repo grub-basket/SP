@@ -467,8 +467,8 @@ export class StashpadPanelsView extends ItemView {
    *  any open Stashpad leaf, then to activating the default view. */
   private async openSearchFromPanel(): Promise<void> {
     const target = await this.resolveTargetStashpad();
-    if (target && typeof (target as any).openSearchModal === "function") {
-      (target as any).openSearchModal();
+    if (target && typeof (target).openSearchModal === "function") {
+      (target).openSearchModal();
     }
   }
 
@@ -496,8 +496,8 @@ export class StashpadPanelsView extends ItemView {
   /** Home button → navigate the MRU Stashpad to its root. */
   private async openHomeFromPanel(): Promise<void> {
     const target = await this.resolveTargetStashpad();
-    if (target && typeof (target as any).navigateTo === "function") {
-      (target as any).navigateTo(ROOT_ID);
+    if (target && typeof (target).navigateTo === "function") {
+      (target).navigateTo(ROOT_ID);
     }
   }
 

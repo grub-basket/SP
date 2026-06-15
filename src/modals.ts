@@ -43,12 +43,12 @@ export class LogModal extends Modal {
     this.events = [];
     for (const line of this.text.trim().split(/\r?\n/)) {
       if (!line) continue;
-      try { this.events.push(JSON.parse(line)); } catch {}
+      try { this.events.push(JSON.parse(line)); } catch { /* ignore */ }
     }
     this.events.reverse();
 
     const toolbar = this.contentEl.createDiv({ cls: "stashpad-log-toolbar" });
-    this.countEl = toolbar.createSpan({ cls: "stashpad-log-count" }) as HTMLSpanElement;
+    this.countEl = toolbar.createSpan({ cls: "stashpad-log-count" });
     this.updateCount();
 
     // Type filter dropdown. Built lazily here, repopulated by
@@ -77,10 +77,10 @@ export class LogModal extends Modal {
     const clearBtn = toolbar.createEl("button", { cls: "mod-warning", text: "Clear log" });
     clearBtn.onclick = () => this.clearLog();
 
-    this.listEl = this.contentEl.createDiv({ cls: "stashpad-log-list" }) as HTMLDivElement;
+    this.listEl = this.contentEl.createDiv({ cls: "stashpad-log-list" });
     this.refreshList();
 
-    this.footerEl = this.contentEl.createDiv({ cls: "stashpad-log-footer" }) as HTMLDivElement;
+    this.footerEl = this.contentEl.createDiv({ cls: "stashpad-log-footer" });
     this.renderFooter();
   }
 
@@ -177,7 +177,7 @@ export class LogModal extends Modal {
     try {
       const full = (this.app.vault.adapter as any).getFullPath?.(this.jsonlPath);
       if (!full) throw new Error("no full path");
-      // eslint-disable-next-line @typescript-eslint/no-var-requires -- Electron's shell is only reachable via the runtime window.require; there is no ES import for it in the Obsidian sandbox.
+       
       const { shell } = (window as any).require("electron");
       if (kind === "reveal") shell.showItemInFolder(full);
       else shell.openPath(full);
@@ -356,7 +356,7 @@ export class ConfirmDeleteModal extends Modal {
     let deleteAtts = this.offerAttachmentDelete && this.attachmentCount > 0;
     if (this.offerAttachmentDelete && this.attachmentCount > 0) {
       const label = this.contentEl.createEl("label", { cls: "stashpad-modal-check" });
-      const cb = label.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+      const cb = label.createEl("input", { type: "checkbox" });
       cb.checked = deleteAtts;
       cb.onchange = () => { deleteAtts = cb.checked; };
       label.createSpan({ text: " Also delete attachments" });
@@ -533,12 +533,12 @@ export class SplitNoteModal extends Modal {
     // Center the divider in the list after a (re)render so you see context both
     // above AND below the split point — and so moving it with ↑/↓ or a click
     // doesn't snap scroll to the top and push the divider off-screen.
-    if (divider) window.requestAnimationFrame(() => divider!.scrollIntoView({ block: "center" }));
+    if (divider) window.requestAnimationFrame(() => divider.scrollIntoView({ block: "center" }));
   }
 
   private renderCursorMode(): void {
     const wrap = this.contentEl.createDiv({ cls: "stashpad-split-cursor-wrap" });
-    const ta = wrap.createEl("textarea", { cls: "stashpad-split-cursor-ta" }) as HTMLTextAreaElement;
+    const ta = wrap.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
     ta.value = this.body;
     ta.readOnly = false;
     this.cursorTextarea = ta;
@@ -604,7 +604,7 @@ export class ExportStashModal extends Modal {
 
     const field = this.contentEl.createDiv({ cls: "stashpad-export-field" });
     field.createEl("label", { cls: "stashpad-export-label", text: "File name" });
-    const input = field.createEl("input", { type: "text" }) as HTMLInputElement;
+    const input = field.createEl("input", { type: "text" });
     input.addClass("stashpad-export-name");
     input.value = this.defaultBaseName;
 
@@ -615,7 +615,7 @@ export class ExportStashModal extends Modal {
     // --- 0.84.3: optional password encryption (opt-in, default off) ---
     const encWrap = this.contentEl.createDiv({ cls: "stashpad-export-encrypt" });
     const toggleRow = encWrap.createDiv({ cls: "stashpad-export-toggle" });
-    const cb = toggleRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const cb = toggleRow.createEl("input", { type: "checkbox" });
     cb.id = "stashpad-export-encrypt-cb";
     const cbLabel = toggleRow.createEl("label", { text: "Encrypt with a password" });
     cbLabel.htmlFor = cb.id;
@@ -630,7 +630,7 @@ export class ExportStashModal extends Modal {
     const pwSyncers: Array<() => void> = [];
     const makePwRow = (placeholder: string): HTMLInputElement => {
       const row = pwArea.createDiv({ cls: "stashpad-export-pw-row" });
-      const inp = row.createEl("input", { type: "password" }) as HTMLInputElement;
+      const inp = row.createEl("input", { type: "password" });
       inp.addClass("stashpad-export-name"); inp.placeholder = placeholder;
       const btn = row.createEl("button", { cls: "stashpad-export-copy" });
       const syncBtn = () => {
@@ -702,7 +702,7 @@ export class ExportStashModal extends Modal {
     // passphrase typed/copied.
     const secretStorage = (this.app as App & { secretStorage?: SecretStorage }).secretStorage;
     const rememberRow = pwArea.createDiv({ cls: "stashpad-export-remember" });
-    const rememberCb = rememberRow.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+    const rememberCb = rememberRow.createEl("input", { type: "checkbox" });
     rememberCb.id = "stashpad-export-remember-cb";
     const rememberLabel = rememberRow.createEl("label", {
       text: "Remember in this vault (this device) — skips the prompt when you re-import here.",
@@ -845,7 +845,7 @@ export class StashPasswordModal extends Modal {
     if (this.errorMsg) {
       this.contentEl.createEl("div", { cls: "stashpad-export-error", text: this.errorMsg });
     }
-    const input = this.contentEl.createEl("input", { type: "password" }) as HTMLInputElement;
+    const input = this.contentEl.createEl("input", { type: "password" });
     input.addClass("stashpad-export-name");
     input.placeholder = "Password";
 
@@ -931,7 +931,7 @@ export class EncryptionPasswordModal extends Modal {
     const pwSyncers: Array<() => void> = [];
     const field = (placeholder: string): HTMLInputElement => {
       const row = this.contentEl.createDiv({ cls: "stashpad-export-pw-row stashpad-encryption-row" });
-      const i = row.createEl("input", { type: "password" }) as HTMLInputElement;
+      const i = row.createEl("input", { type: "password" });
       i.addClass("stashpad-export-name", "stashpad-encryption-field");
       i.placeholder = placeholder;
       const btn = row.createEl("button", { cls: "stashpad-export-copy" });
@@ -979,7 +979,7 @@ export class EncryptionPasswordModal extends Modal {
       const counter = this.contentEl.createDiv({ cls: "stashpad-encryption-counter" });
 
       const refresh = () => {
-        const v = nextEl!.value;
+        const v = nextEl.value;
         const s = estimatePasswordStrength(v);
         segs.forEach((seg, i) => seg.toggleClass("is-on", i < s.level));
         label.setText(v ? s.label : "");
@@ -993,7 +993,7 @@ export class EncryptionPasswordModal extends Modal {
       genRow.createEl("button", { cls: "stashpad-export-gen", text: "Generate strong passphrase" }).onclick = (e) => {
         e.preventDefault();
         const pw = generatePassphrase(5);
-        nextEl!.value = pw;
+        nextEl.value = pw;
         if (confirmEl) confirmEl.value = pw;
         // Keep it masked — the user reveals with Show if they want; it's already
         // copied to the clipboard below, and Copy works while masked.
@@ -1005,8 +1005,8 @@ export class EncryptionPasswordModal extends Modal {
       const showBtn = genRow.createEl("button", { cls: "stashpad-export-show", text: "Show" });
       showBtn.onclick = (e) => {
         e.preventDefault();
-        const show = nextEl!.type === "password";
-        nextEl!.type = show ? "text" : "password";
+        const show = nextEl.type === "password";
+        nextEl.type = show ? "text" : "password";
         if (confirmEl) confirmEl.type = show ? "text" : "password";
         showBtn.setText(show ? "Hide" : "Show");
       };
@@ -1030,7 +1030,7 @@ export class EncryptionPasswordModal extends Modal {
     const secretStorage = (this.app as App & { secretStorage?: SecretStorage }).secretStorage;
     if (this.opts.offerKeychain && secretStorage) {
       const row = this.contentEl.createDiv({ cls: "stashpad-export-remember" });
-      rememberCb = row.createEl("input", { type: "checkbox" }) as HTMLInputElement;
+      rememberCb = row.createEl("input", { type: "checkbox" });
       rememberCb.id = "stashpad-enc-remember";
       const lbl = row.createEl("label", { text: "Remember on this device (keychain) — auto-unlock here without re-typing." });
       lbl.htmlFor = rememberCb.id;
@@ -1107,13 +1107,13 @@ export class TypeToConfirmModal extends Modal {
     let pwInput: HTMLInputElement | null = null;
     if (this.opts.requirePassword) {
       this.contentEl.createEl("p", { cls: "stashpad-export-desc" }).setText("Enter your encryption password:");
-      pwInput = this.contentEl.createEl("input", { type: "password" }) as HTMLInputElement;
+      pwInput = this.contentEl.createEl("input", { type: "password" });
       pwInput.addClass("stashpad-export-name", "stashpad-encryption-field");
       pwInput.placeholder = "Password";
     }
 
     this.contentEl.createEl("p", { cls: "stashpad-export-desc" }).setText(`Type "${this.opts.phrase}" to confirm.`);
-    const input = this.contentEl.createEl("input", { type: "text" }) as HTMLInputElement;
+    const input = this.contentEl.createEl("input", { type: "text" });
     input.addClass("stashpad-export-name", "stashpad-encryption-field");
     input.placeholder = this.opts.phrase;
 
@@ -1171,13 +1171,13 @@ export class CustomColorModal extends Modal {
     preview.style.background = this.value;
 
     // Native wheel — clicking the preview pops the OS color picker.
-    const wheel = row.createEl("input", { type: "color" }) as HTMLInputElement;
+    const wheel = row.createEl("input", { type: "color" });
     wheel.value = this.value;
     wheel.addClass("stashpad-custom-color-wheel");
     preview.onclick = () => wheel.click();
 
     // Hex text input for direct entry. Synced both ways with the wheel.
-    const hex = row.createEl("input", { type: "text" }) as HTMLInputElement;
+    const hex = row.createEl("input", { type: "text" });
     hex.addClass("stashpad-custom-color-hex");
     hex.placeholder = "#RRGGBB";
     hex.value = this.value;
@@ -1320,7 +1320,7 @@ export class ColorPickerModal extends Modal {
 
     // After paint, focus the modal so arrow keys land here, not in the
     // background view.
-    requestAnimationFrame(() => (this.modalEl as HTMLElement).focus());
+    requestAnimationFrame(() => (this.modalEl).focus());
   }
 
   /** Click or Enter on a tile. Preset/saved/none → apply immediately + close.
@@ -1463,7 +1463,7 @@ export function buildAssigneePicker(
   const input = inputWrap.createEl("input", {
     type: "text", cls: "stashpad-assign-input",
     attr: { placeholder: "Add a person — type a name…" },
-  }) as HTMLInputElement;
+  });
   const sugg = inputWrap.createDiv({ cls: "stashpad-assign-suggest" });
   sugg.setCssStyles({ display: "none" });
 
@@ -1507,7 +1507,7 @@ export function buildAssigneePicker(
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       e.preventDefault();
-      const first = sugg.querySelector(".stashpad-assign-suggest-item") as HTMLElement | null;
+      const first = sugg.querySelector(".stashpad-assign-suggest-item");
       if (first) first.dispatchEvent(new MouseEvent("mousedown"));
     } else if (e.key === "Escape" && sugg.style.display !== "none") {
       e.stopPropagation(); sugg.setCssStyles({ display: "none" });
@@ -1588,11 +1588,11 @@ export class DueDatePickerModal extends Modal {
     const dateField = fields.createDiv({ cls: "stashpad-due-field" });
     const dateIcon = dateField.createSpan({ cls: "stashpad-due-field-icon" });
     setIcon(dateIcon, "calendar");
-    const dateInput = dateField.createEl("input", { type: "date", cls: "stashpad-due-date" }) as HTMLInputElement;
+    const dateInput = dateField.createEl("input", { type: "date", cls: "stashpad-due-date" });
     const timeField = fields.createDiv({ cls: "stashpad-due-field" });
     const timeIcon = timeField.createSpan({ cls: "stashpad-due-field-icon" });
     setIcon(timeIcon, "clock");
-    const timeInput = timeField.createEl("input", { type: "time", cls: "stashpad-due-time" }) as HTMLInputElement;
+    const timeInput = timeField.createEl("input", { type: "time", cls: "stashpad-due-time" });
     // 0.76.8: the leading icon IS the picker button. The native
     // ::-webkit-calendar-picker-indicator (on the input's right) is
     // hidden via CSS; clicking our left icon opens the OS picker via
@@ -1816,7 +1816,7 @@ export class NotificationHistoryModal extends Modal {
     this.records = this.service.recent();
 
     const toolbar = this.contentEl.createDiv({ cls: "stashpad-log-toolbar" });
-    this.countEl = toolbar.createSpan({ cls: "stashpad-log-count" }) as HTMLSpanElement;
+    this.countEl = toolbar.createSpan({ cls: "stashpad-log-count" });
     this.updateCount();
 
     this.filterSelEl = toolbar.createEl("select", { cls: "stashpad-log-type-filter" });
@@ -1856,9 +1856,9 @@ export class NotificationHistoryModal extends Modal {
       ).open();
     };
 
-    this.listEl = this.contentEl.createDiv({ cls: "stashpad-log-list" }) as HTMLDivElement;
+    this.listEl = this.contentEl.createDiv({ cls: "stashpad-log-list" });
     this.refreshList();
-    this.footerEl = this.contentEl.createDiv({ cls: "stashpad-log-footer" }) as HTMLDivElement;
+    this.footerEl = this.contentEl.createDiv({ cls: "stashpad-log-footer" });
     this.renderFooter();
 
     // Live-update: re-pull records on every service change.
@@ -2111,11 +2111,11 @@ export class OkfExportModal extends Modal {
     this.modalEl.addClass("stashpad-export-modal");
     this.titleEl.setText("Export as OKF");
     this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: `Export ${this.noteCount} note${this.noteCount === 1 ? "" : "s"} as an Open Knowledge Format bundle. Pick one or more formats.` });
-    const name = this.contentEl.createEl("input", { type: "text" }) as HTMLInputElement;
+    const name = this.contentEl.createEl("input", { type: "text" });
     name.addClass("stashpad-export-name"); name.value = this.base; name.placeholder = "Export name";
     const mk = (label: string, checked: boolean): HTMLInputElement => {
       const row = this.contentEl.createDiv({ cls: "stashpad-okf-fmt" });
-      const cb = row.createEl("input", { type: "checkbox" }) as HTMLInputElement; cb.checked = checked;
+      const cb = row.createEl("input", { type: "checkbox" }); cb.checked = checked;
       row.createEl("label", { text: label });
       return cb;
     };

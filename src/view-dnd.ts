@@ -60,10 +60,10 @@ export class ViewDnD {
           let targetId: string | undefined;
           let position: "before" | "after" = "before";
           if (after && after.classList.contains("stashpad-note")) {
-            targetId = (after as HTMLElement).dataset.id;
+            targetId = (after).dataset.id;
             position = "before";
           } else if (before && before.classList.contains("stashpad-note")) {
-            targetId = (before as HTMLElement).dataset.id;
+            targetId = (before).dataset.id;
             position = "after";
           }
           if (targetId) void this.host.reorderToTarget(sources, targetId, position);
@@ -76,7 +76,7 @@ export class ViewDnD {
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = "move";
         // Use the whole row as the drag image (not just the grip when that's the source).
-        try { e.dataTransfer.setDragImage(row, 12, 12); } catch {}
+        try { e.dataTransfer.setDragImage(row, 12, 12); } catch { /* ignore */ }
       }
     });
     row.addEventListener("dragend", () => {
@@ -162,10 +162,10 @@ export class ViewDnD {
       const before = this.dragPlaceholder.previousElementSibling as HTMLElement | null;
       this.removeDragPlaceholder();
       if (after && after.classList.contains("stashpad-note")) {
-        const id = (after as HTMLElement).dataset.id;
+        const id = (after).dataset.id;
         if (id) void this.host.reorderToTarget(sources, id, "before");
       } else if (before && before.classList.contains("stashpad-note")) {
-        const id = (before as HTMLElement).dataset.id;
+        const id = (before).dataset.id;
         if (id) void this.host.reorderToTarget(sources, id, "after");
       }
     });
@@ -185,7 +185,7 @@ export class ViewDnD {
     if (!wasMounted) {
       this.dragPlaceholder.setCssStyles({ height: "0px" });
       // Force layout, then animate to full height.
-      // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- reading offsetHeight is an intentional synchronous reflow so the height transition animates from 0.
+       
       this.dragPlaceholder.offsetHeight;
       this.dragPlaceholder.setCssStyles({ height: `${this.dragRowHeight}px` });
     } else {

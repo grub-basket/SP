@@ -225,11 +225,11 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
   onClose(): void {
     while (this.pendingCleanups.length > 0) {
       const cb = this.pendingCleanups.pop();
-      try { if (cb) cb(); } catch {}
+      try { if (cb) cb(); } catch { /* ignore */ }
     }
     // 0.85.10: notify the caller the picker closed (pick OR dismiss). The
     // destination picker uses this to refocus the composer only on dismiss.
-    try { this.opts.onClose?.(); } catch {}
+    try { this.opts.onClose?.(); } catch { /* ignore */ }
   }
 
   constructor(
@@ -1086,7 +1086,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         return true; // let Tab proceed normally between modal elements
       });
       (this.app as any).keymap?.pushScope(chipScope);
-      this.pendingCleanups.push(() => { try { (this.app as any).keymap?.popScope(chipScope); } catch {} });
+      this.pendingCleanups.push(() => { try { (this.app as any).keymap?.popScope(chipScope); } catch { /* ignore */ } });
   }
 
   /** Append `key: [value]` to the input and place caret inside the
@@ -1278,7 +1278,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       const calNative = calSlot.createEl("input", {
         cls: "stashpad-when-native",
         attr: { type: "date" },
-      }) as HTMLInputElement;
+      });
       // 0.69.30: hidden natives shouldn't show up in tab order — Tab
       // was previously hitting them between each visible icon button.
       calNative.tabIndex = -1;
@@ -1319,7 +1319,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       const input = wrap.createEl("input", {
         cls: "stashpad-when-input",
         attr: { type: "text", placeholder },
-      }) as HTMLInputElement;
+      });
       input.value = getter();
       input.addEventListener("input", () => setter(input.value));
 
@@ -1360,7 +1360,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           closed = true;
           pop.remove();
           document.removeEventListener("mousedown", outside, true);
-          try { (this.app as any).keymap?.popScope(popScope); } catch {}
+          try { (this.app as any).keymap?.popScope(popScope); } catch { /* ignore */ }
           if (currentPopoverClose === close) currentPopoverClose = null;
         };
         currentPopoverClose = close;
@@ -1436,7 +1436,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           const nInput = builder.createEl("input", {
             cls: "stashpad-when-pop-number",
             attr: { type: "number", min: "1", max: "999", value: "7" },
-          }) as HTMLInputElement;
+          });
           const unitSel = builder.createEl("select", { cls: "stashpad-when-pop-unit" });
           for (const u of [
             { v: "d", label: "days" },

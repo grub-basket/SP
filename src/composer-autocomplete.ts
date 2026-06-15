@@ -293,7 +293,7 @@ export class ComposerAutocomplete {
 
   private popScope(): void {
     if (!this.scope) return;
-    try { (this.app as any).keymap?.popScope(this.scope); } catch {}
+    try { (this.app as any).keymap?.popScope(this.scope); } catch { /* ignore */ }
     this.scope = null;
   }
 

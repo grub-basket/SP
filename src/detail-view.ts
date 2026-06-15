@@ -200,7 +200,7 @@ export class StashpadDetailView extends ItemView {
     try {
       const raw = await this.app.vault.cachedRead(file);
       const stripped = this.stripFrontmatter(raw);
-      await MarkdownRenderer.render(this.app, stripped, bodyWrap, file.path, this as any);
+      await MarkdownRenderer.render(this.app, stripped, bodyWrap, file.path, this);
     } catch (e) {
       bodyWrap.createDiv({ cls: "stashpad-detail-error", text: `Couldn't read \`${file.path}\`: ${(e as Error).message}` });
     }
@@ -237,7 +237,7 @@ export class StashpadDetailView extends ItemView {
     const ta = composer.createEl("textarea", {
       cls: "stashpad-detail-composer-input",
       attr: { placeholder: "Add a child note…", rows: "2" },
-    }) as HTMLTextAreaElement;
+    });
     this.composerInputEl = ta;
     // Restore the draft only when it belongs to the displayed note.
     if (this.composerDraftForId === sel.id) {
@@ -307,7 +307,7 @@ export class StashpadDetailView extends ItemView {
   private renderChildren(parent: HTMLElement, folder: string, noteId: StashpadId): void {
     const view = this.plugin.lastActiveStashpadLeaf?.view as any;
     if (!view || view.getViewType?.() !== STASHPAD_VIEW_TYPE) return;
-    const tree = (view as any).tree;
+    const tree = (view).tree;
     if (!tree?.getChildren) return;
     const children = tree.getChildren(noteId) as Array<{ id: string; file: TFile | null }>;
     if (!children || children.length === 0) return;

@@ -47,13 +47,13 @@ export function buildTimePickerInto(pop: HTMLElement, opts: BuildTimePickerOpts)
   const hField = display.createEl("input", {
     cls: "stashpad-when-time-field",
     attr: { type: "text", inputmode: "numeric", maxlength: "2" },
-  }) as HTMLInputElement;
+  });
   hField.value = String(opts.seedH);
   display.createSpan({ cls: "stashpad-when-time-colon", text: ":" });
   const mField = display.createEl("input", {
     cls: "stashpad-when-time-field",
     attr: { type: "text", inputmode: "numeric", maxlength: "2" },
-  }) as HTMLInputElement;
+  });
   mField.value = String(opts.seedM).padStart(2, "0");
 
   const periodWrap = display.createDiv({ cls: "stashpad-when-time-period" });

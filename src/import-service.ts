@@ -849,7 +849,7 @@ export class ImportService {
           try { await this.plugin.setColorAlias(root, hex, name); } catch { /* non-fatal */ }
         }
       }
-      try { await this.app.fileManager.trashFile(file); } catch {}
+      try { await this.app.fileManager.trashFile(file); } catch { /* ignore */ }
       this.pendingEncryptedStashes.delete(file.path);
       try {
         await this.plugin.newLog().append({
@@ -863,7 +863,7 @@ export class ImportService {
             loose: true,
           },
         });
-      } catch {}
+      } catch { /* ignore */ }
       return true;
     } catch (e) {
       console.warn("[Stashpad] loose .stash import failed", file.path, e);

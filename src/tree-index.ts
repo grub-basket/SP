@@ -375,7 +375,7 @@ export class TreeIndex {
       return changed;
     }
 
-    const parentId = ((fm?.parent as string | null | undefined) ?? ROOT_ID) as StashpadId;
+    const parentId = ((fm?.parent as string | null | undefined) ?? ROOT_ID);
     const created = (fm?.created as string) ?? "";
 
     // Safety net: if the declared parent isn't ROOT and isn't in the
