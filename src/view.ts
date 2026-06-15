@@ -2738,6 +2738,10 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Notification history…").setIcon("bell").onClick(() => {
       (this.app as any).commands?.executeCommandById?.("stashpad:stashpad-open-notification-history");
     }));
+    // 0.103.x: "Reload without saving" recovery action — the fix when the view
+    // looks reverted to a stale state. Kept here in the top (selection-independent)
+    // group so it's visible without scrolling past the selection commands.
+    menu.addItem((it: any) => it.setTitle("Reload without saving").setIcon("rotate-ccw").onClick(() => this.plugin.reloadAppForUpdate()));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").setDisabled(!hasTargets).onClick(() => this.cmdOpenInNewStashpadTab()));
     menu.addItem((it: any) => it.setTitle("Open in editor").setIcon("pencil").setDisabled(!hasTargets).onClick(() => this.cmdOpenInEditor()));
@@ -2765,13 +2769,6 @@ export class StashpadView extends ItemView {
     // 0.87.0: escape hatch to the full command set — anything not surfaced
     // here (or in the context menu) is reachable via the command palette.
     menu.addItem((it: any) => it.setTitle("More commands…").setIcon("terminal").onClick(() => this.openCommandPalette()));
-    // 0.103.x: "Reload without saving" recovery action — the fix when the view
-    // (especially on mobile) looks reverted to a stale state. Hidden while notes
-    // are selected so it can't be hit mid-action by mistake.
-    if (this.selection.size === 0) {
-      menu.addSeparator();
-      menu.addItem((it: any) => it.setTitle("Reload without saving").setIcon("rotate-ccw").onClick(() => this.plugin.reloadAppForUpdate()));
-    }
     const r = anchor.getBoundingClientRect();
     menu.showAtPosition({ x: r.left, y: r.bottom + 4 });
   }
