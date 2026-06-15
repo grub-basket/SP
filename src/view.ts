@@ -9491,7 +9491,7 @@ export class StashpadView extends ItemView {
     let bar: { notice: Notice; fill: HTMLElement; label: HTMLElement } | null = null;
     if (total >= SHOW_BAR_AT) {
       const notice = new Notice("", 0);
-      const el = notice.noticeEl;
+      const el = notice.messageEl;
       el.empty();
       el.createDiv({ cls: "stashpad-split-progress-title", text: `Splitting into ${total} notes…` });
       const wrap = el.createDiv({ cls: "stashpad-split-progress-bar" });

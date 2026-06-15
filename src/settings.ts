@@ -1206,7 +1206,7 @@ export class StashpadSettingTab extends PluginSettingTab {
             },
           }).open();
         });
-        (b as unknown as { setWarning?: (v: boolean) => void }).setWarning?.(true);
+        b.setDestructive();
       });
       }
 
@@ -1221,7 +1221,7 @@ export class StashpadSettingTab extends PluginSettingTab {
               new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: false, kdfProbe, title: "Change shared password", intro: "Everyone who unlocks with the shared password will need the new one. Re-share it securely after changing.",
                 onSubmit: async ({ next }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next); } catch (e) { return (e as Error).message; } new Notice("Shared password updated."); this.update?.(); return null; } }).open();
             }))
-            .addButton((b) => { b.setButtonText("Turn off").onClick(async () => { await enc.removeSharedPassword(); new Notice("Shared password turned off."); this.update?.(); }); (b as unknown as { setWarning?: (v: boolean) => void }).setWarning?.(true); });
+            .addButton((b) => { b.setButtonText("Turn off").onClick(async () => { await enc.removeSharedPassword(); new Notice("Shared password turned off."); this.update?.(); }); b.setDestructive(); });
         } else {
           new Setting(host).setName("Shared password").setDesc("OFF — set one passphrase that everyone types to unlock (the simplest way to share). Anyone who knows it can unlock; turning it off later doesn't claw back copies already synced elsewhere.")
             .addButton((b) => b.setButtonText("Set shared password…").onClick(() => {
@@ -1251,7 +1251,7 @@ export class StashpadSettingTab extends PluginSettingTab {
               await enc.removeMember(m.id);
               new Notice(`Removed ${m.label}. (Not full revocation without rotating the key.)`);
               this.update?.();
-            }); (b as unknown as { setWarning?: (v: boolean) => void }).setWarning?.(true); });
+            }); b.setDestructive(); });
           }
         }
         const reqs = enc.pendingJoinRequests();
