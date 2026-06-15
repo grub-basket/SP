@@ -11,11 +11,14 @@ LLMs and agents.
 > The project was designed and directed by its maintainer, but the **code was
 > written by an AI assistant** — it is not hand-authored or human-reviewed.
 
-## Install (via BRAT)
+## Install
 
-1. Install **BRAT** ([Obsidian community page](https://obsidian.md/plugins?id=obsidian42-brat) / [GitHub](https://github.com/TfTHacker/obsidian42-brat)), the beta-plugin manager.
-2. In BRAT, choose "Add beta plugin" and paste: `https://github.com/grub-basket/SP`
-3. Enable **Stashpad** in Community Plugins.
+Stashpad is on the [Obsidian community store](https://community.obsidian.md/plugins/stashpad). Requires Obsidian **1.13.0+** (desktop or mobile).
+
+1. Open **Settings → Community plugins → Browse** and search for **Stashpad** (or use the [store page](https://community.obsidian.md/plugins/stashpad)).
+2. Install, then enable **Stashpad**.
+
+**Via BRAT (optional).** You can also install through [BRAT](https://obsidian.md/plugins?id=obsidian42-brat) ([GitHub](https://github.com/TfTHacker/obsidian42-brat)): choose "Add beta plugin" and paste `https://github.com/grub-basket/SP`. BRAT lets you pin a specific version, which is handy for downgrading or grabbing a fix before it reaches the store.
 
 ## Quick start
 

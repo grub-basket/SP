@@ -2765,6 +2765,13 @@ export class StashpadView extends ItemView {
     // 0.87.0: escape hatch to the full command set — anything not surfaced
     // here (or in the context menu) is reachable via the command palette.
     menu.addItem((it: any) => it.setTitle("More commands…").setIcon("terminal").onClick(() => this.openCommandPalette()));
+    // 0.103.x: "Reload without saving" recovery action — the fix when the view
+    // (especially on mobile) looks reverted to a stale state. Hidden while notes
+    // are selected so it can't be hit mid-action by mistake.
+    if (this.selection.size === 0) {
+      menu.addSeparator();
+      menu.addItem((it: any) => it.setTitle("Reload without saving").setIcon("rotate-ccw").onClick(() => this.plugin.reloadAppForUpdate()));
+    }
     const r = anchor.getBoundingClientRect();
     menu.showAtPosition({ x: r.left, y: r.bottom + 4 });
   }

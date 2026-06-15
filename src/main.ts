@@ -1867,7 +1867,7 @@ export default class StashpadPlugin extends Plugin {
    *  pick up a freshly-synced build. Plugin disable/enable often left the
    *  renderer on the cached old main.js, so the update wouldn't take. Falls back
    *  to a raw window reload if the command isn't available. */
-  private reloadAppForUpdate(): void {
+  reloadAppForUpdate(): void {
     // 0.89.1: leave a one-shot flag so the NEXT load un-ghosts deferred Stashpad
     // tabs. Obsidian defers inactive leaves on launch; after an update reload
     // they'd otherwise sit as blank "ghost" tabs (and dead buttons) until tapped.
@@ -2821,26 +2821,30 @@ export default class StashpadPlugin extends Plugin {
         }
         if (item.kind === "convert") {
           // 0.65.2: convert an EXISTING vault folder into a Stashpad.
-          // Just opens a new tab on it — bootstrapFolder adds the Home
-          // note + _imports / _exports subfolders. Existing files in
-          // the folder are NOT touched. Confirmation modal warns the
-          // user about the additions.
+          // bootstrapFolder adds the Home note + _imports / _exports
+          // subfolders. 0.103.x: it now ALSO sweeps the folder's existing
+          // loose files + subfolders into notes (the "import loose files &
+          // folders" command) on confirm, so convert + import are one step
+          // instead of two disjoint features.
           const { ConfirmModal } = await import("./modals");
           const folder = item.folder;
           const lines = [
             `“${folder}” already exists as a regular vault folder.`,
-            `Converting will add a Home note + _imports / _exports subfolders inside it.`,
-            `Existing files are NOT touched.`,
+            `Converting adds a Home note + _imports / _exports subfolders, and imports the existing loose files and subfolders inside it as notes.`,
+            `(Files already structured as notes, and reserved subfolders, are left alone.)`,
           ];
           new ConfirmModal(
             plugin.app,
             "Convert into a Stashpad?",
             lines.join("\n"),
-            "Convert",
+            "Convert & import",
             async (ok: boolean) => {
               if (!ok) return;
               try {
                 await plugin.activateViewForFolder(folder);
+                // Reconcile with the loose-file importer: sweep existing
+                // top-level files / subfolders / .stash into notes now.
+                await plugin.runImportLooseFiles(folder);
               } catch (e) {
                 new Notice(`Stashpad: couldn't convert folder (${(e as Error).message})`);
               }

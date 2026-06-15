@@ -1,0 +1,13 @@
+#!/bin/sh
+# Thin wrapper for the dedicated Stashpad test-instance driver (CDP on :9222).
+# Drives ONLY a separate Obsidian instance pinned to the Claude Dev Vault, so the
+# user's normal Obsidian is never touched. See scripts/obs-dev.mjs for details.
+#
+#   scripts/obs-dev start                  launch/reuse + verify the dev instance
+#   scripts/obs-dev verify                 confirm it's the Claude Dev Vault (+ sentinel)
+#   scripts/obs-dev eval '<js>'            run JS (app in scope) against the dev instance
+#   scripts/obs-dev eval-file <path>       run a JS file
+#   scripts/obs-dev reload                 reload renderer after a deploy
+#   scripts/obs-dev screenshot /tmp/x.png  screenshot the dev instance
+#   scripts/obs-dev stop                   quit the dev instance
+exec node "$(dirname "$0")/obs-dev.mjs" "$@"
