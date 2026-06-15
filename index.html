@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stashpad — a chat-style nested-notes workspace for Obsidian</title>
+<meta name="description" content="Stashpad turns an Obsidian folder into a chat-style, nestable notes workspace: rapid capture, outliner navigation, fast search, tasks, and one-click Open Knowledge Format (OKF) export.">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<button class="menu-btn" id="menuBtn" aria-label="Open menu">☰</button>
+<div class="scrim" id="scrim"></div>
+<div class="layout">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand"><span class="logo">S</span> Stashpad</div>
+    <nav id="toc">
+      <div class="group">Start</div>
+      <a href="#overview">Overview</a>
+      <a href="#install">Install &amp; requirements</a>
+      <a href="#concept">The core idea</a>
+      <div class="group">Capture &amp; edit</div>
+      <a href="#composer">The composer</a>
+      <a href="#splitting">Splitting notes</a>
+      <a href="#editing">Editing &amp; structure</a>
+      <div class="group">Find &amp; organize</div>
+      <a href="#navigation">Navigation &amp; keyboard</a>
+      <a href="#search">Search (Sift)</a>
+      <a href="#panels">Panels &amp; sidebars</a>
+      <a href="#organizing">Organizing</a>
+      <a href="#tasks">Tasks &amp; reminders</a>
+      <div class="group">Power features</div>
+      <a href="#okf">Open Knowledge Format</a>
+      <a href="#import-export">Import / export</a>
+      <a href="#multiplayer">Authorship / multiplayer</a>
+      <a href="#encryption">Encryption</a>
+      <a href="#jd">Johnny.Decimal index</a>
+      <div class="group">Quality of life</div>
+      <a href="#tiny">Tiny mode</a>
+      <a href="#templates">Templates</a>
+      <a href="#extras">Undo, history &amp; speed</a>
+      <a href="#mobile">Mobile</a>
+      <div class="group">More</div>
+      <a href="#settings">Settings &amp; keybindings</a>
+      <a href="#troubleshooting">Troubleshooting</a>
+      <a href="#faq">FAQ</a>
+      <a href="#credits">Credits &amp; license</a>
+    </nav>
+  </aside>
+
+  <main class="content">
+  <div class="wrap">
+
+    <header class="hero" id="top">
+      <div class="badges">
+        <span class="badge alpha">Alpha</span>
+        <span class="badge req">Requires Obsidian 1.13+</span>
+        <span class="badge">Desktop &amp; mobile</span>
+        <span class="badge">Built with Claude Code</span>
+      </div>
+      <h1>The <span class="grad">chat-style</span> notes workspace for Obsidian.</h1>
+      <p class="tagline">Type at the bottom. Your notes stack and nest. Drill in and out of the tree. Capture fast, organize later, and export it all as portable, agent-readable knowledge.</p>
+      <div class="cta-row">
+        <a class="btn primary" href="#install">Install</a>
+        <a class="btn" href="https://github.com/grub-basket/SP" target="_blank" rel="noopener">View on GitHub ↗</a>
+      </div>
+      <figure class="shot" data-shot="hero" data-cap="Stashpad open in Obsidian: the composer at the bottom, notes stacking and nesting above."></figure>
+    </header>
+
+    <section id="overview">
+      <h2>Overview</h2>
+      <p class="lead">Stashpad is an Obsidian plugin that turns any folder into a chat-style, nestable notes workspace — the feel of jotting in a chat box, backed by a real outliner and plain Markdown files.</p>
+      <p>It's a homage to <strong>Stashpad Notes</strong>, a lovely little app discontinued in 2024. This plugin brings its rapid, jot-it-down feeling into Obsidian, on top of your own vault. Everything is stored as ordinary Markdown with YAML frontmatter, so nothing is locked in.</p>
+      <div class="grid">
+        <div class="card"><div class="ico">⚡</div><h4>Capture in a second</h4><p>Type at the bottom, hit Enter, keep going. Built for getting thoughts down without ceremony.</p></div>
+        <div class="card"><div class="ico">🌳</div><h4>Real outliner</h4><p>Notes nest under notes, arbitrarily deep. Drill in and out, or focus any note as a temporary root.</p></div>
+        <div class="card"><div class="ico">🔎</div><h4>Fast, forgiving search</h4><p>"Sift" matches all your tokens in any order across a folder or the whole vault.</p></div>
+        <div class="card"><div class="ico">🤖</div><h4>Agent-ready export</h4><p>One-click Open Knowledge Format bundles so LLMs and agents can read your notes.</p></div>
+      </div>
+      <div class="callout warn">
+        <div class="t">⚠️ Alpha software</div>
+        <p>Stashpad does a lot and is usable daily, but it's young — keep backups of anything important. It was designed and directed by its maintainer and <strong>built with Claude Code</strong> (Anthropic's Opus models, 4.6–4.8 so far); the code is not hand-authored or human-reviewed.</p>
+      </div>
+    </section>
+
+    <section id="install">
+      <h2>Install &amp; requirements</h2>
+      <p class="lead">Stashpad is on the <a href="https://community.obsidian.md/plugins/stashpad" target="_blank" rel="noopener">Obsidian community store</a>, so you can install it right from inside Obsidian.</p>
+      <div class="callout req">
+        <div class="t">Requires Obsidian 1.13.0 or newer</div>
+        <p>On both desktop and mobile. Stashpad uses 1.13-era APIs (settings search and more), so older versions can't install it. Update Obsidian first if needed.</p>
+      </div>
+      <h3>From the community store (recommended)</h3>
+      <ol class="steps">
+        <li>Open <strong>Settings → Community plugins → Browse</strong> and search for <strong>Stashpad</strong> (or use the <a href="https://community.obsidian.md/plugins/stashpad" target="_blank" rel="noopener">store page</a>).</li>
+        <li>Install, then enable <strong>Stashpad</strong>.</li>
+        <li>Run <em>"Reveal or open Stashpad"</em> from the command palette (or click the ribbon icon). The first run creates a <code>Stashpad</code> folder.</li>
+      </ol>
+      <h3>Via BRAT (optional)</h3>
+      <p>You can also install through <strong>BRAT</strong> (<a href="https://obsidian.md/plugins?id=obsidian42-brat" target="_blank" rel="noopener">community page</a> / <a href="https://github.com/TfTHacker/obsidian42-brat" target="_blank" rel="noopener">GitHub</a>): choose <em>Add beta plugin</em> and paste <code>https://github.com/grub-basket/SP</code>. BRAT is handy when you want to <strong>pin a specific version</strong> — to downgrade if something regresses, or to grab a fix before it reaches the store — instead of waiting on store review.</p>
+      <figure class="shot" data-shot="install" data-cap="Installing Stashpad from Obsidian's community plugin browser."></figure>
+    </section>
+
+    <section id="concept">
+      <h2>The core idea</h2>
+      <p class="lead">A Stashpad folder is a stream of notes you read bottom-up, where any note can contain more notes.</p>
+      <p>You write in a composer at the bottom; new notes appear in the list above. Click a note (or press <kbd>→</kbd>) to <strong>drill in</strong> — now what you type nests under it. Press <kbd>←</kbd> to come back out. You can also <strong>focus</strong> any note to treat it as a temporary root and work entirely within its subtree.</p>
+      <p>Because the hierarchy is real (each note records its parent), it maps cleanly onto outlines, project breakdowns, and — when you want it — Open Knowledge Format's parent/child structure.</p>
+      <figure class="shot" data-shot="outliner" data-cap="Drilling into a note: the breadcrumb shows where you are; new notes nest here."></figure>
+    </section>
+
+    <section id="composer">
+      <h2>The composer</h2>
+      <p class="lead">Deliberately a plain text box — but it does the things that matter for fast capture.</p>
+      <ul class="feat">
+        <li><b>Type and send.</b> Write, press Enter, the note appears. <kbd>Shift</kbd>+<kbd>Enter</kbd> for newlines, with an optional <em>split-on-newlines</em> mode that fans one block into several notes at once.</li>
+        <li><b>Inline <code>[[</code> links and <code>#</code> tags.</b> Start typing <code>[[</code> to link another note or <code>#</code> to tag, and a popup completes it as you go — quicker and more forgiving than the default editor, because it's built for jotting.</li>
+        <li><b>Attachments, however you like.</b> Click the paperclip, <strong>paste</strong> an image from the clipboard, or <strong>drag and drop</strong> files onto the composer. They're imported and linked automatically.</li>
+        <li><b>A tidy button rail.</b> Toggle split mode, set the <em>destination</em> for new notes (so a capture lands exactly where you want), flip whether Enter sends or inserts a newline, attach files, and send. On narrow widths it collapses behind one expander.</li>
+      </ul>
+      <figure class="shot" data-shot="composer" data-cap="The composer and its button rail (split, destination, Enter behavior, attach, send)."></figure>
+      <figure class="shot" data-shot="composer-autocomplete" data-cap="Inline autocomplete for [[links]] and #tags as you type."></figure>
+    </section>
+
+    <section id="splitting">
+      <h2>Splitting notes</h2>
+      <p class="lead">Turn a wall of text into many notes — on capture or after the fact.</p>
+      <p>With <strong>split mode</strong> on, a paste becomes multiple notes at once. Right-click the split button to choose how it's broken up: <strong>each line</strong>, <strong>paragraphs</strong> (blank-line separated), or <strong>headings</strong>. Long pastes show a progress bar, are created as one batch, and undo as a single action.</p>
+      <p>Already have a long note? The <strong>Split modal</strong> breaks one note into several. Use the "Split by" presets to split into many parts in one click, or place a single divider by line or cursor position. The divider centers in view so you see context above and below it.</p>
+      <figure class="shot" data-shot="split-modes" data-cap="Right-click the split button to choose: each line / paragraphs / headings."></figure>
+      <figure class="shot" data-shot="split-modal" data-cap="The Split modal: split a note into many at once, with a centered divider."></figure>
+    </section>
+
+    <section id="editing">
+      <h2>Editing &amp; structure</h2>
+      <ul class="feat">
+        <li><b>Edit in Obsidian's editor.</b> Open any note's body in a regular Obsidian tab for the full Markdown editing experience.</li>
+        <li><b>Outliner structure.</b> Notes nest under notes, arbitrarily deep — the same hierarchy OKF turns into parent/child links.</li>
+        <li><b>Everything's a real file.</b> Each note is Markdown with frontmatter (<code>id</code>, <code>parent</code>, <code>created</code>…), so your data stays portable and inspectable.</li>
+      </ul>
+    </section>
+
+    <section id="navigation">
+      <h2>Navigation &amp; keyboard</h2>
+      <p class="lead">Keyboard-first: drill, move, select, reorder, search, and fire commands without the mouse.</p>
+      <p>There are <strong>50+ bindable actions</strong>, all remappable in settings, plus a <strong>Stashpad-only command palette</strong>. Drill in and out of the tree, focus any note as a temporary root, and jump around with the keyboard.</p>
+      <figure class="shot" data-shot="command-palette" data-cap="The Stashpad command palette and customizable keybindings."></figure>
+    </section>
+
+    <section id="search">
+      <h2>Search (Sift)</h2>
+      <p class="lead">All your tokens, any order, case-insensitive — across one folder or every Stashpad in the vault.</p>
+      <p>"Sift" is Stashpad's matcher: split your query on spaces and every token must appear somewhere. It powers the search modal, the composer autocomplete, the note/folder pickers, and settings search. Results can open in a new tab.</p>
+      <figure class="shot" data-shot="search" data-cap="Sift search across a folder or the whole vault."></figure>
+    </section>
+
+    <section id="panels">
+      <h2>Panels &amp; sidebars</h2>
+      <p class="lead">Dedicated side views for the things you reach for most.</p>
+      <div class="grid">
+        <div class="card"><h4>📌 Pinned</h4><p>Quick access to pinned notes <em>and</em> folders in one place.</p></div>
+        <div class="card"><h4>✅ Tasks</h4><p>Every note with a due date or marked done, grouped by folder.</p></div>
+        <div class="card"><h4>👥 Shared</h4><p>Notes you've authored — handy in shared/multiplayer vaults.</p></div>
+      </div>
+      <p>There's also a <strong>folder panel</strong> listing your Stashpad folders, and a <strong>detail panel</strong> showing the cursored note's body, metadata, and children.</p>
+      <figure class="shot" data-shot="panels" data-cap="The panels sidebar: Pinned, Tasks, and Shared."></figure>
+    </section>
+
+    <section id="organizing">
+      <h2>Organizing</h2>
+      <ul class="feat">
+        <li><b>Move, merge, clone, outdent</b>, drag-and-drop re-parenting, and manual ordering (up / down / top / bottom).</li>
+        <li><b>Per-note colors</b> with friendly color aliases per folder.</li>
+        <li><b>Cross-folder cut / copy / paste</b> of whole subtrees — attachments come along, fully undo/redo-able.</li>
+        <li><b>Pin notes</b> to the sidebar, and <b>swap a note with its parent</b> ("ouroboros").</li>
+      </ul>
+      <figure class="shot" data-shot="organizing" data-cap="The right-click menu: move, merge, clone, colors, pin, and more."></figure>
+    </section>
+
+    <section id="tasks">
+      <h2>Tasks &amp; reminders</h2>
+      <p class="lead">Turn any note into a to-do.</p>
+      <p>Toggle a note into a task, set a due date, and get reminders (they fire when Obsidian next opens, scoped to the assignee). Everything with a due date or done state collects in the <strong>Tasks panel</strong>, grouped by folder.</p>
+      <figure class="shot" data-shot="tasks" data-cap="A task note with a due date, and the Tasks panel."></figure>
+    </section>
+
+    <section id="okf">
+      <h2>Open Knowledge Format (OKF)</h2>
+      <p class="lead">Export your notes as a portable, spec-compliant bundle that LLMs and agents can actually read.</p>
+      <p><a href="https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf" target="_blank" rel="noopener">OKF</a> is Google's open, vendor-neutral spec for packaging curated knowledge as plain Markdown. Stashpad already stores notes as Markdown with frontmatter and a real hierarchy, so it can produce OKF bundles for you — without you hand-authoring any of it.</p>
+      <ul class="feat">
+        <li><b>One toggle to enable</b>, then opt in per folder (all, some, or none) by assigning an auto-created template.</li>
+        <li><b>Complementary frontmatter</b> (<code>okfType</code>, <code>okfTitle</code>, <code>okfTimestamp</code> + managed <code>okfParent</code>/<code>okfChildren</code> links) added alongside your own fields — nothing of yours is renamed or removed.</li>
+        <li><b>A generated <code>index.md</code></b> per OKF folder (the table of contents the spec wants), with a legend.</li>
+        <li><b>Multi-format export</b> to <code>.zip</code> / <code>.tar.gz</code> (portable bundles) or <code>.stash</code>. On export, <code>okf*</code> fields map to OKF's standard keys and the hierarchy becomes relative-Markdown links, so the bundle is spec-compliant while your originals stay intact for lossless re-import.</li>
+        <li><b>Stays in sync automatically</b> as you add, move, or delete notes (with a manual Rebuild too).</li>
+      </ul>
+      <figure class="shot" data-shot="okf-export" data-cap="Export as OKF: pick .zip, .tar.gz, and/or .stash."></figure>
+      <figure class="shot" data-shot="okf-frontmatter" data-cap="okf* frontmatter on a note, plus the generated index.md."></figure>
+    </section>
+
+    <section id="import-export">
+      <h2>Import / export</h2>
+      <ul class="feat">
+        <li><b><code>.stash</code> bundles.</b> Export a subtree (optionally encrypted) and re-import it elsewhere — attachments and all.</li>
+        <li><b>Auto-import dropped files.</b> Drop files into a Stashpad folder: Markdown becomes notes, other files become linked attachments.</li>
+      </ul>
+      <figure class="shot" data-shot="stash-export" data-cap="Exporting a subtree as a .stash bundle."></figure>
+    </section>
+
+    <section id="multiplayer">
+      <h2>Authorship / multiplayer</h2>
+      <p class="lead">For vaults shared across people or devices.</p>
+      <p>Stamp notes with your name. Shared vaults track contributors on top of the original author, with a vault-wide author registry and a "sync authors" command — handy for teams sharing one vault.</p>
+      <figure class="shot" data-shot="authorship" data-cap="Author and contributor stamps on a note."></figure>
+    </section>
+
+    <section id="encryption">
+      <h2>Encryption</h2>
+      <p class="lead">Optional, off by default — lock notes, folders, or deletes into encrypted files.</p>
+      <p>Lock a subtree, a folder, or your deletes into encrypted <code>.stashenc</code> files. There are archive folders that auto-encrypt on move-in, a recoverable encrypted trash, and shared-key collaboration (per-device approval or a shared password).</p>
+      <div class="callout warn">
+        <div class="t">🔒 Please read</div>
+        <p>The encryption is <strong>beta and AI-built</strong>, and has <strong>not</strong> been human-audited or security-tested. Treat it as a best-effort way to deter a casual snoop, <strong>not</strong> a guarantee. Don't rely on it for anything truly sensitive, and keep unencrypted backups.</p>
+      </div>
+      <figure class="shot" data-shot="encryption" data-cap="Encryption settings and a locked note."></figure>
+    </section>
+
+    <section id="jd">
+      <h2>Johnny.Decimal index</h2>
+      <p class="lead">Build a JD-style hierarchy from dotted-prefix titles.</p>
+      <p>From titles like <code>1.2 Family</code> or <code>animal.duck.yellow Eggs</code>, Stashpad can build a Johnny.Decimal-style index — either a preview in your home note or an actual hierarchy of notes.</p>
+      <figure class="shot" data-shot="jd" data-cap="A generated Johnny.Decimal index."></figure>
+    </section>
+
+    <section id="tiny">
+      <h2>Tiny mode</h2>
+      <p class="lead">A small, pinnable capture window that floats above everything.</p>
+      <p>Pop Stashpad out into a compact window you can pin to stay on top, with an opacity slider, so it tucks into a corner for quick capture while you work in other apps.</p>
+      <figure class="shot" data-shot="tiny-mode" data-cap="Tiny mode: a floating, pinnable, opacity-adjustable capture window."></figure>
+    </section>
+
+    <section id="templates">
+      <h2>Templates</h2>
+      <p class="lead">Per-folder note templates with keyboard-navigable path autocomplete.</p>
+      <p>Assign a template per Stashpad folder so every new note starts from a known shape. The path field autocompletes with the arrow keys, Enter, and Tab.</p>
+      <figure class="shot" data-shot="templates" data-cap="Setting a per-folder note template."></figure>
+    </section>
+
+    <section id="extras">
+      <h2>Undo, history &amp; speed</h2>
+      <div class="grid">
+        <div class="card"><h4>↩️ Undo / redo everywhere</h4><p>Mutating actions are reversible — including cross-folder paste and bulk splits.</p></div>
+        <div class="card"><h4>🔔 Notification history</h4><p>Browse recent toasts, filtered by category, even ones you missed.</p></div>
+        <div class="card"><h4>🚀 Persisted render cache</h4><p>Rendered note bodies are cached, so big vaults stay fast.</p></div>
+      </div>
+    </section>
+
+    <section id="mobile">
+      <h2>Mobile</h2>
+      <p class="lead">Made for phones too.</p>
+      <p>The layout adapts so you can open Stashpad, see your list of notes, and fire one off in a couple of taps. The composer's button rail collapses to keep the input front and center, and the same drill-in/out flow works by touch.</p>
+      <figure class="shot" data-shot="mobile" data-cap="Stashpad on mobile."></figure>
+    </section>
+
+    <section id="settings">
+      <h2>Settings &amp; keybindings</h2>
+      <p class="lead">Tune Stashpad to your workflow.</p>
+      <p>Settings cover capture behavior, colors, templates, OKF, encryption, authorship, and more — with native settings search on Obsidian 1.13+. Every view-level command can be rebound in Stashpad's own keybindings UI, and plugin-level commands appear in Obsidian's Hotkeys page.</p>
+      <figure class="shot" data-shot="settings" data-cap="The Stashpad settings tab."></figure>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting</h2>
+      <p class="lead">Most hiccups are the view getting out of sync with your files — not lost data. Your notes are plain Markdown on disk; reloading rebuilds the view from them.</p>
+
+      <div class="callout">
+        <div class="t">🔄 The app looks reverted to an earlier state (especially on mobile)</div>
+        <p>If Stashpad shows stale content — old text, a note that "came back," or changes that seem undone — <strong>reload without saving</strong>. It rebuilds the view from the files on disk and almost always fixes it. Your notes are safe; only the in-memory view was out of date.</p>
+        <p class="muted">How: open the <strong>⚡ actions menu</strong> and tap <strong>"Reload without saving"</strong> — or run Obsidian's <em>"Reload app without saving"</em> command from the command palette.</p>
+      </div>
+
+      <h3>A note row is blank, or a tab is a "ghost" after an update</h3>
+      <p>Tap the tab to wake it, or do a <strong>Reload without saving</strong>. Obsidian defers inactive tabs on launch; after a plugin update they can sit blank until touched.</p>
+
+      <h3>A new version didn't take after BRAT updated the plugin</h3>
+      <p><strong>Reload without saving.</strong> Disabling/re-enabling a plugin often leaves the old code cached in the renderer; a full reload picks up the new build reliably.</p>
+
+      <h3>Styling looks off after an update</h3>
+      <p>Reload — the stylesheet doesn't hot-reload, so a refresh applies the latest styles.</p>
+
+      <h3>The settings tab is blank, or settings search is missing</h3>
+      <p>Make sure you're on <strong>Obsidian 1.13.0+</strong> (desktop or mobile). Stashpad needs 1.13-era APIs; older versions can't run it.</p>
+
+      <h3>Notes look out of date after editing elsewhere or syncing</h3>
+      <p>Give Obsidian a moment to re-index, or <strong>Reload without saving</strong>. After external edits (another device, a sync client, the file system) the metadata cache may still be catching up.</p>
+
+      <h3>OKF fields or <code>index.md</code> didn't update right away</h3>
+      <p>That's expected — the OKF rebuild is debounced a couple of seconds after a change. Use the <strong>Rebuild</strong> button in the OKF settings to force it immediately.</p>
+
+      <h3>A keyboard shortcut isn't firing</h3>
+      <p>Stashpad has its <em>own</em> keybindings (Settings → Stashpad) for in-list commands, separate from Obsidian's Hotkeys page (which covers plugin-level commands like open/reveal). Check both if a chord doesn't work.</p>
+
+      <h3>Still stuck?</h3>
+      <p>Please report it on the <a href="https://github.com/grub-basket/SP/issues" target="_blank" rel="noopener">issues tab</a> — include your Obsidian version, platform (desktop/mobile), and what you did just before it happened. And remember: it's alpha, so keep backups.</p>
+    </section>
+
+    <section id="faq">
+      <h2>FAQ</h2>
+      <h3>Is my data locked into Stashpad?</h3>
+      <p>No. Every note is a plain Markdown file with YAML frontmatter in your own vault. Uninstall and your notes are still just files.</p>
+      <h3>Why does it need Obsidian 1.13+?</h3>
+      <p>Stashpad uses 1.13-era APIs (including settings search). On older versions it can't be installed; update Obsidian to use it.</p>
+      <h3>The OKF frontmatter doesn't look like the spec — is the export still valid?</h3>
+      <p>Yes. Stashpad keeps its fields namespaced (<code>okf*</code>) in your vault so they never clash with your own frontmatter, then maps them to OKF's standard keys on export. In your vault it stays tidy; in the bundle it's by-the-book OKF.</p>
+      <h3>Can I trust the encryption?</h3>
+      <p>It's beta and AI-built, not human-audited. Use it to deter a casual snoop, not to protect anything truly sensitive — and keep unencrypted backups.</p>
+      <h3>Found a bug?</h3>
+      <p>Please report anything buggy or strange on the <a href="https://github.com/grub-basket/SP/issues" target="_blank" rel="noopener">issues tab</a>.</p>
+    </section>
+
+    <section id="credits">
+      <h2>Credits &amp; license</h2>
+      <p>Stashpad is a homage to <strong>Stashpad Notes</strong>, discontinued in 2024. Sincere thanks to its founders, <strong>Cara and Theo, and the rest of the Stashpad team</strong>, for the original that inspired it. The name and spirit are theirs; any rough edges here are not.</p>
+      <p>Designed and directed by its maintainer; <strong>built with Claude Code</strong> (Anthropic's Opus models, 4.6–4.8 so far). Licensed <a href="https://github.com/grub-basket/SP/blob/main/LICENSE" target="_blank" rel="noopener">MIT</a> © grub-basket.</p>
+      <div class="cta-row">
+        <a class="btn primary" href="#install">Install</a>
+        <a class="btn" href="https://github.com/grub-basket/SP" target="_blank" rel="noopener">GitHub ↗</a>
+        <a class="btn" href="https://github.com/grub-basket/SP/issues" target="_blank" rel="noopener">Report an issue ↗</a>
+      </div>
+    </section>
+
+    <footer>
+      <p>Stashpad — a chat-style nested-notes workspace for Obsidian. Alpha software; keep backups. Not affiliated with Obsidian or Google.</p>
+    </footer>
+
+  </div>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
