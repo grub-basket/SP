@@ -22,16 +22,29 @@ import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
 import { StashpadSuggest } from "./note-picker";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { AssignModal, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
+import { ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, humanCombo } from "./view-keys";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
 import { NoteBodyRenderer } from "./note-body-renderer";
 import { computeSortedIds } from "./view-sort";
+import {
+  SHEET_KEY,
+  SHEET_ORDER_KEY,
+  SHEET_FINAL_KEY,
+  sheetIdOf,
+  isVersionMember,
+  sheetIsFinal,
+  newSheetGroupId,
+  nodeFm,
+  sortVersions,
+  defaultActive,
+  tabTitle,
+} from "./sheets-versions";
 import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
-import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
+import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -251,6 +264,10 @@ export class StashpadView extends ItemView {
    *  (lazy-loaded) on reload. 0.91.0. */
   private lastSelectionByFocus = new Map<StashpadId, StashpadId[]>();
   private expandedNotes = new Set<StashpadId>();
+  /** Sheet versions: which version (note id) of a `sheet:` group is currently
+   *  shown as the row. View-state only (not persisted) — falls back to the
+   *  final pick / first-by-order when unset. */
+  private activeVersionByGroup = new Map<string, StashpadId>();
   private focusComposerOnNextRender = false;
   /** 0.76.21: timestamp until which the activation auto-focus
    *  (focusComposer) is suppressed. Set after actions that close a
@@ -310,8 +327,8 @@ export class StashpadView extends ItemView {
     this.tree.setOrderProvider((parentId) => {
       const folder = this.noteFolder;
       const mode = this.sortStore.getMode(folder, parentId);
-      if (mode === "manual") return this.order.getOrder(folder, parentId);
-      return computeSortedIds(this, parentId, mode);
+      const base = mode === "manual" ? this.order.getOrder(folder, parentId) : computeSortedIds(this, parentId, mode);
+      return this.hoistListPinned(parentId, base);
     });
     this.debouncedRender = debounce(() => { if (this.renderSuppressed()) return; this.render(); }, 80);
     this.authorship = new AuthorshipTracker(this);
@@ -568,6 +585,8 @@ export class StashpadView extends ItemView {
       for (const [focusId, noteId] of loaded) this.lastCursorByFocus.set(focusId, noteId);
       // 0.91.0: hydrate the persisted multi-selection alongside the cursor.
       this.lastSelectionByFocus = this.plugin.loadLastSelection(this.noteFolder);
+      // Sheet versions: restore which version of each group is shown.
+      this.activeVersionByGroup = this.plugin.loadActiveVersions(this.noteFolder);
     } catch { /* ignore */ }
     // On a fresh mount (app reload, tab restore, first-ever open), scroll
     // to the end of the list so the newest notes are visible. Once the
@@ -898,6 +917,8 @@ export class StashpadView extends ItemView {
         for (const [focusId, noteId] of loaded) this.lastCursorByFocus.set(focusId, noteId);
         // 0.91.0: re-hydrate the persisted multi-selection for the new folder.
         this.lastSelectionByFocus = this.plugin.loadLastSelection(this.noteFolder);
+        // Sheet versions: re-hydrate active versions for the new folder.
+        this.activeVersionByGroup = this.plugin.loadActiveVersions(this.noteFolder);
       } catch { /* ignore */ }
       const savedCursorId = this.lastCursorByFocus.get(this.focusId);
       let policy: ScrollPolicy;
@@ -1893,6 +1914,10 @@ export class StashpadView extends ItemView {
   }
 
   private filterChildren(children: TreeNode[]): TreeNode[] {
+    // Sheet versions collapse FIRST and unconditionally (before the
+    // no-filters early-return below): non-active versions of a group are
+    // hidden so only the active one shows as a row.
+    children = this.collapseVersions(children);
     const cutoff = this.timeFilterCutoff();
     const tag = this.tagFilter?.toLowerCase();
     const color = this.colorFilter?.toLowerCase() ?? null;
@@ -1918,7 +1943,9 @@ export class StashpadView extends ItemView {
       }
       if (tag) {
         if (!n.file) return false;
-        if (!this.nodeHasTag(n, tag)) return false;
+        if (this.tagFilter === TAG_FILTER_TAGGED) { if (!this.nodeHasAnyTag(n)) return false; }
+        else if (this.tagFilter === TAG_FILTER_UNTAGGED) { if (this.nodeHasAnyTag(n)) return false; }
+        else if (!this.nodeHasTag(n, tag)) return false;
       }
       if (color) {
         const c = this.colorForNode(n)?.toLowerCase() ?? null;
@@ -1934,6 +1961,70 @@ export class StashpadView extends ItemView {
       if (attachmentsOnly && !this.hasAttachmentInSubtree(n)) return false;
       return true;
     });
+  }
+
+  /** Collapse `sheet:` version groups so only the active version remains in
+   *  the list. Notes without a sheet id pass through untouched. */
+  private collapseVersions(children: TreeNode[]): TreeNode[] {
+    // Feature is opt-in: when off, never hide anything.
+    if (!this.plugin.settings.enableSheetVersions) return children;
+    // Bucket nodes by group id; non-sheet nodes go straight through.
+    const groups = new Map<string, TreeNode[]>();
+    let anyGroup = false;
+    for (const n of children) {
+      const fm = nodeFm(this.app, n);
+      if (!isVersionMember(fm)) continue; // needs BOTH sheet-group + sheet-order
+      anyGroup = true;
+      const gid = sheetIdOf(fm)!;
+      const arr = groups.get(gid);
+      if (arr) arr.push(n);
+      else groups.set(gid, [n]);
+    }
+    if (!anyGroup) return children;
+    // For each group, decide the single active member to keep.
+    const keep = new Set<StashpadId>();
+    for (const [gid, members] of groups) {
+      const active = this.activeVersionNode(gid, members);
+      if (active) keep.add(active.id);
+    }
+    return children.filter((n) => {
+      // Only fully-stamped version members are eligible to be hidden.
+      if (!isVersionMember(nodeFm(this.app, n))) return true;
+      return keep.has(n.id);
+    });
+  }
+
+  /** The version node to show for a group, honoring an explicit user choice
+   *  when that choice is still present in the current set. */
+  private activeVersionNode(groupId: string, members: TreeNode[]): TreeNode | null {
+    const chosen = this.activeVersionByGroup.get(groupId);
+    if (chosen) {
+      const hit = members.find((m) => m.id === chosen);
+      if (hit) return hit;
+    }
+    return defaultActive(this.app, members);
+  }
+
+  /** Switch which version of a group is shown, persist it, then repaint. */
+  private setActiveVersion(groupId: string, id: StashpadId): void {
+    this.activeVersionByGroup.set(groupId, id);
+    this.plugin.saveActiveVersion(this.noteFolder, groupId, id);
+    this.render();
+  }
+
+  /** True if `node`'s file carries ANY tag (inline or frontmatter) —
+   *  backs the "Tagged"/"Untagged" filter modes. */
+  private nodeHasAnyTag(node: TreeNode): boolean {
+    if (!node.file) return false;
+    const cache = this.app.metadataCache.getFileCache(node.file);
+    if (!cache) return false;
+    if (cache.tags && cache.tags.length > 0) return true;
+    const fmTags = cache.frontmatter?.tags;
+    if (fmTags) {
+      const arr = Array.isArray(fmTags) ? fmTags : [fmTags];
+      if (arr.some((t) => typeof t === "string" && t.trim().length > 0)) return true;
+    }
+    return false;
   }
 
   /** True if `node`'s file carries `tag` (case-insensitive) — checks
@@ -2743,6 +2834,10 @@ export class StashpadView extends ItemView {
     // group so it's visible without scrolling past the selection commands.
     menu.addItem((it: any) => it.setTitle("Reload without saving").setIcon("rotate-ccw").onClick(() => this.plugin.reloadAppForUpdate()));
     menu.addSeparator();
+    // List-wide expand/collapse — operate on every note, independent of selection.
+    menu.addItem((it: any) => it.setTitle("Expand all").setIcon("unfold-vertical").onClick(() => this.cmdExpandAll()));
+    menu.addItem((it: any) => it.setTitle("Collapse all").setIcon("fold-vertical").onClick(() => this.cmdCollapseAll()));
+    menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").setDisabled(!hasTargets).onClick(() => this.cmdOpenInNewStashpadTab()));
     menu.addItem((it: any) => it.setTitle("Open in editor").setIcon("pencil").setDisabled(!hasTargets).onClick(() => this.cmdOpenInEditor()));
     menu.addSeparator();
@@ -2758,6 +2853,10 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Copy").setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopy()));
     menu.addItem((it: any) => it.setTitle("Copy tree").setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
     menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").setDisabled(!hasTargets).onClick(() => void this.cmdClone()));
+    if (this.plugin.settings.enableSheetVersions) {
+      menu.addItem((it: any) => it.setTitle("Fork as version").setIcon("git-fork").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdForkVersion()));
+      menu.addItem((it: any) => it.setTitle("Mark version as final").setIcon("star").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdMarkVersionFinal()));
+    }
     menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
     menu.addItem((it: any) => it.setTitle("Merge").setIcon("merge").setDisabled(this.selection.size < 2).onClick(() => void this.cmdMerge()));
     // Split only operates on a single note — the cmdSplit modal would
@@ -2786,27 +2885,131 @@ export class StashpadView extends ItemView {
     new StashpadCommandPalette(this.app).open();
   }
 
-  /** Render the tag-filter <select>. Folder tags are tallied + sorted
-   *  here on each render so newly-added tags appear without a refresh. */
+  /** Human label for the current tag filter (button text). */
+  private tagFilterLabel(): string {
+    if (this.tagFilter === TAG_FILTER_TAGGED) return "Tagged";
+    if (this.tagFilter === TAG_FILTER_UNTAGGED) return "Untagged";
+    if (this.tagFilter) return `#${this.formatTagLabel(this.tagFilter)}`;
+    return this.collectFolderTags().length === 0 ? "No tags" : "All tags";
+  }
+
+  /** 0.104.x: the tag filter is a custom button + searchable popover
+   *  (fused from the iOS/macOS Drafts design) instead of a native
+   *  <select>. Clicking opens a popover with a search box (ranked, X to
+   *  clear), the "Tagged"/"Untagged" special modes, and every folder tag —
+   *  navigable by ↑/↓ + Enter. Tags are tallied each render so new ones
+   *  appear without a refresh. */
   private renderTagFilterDropdown(bar: HTMLElement): void {
-    const sel = bar.createEl("select", { cls: "stashpad-tag-filter-select" });
-    const all = sel.createEl("option", { text: "All tags" });
-    all.value = "";
-    if (!this.tagFilter) all.selected = true;
-
     const tags = this.collectFolderTags();
-    if (tags.length === 0) {
-      sel.disabled = true;
-      all.text = "No tags";
-    } else {
-      for (const t of tags) {
-        const opt = sel.createEl("option", { text: `${t.label} (${t.count})` });
-        opt.value = t.raw;
-        if (this.tagFilter && this.tagFilter.toLowerCase() === t.raw.toLowerCase()) opt.selected = true;
-      }
-    }
+    const btn = bar.createDiv({ cls: "stashpad-tag-filter-btn" });
+    btn.setAttribute("role", "button");
+    btn.setAttribute("tabindex", "0");
+    const icon = btn.createSpan({ cls: "stashpad-tag-filter-btn-icon" });
+    setIconSafe(icon, "tag", "#");
+    btn.createSpan({ cls: "stashpad-tag-filter-label", text: this.tagFilterLabel() });
+    if (tags.length === 0 && !this.tagFilter) btn.addClass("is-disabled");
+    const open = (e: Event): void => {
+      e.preventDefault();
+      // Allow opening with a stale filter active even if no tags remain, so
+      // it's always recoverable via the "All tags" reset.
+      if (tags.length === 0 && !this.tagFilter) return;
+      this.openTagFilterMenu(btn);
+    };
+    btn.onclick = open;
+    btn.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") open(e); };
+  }
 
-    sel.onchange = () => this.setTagFilter(sel.value || null);
+  /** Searchable tag-filter popover anchored beneath `anchor`. Mirrors the
+   *  color-filter popover's outside-click + Escape teardown. */
+  private openTagFilterMenu(anchor: HTMLElement): void {
+    const doc = anchor.ownerDocument ?? document;
+    doc.querySelectorAll(".stashpad-tag-filter-popover").forEach((el) => el.remove());
+
+    const pop = doc.body.createDiv({ cls: "stashpad-tag-filter-popover" });
+    const r = anchor.getBoundingClientRect();
+    pop.setCssStyles({
+      left: `${Math.max(8, r.left)}px`,
+      top: `${r.bottom + 4}px`,
+      minWidth: `${Math.max(r.width, 200)}px`,
+      maxWidth: "min(320px, calc(100vw - 16px))",
+      width: "max-content",
+    });
+
+    const scope = new Scope((this.app as any).scope);
+    const close = (): void => {
+      pop.remove();
+      doc.removeEventListener("mousedown", outside, true);
+      try { (this.app as any).keymap?.popScope(scope); } catch { /* ignore */ }
+    };
+    const outside = (ev: MouseEvent): void => {
+      if (!pop.contains(ev.target as Node) && ev.target !== anchor && !anchor.contains(ev.target as Node)) close();
+    };
+
+    // Search row: icon + input + (conditionally) an X-to-clear button.
+    const searchRow = pop.createDiv({ cls: "stashpad-tag-filter-search" });
+    const sIcon = searchRow.createSpan({ cls: "stashpad-tag-filter-search-icon" });
+    setIconSafe(sIcon, "search", "⌕");
+    const input = searchRow.createEl("input", { type: "text", cls: "stashpad-tag-filter-input", attr: { placeholder: "Filter tags…" } });
+    const clearX = searchRow.createSpan({ cls: "stashpad-tag-filter-clear", attr: { "aria-label": "Clear" } });
+    setIconSafe(clearX, "x", "×");
+    clearX.setCssStyles({ display: "none" });
+
+    const list = pop.createDiv({ cls: "stashpad-tag-filter-list" });
+    const allTags = this.collectFolderTags();
+    let rows: Array<{ value: string | null; el: HTMLElement }> = [];
+    let highlight = 0;
+
+    const select = (value: string | null): void => { this.setTagFilter(value); close(); };
+    const setHighlight = (i: number): void => {
+      if (rows.length === 0) { highlight = 0; return; }
+      highlight = (i + rows.length) % rows.length;
+      rows.forEach((row, k) => row.el.toggleClass("is-highlighted", k === highlight));
+      rows[highlight].el.scrollIntoView({ block: "nearest" });
+    };
+    const addRow = (label: string, value: string | null, count: number | undefined, active: boolean): void => {
+      const row = list.createDiv({ cls: "stashpad-tag-filter-row" });
+      if (active) row.addClass("is-active");
+      row.createSpan({ cls: "stashpad-tag-filter-row-label", text: label });
+      if (typeof count === "number") row.createSpan({ cls: "stashpad-tag-filter-row-count", text: String(count) });
+      const idx = rows.length;
+      rows.push({ value, el: row });
+      row.onmousedown = (e) => { e.preventDefault(); select(value); };
+      row.onmouseenter = () => setHighlight(idx);
+    };
+    const renderList = (): void => {
+      const q = input.value;
+      clearX.setCssStyles({ display: q ? "" : "none" });
+      list.empty();
+      rows = [];
+      const activeRaw = this.tagFilter?.toLowerCase();
+      if (!q.trim()) {
+        // Empty query: special modes pinned on top, then every tag.
+        addRow("All tags", null, undefined, !this.tagFilter);
+        addRow("Tagged", TAG_FILTER_TAGGED, undefined, this.tagFilter === TAG_FILTER_TAGGED);
+        addRow("Untagged", TAG_FILTER_UNTAGGED, undefined, this.tagFilter === TAG_FILTER_UNTAGGED);
+        for (const t of allTags) addRow(`#${t.label}`, t.raw, t.count, activeRaw === t.raw.toLowerCase());
+      } else {
+        // Typing: hide the specials so ↑/↓ jump straight to ranked tags.
+        const ranked = rankTags(q, allTags);
+        if (ranked.length === 0) list.createDiv({ cls: "stashpad-tag-filter-empty", text: "No matching tags" });
+        else for (const t of ranked) addRow(`#${t.label}`, t.raw, t.count, activeRaw === t.raw.toLowerCase());
+      }
+      setHighlight(0);
+    };
+
+    clearX.onclick = () => { input.value = ""; renderList(); input.focus(); };
+    input.addEventListener("input", renderList);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); setHighlight(highlight + 1); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); setHighlight(highlight - 1); }
+      else if (e.key === "Enter") { e.preventDefault(); if (rows[highlight]) select(rows[highlight].value); }
+    });
+
+    scope.register([], "Escape", (ev: KeyboardEvent) => { ev.preventDefault(); close(); return false; });
+    (this.app as any).keymap?.pushScope(scope);
+
+    renderList();
+    setTimeout(() => { doc.addEventListener("mousedown", outside, true); input.focus(); }, 0);
   }
 
   /** Color filter — custom button + popover. Native <select> is unable
@@ -3524,6 +3727,8 @@ export class StashpadView extends ItemView {
       };
     };
     addRow(tags.length === 0 ? "No tags" : "All tags", null);
+    addRow("Tagged", TAG_FILTER_TAGGED);
+    addRow("Untagged", TAG_FILTER_UNTAGGED);
     for (const t of tags) addRow(`${t.label} (${t.count})`, t.raw);
   }
 
@@ -4250,6 +4455,7 @@ export class StashpadView extends ItemView {
     if (isCursor && this.plugin.settings.autoExpandCursorRow) row.addClass("is-cursor-expanded");
     if (isPickTarget) row.addClass("is-pick-target");
     if (this.isCompleted(node)) row.addClass("is-completed");
+    if (this.isListPinned(node.id)) row.addClass("is-list-pinned");
     // 0.99.5: ghost rows that are sitting on a pending CUT (note clipboard),
     // mirroring a file manager — they're about to move/be-extracted on paste.
     if (this.isCutPending(node.id)) row.addClass("is-cut-pending");
@@ -4314,8 +4520,16 @@ export class StashpadView extends ItemView {
     // horizontal line below the timestamp — the mobile checkbox sits just to the
     // LEFT of the arrow (see the desktop addTaskCheckbox call above).
     const mobileTask = showCheckbox && Platform.isMobile;
-    if (childCount > 0 || mobileTask) {
+    const isPinnedRow = this.isListPinned(node.id);
+    if (childCount > 0 || mobileTask || isPinnedRow) {
       const metaBottom = meta.createDiv({ cls: "stashpad-note-meta-bottom" });
+      // 0.106.x: list-pin indicator — a lucide pin icon under the timestamp,
+      // placed before the children-count arrow.
+      if (isPinnedRow) {
+        const pin = metaBottom.createSpan({ cls: "stashpad-note-listpin" });
+        setIcon(pin, "pin");
+        pin.setAttr("aria-label", "Pinned to top of list");
+      }
       if (mobileTask) this.addTaskCheckbox(metaBottom, node);
       if (childCount > 0) {
         const enter = metaBottom.createSpan({ cls: "stashpad-note-enter" });
@@ -4387,7 +4601,52 @@ export class StashpadView extends ItemView {
     // Show More toggle into that cluster (anchored before the first button).
     this.renderNoteBody(bodyContent, node, { clamp: true, toggleHost: actions, toggleAnchor });
 
+    // Sheet version tabs (only when this row is part of a multi-version group).
+    this.renderVersionTabs(body, node);
+
     row.oncontextmenu = (evt) => { evt.preventDefault(); this.openNoteMenu(evt, node); };
+  }
+
+  /** Render the version tab bar at the bottom of a row whose note belongs to a
+   *  `sheet:` group with more than one version. */
+  private renderVersionTabs(body: HTMLElement, node: TreeNode): void {
+    if (!this.plugin.settings.enableSheetVersions) return;
+    if (!isVersionMember(nodeFm(this.app, node))) return;
+    const gid = sheetIdOf(nodeFm(this.app, node))!;
+    const parent = node.parent ?? this.focusId;
+    const siblings = this.tree.getChildren(parent);
+    const members = sortVersions(
+      this.app,
+      siblings.filter((s) => {
+        const fm = nodeFm(this.app, s);
+        return isVersionMember(fm) && sheetIdOf(fm) === gid;
+      }),
+    );
+    if (members.length < 2) return;
+
+    const bar = body.createDiv({ cls: "stashpad-version-tabs" });
+    for (const m of members) {
+      const isActive = m.id === node.id;
+      const isFinal = sheetIsFinal(nodeFm(this.app, m));
+      const tab = bar.createDiv({
+        cls:
+          "stashpad-version-tab" +
+          (isActive ? " is-active" : "") +
+          (isFinal ? " is-final" : ""),
+      });
+      if (isFinal) tab.createSpan({ cls: "stashpad-version-star", text: "★" });
+      tab.createSpan({
+        cls: "stashpad-version-tab-label",
+        text: tabTitle(this.app, m, this.titleForNode(m).trim() || "Untitled"),
+      });
+      tab.title = this.titleForNode(m).trim();
+      if (!isActive) {
+        tab.onclick = (e) => { e.stopPropagation(); this.setActiveVersion(gid, m.id); };
+      }
+    }
+    const add = bar.createEl("button", { cls: "stashpad-version-add", text: "+" });
+    add.title = "New version";
+    add.onclick = (e) => { e.stopPropagation(); void this.cmdForkVersion(node, true); };
   }
 
   /** Create + wire the task checkbox (used at the row's left edge on desktop,
@@ -4455,7 +4714,7 @@ export class StashpadView extends ItemView {
       // appending fresh nodes.
       container.empty();
       const textEl = container.createDiv({ cls: "stashpad-note-text" });
-      const expanded = this.expandedNotes.has(node.id);
+      const expanded = this.isNoteExpanded(node.id);
       if (opts.clamp && !expanded) textEl.addClass("is-clamped");
       // 0.71.23: in compact/tiny modes the row is too short to host
       // rendered markdown — headings overflow, code blocks get clipped
@@ -4557,8 +4816,7 @@ export class StashpadView extends ItemView {
     }
     toggle.onclick = (e) => {
       e.stopPropagation();
-      if (this.expandedNotes.has(node.id)) this.expandedNotes.delete(node.id);
-      else this.expandedNotes.add(node.id);
+      this.setNoteExpanded(node.id, !this.isNoteExpanded(node.id));
       // Re-render just this body in place to preserve list scroll.
       container.empty();
       this.renderNoteBody(container, node, opts);
@@ -5524,9 +5782,13 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.openTab)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdOpenInNewStashpadTab(); return; }
       if (matchBinding(e, sb.split)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdSplit(); return; }
       if (matchBinding(e, sb.clone)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdClone(); return; }
+      if (matchBinding(e, sb.forkNote)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdForkNote(); return; }
       if (matchBinding(e, sb.insertTemplate)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInsertTemplate(); return; }
       if (matchBinding(e, sb.toggleExpand)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdToggleExpand(); return; }
+      if (matchBinding(e, sb.expandAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdExpandAll(); return; }
+      if (matchBinding(e, sb.collapseAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdCollapseAll(); return; }
       if (matchBinding(e, sb.togglePin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdTogglePin(); return; }
+      if (matchBinding(e, sb.listPin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin(); return; }
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
     }
@@ -6855,11 +7117,37 @@ export class StashpadView extends ItemView {
   cmdToggleExpand(): void {
     const targets = this.getActionTargets();
     if (!targets.length) return;
-    const anyCollapsed = targets.some((t) => !this.expandedNotes.has(t.id));
-    for (const t of targets) {
-      if (anyCollapsed) this.expandedNotes.add(t.id);
-      else this.expandedNotes.delete(t.id);
-    }
+    const anyCollapsed = targets.some((t) => !this.isNoteExpanded(t.id));
+    for (const t of targets) this.setNoteExpanded(t.id, anyCollapsed);
+    this.render();
+  }
+
+  /** Is this note's body currently shown expanded (un-clamped)?
+   *  The expandedNotes Set stores ids that DIFFER from the default:
+   *  when expandBodiesByDefault is off (default), membership = expanded;
+   *  when on, membership = collapsed. This lets one Set serve both modes. */
+  isNoteExpanded(id: StashpadId): boolean {
+    const differsFromDefault = this.expandedNotes.has(id);
+    return this.plugin.settings.expandBodiesByDefault ? !differsFromDefault : differsFromDefault;
+  }
+
+  /** Set a note's expanded/collapsed state, normalizing against the
+   *  default so the Set only ever holds the non-default ids. */
+  setNoteExpanded(id: StashpadId, expanded: boolean): void {
+    const defaultExpanded = this.plugin.settings.expandBodiesByDefault;
+    if (expanded === defaultExpanded) this.expandedNotes.delete(id);
+    else this.expandedNotes.add(id);
+  }
+
+  /** Expand every note in the current list (un-clamp all bodies). */
+  cmdExpandAll(): void {
+    for (const n of this.currentChildren) this.setNoteExpanded(n.id, true);
+    this.render();
+  }
+
+  /** Collapse every note in the current list (re-clamp all bodies). */
+  cmdCollapseAll(): void {
+    for (const n of this.currentChildren) this.setNoteExpanded(n.id, false);
     this.render();
   }
 
@@ -7021,6 +7309,187 @@ export class StashpadView extends ItemView {
       affectedIds: newRootIds,
       folder: this.noteFolder,
     });
+  }
+
+  /** Fork a single note: duplicate its subtree as a standalone "variant" and
+   *  place it under a parent chosen via the picker. The current parent is
+   *  named as the default in the placeholder; Esc cancels. Same-folder only
+   *  for now (cross-folder forking deferred). NOTE: distinct from the sheet
+   *  "Fork as version" (cmdForkVersion) — that makes a draft within a sheet
+   *  group; this makes a separate note you can re-home. */
+  cmdForkNote(): void {
+    const node = this.getActionTargets()[0];
+    if (!node?.file) { new Notice("Nothing to fork."); return; }
+    const curParent = node.parent ?? ROOT_ID;
+    const curNode = curParent === ROOT_ID ? null : this.tree.get(curParent);
+    const curLabel = curNode ? this.titleForNode(curNode) : "Home";
+    new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+      mode: "pick",
+      allowCreate: true,
+      placeholder: `Fork "${this.titleForNode(node)}" under… (default: ${curLabel})`,
+      onPick: (item) => {
+        if (item.crossFolder) { new Notice("Fork stays in this folder for now."); return; }
+        void this.forkNoteUnder(node, item.id);
+      },
+      onCreate: (q) => { void (async () => { const id = await this.createNoteUnder(q, this.focusId); if (id) await this.forkNoteUnder(node, id); })(); },
+    }).open();
+  }
+
+  /** Clone `node`'s subtree under `parentId`, focus the new root, with undo.
+   *  Mirrors cmdClone's clone+snapshot+undo machinery for a single node. */
+  private async forkNoteUnder(node: TreeNode, parentId: StashpadId): Promise<void> {
+    if (!node.file) return;
+    const folder = this.noteFolder;
+    const createdPaths: string[] = [];
+    const newRootId = await this.cloneSubtree(node, parentId, createdPaths);
+    if (!newRootId) return;
+    this.tree.rebuild(folder);
+    this.pendingFocusIds = [newRootId];
+    this.render();
+    const snapNodes: TreeNode[] = createdPaths
+      .map((p) => this.app.vault.getAbstractFileByPath(p))
+      .filter((f): f is TFile => !!f && (f as any).extension === "md")
+      .map((file) => ({ id: parseIdFromFilename(file.basename) ?? file.basename, parent: null, children: [], file, created: new Date().toISOString() }));
+    const snap = await this.snapshotNotes(snapNodes, false);
+    this.plugin.getUndoStack(folder).push({
+      label: "Fork note",
+      undo: async () => {
+        for (const p of [...createdPaths].reverse()) {
+          const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
+          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+      redo: async () => { await this.restoreSnapshots(snap, [newRootId]); },
+    });
+    const forked = this.tree.get(newRootId);
+    this.plugin.notifications.show({
+      message: forked
+        ? `Forked "${this.titleForNode(node)}" → "${this.titleForNode(forked)}" (${createdPaths.length} file${createdPaths.length === 1 ? "" : "s"})`
+        : "Forked note",
+      kind: "success",
+      category: "clone",
+      affectedIds: [newRootId],
+      folder,
+    });
+  }
+
+  // --- Sheet versions ---
+
+  /** Ensure a note carries a `sheet:` group id, stamping a fresh one (and an
+   *  initial order of 0) if it doesn't. Returns the group id. */
+  private async ensureSheetGroup(file: TFile): Promise<string> {
+    const existing = sheetIdOf(this.app.metadataCache.getFileCache(file)?.frontmatter);
+    if (existing) return existing;
+    const gid = newSheetGroupId();
+    await this.app.fileManager.processFrontMatter(file, (m: any) => {
+      m[SHEET_KEY] = gid;
+      if (typeof m[SHEET_ORDER_KEY] !== "number") m[SHEET_ORDER_KEY] = 0;
+    });
+    return gid;
+  }
+
+  /** Create a new version of `source` as a sibling sharing its sheet group.
+   *  `blank` → empty body; otherwise the source body is duplicated (a fork).
+   *  The new version becomes the shown one. Used by the row "+" button, the
+   *  context menu, and the command. */
+  async cmdForkVersion(source?: TreeNode, blank = false): Promise<void> {
+    if (!this.plugin.settings.enableSheetVersions) {
+      new Notice("Sheet versions are off — enable them in Settings → General.");
+      return;
+    }
+    const src = source ?? this.getActionTargets()[0];
+    if (!src?.file) { new Notice("Select a note to version."); return; }
+    const folder = this.noteFolder;
+    const gid = await this.ensureSheetGroup(src.file);
+    const parent = src.parent ?? this.focusId;
+
+    // Next order = one past the current highest in the group.
+    const siblings = this.tree.getChildren(parent)
+      .filter((s) => sheetIdOf(nodeFm(this.app, s)) === gid);
+    let maxOrder = -1;
+    for (const s of siblings) {
+      const o = this.app.metadataCache.getFileCache(s.file!)?.frontmatter?.[SHEET_ORDER_KEY];
+      if (typeof o === "number" && o > maxOrder) maxOrder = o;
+    }
+    const order = maxOrder + 1;
+
+    const body = blank ? "" : this.stripFrontmatter(await this.app.vault.read(src.file));
+    const cloneId = newId();
+    const slug = bodyToSlug(body, this.activeStopwords());
+    const filename = buildFilename(slug, cloneId);
+    const path = `${folder}/${filename}`;
+    const created = new Date().toISOString();
+    const attachments = this.extractAttachments(body);
+
+    const fmInit = ["---", `id: ${cloneId}`, `parent: ${parent}`, `created: ${created}`];
+    if (attachments.length > 0) {
+      fmInit.push("attachments:");
+      for (const a of attachments) fmInit.push(`  - "${a.replace(/"/g, '\\"')}"`);
+    } else {
+      fmInit.push("attachments: []");
+    }
+    fmInit.push("---", body);
+    await this.ensureFolder(folder);
+    await this.app.vault.create(path, fmInit.join("\n"));
+
+    const newFile = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+    if (!newFile) { new Notice("Sheets: could not create version."); return; }
+    await this.app.fileManager.processFrontMatter(newFile, (m: any) => {
+      m[SHEET_KEY] = gid;
+      m[SHEET_ORDER_KEY] = order;
+      delete m[SHEET_FINAL_KEY];
+    });
+    try {
+      this.tree.insertSynthetic({ id: cloneId, parent, children: [], file: newFile, created });
+    } catch { /* ignore */ }
+    this.fmSync.scheduleParentChange(cloneId, null, parent);
+
+    this.tree.rebuild(folder);
+    this.activeVersionByGroup.set(gid, cloneId); // show the new version
+    this.plugin.saveActiveVersion(folder, gid, cloneId);
+    this.render();
+
+    this.plugin.getUndoStack(folder).push({
+      label: blank ? "New version" : "Fork version",
+      undo: async () => {
+        const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+        if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+        this.activeVersionByGroup.delete(gid);
+        this.tree.rebuild(folder);
+        this.render();
+      },
+      redo: async () => { /* best-effort: re-running the command recreates it */ },
+    });
+    new Notice(blank ? "New version added" : "Forked a new version");
+  }
+
+  /** Toggle the "final" flag on a version, clearing it from its group-mates. */
+  async cmdMarkVersionFinal(target?: TreeNode): Promise<void> {
+    if (!this.plugin.settings.enableSheetVersions) {
+      new Notice("Sheet versions are off — enable them in Settings → General.");
+      return;
+    }
+    const node = target ?? this.getActionTargets()[0];
+    if (!node?.file) return;
+    const gid = sheetIdOf(nodeFm(this.app, node));
+    if (!gid) { new Notice("Not a versioned note."); return; }
+    const makeFinal = !sheetIsFinal(nodeFm(this.app, node));
+    const parent = node.parent ?? this.focusId;
+    const members = this.tree.getChildren(parent)
+      .filter((s) => sheetIdOf(nodeFm(this.app, s)) === gid);
+    for (const m of members) {
+      if (!m.file) continue;
+      const wasFinal = sheetIsFinal(nodeFm(this.app, m));
+      const shouldBeFinal = makeFinal && m.id === node.id;
+      if (wasFinal === shouldBeFinal) continue;
+      await this.app.fileManager.processFrontMatter(m.file, (fm: any) => {
+        if (shouldBeFinal) fm[SHEET_FINAL_KEY] = true;
+        else delete fm[SHEET_FINAL_KEY];
+      });
+    }
+    this.render();
   }
 
   // ---- 0.99.0: note clipboard — copy / cut / paste of note BLOCKS ----
@@ -7372,7 +7841,9 @@ export class StashpadView extends ItemView {
     // Clear an active tag/color filter if the new subtree doesn't
     // contain it — otherwise we'd show "All …" in the dropdown while
     // a hidden filter empties the list.
-    if (this.tagFilter) {
+    if (this.tagFilter && this.tagFilter !== TAG_FILTER_TAGGED && this.tagFilter !== TAG_FILTER_UNTAGGED) {
+      // Sentinel modes (Tagged/Untagged) are always valid; only real tags
+      // get cleared when the new subtree doesn't contain them.
       const wanted = this.tagFilter.toLowerCase();
       const present = this.collectFolderTags().some((t) => t.raw.toLowerCase() === wanted);
       if (!present) this.tagFilter = null;
@@ -7909,6 +8380,92 @@ export class StashpadView extends ItemView {
     else if (unpinned > 0) new Notice(`Unpinned ${unpinned} note${unpinned === 1 ? "" : "s"} from sidebar.`);
   }
 
+  /** Is this note list-pinned (floated to the top of its sibling list)?
+   *  Distinct from the sidebar pin (plugin.isPinned). Reads frontmatter. */
+  isListPinned(id: StashpadId): boolean {
+    const node = this.tree.get(id);
+    if (!node?.file) return false;
+    const ov = this.listPinnedState.get(node.file.path);
+    if (ov) return ov.pinned;
+    return this.app.metadataCache.getFileCache(node.file)?.frontmatter?.listPinned === true;
+  }
+  private listPinnedAt(id: StashpadId): number {
+    const node = this.tree.get(id);
+    if (!node?.file) return 0;
+    const ov = this.listPinnedState.get(node.file.path);
+    if (ov) return ov.at;
+    const v = this.app.metadataCache.getFileCache(node.file)?.frontmatter?.listPinnedAt;
+    const t = typeof v === "string" ? Date.parse(v) : NaN;
+    return Number.isNaN(t) ? 0 : t;
+  }
+  /** Float list-pinned children to the top of `base` (in pin order). Returns
+   *  `base` unchanged when nothing in this parent is pinned — so unpinned
+   *  lists keep EXACTLY their prior ordering/behavior (zero regression risk). */
+  private hoistListPinned(parentId: StashpadId, base: StashpadId[]): StashpadId[] {
+    const childIds = this.tree.getChildren(parentId).map((n) => n.id);
+    if (!childIds.some((id) => this.isListPinned(id))) return base;
+    // base may be empty (manual order unset) — fall back to the tree's order.
+    const seen = new Set(base);
+    const full = [...base, ...childIds.filter((id) => !seen.has(id))];
+    const pinned = full.filter((id) => this.isListPinned(id)).sort((a, b) => this.listPinnedAt(a) - this.listPinnedAt(b));
+    const rest = full.filter((id) => !this.isListPinned(id));
+    return [...pinned, ...rest];
+  }
+
+  /** Toggle the list pin (float-to-top) on the action targets. Distinct from
+   *  the sidebar pin (cmdTogglePin). Writes listPinned/listPinnedAt + undo. */
+  async cmdToggleListPin(): Promise<void> {
+    let targets = this.getActionTargets();
+    if (targets.length === 0) {
+      const focused = this.tree.get(this.focusId);
+      if (focused?.file) targets = [focused];
+    }
+    if (targets.length === 0) { new Notice("Nothing to pin."); return; }
+    const anyUnpinned = targets.some((t) => !this.isListPinned(t.id));
+    const prior: { path: string; listPinned: unknown; listPinnedAt: unknown }[] = [];
+    const stamp = new Date().toISOString();
+    const changed: StashpadId[] = [];
+    for (const t of targets) {
+      if (!t.file) continue;
+      const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
+      prior.push({ path: t.file.path, listPinned: fm?.listPinned, listPinnedAt: fm?.listPinnedAt });
+      const at = anyUnpinned ? (typeof fm?.listPinnedAt === "string" ? Date.parse(fm.listPinnedAt) || Date.parse(stamp) : Date.parse(stamp)) : 0;
+      // Override now so the re-sort below reflects the new state immediately
+      // (the metadata cache lags the frontmatter write by a tick).
+      this.listPinnedState.set(t.file.path, { pinned: anyUnpinned, at });
+      await this.app.fileManager.processFrontMatter(t.file, (m) => {
+        if (anyUnpinned) { m.listPinned = true; if (!m.listPinnedAt) m.listPinnedAt = stamp; }
+        else { delete m.listPinned; delete m.listPinnedAt; }
+      });
+      changed.push(t.id);
+    }
+    const folder = this.noteFolder;
+    this.tree.rebuild(folder);
+    this.render();
+    this.plugin.notifications.show({
+      message: anyUnpinned ? `Pinned ${changed.length} to top of list` : `Unpinned ${changed.length} from list`,
+      kind: "success", category: "edit", affectedIds: changed, folder,
+    });
+    this.plugin.getUndoStack(folder).push({
+      label: anyUnpinned ? `Pin to top (${changed.length})` : `Unpin from top (${changed.length})`,
+      undo: async () => {
+        for (const p of prior) {
+          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+          if (!f) continue;
+          await this.app.fileManager.processFrontMatter(f, (m) => {
+            if (p.listPinned === undefined) delete m.listPinned; else m.listPinned = p.listPinned;
+            if (p.listPinnedAt === undefined) delete m.listPinnedAt; else m.listPinnedAt = p.listPinnedAt;
+          });
+          const wasPinned = p.listPinned === true;
+          const at = typeof p.listPinnedAt === "string" ? (Date.parse(p.listPinnedAt) || 0) : 0;
+          this.listPinnedState.set(p.path, { pinned: wasPinned, at });
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
+
   async cmdToggleComplete(): Promise<void> {
     let targets = this.getActionTargets();
     if (targets.length === 0) {
@@ -8032,6 +8589,12 @@ export class StashpadView extends ItemView {
    *  back to the live cache when there's no override. */
   private taskTaggedState = new Map<string, boolean>();
 
+  /** 0.105.0: list-pin override per path (pinned flag + pin timestamp), so a
+   *  pin/unpin re-sorts the list on THIS render rather than n+1 (the metadata
+   *  cache lags a frontmatter write). Reads fall back to the live cache when
+   *  there's no override. */
+  private listPinnedState = new Map<string, { pinned: boolean; at: number }>();
+
   private isCompleted(node: TreeNode): boolean {
     if (!node.file) return false;
     const override = this.completedState.get(node.file.path);
@@ -8146,9 +8709,12 @@ export class StashpadView extends ItemView {
     });
   }
 
-  /** 0.78.3: standalone assign command — assign people to the target
-   *  task(s) without touching the due date. Opens AssignModal pre-filled
-   *  with the first target's current assignees. */
+  /** 0.104.x: "Assign to" opens the SAME unified modal as "Set due date"
+   *  (date+time picker + assignee picker). Both commands now share one
+   *  modal — only the title differs. Pre-fills the first target's current
+   *  due date AND assignees, and commits through applyDue (which flips
+   *  `task: true` on any due/assignment — so assigning or scheduling a
+   *  plain note auto-converts it to a task). */
   cmdAssign(): void {
     let targets = this.getActionTargets();
     if (targets.length === 0) {
@@ -8158,76 +8724,12 @@ export class StashpadView extends ItemView {
     if (targets.length === 0) { new Notice("Nothing to assign."); return; }
     const first = targets[0];
     const curFm = first.file ? this.app.metadataCache.getFileCache(first.file)?.frontmatter as any : null;
+    const current = curFm && (typeof curFm.due === "string" || typeof curFm.due === "number") ? String(curFm.due) : null;
     const knownAuthors = this.plugin.collectKnownAuthors();
     const currentAssignees = parseAssignees(curFm ?? {});
-    new AssignModal(this.app, { knownAuthors, currentAssignees }, (assignees) => {
-      void this.applyAssignees(targets, assignees);
-    }).open();
-  }
-
-  /** Write `assignedTo`/`assignedBy` across `targets` (without touching
-   *  `due`), with undo. An empty list clears the assignment. Assigning
-   *  also flips `task: true`. */
-  private async applyAssignees(targets: TreeNode[], assignees: Array<{ id: string; name: string }>): Promise<void> {
-    const me = this.authorship.currentAuthorLink();
-    for (const a of assignees) {
-      await this.plugin.ensureAuthorStubFor(this.noteFolder, a.id, a.name);
-    }
-    const assignLinks = assignees.map((a) => this.plugin.authorRefFor(this.noteFolder, a.id, a.name));
-    const prior: { path: string; assignedTo: unknown; assignedBy: unknown; task: unknown; wasTagged: boolean }[] = [];
-    const changedIds: StashpadId[] = [];
-    for (const t of targets) {
-      if (!t.file) continue;
-      const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
-      const wasTagged = this.isTaskTagged(t);
-      prior.push({ path: t.file.path, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, task: fm?.task, wasTagged });
-      await this.app.fileManager.processFrontMatter(t.file, (m) => {
-        if (assignLinks.length > 0) {
-          m.assignedTo = assignLinks;
-          if (me) m.assignedBy = me.link;
-          m.task = true;
-        } else {
-          delete m.assignedTo;
-          delete m.assignedBy;
-        }
-      });
-      // 0.85.1: assigning makes it a task; clearing leaves task-ness unchanged.
-      this.taskTaggedState.set(t.file.path, assignLinks.length > 0 || wasTagged);
-      changedIds.push(t.id);
-    }
-    this.render();
-    if (changedIds.length > 0) {
-      const nodes = changedIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
-      const names = assignees.map((a) => a.name).join(", ");
-      this.plugin.notifications.show({
-        message: this.bulkActionMessage({
-          verb: assignLinks.length > 0 ? `Assigned to ${names}` : "Cleared assignment",
-          nodes,
-        }),
-        kind: "success",
-        category: "edit",
-        affectedIds: changedIds,
-        folder: this.noteFolder,
-      });
-    }
-    const folder = this.noteFolder;
-    this.plugin.getUndoStack(folder).push({
-      label: assignLinks.length > 0 ? `Assign (${targets.length})` : `Clear assignment (${targets.length})`,
-      undo: async () => {
-        for (const p of prior) {
-          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
-          if (!f) continue;
-          await this.app.fileManager.processFrontMatter(f, (m) => {
-            if (p.assignedTo === undefined) delete m.assignedTo; else m.assignedTo = p.assignedTo;
-            if (p.assignedBy === undefined) delete m.assignedBy; else m.assignedBy = p.assignedBy;
-            if (p.task === undefined) delete m.task; else m.task = p.task;
-          });
-          this.taskTaggedState.set(p.path, p.wasTagged); // 0.85.1
-        }
-        this.tree.rebuild(folder);
-        this.render();
-      },
-    });
+    new DueDatePickerModal(this.app, current, (result) => {
+      void this.applyDue(targets, result.iso, result.assignees);
+    }, { knownAuthors, currentAssignees, title: "Assign / schedule task" }).open();
   }
 
   /** 0.76.3: a note is a task when it carries the `task` tag in
@@ -9943,6 +10445,10 @@ export class StashpadView extends ItemView {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       void this.cmdClone();
     }));
+    menu.addItem((it: any) => it.setTitle("Fork (copy under another parent)…").setIcon("git-branch").onClick(() => {
+      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      this.cmdForkNote();
+    }));
     menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
     menu.addItem((it: any) => it.setTitle("Export to .stash").setIcon("package").onClick(() => {
       // Multi-select normalisation (matches Clone / Delete / Set color):
@@ -9991,19 +10497,52 @@ export class StashpadView extends ItemView {
         if (pinned) await this.plugin.unpinNote(pinRef);
         else await this.plugin.pinNote(pinRef);
       }));
+    // 0.105.0: list pin — float to the top of THIS list (distinct from sidebar).
+    const listPinned = this.isListPinned(node.id);
+    menu.addItem((it: any) => it
+      .setTitle(listPinned ? "Unpin from top of list" : "Pin to top of list")
+      .setIcon(listPinned ? "pin-off" : "arrow-up-to-line")
+      .onClick(() => {
+        if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+        void this.cmdToggleListPin();
+      }));
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       this.cmdSetColor();
     }));
-    // 0.58.0: toggle complete — label flips based on current state of the
-    // right-clicked node. Operates on the right-clicked row, normalising
-    // selection first so cmdToggleComplete picks the right target.
-    const isDone = this.isCompleted(node);
-    menu.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => {
+    // 0.104.x: task actions grouped under a "Task ▸" submenu to keep the
+    // right-click menu compact (Obsidian already repositions to stay
+    // on-screen; height is the real lever). Task gating: completion is only
+    // offered once a note IS a task — non-tasks show "Turn into task"; tasks
+    // show "Mark complete" + "Remove from tasks". Right-click is single-node,
+    // so the gate is unambiguous (the mobile ⚡ menu keeps its multi-select
+    // toggles). Every entry normalises selection to the right-clicked row.
+    // setSubmenu is internal/untyped — accessed via the existing `it: any`
+    // pattern; falls back to opening the command palette if unavailable
+    // (effectively never on the 1.13 minAppVersion floor).
+    const focusClicked = (): void => {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
-      void this.cmdToggleComplete();
-    }));
+    };
+    const addTaskItems = (target: { addItem: (cb: (it: any) => unknown) => unknown }): void => {
+      const isTaskNote = this.isTask(node);
+      if (isTaskNote) {
+        const isDone = this.isCompleted(node);
+        target.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => { focusClicked(); void this.cmdToggleComplete(); }));
+      } else {
+        target.addItem((it: any) => it.setTitle("Turn into task").setIcon("check-square").onClick(() => { focusClicked(); void this.cmdToggleTask(); }));
+      }
+      target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => { focusClicked(); this.cmdAssign(); }));
+      if (isTaskNote) {
+        target.addItem((it: any) => it.setTitle("Remove from tasks").setIcon("square").onClick(() => { focusClicked(); void this.cmdToggleTask(); }));
+      }
+    };
+    menu.addItem((it: any) => {
+      it.setTitle("Task").setIcon("check-square");
+      const sub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
+      if (sub && typeof sub.addItem === "function") addTaskItems(sub);
+      else it.onClick(() => this.openCommandPalette()); // degraded fallback
+    });
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Delete").setIcon("trash").onClick(async () => {
       // Route through cmdDelete (not deleteNote directly) so the encryptTrash

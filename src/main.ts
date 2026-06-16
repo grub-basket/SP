@@ -1035,6 +1035,16 @@ export default class StashpadPlugin extends Plugin {
       callback: () => call("toggleSplit"),
     });
     this.addCommand({
+      id: "stashpad-fork-version",
+      name: "Fork as version (alternate draft / sheet)",
+      callback: () => call("cmdForkVersion"),
+    });
+    this.addCommand({
+      id: "stashpad-mark-version-final",
+      name: "Mark version as final (sheet)",
+      callback: () => call("cmdMarkVersionFinal"),
+    });
+    this.addCommand({
       id: "stashpad-command-palette",
       name: "Command palette (Stashpad only)",
       callback: () => call("openStashpadCommandPalette"),
@@ -1190,8 +1200,11 @@ export default class StashpadPlugin extends Plugin {
     // "Clone / duplicate / copy" — three synonyms in the name so command-palette
     // fuzzy search hits regardless of which word the user reaches for.
     this.addCommand({ id: "stashpad-clone", name: "Clone selection (duplicate / copy notes)", callback: () => call("cmdClone") });
+    this.addCommand({ id: "stashpad-fork-note", name: "Fork note (copy as a variant under a chosen parent)", callback: () => call("cmdForkNote") });
     this.addCommand({ id: "stashpad-insert-template", name: "Insert template (clone an existing note)", callback: () => call("cmdInsertTemplate") });
     this.addCommand({ id: "stashpad-toggle-expand", name: "Show more / show less (expand toggle)", callback: () => call("cmdToggleExpand") });
+    this.addCommand({ id: "stashpad-expand-all", name: "Expand all (show every note's full body)", callback: () => call("cmdExpandAll") });
+    this.addCommand({ id: "stashpad-collapse-all", name: "Collapse all (clamp every note's body)", callback: () => call("cmdCollapseAll") });
     // Three view-level keybinds that previously had no command-palette
     // entry. Names mirror their COMMAND_META labels for fuzzy lookup.
     this.addCommand({ id: "stashpad-pick-move", name: "Move (in-list, arrow + Enter)", callback: () => call("cmdInListPicker") });
@@ -1333,6 +1346,7 @@ export default class StashpadPlugin extends Plugin {
     }
     this.addCommand({ id: "stashpad-swap-with-parent", name: "Swap with parent (ouroboros)", callback: () => call("cmdSwapWithParent") });
     this.addCommand({ id: "stashpad-toggle-pin", name: "Pin / unpin selected note (sidebar)", callback: () => call("cmdTogglePin") });
+    this.addCommand({ id: "stashpad-list-pin", name: "Pin / unpin to top of list", callback: () => call("cmdToggleListPin") });
     // 0.61.1: tiny mode — opens a popout window with the minimal shell
     // (folder/focus title + list + composer + sticky/expand controls).
     this.addCommand({
@@ -4872,6 +4886,38 @@ export default class StashpadPlugin extends Plugin {
       window.localStorage.setItem(this.LAST_SELECTION_LS_KEY, JSON.stringify(all));
     } catch (e) {
       console.warn("[Stashpad] failed to save last-selection", e);
+    }
+  }
+
+  // Sheet versions: which version (note id) of each `sheet:` group is the one
+  // shown as a row. Persisted to localStorage (like last-cursor) so the choice
+  // survives reloads. Keyed by group id (globally unique) within a folder.
+  // Storage key: "stashpad:active-versions" → { "<folder>": { "<groupId>": "<noteId>" } }
+  private readonly ACTIVE_VERSIONS_LS_KEY = "stashpad:active-versions";
+  private readActiveVersionsFile(): Record<string, Record<string, string>> {
+    try {
+      const raw = window.localStorage.getItem(this.ACTIVE_VERSIONS_LS_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed as Record<string, Record<string, string>> : {};
+    } catch {
+      return {};
+    }
+  }
+  /** Map of <groupId> → <active version note id> for the given folder. */
+  loadActiveVersions(folder: string): Map<string, string> {
+    const all = this.readActiveVersionsFile();
+    return new Map(Object.entries(all[folder] ?? {}));
+  }
+  /** Synchronously persist the active version for one (folder, group). */
+  saveActiveVersion(folder: string, groupId: string, noteId: string): void {
+    try {
+      const all = this.readActiveVersionsFile();
+      if (!all[folder]) all[folder] = {};
+      all[folder][groupId] = noteId;
+      window.localStorage.setItem(this.ACTIVE_VERSIONS_LS_KEY, JSON.stringify(all));
+    } catch (e) {
+      console.warn("[Stashpad] failed to save active-version", e);
     }
   }
 

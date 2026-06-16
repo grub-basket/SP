@@ -704,6 +704,109 @@
 .stashpad-color-filter-popover-label {
   white-space: nowrap;
 }
+
+/* --- Tag filter: custom button + searchable popover (0.104.x) --- */
+.stashpad-tag-filter-btn {
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.stashpad-tag-filter-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-tag-filter-btn.is-disabled { opacity: 0.5; cursor: not-allowed; }
+.stashpad-tag-filter-btn-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+.stashpad-tag-filter-btn-icon .svg-icon { width: 14px; height: 14px; }
+.stashpad-tag-filter-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 16ch;
+}
+.stashpad-view.is-mobile .stashpad-tag-filter-btn { height: 28px; }
+
+.stashpad-tag-filter-popover {
+  position: fixed;
+  z-index: var(--layer-popover, 30);
+  display: flex;
+  flex-direction: column;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  font-size: var(--font-ui-small);
+  max-height: 340px;
+  overflow: hidden;
+}
+.stashpad-tag-filter-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-tag-filter-search-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+.stashpad-tag-filter-search-icon .svg-icon { width: 14px; height: 14px; }
+.stashpad-tag-filter-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  outline: none;
+  padding: 2px 0;
+}
+.stashpad-tag-filter-clear {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 2px;
+}
+.stashpad-tag-filter-clear:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-tag-filter-clear .svg-icon { width: 13px; height: 13px; }
+.stashpad-tag-filter-list {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.stashpad-tag-filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.stashpad-tag-filter-row.is-highlighted { background: var(--background-modifier-hover); }
+.stashpad-tag-filter-row.is-active { font-weight: var(--font-semibold); }
+.stashpad-tag-filter-row.is-active .stashpad-tag-filter-row-label::after {
+  content: "✓";
+  margin-left: 6px;
+  color: var(--text-accent);
+}
+.stashpad-tag-filter-row-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stashpad-tag-filter-row-count { color: var(--text-muted); font-size: var(--font-ui-smaller); flex: 0 0 auto; }
+.stashpad-tag-filter-empty { padding: 8px 10px; color: var(--text-muted); }
 @container (max-width: 360px) {
   .stashpad-time-filter-btns { display: none; }
   .stashpad-time-filter-select { display: block; }
@@ -1034,6 +1137,22 @@
 .stashpad-note.is-completed .stashpad-note-time {
   text-decoration: line-through;
   opacity: 0.55;
+}
+
+/* 0.105.0 / 0.106.x: list-pinned note — floated to the top of its list. Left
+   accent bar; the pin indicator is a lucide icon in the meta column (under the
+   timestamp, before the children-count arrow) — see .stashpad-note-listpin. */
+.stashpad-note.is-list-pinned {
+  box-shadow: inset 3px 0 0 var(--text-accent);
+}
+.stashpad-note-listpin {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-accent);
+}
+.stashpad-note-listpin svg {
+  width: 13px;
+  height: 13px;
 }
 
 /* 0.99.5: a note sitting on a pending CUT (note clipboard) — ghosted + dashed
@@ -2636,6 +2755,20 @@
 .stashpad-due-field-icon:hover { color: var(--text-normal); background: var(--interactive-hover); }
 .stashpad-due-field-icon:active { background: var(--background-modifier-active-hover); }
 .stashpad-due-field-icon svg { width: 16px; height: 16px; }
+/* 0.104.x: dedicated × to clear a single field (date or time). */
+.stashpad-due-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  cursor: pointer;
+  border-radius: 5px;
+}
+.stashpad-due-clear:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-due-clear svg { width: 13px; height: 13px; }
 /* 0.76.8: hide the native right-side picker indicator — our left
    icon is the picker button now (calls showPicker). */
 .stashpad-due-date::-webkit-calendar-picker-indicator,
@@ -4439,6 +4572,40 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
   color: var(--text-accent);
 }
 .stashpad-folderpanel-pinmark svg { width: 12px; height: 12px; }
+/* 0.105.1: folder-row chevron + inline list of the folder's Home list-pinned
+   notes (revealed on click). */
+.stashpad-folderpanel-pinreveal {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.stashpad-folderpanel-pinreveal:hover { color: var(--text-normal); }
+.stashpad-folderpanel-pinlist {
+  display: flex;
+  flex-direction: column;
+  margin: 0 0 4px 28px;
+}
+.stashpad-folderpanel-pinrow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-normal);
+}
+.stashpad-folderpanel-pinrow:hover { background: var(--background-modifier-hover); }
+.stashpad-folderpanel-pinrow-icon { display: inline-flex; flex: 0 0 auto; color: var(--text-accent); }
+.stashpad-folderpanel-pinrow-icon svg { width: 13px; height: 13px; }
+.stashpad-folderpanel-pinrow-label {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: var(--font-ui-smaller);
+}
 /* 0.98.25: archive-folder badge (auto-encrypt incoming). */
 .stashpad-folderpanel-archive-badge {
   flex: 0 0 auto; display: inline-flex; align-items: center;
@@ -4489,3 +4656,48 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
 .stashpad-split-quick-label { font-size: var(--font-ui-smaller); color: var(--text-muted); margin-right: 2px; }
 .stashpad-split-quick-btn { font-size: var(--font-ui-smaller); padding: 2px 8px; }
 .stashpad-split-quick-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* --- Sheet version tabs (a row's alternate versions) --- */
+.stashpad-version-tabs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.stashpad-version-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 18ch;
+  padding: 1px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  user-select: none;
+}
+.stashpad-version-tab:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-version-tab.is-active {
+  color: var(--text-normal);
+  background: var(--background-primary);
+  border-color: var(--interactive-accent);
+  font-weight: var(--font-semibold);
+  cursor: default;
+}
+.stashpad-version-tab.is-final { border-color: var(--text-accent); }
+.stashpad-version-tab-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-version-star { color: var(--text-accent); font-size: 0.85em; line-height: 1; }
+.stashpad-version-add {
+  font-size: var(--font-ui-smaller);
+  line-height: 1;
+  padding: 1px 7px;
+  height: auto;
+  box-shadow: none;
+  color: var(--text-muted);
+}
+.stashpad-version-add:hover { color: var(--text-normal); }

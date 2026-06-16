@@ -157,3 +157,51 @@ export function arraysEqual<T>(a: T[], b: T[]): boolean {
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
 }
+
+// --- Tag filter: special sentinel modes + ranked matching --------------------
+
+/** Sentinel `tagFilter` values for the "has any tag" / "has no tags" filter
+ *  modes. The `__stashpad:` prefix can't collide with a real tag name. */
+export const TAG_FILTER_TAGGED = "__stashpad:tagged__";
+export const TAG_FILTER_UNTAGGED = "__stashpad:untagged__";
+
+/** Score a tag name against a query for the tag-filter search box.
+ *  Higher = closer match; -1 = no match. Tiers (closest first):
+ *    exact (1000) > prefix (800) > word-boundary substring (≈600) >
+ *    mid-word substring (≈500) > subsequence/fuzzy (200).
+ *  Substring tiers subtract the match index so earlier hits rank higher. */
+export function rankTagMatch(query: string, tag: string): number {
+  const q = query.toLowerCase().trim();
+  const t = tag.toLowerCase();
+  if (!q) return 0;
+  if (t === q) return 1000;
+  if (t.startsWith(q)) return 800;
+  const idx = t.indexOf(q);
+  if (idx > 0) {
+    const prev = t[idx - 1];
+    const boundary = !/[a-z0-9]/.test(prev); // after a separator (-, _, /, space)
+    return (boundary ? 600 : 500) - Math.min(idx, 99);
+  }
+  // Subsequence fuzzy: every query char appears in order somewhere.
+  let qi = 0;
+  for (let i = 0; i < t.length && qi < q.length; i++) {
+    if (t[i] === q[qi]) qi++;
+  }
+  return qi === q.length ? 200 : -1;
+}
+
+/** Rank + filter a tag list by `query`. Empty query returns the list
+ *  unchanged (caller's original frequency/alpha order). Otherwise drops
+ *  non-matches and sorts by score desc, then count desc, then label. */
+export function rankTags<T extends { raw: string; label: string; count: number }>(
+  query: string,
+  tags: T[],
+): T[] {
+  const q = query.trim();
+  if (!q) return tags;
+  return tags
+    .map((t) => ({ t, s: rankTagMatch(q, t.raw) }))
+    .filter((x) => x.s >= 0)
+    .sort((a, b) => b.s - a.s || b.t.count - a.t.count || a.t.label.localeCompare(b.t.label))
+    .map((x) => x.t);
+}

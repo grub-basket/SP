@@ -13,6 +13,9 @@ export interface DuePickerOptions {
   knownAuthors?: AssigneeRef[];
   /** Assignees already on the note, to pre-fill the chips. */
   currentAssignees?: AssigneeRef[];
+  /** Modal title. Defaults to "Set due date". The "Assign to" command
+   *  opens this same modal with a different title. */
+  title?: string;
 }
 import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
@@ -1519,36 +1522,6 @@ export function buildAssigneePicker(
 
 /** 0.78.3: standalone "Assign to" modal — assignment without touching the
  *  due date. onPick gets the chosen assignee set; not called on dismiss. */
-export class AssignModal extends Modal {
-  private didChoose = false;
-  private assignees: AssigneeRef[] = [];
-  constructor(
-    app: App,
-    private opts: { knownAuthors: AssigneeRef[]; currentAssignees: AssigneeRef[] },
-    private onPick: (assignees: AssigneeRef[]) => void,
-  ) {
-    super(app);
-    this.assignees = [...opts.currentAssignees];
-  }
-  onOpen(): void {
-    this.modalEl?.addClass("stashpad-compact-modal");
-    this.contentEl.empty();
-    this.titleEl.setText("Assign task");
-    const wrap = this.contentEl.createDiv({ cls: "stashpad-due-picker" });
-    buildAssigneePicker(wrap, {
-      knownAuthors: this.opts.knownAuthors,
-      initial: this.assignees,
-      onChange: (list) => { this.assignees = list; },
-    });
-    const row = this.contentEl.createDiv({ cls: "stashpad-modal-btns" });
-    const cancel = row.createEl("button", { text: "Cancel" });
-    cancel.onclick = () => { this.didChoose = true; this.close(); };
-    const ok = row.createEl("button", { cls: "mod-cta", text: "Save" });
-    ok.onclick = () => { this.didChoose = true; this.close(); this.onPick(this.assignees); };
-  }
-  onClose(): void { this.contentEl.empty(); void this.didChoose; }
-}
-
 export class DueDatePickerModal extends Modal {
   private didChoose = false;
   /** Working set of assignees, mutated by the chips UI. */
@@ -1571,7 +1544,7 @@ export class DueDatePickerModal extends Modal {
   onOpen(): void {
     this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
     this.contentEl.empty();
-    this.titleEl.setText("Set due date");
+    this.titleEl.setText(this.opts.title ?? "Set due date");
 
     // Pre-fill from the current value when parseable.
     let initial: Date | null = null;
@@ -1589,10 +1562,17 @@ export class DueDatePickerModal extends Modal {
     const dateIcon = dateField.createSpan({ cls: "stashpad-due-field-icon" });
     setIcon(dateIcon, "calendar");
     const dateInput = dateField.createEl("input", { type: "date", cls: "stashpad-due-date" });
+    // 0.104.x: dedicated × to clear this field independently.
+    const dateClear = dateField.createSpan({ cls: "stashpad-due-clear", attr: { "aria-label": "Clear date" } });
+    setIcon(dateClear, "x");
+    dateClear.onclick = () => { dateInput.value = ""; dateInput.focus(); };
     const timeField = fields.createDiv({ cls: "stashpad-due-field" });
     const timeIcon = timeField.createSpan({ cls: "stashpad-due-field-icon" });
     setIcon(timeIcon, "clock");
     const timeInput = timeField.createEl("input", { type: "time", cls: "stashpad-due-time" });
+    const timeClear = timeField.createSpan({ cls: "stashpad-due-clear", attr: { "aria-label": "Clear time" } });
+    setIcon(timeClear, "x");
+    timeClear.onclick = () => { timeInput.value = ""; timeInput.focus(); };
     // 0.76.8: the leading icon IS the picker button. The native
     // ::-webkit-calendar-picker-indicator (on the input's right) is
     // hidden via CSS; clicking our left icon opens the OS picker via

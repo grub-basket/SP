@@ -55,12 +55,12 @@ export type CommandId =
   | "toggleSplit" | "pickDestination" | "search" | "searchInParent" | "delete" | "undo" | "redo"
   | "toggleComplete" | "moveUp" | "moveDown" | "moveToTop" | "moveToBottom"
   | "outdent" | "setColor"
-  | "clone" | "insertTemplate"
-  | "toggleExpand"
+  | "clone" | "forkNote" | "insertTemplate"
+  | "toggleExpand" | "expandAll" | "collapseAll"
   | "exportStash" | "importStash" | "pickFolder"
   | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
   | "swapWithParent"
-  | "togglePin"
+  | "togglePin" | "listPin"
   | "toggleTask" | "setDue"
   | "jumpToTop" | "jumpToBottom"
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
@@ -119,8 +119,11 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "outdent",         label: "Outdent (move to grandparent)", desc: "Default: Mod+[ — re-parents the selection one level up.",                                defaultPrimary: "Mod+[" },
   { id: "setColor",        label: "Set note color",                desc: "Default: Shift+: or ; — open the color picker for the selection (both chords active).",   defaultPrimary: "Shift+:", defaultSecondary: ";", defaultUseBoth: true },
   { id: "clone",           label: "Clone (duplicate / copy) selection", desc: "Default: Mod+Shift+D — clone selected notes (with their subtrees) as siblings.",   defaultPrimary: "Mod+Shift+D" },
+  { id: "forkNote",        label: "Fork note (copy under a chosen parent)", desc: "Duplicate the cursor row (with its subtree) as a variant and pick which parent it nests under. No default chord.", defaultPrimary: "" },
   { id: "insertTemplate",  label: "Insert template (clone an existing note)", desc: "Pick any note in this Stashpad; clone it (with subtree + attachments) into the current view, retimestamped.", defaultPrimary: "" },
   { id: "toggleExpand",    label: "Show more / show less (expand toggle)", desc: "Default: Shift+? — toggle the clamp on the cursor row (or every selected row).", defaultPrimary: "Shift+?" },
+  { id: "expandAll",       label: "Expand all (show every note's full body)", desc: "Un-clamp every note in the current list at once.", defaultPrimary: "" },
+  { id: "collapseAll",     label: "Collapse all (clamp every note's body)", desc: "Re-clamp every note in the current list at once.", defaultPrimary: "" },
   { id: "exportStash",     label: "Export selection to .stash",    desc: "Export the selected subtree(s) as a .stash bundle (notes + attachments).",                defaultPrimary: "" },
   { id: "importStash",     label: "Import .stash file",            desc: "Open the .stash bundle picker and import its notes into this Stashpad.",                  defaultPrimary: "" },
   { id: "pickFolder",      label: "Open / switch / create Stashpad folder", desc: "Default: Mod+S — opens the unified folder picker (reveal, switch, create, convert).", defaultPrimary: "Mod+S" },
@@ -129,6 +132,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "copyCodeBlock",   label: "Copy code from codeblock",      desc: "Default: { — copy the contents of the cursor row's first codeblock (or pick one when multiple exist).", defaultPrimary: "{" },
   { id: "swapWithParent",  label: "Swap with parent (ouroboros)",  desc: "Promote the cursor row above its current parent; the parent slides under it (carrying its other children). No default — bind in this tab.", defaultPrimary: "" },
   { id: "togglePin",       label: "Pin / unpin selected note",     desc: "Default: P — toggle the sidebar pin state of the cursor row (or focused note).", defaultPrimary: "P" },
+  { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. No default chord.", defaultPrimary: "" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: H — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "H" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
   { id: "jumpToTop",       label: "Jump to top of list",           desc: "Default: Home — move the cursor to the first note in the current list.", defaultPrimary: "Home" },
@@ -386,6 +390,12 @@ export interface StashpadSettings {
    *  effect that vanishes the moment the cursor moves. Off by
    *  default. */
   autoExpandCursorRow: boolean;
+  /** When on, note bodies render fully expanded by default; the
+   *  per-note "Show more / show less" toggle and the expand/collapse-all
+   *  commands then act as a *collapse* opt-out (the expandedNotes Set is
+   *  interpreted as "differs from this default"). Off = current behavior
+   *  (bodies clamp by default, expand is opt-in). */
+  expandBodiesByDefault: boolean;
   /** 0.74.1: auto-open the right-sidebar detail panel whenever a
    *  Stashpad view becomes active. Off by default — opt in via this
    *  toggle or the matching palette command. */
@@ -394,6 +404,11 @@ export interface StashpadSettings {
    *  focus/open it — navigate into it, same as ArrowRight or the
    *  enter arrow. On by default. Single click still just selects. */
   doubleClickToFocus: boolean;
+  /** 0.107.0: enable "Sheet versions" — treat notes sharing a `sheet-group`
+   *  frontmatter id as alternate versions of one item (only the active one
+   *  shows as a row; siblings collapse into a tab bar). Off by default so the
+   *  collapse filter never touches anyone who hasn't opted in. */
+  enableSheetVersions: boolean;
   /** 0.76.6: how dates (due dates, created/modified) display across
    *  the Tasks panel + detail panel. One of locale / iso / us / eu /
    *  long. Default "locale". */
@@ -522,8 +537,10 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   autoNavOnMoveIn: false,
   autoNavOnMoveOut: false,
   autoExpandCursorRow: false,
+  expandBodiesByDefault: false,
   autoOpenDetailPanel: false,
   doubleClickToFocus: true,
+  enableSheetVersions: false,
   dateDisplayFormat: "locale",
   dateDisplayTimezone: "",
   jdIndexScope: "vault",
@@ -943,10 +960,14 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.autoNavOnMoveOut, (v) => { this.plugin.settings.autoNavOnMoveOut = v; }, ["navigate", "move", "out"]));
     items.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",
       () => this.plugin.settings.doubleClickToFocus, (v) => { this.plugin.settings.doubleClickToFocus = v; }, ["double", "click", "open", "focus"]));
+    items.push(toggle("Sheet versions (alternate drafts)", "Treat notes that share a 'sheet-group' frontmatter id as alternate versions of one item: only the active version shows as a row, and its siblings collapse into a tab bar at the bottom of that row. Use \"Fork as version\" on a note to start. Off by default — when off, no note is ever hidden by this feature and the commands do nothing.",
+      () => this.plugin.settings.enableSheetVersions, (v) => { this.plugin.settings.enableSheetVersions = v; }, ["sheet", "version", "draft", "alternate", "fork"]));
     items.push(toggle("Auto-open the detail panel", "Open the right-sidebar Stashpad detail panel automatically whenever a Stashpad view becomes active. The panel shows the cursored note's body, metadata, and children. Off = open manually via ribbon or command palette.",
       () => this.plugin.settings.autoOpenDetailPanel, (v) => { this.plugin.settings.autoOpenDetailPanel = v; }, ["detail", "panel", "sidebar"]));
     items.push(toggle("Expand the cursor row's body automatically", "As you arrow-key through the list, the row under the cursor temporarily un-clamps to show its full body. Moving away re-collapses it. Doesn't affect the persistent 'Show more' state — this is a transient view-only effect.",
       () => this.plugin.settings.autoExpandCursorRow, (v) => { this.plugin.settings.autoExpandCursorRow = v; }, ["expand", "cursor", "body"]));
+    items.push(toggle("Expand note bodies by default", "Show every note's full body by default instead of clamping long notes. The per-note 'Show more / show less' toggle and the Expand-all / Collapse-all commands then work in reverse — they let you collapse individual notes back down. Off = bodies clamp by default (expand is opt-in).",
+      () => this.plugin.settings.expandBodiesByDefault, (v) => { this.plugin.settings.expandBodiesByDefault = v; }, ["expand", "collapse", "default", "body", "clamp"]));
     items.push(toggle("Confirm cross-parent drag-and-drop", "When dragging notes onto a note that has a different parent, ask before re-parenting (turn off to allow direct moves).",
       () => this.plugin.settings.confirmCrossParentDrag, (v) => { this.plugin.settings.confirmCrossParentDrag = v; }, ["confirm", "drag", "drop", "reparent"]));
     items.push(toggle("Confirm bulk deletes", "Warn before deletes that affect more than one note — multi-selection delete OR deleting a note that has descendants. A single childless note with no attachments never prompts. Off = those deletes apply immediately (undo still recovers everything).",

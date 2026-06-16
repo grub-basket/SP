@@ -107,6 +107,9 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   // 0.86.3: sidebar pin state lives on the note (so it SYNCS with the note
   // across devices). Stashpad-managed; clones/templates must not inherit it.
   "pinned", "pinnedAt",
+  // 0.105.0: list pin — floats a note to the TOP of its sibling list (distinct
+  // from the sidebar pin above). Stashpad-managed; not inherited by clones.
+  "listPinned", "listPinnedAt",
   // 0.88.0: marks a note that came in via import (used by the "imported only"
   // view filter). Stashpad-managed; a clone of an imported note isn't imported.
   "imported",
