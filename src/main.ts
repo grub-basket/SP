@@ -1,4 +1,5 @@
-import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon, debounce } from "obsidian";
+import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, type PinnedNoteRef, type StashpadId } from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
@@ -41,6 +42,30 @@ interface FileSnapshot { path: string; binary: boolean; text?: string; data?: Ar
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
+  /** 0.108.2: in-memory debug trace ring buffer. Populated by trace() only
+   *  when settings.debugTrace is on; copied out from the Diagnostics tab.
+   *  Purely local — no network, no file writes. Capped so a long session
+   *  can't grow it unbounded. */
+  private debugBuffer: string[] = [];
+  private static readonly DEBUG_BUFFER_MAX = 300;
+  /** Record a structured diagnostic line. No-op (and zero cost beyond the
+   *  flag check) unless debug tracing is enabled. Hard to misuse: data is
+   *  JSON-stringified defensively so a circular/huge value can't throw out
+   *  of a hot path. */
+  trace(category: string, data?: Record<string, unknown>): void {
+    if (!this.settings.debugTrace) return;
+    let payload = "";
+    if (data) { try { payload = " " + JSON.stringify(data); } catch { payload = " [unserializable]"; } }
+    // performance.now() is monotonic and devtools-free — fine on mobile.
+    const t = Math.round(performance.now());
+    this.debugBuffer.push(`+${t}ms ${category}${payload}`);
+    if (this.debugBuffer.length > StashpadPlugin.DEBUG_BUFFER_MAX) {
+      this.debugBuffer.splice(0, this.debugBuffer.length - StashpadPlugin.DEBUG_BUFFER_MAX);
+    }
+  }
+  /** Current trace lines joined for copy/clear from the Diagnostics tab. */
+  getDebugTrace(): string { return this.debugBuffer.join("\n"); }
+  clearDebugTrace(): void { this.debugBuffer = []; }
   private undoStacks = new Map<string, UndoStack>();
   /** Most-recently-active Stashpad leaf — set on active-leaf-change.
    *  Used by sidebar panel actions (Search, Home) so they target the
@@ -701,6 +726,14 @@ export default class StashpadPlugin extends Plugin {
     // last readable plaintext copy, sitting in render-cache.json.
     this.registerEvent(this.app.vault.on("delete", (f) => this.renderCacheStore.evict(f.path)));
     this.registerEvent(this.app.vault.on("rename", (_f, oldPath) => this.renderCacheStore.evict(oldPath)));
+    // Fork siblings: when a family member is deleted (single / subtree / multi /
+    // fork-undo), drop it from every other member's `fork-siblings`. Debounced
+    // so a burst of deletes triggers one vault scan. (Renames are handled by
+    // Obsidian's own wikilink updater.)
+    const pruneForkSiblings = debounce(() => void this.flushForkSiblingPrune(), 250, true);
+    this.registerEvent(this.app.vault.on("delete", (f) => {
+      if (f instanceof TFile && f.extension === "md") { this.pendingForkDeletes.add(f.basename); pruneForkSiblings(); }
+    }));
     // 0.102.x: OKF auto-rebuild — when a note is added/deleted/moved in an OKF
     // folder, refresh that folder's OKF frontmatter + index.md (debounced). Gated
     // through okfActiveFolders so it never runs when OKF is off / for non-OKF /
@@ -1036,7 +1069,7 @@ export default class StashpadPlugin extends Plugin {
     });
     this.addCommand({
       id: "stashpad-fork-version",
-      name: "Fork as version (alternate draft / sheet)",
+      name: "Fork as a version (alternate draft in this sheet)",
       callback: () => call("cmdForkVersion"),
     });
     this.addCommand({
@@ -1200,7 +1233,7 @@ export default class StashpadPlugin extends Plugin {
     // "Clone / duplicate / copy" — three synonyms in the name so command-palette
     // fuzzy search hits regardless of which word the user reaches for.
     this.addCommand({ id: "stashpad-clone", name: "Clone selection (duplicate / copy notes)", callback: () => call("cmdClone") });
-    this.addCommand({ id: "stashpad-fork-note", name: "Fork note (copy as a variant under a chosen parent)", callback: () => call("cmdForkNote") });
+    this.addCommand({ id: "stashpad-fork-note", name: "Fork into a separate note (copy under a chosen parent)", callback: () => call("cmdForkNote") });
     this.addCommand({ id: "stashpad-insert-template", name: "Insert template (clone an existing note)", callback: () => call("cmdInsertTemplate") });
     this.addCommand({ id: "stashpad-toggle-expand", name: "Show more / show less (expand toggle)", callback: () => call("cmdToggleExpand") });
     this.addCommand({ id: "stashpad-expand-all", name: "Expand all (show every note's full body)", callback: () => call("cmdExpandAll") });
@@ -4918,6 +4951,28 @@ export default class StashpadPlugin extends Plugin {
       window.localStorage.setItem(this.ACTIVE_VERSIONS_LS_KEY, JSON.stringify(all));
     } catch (e) {
       console.warn("[Stashpad] failed to save active-version", e);
+    }
+  }
+
+  /** Basenames of recently-deleted notes awaiting a fork-siblings prune. */
+  private pendingForkDeletes = new Set<string>();
+  /** Remove the deleted notes from every other note's `fork-siblings`. */
+  private async flushForkSiblingPrune(): Promise<void> {
+    const names = new Set(this.pendingForkDeletes);
+    this.pendingForkDeletes.clear();
+    if (!names.size) return;
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const sibs = this.app.metadataCache.getFileCache(f)?.frontmatter?.[SIBLINGS_KEY];
+      if (!Array.isArray(sibs)) continue;
+      if (!sibs.some((s) => names.has(wikilinkName(s) ?? ""))) continue;
+      try {
+        await this.app.fileManager.processFrontMatter(f, (m: any) => {
+          const arr = Array.isArray(m[SIBLINGS_KEY]) ? m[SIBLINGS_KEY] : [];
+          const next = arr.filter((s: unknown) => !names.has(wikilinkName(s) ?? ""));
+          if (next.length) m[SIBLINGS_KEY] = next;
+          else delete m[SIBLINGS_KEY];
+        });
+      } catch { /* ignore */ }
     }
   }
 

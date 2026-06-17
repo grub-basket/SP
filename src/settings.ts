@@ -119,7 +119,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "outdent",         label: "Outdent (move to grandparent)", desc: "Default: Mod+[ — re-parents the selection one level up.",                                defaultPrimary: "Mod+[" },
   { id: "setColor",        label: "Set note color",                desc: "Default: Shift+: or ; — open the color picker for the selection (both chords active).",   defaultPrimary: "Shift+:", defaultSecondary: ";", defaultUseBoth: true },
   { id: "clone",           label: "Clone (duplicate / copy) selection", desc: "Default: Mod+Shift+D — clone selected notes (with their subtrees) as siblings.",   defaultPrimary: "Mod+Shift+D" },
-  { id: "forkNote",        label: "Fork note (copy under a chosen parent)", desc: "Duplicate the cursor row (with its subtree) as a variant and pick which parent it nests under. No default chord.", defaultPrimary: "" },
+  { id: "forkNote",        label: "Fork into a separate note (under a chosen parent)", desc: "Duplicate the cursor row (with its subtree) as a separate note and pick which parent it nests under. Distinct from \"Fork as a version\" (a draft within a sheet group). No default chord.", defaultPrimary: "" },
   { id: "insertTemplate",  label: "Insert template (clone an existing note)", desc: "Pick any note in this Stashpad; clone it (with subtree + attachments) into the current view, retimestamped.", defaultPrimary: "" },
   { id: "toggleExpand",    label: "Show more / show less (expand toggle)", desc: "Default: Shift+? — toggle the clamp on the cursor row (or every selected row).", defaultPrimary: "Shift+?" },
   { id: "expandAll",       label: "Expand all (show every note's full body)", desc: "Un-clamp every note in the current list at once.", defaultPrimary: "" },
@@ -192,6 +192,12 @@ export interface StashpadSettings {
    *  timing so the "Dump performance profile" command reports where the
    *  time goes on a slow vault. Off by default. */
   enablePerfProfiling: boolean;
+  /** 0.108.2: opt-in local debug tracing — records structured diagnostic
+   *  lines (e.g. tap coordinates vs resolved row) to an in-memory ring buffer
+   *  you can copy from the Diagnostics tab. Purely local, no network, no file
+   *  writes; a no-op when off. Ships dormant — never needs stripping for the
+   *  store / pristine. */
+  debugTrace: boolean;
   /** 0.83.1: maintain the redundant `parentLink`/`children` recovery
    *  fields on every move. Default true. Turning it off skips those writes
    *  entirely — a big speedup on slow/network drives (each is a full
@@ -483,6 +489,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   folderPanelHidden: [],
   folderPanelPinnedGrouping: "pin-order",
   enablePerfProfiling: false,
+  debugTrace: false,
   writeRecoveryLinks: true,
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
@@ -735,6 +742,23 @@ export class StashpadSettingTab extends PluginSettingTab {
         s.addToggle((t) => t.setValue(this.plugin.settings.enablePerfProfiling).onChange(async (v) => {
           this.plugin.settings.enablePerfProfiling = v; await this.plugin.saveSettings();
         })), ["perf", "profiling", "timing", "slow"]),
+
+      this.renderDef("Debug trace", "Record low-level diagnostic lines (e.g. tap coordinates vs the row they resolve to) to an in-memory buffer while you reproduce a bug, then copy them below to share. Local only — no network, no file writes; zero overhead when off.", (s) =>
+        s.addToggle((t) => t.setValue(this.plugin.settings.debugTrace).onChange(async (v) => {
+          this.plugin.settings.debugTrace = v; await this.plugin.saveSettings();
+        })), ["debug", "trace", "diagnostics", "tap", "log"]),
+
+      this.renderDef("Copy / clear debug trace", "Copy the captured debug lines to the clipboard (paste them back to share), or clear the buffer to start a fresh capture.", (s) => {
+        s.addButton((b) => b.setButtonText("Copy").onClick(async () => {
+          const text = this.plugin.getDebugTrace();
+          if (!text) { new Notice("Debug trace is empty — enable it and reproduce the issue first."); return; }
+          try { await navigator.clipboard.writeText(text); new Notice("Debug trace copied."); }
+          catch { new Notice("Couldn't access clipboard."); }
+        }));
+        s.addButton((b) => b.setButtonText("Clear").onClick(() => {
+          this.plugin.clearDebugTrace(); new Notice("Debug trace cleared.");
+        }));
+      }, ["debug", "trace", "copy", "clear"]),
 
       this.renderDef("Open log file", "Append-only history of creates, deletes, parent changes, renames. Stored alongside the plugin's other private files.", (s) =>
         s.addButton((b) => b.setButtonText("Open log").onClick(async () => {

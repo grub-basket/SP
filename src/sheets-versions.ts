@@ -14,6 +14,17 @@ export const SHEET_KEY = "sheet-group"; // group id shared by all versions (stri
 export const SHEET_ORDER_KEY = "sheet-order"; // numeric order within the group
 export const SHEET_FINAL_KEY = "sheet-final"; // true on the chosen version
 export const SHEET_LABEL_KEY = "sheet-label"; // optional custom tab label
+export const SHEET_ORIGIN_KEY = "sheet-origin"; // true on the original (group seed)
+export const FORKED_FROM_KEY = "forked-from"; // provenance: id of the note this was forked from
+export const SIBLINGS_KEY = "fork-siblings"; // wikilinks to all other members of the fork family
+
+/** Keys that mark a note as a sheet version or record its provenance. They are
+ *  stripped when a note is DUPLICATED by clone / fork-note / insert-template —
+ *  a copy is a brand-new note, never a silent member of the source's version
+ *  group and never an "original" or "final". */
+export const SHEET_COPY_SKIP_KEYS: readonly string[] = [
+  SHEET_KEY, SHEET_ORDER_KEY, SHEET_FINAL_KEY, SHEET_LABEL_KEY, SHEET_ORIGIN_KEY, FORKED_FROM_KEY, SIBLINGS_KEY,
+];
 
 type Fm = Record<string, unknown> | null | undefined;
 
@@ -38,6 +49,29 @@ export function isVersionMember(fm: Fm): boolean {
 
 export function sheetIsFinal(fm: Fm): boolean {
   return fm?.[SHEET_FINAL_KEY] === true;
+}
+
+/** True on the original note that seeded the group (never on a fork). */
+export function isOriginal(fm: Fm): boolean {
+  return fm?.[SHEET_ORIGIN_KEY] === true;
+}
+
+/** The raw `forked-from` value (a `[[wikilink]]`), if any. */
+export function forkedFromOf(fm: Fm): string | null {
+  const v = fm?.[FORKED_FROM_KEY];
+  return typeof v === "string" && v.trim() ? v : null;
+}
+
+/** The bare note name inside a `[[wikilink]]` (strips brackets, alias, subpath). */
+export function wikilinkName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const inner = raw.replace(/^\[\[/, "").replace(/\]\]$/, "");
+  return inner.split("|")[0].split("#")[0].trim() || null;
+}
+
+/** The bare note name behind `forked-from`. */
+export function forkedFromName(fm: Fm): string | null {
+  return wikilinkName(forkedFromOf(fm));
 }
 
 export function sheetLabelOf(fm: Fm): string | null {

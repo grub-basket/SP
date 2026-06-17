@@ -33,8 +33,14 @@ import {
   SHEET_KEY,
   SHEET_ORDER_KEY,
   SHEET_FINAL_KEY,
+  SHEET_ORIGIN_KEY,
+  FORKED_FROM_KEY,
+  SIBLINGS_KEY,
+  SHEET_COPY_SKIP_KEYS,
   sheetIdOf,
   isVersionMember,
+  isOriginal,
+  forkedFromName,
   sheetIsFinal,
   newSheetGroupId,
   nodeFm,
@@ -241,6 +247,19 @@ export class StashpadView extends ItemView {
    *  "moving" on every composer interaction). During this window we
    *  let the browser's own reflow settle without fighting it. */
   private keyboardTransitionUntil = 0;
+  /** 0.108.3: while `Date.now() < this`, a mobile row tap only dismisses the
+   *  keyboard (no select/open). Set on composer blur to cover the keyboard-
+   *  dismiss reflow, during which rows slide out from under the finger — see
+   *  shouldAbsorbDismissTap. */
+  private tapSettleUntil = 0;
+  /** 0.108.4: the note under the finger on the FIRST tap of a double-tap that
+   *  began during the keyboard-dismiss reflow (keyboard-up layout — what the
+   *  user actually aimed at). The double-tap opens THIS, not the row that slid
+   *  under the second tap. Window-gated so a lone dismiss tap can't later be
+   *  "opened" by an unrelated double-tap. */
+  private aimedTapTargetId: string | null = null;
+  private aimedTapAt = 0;
+  private static readonly AIMED_TAP_WINDOW_MS = 600;
   /** Per-row ResizeObserver attached during scrollListToBottom — re-pins
    *  the list to the bottom whenever a row's height changes. Survives
    *  past the initial paint so cold-cache markdown / late font loads
@@ -2854,7 +2873,7 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Copy tree").setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
     menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").setDisabled(!hasTargets).onClick(() => void this.cmdClone()));
     if (this.plugin.settings.enableSheetVersions) {
-      menu.addItem((it: any) => it.setTitle("Fork as version").setIcon("git-fork").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdForkVersion()));
+      menu.addItem((it: any) => it.setTitle("Fork as a version (draft)").setIcon("git-fork").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdForkVersion()));
       menu.addItem((it: any) => it.setTitle("Mark version as final").setIcon("star").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdMarkVersionFinal()));
     }
     menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
@@ -4478,6 +4497,22 @@ export class StashpadView extends ItemView {
     // browser makes on double-click so it doesn't flash before nav.
     row.addEventListener("dblclick", (e) => {
       if (!this.plugin.settings.doubleClickToFocus) return;
+      // Mobile: if this double-tap began during the keyboard-dismiss reflow,
+      // open the note that was under the finger when it STARTED (recorded on
+      // the first, dismissing tap) — not the row that slid under the reflowed
+      // second tap. One fluid double-tap on the note above the composer.
+      const absorbed = this.shouldAbsorbDismissTap();
+      if (absorbed && this.aimedTapTargetId && Date.now() - this.aimedTapAt <= StashpadView.AIMED_TAP_WINDOW_MS) {
+        const aimed = this.aimedTapTargetId;
+        this.aimedTapTargetId = null;
+        this.traceTap("dblclick", e, idx, false);
+        e.preventDefault();
+        window.getSelection()?.removeAllRanges();
+        this.navigateTo(aimed);
+        return;
+      }
+      this.traceTap("dblclick", e, idx, absorbed);
+      if (absorbed) { e.preventDefault(); return; }
       const t = e.target as HTMLElement | null;
       // 0.76.12: also skip the task checkbox — double-clicking it
       // should toggle, never navigate.
@@ -4627,19 +4662,23 @@ export class StashpadView extends ItemView {
     const bar = body.createDiv({ cls: "stashpad-version-tabs" });
     for (const m of members) {
       const isActive = m.id === node.id;
-      const isFinal = sheetIsFinal(nodeFm(this.app, m));
+      const mFm = nodeFm(this.app, m);
+      const isFinal = sheetIsFinal(mFm);
+      const orig = isOriginal(mFm);
       const tab = bar.createDiv({
         cls:
           "stashpad-version-tab" +
           (isActive ? " is-active" : "") +
-          (isFinal ? " is-final" : ""),
+          (isFinal ? " is-final" : "") +
+          (orig ? " is-original" : ""),
       });
       if (isFinal) tab.createSpan({ cls: "stashpad-version-star", text: "★" });
       tab.createSpan({
         cls: "stashpad-version-tab-label",
         text: tabTitle(this.app, m, this.titleForNode(m).trim() || "Untitled"),
       });
-      tab.title = this.titleForNode(m).trim();
+      const title = this.titleForNode(m).trim();
+      tab.title = orig ? `${title} (original)` : `${title} (forked)`;
       if (!isActive) {
         tab.onclick = (e) => { e.stopPropagation(); this.setActiveVersion(gid, m.id); };
       }
@@ -4932,6 +4971,9 @@ export class StashpadView extends ItemView {
       ta.addEventListener("blur", () => {
         document.body.classList.remove("stashpad-keyboard-open");
         keyboardTransition();
+        // Guard row taps until the keyboard-dismiss reflow settles (rows slide
+        // ~336px under the finger over ~120ms; 300ms covers slower devices).
+        this.tapSettleUntil = Date.now() + 300;
         // 0.89.0: tapping the list to dismiss the composer should leave the
         // selected note visible (it may have been hidden behind the composer).
         // Re-reveal after the keyboard's close animation settles the layout.
@@ -5364,6 +5406,25 @@ export class StashpadView extends ItemView {
   }
 
   private handleRowClick(e: MouseEvent, idx: number, node: TreeNode): void {
+    // Mobile: a tap during the keyboard-dismiss reflow only dismisses the
+    // keyboard — acting on it would select whatever row slid under the finger.
+    const absorbed = this.shouldAbsorbDismissTap();
+    this.traceTap("click", e, idx, absorbed);
+    if (absorbed) {
+      // Remember the note under the finger on this dismissing tap (keyboard-up
+      // layout = what the user aimed at) so a double-tap that began here opens
+      // THAT note, not whatever slides under the reflowed second tap. Keep the
+      // earliest tap of the burst — don't let the second tap overwrite it.
+      if (!this.aimedTapTargetId || Date.now() - this.aimedTapAt > StashpadView.AIMED_TAP_WINDOW_MS) {
+        this.aimedTapTargetId = node.id;
+        this.aimedTapAt = Date.now();
+      }
+      e.stopPropagation();
+      return;
+    }
+    // Normal (settled) tap — drop any stale aimed target so it can't leak into
+    // a later unrelated double-tap.
+    this.aimedTapTargetId = null;
     const targetEl = e.target as HTMLElement | null;
     // Tag click → open global search filtered by that tag.
     const tag = targetEl?.closest?.(".tag") as HTMLElement | null;
@@ -5499,6 +5560,44 @@ export class StashpadView extends ItemView {
     requestAnimationFrame(doReveal);
     setTimeout(doReveal, 60);
     setTimeout(doReveal, 200);
+  }
+
+  /** Mobile only. True if a row tap should be absorbed (dismiss-the-keyboard
+   *  only, no select/open). When the soft keyboard dismisses, Obsidian regrows
+   *  the leaf by the keyboard height a beat later; the list stays pinned to the
+   *  bottom, so existing rows slide DOWN under a stationary finger (measured:
+   *  ~336px over ~120ms). A tap that lands during that reflow — including the
+   *  second tap of a quick double-tap that began while the keyboard was up —
+   *  opens whatever row slid under the finger, not the one the user aimed at.
+   *  So while the list height is still settling we treat the tap as a pure
+   *  keyboard-dismiss and let the user re-aim on the stable list (which is the
+   *  manual workaround, now automatic). */
+  private shouldAbsorbDismissTap(): boolean {
+    return Platform.isMobile && Date.now() < this.tapSettleUntil;
+  }
+
+  /** Diagnostics: record the tap's coordinate picture so a tap-vs-row offset
+   *  can be measured from a real device. No-op (and no layout reads) unless
+   *  debugTrace is on. */
+  private traceTap(type: string, e: MouseEvent, idx: number, absorbed: boolean): void {
+    if (!this.plugin.settings.debugTrace || !this.listEl) return;
+    const list = this.listEl;
+    const vv = window.visualViewport;
+    const dRect = list.querySelector<HTMLElement>(`.stashpad-note[data-idx="${idx}"]`)?.getBoundingClientRect();
+    this.plugin.trace(`tap:${type}`, {
+      absorbed,
+      clientY: Math.round(e.clientY), clientX: Math.round(e.clientX),
+      idx, rowTop: dRect ? Math.round(dRect.top) : null,
+      listTop: Math.round(list.getBoundingClientRect().top),
+      listScrollTop: Math.round(list.scrollTop),
+      listScrollH: Math.round(list.scrollHeight),
+      listClientH: Math.round(list.clientHeight),
+      innerH: window.innerHeight,
+      vvHeight: vv ? Math.round(vv.height) : null,
+      vvOffsetTop: vv ? Math.round(vv.offsetTop) : null,
+      tapSettleInMs: Math.max(0, this.tapSettleUntil - Date.now()),
+      kbOpen: document.body.classList.contains("stashpad-keyboard-open"),
+    });
   }
 
   // --- Document-level keyboard ---
@@ -7218,6 +7317,10 @@ export class StashpadView extends ItemView {
         await this.app.fileManager.processFrontMatter(newFile, (m: any) => {
           for (const [k, v] of Object.entries(sourceFm)) {
             if (RESERVED_FRONTMATTER.includes(k)) continue;
+            // A duplicate is a NEW note, not a member of the source's version
+            // group — never inherit sheet/provenance keys (would falsely mark
+            // it original/final or collide on order).
+            if (SHEET_COPY_SKIP_KEYS.includes(k)) continue;
             m[k] = v;
           }
         });
@@ -7343,9 +7446,20 @@ export class StashpadView extends ItemView {
     const createdPaths: string[] = [];
     const newRootId = await this.cloneSubtree(node, parentId, createdPaths);
     if (!newRootId) return;
+    // Provenance: the forked root records the note it was forked from. (The
+    // sheet/origin keys were stripped by cloneSubtree, so this is the only
+    // version marker a re-homed fork carries.)
+    const rootFile = createdPaths[0] ? this.app.vault.getAbstractFileByPath(createdPaths[0]) as TFile | null : null;
+    if (rootFile) {
+      try {
+        await this.app.fileManager.processFrontMatter(rootFile, (m: any) => { m[FORKED_FROM_KEY] = `[[${node.file!.basename}]]`; });
+      } catch { /* ignore */ }
+    }
     this.tree.rebuild(folder);
     this.pendingFocusIds = [newRootId];
     this.render();
+    // Cross-link the lineage: the origin + all its separate-note forks.
+    await this.syncForkSiblings(this.forkFamilyFiles({ originName: node.file.basename, include: [node.file, rootFile] }));
     const snapNodes: TreeNode[] = createdPaths
       .map((p) => this.app.vault.getAbstractFileByPath(p))
       .filter((f): f is TFile => !!f && (f as any).extension === "md")
@@ -7386,8 +7500,39 @@ export class StashpadView extends ItemView {
     await this.app.fileManager.processFrontMatter(file, (m: any) => {
       m[SHEET_KEY] = gid;
       if (typeof m[SHEET_ORDER_KEY] !== "number") m[SHEET_ORDER_KEY] = 0;
+      // This note seeded the group → it's the original. Forks never get this.
+      m[SHEET_ORIGIN_KEY] = true;
     });
     return gid;
+  }
+
+  /** All notes in a fork family: either a sheet group's members (by `gid`) or
+   *  a separate-note lineage (the origin `originId` + everything forked from
+   *  it). `include` force-adds freshly-written files the cache may still lag. */
+  private forkFamilyFiles(opts: { gid?: string | null; originName?: string | null; include?: (TFile | null)[] }): TFile[] {
+    const set = new Map<string, TFile>();
+    const add = (f: TFile | null) => { if (f) set.set(f.path, f); };
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      if (opts.gid && sheetIdOf(fm) === opts.gid) add(f);
+      if (opts.originName) {
+        // The origin note itself, plus everything whose forked-from links to it.
+        if (f.basename === opts.originName || forkedFromName(fm) === opts.originName) add(f);
+      }
+    }
+    for (const f of opts.include ?? []) add(f);
+    return [...set.values()];
+  }
+
+  /** Write each family member's `fork-siblings` to wikilinks of the others. */
+  private async syncForkSiblings(family: TFile[]): Promise<void> {
+    for (const f of family) {
+      const others = family.filter((o) => o.path !== f.path).map((o) => `[[${o.basename}]]`);
+      await this.app.fileManager.processFrontMatter(f, (m: any) => {
+        if (others.length) m[SIBLINGS_KEY] = others;
+        else delete m[SIBLINGS_KEY];
+      });
+    }
   }
 
   /** Create a new version of `source` as a sibling sharing its sheet group.
@@ -7395,81 +7540,120 @@ export class StashpadView extends ItemView {
    *  The new version becomes the shown one. Used by the row "+" button, the
    *  context menu, and the command. */
   async cmdForkVersion(source?: TreeNode, blank = false): Promise<void> {
+    // Explicitly invoking a version command opts you in — turn the feature on
+    // rather than nagging about a setting.
     if (!this.plugin.settings.enableSheetVersions) {
-      new Notice("Sheet versions are off — enable them in Settings → General.");
-      return;
+      this.plugin.settings.enableSheetVersions = true;
+      await this.plugin.saveSettings();
+      new Notice("Sheet versions enabled.");
     }
     const src = source ?? this.getActionTargets()[0];
     if (!src?.file) { new Notice("Select a note to version."); return; }
     const folder = this.noteFolder;
+    // Snapshot the source frontmatter BEFORE ensureSheetGroup mutates it — the
+    // metadata cache lags processFrontMatter, so reading it afterward returns
+    // stale/partial data (drops color/tags, miscounts order).
+    const srcFm = { ...(this.app.metadataCache.getFileCache(src.file)?.frontmatter ?? {}) } as Record<string, any>;
     const gid = await this.ensureSheetGroup(src.file);
     const parent = src.parent ?? this.focusId;
 
-    // Next order = one past the current highest in the group.
-    const siblings = this.tree.getChildren(parent)
-      .filter((s) => sheetIdOf(nodeFm(this.app, s)) === gid);
-    let maxOrder = -1;
-    for (const s of siblings) {
-      const o = this.app.metadataCache.getFileCache(s.file!)?.frontmatter?.[SHEET_ORDER_KEY];
+    // Next order = one past the current highest in the group. Start from the
+    // source's own order (from the snapshot — its cache entry is now stale),
+    // then fold in the other members' cached orders.
+    let maxOrder = typeof srcFm[SHEET_ORDER_KEY] === "number" ? srcFm[SHEET_ORDER_KEY] : 0;
+    for (const s of this.tree.getChildren(parent)) {
+      if (s.id === src.id) continue;
+      const fm = nodeFm(this.app, s);
+      if (sheetIdOf(fm) !== gid) continue;
+      const o = fm?.[SHEET_ORDER_KEY];
       if (typeof o === "number" && o > maxOrder) maxOrder = o;
     }
     const order = maxOrder + 1;
 
-    const body = blank ? "" : this.stripFrontmatter(await this.app.vault.read(src.file));
-    const cloneId = newId();
-    const slug = bodyToSlug(body, this.activeStopwords());
-    const filename = buildFilename(slug, cloneId);
-    const path = `${folder}/${filename}`;
-    const created = new Date().toISOString();
-    const attachments = this.extractAttachments(body);
+    const createdPaths: string[] = [];
+    let newRootId: StashpadId;
 
-    const fmInit = ["---", `id: ${cloneId}`, `parent: ${parent}`, `created: ${created}`];
-    if (attachments.length > 0) {
-      fmInit.push("attachments:");
-      for (const a of attachments) fmInit.push(`  - "${a.replace(/"/g, '\\"')}"`);
+    if (blank) {
+      // Blank new version: a single empty note (no subtree).
+      const cloneId = newId();
+      const filename = buildFilename(bodyToSlug("", this.activeStopwords()), cloneId);
+      const path = `${folder}/${filename}`;
+      const created = new Date().toISOString();
+      await this.ensureFolder(folder);
+      await this.app.vault.create(path, ["---", `id: ${cloneId}`, `parent: ${parent}`, `created: ${created}`, "attachments: []", "---", ""].join("\n"));
+      const newFile = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+      if (!newFile) { new Notice("Sheets: could not create version."); return; }
+      await this.app.fileManager.processFrontMatter(newFile, (m: any) => {
+        // Carry the source's styling/metadata (color, tags, custom keys) so a
+        // version looks like its sibling — but never its sheet/provenance keys.
+        for (const [k, v] of Object.entries(srcFm)) {
+          if (RESERVED_FRONTMATTER.includes(k)) continue;
+          if (SHEET_COPY_SKIP_KEYS.includes(k)) continue;
+          m[k] = v;
+        }
+        m[SHEET_KEY] = gid;
+        m[SHEET_ORDER_KEY] = order;
+        delete m[SHEET_FINAL_KEY];
+        delete m[SHEET_ORIGIN_KEY];
+        m[FORKED_FROM_KEY] = `[[${src.file!.basename}]]`;
+      });
+      try {
+        this.tree.insertSynthetic({ id: cloneId, parent, children: [], file: newFile, created });
+      } catch { /* ignore */ }
+      this.fmSync.scheduleParentChange(cloneId, null, parent);
+      createdPaths.push(path);
+      newRootId = cloneId;
     } else {
-      fmInit.push("attachments: []");
+      // Fork: duplicate the whole subtree as a sibling. cloneSubtree already
+      // copies color/tags/custom keys and STRIPS the sheet/provenance keys
+      // (SHEET_COPY_SKIP_KEYS) from every copied node, so only the new root
+      // becomes a version — its children are plain copies.
+      const rootId = await this.cloneSubtree(src, parent, createdPaths);
+      if (!rootId || !createdPaths.length) { new Notice("Sheets: could not create version."); return; }
+      newRootId = rootId;
+      const rootFile = this.app.vault.getAbstractFileByPath(createdPaths[0]) as TFile | null;
+      if (rootFile) {
+        await this.app.fileManager.processFrontMatter(rootFile, (m: any) => {
+          m[SHEET_KEY] = gid;
+          m[SHEET_ORDER_KEY] = order;
+          delete m[SHEET_FINAL_KEY];
+          delete m[SHEET_ORIGIN_KEY]; // a fork is never the original…
+          m[FORKED_FROM_KEY] = `[[${src.file!.basename}]]`; // …and records what it came from
+        });
+      }
     }
-    fmInit.push("---", body);
-    await this.ensureFolder(folder);
-    await this.app.vault.create(path, fmInit.join("\n"));
-
-    const newFile = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-    if (!newFile) { new Notice("Sheets: could not create version."); return; }
-    await this.app.fileManager.processFrontMatter(newFile, (m: any) => {
-      m[SHEET_KEY] = gid;
-      m[SHEET_ORDER_KEY] = order;
-      delete m[SHEET_FINAL_KEY];
-    });
-    try {
-      this.tree.insertSynthetic({ id: cloneId, parent, children: [], file: newFile, created });
-    } catch { /* ignore */ }
-    this.fmSync.scheduleParentChange(cloneId, null, parent);
 
     this.tree.rebuild(folder);
-    this.activeVersionByGroup.set(gid, cloneId); // show the new version
-    this.plugin.saveActiveVersion(folder, gid, cloneId);
+    this.activeVersionByGroup.set(gid, newRootId); // show the new version
+    this.plugin.saveActiveVersion(folder, gid, newRootId);
     this.render();
+
+    // Keep every group member's `fork-siblings` list current.
+    const newRootFile = this.app.vault.getAbstractFileByPath(createdPaths[0]) as TFile | null;
+    await this.syncForkSiblings(this.forkFamilyFiles({ gid, include: [src.file, newRootFile] }));
 
     this.plugin.getUndoStack(folder).push({
       label: blank ? "New version" : "Fork version",
       undo: async () => {
-        const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-        if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+        for (const p of [...createdPaths].reverse()) {
+          const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
+          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+        }
         this.activeVersionByGroup.delete(gid);
         this.tree.rebuild(folder);
         this.render();
       },
       redo: async () => { /* best-effort: re-running the command recreates it */ },
     });
-    new Notice(blank ? "New version added" : "Forked a new version");
+    const n = createdPaths.length;
+    new Notice(blank ? "New version added" : `Forked a new version${n > 1 ? ` (${n} notes)` : ""}`);
   }
 
   /** Toggle the "final" flag on a version, clearing it from its group-mates. */
   async cmdMarkVersionFinal(target?: TreeNode): Promise<void> {
     if (!this.plugin.settings.enableSheetVersions) {
-      new Notice("Sheet versions are off — enable them in Settings → General.");
-      return;
+      this.plugin.settings.enableSheetVersions = true;
+      await this.plugin.saveSettings();
     }
     const node = target ?? this.getActionTargets()[0];
     if (!node?.file) return;
@@ -9915,6 +10099,7 @@ export class StashpadView extends ItemView {
               await this.app.fileManager.processFrontMatter(f as TFile, (m: any) => {
                 for (const [k, v] of Object.entries(templateFm)) {
                   if (RESERVED_FRONTMATTER.includes(k)) continue;
+                  if (SHEET_COPY_SKIP_KEYS.includes(k)) continue; // templates don't seed version groups
                   if (m[k] === undefined) m[k] = v;
                 }
               });
@@ -10445,7 +10630,7 @@ export class StashpadView extends ItemView {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       void this.cmdClone();
     }));
-    menu.addItem((it: any) => it.setTitle("Fork (copy under another parent)…").setIcon("git-branch").onClick(() => {
+    menu.addItem((it: any) => it.setTitle("Fork into a separate note…").setIcon("git-branch").onClick(() => {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       this.cmdForkNote();
     }));
