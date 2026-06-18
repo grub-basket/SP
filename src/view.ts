@@ -15,7 +15,7 @@ import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { buildFileActions } from "./notifications";
 import { newId } from "./id-service";
-import { bodyToSlug, buildFilename, parseIdFromFilename, DEFAULT_STOPWORDS } from "./slug-service";
+import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, DEFAULT_STOPWORDS } from "./slug-service";
 import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
 import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
@@ -10295,7 +10295,7 @@ export class StashpadView extends ItemView {
       await this.ensureFolder(folder);
       const safeName = file.name.replace(/[^\w.\-]+/g, "_");
       const stamp = Date.now().toString(36);
-      const path = `${folder}/${stamp}-${safeName}`;
+      const path = `${folder}/${buildAttachmentName(safeName, stamp)}`;
       await this.app.vault.createBinary(path, buf);
       await this.log.append({ type: "attachment_add", id: ROOT_ID, payload: { path, name: file.name, size: file.size } });
       this.plugin.notifications.show({

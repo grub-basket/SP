@@ -50,3 +50,32 @@ export function parseIdFromFilename(basename: string): string | null {
   const m = basename.match(/-([a-z0-9]{4,12})$/);
   return m ? m[1] : null;
 }
+
+/** Place an attachment's uniquifier stamp at the END of the filename (just
+ *  before the extension) rather than the start:
+ *  `buildAttachmentName("photo.png", "lqf3k2a9") === "photo-lqf3k2a9.png"`.
+ *  Files with no extension just get `-<stamp>` appended. 0.109.0 — the stamp
+ *  used to be a prefix (`lqf3k2a9-photo.png`); suffixing keeps the readable
+ *  name first and the original extension last. */
+export function buildAttachmentName(originalName: string, stamp: string): string {
+  const dot = originalName.lastIndexOf(".");
+  if (dot > 0) return `${originalName.slice(0, dot)}-${stamp}${originalName.slice(dot)}`;
+  return `${originalName}-${stamp}`;
+}
+
+/** Detect a legacy *prefix*-stamped attachment name (`<stamp>-<rest>`) so
+ *  rebootstrap can migrate it to the suffix form. The stamp was
+ *  `Date.now().toString(36)` (8 base36 chars). To avoid renaming user files
+ *  that merely start with a short token, only match when the prefix decodes to
+ *  a plausible recent millisecond timestamp. Returns `{ stamp, rest }` or null.
+ *  After migration the name is `<rest-base>-<stamp>.<ext>`, whose leading token
+ *  is the human name — so this won't re-match and the migration is idempotent.
+ */
+export function parseLegacyAttachmentPrefix(basename: string): { stamp: string; rest: string } | null {
+  const m = basename.match(/^([0-9a-z]{7,9})-(.+)$/);
+  if (!m) return null;
+  const ts = parseInt(m[1], 36);
+  // base36 ms timestamps land ~2015-01-01 (1.42e12) onward; cap a day past now.
+  if (!Number.isFinite(ts) || ts < 1.42e12 || ts > Date.now() + 86_400_000) return null;
+  return { stamp: m[1], rest: m[2] };
+}

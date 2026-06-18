@@ -14,7 +14,7 @@ import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
 } from "./settings";
-import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, parseIdFromFilename } from "./slug-service";
+import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { ensureOkfTemplate, okfFolders, rebuildOkfForFolder, OKF_DEFAULT_TEMPLATE_PATH } from "./okf";
@@ -1497,16 +1497,20 @@ export default class StashpadPlugin extends Plugin {
       callback: async () => {
         new Notice("Stashpad: rebootstrapping…");
         try {
-          const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked } = await this.rebootstrapAllFolders();
+          const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped } = await this.rebootstrapAllFolders();
           const parts: string[] = [];
           parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
           if (imported > 0) parts.push(`imported ${imported} loose file${imported === 1 ? "" : "s"}`);
           if (attachmentsLinked > 0) parts.push(`linked attachments on ${attachmentsLinked} note${attachmentsLinked === 1 ? "" : "s"}`);
+          if (attachmentsRenamed > 0) parts.push(`renamed ${attachmentsRenamed} attachment${attachmentsRenamed === 1 ? "" : "s"}`);
           if (fmWritten > 0) parts.push(`updated ${fmWritten} note${fmWritten === 1 ? "" : "s"}' metadata`);
           if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"}`);
           if (authors > 0) parts.push(`${authors} author${authors === 1 ? "" : "s"} in registry`);
           parts.push(`(checked ${fmChecked} total)`);
           new Notice(`Stashpad: ${parts.join(" · ")}`);
+          if (attachmentsSkipped > 0) {
+            new Notice(`Stashpad: ${attachmentsSkipped} attachment${attachmentsSkipped === 1 ? "" : "s"} need renaming, but skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links” in Obsidian, then rebootstrap again.`, 12000);
+          }
         } catch (e) {
           new Notice(`Stashpad: rebootstrap failed (${(e as Error).message})`);
         }
@@ -2340,7 +2344,7 @@ export default class StashpadPlugin extends Plugin {
    *  ensure it has the import/export subfolders, and run the redundant-frontmatter
    *  backfill (parentLink + children) so older notes pick up the recovery fields.
    *  Used by the "Rebootstrap" button in settings to retrofit older folders. */
-  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number }> {
+  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
     // 0.79.19: suppress contribution stamping for the duration (+ a short
     // tail to catch async link-rewrite modify events) so rebootstrap never
     // bumps `modified`/`created` or adds contributors.
@@ -2361,7 +2365,7 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  private async rebootstrapAllFoldersInner(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number }> {
+  private async rebootstrapAllFoldersInner(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
     const ROOT_ID = "__root__";
     const seen = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -2387,6 +2391,11 @@ export default class StashpadPlugin extends Plugin {
     let fmWritten = 0;
     let slugsRenamed = 0;
     let imported = 0;
+    let attachmentsRenamed = 0;
+    let attachmentsSkipped = 0;
+    // Renaming attachments only updates their links if Obsidian is configured
+    // to do so; otherwise we detect-but-skip and warn (see rebootstrapFolderAttachments).
+    const linkUpdatesOn = !!(this.app.vault as { getConfig?: (k: string) => unknown }).getConfig?.("alwaysUpdateLinks");
     const okfSet = new Set(this.okfActiveFolders());
     for (const folder of seen) {
       try {
@@ -2419,6 +2428,10 @@ export default class StashpadPlugin extends Plugin {
         // landed (and any whose body was edited without the per-view
         // scheduleSlugRename firing).
         slugsRenamed += await this.rebootstrapFolderSlugs(folder);
+        // 0.109.0: migrate legacy prefix-stamped attachments to suffix form.
+        const att = await this.rebootstrapFolderAttachments(folder, linkUpdatesOn);
+        attachmentsRenamed += att.renamed;
+        attachmentsSkipped += att.skipped;
         // 0.102.x: rebootstrap also fixes OKF frontmatter + regenerates index.md
         // for OKF-enabled folders (those using the OKF template). The OKF-section
         // "Rebuild" button is just a scoped shortcut to this same pass — not an
@@ -2444,7 +2457,7 @@ export default class StashpadPlugin extends Plugin {
     let attachmentsLinked = 0;
     try { attachmentsLinked = await this.convertAttachmentsToLinks(); }
     catch (e) { console.warn("Stashpad: attachment-link conversion failed", e); }
-    return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked };
+    return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped };
   }
 
   /** Walk every Stashpad note in `folder`. For each one whose filename
@@ -2483,6 +2496,43 @@ export default class StashpadPlugin extends Plugin {
       }
     }
     return renamed;
+  }
+
+  /** Migrate legacy prefix-stamped attachments (`<stamp>-name.ext`) in
+   *  `<folder>/_attachments` to the suffix form (`name-<stamp>.ext`). Uses
+   *  fileManager.renameFile so Obsidian rewrites the `![[links]]` in note bodies
+   *  AND the `attachments` frontmatter — but ONLY when "Automatically update
+   *  internal links" is on. When it's off, renaming would orphan every link, so
+   *  we don't touch anything and report a `skipped` count instead; the caller
+   *  warns the user to enable the setting and run again. 0.109.0. */
+  private async rebootstrapFolderAttachments(
+    folder: string,
+    linkUpdatesOn: boolean,
+  ): Promise<{ renamed: number; skipped: number }> {
+    const dir = `${folder.replace(/\/+$/, "")}/_attachments`;
+    const af = this.app.vault.getAbstractFileByPath(dir);
+    if (!(af instanceof TFolder)) return { renamed: 0, skipped: 0 };
+    // Snapshot first — renaming mutates the live children listing mid-loop.
+    const files = af.children.filter((c): c is TFile => c instanceof TFile);
+    let renamed = 0;
+    let skipped = 0;
+    for (const file of files) {
+      const legacy = parseLegacyAttachmentPrefix(file.name);
+      if (!legacy) continue;
+      const desired = buildAttachmentName(legacy.rest, legacy.stamp);
+      if (file.name === desired) continue;
+      if (!linkUpdatesOn) { skipped += 1; continue; }
+      const newPath = `${dir}/${desired}`;
+      if (this.app.vault.getAbstractFileByPath(newPath)) continue;
+      try {
+        await this.app.fileManager.renameFile(file, newPath);
+        renamed += 1;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      } catch (e) {
+        console.warn(`Stashpad: attachment rebootstrap skipped ${file.path}`, e);
+      }
+    }
+    return { renamed, skipped };
   }
 
   // ---------- Sidebar panels (0.68.0) ----------
