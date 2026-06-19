@@ -1409,6 +1409,7 @@ export class ConfirmModal extends Modal {
     private message: string,
     private confirmText: string,
     private onChoose: (confirmed: boolean) => void,
+    private cancelText: string = "Cancel",
   ) { super(app); }
   onOpen(): void {
     this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
@@ -1423,7 +1424,7 @@ export class ConfirmModal extends Modal {
       block.createDiv({ cls: "stashpad-confirm-line", text: line });
     }
     const row = this.contentEl.createDiv({ cls: "stashpad-modal-btns" });
-    const cancel = row.createEl("button", { text: "Cancel" });
+    const cancel = row.createEl("button", { text: this.cancelText });
     cancel.onclick = () => { this.didChoose = true; this.close(); this.onChoose(false); };
     const ok = row.createEl("button", { cls: "mod-cta", text: this.confirmText });
     ok.onclick = () => { this.didChoose = true; this.close(); this.onChoose(true); };

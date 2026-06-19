@@ -2435,6 +2435,23 @@
 .stashpad-trash-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); }
 .stashpad-trash-restore { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; font-size: var(--font-ui-smaller); padding: 3px 10px; cursor: pointer; --icon-size: 13px; }
 .stashpad-trash-restore .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+/* 0.112.3: multi-select + permanent-delete in the encrypted-trash tab. */
+.stashpad-trash-row { cursor: pointer; }
+.stashpad-trash-row.is-selected { background: var(--background-modifier-hover); box-shadow: inset 0 0 0 1px var(--interactive-accent); }
+.stashpad-trash-delete {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  padding: 3px 8px; cursor: pointer; --icon-size: 14px;
+  background: transparent; border: none; box-shadow: none; color: var(--text-faint);
+}
+.stashpad-trash-delete:hover { color: var(--text-error); background: var(--background-modifier-error-hover); }
+.stashpad-trash-delete .svg-icon { width: var(--icon-size); height: var(--icon-size); }
+.stashpad-trash-selbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 8px; margin-bottom: 8px; border-radius: 6px;
+  background: var(--background-modifier-hover);
+}
+.stashpad-trash-selcount { flex: 1 1 auto; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-trash-delete.mod-warning { color: var(--text-on-accent); background: var(--text-error); padding: 3px 10px; border-radius: 4px; font-size: var(--font-ui-smaller); }
 /* 0.98.24: mobile ⋮ menu button on locked stubs (desktop uses right-click). */
 .stashpad-locked-menu {
   flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;

@@ -9,14 +9,13 @@ import { FolderSuggest } from "./folder-suggest";
 import type StashpadPlugin from "./main";
 import { RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
-import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal } from "./modals";
+import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal } from "./modals";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
 import { DEFAULT_STOPWORDS } from "./slug-service";
 import { newId } from "./id-service";
 import { formatDateTime } from "./format";
 import { type EncryptionConfig, defaultEncryptionConfig } from "./encryption-service";
-import { anyStashencOnDisk } from "./encryption-ops";
 import { getActiveView } from "./active-view";
 
 export interface ShortcutMap {
@@ -597,7 +596,7 @@ export type SettingsTabId =
   | "movingNotes" | "deleting" | "composerCopy" | "windowsTabs" | "notifications"
   | "encryption" | "authorship" | "templates" | "jdindex" | "okf"
   | "maintenance" | "diagnostics" | "misc" | "hotkeys";
-export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
+export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = ([
   { id: "foldersStorage", label: "Folders & storage" },
   { id: "importExport",   label: "Import & export" },
   { id: "noteTitles",     label: "Note titles" },
@@ -617,7 +616,9 @@ export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = [
   { id: "diagnostics",    label: "Diagnostics" },
   { id: "misc",           label: "Misc" },
   { id: "hotkeys",        label: "Hotkeys" },
-];
+// 0.112.9: sections shown alphabetically by label. Display order only — the
+// `id`-keyed itemsForTab dispatch is unaffected, and new tabs auto-sort in.
+] as Array<{ id: SettingsTabId; label: string }>).sort((a, b) => a.label.localeCompare(b.label));
 
 /** 0.94.0: a declarative sub-page that renders one of Stashpad's settings tabs
  *  via the existing imperative `renderTabContent`. Used by
@@ -670,8 +671,19 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  (and super.display() is a no-op), so render the SAME settings imperatively
    *  (one section per tab) — no native search there, which is fine. Without this
    *  the Stashpad settings tab renders BLANK on older Obsidian. */
+  /** 0.112.11: IMPERATIVE fallback ONLY. On 1.13+ Obsidian ignores display()
+   *  whenever getSettingDefinitions() returns items — it renders declaratively
+   *  via the base `update()` (a navigable page list + native search). So this
+   *  runs only on pre-1.13 (no declarative API). It must NOT call super.display()
+   *  — on 1.13 that renders nothing (the source of the earlier blank tab) and on
+   *  pre-1.13 it's a no-op. Just render every tab's items inline.
+   *
+   *  CRITICAL: do NOT override `update()`. The base SettingTab.update() IS the
+   *  1.13 declarative renderer + search indexer; overriding it (as 0.112.8 did,
+   *  based on stale-Obsidian testing where update() didn't exist) blanks the tab
+   *  and forces this imperative fallback. The `this.update?.()` refresh calls
+   *  resolve to the base update() on 1.13 (re-render) and no-op on pre-1.13. */
   display(): void {
-    if (SettingPage) { super.display(); return; }
     const { containerEl } = this;
     containerEl.empty();
     for (const t of SETTINGS_TABS) {
@@ -861,7 +873,13 @@ export class StashpadSettingTab extends PluginSettingTab {
     build: (s: Setting) => void,
     aliases?: string[],
   ): SettingDefinitionItem {
-    return { name, desc, aliases, render: (s: Setting) => { s.setName(name).setDesc(desc); build(s); } };
+    // 0.112.5: try/catch so a single throwing control (e.g. a missing Obsidian
+    // API on an older build) degrades to a labelled row instead of aborting the
+    // ENTIRE declarative settings render and blanking every later section.
+    return { name, desc, aliases, render: (s: Setting) => {
+      s.setName(name).setDesc(desc);
+      try { build(s); } catch (e) { console.error(`[Stashpad] settings control "${name}" failed to render:`, e); }
+    } };
   }
 
   /** 0.94.3: a declarative item whose render builds a whole MULTI-element
@@ -881,7 +899,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         host.empty();
         host.removeClass("setting-item");
         host.addClass("stashpad-settings-section");
-        render(host);
+        try { render(host); } catch (e) { console.error(`[Stashpad] settings section "${name}" failed to render:`, e); }
       },
     };
   }
@@ -1279,37 +1297,113 @@ export class StashpadSettingTab extends PluginSettingTab {
       }
 
       if (enc.amIMember()) {
-      new Setting(host).setName("Remove encryption").setDesc("Erases the key from this vault. Refused while any locked notes exist — decrypt everything first (locked notes have NO plaintext copy; losing the key loses them forever).").addButton((b) => {
-        b.setButtonText("Remove…").onClick(async () => {
-          // 0.98.23: HARD GUARD — locked blobs are the ONLY copy of their notes
-          // (lock permanently deletes the plaintext). Erasing the key with blobs
-          // still on disk = permanent data loss. Refuse until everything is
-          // decrypted; offer the vault-wide unlock as the way out.
-          // 0.98.42: scan the ADAPTER, not vault.getFiles — blobs are written
-          // via the adapter and can be invisible to the vault index for a
-          // while (and `_deleted/` / `.trash` blobs aren't indexed at all).
-          if (await anyStashencOnDisk(this.app)) {
-            new Notice(`Can't remove encryption: locked/encrypted-deleted notes still exist and would be lost forever. Run "Decrypt (unlock) ALL locked notes in the vault" and empty the encrypted trash first.`, 10000);
-            return;
-          }
-          new TypeToConfirmModal(this.app, {
-            title: "Remove encryption?",
-            body: "This erases the encryption key for this vault. Nothing is currently encrypted (locked notes are checked), so no content is lost — but you'll need to set a new password to encrypt later, and anything you had exported encrypted with this key stays locked to its passphrase.",
-            phrase: "REMOVE ENCRYPTION",
-            confirmText: "Remove encryption",
-            requirePassword: (pw) => enc.verifyPassword(pw),
-            onConfirm: async () => {
-              // Re-check at confirm time — a lock could have happened while the
-              // modal sat open (another device syncing, another window).
-              if (await anyStashencOnDisk(this.app)) {
-                new Notice("Locked notes appeared while this dialog was open — removal cancelled. Decrypt everything first.", 10000);
+      new Setting(host).setName("Remove encryption").setDesc("Erases the key for this vault so you can start fresh. If anything is still encrypted, you'll be offered to decrypt it (needs your password) or — if you've lost the password — permanently delete it. Then just type the confirmation phrase; no password needed.").addButton((b) => {
+        const runRemoval = async (): Promise<void> => {
+          // 0.112.0: authoritative-but-cheap state check (in-memory index + two
+          // folder listings of `_deleted/` and `.trash/`) instead of the old full
+          // recursive adapter walk that took minutes.
+          const state = await this.plugin.encryptionStateStrict();
+          if (state.live) {
+            // 0.112.7: live locked content has no plaintext copy. Offer to either
+            // DECRYPT everything (needs the password) or DELETE it forever (for a
+            // lost password), then re-enter the removal flow. Mirrors the trash.
+            const deleteAllLocked = (): void => {
+              new ConfirmModal(this.app, "Delete all locked content forever?",
+                "This PERMANENTLY destroys every locked note and folder — there is NO decrypted copy and NO recovery. Only do this if you've lost the password and want to start fresh.",
+                "Delete locked content forever",
+                async (del) => {
+                  if (!del) return;
+                  const n = await this.plugin.purgeAllLockedContent();
+                  new Notice(`Deleted ${n} locked item${n === 1 ? "" : "s"}.`);
+                  void runRemoval();
+                }).open();
+            };
+            const decryptAll = async (): Promise<void> => {
+              await this.plugin.unlockAllInVault(); // prompts for the password if locked
+              if ((await this.plugin.encryptionStateStrict()).live) {
+                new Notice("Some notes are still locked (decryption was cancelled or failed) — removal cancelled.", 10000);
                 return;
               }
-              await enc.clear(); new Notice("Encryption removed."); this.update?.();
-            },
-          }).open();
-        });
-        b.setDestructive();
+              void runRemoval();
+            };
+            new ConfirmModal(this.app, "Encrypted notes are still locked",
+              "Some notes or folders are still encrypted (locked) and have no plaintext copy. Before removing encryption:\n\n• Decrypt everything — unlock them back to normal notes (needs your password).\n• Delete locked content — permanently destroy them (only if you've lost the password).",
+              "Decrypt everything",
+              (decrypt) => { if (decrypt) void decryptAll(); else deleteAllLocked(); },
+              "Delete locked content").open();
+            return;
+          }
+          // No password required to remove encryption. By the time we get here
+          // there is nothing recoverable to protect: live locked content already
+          // HARD-REFUSES removal (you must decrypt it first), and the trash has
+          // been explicitly decrypted or discarded. So the "REMOVE ENCRYPTION"
+          // phrase is the only gate — critically, this lets a user who has LOST
+          // the password (keychain empty/zeroed) still start fresh.
+          // trashConsented: the user already chose to decrypt or discard the
+          // encrypted trash; the confirm-time re-check uses it to abort only if
+          // NEW encrypted content appears mid-dialog.
+          const proceedToConfirm = (extraWarn: string, trashConsented: boolean): void => {
+            new TypeToConfirmModal(this.app, {
+              title: "Remove encryption?",
+              body: `This erases the encryption key for this vault. No locked notes/folders exist, so your live content is safe.${extraWarn} You'll need to set a new password to encrypt again later, and anything previously exported with this key stays locked to its passphrase.`,
+              phrase: "REMOVE ENCRYPTION",
+              confirmText: "Remove encryption",
+              onConfirm: async () => {
+                // Re-check authoritatively at confirm time — a lock or encrypt-
+                // delete could have synced in while the modal sat open.
+                const now = await this.plugin.encryptionStateStrict();
+                if (now.live) {
+                  new Notice("Locked notes appeared while this dialog was open — removal cancelled. Decrypt everything first.", 10000);
+                  return;
+                }
+                if (now.trash && !trashConsented) {
+                  new Notice("Encrypted trash appeared while this dialog was open — removal cancelled. Re-open Remove encryption to handle it.", 10000);
+                  return;
+                }
+                // Discard path: actually DELETE the encrypted-trash blobs now, so
+                // removal doesn't leave orphaned, forever-unreadable files behind.
+                // (Decrypt path already emptied `_deleted/`, so this is a no-op there.)
+                const leftover = await this.plugin.listDeletedTrash();
+                for (const it of leftover) await this.plugin.purgeDeletedAt(it.blob);
+                await enc.clear(); new Notice("Encryption removed."); this.update?.();
+              },
+            }).open();
+          };
+
+          if (state.trash) {
+            // Encrypted trash exists but no live locked content. Removing the key
+            // makes the trash permanently unreadable. Fork: Decrypt Trash (CTA,
+            // recommended — restores them to their folders) vs Discard trash
+            // (→ a second Cancel/Confirm step before anything is lost). Esc on
+            // this modal routes to the Discard confirm, which is cancelable.
+            const decryptThenRemove = async (): Promise<void> => {
+              const n = await this.plugin.restoreAllTrash();
+              // Authoritative re-check — restore removes blobs via raw adapter
+              // (no vault event), so confirm `_deleted/` is actually empty.
+              if ((await this.plugin.encryptionStateStrict()).trash) {
+                new Notice("Some encrypted-trash items couldn't be decrypted — removal cancelled. Check the trash tab and try again.", 10000);
+                return;
+              }
+              proceedToConfirm(n > 0 ? ` (${n} trash item${n === 1 ? "" : "s"} were decrypted back to their folders.)` : "", true);
+            };
+            const confirmDiscard = (): void => {
+              new ConfirmModal(this.app, "Discard encrypted trash?",
+                "The encrypted-trash items will be PERMANENTLY lost the moment the key is erased — there is no recovery. Continue?",
+                "Confirm",
+                (discard) => { if (discard) proceedToConfirm(" ⚠️ The encrypted trash is being permanently discarded.", true); }).open();
+            };
+            new ConfirmModal(this.app, "Encrypted notes in the trash",
+              "There are encrypted, deleted notes in the trash. Removing encryption makes them PERMANENTLY unreadable.\n\n• Decrypt Trash — restore them to their original folders first (recommended).\n• Discard trash — let them be permanently erased with the key.",
+              "Decrypt Trash",
+              (decrypt) => { if (decrypt) void decryptThenRemove(); else confirmDiscard(); },
+              "Discard trash").open();
+            return;
+          }
+          // Nothing encrypted at all → clean removal.
+          proceedToConfirm("", false);
+        };
+        b.setButtonText("Remove…").onClick(() => void runRemoval());
+        b.buttonEl.addClass("mod-warning");
       });
       }
 
@@ -1324,7 +1418,7 @@ export class StashpadSettingTab extends PluginSettingTab {
               new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: false, kdfProbe, title: "Change shared password", intro: "Everyone who unlocks with the shared password will need the new one. Re-share it securely after changing.",
                 onSubmit: async ({ next }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next); } catch (e) { return (e as Error).message; } new Notice("Shared password updated."); this.update?.(); return null; } }).open();
             }))
-            .addButton((b) => { b.setButtonText("Turn off").onClick(async () => { await enc.removeSharedPassword(); new Notice("Shared password turned off."); this.update?.(); }); b.setDestructive(); });
+            .addButton((b) => { b.setButtonText("Turn off").onClick(async () => { await enc.removeSharedPassword(); new Notice("Shared password turned off."); this.update?.(); }); b.buttonEl.addClass("mod-warning"); });
         } else {
           new Setting(host).setName("Shared password").setDesc("OFF — set one passphrase that everyone types to unlock (the simplest way to share). Anyone who knows it can unlock; turning it off later doesn't claw back copies already synced elsewhere.")
             .addButton((b) => b.setButtonText("Set shared password…").onClick(() => {
@@ -1354,7 +1448,7 @@ export class StashpadSettingTab extends PluginSettingTab {
               await enc.removeMember(m.id);
               new Notice(`Removed ${m.label}. (Not full revocation without rotating the key.)`);
               this.update?.();
-            }); b.setDestructive(); });
+            }); b.buttonEl.addClass("mod-warning"); });
           }
         }
         const reqs = enc.pendingJoinRequests();

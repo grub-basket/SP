@@ -313,24 +313,13 @@ export async function deletedRestoreDest(app: App, blobPath: string, meta: Delet
   return blobDir;
 }
 
-/** Is ANY `.stashenc` blob on disk? Walks the ADAPTER (not vault.getFiles) —
- *  adapter-written blobs can be invisible to the vault index for a while, and
- *  this backs the "Remove encryption" hard guard, which must never miss one.
- *  Skips `.obsidian/` only. */
-export async function anyStashencOnDisk(app: App): Promise<boolean> {
-  const queue = [""];
-  while (queue.length) {
-    const dir = queue.shift()!;
-    let listing;
-    try { listing = await app.vault.adapter.list(dir || "/"); } catch { continue; }
-    if (listing.files.some((f) => f.endsWith(`.${STASHENC_EXT}`))) return true;
-    for (const f of listing.folders) {
-      if (f === ".obsidian" || f.endsWith("/.obsidian")) continue;
-      queue.push(f);
-    }
-  }
-  return false;
-}
+// 0.112.2: `anyStashencOnDisk()` (a full recursive adapter walk) was removed —
+// it took minutes on big vaults and its premise was wrong. Empirically (Claude
+// Dev Vault, pendingEncBlobs empty): `vault.getFiles()` DOES return
+// `_deleted/*.stashenc` (it's a normal, fully-indexed folder), so the old
+// comment "`_deleted/` blobs aren't indexed" was stale. The only location
+// `getFiles()` misses is the `.trash/` DOT-folder, which `plugin.encryptionState`
+// + `encryptionStateStrict` now handle directly. Use those instead.
 
 /** Encrypt-delete a subtree into `_deleted/` (recoverable, encrypted), then
  *  permanently delete the plaintext. Mirrors lockSubtree but the blob lives in the
@@ -409,6 +398,14 @@ export async function restoreDeleted(
 export async function readDeletedMeta(app: App, blobPath: string): Promise<DeletedMeta | null> {
   try { return JSON.parse(await app.vault.adapter.read(sidecarPath(blobPath))) as DeletedMeta; }
   catch { return null; }
+}
+
+/** Permanently delete an encrypted-trash item: the `.stashenc` blob AND its
+ *  `.stashmeta` sidecar. No decrypt, no restore — the content is GONE forever.
+ *  Callers MUST confirm first (it's irreversible). 0.112.3. */
+export async function purgeDeletedBlob(app: App, blobPath: string): Promise<void> {
+  await app.vault.adapter.remove(blobPath);
+  try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* sidecar may not exist */ }
 }
 
 // ------- v2 backfill: encrypt Obsidian's pre-existing plaintext trash -------

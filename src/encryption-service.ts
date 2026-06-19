@@ -112,6 +112,23 @@ export class EncryptionService {
   isRemembered(): boolean {
     try { return !!this.secretStore()?.getSecret(this.keychainId()); } catch { return false; }
   }
+  /** The password saved in this device's keychain, or null. Lets flows that
+   *  need the password (e.g. Remove encryption) pull it automatically instead
+   *  of forcing the user to retype it. Falls back to the legacy entry. */
+  rememberedPassword(): string | null {
+    const ss = this.secretStore();
+    if (!ss) return null;
+    try { const v = ss.getSecret(this.keychainId()); if (v) return v; } catch { /* fall through */ }
+    try { return ss.getSecret(LEGACY_KEYCHAIN_ID) || null; } catch { return null; }
+  }
+  /** True if the keychain holds a password that actually verifies against the
+   *  current key — so a flow can treat "keychain present" as proof of access
+   *  without prompting. */
+  async verifyWithKeychain(): Promise<boolean> {
+    const pw = this.rememberedPassword();
+    if (!pw) return false;
+    try { return await this.verifyPassword(pw); } catch { return false; }
+  }
   private async remember(password: string): Promise<void> {
     try { await this.secretStore()?.setSecret(this.keychainId(), password); }
     catch (e) { console.warn("[Stashpad] couldn't save password to keychain", e); }

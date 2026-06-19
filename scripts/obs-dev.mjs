@@ -17,7 +17,7 @@
 // Node 18+ (global fetch / WebSocket). macOS paths.
 
 import { spawn } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, copyFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 import { execSync } from "node:child_process";
@@ -110,6 +110,30 @@ function seedConfig() {
   writeFileSync(cfgPath, JSON.stringify(cfg));
 }
 
+// Obsidian auto-updates by writing a newer `obsidian-<ver>.asar` into the
+// user-data-dir (NOT the .app bundle), and loads the newest asar present there.
+// The dev profile is isolated, so it never receives those updates and runs the
+// bundled (older, stable) version — which can render/behave differently from the
+// user's main app (e.g. the 1.13 declarative-settings API is absent on stable, so
+// dev tests silently exercise a different code path). Mirror the main profile's
+// newest asar into the dev profile so the dev instance matches the real app.
+const MAIN_OBSIDIAN_DIR = join(process.env.HOME, "Library", "Application Support", "obsidian");
+function syncInsiderAsar() {
+  try {
+    if (!existsSync(MAIN_OBSIDIAN_DIR)) return;
+    const verOf = (f) => (f.match(/(\d+)\.(\d+)\.(\d+)/) || []).slice(1).map(Number);
+    const cmp = (a, b) => { for (let i = 0; i < 3; i++) { const d = (verOf(a)[i] ?? 0) - (verOf(b)[i] ?? 0); if (d) return d; } return 0; };
+    const asars = readdirSync(MAIN_OBSIDIAN_DIR).filter((f) => /^obsidian-.*\.asar$/.test(f)).sort(cmp);
+    if (!asars.length) return; // main app on the bundled version too — nothing to mirror
+    const newest = asars[asars.length - 1];
+    const dst = join(USER_DATA_DIR, newest);
+    if (!existsSync(dst)) {
+      copyFileSync(join(MAIN_OBSIDIAN_DIR, newest), dst);
+      console.log(`synced ${newest} into the dev profile (matches your main Obsidian version)`);
+    }
+  } catch (e) { console.warn("asar sync skipped:", e.message); }
+}
+
 async function start() {
   if (await portReady()) {
     const v = await verifyVault();
@@ -117,6 +141,7 @@ async function start() {
     return;
   }
   seedConfig();
+  syncInsiderAsar();
   console.log(`launching dedicated Obsidian (vault: ${VAULT_NAME}, port :${PORT}, isolated user-data-dir)…`);
   const child = spawn(OBSIDIAN_BIN, [`--remote-debugging-port=${PORT}`, `--user-data-dir=${USER_DATA_DIR}`], {
     detached: true, stdio: "ignore",

@@ -8,7 +8,7 @@ import { STASHPAD_TRASH_VIEW_TYPE } from "./types";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree } from "./encryption-ops";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree } from "./encryption-ops";
 import { EncryptionPasswordModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
@@ -79,6 +79,11 @@ export default class StashpadPlugin extends Plugin {
    *  wikilink rewrites Obsidian does when slug-renames move files — never
    *  bump `modified` (or add the local user as a contributor). */
   rebootstrapInProgress = false;
+  /** 0.112.0: paths of `.stashenc` blobs written via the adapter THIS session
+   *  that the vault's in-memory index may not have picked up yet. Backs the fast
+   *  encryption-state check so the removal guard never has to do a full recursive
+   *  adapter walk. Pruned by the create watcher (once indexed) and delete watcher. */
+  private pendingEncBlobs = new Set<string>();
   /** 0.86.6: while `Date.now() < this`, a Stashpad view's activation
    *  auto-focus skips grabbing the composer. Set by the folder panel before it
    *  reveals/opens a leaf so tapping a pinned note on mobile doesn't pop the
@@ -760,6 +765,11 @@ export default class StashpadPlugin extends Plugin {
     // has settled so folder discovery + the "already has my stub" check
     // are accurate (avoids creating a duplicate before the cache lists
     // the existing one). New folders are seeded at creation time instead.
+    // 0.112.0: keep the fast encryption-state index honest — drop a pending blob
+    // once the vault indexes it (then getFiles() covers it), and reflect external
+    // or synced deletes so a stale pending entry can't falsely report "locked".
+    this.registerEvent(this.app.vault.on("create", (f) => { if (f.path.endsWith(".stashenc")) this.pendingEncBlobs.delete(f.path); }));
+    this.registerEvent(this.app.vault.on("delete", (f) => { if (f.path.endsWith(".stashenc")) this.pendingEncBlobs.delete(f.path); }));
     this.app.workspace.onLayoutReady(() => {
       // Vault is fully indexed now — safe to reconcile locked placeholders
       // (drop entries whose blob is truly gone, add cross-device blobs).
@@ -3130,6 +3140,60 @@ export default class StashpadPlugin extends Plugin {
     });
   }
 
+  /** 0.112.0: FAST encryption-state check — replaces a full recursive adapter
+   *  walk that made "Remove encryption" take minutes on big vaults. Reads
+   *  Obsidian's in-memory file index (instant) plus this session's
+   *  `pendingEncBlobs` (adapter writes not yet indexed). Splits LIVE locked
+   *  content (notes/folders — irrecoverable if the key is erased) from TRASH
+   *  (`_deleted/` — recoverable until the key goes). Short-circuits as soon as it
+   *  knows both.
+   *
+   *  0.112.2: empirically verified (Claude Dev Vault, pendingEncBlobs empty)
+   *  that `vault.getFiles()` DOES return `_deleted/*.stashenc` — it's a normal,
+   *  fully-indexed folder — so trash detection here is reliable across sessions,
+   *  NOT dependent on `pendingEncBlobs`. The only location `getFiles()` misses is
+   *  the `.trash/` DOT-folder; for any IRREVERSIBLE decision use
+   *  `encryptionStateStrict()`, which adapter-confirms `_deleted/` + `.trash/`. */
+  encryptionState(): { live: boolean; trash: boolean } {
+    const isTrash = (p: string): boolean => {
+      const dir = p.replace(/\/[^/]*$/, "");
+      return dir === "_deleted" || dir.startsWith("_deleted/");
+    };
+    let live = false, trash = false;
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension !== "stashenc") continue;
+      if (isTrash(f.path)) trash = true; else live = true;
+      if (live && trash) return { live, trash };
+    }
+    for (const p of this.pendingEncBlobs) {
+      if (isTrash(p)) trash = true; else live = true;
+      if (live && trash) break;
+    }
+    return { live, trash };
+  }
+
+  /** Authoritative-but-cheap variant for the IRREVERSIBLE "Remove encryption"
+   *  moment. Starts from the fast in-memory check, then confirms TRASH via two
+   *  adapter folder listings: `_deleted/` (covers an index lag) and Obsidian's
+   *  vault-local trash `.trash/` — a DOT-folder that `vault.getFiles()` never
+   *  returns, so a `.stashenc` the user trashed there would otherwise be erased
+   *  silently. Two listings, not a full vault walk. Live blobs only ever live in
+   *  normal (indexed) Stashpad folders, so live detection stays on the fast path. */
+  async encryptionStateStrict(): Promise<{ live: boolean; trash: boolean }> {
+    const s = this.encryptionState();
+    let trash = s.trash;
+    if (!trash) {
+      try { trash = (await listDeletedBlobs(this.app)).length > 0; } catch { /* ignore */ }
+    }
+    if (!trash) {
+      try {
+        const t = await this.app.vault.adapter.list(OBSIDIAN_TRASH_DIR);
+        trash = t.files.some((f) => f.endsWith(".stashenc"));
+      } catch { /* no .trash dir — fine */ }
+    }
+    return { live: s.live, trash };
+  }
+
   async lockNoteSubtree(folder: string, rootId: StashpadId, prevSibling: StashpadId | null = null, opts: { silent?: boolean; blobFolder?: string } = {}): Promise<LockResult | null> {
     if (!(await this.ensureEncryptionUnlocked())) return null;
     const dek = this.encryption.getSessionKey();
@@ -3137,6 +3201,7 @@ export default class StashpadPlugin extends Plugin {
     try {
       const hideTitle = this.settings.hideLockedTitles ?? false;
       const r = await lockSubtree(this.app, folder, rootId, dek, prevSibling, hideTitle, opts.blobFolder);
+      this.pendingEncBlobs.add(r.blobPath); // fast-state index: cover the pre-vault-index window
       // Record a placeholder registry entry so the list shows a 🔒 stub where
       // the note was. The blob may live in a different folder than the note's
       // source (archive) — register it under the blob's actual folder.
@@ -3188,6 +3253,9 @@ export default class StashpadPlugin extends Plugin {
     const folder = (opts.destFolder ?? blobPath.replace(/\/[^/]*$/, "")).replace(/\/+$/, "");
     try {
       const r = await this.unlockBundleCore(blobPath, dek, opts.destFolder);
+      // Blob is removed via raw adapter (no vault 'delete' event) — prune the
+      // fast-index pending entry directly so it can't falsely report "locked".
+      this.pendingEncBlobs.delete(blobPath);
       this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== blobPath);
       await this.saveSettings();
       if (!opts.silent) this.notifications.show({ message: `Unlocked ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"}.`, kind: "success", category: "system", folder });
@@ -3317,6 +3385,7 @@ export default class StashpadPlugin extends Plugin {
       // the general hide-locked-titles setting is off.
       const hideTitle = (this.settings.hideLockedTitles ?? false) || (this.settings.encryptTrashFilenames ?? false);
       const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle);
+      this.pendingEncBlobs.add(r.blobPath); // fast-state index
       if (r.unpurged.length > 0) {
         new Notice(`⚠️ Sent to encrypted trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
       }
@@ -3339,6 +3408,7 @@ export default class StashpadPlugin extends Plugin {
     if (meta?.kind === "rawtrash") {
       try {
         const r = await restoreRawTrash(this.app, blobPath, dek);
+        this.pendingEncBlobs.delete(blobPath);
         if (!opts.silent) this.notifications.show({ message: `Restored ${r.filesWritten} file${r.filesWritten === 1 ? "" : "s"} to Obsidian's trash (${OBSIDIAN_TRASH_DIR}/).`, kind: "success", category: "system", folder: "" });
         return true;
       } catch (e) {
@@ -3364,6 +3434,7 @@ export default class StashpadPlugin extends Plugin {
         } catch { /* unreadable — skip */ }
       }
       const r = await restoreDeleted(this.app, blobPath, dek, existing);
+      this.pendingEncBlobs.delete(blobPath);
       if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo });
       return true;
     } catch (e) {
@@ -3371,6 +3442,39 @@ export default class StashpadPlugin extends Plugin {
       new Notice(`Couldn't restore: ${(e as Error).message}`, 0);
       return false;
     }
+  }
+
+  /** Permanently delete one encrypted-trash item (blob + sidecar). Irreversible
+   *  — no decrypt. The caller MUST confirm first. Returns true on success. */
+  async purgeDeletedAt(blobPath: string): Promise<boolean> {
+    try {
+      await purgeDeletedBlob(this.app, blobPath);
+      this.pendingEncBlobs.delete(blobPath);
+      return true;
+    } catch (e) {
+      console.warn("[Stashpad] purge-from-trash failed", blobPath, e);
+      new Notice(`Couldn't delete: ${(e as Error).message}`, 0);
+      return false;
+    }
+  }
+
+  /** Permanently delete EVERY live locked `.stashenc` bundle (+ sidecar) WITHOUT
+   *  decrypting — the notes inside are gone for good. Backs "Remove encryption →
+   *  Delete locked content" for when the password is lost. Excludes `_deleted/`
+   *  trash (that's handled separately). Caller MUST confirm. Returns the count. */
+  async purgeAllLockedContent(): Promise<number> {
+    const isTrash = (p: string): boolean => { const d = p.replace(/\/[^/]*$/, ""); return d === "_deleted" || d.startsWith("_deleted/"); };
+    const blobs = new Set<string>();
+    for (const f of this.app.vault.getFiles()) if (f.extension === "stashenc" && !isTrash(f.path)) blobs.add(f.path);
+    for (const p of this.pendingEncBlobs) if (!isTrash(p)) blobs.add(p);
+    let n = 0;
+    for (const b of blobs) {
+      try { await purgeDeletedBlob(this.app, b); this.pendingEncBlobs.delete(b); n++; }
+      catch (e) { console.warn("[Stashpad] purge locked content failed", b, e); }
+    }
+    this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => !blobs.has(e.blob));
+    await this.saveSettings();
+    return n;
   }
 
   /** List the encrypted-trash contents (blob path + sidecar metadata). */

@@ -72,8 +72,10 @@ export class StashpadFolderPanelView extends ItemView {
     he.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); this.plugin.openFolderPicker(); } };
     const newBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-newfolder" });
     setIcon(newBtn, "folder-plus");
-    newBtn.setAttr("aria-label", "New Stashpad folder");
-    newBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); void this.createNewFolderFlow(); } };
+    newBtn.setAttr("aria-label", "New Stashpad folder (folder switcher)");
+    // 0.112.3: open the folder switcher (which already has a "Create" entry)
+    // rather than a bespoke prompt — one place to create + switch folders.
+    newBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); this.plugin.openFolderPicker(); } };
     if (this.plugin.encryption?.isConfigured?.()) {
       const trashBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-trash" });
       setIcon(trashBtn, "trash-2");
@@ -81,23 +83,6 @@ export class StashpadFolderPanelView extends ItemView {
       trashBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); this.plugin.openEncryptedTrash(); } };
     }
     this.renderFolders(folderSection.createDiv({ cls: "stashpad-folderpanel-list" }));
-  }
-
-  /** Prompt for a name, create a new Stashpad folder, then open it. Wired to the
-   *  "+" button in the Folders heading. 0.111.0. */
-  private async createNewFolderFlow(): Promise<void> {
-    const raw = await new NewFolderPromptModal(this.app).prompt();
-    const cleaned = (raw ?? "").trim().replace(/^\/+|\/+$/g, "");
-    if (!cleaned) return; // cancelled or empty
-    try {
-      await this.plugin.createNewStashpad(cleaned);
-      await this.plugin.waitForStashpadFolder(cleaned, 2000);
-      await this.plugin.activateViewForFolder(cleaned);
-      this.scheduleRender();
-      new Notice(`Created Stashpad "${cleaned.split("/").pop()}".`);
-    } catch (e) {
-      new Notice(`Couldn't create folder: ${(e as Error).message}`);
-    }
   }
 
   private clampFrac(f: number): number {
@@ -768,52 +753,4 @@ export async function openFolderPanelView(app: App): Promise<void> {
   if (!leaf) { new Notice("Stashpad: couldn't open the folder panel."); return; }
   await leaf.setViewState({ type: STASHPAD_FOLDER_PANEL_VIEW_TYPE, active: true });
   app.workspace.revealLeaf(leaf);
-}
-
-/** Minimal single-line name prompt for "New Stashpad folder". Resolves the
- *  entered name, or null if cancelled (Esc / Cancel / empty). 0.111.0. */
-class NewFolderPromptModal extends Modal {
-  private value = "";
-  private resolved = false;
-  private resolve: ((v: string | null) => void) | null = null;
-
-  prompt(): Promise<string | null> {
-    return new Promise((resolve) => { this.resolve = resolve; this.open(); });
-  }
-
-  onOpen(): void {
-    this.titleEl.setText("New Stashpad folder");
-    const { contentEl } = this;
-    contentEl.createEl("p", {
-      cls: "setting-item-description",
-      text: "Vault-relative folder path. It's created (with intermediates) and seeded with a Home note, then opened.",
-    });
-    const input = contentEl.createEl("input", { type: "text", cls: "stashpad-newfolder-input" });
-    input.placeholder = "my-stashpad";
-    input.setCssStyles({ width: "100%", marginBottom: "12px" });
-    input.addEventListener("input", () => { this.value = input.value; });
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") { e.preventDefault(); this.finish(input.value); }
-      else if (e.key === "Escape") { e.preventDefault(); this.finish(null); }
-    });
-    const btns = contentEl.createDiv({ cls: "modal-button-container" });
-    const create = btns.createEl("button", { text: "Create", cls: "mod-cta" });
-    create.onclick = () => this.finish(this.value);
-    const cancel = btns.createEl("button", { text: "Cancel" });
-    cancel.onclick = () => this.finish(null);
-    window.setTimeout(() => input.focus(), 0);
-  }
-
-  private finish(v: string | null): void {
-    if (this.resolved) return;
-    this.resolved = true;
-    this.resolve?.(v);
-    this.close();
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-    // Closed via the X / click-out without an explicit choice → treat as cancel.
-    if (!this.resolved) { this.resolved = true; this.resolve?.(null); }
-  }
 }
