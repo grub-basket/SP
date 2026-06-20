@@ -1,7 +1,7 @@
 {
   "id": "stashpad",
   "name": "Stashpad",
-  "version": "0.112.11",
+  "version": "0.113.0",
   "minAppVersion": "1.13.0",
   "description": "A chat-style, nested-notes workspace: rapid capture, outliner navigation, fast search, tasks, and per-folder templates, with one-click Open Knowledge Format (OKF) export for LLMs and agents.",
   "author": "Human",
