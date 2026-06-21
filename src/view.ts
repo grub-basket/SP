@@ -272,6 +272,10 @@ export class StashpadView extends ItemView {
    *  rail can collapse behind a chevron when the composer is narrow
    *  (compact mode, tiny window, narrow split). */
   private composerNarrowObserver: ResizeObserver | null = null;
+  /** 0.116.0: observes the header bar's width so its clusters fold into a
+   *  single ⋯ overflow menu (cascading, by priority) instead of wrapping
+   *  to a second row. Desktop only; see setupBarOverflow. */
+  private barOverflowRO: ResizeObserver | null = null;
   /** Per-focus "last cursor note id" — persisted via plugin.saveLastCursor.
    *  Read on view open / folder switch; restored via the `scroll-to-id`
    *  policy so the user lands looking at the same note they were on, even
@@ -800,6 +804,8 @@ export class StashpadView extends ItemView {
     this.stickyRowObserver?.disconnect();
     this.stickyRowObserver = null;
     this.bodyRenderer.dispose();
+    this.barOverflowRO?.disconnect();
+    this.barOverflowRO = null;
     this.composerNarrowObserver?.disconnect();
     this.composerNarrowObserver = null;
     this.focusedMiniObserver?.disconnect();
@@ -2754,6 +2760,284 @@ export class StashpadView extends ItemView {
 
     // Action cluster moved to the breadcrumb row's start — see
     // renderActionsCluster, called from renderBreadcrumb.
+
+    // 0.116.0: width-driven cascading overflow. When the bar is too narrow
+    // to show every cluster on one row, clusters fold — in priority order
+    // (mode buttons → time → color → tag → sort → view → search → folder)
+    // — into a single trailing ⋯ menu, instead of clipping/wrapping to a
+    // second row. Desktop only; mobile already collapses into the
+    // combined-filters accordion (and returned above).
+    this.setupBarOverflow(bar);
+  }
+
+  /** Install the two-phase cascading-overflow controller on the header bar.
+   *
+   *  The bar's clusters are organized into five GROUPS, each with its own
+   *  distinctive icon and a combined popover:
+   *    nav (folder+search) · filter (tag+color) · arrange (sort+view) ·
+   *    time · window (tiny/compact/popout)
+   *
+   *  Phase A — as the bar narrows, groups fold from their expanded button
+   *  row into a single iconed "combined menu" button, in this order:
+   *    window → time → filter → arrange → nav   (collapsePrio ascending)
+   *
+   *  Phase B — once every group is a compact icon and it STILL doesn't fit,
+   *  the master sideways-kebab (⋯) appears at the right and "gobbles" the
+   *  group buttons right-to-left (window, time, arrange, filter, nav),
+   *  surfacing them as sections inside its own menu.
+   *
+   *  The per-cluster `populate*MenuBody` builders are reused for the group
+   *  popovers AND the kebab menu via openBarOverflowMenu(member-keys).
+   *  Desktop only (mobile returns before this call). 0.116.0. */
+  private setupBarOverflow(bar: HTMLElement): void {
+    type Group = {
+      key: string; icon: string; title: string;
+      memberSel: string[];   // selectors of the cluster buttons it owns
+      memberKeys: string[];  // openBarOverflowMenu section keys, display order
+      collapsePrio: number;  // ASC = folds to icon first (window=1 … nav=5)
+      displayIdx: number;    // L→R position (nav=0 … window=4)
+    };
+    const GROUPS: Group[] = [
+      { key: "nav",     icon: "folder-search",      title: "Folder & search", memberSel: [".stashpad-folder-btn", ".stashpad-search-btn"], memberKeys: ["folder", "search"], collapsePrio: 5, displayIdx: 0 },
+      { key: "filter",  icon: "filter",             title: "Tag & color",     memberSel: [".stashpad-tag-filter-btn", ".stashpad-color-filter-btn"], memberKeys: ["tag", "color"], collapsePrio: 3, displayIdx: 1 },
+      { key: "arrange", icon: "sliders-horizontal", title: "Sort & view",     memberSel: [".stashpad-sort-btn", ".stashpad-view-btn"], memberKeys: ["sort", "view"], collapsePrio: 4, displayIdx: 2 },
+      { key: "time",    icon: "clock",              title: "Time",            memberSel: [".stashpad-time-filter-btns", ".stashpad-time-filter-select"], memberKeys: ["time"], collapsePrio: 2, displayIdx: 3 },
+      { key: "window",  icon: "app-window",         title: "Window & layout", memberSel: [".stashpad-view-mode-btns"], memberKeys: ["mode"], collapsePrio: 1, displayIdx: 4 },
+    ];
+
+    bar.addClass("stashpad-overflow-managed");
+
+    // Wrap each group's existing cluster buttons into a group container that
+    // holds the expanded row + a (hidden) collapsed icon button. The wrapper
+    // is inserted at the group's first member's position so display order is
+    // preserved; members are then moved into the wrapper's expanded row.
+    type Built = Group & { wrapper: HTMLElement; expanded: HTMLElement; iconBtn: HTMLElement };
+    const built: Built[] = [];
+    for (const g of [...GROUPS].sort((a, b) => a.displayIdx - b.displayIdx)) {
+      const members = g.memberSel
+        .map((s) => bar.querySelector(s) as HTMLElement | null)
+        .filter((e): e is HTMLElement => !!e);
+      if (members.length === 0) continue;
+      const wrapper = createDiv({ cls: "stashpad-bar-group" });
+      bar.insertBefore(wrapper, members[0]);
+      const expanded = wrapper.createDiv({ cls: "stashpad-bar-group-expanded" });
+      for (const m of members) expanded.appendChild(m);
+      const iconBtn = wrapper.createDiv({ cls: "stashpad-bar-overflow-btn stashpad-bar-group-icon stashpad-overflow-hidden" });
+      iconBtn.setAttribute("role", "button");
+      iconBtn.setAttribute("tabindex", "0");
+      setIcon(iconBtn.createSpan({ cls: "stashpad-bar-group-icon-glyph" }), g.icon);
+      iconBtn.title = `${g.title} — combined menu`;
+      const openGroup = (e: Event): void => { e.preventDefault(); this.openBarOverflowMenu(iconBtn, g.memberKeys); };
+      iconBtn.onclick = openGroup;
+      iconBtn.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") openGroup(e); };
+      built.push({ ...g, wrapper, expanded, iconBtn });
+    }
+
+    // Master kebab — rightmost, hidden until Phase B.
+    const kebab = bar.createDiv({ cls: "stashpad-bar-overflow-btn stashpad-bar-kebab stashpad-overflow-hidden" });
+    kebab.setAttribute("role", "button");
+    kebab.setAttribute("tabindex", "0");
+    setIcon(kebab.createSpan({ cls: "stashpad-bar-overflow-icon" }), "more-horizontal");
+    kebab.title = "More filters / view options";
+
+    const collapseOrder = [...built].sort((a, b) => a.collapsePrio - b.collapsePrio);
+    const gobbleOrder = [...built].sort((a, b) => b.displayIdx - a.displayIdx); // RTL
+    let kebabKeys: string[] = [];
+
+    const fits = (): boolean => bar.scrollWidth <= bar.clientWidth + 1;
+
+    const reflow = (): void => {
+      if (!bar.isConnected || bar.clientWidth === 0) return;
+      // Reset to fully expanded.
+      for (const g of built) {
+        g.wrapper.removeClass("stashpad-overflow-hidden");
+        g.expanded.removeClass("stashpad-overflow-hidden");
+        g.iconBtn.addClass("stashpad-overflow-hidden");
+        g.iconBtn.toggleClass("is-active", g.memberKeys.some((k) => this.barUnitActive(k)));
+      }
+      kebab.addClass("stashpad-overflow-hidden");
+      kebabKeys = [];
+      if (fits()) return;
+
+      // Phase A — fold groups into their icon buttons (window → … → nav).
+      for (const g of collapseOrder) {
+        if (fits()) break;
+        g.expanded.addClass("stashpad-overflow-hidden");
+        g.iconBtn.removeClass("stashpad-overflow-hidden");
+      }
+      if (fits()) return;
+
+      // Phase B — reveal the kebab and gobble group icons RTL.
+      kebab.removeClass("stashpad-overflow-hidden");
+      const gobbled: Built[] = [];
+      for (const g of gobbleOrder) {
+        if (fits()) break;
+        g.wrapper.addClass("stashpad-overflow-hidden");
+        gobbled.push(g);
+      }
+      // Kebab menu lists gobbled groups' members in display order.
+      kebabKeys = [...gobbled].sort((a, b) => a.displayIdx - b.displayIdx).flatMap((g) => g.memberKeys);
+      kebab.toggleClass("is-active", kebabKeys.some((k) => this.barUnitActive(k)));
+    };
+
+    const openKebab = (e: Event): void => { e.preventDefault(); this.openBarOverflowMenu(kebab, kebabKeys); };
+    kebab.onclick = openKebab;
+    kebab.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") openKebab(e); };
+
+    try { this.barOverflowRO?.disconnect(); } catch { /* ignore */ }
+    const RO = (bar.ownerDocument?.defaultView ?? window).ResizeObserver;
+    // Only reflow when the bar's WIDTH actually changes. Folding clusters can
+    // nudge the bar's height (icon buttons vs text rows), which would re-fire
+    // the observer; without this guard each fire could re-grow the row in a
+    // feedback loop. Height-only changes are ignored.
+    let lastW = -1;
+    this.barOverflowRO = new RO((entries) => {
+      const w = Math.round(entries[entries.length - 1].contentRect.width);
+      if (w === lastW) return;
+      lastW = w;
+      reflow();
+    });
+    this.barOverflowRO.observe(bar);
+    // Initial pass after layout settles (fonts/icons can shift widths).
+    requestAnimationFrame(() => reflow());
+  }
+
+  /** Whether a foldable cluster is currently in a non-default state — used
+   *  to accent the ⋯ button so a collapsed-but-active filter stays visible. */
+  private barUnitActive(key: string): boolean {
+    switch (key) {
+      case "folder": return !!this.folderOverride;
+      case "tag": return !!this.tagFilter;
+      case "color": return !!this.colorFilter;
+      case "time": return this.timeFilter !== "all";
+      case "sort": return this.currentViewMode() === "nested"
+        && this.sortStore.getMode(this.noteFolder, this.focusId) !== "manual";
+      case "view": return this.currentViewMode() !== "nested"
+        || this.currentEncryptionFilter() !== "all"
+        || this.currentHideChildless() || this.currentHideCompleted()
+        || this.currentAttachmentsOnly() || this.currentIncludeAttachments();
+      case "mode": return this.compactMode;
+      default: return false;
+    }
+  }
+
+  /** Accordion popover for the clusters currently folded into ⋯. Lists
+   *  them in display order, reusing the same populate* bodies as the
+   *  per-cluster popovers and the mobile combined-filters menu. 0.116.0. */
+  private openBarOverflowMenu(anchor: HTMLElement, collapsedKeys: string[]): void {
+    const doc = anchor.ownerDocument ?? document;
+    doc.querySelectorAll(".stashpad-mobile-filters-popover").forEach((el) => el.remove());
+    const pop = doc.body.createDiv({ cls: "stashpad-mobile-filters-popover" });
+    const r = anchor.getBoundingClientRect();
+    const win = doc.defaultView ?? window;
+    pop.setCssStyles({
+      right: `${Math.max(8, win.innerWidth - r.right)}px`,
+      left: "auto",
+      top: `${r.bottom + 4}px`,
+      maxWidth: "min(360px, calc(100vw - 16px))",
+      width: "max-content",
+      minWidth: "260px",
+    });
+
+    const scope = new Scope((this.app as any).scope);
+    const close = (): void => {
+      pop.remove();
+      doc.removeEventListener("mousedown", outside, true);
+      try { (this.app as any).keymap?.popScope(scope); } catch { /* ignore */ }
+    };
+    const outside = (ev: MouseEvent): void => {
+      if (!pop.contains(ev.target as Node) && ev.target !== anchor && !anchor.contains(ev.target as Node)) close();
+    };
+
+    type Section = { key: string; title: string; summary: () => string; populate: (body: HTMLElement) => void };
+    // Display order (left→right on the bar). Filtered to what's folded.
+    const all: Section[] = [
+      { key: "folder", title: "Folder", summary: () => (this.noteFolder.split("/").pop() || this.noteFolder) || "Stashpad",
+        populate: (b) => this.populateFolderMenuBody(b, close) },
+      { key: "search", title: "Search", summary: () => "Search notes (Mod+F)",
+        populate: (b) => this.populateSearchMenuBody(b, close) },
+      { key: "tag", title: "Tag filter", summary: () => this.tagFilter ? `#${this.tagFilter}` : "All tags",
+        populate: (b) => this.populateTagMenuBody(b, close) },
+      { key: "color", title: "Color filter",
+        summary: () => this.colorFilter ? (this.plugin.getColorAlias(this.noteFolder, this.colorFilter) ?? this.colorFilter) : "All colors",
+        populate: (b) => this.populateColorMenuBody(b, this.collectFolderColors(), close) },
+      { key: "sort", title: "Sort",
+        summary: () => this.currentViewMode() !== "nested" ? "— (Nested only)" : SORT_MODE_LABELS[this.sortStore.getMode(this.noteFolder, this.focusId)],
+        populate: (b) => {
+          if (this.currentViewMode() !== "nested") { b.createDiv({ cls: "stashpad-mobile-filters-note", text: "Sort applies only in Nested view." }); return; }
+          this.populateSortMenuBody(b, close);
+        } },
+      { key: "view", title: "View", summary: () => VIEW_MODE_LABELS[this.currentViewMode()],
+        populate: (b) => this.populateViewMenuBody(b, close) },
+      { key: "time", title: "Time filter",
+        summary: () => { const opt = TIME_FILTER_OPTIONS.find((o) => o.key === this.timeFilter); return opt ? (this.timeFilterCalendar ? opt.calShort : opt.rollShort) : "All"; },
+        populate: (b) => this.populateTimeMenuBody(b, close) },
+      { key: "mode", title: "View mode", summary: () => this.compactMode ? "Compact on" : "Tiny · Compact · Window",
+        populate: (b) => this.populateModeMenuBody(b, close) },
+    ];
+    const sections = all.filter((s) => collapsedKeys.includes(s.key));
+
+    let expandedKey = "";
+    const renderAccordion = (): void => {
+      pop.empty();
+      for (const sec of sections) {
+        const sectionEl = pop.createDiv({ cls: "stashpad-mobile-filters-section" });
+        const header = sectionEl.createDiv({ cls: "stashpad-mobile-filters-header" });
+        const chev = header.createSpan({ cls: "stashpad-mobile-filters-chev" });
+        setIcon(chev, expandedKey === sec.key ? "chevron-down" : "chevron-right");
+        header.createSpan({ cls: "stashpad-mobile-filters-title", text: sec.title });
+        header.createSpan({ cls: "stashpad-mobile-filters-summary", text: sec.summary() });
+        header.onclick = (e) => {
+          e.preventDefault(); e.stopPropagation();
+          expandedKey = expandedKey === sec.key ? "" : sec.key;
+          renderAccordion();
+        };
+        if (expandedKey === sec.key) sec.populate(sectionEl.createDiv({ cls: "stashpad-mobile-filters-body" }));
+      }
+    };
+    renderAccordion();
+
+    scope.register([], "Escape", (ev: KeyboardEvent) => { ev.preventDefault(); close(); return false; });
+    (this.app as any).keymap?.pushScope(scope);
+    setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
+  }
+
+  /** ⋯-menu body for the folder cluster: open the folder picker. */
+  private populateFolderMenuBody(container: HTMLElement, onPicked: () => void): void {
+    const row = container.createDiv({ cls: "stashpad-sort-popover-row" });
+    row.createSpan({ cls: "stashpad-sort-popover-label", text: this.folderOverride ? "Change folder (override active)…" : "Change folder for this tab…" });
+    row.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onPicked(); this.openFolderPicker(); };
+  }
+
+  /** ⋯-menu body for the search cluster: open the search modal. */
+  private populateSearchMenuBody(container: HTMLElement, onPicked: () => void): void {
+    const row = container.createDiv({ cls: "stashpad-sort-popover-row" });
+    row.createSpan({ cls: "stashpad-sort-popover-label", text: "Search notes…" });
+    row.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onPicked(); this.openSearchModal(); };
+  }
+
+  /** ⋯-menu body for the mode cluster: tiny / compact / open-in-new-window. */
+  private populateModeMenuBody(container: HTMLElement, onPicked: () => void): void {
+    const addRow = (label: string, run: () => void): void => {
+      const row = container.createDiv({ cls: "stashpad-sort-popover-row" });
+      row.createSpan({ cls: "stashpad-sort-popover-label", text: label });
+      row.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onPicked(); run(); };
+    };
+    addRow("Tiny mode (popout window)", () => void this.plugin.openTinyWindow());
+    const cRow = container.createDiv({ cls: "stashpad-sort-popover-row" });
+    if (this.compactMode) cRow.addClass("is-active");
+    cRow.createSpan({ cls: "stashpad-sort-popover-label", text: this.compactMode ? "Compact mode (on)" : "Compact mode" });
+    cRow.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onPicked(); this.toggleCompactMode(); };
+    addRow(getSettings().popoutDuplicates ? "Duplicate to new window" : "Move to new window", () => {
+      try {
+        const ws = this.app.workspace as any;
+        if (getSettings().popoutDuplicates) {
+          const popLeaf = ws.openPopoutLeaf?.();
+          if (popLeaf) void popLeaf.setViewState({ ...this.leaf.getViewState(), active: true });
+          else new Notice("Stashpad: this Obsidian build doesn't expose openPopoutLeaf.");
+        } else ws.moveLeafToPopout?.(this.leaf);
+      } catch (err) { new Notice(`Stashpad: open-in-new-window failed (${(err as Error).message})`); }
+    });
   }
 
   /** Toggle compact mode + persist + re-render. 0.61.2. */

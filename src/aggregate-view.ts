@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, moment, setIcon } from "obsidian";
+import { ItemView, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
 import type StashpadPlugin from "./main";
 import { STASHPAD_AGGREGATE_VIEW_TYPE } from "./types";
 
@@ -34,8 +34,7 @@ export class StashpadAggregateView extends ItemView {
   getState(): Record<string, unknown> { return { ...super.getState(), mode: this.mode }; }
   async setState(state: AggregateState, result: unknown): Promise<void> {
     if (state?.mode === "archived" || state?.mode === "encrypted") this.mode = state.mode;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await super.setState(state, result as any);
+    await super.setState(state, result as ViewStateResult);
     await this.render();
   }
 

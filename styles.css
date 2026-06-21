@@ -807,9 +807,49 @@
 .stashpad-tag-filter-row-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .stashpad-tag-filter-row-count { color: var(--text-muted); font-size: var(--font-ui-smaller); flex: 0 0 auto; }
 .stashpad-tag-filter-empty { padding: 8px 10px; color: var(--text-muted); }
-@container (max-width: 360px) {
-  .stashpad-time-filter-btns { display: none; }
-  .stashpad-time-filter-select { display: block; }
+/* 0.116.0: desktop overflow is now JS-driven (setupBarOverflow) — clusters
+   fold into the ⋯ menu by priority rather than the time row alone dropping
+   to a <select>. The old @container time-filter rule is retired; the select
+   stays display:none on desktop (the ⋯ Time section replaces it). */
+.stashpad-overflow-managed {
+  /* Managed bar must NOT wrap — overflow is measured (scrollWidth vs
+     clientWidth) and resolved by folding clusters, not by wrapping. */
+  flex-wrap: nowrap;
+}
+.stashpad-overflow-managed > * {
+  /* Groups + kebab keep their content width so overflow is detectable;
+     without this, flex shrink hides overflow by clipping instead. */
+  flex: 0 0 auto;
+}
+.stashpad-overflow-hidden { display: none !important; }
+/* A group container holds its expanded cluster row OR a single collapsed
+   icon button (combined menu). 0.116.0. */
+.stashpad-bar-group { display: inline-flex; align-items: center; flex: 0 0 auto; }
+/* The folder button's default max-width:50% is relative to its containing
+   block — fine when it was a direct child of the bar, but inside a shrink-to
+   -fit group it resolves against the tiny group width (truncating the name)
+   and the circular constraint leaves dead space after the button. Use a fixed
+   cap instead; an over-long name just folds the nav group to its icon. */
+.stashpad-overflow-managed .stashpad-folder-btn { max-width: 240px; }
+.stashpad-bar-group-expanded { display: inline-flex; align-items: center; gap: 6px; }
+.stashpad-bar-group-icon-glyph { display: inline-flex; align-items: center; }
+.stashpad-bar-overflow-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 4px;
+  aspect-ratio: 1 / 1;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.stashpad-bar-overflow-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-bar-overflow-btn.is-active {
+  border-color: var(--interactive-accent);
+  color: var(--interactive-accent);
 }
 /* Mobile: the time filter moves into the combined-filters accordion.
    Hide both the button row AND the fallback select here — the accordion's

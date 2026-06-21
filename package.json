@@ -1,22 +1,22 @@
 {
-  "name": "stashpad-obsidian",
-  "version": "0.115.9",
-  "private": true,
-  "scripts": {
-    "dev": "node esbuild.config.mjs",
-    "build": "node esbuild.config.mjs production",
-    "deploy:files": "node scripts/deploy.mjs",
-    "deploy": "pnpm run build && node scripts/deploy.mjs",
-    "typecheck": "tsc --noEmit"
-  },
-  "devDependencies": {
-    "@types/node": "^20.10.0",
-    "esbuild": "^0.21.0",
-    "obsidian": "latest",
-    "typescript": "^5.4.0"
-  },
-  "dependencies": {
-    "fflate": "^0.8.3",
-    "hash-wasm": "^4.12.0"
-  }
+	"name": "stashpad-obsidian",
+	"version": "0.116.1",
+	"private": true,
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "node esbuild.config.mjs production",
+		"deploy:files": "node scripts/deploy.mjs",
+		"deploy": "pnpm run build && node scripts/deploy.mjs",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/node": "^20.10.0",
+		"esbuild": "^0.21.0",
+		"obsidian": "latest",
+		"typescript": "^5.4.0"
+	},
+	"dependencies": {
+		"fflate": "^0.8.3",
+		"hash-wasm": "^4.12.0"
+	}
 }
