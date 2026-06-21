@@ -2,7 +2,7 @@ import type { App } from "obsidian";
 import { encryptStash, decryptStash, argon2Available, type StashKdf } from "./stash-crypto";
 import { newId } from "./id-service";
 import { generateIdentityKeys, wrapDekTo, unwrapDekWith } from "./vault-keyring";
-import { KeyfileStore, emptyKeyfile, type VaultKeyfile, type KeyfileIdentity, type KeyfileJoinRequest } from "./vault-keyfile";
+import { KeyfileStore, emptyKeyfile, type VaultKeyfile, type KeyfileIdentity, type KeyfileJoinRequest, type FolderKeyEntry, type KeyfilePasswordSlot } from "./vault-keyfile";
 
 /** Legacy global keychain id (pre-0.99.24). Namespaced per-vault now — see
  *  `keychainId()`; kept for a one-time migration read. */
@@ -81,6 +81,10 @@ export type AccessState = "none" | "member" | "pending" | "outsider";
 
 export class EncryptionService {
   private sessionKey: Uint8Array | null = null;
+  /** Per-folder overhaul (Phase A): unlocked per-folder DEKs, keyed by cleaned
+   *  folder path. Overlay on the vault DEK — a folder with no entry here uses the
+   *  vault `sessionKey`. Zeroed on lock()/idle alongside the vault key. */
+  private folderSessionKeys = new Map<string, Uint8Array>();
   private idleTimer: number | null = null;
   private keyfiles: KeyfileStore;
   /** In-memory cache of the synced keyfile (refreshed via init()/refresh()). */
@@ -105,12 +109,24 @@ export class EncryptionService {
     return (this.app as App & { secretStorage?: SecretStore }).secretStorage ?? null;
   }
   keychainAvailable(): boolean { return !!this.secretStore(); }
+  /** Obsidian secret IDs must match /^[a-z0-9-]{1,64}$/. appId is normally a
+   *  lowercase hex string, but sanitize + bound it so we never feed an invalid id
+   *  to secretStorage. */
+  private appTag(): string {
+    const appId = (this.app as App & { appId?: string }).appId || "default";
+    return appId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20) || "default";
+  }
   private keychainId(): string {
+    return `${LEGACY_KEYCHAIN_ID}-${this.appTag()}`; // ≤ 25+1+20 = 46
+  }
+  /** Pre-0.114.7 vault id: full (unsanitized, unbounded) appId. Read as a fallback so
+   *  a vault password remembered before appTag() sanitization still auto-unlocks. */
+  private legacyAppIdKeychainId(): string {
     const appId = (this.app as App & { appId?: string }).appId || "default";
     return `${LEGACY_KEYCHAIN_ID}-${appId}`;
   }
   isRemembered(): boolean {
-    try { return !!this.secretStore()?.getSecret(this.keychainId()); } catch { return false; }
+    try { const ss = this.secretStore(); return !!(ss?.getSecret(this.keychainId()) || ss?.getSecret(this.legacyAppIdKeychainId())); } catch { return false; }
   }
   /** The password saved in this device's keychain, or null. Lets flows that
    *  need the password (e.g. Remove encryption) pull it automatically instead
@@ -119,6 +135,7 @@ export class EncryptionService {
     const ss = this.secretStore();
     if (!ss) return null;
     try { const v = ss.getSecret(this.keychainId()); if (v) return v; } catch { /* fall through */ }
+    try { const v = ss.getSecret(this.legacyAppIdKeychainId()); if (v) return v; } catch { /* fall through */ }
     try { return ss.getSecret(LEGACY_KEYCHAIN_ID) || null; } catch { return null; }
   }
   /** True if the keychain holds a password that actually verifies against the
@@ -196,7 +213,10 @@ export class EncryptionService {
     await this.keyfiles.save(kf);
     this.kf = kf;
     this.sessionKey = dek;
-    if (remember) await this.remember(password); else await this.forgetKeychain();
+    // Only WRITE on explicit remember — never auto-forget. Wiping is reserved for the
+    // explicit "Forget on this device" button and remove-encryption, so a password the
+    // user asked us to keep can't be silently zeroed by going through a later flow.
+    if (remember) await this.remember(password);
     this.armIdle();
   }
 
@@ -240,9 +260,11 @@ export class EncryptionService {
         } catch { priv.fill(0); }
       } catch { /* wrong password for my key — try shared password below */ }
     }
-    // Shared-password path (Model 1) — try the typed password against any shared
-    // password slot. Lets a device with no identity join just by knowing it.
-    for (const ps of (this.kf?.passwordSlots ?? [])) {
+    // Shared-password path (Model 1) — try the typed password against any ACTIVE
+    // shared password slot. Lets a device with no identity join just by knowing it.
+    // [deprecated] slots are RETAINED for recovery but don't unlock (old passwords
+    // stop working after a change — see setSharedPassword).
+    for (const ps of (this.kf?.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"))) {
       try {
         const dek = await decryptStash(fromB64(ps.wrapped), password);
         this.sessionKey = dek;
@@ -254,20 +276,36 @@ export class EncryptionService {
     return false;
   }
 
-  /** True if a shared password is enabled for this vault. */
-  hasSharedPassword(): boolean { return (this.kf?.passwordSlots?.length ?? 0) > 0; }
+  /** True if an ACTIVE (non-deprecated) shared password is enabled for this vault. */
+  hasSharedPassword(): boolean { return (this.kf?.passwordSlots ?? []).some((s) => !s.label.startsWith("[deprecated]")); }
 
-  /** Set (or replace) the shared password: wrap the unlocked DEK under `passphrase`
+  /** Set (or change) the shared password: wrap the unlocked DEK under `passphrase`
    *  so anyone who knows it can unlock — no per-device approval (Model 1). Requires
-   *  the vault to be unlocked (we need the DEK in hand). */
-  async setSharedPassword(passphrase: string): Promise<void> {
+   *  the vault to be unlocked (we need the DEK in hand). NOTHING is deleted on a
+   *  change: the prior slot is RETAINED and relabeled `[deprecated] …` (and the old
+   *  keychain password parked under a `-d-<slotId>` id); the new slot is the only
+   *  ACTIVE one, so the old password no longer unlocks via the normal path. */
+  async setSharedPassword(passphrase: string, remember = false): Promise<void> {
     if (!this.sessionKey) throw new Error("Unlock encryption first.");
     if (!passphrase) throw new Error("Password required.");
     await this.refresh();
     if (!this.kf) throw new Error("Encryption is not set up.");
+    const prevActive = (this.kf.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"));
+    const oldPw = this.rememberedPassword();
+    if (oldPw && prevActive[0]) {
+      try { await this.secretStore()?.setSecret(`${this.keychainId()}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort retention */ }
+    }
     const wrapped = await encryptStash(this.sessionKey, passphrase);
-    this.kf.passwordSlots = [{ id: newId(8), label: "Shared password", wrapped: toB64(wrapped.data), kdf: wrapped.kdf, createdAt: new Date().toISOString() }];
+    const retained = (this.kf.passwordSlots ?? []).map((s) => s.label.startsWith("[deprecated]") ? s : { ...s, label: `[deprecated] ${s.label}` });
+    this.kf.passwordSlots = [{ id: newId(8), label: "Shared password", wrapped: toB64(wrapped.data), kdf: wrapped.kdf, createdAt: new Date().toISOString() }, ...retained];
     await this.keyfiles.save(this.kf);
+    // Keep this device's keychain in sync with the ACTIVE shared password. Without
+    // this, the single device slot kept serving a stale password — so auto-unlock
+    // used the old one and "paste from keychain" handed back the wrong value. We
+    // UPDATE (never wipe): on explicit remember, or if a password was already saved
+    // here (so the now-invalid old one is replaced, not left stale). Forgetting is
+    // only ever the explicit "Forget on this device" button / remove-encryption.
+    if (remember || this.isRemembered()) await this.remember(passphrase);
   }
 
   /** Turn off the shared password. Devices that only had it can no longer unlock
@@ -278,6 +316,202 @@ export class EncryptionService {
     if (!this.kf || !this.kf.passwordSlots?.length) return;
     this.kf.passwordSlots = [];
     await this.keyfiles.save(this.kf);
+  }
+
+  // ---- per-folder keys (Phase A of the per-folder overhaul) ------------------
+  // A folder with its own FolderKeyEntry uses a SEPARATE DEK, wrapped under that
+  // folder's password. A folder WITHOUT an entry falls back to the vault DEK
+  // (getSessionKey). All of this is an OVERLAY — existing single-DEK content is
+  // unaffected. UNVERIFIED: no live crypto test yet; wiring into the lock/unlock
+  // ops is intentionally deferred to an attended pass.
+
+  /** The keyfile entry for a folder, or null (folder uses the vault DEK). */
+  folderKeyEntry(folder: string): FolderKeyEntry | null {
+    return this.kf?.folderKeys?.[this.cleanFolder(folder)] ?? null;
+  }
+  hasFolderKey(folder: string): boolean { return !!this.folderKeyEntry(folder); }
+  /** Active (non-deprecated) password slots for a folder, newest first. Deprecated
+   *  slots are NEVER returned — an old/retired password must not unlock current
+   *  content (matches the vault shared-password path). If there are somehow zero
+   *  active slots, return none (don't silently fall back to deprecated ones). */
+  private folderActiveSlots(entry: FolderKeyEntry): KeyfilePasswordSlot[] {
+    return entry.passwordSlots.filter((s) => !s.label.startsWith("[deprecated]"));
+  }
+  /** Is the effective key for this folder available right now? */
+  isFolderUnlocked(folder: string): boolean {
+    const entry = this.folderKeyEntry(folder);
+    return entry ? this.folderSessionKeys.has(this.cleanFolder(folder)) : this.isUnlocked();
+  }
+  /** The DEK to use for `folder`: the unlocked folder key if it has its own,
+   *  otherwise the vault DEK. Returns a COPY (caller may zero), or null if the
+   *  needed key isn't unlocked. Arms the idle timer like getSessionKey. */
+  getFolderKey(folder: string): Uint8Array | null {
+    const entry = this.folderKeyEntry(folder);
+    if (!entry) return this.getSessionKey();
+    const k = this.folderSessionKeys.get(this.cleanFolder(folder));
+    if (!k) return null;
+    this.armIdle();
+    return k.slice();
+  }
+
+  /** Give `folder` its OWN key for the first time: mint a DEK, wrap under
+   *  `password`, write a FolderKeyEntry, unlock it in memory. `label` is built by
+   *  the caller (it owns author info): "YYYY-MM-DD HH:mm – folder – author|id". */
+  async setupFolderKey(folder: string, password: string, label: string, remember = false): Promise<void> {
+    if (!password) throw new Error("Password required.");
+    await this.refresh();
+    if (!this.kf) throw new Error("Set up vault encryption first.");
+    const f = this.cleanFolder(folder);
+    if (this.kf.folderKeys?.[f]) throw new Error("This folder already has its own key.");
+    const dek = crypto.getRandomValues(new Uint8Array(DEK_LEN));
+    const wrapped = await encryptStash(dek, password);
+    const keyId = newId(8);
+    const entry: FolderKeyEntry = {
+      keyId, folderPath: f, label, kcId: this.folderKcId(label, keyId),
+      passwordSlots: [{ id: newId(8), label: "Folder password", wrapped: toB64(wrapped.data), kdf: wrapped.kdf, createdAt: new Date().toISOString() }],
+      createdAt: new Date().toISOString(),
+    };
+    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [f]: entry };
+    await this.keyfiles.save(this.kf);
+    this.folderSessionKeys.set(f, dek);
+    if (remember) await this.rememberFolder(this.folderKcIdFor(entry), password);
+    this.armIdle();
+  }
+
+  /** Unlock a folder's own key with `password`. False on wrong password / no entry. */
+  async unlockFolder(folder: string, password: string, remember = false): Promise<boolean> {
+    await this.refresh();
+    const f = this.cleanFolder(folder);
+    const entry = this.folderKeyEntry(f);
+    if (!entry) return false;
+    for (const slot of this.folderActiveSlots(entry)) {
+      try {
+        const dek = await decryptStash(fromB64(slot.wrapped), password);
+        this.folderSessionKeys.set(f, dek);
+        const kcId = this.folderKcIdFor(entry);
+        if (remember || this.isFolderRemembered(kcId)) await this.rememberFolder(kcId, password);
+        this.armIdle();
+        return true;
+      } catch { /* try next slot */ }
+    }
+    return false;
+  }
+
+  /** Try the folder password saved in this device's keychain (no prompt). */
+  async tryAutoUnlockFolder(folder: string): Promise<boolean> {
+    const entry = this.folderKeyEntry(folder);
+    if (!entry || this.isFolderUnlocked(folder)) return this.isFolderUnlocked(folder);
+    const pw = this.rememberedFolderPassword(this.folderKcIdFor(entry));
+    if (!pw) return false;
+    return this.unlockFolder(folder, pw);
+  }
+
+  /** Cheap "Change password" for a folder: re-wrap the SAME DEK under a new
+   *  passphrase (requires the folder unlocked). NOTHING is deleted — the old
+   *  active slot is RETAINED and relabeled `[deprecated] …` (so it's an audit /
+   *  recovery record), and the old keychain password is parked under a
+   *  `-d-<slotId>` id rather than overwritten. The new slot becomes the only
+   *  ACTIVE one, so the old password no longer unlocks via the normal path
+   *  (`folderActiveSlots` skips deprecated). For true cryptographic invalidation
+   *  (re-encrypt under a fresh DEK) use Phase B rotation. */
+  async changeFolderPassword(folder: string, newPassword: string, remember = false): Promise<void> {
+    if (!newPassword) throw new Error("Password required.");
+    const f = this.cleanFolder(folder);
+    const dek = this.folderSessionKeys.get(f);
+    if (!dek) throw new Error("Unlock this folder first.");
+    await this.refresh();
+    const entry = this.folderKeyEntry(f);
+    if (!entry || !this.kf) throw new Error("This folder has no key.");
+    // Retain the OLD keychain password under a deprecated id (never delete) so an
+    // old export emailed months ago can still be looked up / decrypted.
+    const prevActive = entry.passwordSlots.filter((s) => !s.label.startsWith("[deprecated]"));
+    const kcId = this.folderKcIdFor(entry);
+    const oldPw = this.rememberedFolderPassword(kcId);
+    if (oldPw && prevActive[0]) {
+      try { await this.secretStore()?.setSecret(`${kcId}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort retention */ }
+    }
+    const wrapped = await encryptStash(dek, newPassword);
+    // Relabel every prior slot as [deprecated] (retained), prepend the new active one.
+    const retained = entry.passwordSlots.map((s) => s.label.startsWith("[deprecated]") ? s : { ...s, label: `[deprecated] ${s.label}` });
+    const next: FolderKeyEntry = {
+      ...entry,
+      kcId: entry.kcId ?? this.folderKcId(entry.label, entry.keyId), // backfill kcId for legacy entries
+      passwordSlots: [
+        { id: newId(8), label: "Folder password", wrapped: toB64(wrapped.data), kdf: wrapped.kdf, createdAt: new Date().toISOString() },
+        ...retained,
+      ],
+    };
+    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [f]: next };
+    await this.keyfiles.save(this.kf);
+    if (remember || this.isFolderRemembered(kcId)) await this.rememberFolder(this.folderKcIdFor(next), newPassword);
+  }
+
+
+  /** Phase B — FINALIZE a key rotation: after the caller has re-encrypted every
+   *  blob in `folder` from the old DEK to `newDek`, swap the keyfile to the new key
+   *  (wrap `newDek` under `newPassword`; retain old slots as `[deprecated]`), make
+   *  `newDek` the live session key, and remember the new password. If the folder had
+   *  no own key (was vault-keyed), this MINTS its own key. NOTHING is deleted. */
+  async commitFolderRotation(folder: string, newPassword: string, newDek: Uint8Array, rotId: string, label?: string, remember = false): Promise<void> {
+    if (!newPassword) throw new Error("Password required.");
+    await this.refresh();
+    if (!this.kf) throw new Error("Encryption is not set up.");
+    const f = this.cleanFolder(folder);
+    const entry = this.folderKeyEntry(f);
+    const keyId = entry?.keyId ?? newId(8);
+    const oldKcId = entry ? this.folderKcIdFor(entry) : null;
+    // Park the old active keychain password (retain, never delete).
+    const prevActive = (entry?.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"));
+    const oldPw = oldKcId ? this.rememberedFolderPassword(oldKcId) : null;
+    if (oldPw && prevActive[0]) {
+      try { await this.secretStore()?.setSecret(`${oldKcId}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort */ }
+    }
+    const wrapped = await encryptStash(newDek, newPassword);
+    const retained = (entry?.passwordSlots ?? []).map((s) => s.label.startsWith("[deprecated]") ? s : { ...s, label: `[deprecated] ${s.label}` });
+    const newLabel = label ?? entry?.label ?? `rotated - ${f.split("/").pop() || f}`;
+    const next: FolderKeyEntry = {
+      keyId, folderPath: f, label: newLabel, kcId: this.folderKcId(newLabel, keyId), rotId,
+      passwordSlots: [{ id: newId(8), label: "Folder password", wrapped: toB64(wrapped.data), kdf: wrapped.kdf, createdAt: new Date().toISOString() }, ...retained],
+      createdAt: entry?.createdAt ?? new Date().toISOString(),
+    };
+    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [f]: next };
+    await this.keyfiles.save(this.kf);
+    this.folderSessionKeys.set(f, newDek);
+    if (remember || (oldKcId && this.isFolderRemembered(oldKcId))) await this.rememberFolder(this.folderKcIdFor(next), newPassword);
+  }
+
+  // --- per-folder keychain helpers (one slot PER folder key — no clobbering) ---
+  /** Build a recognizable, VALID secret id from a folder key's label
+   *  ("20260620-1430 - Beta - SC" → "sp-20260620-1430-beta-sc-ab12cd").
+   *  Lowercased, dashes only, bounded so the `-d-<slotId>` deprecated variant stays
+   *  ≤64. A short keyId suffix keeps it unique + stable for lookup. */
+  private folderKcId(label: string, keyId: string): string {
+    const base = (label || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return (`sp-${base}`.slice(0, 44) + `-${keyId.slice(0, 6)}`).replace(/-+/g, "-");
+  }
+  /** The keychain id for an entry: its stored kcId, or a legacy keyId-based id for
+   *  entries created before kcId existed (so existing remembered passwords resolve). */
+  private folderKcIdFor(entry: FolderKeyEntry): string {
+    return entry.kcId || `${LEGACY_KEYCHAIN_ID}-f-${entry.keyId}`;
+  }
+  private isFolderRemembered(kcId: string): boolean {
+    try { return !!this.secretStore()?.getSecret(kcId); } catch { return false; }
+  }
+  private rememberedFolderPassword(kcId: string): string | null {
+    try { return this.secretStore()?.getSecret(kcId) || null; } catch { return null; }
+  }
+  private async rememberFolder(kcId: string, password: string): Promise<void> {
+    try { await this.secretStore()?.setSecret(kcId, password); }
+    catch (e) { console.warn("[Stashpad] couldn't save folder password to keychain", e); }
+  }
+  async forgetFolderKeychain(folder: string): Promise<void> {
+    const entry = this.folderKeyEntry(folder);
+    if (!entry) return;
+    const ss = this.secretStore();
+    if (!ss) return;
+    const id = this.folderKcIdFor(entry);
+    try { if (ss.removeSecret) await ss.removeSecret(id); else await ss.setSecret(id, ""); }
+    catch (e) { console.warn("[Stashpad] couldn't clear folder keychain", e); }
   }
 
   /** Verify a password without changing session state (destructive-action gates). */
@@ -305,7 +539,10 @@ export class EncryptionService {
     const wrapped = await encryptStash(priv, newPassword);
     priv.fill(0);
     await this.save({ ...fresh, identityPrivWrapped: toB64(wrapped.data), identityPrivKdf: wrapped.kdf });
-    if (remember) await this.remember(newPassword); else await this.forgetKeychain();
+    // UPDATE the keychain, never wipe: on explicit remember, or if a password was
+    // already saved here (the old one is now invalid — replace it so auto-unlock
+    // doesn't keep trying a stale password). Explicit forgetting lives elsewhere.
+    if (remember || this.isRemembered()) await this.remember(newPassword);
     this.armIdle();
     return true;
   }
@@ -327,7 +564,8 @@ export class EncryptionService {
     await this.keyfiles.save(this.kf);
     // Remembering now lets this device auto-unlock the moment a member approves
     // it and the keyfile syncs here (the password already protects its priv key).
-    if (remember) await this.remember(password); else await this.forgetKeychain();
+    // Update-or-skip, never wipe (explicit forgetting lives elsewhere).
+    if (remember || this.isRemembered()) await this.remember(password);
   }
 
   pendingJoinRequests(): KeyfileJoinRequest[] { return this.kf?.joinRequests ?? []; }
@@ -371,8 +609,21 @@ export class EncryptionService {
   lock(): void {
     if (this.sessionKey) this.sessionKey.fill(0);
     this.sessionKey = null;
+    // Lock everything: zero every unlocked per-folder DEK too (idle auto-lock and
+    // the explicit Lock command should drop ALL key material from memory).
+    for (const k of this.folderSessionKeys.values()) k.fill(0);
+    this.folderSessionKeys.clear();
     this.clearIdle();
   }
+
+  /** Lock a SINGLE folder's key (leave the vault key + other folders unlocked). */
+  lockFolder(folder: string): void {
+    const f = this.cleanFolder(folder);
+    const k = this.folderSessionKeys.get(f);
+    if (k) { k.fill(0); this.folderSessionKeys.delete(f); }
+  }
+
+  private cleanFolder(p: string): string { return (p || "").replace(/\/+$/, ""); }
 
   /** Remove encryption entirely (caller gates on "no .stashenc exists"): wipe the
    *  session key, this device's identity, the legacy wrap, AND the synced keyfile

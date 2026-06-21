@@ -18,14 +18,55 @@ export interface KeyfileJoinRequest { id: string; label: string; pubKey: string;
  *  passphrase unlocks — no per-device approval. Coexists with the public-key
  *  `slots` (both wrap the same DEK); a vault can use either or both. */
 export interface KeyfilePasswordSlot { id: string; label: string; wrapped: string; kdf: StashKdf; createdAt: string; }
+
+/** A PER-FOLDER encryption key (per-folder overhaul, Phase A). Each top-level
+ *  encrypted Stashpad folder gets its OWN DEK, wrapped under that folder's
+ *  password(s) as `passwordSlots`. Subfolders inherit the parent's key (the
+ *  encrypted unit is the whole subtree under one key — no per-subfolder keys).
+ *
+ *  Keyed by cleaned folder PATH in `VaultKeyfile.folderKeys`. Folders are
+ *  path-based in Stashpad (no stable folder ids), so a folder rename orphans its
+ *  entry — handled by a rename hook / "recover orphaned key" follow-up.
+ *
+ *  Backward-compatible OVERLAY: a folder WITHOUT an entry here falls back to the
+ *  vault-wide DEK (`slots` / `passwordSlots`), so all existing single-DEK content
+ *  keeps decrypting unchanged. Deprecated slots/keys are RETAINED, never deleted
+ *  (recovery net + the [deprecated] convention from the overhaul plan). */
+export interface FolderKeyEntry {
+  /** Stable id for this folder key — used for the per-folder keychain id + labels. */
+  keyId: string;
+  /** Last-known folder path (for labels/UX; identity is the map key). */
+  folderPath: string;
+  /** "YYYY-MM-DD HH:mm – <folder> – <author|authorId>" (see overhaul plan #3). */
+  label: string;
+  /** The OS-keychain secret id for this key — a sanitized, recognizable form of the
+   *  label (`^[a-z0-9-]{1,64}$`), so the entry reads as timestamp-folder-author in
+   *  the keychain rather than an opaque random id. Optional for back-compat: entries
+   *  created before this fall back to a keyId-based id. */
+  kcId?: string;
+  /** The folder DEK wrapped under the folder password(s). Old (rotated/changed)
+   *  slots are kept with `deprecated: true` rather than deleted. */
+  passwordSlots: KeyfilePasswordSlot[];
+  createdAt: string;
+  /** Whole key retired after a Phase-B rotation; kept only as a recovery artifact. */
+  deprecated?: boolean;
+  /** Rotation nonce — stamped by commitFolderRotation when the keyfile is swapped to
+   *  a new key. resumeRotations() compares it to the rotation lock's nonce to tell,
+   *  unambiguously, whether the keyfile swap actually landed before a crash (so it
+   *  knows whether to COMMIT the .rot temps or DROP them). */
+  rotId?: string;
+}
+
 export interface VaultKeyfile {
   v: 2;
   keyId: string;
   identities: KeyfileIdentity[];
   slots: KeySlot[];
   joinRequests: KeyfileJoinRequest[];
-  /** Optional — present only when a shared password is enabled. */
+  /** Optional — present only when a shared password is enabled (vault-wide DEK). */
   passwordSlots?: KeyfilePasswordSlot[];
+  /** Optional — per-folder keys (overlay on the vault DEK). Keyed by folder path. */
+  folderKeys?: Record<string, FolderKeyEntry>;
 }
 
 const PRIMARY = ".stashpad/keys.json";

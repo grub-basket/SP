@@ -1,10 +1,12 @@
 import { FuzzySuggestModal, Notice, TFile, moment } from "obsidian";
 import { ROOT_ID, type StashpadId, type TreeNode } from "../types";
 import { buildStashZip, importStashZip, STASH_EXT } from "../stash-package";
-import { argon2Available, encryptStash, resolveStashBytes, STASH_KDF_INFO } from "../stash-crypto";
+import { argon2Available, encryptStash, decryptWithKey, resolveStashBytes, STASH_KDF_INFO } from "../stash-crypto";
 import { secretIdForStashName } from "../passphrase";
 import { ExportStashModal, OkfExportModal } from "../modals";
+import { readLockedMeta } from "../encryption-ops";
 import type { StashpadView } from "../view";
+import type StashpadPlugin from "../main";
 
 /** .stash import/export command group extracted from StashpadView
  *  (view-split stage 5). Free functions taking the view. Behavior is
@@ -31,6 +33,54 @@ export async function cmdExportStash(view: StashpadView, rootNode?: TreeNode): P
   new ExportStashModal(view.app, defaultBase, all.length, (chosen, password, remember) => {
     void runExport(view, roots, all, chosen, password, remember);
   }, argon2Available).open();
+}
+
+/** Export an ALREADY-LOCKED subtree (a `.stashenc` blob) as a shareable `.stash`.
+ *  Feedback #4 / Option B: the original blob is left UNTOUCHED — we decrypt a virtual
+ *  copy with the folder key (in memory), then re-encrypt it under a NEW password the
+ *  user types in the normal export modal. The recipient opens it with that password.
+ *  (The blob itself is DEK-encrypted, not password-encrypted, so it isn't shareable
+ *  as-is — hence the re-encrypt.) */
+export async function cmdExportLockedBlob(plugin: StashpadPlugin, blobPath: string): Promise<void> {
+  const residentFolder = blobPath.replace(/\/[^/]*$/, "").replace(/\/+$/, "");
+  const dek = await plugin.ensureFolderUnlocked(residentFolder);
+  if (!dek) return; // not configured / cancelled / wrong password
+  let zip: Uint8Array;
+  try {
+    const bytes = new Uint8Array(await plugin.app.vault.adapter.readBinary(blobPath));
+    zip = await decryptWithKey(bytes, dek); // the stash zip inside the .stashenc
+  } catch (e) { new Notice(`Couldn't decrypt this note to export it: ${(e as Error).message}`); return; }
+  finally { dek.fill(0); }
+  const meta = await readLockedMeta(plugin.app, blobPath);
+  const entry = (plugin.settings.lockedSubtrees ?? []).find((x) => x.blob === blobPath);
+  const base = entry?.title || meta?.title || "locked-note";
+  const count = entry?.count ?? meta?.count ?? 1;
+  new ExportStashModal(plugin.app, base, count, (chosen, password, remember) => {
+    void deliverLockedExport(plugin, residentFolder, chosen, zip, password, remember);
+  }, argon2Available).open();
+}
+
+async function deliverLockedExport(plugin: StashpadPlugin, folder: string, baseName: string, zip: Uint8Array, password: string | null, remember = false): Promise<void> {
+  try {
+    let buf = zip; let encNote = "";
+    if (password) {
+      const enc = await encryptStash(buf, password); buf = enc.data;
+      const info = STASH_KDF_INFO[enc.kdf];
+      encNote = info.strong ? ` (encrypted · ${info.label})` : ` (encrypted · ${info.label} — Argon2id unavailable here, weaker)`;
+    }
+    const stamp = (moment as unknown as (...a: unknown[]) => { format(f: string): string })().format("YYYYMMDD-HHmmss");
+    const exportSub = (plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
+    const exportFolder = `${folder}/${exportSub}`;
+    if (!(await plugin.app.vault.adapter.exists(exportFolder))) await plugin.app.vault.adapter.mkdir(exportFolder);
+    const outBase = `${safeBaseName(baseName)}-${stamp}`;
+    const outPath = `${exportFolder}/${outBase}.${STASH_EXT}`;
+    await plugin.app.vault.createBinary(outPath, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
+    if (remember && password) {
+      try { (plugin.app as unknown as { secretStorage?: { setSecret(id: string, v: string): void } }).secretStorage?.setSecret(secretIdForStashName(outBase), password); }
+      catch (e) { console.warn("[Stashpad] couldn't save export passphrase", e); }
+    }
+    new Notice(`Exported encrypted note${encNote} → ${outPath}`, 0);
+  } catch (e) { new Notice(`Export failed: ${(e as Error).message}`); console.error(e); }
 }
 
 /** Export the selection/cursor subtree as an OKF bundle (.zip / .tar.gz) and/or a

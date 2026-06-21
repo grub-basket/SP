@@ -2417,6 +2417,19 @@
 .stashpad-trash-view-body { padding: 4px 12px 16px; }
 .stashpad-trash-view-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .stashpad-trash-view-header h3 { flex: 1 1 auto; margin: 0; }
+
+/* Per-folder overhaul (Phase A): aggregate "All encrypted / archived" tabs —
+   reuse the trash row/group classes; only the header/sub/badge are new. */
+.stashpad-aggregate-body { padding: 4px 12px 16px; }
+.stashpad-aggregate-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.stashpad-aggregate-header h3 { flex: 1 1 auto; margin: 0; }
+.stashpad-aggregate-sub { color: var(--text-muted); font-size: var(--font-ui-smaller); margin: 0 0 10px; }
+.stashpad-aggregate-lockbadge { flex: 0 0 auto; display: inline-flex; align-items: center; color: var(--text-muted); --icon-size: 14px; }
+
+/* Per-folder encryption: filename sub-toggles sit indented under their content
+   toggle, dimmed when disabled. */
+.stashpad-subsetting { padding-left: 22px; opacity: 0.85; }
+.stashpad-subsetting .setting-item-name { font-size: var(--font-ui-smaller); color: var(--text-muted); }
 .stashpad-trash-iconbtn { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; padding: 4px 6px; cursor: pointer; --icon-size: 15px; background: transparent; border: none; box-shadow: none; color: var(--text-muted); }
 .stashpad-trash-iconbtn:hover { color: var(--text-normal); }
 .stashpad-trash-iconbtn .svg-icon { width: var(--icon-size); height: var(--icon-size); }

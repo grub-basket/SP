@@ -29,6 +29,10 @@ export class StashpadFolderPanelView extends ItemView {
     this.registerEvent(this.app.metadataCache.on("changed", () => this.scheduleRender()));
   }
 
+  /** Public re-render hook — e.g. after settings change a folder's archive flag,
+   *  so the archive icon repaints without waiting for a vault event. */
+  refresh(): void { this.scheduleRender(); }
+
   private renderTimer: number | null = null;
   private scheduleRender(): void {
     if (this.renderTimer != null) return;

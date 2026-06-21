@@ -525,6 +525,58 @@ export async function restoreRawTrash(app: App, blobPath: string, dek: Uint8Arra
   return { filesWritten: written };
 }
 
+// ---- Phase B: key rotation (re-encrypt a folder's blobs old DEK → new DEK) ----
+
+/** Re-encrypt ONE live `.stashenc` blob from `oldDek` to `newDek`, writing the
+ *  result to `<blob>.rot` (verified on disk). The ORIGINAL is left untouched — the
+ *  caller commits all `.rot` files only after every blob in the folder succeeds, so
+ *  a crash mid-rotation never strands a note under a key nobody holds. Throws on a
+ *  wrong old key (decrypt fails) or any self-check failure. The live-lock `.stashmeta`
+ *  sidecar is PLAINTEXT (no key-encrypted fields), so it needs no re-encryption. */
+export async function writeRotatedBlob(app: App, blobPath: string, oldDek: Uint8Array, newDek: Uint8Array): Promise<void> {
+  const bytes = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
+  if (!isEncryptedStash(bytes)) throw new Error(`Not an encrypted blob: ${blobPath}`);
+  const plain = await decryptWithKey(bytes, oldDek); // throws on wrong key / tampering
+  try {
+    const reblob = await encryptWithKey(plain, newDek);
+    const back = await decryptWithKey(reblob, newDek); // round-trips under the NEW key?
+    if (back.length !== plain.length) throw new Error("Rotation self-check failed (size).");
+    for (let i = 0; i < plain.length; i++) { if (back[i] !== plain[i]) throw new Error("Rotation self-check failed (content)."); }
+    await writeBlobVerified(app, `${blobPath}.rot`, reblob);
+  } finally { plain.fill(0); }
+}
+
+/** Commit a re-encrypted blob: replace the original with its verified `.rot`, then
+ *  remove the temp. No-op if the `.rot` is missing (already committed). */
+export async function commitRotatedBlob(app: App, blobPath: string): Promise<void> {
+  const rot = `${blobPath}.rot`;
+  if (!(await app.vault.adapter.exists(rot))) return;
+  const bytes = new Uint8Array(await app.vault.adapter.readBinary(rot));
+  await writeBlobVerified(app, blobPath, bytes); // replace original (verified)
+  try { await app.vault.adapter.remove(rot); } catch { /* leave temp; original is good */ }
+}
+
+/** Remove any leftover `.rot` temp files in a folder (cleanup after an aborted
+ *  rotation — originals are intact, so the temps are just orphans). */
+export async function cleanupRotTemps(app: App, folder: string): Promise<void> {
+  const cleaned = folder.replace(/\/+$/, "");
+  try {
+    const listing = await app.vault.adapter.list(cleaned);
+    for (const f of listing.files) if (f.endsWith(`.${STASHENC_EXT}.rot`)) { try { await app.vault.adapter.remove(f); } catch { /* */ } }
+  } catch { /* no folder */ }
+}
+
+/** The original blob paths that have a pending `.rot` temp in a folder — read from
+ *  the ADAPTER (authoritative), not the in-memory file index, so rotation resume
+ *  works during onload before the index is populated. */
+export async function listRotTemps(app: App, folder: string): Promise<string[]> {
+  const cleaned = folder.replace(/\/+$/, "");
+  try {
+    const listing = await app.vault.adapter.list(cleaned);
+    return listing.files.filter((f) => f.endsWith(`.${STASHENC_EXT}.rot`)).map((f) => f.replace(/\.rot$/, ""));
+  } catch { return []; }
+}
+
 /** All encrypted-deleted blob paths in `_deleted/`. */
 export async function listDeletedBlobs(app: App): Promise<string[]> {
   if (!(await app.vault.adapter.exists(DELETED_DIR))) return [];

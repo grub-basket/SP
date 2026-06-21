@@ -12,6 +12,11 @@ export const STASHPAD_DETAIL_VIEW_TYPE = "stashpad-detail";
 /** 0.98.35: dedicated encrypted-trash tab (recoverable deleted notes, grouped by
  *  the folder they came from). */
 export const STASHPAD_TRASH_VIEW_TYPE = "stashpad-trash";
+/** Per-folder overhaul (Phase A): on-the-fly "database" tab that lists notes by
+ *  state across the whole vault. One view type, two modes via view state:
+ *  "encrypted" (all locked subtrees) and "archived" (all archive folders). The
+ *  "deleted" aggregate is the existing trash view. Read-only: list + navigate. */
+export const STASHPAD_AGGREGATE_VIEW_TYPE = "stashpad-aggregate";
 export const ROOT_ID = "__root__";
 
 /** A user's pinned-note record. Cross-folder by design — the panel

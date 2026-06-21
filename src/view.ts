@@ -1818,6 +1818,9 @@ export class StashpadView extends ItemView {
           } catch (err) { console.warn("[Stashpad] showItemInFolder failed", err); }
         }));
       }
+      menu.addItem((i: any) => i.setTitle("Export to .stash…").setIcon("package").onClick(() => {
+        void this.plugin.exportLockedSubtree(lk.blob);
+      }));
       menu.addItem((i: any) => i.setTitle("Copy encrypted file path").setIcon("copy").onClick(() => {
         // 0.98.32: full absolute path on desktop (pasteable into Finder/Explorer);
         // mobile has no usable filesystem path, so fall back to the vault-relative one.
@@ -6020,7 +6023,7 @@ export class StashpadView extends ItemView {
    *  is locked (its subtree already subsumes the descendant). */
   async cmdLockSelection(): Promise<void> {
     if (!this.plugin.encryption?.isConfigured?.()) {
-      new Notice("Set up encryption first (Settings → Encryption).");
+      new Notice("Set up encryption first (Settings → Stashpad → Encryption).");
       return;
     }
     const targets = this.getActionTargets();
@@ -6060,21 +6063,26 @@ export class StashpadView extends ItemView {
    *  auto-encrypts them on arrival. Uses the default archive folder if set; else
    *  the only archive folder if there's just one; else offers a pick-list. */
   async cmdMoveToArchive(): Promise<void> {
-    if (!this.plugin.encryption?.isConfigured?.()) {
-      new Notice("Set up encryption first (Settings → Encryption)."); return;
-    }
-    const archives = (this.plugin.settings.archiveFolders ?? []).filter((f) => f !== this.noteFolder);
-    if (archives.length === 0) {
-      new Notice("No archive folder available. Mark a folder as archive first (folder panel → right-click → “Mark as archive”).", 8000);
-      return;
-    }
     const targets = this.getActionTargets();
     if (targets.length === 0) return;
-    const def = this.plugin.settings.defaultArchiveFolder;
+    const cur = (this.noteFolder ?? "").replace(/\/+$/, "");
+    // If we're ALREADY in an archive folder, don't silently re-home to a DIFFERENT
+    // archive (the old bug: the current folder was filtered out, so the default was
+    // ignored and a different archive was picked). The note is already archived.
+    if (this.plugin.isArchiveFolder(cur)) {
+      new Notice(`These notes are already in an archive folder (“${cur.split("/").pop()}”).`, 6000);
+      return;
+    }
+    const archives = (this.plugin.settings.archiveFolders ?? []).map((f) => f.replace(/\/+$/, "")).filter((f) => f !== cur);
+    if (archives.length === 0) {
+      new Notice("No archive folder available. Mark a folder as archive first (Settings → Stashpad → Encryption → Per-folder, or the folder panel right-click).", 8000);
+      return;
+    }
+    const def = (this.plugin.settings.defaultArchiveFolder ?? "").replace(/\/+$/, "");
     const dest = (def && archives.includes(def)) ? def : (archives.length === 1 ? archives[0] : null);
     const go = (folder: string) => { void this.archiveSources(targets, folder); };
     if (dest) { go(dest); return; }
-    // Several archives, no default → pick one.
+    // Several archives, no (valid) default → pick one.
     new ArchiveFolderSuggestModal(this.app, archives, go).open();
   }
 
@@ -6086,6 +6094,20 @@ export class StashpadView extends ItemView {
    *  no async hook, so undo is a clean self-contained reversal. */
   private async archiveSources(sources: TreeNode[], dest: string): Promise<void> {
     const src = this.noteFolder;
+    // Archiving currently encrypts the moved notes (under the destination folder's
+    // key, or the vault key as fallback). If the destination is set to NOT encrypt
+    // its archive ("Encrypt archived notes" off = plaintext archive), that's a
+    // plaintext move — not wired into this command yet, so guide rather than fail.
+    const cleanDest = dest.replace(/\/+$/, "");
+    const encryptDest = (this.plugin.settings.folderEncPrefs ?? {})[cleanDest]?.archiveEncryptContent ?? true;
+    if (!encryptDest) {
+      new Notice(`“${cleanDest.split("/").pop()}” is a plaintext archive (encryption off). Moving notes into a plaintext archive from the command isn't wired yet — drag them in, or turn on “Encrypt archived notes” for that folder.`, 9000);
+      return;
+    }
+    if (!this.plugin.encryption?.isConfigured?.()) {
+      new Notice(`Archiving encrypts the notes, but encryption isn't set up yet (Settings → Stashpad → Encryption). Set it up — or turn off “Encrypt archived notes” for “${cleanDest.split("/").pop()}” to make it a plaintext archive.`, 9000);
+      return;
+    }
     const ids = new Set(sources.map((t) => t.id));
     const roots = sources.filter((t) => {
       let p = t.parent;
@@ -6127,7 +6149,7 @@ export class StashpadView extends ItemView {
    *  Recoverable via "Restore from encrypted trash". Confirm-gated. */
   async cmdEncryptDelete(): Promise<void> {
     if (!this.plugin.encryption?.isConfigured?.()) {
-      new Notice("Set up encryption first (Settings → Encryption)."); return;
+      new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return;
     }
     const targets = this.getActionTargets();
     if (targets.length === 0) return;
@@ -6166,7 +6188,7 @@ export class StashpadView extends ItemView {
    *  Undo is the safety net). */
   private async secureDeleteSources(sources: TreeNode[]): Promise<void> {
     if (!this.plugin.encryption?.isConfigured?.()) {
-      new Notice("Set up encryption first (Settings → Encryption)."); return;
+      new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return;
     }
     const ids = new Set(sources.map((t) => t.id));
     const roots = sources.filter((t) => {
@@ -6205,7 +6227,7 @@ export class StashpadView extends ItemView {
    *  batch never corrupts or double-imports). */
   async cmdUnlockAll(): Promise<void> {
     if (!this.plugin.encryption?.isConfigured?.()) {
-      new Notice("Set up encryption first (Settings → Encryption).");
+      new Notice("Set up encryption first (Settings → Stashpad → Encryption).");
       return;
     }
     // Target-aware + RECURSIVE: point at a DECRYPTED parent note and unlock
@@ -9575,10 +9597,16 @@ export class StashpadView extends ItemView {
     // a normal delete routes to the encrypted trash (recoverable + Ctrl+Z) instead
     // of plaintext-trashing. Scoped to Stashpad's own delete (per the agreed design).
     // ("Follow Obsidian's trash setting" opts back out of the override.)
-    if ((this.plugin.settings.encryptTrash ?? false) && !(this.plugin.settings.encryptTrashFollowObsidian ?? false)) {
+    // Per-folder overhaul: this folder's prefs override the globals — its
+    // trashEncryptContent + trashHandling (stashpad/obsidian) take precedence.
+    const _delFolder = (this.noteFolder ?? "").replace(/\/+$/, "");
+    const _delFp = (this.plugin.settings.folderEncPrefs ?? {})[_delFolder] ?? {};
+    const _encryptTrash = _delFp.trashEncryptContent ?? this.plugin.settings.encryptTrash ?? false;
+    const _followObsidian = _delFp.trashHandling ? _delFp.trashHandling === "obsidian" : (this.plugin.settings.encryptTrashFollowObsidian ?? false);
+    if (_encryptTrash && !_followObsidian) {
       if (!this.plugin.encryption?.isConfigured?.()) {
         // Don't silently fall back to the plaintext trash the user asked to avoid.
-        new Notice("“Encrypt items sent to trash” is ON but encryption isn't set up (Settings → Encryption). Nothing was deleted.");
+        new Notice("“Encrypt items sent to trash” is ON but encryption isn't set up (Settings → Stashpad → Encryption). Nothing was deleted.");
         return;
       }
       await this.secureDeleteSources(targets);

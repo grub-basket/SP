@@ -159,6 +159,43 @@ export function buildDefaultBindings(): CommandBindingMap {
   return out as CommandBindingMap;
 }
 
+/** Per-folder overhaul: the manual shared-password model is how sharing works now,
+ *  so the device-approval ("Model 3") collaborator UI is hidden by default. The
+ *  service code (approveJoinRequest/removeMember/…) is kept DORMANT — flip this to
+ *  true to bring the UI back. */
+const SHOW_DEVICE_APPROVAL_UI = false;
+
+/** Per-folder overhaul: the dedicated "Forget password on this device" buttons are
+ *  discontinued (passwords are retained, never deleted — see the no-delete policy).
+ *  The forgetKeychain service code stays for remove-encryption + possible reinstate;
+ *  flip this to bring the buttons back. */
+const SHOW_FORGET_KEYCHAIN_BUTTON = false;
+
+/** Per-folder encryption/archive/trash preferences (per-folder overhaul, Phase A).
+ *  Keyed by cleaned folder PATH in `StashpadSettings.folderEncPrefs`, matching the
+ *  existing per-folder Record pattern (viewModes, colorAliases, …). The KEY MATERIAL
+ *  lives in the synced keyfile (`FolderKeyEntry`); these are the user-facing TOGGLES
+ *  that decide whether/what a folder encrypts. All optional → unset means "off"
+ *  (plaintext), preserving current behavior for folders the user never touched.
+ *
+ *  The six "encrypt" flags are the 6-checkbox model: a content flag + a filename
+ *  flag for each of folder / archive / trash. A filename flag is only meaningful
+ *  when its content flag is on (the UI greys it out otherwise). */
+export interface FolderEncPrefs {
+  /** Folder is an archive (de-indexed from cross-folder search). Supersedes the
+   *  legacy `archiveFolders[]` list over time; both honored during migration. */
+  archive?: boolean;
+  /** Per-folder trash destination: Stashpad's own `_deleted/` trash tab, or
+   *  Obsidian's native `.trash`/system handling. Unset → global default. */
+  trashHandling?: "stashpad" | "obsidian";
+  encryptContent?: boolean;
+  encryptFilenames?: boolean;
+  archiveEncryptContent?: boolean;
+  archiveEncryptFilenames?: boolean;
+  trashEncryptContent?: boolean;
+  trashEncryptFilenames?: boolean;
+}
+
 export interface StashpadSettings {
   folder: string;
   importDropFolder: string;
@@ -265,6 +302,10 @@ export interface StashpadSettings {
    *  Optional — if blank, the command offers a pick-list of all archive folders
    *  (or uses the only one if there's exactly one). */
   defaultArchiveFolder?: string;
+  /** Per-folder overhaul (Phase A): per-folder encryption/archive/trash toggles,
+   *  keyed by cleaned folder path. See `FolderEncPrefs`. Empty default → no folder
+   *  is encrypted until the user opts in, so existing vaults are unaffected. */
+  folderEncPrefs: Record<string, FolderEncPrefs>;
   /** 0.98.1: registry of locked subtrees, so the list can render a placeholder
    *  where the note was (and find the blob to unlock). One entry per `.stashenc`
    *  bundle. `parentId` = where the locked root was attached (null/ROOT = top). */
@@ -505,6 +546,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   encryptionIdleLockMinutes: 0,
   hideLockedTitles: false,
   archiveFolders: [],
+  folderEncPrefs: {},
   lockedSubtrees: [],
   searchOpensInNewTab: true,
   pinnedNotes: [],
@@ -904,6 +946,170 @@ export class StashpadSettingTab extends PluginSettingTab {
     };
   }
 
+  // ---- Per-folder encryption (per-folder overhaul) ----
+  /** "YYYY-MM-DD HH:mm – folder – author|authorId" key label (overhaul plan #3). */
+  private folderKeyLabel(folder: string): string {
+    const d = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    // Compact stamp (no internal dashes) so the keychain id keeps more room for long
+    // folder names: "20260620-1430" rather than "2026-06-20-14-30".
+    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+    // Author INITIALS (not the full name) — the keyId suffix already disambiguates,
+    // so initials keep the keychain id short for long folder names. "Sam Chen" → "SC";
+    // no name → first 4 of the authorId.
+    const name = (this.plugin.settings.authorName || "").trim();
+    const who = name ? name.split(/\s+/).map((w) => w[0]).join("") : (this.plugin.settings.authorId || "anon").slice(0, 4);
+    return `${stamp} - ${folder.split("/").pop() || folder} - ${who}`;
+  }
+  private promptSetFolderPassword(folder: string): void {
+    new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: true, title: `Set password for “${folder.split("/").pop()}”`,
+      intro: "A separate password just for this folder. Share it with collaborators out-of-band (a password manager, Signal, in person). There is NO recovery if it's lost.",
+      onSubmit: async ({ next, remember }) => { if (!next) return "Enter a password."; try { await this.plugin.encryption.setupFolderKey(folder, next, this.folderKeyLabel(folder), remember); } catch (e) { return (e as Error).message; } new Notice("Folder password set — share it securely."); this.update?.(); return null; } }).open();
+  }
+  private promptChangeFolderPassword(folder: string): void {
+    new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: true, title: `Change password for “${folder.split("/").pop()}”`,
+      intro: "Re-wraps this folder's key under a new password. The OLD password stops working on THIS device right away (un-synced copies elsewhere keep working until they sync). To truly cut off someone who left, you'll want “Rotate key” (re-encrypts everything) — coming soon.",
+      onSubmit: async ({ next, remember }) => { if (!next) return "Enter a password."; try { await this.plugin.encryption.changeFolderPassword(folder, next, remember); } catch (e) { return (e as Error).message; } new Notice("Folder password changed."); this.update?.(); return null; } }).open();
+  }
+  private promptRotateFolderKey(folder: string): void {
+    const name = folder.split("/").pop() || folder;
+    new ConfirmModal(this.app, `Rotate key for “${name}”?`,
+      `This RE-ENCRYPTS every locked note in “${name}” under a brand-new key, then retires the old password so it can no longer decrypt them — even copies a collaborator synced earlier. Use this when someone should LOSE access (e.g. they left the org). Large folders can take a while. Everyone who should keep access will need the new password.`,
+      "Rotate key",
+      (ok) => {
+        if (!ok) return;
+        new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: true, title: `New password for “${name}”`, intro: "The new password to use after rotating. Share it only with people who should keep access.",
+          onSubmit: async ({ next, remember }) => { if (!next) return "Enter a password."; const n = await this.plugin.rotateFolderKey(folder, next, remember); if (n < 0) return "Rotation failed — see the notice."; this.update?.(); return null; } }).open();
+      }).open();
+  }
+  private promptUnlockFolder(folder: string): void {
+    new EncryptionPasswordModal(this.app, { mode: "unlock", offerKeychain: true, title: `Unlock “${folder.split("/").pop()}”`, intro: "Enter this folder's password.",
+      onSubmit: async ({ current, remember }) => { const ok = await this.plugin.encryption.unlockFolder(folder, current!, remember); if (!ok) return "Wrong password. Try again."; new Notice("Folder unlocked."); this.update?.(); return null; } }).open();
+  }
+
+  /** Gate for settings that do nothing without vault encryption: returns true if
+   *  it's set up; otherwise warns and opens the setup flow (onboarding), returning
+   *  false so the caller can leave the toggle off until setup completes. */
+  private encryptionOrOnboard(): boolean {
+    if (this.plugin.encryption?.isConfigured?.()) return true;
+    new Notice("That setting needs vault encryption, which isn't set up yet — let's set it up first.", 6000);
+    new EncryptionPasswordModal(this.app, {
+      mode: "setup", offerKeychain: true,
+      title: "Set up encryption",
+      intro: "One password protects what you encrypt in this vault. It's stored only on this device — there is NO recovery if you lose it.",
+      onSubmit: async ({ next, remember }) => {
+        if (!next) return "Enter a password.";
+        try { await this.plugin.encryption.setup(next, remember, this.plugin.settings.authorName || "This device"); } catch (e) { return (e as Error).message; }
+        new Notice("Encryption set up — now switch on the setting you wanted.");
+        this.update?.();
+        return null;
+      },
+    }).open();
+    return false;
+  }
+
+  /** The folder selected in the per-folder dropdown — kept on the tab instance so it
+   *  survives the declarative `update()` re-renders (no ghosting between folders). */
+  private pfeSelected: string | null = null;
+
+  private renderPerFolderEncryption(host: HTMLElement): void {
+    const enc = this.plugin.encryption;
+    if (!enc.isConfigured()) {
+      host.createEl("p", { cls: "setting-item-description" }).setText("Set up vault encryption above first. Per-folder passwords layer on top: a folder with its own password uses a separate key; folders without one use the vault password.");
+      return;
+    }
+    const folders = this.plugin.discoverStashpadFolders();
+    if (folders.length === 0) { host.createEl("p", { cls: "setting-item-description" }).setText("No Stashpad folders found yet."); return; }
+    // Keep a VALID selection across re-renders (default to the first folder).
+    if (!this.pfeSelected || !folders.includes(this.pfeSelected)) this.pfeSelected = folders[0];
+
+    // One dropdown to pick the folder; the panel below shows only that folder's
+    // options — so the section stays compact regardless of folder count.
+    new Setting(host).setName("Folder")
+      .setDesc("Pick a folder to configure its password, archive, and trash options. Everything below applies to the selected folder only.")
+      .addDropdown((d) => {
+        for (const f of folders) d.addOption(f, f);
+        d.setValue(this.pfeSelected!);
+        d.onChange((v) => { this.pfeSelected = v; this.update?.(); });
+      });
+
+    const panel = host.createDiv({ cls: "stashpad-folderenc-panel" });
+    this.renderFolderEncPanel(panel, this.pfeSelected);
+  }
+
+  /** Render the encryption/archive/trash controls for ONE folder. Built fresh on
+   *  every selection change (closures capture the SELECTED folder only — no stale
+   *  associations). */
+  private renderFolderEncPanel(host: HTMLElement, folder: string): void {
+    const enc = this.plugin.encryption;
+    const hasKey = enc.hasFolderKey(folder);
+    const unlocked = enc.isFolderUnlocked(folder);
+    const prefs = (this.plugin.settings.folderEncPrefs ?? {})[folder] ?? {};
+    const status = hasKey ? (unlocked ? "Has its own password · unlocked" : "Has its own password · locked") : "Uses the vault password";
+
+    const head = new Setting(host).setName("Password").setDesc(status);
+    if (!hasKey) {
+      head.addButton((b) => b.setButtonText("Set folder password…").setCta().onClick(() => this.promptSetFolderPassword(folder)));
+    } else if (!unlocked) {
+      head.addButton((b) => b.setButtonText("Unlock…").setCta().onClick(() => this.promptUnlockFolder(folder)));
+    } else {
+      head.addButton((b) => b.setButtonText("Lock now").onClick(async () => { await this.plugin.lockFolder(folder); this.update?.(); }));
+      head.addButton((b) => b.setButtonText("Unlock all").onClick(async () => { await this.plugin.unlockFolder(folder); this.update?.(); }));
+      head.addButton((b) => b.setButtonText("Change password…").onClick(() => this.promptChangeFolderPassword(folder)));
+      head.addButton((b) => { b.setButtonText("Rotate key…").onClick(() => this.promptRotateFolderKey(folder)); b.buttonEl.addClass("mod-warning"); });
+    }
+
+    const setPref = async (patch: Partial<FolderEncPrefs>) => {
+      this.plugin.settings.folderEncPrefs = { ...(this.plugin.settings.folderEncPrefs ?? {}), [folder]: { ...((this.plugin.settings.folderEncPrefs ?? {})[folder] ?? {}), ...patch } };
+      await this.plugin.saveSettings();
+    };
+
+    new Setting(host).setName("Archive")
+      .setDesc("De-indexes this folder from cross-folder search; notes moved in get auto-encrypted (when “Encrypt archived notes” is on below).")
+      .addToggle((t) => t.setValue(!!prefs.archive).onChange(async (v) => {
+        await setPref({ archive: v, ...(v && prefs.archiveEncryptContent === undefined ? { archiveEncryptContent: true } : {}) });
+        const set = new Set((this.plugin.settings.archiveFolders ?? []).map((f) => f.replace(/\/+$/, "")));
+        if (v) set.add(folder); else set.delete(folder);
+        this.plugin.settings.archiveFolders = [...set];
+        if (!v && (this.plugin.settings.defaultArchiveFolder ?? "") === folder) this.plugin.settings.defaultArchiveFolder = undefined;
+        await this.plugin.saveSettings();
+        this.plugin.refreshFolderPanels();
+        this.update?.();
+      }));
+    // (The default archive target is chosen via the "Default archive folder" dropdown
+    // in the global settings below — no per-folder toggle needed.)
+
+    new Setting(host).setName("Trash handling").setDesc("Where notes deleted from this folder go.")
+      .addDropdown((d) => d
+        .addOption("", "Use global default")
+        .addOption("stashpad", "Stashpad encrypted trash")
+        .addOption("obsidian", "Obsidian native trash")
+        .setValue(prefs.trashHandling ?? "")
+        .onChange((v) => setPref({ trashHandling: (v || undefined) as FolderEncPrefs["trashHandling"] })));
+
+    const pair = (label: string, cKey: keyof FolderEncPrefs, fKey: keyof FolderEncPrefs, onContent?: (v: boolean) => Promise<void>) => {
+      new Setting(host).setName(label)
+        .addToggle((t) => t.setValue(!!prefs[cKey]).onChange(async (v) => {
+          const patch: Partial<FolderEncPrefs> = {}; (patch as Record<string, unknown>)[cKey] = v; if (!v) (patch as Record<string, unknown>)[fKey] = false;
+          await setPref(patch);
+          if (onContent) await onContent(v);
+          this.update?.();
+        }));
+      new Setting(host).setName(`↳ ${label} — hide filenames`).setClass("stashpad-subsetting")
+        .addToggle((t) => { t.setValue(!!prefs[fKey]); t.setDisabled(!prefs[cKey]); t.onChange((v) => { const p: Partial<FolderEncPrefs> = {}; (p as Record<string, unknown>)[fKey] = v; void setPref(p); }); });
+    };
+    pair("Encrypt this folder's notes", "encryptContent", "encryptFilenames", async (v) => {
+      if (v) await this.plugin.lockFolder(folder); else await this.plugin.unlockFolder(folder);
+      // Lock/unlock may be cancelled (password prompt dismissed) or partial — set the
+      // pref to the folder's ACTUAL locked state so the toggle never claims a state
+      // the folder isn't in.
+      const has = (this.plugin.settings.lockedSubtrees ?? []).some((e) => (e.folder || "").replace(/\/+$/, "") === folder);
+      await setPref({ encryptContent: has, ...(has ? {} : { encryptFilenames: false }) });
+    });
+    pair("Encrypt archived notes", "archiveEncryptContent", "archiveEncryptFilenames");
+    pair("Encrypt trashed notes", "trashEncryptContent", "trashEncryptFilenames");
+  }
+
   /** 0.94.3: General tab decomposed into per-setting items (render at DISPLAY
    *  time, so values + the folder list are always fresh). Simple settings use
    *  renderDef; the dynamic search-scope / create-Stashpad block is a
@@ -1275,7 +1481,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           b.setButtonText("Lock now").onClick(() => { enc.lock(); new Notice("Encryption locked."); this.update?.(); }));
       }
 
-      if (enc.keychainAvailable() && enc.isRemembered()) {
+      if (SHOW_FORGET_KEYCHAIN_BUTTON && enc.keychainAvailable() && enc.isRemembered()) {
         new Setting(host).setName("Forget password on this device").setDesc("Drops ONLY the copy saved in this device's keychain — your encryption stays set up and nothing is decrypted or deleted. You'll just re-type the password next session. (To turn encryption off entirely, use “Remove encryption” below.)").addButton((b) =>
           b.setButtonText("Forget on this device").onClick(async () => { await enc.forgetKeychain(); new Notice("Removed from this device's keychain — encryption still set up."); this.update?.(); }));
       }
@@ -1415,20 +1621,23 @@ export class StashpadSettingTab extends PluginSettingTab {
         if (enc.hasSharedPassword()) {
           new Setting(host).setName("Shared password").setDesc("ON — anyone who knows it can unlock this vault (no approval). Share it via a password manager or secure message; don't send it in the clear.")
             .addButton((b) => b.setButtonText("Change…").onClick(() => {
-              new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: false, kdfProbe, title: "Change shared password", intro: "Everyone who unlocks with the shared password will need the new one. Re-share it securely after changing.",
-                onSubmit: async ({ next }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next); } catch (e) { return (e as Error).message; } new Notice("Shared password updated."); this.update?.(); return null; } }).open();
+              new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: true, kdfProbe, title: "Change shared password", intro: "Everyone who unlocks with the shared password will need the new one. Re-share it securely after changing.",
+                onSubmit: async ({ next, remember }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next, remember); } catch (e) { return (e as Error).message; } new Notice("Shared password updated."); this.update?.(); return null; } }).open();
             }))
             .addButton((b) => { b.setButtonText("Turn off").onClick(async () => { await enc.removeSharedPassword(); new Notice("Shared password turned off."); this.update?.(); }); b.buttonEl.addClass("mod-warning"); });
         } else {
           new Setting(host).setName("Shared password").setDesc("OFF — set one passphrase that everyone types to unlock (the simplest way to share). Anyone who knows it can unlock; turning it off later doesn't claw back copies already synced elsewhere.")
             .addButton((b) => b.setButtonText("Set shared password…").onClick(() => {
-              new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: false, kdfProbe, title: "Set shared password", intro: "One passphrase everyone types to unlock this vault. Anyone who knows it gets in — share it ONLY through a password manager or secure message, never in the clear. You can turn it off later.",
-                onSubmit: async ({ next }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next); } catch (e) { return (e as Error).message; } new Notice("Shared password set — share it securely with your collaborators."); this.update?.(); return null; } }).open();
+              new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: true, kdfProbe, title: "Set shared password", intro: "One passphrase everyone types to unlock this vault. Anyone who knows it gets in — share it ONLY through a password manager or secure message, never in the clear. You can turn it off later.",
+                onSubmit: async ({ next, remember }) => { if (!next) return "Enter a password."; try { await enc.setSharedPassword(next, remember); } catch (e) { return (e as Error).message; } new Notice("Shared password set — share it securely with your collaborators."); this.update?.(); return null; } }).open();
             }));
         }
       }
 
       // ---- Sharing method 2: device approval (Model 3) — members + requests ----
+      // Hidden in the per-folder overhaul (manual password sharing is the model
+      // now). Code kept dormant; flip SHOW_DEVICE_APPROVAL_UI to re-enable.
+      if (SHOW_DEVICE_APPROVAL_UI) {
       new Setting(host).setName("Collaborators (device approval)").setHeading();
       host.createEl("p", { cls: "setting-item-description" }).setText(
         "Everyone who can unlock this vault, and devices waiting for access. Approving a request shares the vault key with that device — it never sees a password. Removing a member revokes future access (existing synced copies they already hold aren't clawed back — rotate the key for that, a future feature).",
@@ -1466,14 +1675,17 @@ export class StashpadSettingTab extends PluginSettingTab {
           }
         }
       }
+      } // end SHOW_DEVICE_APPROVAL_UI
     }, ["encryption", "encrypt", "password", "passphrase", "lock", "unlock", "key", "security", "private", "collaborator", "share", "team", "member", "approve"]));
 
     items.push(this.renderDef("Encrypt items sent to trash", "When ON, deleting a note sends it to Stashpad's encrypted trash (recoverable with your password) instead of a plaintext trash. Default OFF.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.encryptTrash).onChange(async (v) => {
+        if (v && !this.encryptionOrOnboard()) { this.update?.(); return; }
         this.plugin.settings.encryptTrash = v; await this.plugin.saveSettings();
       })), ["trash", "delete", "encrypt"]));
     items.push(this.renderDef("Encrypt trash filenames", "Hide the filename + origin folder of encrypted-trashed items (opaque names on disk; shown under “Hidden” in the trash tab). Default OFF so you can still tell what to restore when working outside the app.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.encryptTrashFilenames).onChange(async (v) => {
+        if (v && !this.encryptionOrOnboard()) { this.update?.(); return; }
         this.plugin.settings.encryptTrashFilenames = v; await this.plugin.saveSettings();
       })), ["trash", "filename", "encrypt"]));
     items.push(this.renderDef("Follow Obsidian's trash setting instead", "OFF (recommended): encrypted-deleted notes go to Stashpad's own “_deleted/” store — the only trash location Stashpad fully controls, so it can encrypt, list, and restore them. ON: deletes follow Obsidian's “Deleted files” setting instead (system/OS trash or permanent). ⚠️ Stashpad CANNOT encrypt or recover notes that go to the system trash — so the encrypted trash + recoverable trash view won't apply. Only turn this on if you specifically want Obsidian's native trash behavior.", (s) =>
@@ -1485,8 +1697,9 @@ export class StashpadSettingTab extends PluginSettingTab {
         const n = Math.max(0, Math.floor(Number(v) || 0));
         this.plugin.settings.encryptionIdleLockMinutes = n; await this.plugin.saveSettings();
       })), ["auto-lock", "idle", "timeout", "lock"]));
-    items.push(this.renderDef("Hide titles of locked notes", "Show a generic label on 🔒 locked placeholders instead of the note's title, so a glance at the vault doesn't reveal what's locked. Default OFF.", (s) =>
+    items.push(this.renderDef("Hide titles of locked notes (default)", "The DEFAULT for hiding 🔒 locked-placeholder titles — used by any folder/trash that doesn't set its own “hide filenames” option in Per-folder passwords below (those override this). Shows a generic label instead of the note's title so a glance doesn't reveal what's locked. Default OFF.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.hideLockedTitles ?? false).onChange(async (v) => {
+        if (v && !this.encryptionOrOnboard()) { this.update?.(); return; }
         this.plugin.settings.hideLockedTitles = v; await this.plugin.saveSettings();
         this.plugin.refreshAllStashpadViews?.();
       })), ["title", "hide", "private", "lock", "placeholder", "visibility"]));
@@ -1501,6 +1714,11 @@ export class StashpadSettingTab extends PluginSettingTab {
         d.onChange(async (v) => { this.plugin.settings.defaultArchiveFolder = v || undefined; await this.plugin.saveSettings(); });
       });
     }, ["archive", "default", "move", "encrypt", "folder"]));
+
+    // ---- Per-folder passwords (per-folder overhaul) — below the global settings ----
+    items.push(this.sectionDef("Per-folder passwords", "Give a folder its own password (a separate key) so you can share just that folder with collaborators. Folders without their own password use the vault password.", (host) => {
+      this.renderPerFolderEncryption(host);
+    }, ["folder", "per-folder", "password", "encrypt", "key", "share", "collaborator", "archive", "unlock", "lock"]));
 
     return items;
   }
