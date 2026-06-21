@@ -22,7 +22,7 @@ import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
 import { StashpadSuggest } from "./note-picker";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, humanCombo } from "./view-keys";
 import { AuthorshipTracker } from "./authorship-tracker";
@@ -4399,6 +4399,8 @@ export class StashpadView extends ItemView {
     // Action cluster (select-mode toggle + ⋯ menu) sits at the START of
     // the breadcrumb row, before Home — easier to reach on mobile and
     // gives the time-filter row more horizontal real estate.
+    // 0.117.0: the "jump to level" button now lives inside the actions
+    // cluster (rendered above), grouped with back/forward/select/⚡.
     this.renderActionsCluster(bar);
     const homeBtn = bar.createSpan({ cls: "stashpad-crumb stashpad-crumb-home" });
     if (Platform.isMobile) {
@@ -4458,8 +4460,13 @@ export class StashpadView extends ItemView {
       }
     }
 
+    // 0.117.0: on mobile the row already has a flex `gap` between items, so
+    // the spaces around the slash double the spacing and look wasteful at
+    // very small widths. Use a bare "/" there and let the gap do the work;
+    // desktop keeps " / " (it has no inter-item gap).
+    const sepText = Platform.isMobile ? "/" : " / ";
     for (const c of crumbs) {
-      bar.createSpan({ cls: "stashpad-crumb-sep", text: " / " });
+      bar.createSpan({ cls: "stashpad-crumb-sep", text: sepText });
       if (c.isEllipsis) {
         bar.createSpan({ cls: "stashpad-crumb stashpad-crumb-ellipsis", text: c.label }).title =
           path.map((n) => this.titleForNode(n)).join(" / ");
@@ -4508,6 +4515,48 @@ export class StashpadView extends ItemView {
       exitBtn.title = "Exit compact mode";
       exitBtn.onclick = (e) => { e.preventDefault(); this.toggleCompactMode(); };
     }
+    // 0.117.0: "jump to level" button pinned at the END of the breadcrumb row
+    // (by the crumbs, not the nav cluster). CSS absolutely-positions it at the
+    // right edge with reserved padding, so it stays visible even when the
+    // inline crumbs clip — which is exactly when it's needed.
+    this.renderBreadcrumbLevelsButton(bar);
+  }
+
+  /** 0.117.0: the breadcrumb "all levels" button. Pinned at the right end of
+   *  the row (CSS), so it never clips, and opens BreadcrumbLevelsModal listing
+   *  every level full-width + clickable — the escape hatch when the inline
+   *  crumbs are squished. */
+  private renderBreadcrumbLevelsButton(parent: HTMLElement): void {
+    // Same button shape as the other actions-cluster controls (back /
+    // forward / select / ⚡) so it reads as one group.
+    const btn = parent.createEl("button", { cls: "stashpad-mobile-action-btn stashpad-crumb-levels-btn" });
+    setIconSafe(btn, "route", "⋔");
+    btn.title = "Show all levels — jump to any level in the path";
+    btn.onclick = (e) => { e.preventDefault(); this.openBreadcrumbLevelsModal(); };
+  }
+
+  /** Build the level list (Home + full path, untruncated) and open the
+   *  picker modal. Clicking a level navigates there. 0.117.0. */
+  private openBreadcrumbLevelsModal(): void {
+    const path = this.tree.pathTo(this.focusId);
+    const levels: BreadcrumbLevel[] = [
+      { id: ROOT_ID, label: "Home", level: 0, isCurrent: this.focusId === ROOT_ID, isHome: true },
+    ];
+    path.forEach((n, i) => {
+      levels.push({
+        id: n.id,
+        label: this.titleForNode(n),
+        level: i + 1,
+        isCurrent: n.id === this.focusId,
+      });
+    });
+    new BreadcrumbLevelsModal(this.app, levels, (id) => this.navigateTo(id as StashpadId), {
+      // Same context menu as the inline crumbs (navigate / open in new
+      // Stashpad tab / open in editor), via right-click + long-press. The
+      // `close` lets a chosen action dismiss the modal.
+      onContext: (id, evt, anchorEl, close) => this.openCrumbMenu(evt, id as StashpadId, anchorEl, close),
+      attachLongPress: (el, cb) => this.attachLongPress(el, cb),
+    }).open();
   }
 
   /** Long-press helper. Triggers `cb` after 500ms of touchstart held in
@@ -4533,21 +4582,31 @@ export class StashpadView extends ItemView {
   }
 
   /** Context menu for a breadcrumb crumb — open in a new Stashpad tab or
-   *  open the underlying note in a regular Obsidian markdown tab. */
-  private openCrumbMenu(evt: MouseEvent | null, id: StashpadId): void {
+   *  open the underlying note in a regular Obsidian markdown tab.
+   *  `anchorEl` (optional) overrides the long-press anchor — used by the
+   *  levels modal, which passes the row element. `onAction` (optional) runs
+   *  before each item's action — the levels modal passes its `close` so the
+   *  modal dismisses when the user picks something. 0.117.0. */
+  private openCrumbMenu(
+    evt: MouseEvent | null,
+    id: StashpadId,
+    anchorEl?: HTMLElement,
+    onAction?: () => void,
+  ): void {
     const node = this.tree.get(id);
     if (!node) return;
     const menu = new Menu();
-    menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => this.navigateTo(id)));
-    menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").onClick(() => this.cmdOpenInNewStashpadTab(node)));
+    menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => { onAction?.(); this.navigateTo(id); }));
+    menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").onClick(() => { onAction?.(); this.cmdOpenInNewStashpadTab(node); }));
     if (node.file) {
-      menu.addItem((it: any) => it.setTitle("Open in editor (new tab)").setIcon("pencil").onClick(() => this.cmdOpenInEditor(node)));
+      menu.addItem((it: any) => it.setTitle("Open in editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
     }
     if (evt && (evt.clientX > 0 || evt.clientY > 0)) {
       menu.showAtMouseEvent(evt);
     } else {
-      // Long-press path: anchor below the crumb element.
-      const el = (evt?.target as HTMLElement | null) ?? null;
+      // Long-press path: anchor below the provided element (or the event
+      // target, for the breadcrumb's own long-press).
+      const el = anchorEl ?? (evt?.target as HTMLElement | null) ?? null;
       const r = el?.getBoundingClientRect();
       menu.showAtPosition({ x: r?.left ?? 8, y: (r?.bottom ?? 60) + 4 });
     }

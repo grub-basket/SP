@@ -892,6 +892,70 @@
   margin-left: 6px;
   flex: 0 0 auto;
 }
+/* 0.117.0: "jump to level" button pinned at the right end of the breadcrumb
+   row. Absolutely positioned (the bar is overflow:hidden + nowrap, so an
+   in-flow button at the end would clip exactly when crumbs overflow — which is
+   when it's needed). The bar reserves right padding so crumbs clip BEHIND it. */
+.stashpad-breadcrumb { position: relative; }
+.stashpad-breadcrumb:has(.stashpad-crumb-levels-btn) { padding-right: 40px; }
+.stashpad-view.is-mobile .stashpad-breadcrumb:has(.stashpad-crumb-levels-btn) { padding-right: 40px; }
+.stashpad-crumb-levels-btn.stashpad-mobile-action-btn {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+/* 0.117.0: breadcrumb levels modal — full-width clickable rows, indented
+   by depth. Mobile-responsive via the compact-modal base + fluid width. */
+/* Size to content (don't sit at the compact-modal's fixed 440px with empty
+   space to the right) — shrink to the longest label, capped + min for sanity. */
+.modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
+  width: fit-content !important;
+  min-width: 260px;
+  max-width: min(440px, 94vw) !important;
+}
+.stashpad-breadcrumb-modal .stashpad-bc-levels { display: flex; flex-direction: column; gap: 2px; }
+.stashpad-bc-level-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  min-width: 0;
+}
+.stashpad-bc-level-row:hover:not(.is-current) { background: var(--background-modifier-hover); }
+.stashpad-bc-level-row.is-current { background: var(--background-secondary); cursor: default; }
+/* Leading level number — Home is 0, then 1..n. Fixed-size chip so labels
+   start at a consistent left edge regardless of single/double-digit depth. */
+.stashpad-bc-level-num {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 11px;
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+}
+.stashpad-bc-level-row.is-current .stashpad-bc-level-num {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.stashpad-bc-level-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* The whole point of this modal is to show the FULL title that the inline
+     crumb truncates — so wrap long titles instead of ellipsizing them. */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: var(--text-normal);
+}
+.stashpad-bc-level-row.is-current .stashpad-bc-level-label { font-weight: var(--font-semibold); }
 
 /* Focused header — laid out exactly like a list row: 3 columns of
    [meta | body | actions]. The meta column carries the timestamp +
@@ -2069,8 +2133,13 @@
 .stashpad-view.is-mobile .stashpad-breadcrumb {
   font-size: var(--font-ui-small);
   padding: 6px 2px;
-  gap: 4px;
+  /* 0.117.0: tighter inter-item gap. The separator is now a bare "/"
+     (no surrounding spaces) on mobile, so this gap alone spaces crumbs —
+     2px keeps the slash visually close to its neighbours at small widths. */
+  gap: 2px;
 }
+/* The bare "/" separator can hug its neighbours a touch on mobile. */
+.stashpad-view.is-mobile .stashpad-crumb-sep { margin: 0 1px; }
 .stashpad-view.is-mobile .stashpad-crumb {
   padding: 2px 4px;
   border-radius: 4px;

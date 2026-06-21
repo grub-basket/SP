@@ -1443,6 +1443,73 @@ export class ConfirmModal extends Modal {
   }
 }
 
+/** 0.117.0: breadcrumb "all levels" picker. The breadcrumb row squishes
+ *  (and clips its rightmost crumbs) when the pane is narrow or the path is
+ *  deep, so this modal lists EVERY level top-to-bottom — full titles, no
+ *  truncation — and lets the user jump to any one. Mobile-responsive: rows
+ *  are full-width tap targets; indentation conveys depth. The current level
+ *  is marked and non-navigating. */
+export interface BreadcrumbLevel {
+  id: string;
+  /** Full, untruncated title for this level. */
+  label: string;
+  /** 0 = Home; 1..n = depth down the path. Drives the indent. */
+  level: number;
+  isCurrent: boolean;
+  isHome?: boolean;
+}
+export interface BreadcrumbLevelsModalOpts {
+  /** Open the same context menu the inline crumbs use, for a given level.
+   *  `evt` is the MouseEvent for right-click, or null for long-press;
+   *  `anchorEl` is the row (long-press anchor); `close` dismisses the modal. */
+  onContext?: (id: string, evt: MouseEvent | null, anchorEl: HTMLElement, close: () => void) => void;
+  /** Mobile long-press wiring (the view's attachLongPress). */
+  attachLongPress?: (el: HTMLElement, cb: () => void) => void;
+}
+export class BreadcrumbLevelsModal extends Modal {
+  constructor(
+    app: App,
+    private levels: BreadcrumbLevel[],
+    private onPick: (id: string) => void,
+    private opts: BreadcrumbLevelsModalOpts = {},
+  ) { super(app); }
+  onOpen(): void {
+    this.modalEl?.addClass("stashpad-compact-modal");
+    this.modalEl?.addClass("stashpad-breadcrumb-modal");
+    this.contentEl.empty();
+    this.titleEl.setText("Jump to level");
+    const list = this.contentEl.createDiv({ cls: "stashpad-bc-levels" });
+    for (const lvl of this.levels) {
+      const row = list.createDiv({ cls: "stashpad-bc-level-row" });
+      if (lvl.isCurrent) row.addClass("is-current");
+      // Flat, left-aligned rows (no indentation) so deep levels stay
+      // full-width on a narrow phone. Depth is conveyed by a leading level
+      // number — Home is 0, then 1..n down the path.
+      row.createSpan({ cls: "stashpad-bc-level-num", text: String(lvl.level) });
+      row.createSpan({ cls: "stashpad-bc-level-label", text: lvl.label });
+      // The current level is shown by its accent number chip + highlighted
+      // row (no "current" text label — it just padded the width).
+      if (!lvl.isCurrent) {
+        row.setAttribute("role", "button");
+        row.setAttribute("tabindex", "0");
+        const go = (): void => { this.close(); this.onPick(lvl.id); };
+        row.onclick = go;
+        row.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
+      }
+      // Context-menu parity with the inline crumbs — every row (incl. the
+      // current one) gets right-click + long-press → the same crumb menu.
+      if (this.opts.onContext) {
+        row.oncontextmenu = (evt) => {
+          evt.preventDefault();
+          this.opts.onContext!(lvl.id, evt, row, () => this.close());
+        };
+        this.opts.attachLongPress?.(row, () => this.opts.onContext!(lvl.id, null, row, () => this.close()));
+      }
+    }
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
 /** 0.76.1: pick a due date + time for a task. Uses native
  *  <input type="date"> + <input type="time"> so mobile gets the OS
  *  date/time pickers for free. Quick-preset buttons (Today, Tomorrow,
