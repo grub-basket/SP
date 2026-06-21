@@ -6101,7 +6101,31 @@ export class StashpadView extends ItemView {
     const cleanDest = dest.replace(/\/+$/, "");
     const encryptDest = (this.plugin.settings.folderEncPrefs ?? {})[cleanDest]?.archiveEncryptContent ?? true;
     if (!encryptDest) {
-      new Notice(`“${cleanDest.split("/").pop()}” is a plaintext archive (encryption off). Moving notes into a plaintext archive from the command isn't wired yet — drag them in, or turn on “Encrypt archived notes” for that folder.`, 9000);
+      // Plaintext archive (encryption off): MOVE the subtree's files into the
+      // destination (de-indexed via the archive flag, but not encrypted). Stashpad's
+      // re-home listener reparents the moved roots in the destination folder.
+      const ids0 = new Set(sources.map((t) => t.id));
+      const roots0 = sources.filter((t) => { let p = t.parent; while (p) { if (ids0.has(p)) return false; p = this.tree.get(p)?.parent ?? null; } return true; });
+      if (roots0.length === 0) return;
+      const files: TFile[] = [];
+      const seen0 = new Set<string>();
+      const walk0 = (n: TreeNode) => { if (seen0.has(n.id)) return; seen0.add(n.id); if (n.file) files.push(n.file); for (const c of this.tree.getChildren(n.id)) walk0(c); };
+      for (const r of roots0) walk0(r);
+      const moves: Array<{ from: string; to: string }> = [];
+      for (const f of files) {
+        const fromPath = f.path;
+        const name = f.name; const dot = name.lastIndexOf("."); const stem = dot > 0 ? name.slice(0, dot) : name; const ext = dot > 0 ? name.slice(dot) : "";
+        let to = `${cleanDest}/${name}`;
+        for (let n = 1; await this.app.vault.adapter.exists(to); n++) to = `${cleanDest}/${stem}-${n}${ext}`;
+        try { await this.app.fileManager.renameFile(f, to); moves.push({ from: fromPath, to }); } catch (e) { console.warn("[Stashpad] plaintext archive move failed", fromPath, e); }
+      }
+      this.selection.clear(); this.lastSelected = null; this.tree.rebuild(src); this.render();
+      const nm = cleanDest.split("/").pop() || cleanDest;
+      this.plugin.notifications.show({ message: `Moved ${moves.length} note${moves.length === 1 ? "" : "s"} → plaintext archive “${nm}” (de-indexed, not encrypted). Undo to bring ${moves.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder: src });
+      this.plugin.getUndoStack(src).push({
+        label: `Archive (plaintext, ${roots0.length})`,
+        undo: async () => { for (const m of moves) { const fl = this.app.vault.getAbstractFileByPath(m.to); if (fl instanceof TFile) { try { await this.app.fileManager.renameFile(fl, m.from); } catch (e) { console.warn("[Stashpad] plaintext archive undo failed", m.to, e); } } } this.tree.rebuild(src); this.render(); },
+      });
       return;
     }
     if (!this.plugin.encryption?.isConfigured?.()) {

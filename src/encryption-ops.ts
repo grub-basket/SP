@@ -278,6 +278,11 @@ export interface DeletedMeta {
   originalFolderEnc?: string;
   parentId: string | null; title: string; count: number; created: string;
   rootId: string; deletedAt: string;
+  /** Per-folder trash keys: the FOLDER key id this blob was encrypted under
+   *  (plaintext — just an identifier, safe to expose). Absent ⇒ encrypted under the
+   *  vault DEK (legacy / vault-keyed folders). Restore resolves the right key by this
+   *  id; rotation re-encrypts the trash blobs whose keyId matches the rotated key. */
+  keyId?: string;
 }
 
 function bytesToB64(bytes: Uint8Array): string {
@@ -326,7 +331,7 @@ export async function deletedRestoreDest(app: App, blobPath: string, meta: Delet
  *  trash store + the sidecar records the original folder so Restore can put it
  *  back. `deletedAt` is passed in (callers stamp it — keeps this pure-ish). */
 export async function deleteEncryptSubtree(
-  app: App, folder: string, rootId: StashpadId, dek: Uint8Array, deletedAt: string, hideTitle = false,
+  app: App, folder: string, rootId: StashpadId, dek: Uint8Array, deletedAt: string, hideTitle = false, keyId?: string,
 ): Promise<{ blobPath: string; noteCount: number; rootId: StashpadId; originalFolder: string; title: string; unpurged: string[] }> {
   const sub = await collectSubtree(app, folder, rootId);
   if (!sub) throw new Error("Couldn't find that note to delete.");
@@ -368,6 +373,7 @@ export async function deleteEncryptSubtree(
     parentId,
     title: hideTitle ? "" : titleFromFile(rootNote.file), count: all.length,
     created: rootNote.created, rootId, deletedAt,
+    ...(keyId ? { keyId } : {}),
   };
   try { await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta)); }
   catch (e) { console.warn("[Stashpad] couldn't write deleted sidecar", e); }
@@ -546,6 +552,28 @@ export async function writeRotatedBlob(app: App, blobPath: string, oldDek: Uint8
   } finally { plain.fill(0); }
 }
 
+/** During a folder-key rotation, re-wrap a deleted blob's sidecar field that is
+ *  itself encrypted with the folder DEK (`originalFolderEnc`, hidden-titles deletes)
+ *  old → new. No-op if absent. Run AFTER the blob's `.rot` is committed. */
+export async function rewrapDeletedSidecar(app: App, blobPath: string, oldDek: Uint8Array, newDek: Uint8Array): Promise<void> {
+  const meta = await readDeletedMeta(app, blobPath);
+  if (!meta?.originalFolderEnc) return;
+  const plain = await decryptWithKey(b64ToBytes(meta.originalFolderEnc), oldDek);
+  try { meta.originalFolderEnc = bytesToB64(await encryptWithKey(plain, newDek)); }
+  finally { plain.fill(0); }
+  await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta));
+}
+
+/** Trash blob paths in `_deleted/` whose sidecar `keyId` matches `keyId`. */
+export async function deletedBlobsForKeyId(app: App, keyId: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const b of await listDeletedBlobs(app)) {
+    const m = await readDeletedMeta(app, b);
+    if (m?.keyId === keyId) out.push(b);
+  }
+  return out;
+}
+
 /** Commit a re-encrypted blob: replace the original with its verified `.rot`, then
  *  remove the temp. No-op if the `.rot` is missing (already committed). */
 export async function commitRotatedBlob(app: App, blobPath: string): Promise<void> {
@@ -556,25 +584,24 @@ export async function commitRotatedBlob(app: App, blobPath: string): Promise<voi
   try { await app.vault.adapter.remove(rot); } catch { /* leave temp; original is good */ }
 }
 
-/** Remove any leftover `.rot` temp files in a folder (cleanup after an aborted
- *  rotation — originals are intact, so the temps are just orphans). */
+/** Remove any leftover `.rot` temp files under a folder SUBTREE (cleanup after an
+ *  aborted rotation — originals are intact, so the temps are just orphans).
+ *  Recursive: subfolders inherit the parent key, so their blobs rotate too. */
 export async function cleanupRotTemps(app: App, folder: string): Promise<void> {
   const cleaned = folder.replace(/\/+$/, "");
-  try {
-    const listing = await app.vault.adapter.list(cleaned);
-    for (const f of listing.files) if (f.endsWith(`.${STASHENC_EXT}.rot`)) { try { await app.vault.adapter.remove(f); } catch { /* */ } }
-  } catch { /* no folder */ }
+  for (const f of await listFilesRecursive(app, cleaned)) {
+    if (f.endsWith(`.${STASHENC_EXT}.rot`)) { try { await app.vault.adapter.remove(f); } catch { /* */ } }
+  }
 }
 
-/** The original blob paths that have a pending `.rot` temp in a folder — read from
- *  the ADAPTER (authoritative), not the in-memory file index, so rotation resume
- *  works during onload before the index is populated. */
+/** The original blob paths that have a pending `.rot` temp anywhere under a folder
+ *  SUBTREE — read from the ADAPTER (authoritative), not the in-memory file index, so
+ *  rotation resume works during onload before the index is populated. */
 export async function listRotTemps(app: App, folder: string): Promise<string[]> {
   const cleaned = folder.replace(/\/+$/, "");
-  try {
-    const listing = await app.vault.adapter.list(cleaned);
-    return listing.files.filter((f) => f.endsWith(`.${STASHENC_EXT}.rot`)).map((f) => f.replace(/\.rot$/, ""));
-  } catch { return []; }
+  return (await listFilesRecursive(app, cleaned))
+    .filter((f) => f.endsWith(`.${STASHENC_EXT}.rot`))
+    .map((f) => f.replace(/\.rot$/, ""));
 }
 
 /** All encrypted-deleted blob paths in `_deleted/`. */

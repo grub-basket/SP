@@ -306,6 +306,10 @@ export interface StashpadSettings {
    *  keyed by cleaned folder path. See `FolderEncPrefs`. Empty default → no folder
    *  is encrypted until the user opts in, so existing vaults are unaffected. */
   folderEncPrefs: Record<string, FolderEncPrefs>;
+  /** Comma-separated subfolder-name prefixes (default "_") that EXCLUDE a folder from
+   *  Stashpad discovery + import — it stays local, not surfaced/pulled in. A path is
+   *  excluded if any of its segments starts with a listed prefix. */
+  importExcludePrefixes: string;
   /** 0.98.1: registry of locked subtrees, so the list can render a placeholder
    *  where the note was (and find the blob to unlock). One entry per `.stashenc`
    *  bundle. `parentId` = where the locked root was attached (null/ROOT = top). */
@@ -547,6 +551,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   hideLockedTitles: false,
   archiveFolders: [],
   folderEncPrefs: {},
+  importExcludePrefixes: "_",
   lockedSubtrees: [],
   searchOpensInNewTab: true,
   pinnedNotes: [],
@@ -639,28 +644,33 @@ export type SettingsTabId =
   | "encryption" | "authorship" | "templates" | "jdindex" | "okf"
   | "maintenance" | "diagnostics" | "misc" | "hotkeys";
 export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = ([
-  { id: "foldersStorage", label: "Folders & storage" },
-  { id: "importExport",   label: "Import & export" },
-  { id: "noteTitles",     label: "Note titles" },
-  { id: "datesTime",      label: "Dates & time" },
-  { id: "listDisplay",    label: "List & display" },
-  { id: "movingNotes",    label: "Moving notes" },
-  { id: "deleting",       label: "Deleting" },
-  { id: "composerCopy",   label: "Composer & copying" },
-  { id: "windowsTabs",    label: "Windows & tabs" },
-  { id: "notifications",  label: "Notifications" },
-  { id: "encryption",     label: "Encryption" },
-  { id: "authorship",     label: "Authorship" },
-  { id: "templates",      label: "Templates" },
-  { id: "jdindex",        label: "JD Index" },
-  { id: "okf",            label: "Open Knowledge Format (OKF)" },
-  { id: "maintenance",    label: "Maintenance" },
-  { id: "diagnostics",    label: "Diagnostics" },
-  { id: "misc",           label: "Misc" },
-  { id: "hotkeys",        label: "Hotkeys" },
+  { id: "foldersStorage", label: "📁 Folders & Storage" },
+  { id: "importExport",   label: "🔄 Import & Export" },
+  { id: "noteTitles",     label: "🏷️ Note Titles" },
+  { id: "datesTime",      label: "🕒 Dates & Time" },
+  { id: "listDisplay",    label: "📋 List & Display" },
+  { id: "movingNotes",    label: "↕️ Moving Notes" },
+  { id: "deleting",       label: "🗑️ Deleting" },
+  { id: "composerCopy",   label: "✍️ Composer & Copying" },
+  { id: "windowsTabs",    label: "🪟 Windows & Tabs" },
+  { id: "notifications",  label: "🔔 Notifications" },
+  { id: "encryption",     label: "🔒 Encryption" },
+  { id: "authorship",     label: "✒️ Authorship" },
+  { id: "templates",      label: "📄 Templates" },
+  { id: "jdindex",        label: "🔢 JD Index" },
+  { id: "okf",            label: "📚 Open Knowledge Format (OKF)" },
+  { id: "maintenance",    label: "🛠️ Maintenance" },
+  { id: "diagnostics",    label: "🩺 Diagnostics" },
+  { id: "misc",           label: "⚙️ Misc" },
+  { id: "hotkeys",        label: "⌨️ Hotkeys" },
 // 0.112.9: sections shown alphabetically by label. Display order only — the
 // `id`-keyed itemsForTab dispatch is unaffected, and new tabs auto-sort in.
-] as Array<{ id: SettingsTabId; label: string }>).sort((a, b) => a.label.localeCompare(b.label));
+] as Array<{ id: SettingsTabId; label: string }>).sort((a, b) => {
+  // Sort by the label TEXT, ignoring the leading emoji prefix (else the order would
+  // scramble by emoji codepoint).
+  const strip = (s: string) => s.replace(/^[^\p{L}\p{N}]+/u, "");
+  return strip(a.label).localeCompare(strip(b.label));
+});
 
 /** 0.94.0: a declarative sub-page that renders one of Stashpad's settings tabs
  *  via the existing imperative `renderTabContent`. Used by
@@ -1042,13 +1052,21 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  associations). */
   private renderFolderEncPanel(host: HTMLElement, folder: string): void {
     const enc = this.plugin.encryption;
-    const hasKey = enc.hasFolderKey(folder);
+    const hasOwn = enc.hasOwnFolderKey(folder);              // this exact folder has a key
+    const owner = enc.folderKeyEntry(folder)?.folderPath ?? null; // key-owning folder (self or ancestor)
+    const inherited = !!owner && !hasOwn;                    // subfolder inheriting an ancestor's key
     const unlocked = enc.isFolderUnlocked(folder);
     const prefs = (this.plugin.settings.folderEncPrefs ?? {})[folder] ?? {};
-    const status = hasKey ? (unlocked ? "Has its own password · unlocked" : "Has its own password · locked") : "Uses the vault password";
+    const status = hasOwn
+      ? (unlocked ? "Has its own password · unlocked" : "Has its own password · locked")
+      : inherited
+        ? `Inherits “${(owner!.split("/").pop()) || owner}”'s password · ${unlocked ? "unlocked" : "locked"}`
+        : "Uses the vault password";
 
     const head = new Setting(host).setName("Password").setDesc(status);
-    if (!hasKey) {
+    if (inherited) {
+      head.addButton((b) => b.setButtonText("Manage on parent folder").onClick(() => { this.pfeSelected = owner; this.update?.(); }));
+    } else if (!hasOwn) {
       head.addButton((b) => b.setButtonText("Set folder password…").setCta().onClick(() => this.promptSetFolderPassword(folder)));
     } else if (!unlocked) {
       head.addButton((b) => b.setButtonText("Unlock…").setCta().onClick(() => this.promptUnlockFolder(folder)));
@@ -1111,6 +1129,31 @@ export class StashpadSettingTab extends PluginSettingTab {
     });
     pair("Encrypt archived notes", "archiveEncryptContent", "archiveEncryptFilenames");
     pair("Encrypt trashed notes", "trashEncryptContent", "trashEncryptFilenames");
+
+    // Subfolders: each shares this folder's key (inheritance), but you can encrypt
+    // their notes / hide their filenames individually.
+    const subs = this.plugin.discoverStashpadFolders().filter((sf) => sf !== folder && sf.startsWith(folder + "/")).sort();
+    if (subs.length) {
+      new Setting(host).setName("Subfolders").setDesc(`${subs.length} subfolder${subs.length === 1 ? "" : "s"} — they use “${folder.split("/").pop()}”'s password. Encrypt each individually.`).setHeading();
+      for (const sub of subs) {
+        const sp = (this.plugin.settings.folderEncPrefs ?? {})[sub] ?? {};
+        const setSubPref = async (patch: Partial<FolderEncPrefs>) => {
+          this.plugin.settings.folderEncPrefs = { ...(this.plugin.settings.folderEncPrefs ?? {}), [sub]: { ...((this.plugin.settings.folderEncPrefs ?? {})[sub] ?? {}), ...patch } };
+          await this.plugin.saveSettings();
+        };
+        const subLocked = (this.plugin.settings.lockedSubtrees ?? []).some((e) => (e.folder || "").replace(/\/+$/, "") === sub);
+        const rel = sub.slice(folder.length + 1);
+        new Setting(host).setName(rel)
+          .addToggle((t) => t.setValue(subLocked).onChange(async (v) => {
+            if (v) await this.plugin.lockFolder(sub); else await this.plugin.unlockFolder(sub);
+            const has = (this.plugin.settings.lockedSubtrees ?? []).some((e) => (e.folder || "").replace(/\/+$/, "") === sub);
+            await setSubPref({ encryptContent: has, ...(has ? {} : { encryptFilenames: false }) });
+            this.update?.();
+          }));
+        new Setting(host).setName(`↳ ${rel} — hide filenames`).setClass("stashpad-subsetting")
+          .addToggle((t) => { t.setValue(!!sp.encryptFilenames); t.setDisabled(!subLocked); t.onChange((v) => void setSubPref({ encryptFilenames: v })); });
+      }
+    }
   }
 
   /** 0.94.3: General tab decomposed into per-setting items (render at DISPLAY
@@ -1186,6 +1229,10 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.plugin.settings.exportFolder = (v || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.exportFolder;
         await set();
       })), ["export", "stash", "subfolder"]));
+    cats.importExport.push(this.renderDef("Exclude subfolders by prefix", "Comma-separated name prefixes (default “_”). A subfolder whose name starts with any of these — at any depth — is NOT surfaced as a Stashpad folder or imported (it stays local). To encrypt such a folder, right-click it in Obsidian's file explorer → “🔒 Encrypt with Stashpad”.", (s) =>
+      s.addText((t) => t.setValue(this.plugin.settings.importExcludePrefixes ?? "_").setPlaceholder("_").onChange(async (v) => {
+        this.plugin.settings.importExcludePrefixes = v; await set();
+      })), ["import", "exclude", "prefix", "subfolder", "underscore", "ignore"]));
 
     cats.maintenance.push(this.renderDef("Rebootstrap existing Stashpad folders", "Walk every folder that has a home note: ensure infrastructure (_imports, _exports, drafts file), backfill the redundant parentLink + children frontmatter fields, rename any note whose filename slug no longer matches its body's first line, AND migrate legacy attachment filenames to the new name-first format (`photo-<id>.png`). Safe to run anytime; skip-if-equal means already-synced notes are no-op writes.", (s) =>
       s.addButton((b) =>
@@ -1304,10 +1351,10 @@ export class StashpadSettingTab extends PluginSettingTab {
         }));
     }, ["slug", "stopwords", "filename", "title"]));
 
-    cats.foldersStorage.push(this.sectionDef("Cross-Stashpad search scope", "Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations. Also: create a new Stashpad.", (host) => {
+    cats.foldersStorage.push(this.sectionDef("Cross-Stashpad Search Scope", "Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations. Also: create a new Stashpad.", (host) => {
       const folders = this.plugin.discoverStashpadFolders();
       new Setting(host)
-        .setName("Cross-Stashpad search scope")
+        .setName("Cross-Stashpad Search Scope")
         .setDesc("Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations — their notes just don't appear in search results from elsewhere.");
       if (folders.length === 0) {
         host.createEl("p", { cls: "setting-item-description" }).setText(
@@ -1338,9 +1385,9 @@ export class StashpadSettingTab extends PluginSettingTab {
           }));
     }, ["search", "scope", "exclude", "include", "create", "new", "stashpad", "folder"]));
 
-    cats.foldersStorage.push(this.sectionDef("Folder panel placement", "Pin, downrank, or hide folders in the Stashpad folder panel. Restore hidden folders here or from the panel's “Hidden” section.", (host) => {
+    cats.foldersStorage.push(this.sectionDef("Folder Panel Placement", "Pin, downrank, or hide folders in the Stashpad folder panel. Restore hidden folders here or from the panel's “Hidden” section.", (host) => {
       new Setting(host)
-        .setName("Folder panel placement")
+        .setName("Folder Panel Placement")
         .setDesc("Folders you've pinned, downranked, or hidden in the Stashpad folder panel. Pin/downrank from a folder's right-click menu in the panel; restore here or from the panel's “Hidden” section.");
       this.renderFolderPlacementList(host);
     }, ["folder", "panel", "pin", "pinned", "downrank", "hide", "hidden", "restore", "placement"]));
@@ -1364,7 +1411,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     const enc = this.plugin.encryption;
     const items: SettingDefinitionItem[] = [];
 
-    items.push(this.sectionDef("Vault encryption", "Set one password to encrypt content in this vault. Stored only on this device — there is no recovery if you lose it.", (host) => {
+    items.push(this.sectionDef("Vault Encryption", "Set one password to encrypt content in this vault. Stored only on this device — there is no recovery if you lose it.", (host) => {
       host.addClass("stashpad-encryption-section");
       const betaRow = host.createDiv({ cls: "stashpad-beta-row" });
       betaRow.createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
@@ -1700,7 +1747,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         const n = Math.max(0, Math.floor(Number(v) || 0));
         this.plugin.settings.encryptionIdleLockMinutes = n; await this.plugin.saveSettings();
       })), ["auto-lock", "idle", "timeout", "lock"]));
-    items.push(this.renderDef("Hide titles of locked notes (default)", "The DEFAULT for hiding 🔒 locked-placeholder titles — used by any folder/trash that doesn't set its own “hide filenames” option in Per-folder passwords below (those override this). Shows a generic label instead of the note's title so a glance doesn't reveal what's locked. Default OFF.", (s) =>
+    items.push(this.renderDef("Hide titles of locked notes (default)", "The DEFAULT for hiding 🔒 locked-placeholder titles — used by any folder/trash that doesn't set its own “hide filenames” option in Per-Folder Passwords below (those override this). Shows a generic label instead of the note's title so a glance doesn't reveal what's locked. Default OFF.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.hideLockedTitles ?? false).onChange(async (v) => {
         if (v && !this.encryptionOrOnboard()) { this.update?.(); return; }
         this.plugin.settings.hideLockedTitles = v; await this.plugin.saveSettings();
@@ -1719,7 +1766,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     }, ["archive", "default", "move", "encrypt", "folder"]));
 
     // ---- Per-folder passwords (per-folder overhaul) — below the global settings ----
-    items.push(this.sectionDef("Per-folder passwords", "Give a folder its own password (a separate key) so you can share just that folder with collaborators. Folders without their own password use the vault password.", (host) => {
+    items.push(this.sectionDef("Per-Folder Passwords", "Give a folder its own password (a separate key) so you can share just that folder with collaborators. Folders without their own password use the vault password.", (host) => {
       this.renderPerFolderEncryption(host);
     }, ["folder", "per-folder", "password", "encrypt", "key", "share", "collaborator", "archive", "unlock", "lock"]));
 
@@ -2054,11 +2101,11 @@ export class StashpadSettingTab extends PluginSettingTab {
     items.push(footerToggle("Show author in note footer", () => this.plugin.settings.showAuthor, (v) => { this.plugin.settings.showAuthor = v; }, ["author", "footer", "show"]));
     items.push(footerToggle("Show contributors in note footer", () => this.plugin.settings.showContributors, (v) => { this.plugin.settings.showContributors = v; }, ["contributors", "footer", "show"]));
     items.push(footerToggle("Show last edit time in note footer", () => this.plugin.settings.showLastEdit, (v) => { this.plugin.settings.showLastEdit = v; }, ["last edit", "modified", "footer", "time"]));
-    items.push(this.sectionDef("Folders you've worked in",
+    items.push(this.sectionDef("Folders You've Worked In",
       "Folders where you've authored or contributed notes. Click one to open it.",
       (host) => this.renderAuthoredFolders(host),
       ["folders", "authored", "contributed", "worked"]));
-    items.push(this.sectionDef("Known authors",
+    items.push(this.sectionDef("Known Authors",
       "Everyone the plugin has seen, with role/department + rename history; rebuild/restore the registry.",
       (host) => this.renderKnownAuthorsSection(host),
       ["authors", "registry", "rename", "known", "rebuild"]));
@@ -2085,11 +2132,11 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.99.15: Templates tab — the two per-folder editors as searchable sections. */
   private templatesItems(): SettingDefinitionItem[] {
     return [
-      this.sectionDef("Color aliases",
+      this.sectionDef("Color Aliases",
         "Give your note colors friendly names, per Stashpad folder.",
         (host) => this.renderColorAliasesSection(host),
         ["color", "colour", "alias", "name", "swatch", "palette", "label"]),
-      this.sectionDef("Note templates",
+      this.sectionDef("Note Templates",
         "Per-Stashpad note templates — content stamped into new notes.",
         (host) => this.renderNoteTemplatesSection(host),
         ["template", "note", "default", "boilerplate", "snippet"]),
@@ -2299,7 +2346,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     // Stashpad tab via the per-leaf folderOverride mechanism.
     const folders = this.plugin.collectAuthoredFolders();
     if (folders.length > 0) {
-      new Setting(parent).setName("Folders you've worked in").setHeading();
+      new Setting(parent).setName("Folders You've Worked In").setHeading();
       const list = parent.createDiv({ cls: "stashpad-authored-folders-list" });
       for (const f of folders) {
         const row = list.createDiv({ cls: "stashpad-authored-folder-row" });
@@ -2321,7 +2368,7 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  The registry is NOT authoritative (the id baked into note frontmatter
    *  is); this is recovery + an audit trail. */
   private renderKnownAuthorsSection(parent: HTMLElement): void {
-    new Setting(parent).setName("Known authors (registry)").setHeading();
+    new Setting(parent).setName("Known Authors (registry)").setHeading();
     parent.createEl("div", {
       cls: "setting-item-description",
       text: "A rebuildable cache of every author Stashpad has seen, with rename history. Not a source of truth — the author id stored in each note is authoritative. Use it to recover deleted author pages or audit name changes.",

@@ -10,7 +10,7 @@ import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE } from "./types"
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, writeRotatedBlob, commitRotatedBlob, cleanupRotTemps, listRotTemps } from "./encryption-ops";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, writeRotatedBlob, commitRotatedBlob, cleanupRotTemps, listRotTemps, deletedBlobsForKeyId, rewrapDeletedSidecar } from "./encryption-ops";
 import { EncryptionPasswordModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
@@ -433,6 +433,18 @@ export default class StashpadPlugin extends Plugin {
    *  still tell whether the deleted folder was a Stashpad. */
   knownStashpadFolders = new Set<string>();
 
+  /** Subfolder name prefixes (user-configurable, comma-separated; default "_") that
+   *  EXCLUDE a folder from Stashpad discovery + import — it stays local, not pulled
+   *  in. A path is excluded if ANY of its segments starts with a listed prefix. */
+  importExcludePrefixList(): string[] {
+    return (this.settings.importExcludePrefixes ?? "_").split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  pathHasExcludedSegment(path: string): boolean {
+    const prefixes = this.importExcludePrefixList();
+    if (!prefixes.length) return false;
+    return path.replace(/\/+$/, "").split("/").some((seg) => prefixes.some((p) => seg.startsWith(p)));
+  }
+
   discoverStashpadFolders(): string[] {
     const folders = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -444,7 +456,7 @@ export default class StashpadPlugin extends Plugin {
       // field isn't a Stashpad note.
       if (!fm || !("parent" in fm)) continue;
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-      if (dir) folders.add(dir);
+      if (dir && !this.pathHasExcludedSegment(dir)) folders.add(dir);
     }
     const sorted = [...folders].sort();
     this.knownStashpadFolders = new Set(sorted);
@@ -920,6 +932,10 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
       if (!(file instanceof TFolder)) return;
       const path = file.path.replace(/\/+$/, "");
+      // "Encrypt with Stashpad" on ANY folder (incl. import-excluded subfolders that
+      // aren't surfaced as Stashpad folders) — the entry point for encrypting a
+      // folder straight from Obsidian's file explorer.
+      menu.addItem((item) => item.setTitle("🔒 Encrypt with Stashpad").setIcon("lock").onClick(() => void this.encryptFolderFromExplorer(path)));
       if (!this.discoverStashpadFolders().includes(path)) return;
       menu.addItem((item) => {
         item
@@ -3464,6 +3480,32 @@ export default class StashpadPlugin extends Plugin {
    *  protected `.stash` — original blob untouched (feedback #4 / Option B). */
   exportLockedSubtree(blobPath: string): Promise<void> { return cmdExportLockedBlob(this, blobPath); }
 
+  /** "Encrypt with Stashpad" from the file-explorer folder menu. Gives the folder its
+   *  own Stashpad password (works for any folder path, incl. import-excluded
+   *  subfolders) and locks any Stashpad notes inside it. */
+  async encryptFolderFromExplorer(folder: string): Promise<void> {
+    if (this.encryption.hasOwnFolderKey(folder)) { if (await this.ensureFolderUnlocked(folder)) await this.lockFolder(folder); return; }
+    if (!this.encryption.isConfigured()) { new Notice("Set up Stashpad vault encryption first (Settings → Stashpad → Encryption), then try again."); return; }
+    const name = folder.split("/").pop() || folder;
+    const d = new Date(); const p = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+    const who = (this.settings.authorName || "").trim();
+    const initials = who ? who.split(/\s+/).map((w) => w[0]).join("") : (this.settings.authorId || "anon").slice(0, 4);
+    const label = `${stamp} - ${name} - ${initials}`;
+    new EncryptionPasswordModal(this.app, {
+      mode: "setup", offerKeychain: true, title: `Encrypt “${name}” with Stashpad`,
+      intro: "Give this folder its own password. Any Stashpad notes inside it get encrypted under it; you'll re-enter the password to unlock.",
+      onSubmit: async ({ next, remember }) => {
+        if (!next) return "Enter a password.";
+        try { await this.encryption.setupFolderKey(folder, next, label, remember); } catch (e) { return (e as Error).message; }
+        const n = await this.lockFolder(folder);
+        new Notice(n > 0 ? `Encrypted ${n} note${n === 1 ? "" : "s"} in “${name}”.` : `“${name}” now has a Stashpad password — notes added here will use it.`);
+        this.refreshFolderPanels?.();
+        return null;
+      },
+    }).open();
+  }
+
   // --- Phase B: per-folder key ROTATION (true invalidation — re-encrypt) ---
   private rotationLockPath(folder: string): string {
     const cleaned = folder.replace(/\/+$/, "");
@@ -3491,15 +3533,24 @@ export default class StashpadPlugin extends Plugin {
    *  resumeRotations() compares the lock's rotId to the keyfile entry's rotId to know
    *  whether the swap landed (→ commit) or not (→ drop temps). */
   async rotateFolderKey(folder: string, newPassword: string, remember = false): Promise<number> {
-    const cleaned = folder.replace(/\/+$/, "");
+    const requested = folder.replace(/\/+$/, "");
     if (!newPassword) { new Notice("A new password is required to rotate."); return -1; }
-    const oldDek = await this.ensureFolderUnlocked(cleaned);
+    const oldDek = await this.ensureFolderUnlocked(requested);
     if (!oldDek) return -1;
+    // Inheritance: rotate the key-OWNING folder, and re-encrypt every blob under its
+    // whole subtree (subfolders share the owner's key).
+    const cleaned = this.encryption.folderKeyEntry(requested)?.folderPath ?? requested;
     const lock = this.rotationLockPath(cleaned);
     if (await this.app.vault.adapter.exists(lock)) { new Notice("A rotation is already in progress for this folder (or one was interrupted — reload to recover)."); return -1; }
-    const blobs = this.app.vault.getFiles()
-      .filter((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned)
+    const inSubtree = (p: string) => p === cleaned || p.startsWith(cleaned + "/");
+    const liveBlobs = this.app.vault.getFiles()
+      .filter((f) => f.extension === "stashenc" && inSubtree(f.parent?.path?.replace(/\/+$/, "") ?? ""))
       .map((f) => f.path);
+    // Per-folder trash keys: the folder's TRASH blobs (in _deleted/, identified by
+    // the sidecar keyId) must rotate too, or they'd be orphaned under the old DEK.
+    const ownerKeyId = this.encryption.folderKeyEntry(cleaned)?.keyId;
+    const trashBlobs = ownerKeyId ? await deletedBlobsForKeyId(this.app, ownerKeyId) : [];
+    const blobs = [...liveBlobs, ...trashBlobs];
     const newDek = crypto.getRandomValues(new Uint8Array(32));
     const rotId = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
     const prog = blobs.length > 0 ? new Notice("", 0) : null;
@@ -3511,7 +3562,11 @@ export default class StashpadPlugin extends Plugin {
       await this.app.vault.adapter.write(lock, JSON.stringify({ folder: cleaned, phase: "committing", rotId, at: new Date().toISOString() }));
       await this.encryption.commitFolderRotation(cleaned, newPassword, newDek, rotId, undefined, remember);
       prog?.setMessage("🔄 Finalizing…");
-      await this.commitRotTemps(cleaned);
+      await this.commitRotTemps(cleaned); // live subtree
+      for (const tb of trashBlobs) { // trash blobs live in _deleted/, outside the subtree
+        await commitRotatedBlob(this.app, tb);
+        try { await rewrapDeletedSidecar(this.app, tb, oldDek, newDek); } catch (e) { console.warn("[Stashpad] trash sidecar rewrap failed", tb, e); }
+      }
       try { await this.app.vault.adapter.remove(lock); } catch { /* */ }
       prog?.hide();
       new Notice(`🔑 Rotated the key for “${cleaned.split("/").pop()}” — ${blobs.length} item${blobs.length === 1 ? "" : "s"} re-encrypted. The OLD password no longer unlocks it; share the new one with anyone who should keep access.`, 0);
@@ -3520,6 +3575,7 @@ export default class StashpadPlugin extends Plugin {
       prog?.hide();
       // Failure before the keyfile swap → originals intact; just drop the temps.
       try { await cleanupRotTemps(this.app, cleaned); } catch { /* */ }
+      for (const tb of trashBlobs) { try { await this.app.vault.adapter.remove(`${tb}.rot`); } catch { /* */ } }
       try { await this.app.vault.adapter.remove(lock); } catch { /* */ }
       console.warn("[Stashpad] rotation failed", e);
       new Notice(`Rotation failed: ${(e as Error).message}. Nothing was changed (originals intact).`, 0);
@@ -3541,12 +3597,18 @@ export default class StashpadPlugin extends Plugin {
       try { info = JSON.parse(await this.app.vault.adapter.read(lockPath)); } catch { /* */ }
       const folder = (info.folder ?? "").replace(/\/+$/, "");
       if (!folder) { try { await this.app.vault.adapter.remove(lockPath); } catch { /* */ } continue; }
-      const swapped = !!info.rotId && this.encryption.folderKeyEntry(folder)?.rotId === info.rotId;
+      const entry = this.encryption.folderKeyEntry(folder);
+      const swapped = !!info.rotId && entry?.rotId === info.rotId;
       if (swapped) {
-        await this.commitRotTemps(folder);
+        await this.commitRotTemps(folder); // live subtree
+        // Trash blobs (in _deleted/) keyed to this folder — commit their .rot too
+        // (byte copy; the keyfile already holds the new DEK). Hidden-origin sidecars
+        // can't be re-wrapped here (the old DEK is gone) — a rare crash edge.
+        if (entry?.keyId) { for (const tb of await deletedBlobsForKeyId(this.app, entry.keyId)) { try { await commitRotatedBlob(this.app, tb); } catch (e) { console.warn("[Stashpad] resume trash-commit failed", tb, e); } } }
         new Notice(`Finished an interrupted key rotation for “${folder.split("/").pop()}”.`, 0);
       } else {
         try { await cleanupRotTemps(this.app, folder); } catch { /* */ }
+        try { await cleanupRotTemps(this.app, "_deleted"); } catch { /* */ }
       }
       try { await this.app.vault.adapter.remove(lockPath); } catch { /* */ }
     }
@@ -3557,20 +3619,21 @@ export default class StashpadPlugin extends Plugin {
   /** Encrypt-delete a subtree into `_deleted/` (recoverable, encrypted) and
    *  permanently remove the plaintext. Returns the blob path, or null on failure. */
   async encryptDeleteSubtree(folder: string, rootId: StashpadId): Promise<string | null> {
-    if (!(await this.ensureEncryptionUnlocked())) return null;
-    const dek = this.encryption.getSessionKey();
+    // Per-folder trash keys: encrypt the trash blob under the FOLDER's key (or the
+    // vault DEK as fallback) and stamp its keyId into the sidecar so restore can
+    // resolve the right key — even for hidden-origin deletes.
+    const dek = await this.ensureFolderUnlocked(folder);
     if (!dek) return null;
     try {
       // Plugin runtime (not a workflow script) — Date is available.
       const deletedAt = new Date().toISOString();
       // "Encrypt trash filenames" hides the trash blob's name/origin even when
-      // the general hide-locked-titles setting is off. Per-folder overhaul: this
-      // folder's trashEncryptFilenames pref takes precedence over the globals.
-      // (Trash blobs still use the vault DEK for now — per-folder trash KEYS +
-      // hidden-origin restore are a later increment.)
+      // the general hide-locked-titles setting is off. This folder's
+      // trashEncryptFilenames pref takes precedence over the globals.
       const _trFp = (this.settings.folderEncPrefs ?? {})[folder.replace(/\/+$/, "")] ?? {};
       const hideTitle = (_trFp.trashEncryptFilenames ?? false) || (this.settings.hideLockedTitles ?? false) || (this.settings.encryptTrashFilenames ?? false);
-      const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle);
+      const keyId = this.encryption.folderKeyEntry(folder)?.keyId; // undefined ⇒ vault-keyed
+      const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle, keyId);
       this.pendingEncBlobs.add(r.blobPath); // fast-state index
       if (r.unpurged.length > 0) {
         new Notice(`⚠️ Sent to encrypted trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
@@ -3585,10 +3648,19 @@ export default class StashpadPlugin extends Plugin {
 
   /** Restore an encrypted-deleted blob back into its original folder. */
   async restoreDeletedAt(blobPath: string, opts: { silent?: boolean } = {}): Promise<boolean> {
-    if (!(await this.ensureEncryptionUnlocked())) return false;
-    const dek = this.encryption.getSessionKey();
-    if (!dek) return false;
     const meta = await readDeletedMeta(this.app, blobPath);
+    // Per-folder trash keys: resolve the key this blob was encrypted under via its
+    // sidecar keyId (the owning folder's key); else the vault DEK (legacy/vault-keyed).
+    let dek: Uint8Array | null;
+    if (meta?.keyId) {
+      const owner = this.encryption.folderPathByKeyId(meta.keyId);
+      dek = owner ? await this.ensureFolderUnlocked(owner) : null;
+      if (!dek) { if (!opts.silent) new Notice("Couldn't unlock the folder key this trashed note was encrypted with."); return false; }
+    } else {
+      if (!(await this.ensureEncryptionUnlocked())) return false;
+      dek = this.encryption.getSessionKey();
+    }
+    if (!dek) return false;
     // Backfill blobs are raw `.trash/` zips, not Stashpad bundles — different
     // restore path (plain unzip back into `.trash/`).
     if (meta?.kind === "rawtrash") {

@@ -325,11 +325,37 @@ export class EncryptionService {
   // unaffected. UNVERIFIED: no live crypto test yet; wiring into the lock/unlock
   // ops is intentionally deferred to an attended pass.
 
-  /** The keyfile entry for a folder, or null (folder uses the vault DEK). */
-  folderKeyEntry(folder: string): FolderKeyEntry | null {
-    return this.kf?.folderKeys?.[this.cleanFolder(folder)] ?? null;
+  /** The nearest ancestor folder (including the folder itself) that has its OWN
+   *  key, or null. Implements the "subfolders inherit the parent's key" decision:
+   *  a note in `Projects/Sub` is owned by `Projects` if only `Projects` has a key. */
+  private owningFolder(folder: string): string | null {
+    const fks = this.kf?.folderKeys;
+    if (!fks) return null;
+    let p = this.cleanFolder(folder);
+    while (p) {
+      if (fks[p]) return p;
+      const i = p.lastIndexOf("/");
+      if (i < 0) break;
+      p = p.slice(0, i);
+    }
+    return null;
   }
-  hasFolderKey(folder: string): boolean { return !!this.folderKeyEntry(folder); }
+  /** True only if THIS exact folder has its own key (not inherited) — for settings
+   *  UI decisions ("Set folder password" vs "Unlock/Change"). */
+  hasOwnFolderKey(folder: string): boolean { return !!this.kf?.folderKeys?.[this.cleanFolder(folder)]; }
+  /** The keyfile entry governing a folder — its own, or the nearest ancestor's
+   *  (inheritance). Null → the folder uses the vault DEK. */
+  folderKeyEntry(folder: string): FolderKeyEntry | null {
+    const owner = this.owningFolder(folder);
+    return owner ? (this.kf!.folderKeys![owner] ?? null) : null;
+  }
+  hasFolderKey(folder: string): boolean { return this.owningFolder(folder) !== null; }
+  /** The folder path whose key has this keyId, or null — for resolving which key a
+   *  trash blob was encrypted under (its sidecar stores the keyId). */
+  folderPathByKeyId(keyId: string): string | null {
+    for (const [path, e] of Object.entries(this.kf?.folderKeys ?? {})) if (e.keyId === keyId) return path;
+    return null;
+  }
   /** Active (non-deprecated) password slots for a folder, newest first. Deprecated
    *  slots are NEVER returned — an old/retired password must not unlock current
    *  content (matches the vault shared-password path). If there are somehow zero
@@ -337,18 +363,18 @@ export class EncryptionService {
   private folderActiveSlots(entry: FolderKeyEntry): KeyfilePasswordSlot[] {
     return entry.passwordSlots.filter((s) => !s.label.startsWith("[deprecated]"));
   }
-  /** Is the effective key for this folder available right now? */
+  /** Is the effective key for this folder available right now? (Session is keyed by
+   *  the OWNING folder, so an inheriting subfolder reports the owner's state.) */
   isFolderUnlocked(folder: string): boolean {
-    const entry = this.folderKeyEntry(folder);
-    return entry ? this.folderSessionKeys.has(this.cleanFolder(folder)) : this.isUnlocked();
+    const owner = this.owningFolder(folder);
+    return owner ? this.folderSessionKeys.has(owner) : this.isUnlocked();
   }
-  /** The DEK to use for `folder`: the unlocked folder key if it has its own,
-   *  otherwise the vault DEK. Returns a COPY (caller may zero), or null if the
-   *  needed key isn't unlocked. Arms the idle timer like getSessionKey. */
+  /** The DEK to use for `folder`: the unlocked owning-folder key, else the vault DEK.
+   *  Returns a COPY (caller may zero), or null if the needed key isn't unlocked. */
   getFolderKey(folder: string): Uint8Array | null {
-    const entry = this.folderKeyEntry(folder);
-    if (!entry) return this.getSessionKey();
-    const k = this.folderSessionKeys.get(this.cleanFolder(folder));
+    const owner = this.owningFolder(folder);
+    if (!owner) return this.getSessionKey();
+    const k = this.folderSessionKeys.get(owner);
     if (!k) return null;
     this.armIdle();
     return k.slice();
@@ -363,6 +389,10 @@ export class EncryptionService {
     if (!this.kf) throw new Error("Set up vault encryption first.");
     const f = this.cleanFolder(folder);
     if (this.kf.folderKeys?.[f]) throw new Error("This folder already has its own key.");
+    // Inheritance: a subfolder of an already-keyed folder uses the ancestor's key —
+    // don't let it mint a separate (nested) key.
+    const ancestor = this.owningFolder(f);
+    if (ancestor && ancestor !== f) throw new Error(`A parent folder (“${ancestor.split("/").pop()}”) already has its own password; this folder inherits it.`);
     const dek = crypto.getRandomValues(new Uint8Array(DEK_LEN));
     const wrapped = await encryptStash(dek, password);
     const keyId = newId(8);
@@ -387,7 +417,7 @@ export class EncryptionService {
     for (const slot of this.folderActiveSlots(entry)) {
       try {
         const dek = await decryptStash(fromB64(slot.wrapped), password);
-        this.folderSessionKeys.set(f, dek);
+        this.folderSessionKeys.set(entry.folderPath, dek); // key the session by the OWNING folder
         const kcId = this.folderKcIdFor(entry);
         if (remember || this.isFolderRemembered(kcId)) await this.rememberFolder(kcId, password);
         this.armIdle();
@@ -417,11 +447,12 @@ export class EncryptionService {
   async changeFolderPassword(folder: string, newPassword: string, remember = false): Promise<void> {
     if (!newPassword) throw new Error("Password required.");
     const f = this.cleanFolder(folder);
-    const dek = this.folderSessionKeys.get(f);
-    if (!dek) throw new Error("Unlock this folder first.");
     await this.refresh();
     const entry = this.folderKeyEntry(f);
     if (!entry || !this.kf) throw new Error("This folder has no key.");
+    const owner = entry.folderPath; // inheritance: operate on the key-owning folder
+    const dek = this.folderSessionKeys.get(owner);
+    if (!dek) throw new Error("Unlock this folder first.");
     // Retain the OLD keychain password under a deprecated id (never delete) so an
     // old export emailed months ago can still be looked up / decrypted.
     const prevActive = entry.passwordSlots.filter((s) => !s.label.startsWith("[deprecated]"));
@@ -441,7 +472,7 @@ export class EncryptionService {
         ...retained,
       ],
     };
-    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [f]: next };
+    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [owner]: next };
     await this.keyfiles.save(this.kf);
     if (remember || this.isFolderRemembered(kcId)) await this.rememberFolder(this.folderKcIdFor(next), newPassword);
   }
@@ -458,6 +489,7 @@ export class EncryptionService {
     if (!this.kf) throw new Error("Encryption is not set up.");
     const f = this.cleanFolder(folder);
     const entry = this.folderKeyEntry(f);
+    const owner = entry?.folderPath ?? f; // inheritance: rotate the key-owning folder
     const keyId = entry?.keyId ?? newId(8);
     const oldKcId = entry ? this.folderKcIdFor(entry) : null;
     // Park the old active keychain password (retain, never delete).
@@ -470,17 +502,19 @@ export class EncryptionService {
     const retained = (entry?.passwordSlots ?? []).map((s) => s.label.startsWith("[deprecated]") ? s : { ...s, label: `[deprecated] ${s.label}` });
     const newLabel = label ?? entry?.label ?? `rotated - ${f.split("/").pop() || f}`;
     const next: FolderKeyEntry = {
-      keyId, folderPath: f, label: newLabel, kcId: this.folderKcId(newLabel, keyId), rotId,
+      keyId, folderPath: owner, label: newLabel, kcId: this.folderKcId(newLabel, keyId), rotId,
       passwordSlots: [{ id: newId(8), label: "Folder password", wrapped: toB64(wrapped.data), kdf: wrapped.kdf, createdAt: new Date().toISOString() }, ...retained],
       createdAt: entry?.createdAt ?? new Date().toISOString(),
     };
-    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [f]: next };
+    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [owner]: next };
     await this.keyfiles.save(this.kf);
     // Zero the OLD folder DEK before replacing it — after a true-invalidation rotation
     // the prior key shouldn't linger in memory.
-    const prevSess = this.folderSessionKeys.get(f);
+    const prevSess = this.folderSessionKeys.get(owner);
     if (prevSess && prevSess !== newDek) prevSess.fill(0);
-    this.folderSessionKeys.set(f, newDek);
+    // Store a COPY — the caller (rotateFolderKey) zeros its own newDek buffer in a
+    // finally, which would otherwise zero the live session key we just set here.
+    this.folderSessionKeys.set(owner, newDek.slice());
     if (remember || (oldKcId && this.isFolderRemembered(oldKcId))) await this.rememberFolder(this.folderKcIdFor(next), newPassword);
   }
 
@@ -620,11 +654,13 @@ export class EncryptionService {
     this.clearIdle();
   }
 
-  /** Lock a SINGLE folder's key (leave the vault key + other folders unlocked). */
+  /** Lock a SINGLE folder's key (leave the vault key + other folders unlocked).
+   *  Resolves to the OWNING folder so locking an inheriting subfolder drops the
+   *  shared key. */
   lockFolder(folder: string): void {
-    const f = this.cleanFolder(folder);
-    const k = this.folderSessionKeys.get(f);
-    if (k) { k.fill(0); this.folderSessionKeys.delete(f); }
+    const owner = this.owningFolder(folder) ?? this.cleanFolder(folder);
+    const k = this.folderSessionKeys.get(owner);
+    if (k) { k.fill(0); this.folderSessionKeys.delete(owner); }
   }
 
   private cleanFolder(p: string): string { return (p || "").replace(/\/+$/, ""); }
