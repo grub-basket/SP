@@ -476,6 +476,10 @@ export class EncryptionService {
     };
     this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [f]: next };
     await this.keyfiles.save(this.kf);
+    // Zero the OLD folder DEK before replacing it — after a true-invalidation rotation
+    // the prior key shouldn't linger in memory.
+    const prevSess = this.folderSessionKeys.get(f);
+    if (prevSess && prevSess !== newDek) prevSess.fill(0);
     this.folderSessionKeys.set(f, newDek);
     if (remember || (oldKcId && this.isFolderRemembered(oldKcId))) await this.rememberFolder(this.folderKcIdFor(next), newPassword);
   }

@@ -3450,6 +3450,8 @@ export default class StashpadPlugin extends Plugin {
       await this.saveSettings();
     }
     prog?.hide();
+    // Wipe the per-folder DEK copies cached for this batch (hygiene — they're slices).
+    for (const k of keyCache.values()) { try { k?.fill(0); } catch { /* */ } }
     const folder = blobs[0].replace(/\/[^/]*$/, "");
     if (notes > 0) this.notifications.show({ message: `Unlocked ${notes} note${notes === 1 ? "" : "s"} across the vault.`, kind: "success", category: "system", folder });
     if (skippedFolders.size > 0) {

@@ -1053,8 +1053,11 @@ export class StashpadSettingTab extends PluginSettingTab {
     } else if (!unlocked) {
       head.addButton((b) => b.setButtonText("Unlock…").setCta().onClick(() => this.promptUnlockFolder(folder)));
     } else {
-      head.addButton((b) => b.setButtonText("Lock now").onClick(async () => { await this.plugin.lockFolder(folder); this.update?.(); }));
-      head.addButton((b) => b.setButtonText("Unlock all").onClick(async () => { await this.plugin.unlockFolder(folder); this.update?.(); }));
+      // "Lock" = forget THIS folder's key from memory (re-prompts on next access) —
+      // the per-folder analog of the vault "Lock now". It must NOT call
+      // plugin.lockFolder (that's the batch ENCRYPT op). Encrypting/decrypting the
+      // folder's content is the "Encrypt this folder's notes" toggle below.
+      head.addButton((b) => b.setButtonText("Lock (forget password)").onClick(() => { this.plugin.encryption.lockFolder(folder); new Notice("Folder locked — you'll re-enter its password next time."); this.update?.(); }));
       head.addButton((b) => b.setButtonText("Change password…").onClick(() => this.promptChangeFolderPassword(folder)));
       head.addButton((b) => { b.setButtonText("Rotate key…").onClick(() => this.promptRotateFolderKey(folder)); b.buttonEl.addClass("mod-warning"); });
     }

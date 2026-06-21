@@ -69,7 +69,10 @@ async function deliverLockedExport(plugin: StashpadPlugin, folder: string, baseN
       encNote = info.strong ? ` (encrypted · ${info.label})` : ` (encrypted · ${info.label} — Argon2id unavailable here, weaker)`;
     }
     const stamp = (moment as unknown as (...a: unknown[]) => { format(f: string): string })().format("YYYYMMDD-HHmmss");
-    const exportSub = (plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
+    // Sanitize the configured export subfolder — reject `..`/absolute segments so a
+    // bad settings value can't escape the folder (consistent with safeVaultFolder).
+    const rawSub = (plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
+    const exportSub = rawSub.split("/").filter((s) => s && s !== "." && s !== ".." && !/[\\:]/.test(s)).join("/") || "_exports";
     const exportFolder = `${folder}/${exportSub}`;
     if (!(await plugin.app.vault.adapter.exists(exportFolder))) await plugin.app.vault.adapter.mkdir(exportFolder);
     const outBase = `${safeBaseName(baseName)}-${stamp}`;
@@ -81,6 +84,7 @@ async function deliverLockedExport(plugin: StashpadPlugin, folder: string, baseN
     }
     new Notice(`Exported encrypted note${encNote} → ${outPath}`, 0);
   } catch (e) { new Notice(`Export failed: ${(e as Error).message}`); console.error(e); }
+  finally { try { zip.fill(0); } catch { /* */ } } // wipe the decrypted plaintext copy
 }
 
 /** Export the selection/cursor subtree as an OKF bundle (.zip / .tar.gz) and/or a
