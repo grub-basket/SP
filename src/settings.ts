@@ -956,6 +956,15 @@ export class StashpadSettingTab extends PluginSettingTab {
     };
   }
 
+  /** A group HEADING + divider (like the "Sharing" header) as a standalone item, to
+   *  visually divide a settings tab into sections. */
+  private headingDef(name: string, desc?: string): SettingDefinitionItem {
+    return this.sectionDef(name, desc ?? "", (host) => {
+      const s = new Setting(host).setName(name).setHeading();
+      if (desc) s.setDesc(desc);
+    }, [name.toLowerCase()]);
+  }
+
   // ---- Per-folder encryption (per-folder overhaul) ----
   /** "YYYY-MM-DD HH:mm – folder – author|authorId" key label (overhaul plan #3). */
   private folderKeyLabel(folder: string): string {
@@ -1028,6 +1037,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       host.createEl("p", { cls: "setting-item-description" }).setText("Set up vault encryption above first. Per-folder passwords layer on top: a folder with its own password uses a separate key; folders without one use the vault password.");
       return;
     }
+    // Merged archive + trash caution (the same warnings the folder-panel modal shows
+    // on the action) — surfaced here at the start of the folder section.
+    host.createEl("p", { cls: "setting-item-description stashpad-enc-warning" }).setText("⚠️ Encryption has no recovery — if you lose a password, anything encrypted under it (notes, archived items, and encrypted-trash items) is gone for good. Locking / archiving / secure-deleting permanently removes the plaintext; the encrypted copy is the only one left. A plaintext archive only de-indexes notes from search — it does NOT encrypt them.");
     const folders = this.plugin.discoverStashpadFolders();
     if (folders.length === 0) { host.createEl("p", { cls: "setting-item-description" }).setText("No Stashpad folders found yet."); return; }
     // Keep a VALID selection across re-renders (default to the first folder).
@@ -1728,6 +1740,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       } // end SHOW_DEVICE_APPROVAL_UI
     }, ["encryption", "encrypt", "password", "passphrase", "lock", "unlock", "key", "security", "private", "collaborator", "share", "team", "member", "approve"]));
 
+    items.push(this.headingDef("Trash & title defaults", "Vault-wide defaults for deleted notes and locked-note titles. Per-folder overrides live under “Per-Folder Passwords” below."));
     items.push(this.renderDef("Encrypt items sent to trash", "When ON, deleting a note sends it to Stashpad's encrypted trash (recoverable with your password) instead of a plaintext trash. Default OFF.", (s) =>
       s.addToggle((t) => t.setValue(this.plugin.settings.encryptTrash).onChange(async (v) => {
         if (v && !this.encryptionOrOnboard()) { this.update?.(); return; }
@@ -1754,6 +1767,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.plugin.refreshAllStashpadViews?.();
       })), ["title", "hide", "private", "lock", "placeholder", "visibility"]));
 
+    items.push(this.headingDef("Archive", "Archive folders are de-indexed from cross-folder search; mark a folder as an archive (and set whether it encrypts) under “Per-Folder Passwords” below."));
     items.push(this.renderDef("Default archive folder", "Where the \"Move selection to archive\" command sends notes (they're auto-encrypted on arrival). Leaving this blank is fine — the command will just show you a list of your archive folders to pick from each time (or use the only one if you have a single archive). Mark a folder as an archive via the folder panel → right-click → \"Mark as archive\".", (s) => {
       const archives = this.plugin.settings.archiveFolders ?? [];
       s.addDropdown((d) => {

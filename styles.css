@@ -4731,3 +4731,6 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
   color: var(--text-muted);
 }
 .stashpad-version-add:hover { color: var(--text-normal); }
+
+/* Encryption settings: merged archive+trash caution at the top of the per-folder section. */
+.stashpad-enc-warning { color: var(--text-warning, var(--text-muted)); background: var(--background-modifier-error-hover, transparent); border-left: 3px solid var(--text-warning, var(--text-muted)); padding: 8px 12px; border-radius: 4px; margin: 4px 0 12px; }

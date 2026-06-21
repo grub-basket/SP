@@ -10,8 +10,8 @@ import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE } from "./types"
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, writeRotatedBlob, commitRotatedBlob, cleanupRotTemps, listRotTemps, deletedBlobsForKeyId, rewrapDeletedSidecar } from "./encryption-ops";
-import { EncryptionPasswordModal } from "./modals";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, writeRotatedBlob, commitRotatedBlob, cleanupRotTemps, listRotTemps, deletedBlobsForKeyId, rewrapDeletedSidecar, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs } from "./encryption-ops";
+import { EncryptionPasswordModal, ConfirmModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
@@ -936,6 +936,17 @@ export default class StashpadPlugin extends Plugin {
       // aren't surfaced as Stashpad folders) — the entry point for encrypting a
       // folder straight from Obsidian's file explorer.
       menu.addItem((item) => item.setTitle("🔒 Encrypt with Stashpad").setIcon("lock").onClick(() => void this.encryptFolderFromExplorer(path)));
+      // Offer "Decrypt with Stashpad" only when this looks like a raw-folder bundle: a
+      // `.stashenc` child in a folder that is NOT a Stashpad-notes folder. (A Stashpad
+      // folder's `.stashenc` children are locked NOTES, not a bundle — showing Decrypt
+      // there would be a confusing no-op.) The menu builder is sync, so we can't read the
+      // sidecar kind here; the click handler validates via rawFolderBlobIn. This keeps the
+      // 90% case clean — only a fully-locked Stashpad folder (no discoverable notes) could
+      // still mis-show it, and the handler no-ops gracefully there.
+      const hasBlob = file.children?.some((c) => c instanceof TFile && c.extension === "stashenc");
+      if (hasBlob && !this.folderHasStashpadNotes(path)) {
+        menu.addItem((item) => item.setTitle("🔓 Decrypt with Stashpad").setIcon("unlock").onClick(() => void this.decryptFolderFromExplorer(path)));
+      }
       if (!this.discoverStashpadFolders().includes(path)) return;
       menu.addItem((item) => {
         item
@@ -1712,6 +1723,19 @@ export default class StashpadPlugin extends Plugin {
         }
       },
     });
+    // Gap 4: raw-folder bundles only surfaced via the file-explorer right-click. Add a
+    // command-palette path so you can find & decrypt a bundle without hunting for it.
+    this.addCommand({
+      id: "stashpad-decrypt-folder-bundle",
+      name: "Decrypt a folder bundle (encrypted non-Stashpad folder)…",
+      callback: async () => {
+        if (!this.encryption.isConfigured()) { new Notice("Stashpad encryption isn't set up."); return; }
+        const bundles = await listRawFolderBlobs(this.app);
+        if (!bundles.length) { new Notice("No encrypted folder bundles found in this vault."); return; }
+        new FolderBundleSuggest(this.app, bundles, (b) => void this.decryptFolderFromExplorer(b.folder)).open();
+      },
+    });
+
     this.addCommand({
       id: "stashpad-build-jd-index",
       name: "Build JD index notes (creates Stashpad-note hierarchy)",
@@ -3480,18 +3504,51 @@ export default class StashpadPlugin extends Plugin {
    *  protected `.stash` — original blob untouched (feedback #4 / Option B). */
   exportLockedSubtree(blobPath: string): Promise<void> { return cmdExportLockedBlob(this, blobPath); }
 
-  /** "Encrypt with Stashpad" from the file-explorer folder menu. Gives the folder its
-   *  own Stashpad password (works for any folder path, incl. import-excluded
-   *  subfolders) and locks any Stashpad notes inside it. */
-  async encryptFolderFromExplorer(folder: string): Promise<void> {
-    if (this.encryption.hasOwnFolderKey(folder)) { if (await this.ensureFolderUnlocked(folder)) await this.lockFolder(folder); return; }
-    if (!this.encryption.isConfigured()) { new Notice("Set up Stashpad vault encryption first (Settings → Stashpad → Encryption), then try again."); return; }
-    const name = folder.split("/").pop() || folder;
+  /** Does `folder` contain (or sit within, or contain) Stashpad notes? This is the
+   *  CONTENT-based discriminator for "lock the notes" vs "bundle arbitrary files" — it
+   *  deliberately does NOT consult the key registry, because a folder keeps its key after
+   *  a raw bundle is decrypted, and key-presence would then mis-route a re-encrypt (gap 2)
+   *  and mis-show the Decrypt menu item (gap 1). The `d.startsWith(f + "/")` arm is
+   *  protective: if `folder` is an ANCESTOR of a Stashpad folder, treat it as Stashpad so
+   *  we never raw-bundle (zip + delete) live Stashpad notes nested inside it. */
+  private folderHasStashpadNotes(folder: string): boolean {
+    const f = folder.replace(/\/+$/, "");
+    return this.discoverStashpadFolders().some((d) => f === d || f.startsWith(d + "/") || d.startsWith(f + "/"));
+  }
+
+  private encStamp(): string {
     const d = new Date(); const p = (n: number) => String(n).padStart(2, "0");
-    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  }
+
+  private folderKeyLabelFor(name: string): string {
     const who = (this.settings.authorName || "").trim();
     const initials = who ? who.split(/\s+/).map((w) => w[0]).join("") : (this.settings.authorId || "anon").slice(0, 4);
-    const label = `${stamp} - ${name} - ${initials}`;
+    return `${this.encStamp()} - ${name} - ${initials}`;
+  }
+
+  /** "Encrypt with Stashpad" from the file-explorer folder menu. For a Stashpad folder,
+   *  gives it its own password and locks the Stashpad notes inside. For an ARBITRARY
+   *  (non-Stashpad) folder, warns via a modal then bundles every file in it into a
+   *  single encrypted `.stashenc`, deleting the originals (decrypt all at once). */
+  async encryptFolderFromExplorer(folder: string): Promise<void> {
+    if (!this.encryption.isConfigured()) { new Notice("Set up Stashpad vault encryption first (Settings → Stashpad → Encryption), then try again."); return; }
+    const name = folder.split("/").pop() || folder;
+
+    // Gap 2: route on CONTENT, not key-presence. A folder previously raw-encrypted then
+    // decrypted still owns a key, but it's not a Stashpad-notes folder, so it must route
+    // back to the raw path — not the note-locker (which would silently no-op).
+    if (this.folderHasStashpadNotes(folder)) { await this.encryptStashpadFolder(folder, name); return; }
+
+    // Already a raw bundle in there? Don't re-bundle — point the user at Decrypt.
+    if (await rawFolderBlobIn(this.app, folder)) { new Notice(`“${name}” is already encrypted as a Stashpad bundle. Use “Decrypt with Stashpad” to open it.`); return; }
+    await this.encryptRawFolder(folder, name);
+  }
+
+  /** Stashpad-folder branch: own password + lock the notes inside. */
+  private async encryptStashpadFolder(folder: string, name: string): Promise<void> {
+    if (this.encryption.hasOwnFolderKey(folder)) { if (await this.ensureFolderUnlocked(folder)) await this.lockFolder(folder); return; }
+    const label = this.folderKeyLabelFor(name);
     new EncryptionPasswordModal(this.app, {
       mode: "setup", offerKeychain: true, title: `Encrypt “${name}” with Stashpad`,
       intro: "Give this folder its own password. Any Stashpad notes inside it get encrypted under it; you'll re-enter the password to unlock.",
@@ -3504,6 +3561,71 @@ export default class StashpadPlugin extends Plugin {
         return null;
       },
     }).open();
+  }
+
+  /** Non-Stashpad branch: confirm the all-at-once model, then bundle the whole folder.
+   *  Reuses an existing folder key if present (gap 2 re-encrypt case) so we don't trip
+   *  setupFolderKey's "refuse if key exists" guard. */
+  private async encryptRawFolder(folder: string, name: string): Promise<void> {
+    const runBundle = async (dek: Uint8Array): Promise<string | null> => {
+      const keyId = this.encryption.folderKeyEntry(folder)?.keyId;
+      try {
+        const r = await lockRawFolder(this.app, folder, dek, keyId, this.encStamp());
+        if (r.unpurged.length) new Notice(`Encrypted “${name}” (${r.fileCount} files) — but ${r.unpurged.length} file(s) changed mid-encrypt and were left in place.`);
+        else new Notice(`Encrypted “${name}” — ${r.fileCount} file(s) bundled into one encrypted file.`);
+      } catch (e) { return (e as Error).message; }
+      this.refreshFolderPanels?.();
+      return null;
+    };
+    new ConfirmModal(
+      this.app,
+      `Encrypt “${name}” — non-Stashpad folder`,
+      // Gap 3: be explicit that this is NOT Cmd+Z-undoable — the reversal is Decrypt. We
+      // hard-delete (not trash) the originals ON PURPOSE so no plaintext copy is left
+      // behind in `.trash`, which would defeat the encryption.
+      "This isn't a Stashpad folder, so its files can't be locked individually.\nStashpad will bundle EVERY file in this folder into one encrypted file and permanently delete the originals (no copy left in Obsidian's trash — that would defeat encryption).\nThis can't be undone with Cmd+Z; the only way back is “Decrypt with Stashpad” + the password. Continue?",
+      "Bundle & encrypt",
+      (confirmed: boolean) => {
+        if (!confirmed) return;
+        // Reuse an existing key (decrypt→re-encrypt cycle); else prompt for a new one.
+        if (this.encryption.hasOwnFolderKey(folder)) {
+          void (async () => {
+            const dek = await this.ensureFolderUnlocked(folder);
+            if (!dek) return; // prompts/notices on failure
+            const err = await runBundle(dek);
+            if (err) new Notice(err);
+          })();
+          return;
+        }
+        const label = this.folderKeyLabelFor(name);
+        new EncryptionPasswordModal(this.app, {
+          mode: "setup", offerKeychain: true, title: `Encrypt “${name}” with Stashpad`,
+          intro: "Set a password for this bundle. You'll re-enter it to decrypt the whole folder.",
+          onSubmit: async ({ next, remember }) => {
+            if (!next) return "Enter a password.";
+            try { await this.encryption.setupFolderKey(folder, next, label, remember); } catch (e) { return (e as Error).message; }
+            const dek = this.encryption.getFolderKey(folder);
+            if (!dek) return "Couldn't derive the folder key.";
+            return await runBundle(dek);
+          },
+        }).open();
+      },
+    ).open();
+  }
+
+  /** "Decrypt with Stashpad" on a folder holding a raw-folder bundle: unlock the
+   *  folder's key, then unzip the bundle back into the folder and remove the blob. */
+  async decryptFolderFromExplorer(folder: string): Promise<void> {
+    const blob = await rawFolderBlobIn(this.app, folder);
+    if (!blob) { new Notice("No Stashpad bundle found in this folder."); return; }
+    const name = folder.split("/").pop() || folder;
+    const dek = await this.ensureFolderUnlocked(folder);
+    if (!dek) return; // ensureFolderUnlocked prompts/notices on failure
+    try {
+      const r = await unlockRawFolder(this.app, blob, dek);
+      new Notice(`Decrypted “${name}” — restored ${r.filesWritten} file(s).`);
+    } catch (e) { new Notice(`Couldn't decrypt: ${(e as Error).message}`); }
+    this.refreshFolderPanels?.();
   }
 
   // --- Phase B: per-folder key ROTATION (true invalidation — re-encrypt) ---
@@ -5765,4 +5887,26 @@ class ImportTargetModal extends SuggestModal<ImportTarget> {
     }
   }
   onChooseSuggestion(item: ImportTarget): void { this.onPick(item.folder); }
+}
+
+/** Picker for the "Decrypt a folder bundle…" command (gap 4): lists every raw-folder
+ *  `.stashenc` bundle in the vault so you can decrypt one without finding it manually. */
+class FolderBundleSuggest extends SuggestModal<{ folder: string; blobPath: string }> {
+  constructor(
+    app: import("obsidian").App,
+    private bundles: { folder: string; blobPath: string }[],
+    private onPick: (b: { folder: string; blobPath: string }) => void,
+  ) {
+    super(app);
+    this.setPlaceholder("Choose an encrypted folder bundle to decrypt…");
+  }
+  getSuggestions(query: string): { folder: string; blobPath: string }[] {
+    const q = query.toLowerCase();
+    return this.bundles.filter((b) => b.folder.toLowerCase().includes(q));
+  }
+  renderSuggestion(item: { folder: string; blobPath: string }, el: HTMLElement): void {
+    el.createDiv({ text: item.folder || "(vault root)" });
+    el.createDiv({ cls: "stashpad-suggest-note", text: item.blobPath });
+  }
+  onChooseSuggestion(item: { folder: string; blobPath: string }): void { this.onPick(item); }
 }

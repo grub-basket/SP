@@ -268,7 +268,7 @@ export interface DeletedMeta {
   /** "deleted" = a Stashpad note bundle (importStashZip on restore).
    *  "rawtrash" = a raw zip of Obsidian's `.trash/` tree from the backfill
    *  command (plain unzip back into `.trash/` on restore). */
-  v: number; kind: "deleted" | "rawtrash";
+  v: number; kind: "deleted" | "rawtrash" | "rawfolder";
   /** Folder the note was deleted FROM — where Restore puts it back. EMPTY when
    *  titles are hidden (the sidecar is plaintext; the origin would leak where a
    *  hidden note came from) — `originalFolderEnc` carries it instead. */
@@ -602,6 +602,110 @@ export async function listRotTemps(app: App, folder: string): Promise<string[]> 
   return (await listFilesRecursive(app, cleaned))
     .filter((f) => f.endsWith(`.${STASHENC_EXT}.rot`))
     .map((f) => f.replace(/\.rot$/, ""));
+}
+
+// ---- Generic (non-Stashpad) folder encryption: bundle a whole folder ----
+
+/** Encrypt an ARBITRARY folder (any file types, not Stashpad notes) into a single
+ *  `.stashenc` bundle living inside the folder, then delete the originals. Reuses the
+ *  raw-zip path (like the trash backfill). `keyId` is the folder key it's encrypted
+ *  under (stamped in the sidecar so decrypt resolves the right key). */
+export async function lockRawFolder(app: App, folder: string, dek: Uint8Array, keyId: string | undefined, stamp: string): Promise<{ blobPath: string; fileCount: number; unpurged: string[] }> {
+  const cleaned = folder.replace(/\/+$/, "");
+  const files = (await listFilesRecursive(app, cleaned)).filter((f) => !f.endsWith(`.${STASHENC_EXT}`) && !f.endsWith(`.${STASHMETA_EXT}`));
+  if (files.length === 0) throw new Error("This folder has no files to encrypt.");
+  const entries: { name: string; data: ArrayBuffer }[] = [];
+  const mtimes = new Map<string, number>();
+  for (const p of files) {
+    entries.push({ name: `files/${p.slice(cleaned.length + 1)}`, data: await app.vault.adapter.readBinary(p) });
+    try { const st = await app.vault.adapter.stat(p); if (st) mtimes.set(p, st.mtime); } catch { /* no baseline */ }
+  }
+  const zipBytes = await zipFiles(entries);
+  const blob = await encryptWithKey(zipBytes, dek);
+  const back = await decryptWithKey(blob, dek);
+  if (back.length !== zipBytes.length) throw new Error("Encryption self-check failed (size).");
+  for (let i = 0; i < zipBytes.length; i++) if (back[i] !== zipBytes[i]) throw new Error("Encryption self-check failed (content).");
+  const base = safeBlobBase(cleaned.split("/").pop() || "folder");
+  let blobPath = `${cleaned}/${base}.${STASHENC_EXT}`;
+  for (let n = 1; await app.vault.adapter.exists(blobPath); n++) blobPath = `${cleaned}/${base} (${n}).${STASHENC_EXT}`;
+  await writeBlobVerified(app, blobPath, blob);
+  const meta: DeletedMeta = { v: 1, kind: "rawfolder", originalFolder: cleaned, parentId: null, title: cleaned.split("/").pop() || "", count: files.length, created: stamp, rootId: "", deletedAt: stamp, ...(keyId ? { keyId } : {}) };
+  try { await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta)); } catch (e) { console.warn("[Stashpad] couldn't write rawfolder sidecar", e); }
+  const unpurged: string[] = [];
+  for (const p of files) {
+    const baseline = mtimes.get(p);
+    try {
+      if (baseline != null) { const st = await app.vault.adapter.stat(p); if (st && st.mtime !== baseline) { unpurged.push(p); continue; } }
+      await app.vault.adapter.remove(p);
+    } catch (e) { console.warn("[Stashpad] couldn't delete file", p, e); unpurged.push(p); }
+  }
+  // Gap 5: prune subdirectories emptied by the deletion (deepest first) so the folder
+  // isn't left full of hollow dirs. Never touch `cleaned` itself (it holds the blob).
+  if (unpurged.length === 0) {
+    const subdirs = [...new Set(files.map((p) => p.slice(0, p.lastIndexOf("/"))))]
+      .filter((d) => d.length > cleaned.length)
+      .sort((a, b) => b.length - a.length);
+    for (const d of subdirs) {
+      // rmdir's 2nd arg must be `true` even for an empty dir — with `false` the adapter
+      // calls file-`rm` and fails EISDIR. We've already confirmed it's empty, so recursing
+      // removes nothing extra.
+      try { const l = await app.vault.adapter.list(d); if (!l.files.length && !l.folders.length) await app.vault.adapter.rmdir(d, true); } catch { /* keep non-empty/locked dirs */ }
+    }
+  }
+  return { blobPath, fileCount: files.length, unpurged };
+}
+
+/** Decrypt a kind:"rawfolder" bundle back into its folder, then remove the blob +
+ *  sidecar. Existing files are never overwritten (suffix). */
+export async function unlockRawFolder(app: App, blobPath: string, dek: Uint8Array): Promise<{ filesWritten: number; folder: string }> {
+  const blob = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
+  if (!isEncryptedStash(blob)) throw new Error("Not an encrypted bundle.");
+  const meta = await readDeletedMeta(app, blobPath);
+  const folder = safeVaultFolder(meta?.originalFolder) ?? blobPath.replace(/\/[^/]*$/, "");
+  const zipBytes = await decryptWithKey(blob, dek);
+  const zip = await unzipFiles(zipBytes);
+  let written = 0;
+  for (const [name, entry] of Object.entries(zip)) {
+    if (!name.startsWith("files/")) continue;
+    const rel = safeTrashRelPath(name.slice("files/".length));
+    if (!rel) { console.warn("[Stashpad] skipped unsafe folder entry", name); continue; }
+    const dir = `${folder}/${rel}`.split("/").slice(0, -1).join("/");
+    let cur = "";
+    for (const seg of dir.split("/")) { cur = cur ? `${cur}/${seg}` : seg; if (cur && !(await app.vault.adapter.exists(cur))) await app.vault.adapter.mkdir(cur); }
+    let dest = `${folder}/${rel}`;
+    for (let n = 1; await app.vault.adapter.exists(dest); n++) dest = `${folder}/${rel.replace(/(\.[^./]*)?$/, ` (${n})$1`)}`;
+    await app.vault.adapter.writeBinary(dest, entry.buffer as ArrayBuffer);
+    written++;
+  }
+  await app.vault.adapter.remove(blobPath);
+  try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* */ }
+  return { filesWritten: written, folder };
+}
+
+/** The kind:"rawfolder" blob in a folder (the bundle from lockRawFolder), or null. */
+export async function rawFolderBlobIn(app: App, folder: string): Promise<string | null> {
+  const cleaned = folder.replace(/\/+$/, "");
+  try {
+    const listing = await app.vault.adapter.list(cleaned);
+    for (const f of listing.files) {
+      if (!f.endsWith(`.${STASHENC_EXT}`)) continue;
+      const m = await readDeletedMeta(app, f);
+      if (m?.kind === "rawfolder") return f;
+    }
+  } catch { /* no folder */ }
+  return null;
+}
+
+/** Every kind:"rawfolder" bundle in the vault, as {folder, blobPath}. Scans the
+ *  `.stashenc` files Obsidian has indexed and keeps those whose sidecar is rawfolder.
+ *  Used by the command-palette "Decrypt a folder bundle…" picker (gap 4). */
+export async function listRawFolderBlobs(app: App): Promise<{ folder: string; blobPath: string }[]> {
+  const out: { folder: string; blobPath: string }[] = [];
+  for (const f of app.vault.getFiles()) {
+    if (f.extension !== STASHENC_EXT) continue;
+    try { const m = await readDeletedMeta(app, f.path); if (m?.kind === "rawfolder") out.push({ folder: f.parent?.path?.replace(/\/+$/, "") ?? "", blobPath: f.path }); } catch { /* skip */ }
+  }
+  return out;
 }
 
 /** All encrypted-deleted blob paths in `_deleted/`. */
