@@ -306,6 +306,15 @@ export interface StashpadSettings {
    *  keyed by cleaned folder path. See `FolderEncPrefs`. Empty default → no folder
    *  is encrypted until the user opts in, so existing vaults are unaffected. */
   folderEncPrefs: Record<string, FolderEncPrefs>;
+  /** 0.118.0: per-folder tab/panel icon. Keyed by cleaned folder path → a Lucide
+   *  icon id (e.g. "rocket", "star"). When set, the folder's Stashpad tab (and the
+   *  folder panel + folder switcher) show this icon instead of the default
+   *  "list-tree". Empty/absent → default icon. */
+  folderIcons: Record<string, string>;
+  /** 0.118.3: when true, the folder switcher / creator modal also lists pinned
+   *  notes (jump straight to one). Off by default to keep the picker focused on
+   *  folders. */
+  folderSwitcherIncludePinned: boolean;
   /** Comma-separated subfolder-name prefixes (default "_") that EXCLUDE a folder from
    *  Stashpad discovery + import — it stays local, not surfaced/pulled in. A path is
    *  excluded if any of its segments starts with a listed prefix. */
@@ -551,6 +560,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   hideLockedTitles: false,
   archiveFolders: [],
   folderEncPrefs: {},
+  folderIcons: {},
+  folderSwitcherIncludePinned: false,
   importExcludePrefixes: "_",
   lockedSubtrees: [],
   searchOpensInNewTab: true,
@@ -1030,6 +1041,9 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** The folder selected in the per-folder dropdown — kept on the tab instance so it
    *  survives the declarative `update()` re-renders (no ghosting between folders). */
   private pfeSelected: string | null = null;
+  /** 0.118.6: selected folder for the (searchable) per-folder icon control in
+   *  Folders & Storage. */
+  private iconPickFolder: string | null = null;
 
   private renderPerFolderEncryption(host: HTMLElement): void {
     const enc = this.plugin.encryption;
@@ -1230,6 +1244,33 @@ export class StashpadSettingTab extends PluginSettingTab {
     cats.foldersStorage.push(toggle("Inherit Obsidian's excluded files", "Also hide files matching Obsidian's “Excluded files” list (Settings → Files & Links) from Stashpad's link autocomplete and file surfaces — so you manage exclusions in one place. Plugin-internal formats like .edtz are always excluded regardless.",
       () => this.plugin.settings.inheritObsidianExclusions, (v) => { this.plugin.settings.inheritObsidianExclusions = v; }, ["excluded", "ignore", "files"]));
 
+    cats.foldersStorage.push(toggle("Include pinned notes in the folder switcher", "When on, the folder switcher / creator (the folder button and the “Open or switch Stashpad folder” command) also lists your pinned notes, so you can jump straight to one. Off keeps the picker focused on folders.",
+      () => this.plugin.settings.folderSwitcherIncludePinned, (v) => { this.plugin.settings.folderSwitcherIncludePinned = v; }, ["pinned", "switcher", "folder", "picker", "jump"]));
+
+    // 0.118.6: per-folder tab icon — moved here from the Encryption tab's
+    // per-folder panel so it's searchable. Pick a folder, then enter a Lucide
+    // icon id; a live preview shows whether it's valid.
+    cats.foldersStorage.push(this.renderDef("Folder tab icon", "Give a folder its own Lucide icon (e.g. rocket, star, book-open) shown on its tab, the folder switcher, and its folder-panel row. Pick a folder, then enter an icon id (browse at lucide.dev). Blank = the default icon. Set per folder.", (s) => {
+      const folders = this.plugin.discoverStashpadFolders();
+      if (folders.length === 0) { s.setDesc("No Stashpad folders found yet."); return; }
+      if (!this.iconPickFolder || !folders.includes(this.iconPickFolder)) this.iconPickFolder = folders[0];
+      let textComp: import("obsidian").TextComponent | null = null;
+      const preview = s.controlEl.createSpan({ cls: "stashpad-folder-icon-preview" });
+      const paint = (val: string): void => { preview.empty(); const v = val.trim(); if (v) setIcon(preview, v); };
+      s.addDropdown((d) => {
+        for (const f of folders) d.addOption(f, f.split("/").pop() || f);
+        d.setValue(this.iconPickFolder!);
+        d.onChange((v) => { this.iconPickFolder = v; const cur = this.plugin.getFolderIcon(v) ?? ""; textComp?.setValue(cur); paint(cur); });
+      });
+      s.addText((t) => {
+        textComp = t;
+        t.setPlaceholder("list-tree");
+        t.setValue(this.plugin.getFolderIcon(this.iconPickFolder!) ?? "");
+        t.onChange(async (v) => { paint(v); await this.plugin.setFolderIcon(this.iconPickFolder!, v); });
+      });
+      paint(this.plugin.getFolderIcon(this.iconPickFolder) ?? "");
+    }, ["icon", "folder", "tab", "lucide", "emoji", "switcher"]));
+
     cats.importExport.push(this.renderDef("Dedicated import subfolder (optional)", "Optional. A subfolder (relative to each Stashpad folder) where dropped .stash files auto-import. Leave blank to just drop files into the Stashpad folder itself (recommended). Suggested name: _imports.", (s) =>
       s.addText((t) => t.setValue(this.plugin.settings.importDropFolder).setPlaceholder("_imports (leave blank to use the folder root)").onChange(async (v) => {
         this.plugin.settings.importDropFolder = (v || "").trim().replace(/^\/+|\/+$/g, "");
@@ -1249,25 +1290,13 @@ export class StashpadSettingTab extends PluginSettingTab {
     cats.maintenance.push(this.renderDef("Rebootstrap existing Stashpad folders", "Walk every folder that has a home note: ensure infrastructure (_imports, _exports, drafts file), backfill the redundant parentLink + children frontmatter fields, rename any note whose filename slug no longer matches its body's first line, AND migrate legacy attachment filenames to the new name-first format (`photo-<id>.png`). Safe to run anytime; skip-if-equal means already-synced notes are no-op writes.", (s) =>
       s.addButton((b) =>
         b.setButtonText("Rebootstrap now").onClick(async () => {
+          // 0.118.4: progress bar + persistent success live in the shared
+          // runRebootstrapWithUI (so the command and this button match).
           b.setDisabled(true).setButtonText("Working…");
           try {
-            const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped } = await this.plugin.rebootstrapAllFolders();
-            const parts: string[] = [];
-            parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
-            if (imported > 0) parts.push(`imported ${imported} loose file${imported === 1 ? "" : "s"}`);
-            if (attachmentsLinked > 0) parts.push(`linked attachments on ${attachmentsLinked} note${attachmentsLinked === 1 ? "" : "s"}`);
-            if (attachmentsRenamed > 0) parts.push(`renamed ${attachmentsRenamed} attachment${attachmentsRenamed === 1 ? "" : "s"}`);
-            if (fmWritten > 0) parts.push(`updated frontmatter on ${fmWritten} of ${fmChecked} notes`);
-            else if (fmChecked > 0) parts.push(`frontmatter already in sync (${fmChecked} notes checked)`);
-            if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"} to match body`);
-            if (authors > 0) parts.push(`rebuilt author registry (${authors} author${authors === 1 ? "" : "s"})`);
-            new Notice(`Stashpad: ${parts.join("; ")}.`);
-            if (attachmentsSkipped > 0) {
-              new Notice(`Stashpad: ${attachmentsSkipped} attachment${attachmentsSkipped === 1 ? "" : "s"} need renaming, but skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links” in Obsidian, then rebootstrap again.`, 12000);
-            }
-          } catch (e) {
-            new Notice(`Stashpad: rebootstrap failed (${(e as Error).message})`);
-          } finally {
+            await this.plugin.runRebootstrapWithUI();
+          } catch { /* the helper already showed an error notice */ }
+          finally {
             b.setDisabled(false).setButtonText("Rebootstrap now");
           }
         })), ["rebootstrap", "rebuild", "repair", "backfill", "slug"]));

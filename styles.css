@@ -892,6 +892,45 @@
   margin-left: 6px;
   flex: 0 0 auto;
 }
+/* 0.118.0: live preview swatch next to the per-folder icon input in settings. */
+.stashpad-folder-icon-preview {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-right: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  color: var(--text-normal);
+  flex: 0 0 auto;
+}
+.stashpad-folder-icon-preview .svg-icon { width: 18px; height: 18px; }
+/* 0.118.4: rebootstrap progress / success notice. */
+.stashpad-progress-notice, .stashpad-progress-done, .stashpad-progress-error { min-width: 240px; }
+.stashpad-progress-title { font-weight: var(--font-semibold); margin-bottom: 6px; }
+.stashpad-progress-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--background-modifier-border);
+  overflow: hidden;
+  margin: 4px 0 6px;
+}
+.stashpad-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--interactive-accent);
+  border-radius: 3px;
+  transition: width 0.15s ease;
+}
+.stashpad-progress-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+/* 0.118.9: the completion summary must be legible on the notice's own
+   background. `--text-normal` was dark — invisible on themes that give notices a
+   dark background in light mode. Inherit the notice's text color instead, which
+   is guaranteed to contrast its background in any theme. */
+.stashpad-progress-done .stashpad-progress-sub { color: inherit; opacity: 0.9; }
+.stashpad-progress-done .stashpad-progress-title { color: var(--text-success, var(--interactive-accent)); }
+.stashpad-progress-error .stashpad-progress-title { color: var(--text-error); }
 /* 0.117.0: "jump to level" button pinned at the right end of the breadcrumb
    row. Absolutely positioned (the bar is overflow:hidden + nowrap, so an
    in-flow button at the end would clip exactly when crumbs overflow — which is
@@ -1305,6 +1344,19 @@
 .stashpad-note-body > :last-child { margin-bottom: 0; }
 .stashpad-note-text > :first-child { margin-top: 0; }
 .stashpad-note-text > :last-child { margin-bottom: 0; }
+/* 0.118.8: code blocks / inline code in note bodies WRAP instead of bleeding
+   off the right edge (a fenced ```code``` defaults to white-space:pre, which
+   doesn't wrap → it overflowed horizontally). Wrapping also gives the block
+   real vertical height, so the 2-line clamp can actually collapse it. */
+.stashpad-note-text pre,
+.stashpad-note-text code,
+.stashpad-focused-body pre,
+.stashpad-focused-body code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  max-width: 100%;
+}
 /* Tighten heading → adjacent text spacing inside note previews. Both
    the heading's bottom margin AND the FOLLOWING element's top margin
    contribute to the gap, plus headings have padding-bottom in some
@@ -2817,6 +2869,14 @@
   min-height: 0;
   max-height: 80vh;
   overflow-y: auto;
+  /* `overflow-y: auto` forces overflow-x to `auto` too (CSS computed-value
+     rule), so this box CLIPS horizontally at its border edge. The button row
+     is justify-flex-end, so the right button sat flush against that edge and
+     its keyboard focus ring (and rounded border) got shaved. Horizontal
+     padding pulls content in so the ring draws within the padding, before the
+     clip. 0.118.2. */
+  padding-left: 8px;
+  padding-right: 8px;
   /* Clearance so the Cancel/Delete/Set row clears the modal's
      bottom edge. */
   padding-bottom: 16px;
@@ -4840,6 +4900,19 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
   color: var(--text-muted);
 }
 .stashpad-version-add:hover { color: var(--text-normal); }
+.stashpad-version-fork { display: inline-flex; align-items: center; }
+.stashpad-version-fork .svg-icon { width: 14px; height: 14px; }
 
 /* Encryption settings: merged archive+trash caution at the top of the per-folder section. */
-.stashpad-enc-warning { color: var(--text-warning, var(--text-muted)); background: var(--background-modifier-error-hover, transparent); border-left: 3px solid var(--text-warning, var(--text-muted)); padding: 8px 12px; border-radius: 4px; margin: 4px 0 12px; }
+/* 0.118.6: the old `--text-warning` on `--background-modifier-error-hover` was
+   orange-on-solid-red — unreadable in both themes. Use a subtle red TINT with
+   normal (theme-adaptive) text + a red accent border, so it reads as a warning
+   and stays legible light or dark. */
+.stashpad-enc-warning {
+  color: var(--text-normal);
+  background: rgba(var(--color-red-rgb, 224, 49, 49), 0.12);
+  border-left: 3px solid var(--color-red, #e03131);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin: 4px 0 12px;
+}

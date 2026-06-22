@@ -1544,27 +1544,9 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({
       id: "stashpad-rebootstrap-all",
       name: "Rebootstrap all Stashpad folders (backfill metadata + rename stale titles)",
-      callback: async () => {
-        new Notice("Stashpad: rebootstrapping…");
-        try {
-          const { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped } = await this.rebootstrapAllFolders();
-          const parts: string[] = [];
-          parts.push(`rebootstrapped ${touched.length} folder${touched.length === 1 ? "" : "s"}`);
-          if (imported > 0) parts.push(`imported ${imported} loose file${imported === 1 ? "" : "s"}`);
-          if (attachmentsLinked > 0) parts.push(`linked attachments on ${attachmentsLinked} note${attachmentsLinked === 1 ? "" : "s"}`);
-          if (attachmentsRenamed > 0) parts.push(`renamed ${attachmentsRenamed} attachment${attachmentsRenamed === 1 ? "" : "s"}`);
-          if (fmWritten > 0) parts.push(`updated ${fmWritten} note${fmWritten === 1 ? "" : "s"}' metadata`);
-          if (slugsRenamed > 0) parts.push(`renamed ${slugsRenamed} note${slugsRenamed === 1 ? "" : "s"}`);
-          if (authors > 0) parts.push(`${authors} author${authors === 1 ? "" : "s"} in registry`);
-          parts.push(`(checked ${fmChecked} total)`);
-          new Notice(`Stashpad: ${parts.join(" · ")}`);
-          if (attachmentsSkipped > 0) {
-            new Notice(`Stashpad: ${attachmentsSkipped} attachment${attachmentsSkipped === 1 ? "" : "s"} need renaming, but skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links” in Obsidian, then rebootstrap again.`, 12000);
-          }
-        } catch (e) {
-          new Notice(`Stashpad: rebootstrap failed (${(e as Error).message})`);
-        }
-      },
+      // 0.118.4: progress + success feedback lives in runRebootstrapWithUI
+      // (persistent notice + bar), shared with the settings button.
+      callback: () => { void this.runRebootstrapWithUI().catch(() => { /* error notice already shown */ }); },
     });
     this.addCommand({
       id: "stashpad-adopt-note",
@@ -2407,13 +2389,69 @@ export default class StashpadPlugin extends Plugin {
    *  ensure it has the import/export subfolders, and run the redundant-frontmatter
    *  backfill (parentLink + children) so older notes pick up the recovery fields.
    *  Used by the "Rebootstrap" button in settings to retrofit older folders. */
-  async rebootstrapAllFolders(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
+  /** 0.118.4: run rebootstrap with a persistent progress Notice (bar advances
+   *  per folder, weighted by note count) that's replaced in place by a
+   *  persistent success (or error) Notice. Shared by the settings button + the
+   *  command so both get the same feedback. */
+  async runRebootstrapWithUI(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
+    const notice = new Notice("", 0); // persistent until we replace/dismiss it
+    const el = notice.noticeEl;
+    el.empty();
+    el.addClass("stashpad-progress-notice");
+    el.createDiv({ cls: "stashpad-progress-title", text: "Rebootstrapping Stashpad folders…" });
+    const bar = el.createDiv({ cls: "stashpad-progress-bar" });
+    const fill = bar.createDiv({ cls: "stashpad-progress-fill" });
+    const sub = el.createDiv({ cls: "stashpad-progress-sub", text: "Counting notes…" });
+    const onProgress = (done: number, total: number, label: string): void => {
+      const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+      fill.style.width = `${pct}%`;
+      sub.setText(label ? `${label} · ${pct}%` : `${pct}%`);
+    };
+    try {
+      const r = await this.rebootstrapAllFolders(onProgress);
+      // 0.118.9: lead with the outcome, and say so explicitly when nothing
+      // needed changing (so an empty-looking summary isn't ambiguous).
+      const changes = r.imported + r.attachmentsLinked + r.attachmentsRenamed + r.fmWritten + r.slugsRenamed;
+      const parts: string[] = [];
+      parts.push(`Checked ${r.touched.length} folder${r.touched.length === 1 ? "" : "s"} (${r.fmChecked} note${r.fmChecked === 1 ? "" : "s"})`);
+      if (changes === 0) {
+        parts.push("everything already in sync — no changes needed");
+      } else {
+        if (r.fmWritten > 0) parts.push(`updated frontmatter on ${r.fmWritten} note${r.fmWritten === 1 ? "" : "s"}`);
+        if (r.slugsRenamed > 0) parts.push(`renamed ${r.slugsRenamed} note${r.slugsRenamed === 1 ? "" : "s"} to match body`);
+        if (r.imported > 0) parts.push(`imported ${r.imported} loose file${r.imported === 1 ? "" : "s"}`);
+        if (r.attachmentsLinked > 0) parts.push(`linked attachments on ${r.attachmentsLinked} note${r.attachmentsLinked === 1 ? "" : "s"}`);
+        if (r.attachmentsRenamed > 0) parts.push(`renamed ${r.attachmentsRenamed} attachment${r.attachmentsRenamed === 1 ? "" : "s"}`);
+      }
+      if (r.authors > 0) parts.push(`${r.authors} author${r.authors === 1 ? "" : "s"} in registry`);
+      // Replace the progress notice in place with a persistent success notice.
+      fill.style.width = "100%";
+      el.empty();
+      el.removeClass("stashpad-progress-notice");
+      el.addClass("stashpad-progress-done");
+      el.createDiv({ cls: "stashpad-progress-title", text: "✓ Rebootstrap complete" });
+      el.createDiv({ cls: "stashpad-progress-sub", text: `${parts.join("; ")}.` });
+      if (r.attachmentsSkipped > 0) {
+        new Notice(`Stashpad: ${r.attachmentsSkipped} attachment${r.attachmentsSkipped === 1 ? "" : "s"} need renaming, but skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links”, then rebootstrap again.`, 12000);
+      }
+      return r;
+    } catch (e) {
+      el.empty();
+      el.removeClass("stashpad-progress-notice");
+      el.addClass("stashpad-progress-error");
+      el.createDiv({ cls: "stashpad-progress-title", text: "Rebootstrap failed" });
+      el.createDiv({ cls: "stashpad-progress-sub", text: (e as Error).message });
+      throw e;
+    }
+  }
+
+  async rebootstrapAllFolders(onProgress?: (done: number, total: number, label: string) => void): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
     // 0.79.19: suppress contribution stamping for the duration (+ a short
     // tail to catch async link-rewrite modify events) so rebootstrap never
     // bumps `modified`/`created` or adds contributors.
     this.rebootstrapInProgress = true;
     try {
-      return await this.rebootstrapAllFoldersInner();
+      return await this.rebootstrapAllFoldersInner(onProgress);
     } finally {
       window.setTimeout(() => {
         this.rebootstrapInProgress = false;
@@ -2428,7 +2466,7 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  private async rebootstrapAllFoldersInner(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
+  private async rebootstrapAllFoldersInner(onProgress?: (done: number, total: number, label: string) => void): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
     const ROOT_ID = "__root__";
     const seen = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -2437,6 +2475,18 @@ export default class StashpadPlugin extends Plugin {
       const folder = f.parent?.path;
       if (folder) seen.add(folder);
     }
+    // 0.118.4: progress weighting. Count each folder's notes ONCE here (no
+    // persistent cache needed — we're about to walk everything anyway) so the
+    // bar advances in proportion to folder size. `total` is the note count
+    // across all home-note folders; a folder advances the bar by its own count.
+    const fileCount = new Map<string, number>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const p = f.parent?.path;
+      if (p && seen.has(p)) fileCount.set(p, (fileCount.get(p) ?? 0) + 1);
+    }
+    const progressTotal = Math.max(1, [...fileCount.values()].reduce((a, b) => a + b, 0));
+    let progressDone = 0;
+    onProgress?.(0, progressTotal, "Starting…");
     const importSub = (this.settings.importDropFolder || "").trim().replace(/^\/+|\/+$/g, "");
     const exportSub = (this.settings.exportFolder || "").trim().replace(/^\/+|\/+$/g, "");
     const touched: string[] = [];
@@ -2461,6 +2511,8 @@ export default class StashpadPlugin extends Plugin {
     const linkUpdatesOn = !!(this.app.vault as { getConfig?: (k: string) => unknown }).getConfig?.("alwaysUpdateLinks");
     const okfSet = new Set(this.okfActiveFolders());
     for (const folder of seen) {
+      const fcount = fileCount.get(folder) ?? 1;
+      onProgress?.(progressDone, progressTotal, `Processing “${folder.split("/").pop() || folder}” (${fcount} note${fcount === 1 ? "" : "s"})`);
       try {
         if (importSub) await ensureFolder(`${folder}/${importSub}`);
         if (exportSub) await ensureFolder(`${folder}/${exportSub}`);
@@ -2505,8 +2557,12 @@ export default class StashpadPlugin extends Plugin {
         touched.push(folder);
       } catch (e) {
         console.warn(`Stashpad: rebootstrap skipped ${folder}`, e);
+      } finally {
+        progressDone += fcount;
+        onProgress?.(progressDone, progressTotal, `Processing “${folder.split("/").pop() || folder}”`);
       }
     }
+    onProgress?.(progressTotal, progressTotal, "Finalizing…");
     // 0.77.6: rebootstrap is the catch-all full-vault repair, so refresh
     // the author registry cache from the same scan. This is read-only
     // w.r.t. the user's notes (it only rewrites the plugin-private
@@ -2774,6 +2830,40 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** 0.118.0: the user-chosen Lucide icon id for a folder's tab/panel, or
+   *  undefined to use the default. Keyed by cleaned folder path. */
+  getFolderIcon(folder: string): string | undefined {
+    const key = (folder || "").replace(/\/+$/, "");
+    const v = this.settings.folderIcons?.[key];
+    return v && v.trim() ? v.trim() : undefined;
+  }
+
+  /** 0.118.0: persist a folder's icon (empty/undefined clears it), then refresh
+   *  every open Stashpad tab showing that folder + the folder panels so the new
+   *  icon appears immediately. */
+  async setFolderIcon(folder: string, icon: string | undefined): Promise<void> {
+    const key = (folder || "").replace(/\/+$/, "");
+    const map = { ...(this.settings.folderIcons ?? {}) };
+    if (icon && icon.trim()) map[key] = icon.trim(); else delete map[key];
+    this.settings.folderIcons = map;
+    await this.saveSettings();
+    this.refreshFolderIconFor(key);
+  }
+
+  /** Re-read the tab header (icon + title) for every Stashpad view pinned to
+   *  `folder`, and refresh the folder panels. 0.118.0. */
+  refreshFolderIconFor(folder: string): void {
+    const key = (folder || "").replace(/\/+$/, "");
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const v = leaf.view as any;
+      if (v && (v.noteFolder || "").replace(/\/+$/, "") === key) {
+        try { (leaf as any).updateHeader?.(); } catch { /* ignore */ }
+        try { v.refreshFolderSwitcherIcon?.(); } catch { /* ignore */ }
+      }
+    }
+    this.refreshFolderPanels();
+  }
+
   /** Unified folder picker / switcher / creator — the single entry
    *  point for the ribbon button, the view's switch-folder button, and
    *  the `pickFolder` keybinding / command-palette entry. 0.65.0.
@@ -2799,6 +2889,7 @@ export default class StashpadPlugin extends Plugin {
       | { kind: "switch-current"; folder: string; label: string; icon: string }
       | { kind: "create"; folder: string; label: string; icon: string }
       | { kind: "convert"; folder: string; label: string; icon: string }
+      | { kind: "pinned"; folder: string; label: string; icon: string; file: TFile }
       | { kind: "trash"; label: string; icon: string };
 
     const folderForLeaf = (leaf: WorkspaceLeaf): string => {
@@ -2868,6 +2959,20 @@ export default class StashpadPlugin extends Plugin {
       baseItems.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: this.isArchiveFolder(folder) ? "archive" : "layout-template" });
     }
 
+    // 0.118.3: optionally surface pinned notes so the switcher can jump
+    // straight to one. Title from the filename (sync), same as the folder panel.
+    const titleFromFile = (f: TFile): string =>
+      f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || f.basename;
+    const pinnedItems: Item[] = this.settings.folderSwitcherIncludePinned
+      ? this.listPinnedNotes().map((p) => ({
+          kind: "pinned" as const,
+          folder: p.folder,
+          file: p.file,
+          label: titleFromFile(p.file),
+          icon: "pin",
+        }))
+      : [];
+
     const plugin = this;
     const modal = new (class extends SuggestModal<Item> {
       getSuggestions(query: string): Item[] {
@@ -2900,6 +3005,11 @@ export default class StashpadPlugin extends Plugin {
               icon: "folder-input",
             });
           }
+        }
+        // 0.118.3: pinned-note jump targets (when enabled). Matched on title
+        // or folder; placed after the folder actions, before the create offer.
+        for (const it of pinnedItems) {
+          if (matchesAll(it.label) || matchesAll("folder" in it ? it.folder : "")) filtered.push(it);
         }
         // Create / convert offer. Query is non-empty AND isn't reserved.
         //  - If the folder doesn't exist anywhere in the vault →
@@ -2956,6 +3066,7 @@ export default class StashpadPlugin extends Plugin {
       }
       async onChooseSuggestion(item: Item): Promise<void> {
         if (item.kind === "trash") { plugin.openEncryptedTrash(); return; }
+        if (item.kind === "pinned") { await plugin.revealNoteInStashpad(item.file); return; }
         if (item.kind === "reveal") {
           plugin.app.workspace.revealLeaf(item.leaf);
           return;

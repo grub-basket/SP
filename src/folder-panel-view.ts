@@ -494,7 +494,9 @@ export class StashpadFolderPanelView extends ItemView {
     // (one icon instead of folder + a separate badge).
     const isArchive = this.plugin.isArchiveFolder(folder);
     const folderIcon = row.createSpan({ cls: "stashpad-folderpanel-folder-icon" });
-    setIcon(folderIcon, isArchive ? "archive" : "folder");
+    // 0.118.0: a user-set per-folder icon wins; otherwise archive folders show
+    // the archive glyph and everything else the generic folder icon.
+    setIcon(folderIcon, this.plugin.getFolderIcon(folder) ?? (isArchive ? "archive" : "folder"));
     if (isArchive) folderIcon.setAttr("aria-label", "Archive folder — notes moved in are auto-encrypted");
     const homeColor = this.folderHomeColor(folder);
     if (homeColor) folderIcon.style.color = homeColor;

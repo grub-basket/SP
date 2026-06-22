@@ -17,6 +17,7 @@ export const SHEET_LABEL_KEY = "sheet-label"; // optional custom tab label
 export const SHEET_ORIGIN_KEY = "sheet-origin"; // true on the original (group seed)
 export const FORKED_FROM_KEY = "forked-from"; // provenance: id of the note this was forked from
 export const SIBLINGS_KEY = "fork-siblings"; // wikilinks to all other members of the fork family
+export const FORKED_AT_KEY = "forked-at"; // ISO timestamp when this note was forked
 
 /** Keys that mark a note as a sheet version or record its provenance. They are
  *  stripped when a note is DUPLICATED by clone / fork-note / insert-template —
@@ -24,6 +25,7 @@ export const SIBLINGS_KEY = "fork-siblings"; // wikilinks to all other members o
  *  group and never an "original" or "final". */
 export const SHEET_COPY_SKIP_KEYS: readonly string[] = [
   SHEET_KEY, SHEET_ORDER_KEY, SHEET_FINAL_KEY, SHEET_LABEL_KEY, SHEET_ORIGIN_KEY, FORKED_FROM_KEY, SIBLINGS_KEY,
+  FORKED_AT_KEY,
 ];
 
 type Fm = Record<string, unknown> | null | undefined;

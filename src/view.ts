@@ -36,6 +36,7 @@ import {
   SHEET_ORIGIN_KEY,
   FORKED_FROM_KEY,
   SIBLINGS_KEY,
+  FORKED_AT_KEY,
   SHEET_COPY_SKIP_KEYS,
   sheetIdOf,
   isVersionMember,
@@ -54,6 +55,7 @@ import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arra
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
+
 
 const VIEW_MODE_LABELS: Record<ViewMode, string> = {
   nested: "Nested",
@@ -287,6 +289,11 @@ export class StashpadView extends ItemView {
    *  (lazy-loaded) on reload. 0.91.0. */
   private lastSelectionByFocus = new Map<StashpadId, StashpadId[]>();
   private expandedNotes = new Set<StashpadId>();
+  /** 0.118.10: ids the user has MANUALLY collapsed while their row was
+   *  auto-expanded by the cursor (autoExpandCursorRow). Suppresses the transient
+   *  `.is-cursor-expanded` so an explicit collapse sticks; cleared when the
+   *  cursor leaves the row (then it auto-expands again next time). */
+  private cursorExpandOverride = new Set<StashpadId>();
   /** Sheet versions: which version (note id) of a `sheet:` group is currently
    *  shown as the row. View-state only (not persisted) — falls back to the
    *  final pick / first-by-order when unset. */
@@ -393,7 +400,13 @@ export class StashpadView extends ItemView {
       ?? (this as any).titleEl as HTMLElement | null;
     if (titleEl && titleEl.textContent !== text) titleEl.setText(text);
   }
-  getIcon(): string { return "list-tree"; }
+  getIcon(): string {
+    // 0.118.0: per-folder icon (set in settings) overrides the default, so a
+    // folder's tab carries its own Lucide icon. Obsidian renders the tab icon
+    // via setIcon, which only understands Lucide ids — an invalid id renders
+    // nothing, so the picker shows a live preview to guard against that.
+    return this.plugin.getFolderIcon(this.noteFolder) ?? "list-tree";
+  }
 
   async onOpen(): Promise<void> {
     const host = this.contentEl;
@@ -2630,6 +2643,14 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** 0.118.0: re-paint the folder-switcher button's icon in place (called when
+   *  the per-folder icon changes in settings, so open tabs update live without
+   *  a full re-render). */
+  refreshFolderSwitcherIcon(): void {
+    const span = this.containerEl.querySelector(".stashpad-folder-btn .stashpad-btn-icon") as HTMLElement | null;
+    if (span) { span.empty(); setIcon(span, this.plugin.getFolderIcon(this.noteFolder) ?? "folder"); }
+  }
+
   private renderTimeFilterBar(parent: HTMLElement): void {
     const bar = parent.createDiv({ cls: "stashpad-time-filter-bar" });
 
@@ -2637,7 +2658,9 @@ export class StashpadView extends ItemView {
     const folderBtn = bar.createEl("button", { cls: "stashpad-folder-btn" });
     const isOverride = !!this.folderOverride;
     const displayName = (this.noteFolder.split("/").pop() || this.noteFolder) || "Stashpad";
-    setIcon(folderBtn.createSpan({ cls: "stashpad-btn-icon" }), "folder");
+    // 0.118.0: per-folder icon (settings) on the switcher too, falling back to
+    // the generic folder glyph.
+    setIcon(folderBtn.createSpan({ cls: "stashpad-btn-icon" }), this.plugin.getFolderIcon(this.noteFolder) ?? "folder");
     folderBtn.createSpan({ text: displayName, cls: "stashpad-btn-text" });
     folderBtn.title = isOverride
       ? `Folder (override): ${this.noteFolder}\nClick to change or revert to default.`
@@ -4817,7 +4840,7 @@ export class StashpadView extends ItemView {
     if (isCursor) row.addClass("is-cursor");
     // 0.73.14: auto-expand the cursor row on initial render too (not
     // just on arrow-key repaints). Settings-gated.
-    if (isCursor && this.plugin.settings.autoExpandCursorRow) row.addClass("is-cursor-expanded");
+    if (isCursor && this.plugin.settings.autoExpandCursorRow && !this.cursorExpandOverride.has(node.id)) row.addClass("is-cursor-expanded");
     if (isPickTarget) row.addClass("is-pick-target");
     if (this.isCompleted(node)) row.addClass("is-completed");
     if (this.isListPinned(node.id)) row.addClass("is-list-pinned");
@@ -5029,9 +5052,10 @@ export class StashpadView extends ItemView {
         tab.onclick = (e) => { e.stopPropagation(); this.setActiveVersion(gid, m.id); };
       }
     }
-    const add = bar.createEl("button", { cls: "stashpad-version-add", text: "+" });
-    add.title = "New version";
-    add.onclick = (e) => { e.stopPropagation(); void this.cmdForkVersion(node, true); };
+    const fork = bar.createEl("button", { cls: "stashpad-version-add stashpad-version-fork" });
+    setIcon(fork, "git-fork");
+    fork.title = "Fork this version (copy)";
+    fork.onclick = (e) => { e.stopPropagation(); void this.cmdForkVersion(node); };
   }
 
   /** Create + wire the task checkbox (used at the row's left edge on desktop,
@@ -5146,23 +5170,33 @@ export class StashpadView extends ItemView {
       }
       // After layout, decide whether to keep the clamp + show the toggle.
       requestAnimationFrame(() => {
-        // 0.73.16: if the row is currently auto-expanded by the cursor
-        // (CSS rule on .is-cursor-expanded unclamps the text), the
-        // overflow check would see scrollHeight == clientHeight and
-        // strip .is-clamped — permanently destroying the clamp so the
-        // text NEVER re-collapses when the cursor moves away. Bail
-        // early when the cursor is on this row; the next renderNoteBody
-        // pass (or a future repaint) will measure correctly.
-        if (container.closest?.(".stashpad-note.is-cursor-expanded")) return;
-        // With line-clamp the text node's clientHeight reflects the
-        // 2-line cap; scrollHeight reflects the full unconstrained
-        // height. A small tolerance avoids spurious "More" toggles for
-        // text that fits in 2 lines exactly.
+        // 0.118.11: an EXPANDED note isn't clamped, so its scrollHeight ==
+        // clientHeight — measuring it would (wrongly) read "fits" and cache
+        // ovV=false. That stale false then suppressed the toggle the moment you
+        // collapsed the note (fast-path stripped the clamp, no button — the
+        // "body shows but the button is gone, permanently" bug). So: never
+        // measure an unclamped note. An expanded note ALWAYS gets a (collapse)
+        // toggle; only measure/cache when the body is actually clamped.
+        if (expanded) {
+          this.attachExpandToggle(opts, container, node, expanded);
+          return;
+        }
+        // 0.118.7: measure overflow against the ACTUAL clamped height
+        // (scrollHeight vs clientHeight) — rendered markdown lines aren't a
+        // fixed multiple of the base line-height, so the 0.118.5 "line-height ×
+        // 2" heuristic over-triggered (a toggle on nearly every note). The only
+        // wrinkle is that the cursor row is transiently unclamped by
+        // `.is-cursor-expanded`; so for the read we momentarily drop that class
+        // (synchronous — no repaint between the remove, the measure, and the
+        // re-add), letting `.is-clamped` define clientHeight.
+        const cursorRow = container.closest?.(".stashpad-note.is-cursor-expanded") as HTMLElement | null;
+        if (cursorRow) cursorRow.removeClass("is-cursor-expanded");
         const overflowing = textEl.scrollHeight > textEl.clientHeight + 4;
-        // Memoize for subsequent re-renders at this width.
+        if (cursorRow) cursorRow.addClass("is-cursor-expanded");
+        // Memoize for subsequent re-renders at this width (clamped read only).
         entry.ovW = memoW;
         entry.ovV = overflowing;
-        if (!overflowing && !expanded) {
+        if (!overflowing) {
           // Short note that fits — drop the clamp so the fade gradient doesn't apply.
           textEl.removeClass("is-clamped");
           return;
@@ -5187,21 +5221,46 @@ export class StashpadView extends ItemView {
     const host = opts.toggleHost ?? container;
     // Remove any old toggle the host may already have (re-renders).
     host.querySelector(".stashpad-expand-toggle")?.remove();
+    // 0.118.10: the row may be transiently auto-expanded by the cursor
+    // (.is-cursor-expanded). The toggle must reflect what's VISIBLE — so a
+    // cursor-auto-expanded row shows the "collapse" (up) affordance, and
+    // clicking it actually collapses (previously the persistent state said
+    // "collapsed" while the CSS kept it open, so the arrow was wrong and the
+    // click did nothing visible).
+    const cursorExpanded = !!container.closest?.(".stashpad-note.is-cursor-expanded");
+    const effectiveExpanded = expanded || cursorExpanded;
     const toggle = host.createEl("button", { cls: "stashpad-expand-toggle" });
-    toggle.title = expanded ? "Show less" : "Show more";
+    toggle.title = effectiveExpanded ? "Show less" : "Show more";
     if (inHost || Platform.isMobile) {
-      setIcon(toggle, expanded ? "chevron-up" : "chevron-down");
+      setIcon(toggle, effectiveExpanded ? "chevron-up" : "chevron-down");
       toggle.addClass("is-icon");
       if (inHost) toggle.addClass("is-inline");
     } else {
-      toggle.setText(expanded ? "Show less" : "Show more");
+      toggle.setText(effectiveExpanded ? "Show less" : "Show more");
     }
     if (opts.toggleAnchor && opts.toggleAnchor.parentElement === host) {
       host.insertBefore(toggle, opts.toggleAnchor);
     }
+    // 0.118.11: the row enters the note on double-click; a fast double-tap on
+    // THIS button would bubble up and accidentally drill in. Swallow dblclick
+    // (and mousedown) so toggle interactions never reach the row handler.
+    toggle.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
+    toggle.addEventListener("mousedown", (e) => { e.stopPropagation(); });
     toggle.onclick = (e) => {
       e.stopPropagation();
-      this.setNoteExpanded(node.id, !this.isNoteExpanded(node.id));
+      const rowEl = container.closest?.(".stashpad-note") as HTMLElement | null;
+      const isCursorExpandedNow = !!rowEl?.classList.contains("is-cursor-expanded");
+      const currentlyExpanded = this.isNoteExpanded(node.id) || isCursorExpandedNow;
+      const next = !currentlyExpanded;
+      if (isCursorExpandedNow && !next) {
+        // Collapsing an auto-expanded cursor row: drop the transient class and
+        // remember the override so the next repaint doesn't immediately re-open it.
+        rowEl?.removeClass("is-cursor-expanded");
+        this.cursorExpandOverride.add(node.id);
+      } else if (next) {
+        this.cursorExpandOverride.delete(node.id);
+      }
+      this.setNoteExpanded(node.id, next);
       // Re-render just this body in place to preserve list scroll.
       container.empty();
       this.renderNoteBody(container, node, opts);
@@ -6326,7 +6385,10 @@ export class StashpadView extends ItemView {
       // 0.73.14: transient auto-expand. CSS-only — flips off the
       // clamp on the cursor row's text without mutating the
       // expandedNotes Set, so moving away naturally re-collapses.
-      row.classList.toggle("is-cursor-expanded", autoExpand && isCursor);
+      // 0.118.10: respect a manual-collapse override; clear it once the cursor
+      // leaves the row so the auto-expand resumes on the next visit.
+      if (!isCursor) this.cursorExpandOverride.delete(id);
+      row.classList.toggle("is-cursor-expanded", autoExpand && isCursor && !this.cursorExpandOverride.has(id));
       // 0.73.15: pick-target class. Used by the in-list parent picker
       // so its arrow-key nav also avoids the full-render rebuild.
       row.classList.toggle("is-pick-target", idx === pickIdx);
@@ -7656,6 +7718,7 @@ export class StashpadView extends ItemView {
     source: TreeNode,
     newParent: StashpadId,
     createdPaths: string[],
+    opts: { preserveCreated?: boolean; copyKind?: "fork" } = {},
   ): Promise<StashpadId | null> {
     if (!source.file) return null;
     // 0.67.4: SAFETY CHECK — refuse to clone a node into itself or a
@@ -7680,7 +7743,11 @@ export class StashpadView extends ItemView {
     const slug = bodyToSlug(body, this.activeStopwords());
     const filename = buildFilename(slug, cloneId);
     const path = `${this.noteFolder}/${filename}`;
-    const created = new Date().toISOString();
+    const nowIso = new Date().toISOString();
+    // With `preserveCreated` (a fork) the copy keeps the source's `created` and
+    // records `modified` = now. All other callers (Clone, insert-template, note
+    // paste) keep the default new-note `created`.
+    const created = opts.preserveCreated && source.created ? source.created : nowIso;
     const attachments = this.extractAttachments(body);
 
     // Minimal initial file — just enough to be a valid Stashpad note. The
@@ -7712,6 +7779,8 @@ export class StashpadView extends ItemView {
             if (SHEET_COPY_SKIP_KEYS.includes(k)) continue;
             m[k] = v;
           }
+          if (opts.preserveCreated) m.modified = nowIso; // edited = when the copy was made
+          if (opts.copyKind === "fork") m[FORKED_AT_KEY] = nowIso;
         });
       } catch (e) {
         console.warn("[Stashpad] cloneSubtree: processFrontMatter failed", e);
@@ -7732,7 +7801,7 @@ export class StashpadView extends ItemView {
     // node. 0.67.4: use the pre-insert snapshot, NEVER call
     // getChildren again at this depth.
     for (const c of childrenSnapshot) {
-      await this.cloneSubtree(c, cloneId, createdPaths);
+      await this.cloneSubtree(c, cloneId, createdPaths, opts);
     }
     return cloneId;
   }
@@ -7833,7 +7902,7 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     const folder = this.noteFolder;
     const createdPaths: string[] = [];
-    const newRootId = await this.cloneSubtree(node, parentId, createdPaths);
+    const newRootId = await this.cloneSubtree(node, parentId, createdPaths, { preserveCreated: true, copyKind: "fork" });
     if (!newRootId) return;
     // Provenance: the forked root records the note it was forked from. (The
     // sheet/origin keys were stripped by cloneSubtree, so this is the only
@@ -7928,7 +7997,7 @@ export class StashpadView extends ItemView {
    *  `blank` → empty body; otherwise the source body is duplicated (a fork).
    *  The new version becomes the shown one. Used by the row "+" button, the
    *  context menu, and the command. */
-  async cmdForkVersion(source?: TreeNode, blank = false): Promise<void> {
+  async cmdForkVersion(source?: TreeNode): Promise<void> {
     // Explicitly invoking a version command opts you in — turn the feature on
     // rather than nagging about a setting.
     if (!this.plugin.settings.enableSheetVersions) {
@@ -7960,56 +8029,21 @@ export class StashpadView extends ItemView {
     const order = maxOrder + 1;
 
     const createdPaths: string[] = [];
-    let newRootId: StashpadId;
-
-    if (blank) {
-      // Blank new version: a single empty note (no subtree).
-      const cloneId = newId();
-      const filename = buildFilename(bodyToSlug("", this.activeStopwords()), cloneId);
-      const path = `${folder}/${filename}`;
-      const created = new Date().toISOString();
-      await this.ensureFolder(folder);
-      await this.app.vault.create(path, ["---", `id: ${cloneId}`, `parent: ${parent}`, `created: ${created}`, "attachments: []", "---", ""].join("\n"));
-      const newFile = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-      if (!newFile) { new Notice("Sheets: could not create version."); return; }
-      await this.app.fileManager.processFrontMatter(newFile, (m: any) => {
-        // Carry the source's styling/metadata (color, tags, custom keys) so a
-        // version looks like its sibling — but never its sheet/provenance keys.
-        for (const [k, v] of Object.entries(srcFm)) {
-          if (RESERVED_FRONTMATTER.includes(k)) continue;
-          if (SHEET_COPY_SKIP_KEYS.includes(k)) continue;
-          m[k] = v;
-        }
+    // Fork: duplicate the whole subtree as a sibling. cloneSubtree already
+    // copies color/tags/custom keys and STRIPS the sheet/provenance keys
+    // (SHEET_COPY_SKIP_KEYS) from every copied node, so only the new root
+    // becomes a version — its children are plain copies.
+    const newRootId = await this.cloneSubtree(src, parent, createdPaths, { preserveCreated: true, copyKind: "fork" });
+    if (!newRootId || !createdPaths.length) { new Notice("Sheets: could not create version."); return; }
+    const rootFile = this.app.vault.getAbstractFileByPath(createdPaths[0]) as TFile | null;
+    if (rootFile) {
+      await this.app.fileManager.processFrontMatter(rootFile, (m: any) => {
         m[SHEET_KEY] = gid;
         m[SHEET_ORDER_KEY] = order;
         delete m[SHEET_FINAL_KEY];
-        delete m[SHEET_ORIGIN_KEY];
-        m[FORKED_FROM_KEY] = `[[${src.file!.basename}]]`;
+        delete m[SHEET_ORIGIN_KEY]; // a fork is never the original…
+        m[FORKED_FROM_KEY] = `[[${src.file!.basename}]]`; // …and records what it came from
       });
-      try {
-        this.tree.insertSynthetic({ id: cloneId, parent, children: [], file: newFile, created });
-      } catch { /* ignore */ }
-      this.fmSync.scheduleParentChange(cloneId, null, parent);
-      createdPaths.push(path);
-      newRootId = cloneId;
-    } else {
-      // Fork: duplicate the whole subtree as a sibling. cloneSubtree already
-      // copies color/tags/custom keys and STRIPS the sheet/provenance keys
-      // (SHEET_COPY_SKIP_KEYS) from every copied node, so only the new root
-      // becomes a version — its children are plain copies.
-      const rootId = await this.cloneSubtree(src, parent, createdPaths);
-      if (!rootId || !createdPaths.length) { new Notice("Sheets: could not create version."); return; }
-      newRootId = rootId;
-      const rootFile = this.app.vault.getAbstractFileByPath(createdPaths[0]) as TFile | null;
-      if (rootFile) {
-        await this.app.fileManager.processFrontMatter(rootFile, (m: any) => {
-          m[SHEET_KEY] = gid;
-          m[SHEET_ORDER_KEY] = order;
-          delete m[SHEET_FINAL_KEY];
-          delete m[SHEET_ORIGIN_KEY]; // a fork is never the original…
-          m[FORKED_FROM_KEY] = `[[${src.file!.basename}]]`; // …and records what it came from
-        });
-      }
     }
 
     this.tree.rebuild(folder);
@@ -8022,7 +8056,7 @@ export class StashpadView extends ItemView {
     await this.syncForkSiblings(this.forkFamilyFiles({ gid, include: [src.file, newRootFile] }));
 
     this.plugin.getUndoStack(folder).push({
-      label: blank ? "New version" : "Fork version",
+      label: "Fork version",
       undo: async () => {
         for (const p of [...createdPaths].reverse()) {
           const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
@@ -8035,7 +8069,7 @@ export class StashpadView extends ItemView {
       redo: async () => { /* best-effort: re-running the command recreates it */ },
     });
     const n = createdPaths.length;
-    new Notice(blank ? "New version added" : `Forked a new version${n > 1 ? ` (${n} notes)` : ""}`);
+    new Notice(`Forked a new version${n > 1 ? ` (${n} notes)` : ""}`);
   }
 
   /** Toggle the "final" flag on a version, clearing it from its group-mates. */
