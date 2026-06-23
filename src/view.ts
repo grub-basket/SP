@@ -294,6 +294,12 @@ export class StashpadView extends ItemView {
    *  `.is-cursor-expanded` so an explicit collapse sticks; cleared when the
    *  cursor leaves the row (then it auto-expands again next time). */
   private cursorExpandOverride = new Set<StashpadId>();
+  /** Has the user moved the cursor (arrow nav / row click) since this view
+   *  instance loaded? Gates the cursor auto-expand (autoExpandCursorRow) so a
+   *  fresh load/reload/refresh renders EVERY row collapsed — the cursor row
+   *  only auto-expands once the user actively navigates. Per-instance, so an
+   *  app/view reload (new instance) starts collapsed again. */
+  private cursorHasMoved = false;
   /** Sheet versions: which version (note id) of a `sheet:` group is currently
    *  shown as the row. View-state only (not persisted) — falls back to the
    *  final pick / first-by-order when unset. */
@@ -1642,7 +1648,11 @@ export class StashpadView extends ItemView {
         this.pendingCursorId = null;
       }
     }
-    if (focused.file && Platform.isMobile) {
+    // 0.121.1 (item 5 follow-up): mobile appends the focused-note header into
+    // the list. In COMPACT mode skip it (matching desktop compact, which omits
+    // the focused header) — with the breadcrumb also hidden, leaving the header
+    // in left an empty-looking block at the top. Compact = tight list, no header.
+    if (focused.file && Platform.isMobile && !this.compactMode) {
       this.renderFocusedHeaderMini(list, focused);
       this.renderFocusedHeader(list, focused);
     }
@@ -1760,7 +1770,7 @@ export class StashpadView extends ItemView {
         else this.renderLockedPlaceholder(list, it.lk);
       }
     }
-    if (focused.file && Platform.isMobile) this.installFocusedMiniObserver(list);
+    if (focused.file && Platform.isMobile && !this.compactMode) this.installFocusedMiniObserver(list);
   }
 
   /** 0.98.1: a locked-subtree placeholder row. Click → unlock (prompts for the
@@ -2349,13 +2359,19 @@ export class StashpadView extends ItemView {
     if (this.tinyMode) {
       this.renderTinyHeader(root);
     } else {
-      // 0.61.2: compact mode skips the time-filter row (folder switcher,
-      // tag/color/sort/view dropdowns, time-window buttons, the three
-      // view-mode buttons). Breadcrumb stays — it's the smallest signal
-      // of "where am I" worth keeping, and the breadcrumb is where the
-      // actions cluster (select-mode toggle + ⚡ actions menu) lives.
-      if (!this.compactMode) this.renderTimeFilterBar(root);
-      this.renderBreadcrumb(root);
+      // 0.61.2: compact mode skips the time-filter row on DESKTOP (folder
+      // switcher, tag/color/sort/view dropdowns, time-window buttons, the three
+      // view-mode buttons); the breadcrumb stays there and hosts the
+      // exit-compact button + the desktop actions cluster.
+      // 0.121.0 (item 5): on MOBILE compact mode, do the opposite — surface the
+      // bottom toolbar (it already carries the actions cluster + the
+      // compact/exit toggle on mobile) and HIDE the breadcrumb, so the
+      // un-compact button is reachable and compact reads as a tight list. On
+      // desktop compact, behavior is unchanged (toolbar hidden, breadcrumb +
+      // its exit button shown).
+      const mobileCompact = this.compactMode && Platform.isMobile;
+      if (!this.compactMode || Platform.isMobile) this.renderTimeFilterBar(root);
+      if (!mobileCompact) this.renderBreadcrumb(root);
     }
 
     const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
@@ -2654,28 +2670,37 @@ export class StashpadView extends ItemView {
   private renderTimeFilterBar(parent: HTMLElement): void {
     const bar = parent.createDiv({ cls: "stashpad-time-filter-bar" });
 
-    // Folder switcher
-    const folderBtn = bar.createEl("button", { cls: "stashpad-folder-btn" });
-    const isOverride = !!this.folderOverride;
-    const displayName = (this.noteFolder.split("/").pop() || this.noteFolder) || "Stashpad";
-    // 0.118.0: per-folder icon (settings) on the switcher too, falling back to
-    // the generic folder glyph.
-    setIcon(folderBtn.createSpan({ cls: "stashpad-btn-icon" }), this.plugin.getFolderIcon(this.noteFolder) ?? "folder");
-    folderBtn.createSpan({ text: displayName, cls: "stashpad-btn-text" });
-    folderBtn.title = isOverride
-      ? `Folder (override): ${this.noteFolder}\nClick to change or revert to default.`
-      : `Folder: ${this.noteFolder}\nClick to override for this tab.`;
-    if (isOverride) folderBtn.addClass("is-override");
-    folderBtn.onclick = (e) => { e.preventDefault(); this.openFolderPicker(); };
+    // 0.119.0 (mobile-ui-changes-2): on mobile the folder switcher + search move
+    // into the composer's bottom-left nav cluster (renderComposerNavCluster), so
+    // skip them here. Desktop keeps them in the toolbar as before.
+    if (!Platform.isMobile) {
+      // Folder switcher
+      const folderBtn = bar.createEl("button", { cls: "stashpad-folder-btn" });
+      const isOverride = !!this.folderOverride;
+      const displayName = (this.noteFolder.split("/").pop() || this.noteFolder) || "Stashpad";
+      // 0.118.0: per-folder icon (settings) on the switcher too, falling back to
+      // the generic folder glyph.
+      setIcon(folderBtn.createSpan({ cls: "stashpad-btn-icon" }), this.plugin.getFolderIcon(this.noteFolder) ?? "folder");
+      folderBtn.createSpan({ text: displayName, cls: "stashpad-btn-text" });
+      folderBtn.title = isOverride
+        ? `Folder (override): ${this.noteFolder}\nClick to change or revert to default.`
+        : `Folder: ${this.noteFolder}\nClick to override for this tab.`;
+      if (isOverride) folderBtn.addClass("is-override");
+      folderBtn.onclick = (e) => { e.preventDefault(); this.openFolderPicker(); };
 
-    // 0.68.4: icon-only Search button between the folder switcher and
-    // the tags dropdown. Mirrors the Mod+F binding for mouse users.
-    const searchBtn = bar.createEl("button", { cls: "stashpad-search-btn" });
-    setIconSafe(searchBtn, "search", "🔍");
-    searchBtn.title = "Search notes (Mod+F)";
-    searchBtn.onclick = (e) => { e.preventDefault(); this.openSearchModal(); };
+      // 0.68.4: icon-only Search button between the folder switcher and
+      // the tags dropdown. Mirrors the Mod+F binding for mouse users.
+      const searchBtn = bar.createEl("button", { cls: "stashpad-search-btn" });
+      setIconSafe(searchBtn, "search", "🔍");
+      searchBtn.title = "Search notes (Mod+F)";
+      searchBtn.onclick = (e) => { e.preventDefault(); this.openSearchModal(); };
+    }
 
     if (Platform.isMobile) {
+      // 0.119.1 (mobile-ui-changes-2): the actions cluster (back / forward /
+      // select / ⚡) lives here at the start of the bottom toolbar, next to the
+      // ⋯ filters + compact buttons (moved out of the breadcrumb).
+      this.renderActionsCluster(bar);
       // Mobile: collapse the four filter/view buttons into a single
       // entry-point button. Tapping it opens a vertical accordion with
       // one section per former button — keeps the header bar uncluttered
@@ -3093,6 +3118,16 @@ export class StashpadView extends ItemView {
     fwdBtn.title = canGoFwd ? "Forward" : "No forward history";
     if (!canGoFwd) fwdBtn.addClass("is-disabled");
     fwdBtn.onclick = (e) => { e.preventDefault(); this.navigateForward(); };
+
+    // 0.119.6 (mobile-ui-changes-2): jump-to-level (route) sits right after the
+    // forward button on mobile (the actions cluster lives in the bottom toolbar
+    // there). Always shown — at Home the picker just lists Home.
+    if (Platform.isMobile) {
+      const routeBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
+      setIconSafe(routeBtn, "route", "⋔");
+      routeBtn.title = "Jump to a level in the path";
+      routeBtn.onclick = (e) => { e.preventDefault(); this.openBreadcrumbLevelsModal(); };
+    }
 
     const selectBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
     const inSelect = this.mobileSelectMode;
@@ -3589,13 +3624,21 @@ export class StashpadView extends ItemView {
     // instead of off the right side of the screen. Min 8px gutter
     // from the viewport right edge as a safety margin if the button
     // is itself off-screen for any reason.
+    // 0.119.0 (mobile-ui-changes-2): the filters button now sits at the BOTTOM
+    // of the screen (toolbar moved above the composer), so opening downward
+    // would run off-screen. Open UPWARD when there isn't room below.
+    const openUp = r.bottom + 280 > win.innerHeight;
     pop.setCssStyles({
       right: `${Math.max(8, win.innerWidth - r.right)}px`,
       left: "auto",
-      top: `${r.bottom + 4}px`,
+      ...(openUp
+        ? { bottom: `${Math.max(8, win.innerHeight - r.top + 4)}px`, top: "auto" }
+        : { top: `${r.bottom + 4}px`, bottom: "auto" }),
       // Wider than the per-button popovers so accordion section headers +
       // option rows have room to breathe. Capped to viewport width.
       maxWidth: "min(360px, calc(100vw - 16px))",
+      maxHeight: "min(60vh, 420px)",
+      overflowY: "auto",
       width: "max-content",
       minWidth: "260px",
     });
@@ -4424,7 +4467,10 @@ export class StashpadView extends ItemView {
     // gives the time-filter row more horizontal real estate.
     // 0.117.0: the "jump to level" button now lives inside the actions
     // cluster (rendered above), grouped with back/forward/select/⚡.
-    this.renderActionsCluster(bar);
+    // 0.119.1 (mobile-ui-changes-2): on mobile the actions cluster
+    // (back/forward/select/⚡) moves into the bottom toolbar (time-filter-bar),
+    // next to the ⋯ filters + compact buttons; the breadcrumb keeps just the trail.
+    if (!Platform.isMobile) this.renderActionsCluster(bar);
     const homeBtn = bar.createSpan({ cls: "stashpad-crumb stashpad-crumb-home" });
     if (Platform.isMobile) {
       // Mobile: render as a house icon to save horizontal space.
@@ -4542,7 +4588,9 @@ export class StashpadView extends ItemView {
     // (by the crumbs, not the nav cluster). CSS absolutely-positions it at the
     // right edge with reserved padding, so it stays visible even when the
     // inline crumbs clip — which is exactly when it's needed.
-    this.renderBreadcrumbLevelsButton(bar);
+    // 0.119.0 (mobile-ui-changes-2): on mobile it moves into the composer's
+    // bottom-left nav cluster instead.
+    if (!Platform.isMobile) this.renderBreadcrumbLevelsButton(bar);
   }
 
   /** 0.117.0: the breadcrumb "all levels" button. Pinned at the right end of
@@ -4840,7 +4888,7 @@ export class StashpadView extends ItemView {
     if (isCursor) row.addClass("is-cursor");
     // 0.73.14: auto-expand the cursor row on initial render too (not
     // just on arrow-key repaints). Settings-gated.
-    if (isCursor && this.plugin.settings.autoExpandCursorRow && !this.cursorExpandOverride.has(node.id)) row.addClass("is-cursor-expanded");
+    if (isCursor && this.cursorHasMoved && this.plugin.settings.autoExpandCursorRow && !this.cursorExpandOverride.has(node.id)) row.addClass("is-cursor-expanded");
     if (isPickTarget) row.addClass("is-pick-target");
     if (this.isCompleted(node)) row.addClass("is-completed");
     if (this.isListPinned(node.id)) row.addClass("is-list-pinned");
@@ -5290,6 +5338,34 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** 0.119.0 (mobile-ui-changes-2): bottom-left nav cluster in the composer —
+   *  folder picker + search + jump-to-level (route). Mobile only; these moved
+   *  out of the top toolbar / breadcrumb. Always visible (no collapse, per the
+   *  request that always-visible is fine). */
+  private renderComposerNavCluster(rail: HTMLElement): void {
+    const nav = rail.createDiv({ cls: "stashpad-composer-nav" });
+    // Folder picker (shows the per-folder icon if set, else the folder glyph).
+    const folderBtn = nav.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-nav-folder" });
+    setIcon(folderBtn, this.plugin.getFolderIcon(this.noteFolder) ?? "folder");
+    // 0.119.4: show the folder NAME (capped via CSS) so you know which folder
+    // you're in — not just the icon.
+    const fname = (this.noteFolder.split("/").pop() || this.noteFolder) || "Stashpad";
+    folderBtn.createSpan({ cls: "stashpad-btn-text", text: fname });
+    folderBtn.title = `Folder: ${this.noteFolder}\nTap to switch / create.`;
+    if (this.folderOverride) folderBtn.addClass("is-active");
+    folderBtn.onmousedown = (e) => e.preventDefault();
+    folderBtn.onclick = (e) => { e.preventDefault(); this.openFolderPicker(); };
+    // Search.
+    const searchBtn = nav.createEl("button", { cls: "stashpad-composer-btn" });
+    setIconSafe(searchBtn, "search", "🔍");
+    searchBtn.title = "Search notes (Mod+F)";
+    searchBtn.onmousedown = (e) => e.preventDefault();
+    searchBtn.onclick = (e) => { e.preventDefault(); this.openSearchModal(); };
+    // 0.119.6: route (jump-to-level) moved to the actions cluster (after the
+    // forward button) — see renderActionsCluster. The composer nav is now just
+    // folder + search.
+  }
+
   private renderComposer(parent: HTMLElement): void {
     const settings = getSettings();
     const enterSubmits = this.modeEnterSubmits;
@@ -5480,6 +5556,10 @@ export class StashpadView extends ItemView {
     fileInput.setCssStyles({ display: "none" });
 
     const btnRail = composer.createDiv({ cls: "stashpad-composer-btn-rail" });
+    // 0.119.0 (mobile-ui-changes-2): on mobile, the folder picker + search +
+    // jump-to-level (route) controls live here at the bottom-left of the
+    // composer (moved out of the top toolbar / breadcrumb).
+    if (Platform.isMobile) this.renderComposerNavCluster(btnRail);
     // Mobile: secondary buttons (split/dest/enter/clip) live inside a
     // collapsible group. A chevron-left button at the head of the rail
     // toggles their visibility — collapsed at rest to keep the composer
@@ -5830,6 +5910,9 @@ export class StashpadView extends ItemView {
     // Normal (settled) tap — drop any stale aimed target so it can't leak into
     // a later unrelated double-tap.
     this.aimedTapTargetId = null;
+    // A real tap on a row counts as a cursor move — arm the cursor auto-expand
+    // (kept off through the initial post-load render).
+    this.cursorHasMoved = true;
     const targetEl = e.target as HTMLElement | null;
     // Tag click → open global search filtered by that tag.
     const tag = targetEl?.closest?.(".tag") as HTMLElement | null;
@@ -6330,6 +6413,9 @@ export class StashpadView extends ItemView {
   private selectCursor(shift: boolean): void {
     const node = this.currentChildren[this.cursorIdx];
     if (!node) return;
+    // First real cursor move since load — arm the cursor auto-expand (so the
+    // initial render stayed fully collapsed).
+    this.cursorHasMoved = true;
     if (!shift) {
       this.selection.clear();
       this.selection.add(node.id);
@@ -6388,7 +6474,7 @@ export class StashpadView extends ItemView {
       // 0.118.10: respect a manual-collapse override; clear it once the cursor
       // leaves the row so the auto-expand resumes on the next visit.
       if (!isCursor) this.cursorExpandOverride.delete(id);
-      row.classList.toggle("is-cursor-expanded", autoExpand && isCursor && !this.cursorExpandOverride.has(id));
+      row.classList.toggle("is-cursor-expanded", autoExpand && isCursor && this.cursorHasMoved && !this.cursorExpandOverride.has(id));
       // 0.73.15: pick-target class. Used by the in-list parent picker
       // so its arrow-key nav also avoids the full-render rebuild.
       row.classList.toggle("is-pick-target", idx === pickIdx);

@@ -2425,7 +2425,8 @@ export default class StashpadPlugin extends Plugin {
       }
       if (r.authors > 0) parts.push(`${r.authors} author${r.authors === 1 ? "" : "s"} in registry`);
       // Replace the progress notice in place with a persistent success notice.
-      fill.style.width = "100%";
+      // (No need to animate the bar to 100% — el.empty() below removes it
+      // synchronously before the browser can paint, so it would never show.)
       el.empty();
       el.removeClass("stashpad-progress-notice");
       el.addClass("stashpad-progress-done");

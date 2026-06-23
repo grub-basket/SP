@@ -1,19 +1,24 @@
 {
 	"name": "stashpad-obsidian",
-	"version": "0.118.14",
+	"version": "0.121.1",
 	"private": true,
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "node esbuild.config.mjs production",
 		"deploy:files": "node scripts/deploy.mjs",
 		"deploy": "pnpm run build && node scripts/deploy.mjs",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"lint": "eslint src",
+		"lint:store": "eslint src --max-warnings 0"
 	},
 	"devDependencies": {
 		"@types/node": "^20.10.0",
 		"esbuild": "^0.21.0",
+		"eslint": "^10.5.0",
+		"eslint-plugin-obsidianmd": "^0.3.0",
 		"obsidian": "latest",
-		"typescript": "^5.4.0"
+		"typescript": "^5.4.0",
+		"typescript-eslint": "^8.61.1"
 	},
 	"dependencies": {
 		"fflate": "^0.8.3",
