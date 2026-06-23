@@ -9,7 +9,7 @@ import {
 } from "./types";
 import { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
-import { formatDateTime } from "./format";
+import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
 import { OrderStore } from "./order-store";
 import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
@@ -11021,7 +11021,12 @@ export class StashpadView extends ItemView {
       const fmt = getTemplatesFormats(this.app);
       if (fmt) return `${d.format(fmt.dateFormat)}\n${d.format(fmt.timeFormat)}`;
     }
-    return `${d.format("YYYY.MM.DD")}\n${d.format("HH:mm A")}`;
+    // 0.121.7: when NOT using the Templates plugin format, honour the user's
+    // "Date display format" dropdown (+ timezone) for the two-line list
+    // timestamp — previously this ignored the dropdown and was hardcoded to
+    // YYYY.MM.DD / HH:mm A, so the dropdown only affected the detail/tasks panels.
+    const ms = d.valueOf();
+    return `${formatDateOnly(ms, settings)}\n${formatTimeOnly(ms, settings)}`;
   }
   /** public: read by extracted command modules (commands/*.ts). */
   formatTimeInline(iso: string): string {
