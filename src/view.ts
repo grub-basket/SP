@@ -11219,14 +11219,15 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => this.navigateTo(node.id)));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
+    // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
+    // normalises selection to the right-clicked row.
+    // 0.122.10: ordered above Clone so the plain "Copy text" reads first.
+    menu.addItem((it: any) => it.setTitle("Copy text").setIcon("copy").onClick(() => { focusClicked(); void this.cmdCopy(); }));
     menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       void this.cmdClone();
     }));
-    // 0.122.2 (#9): copy the note's text, or cut the whole note (for paste/move).
-    // `focusClicked` (defined below) normalises selection to the right-clicked row.
-    menu.addItem((it: any) => it.setTitle("Copy text").setIcon("copy").onClick(() => { focusClicked(); void this.cmdCopy(); }));
     // 0.122.7: "Cut note" pulled from the menu for now — cut/paste has known bugs
     // and cutting a parent/home note from the context menu is too easy a footgun.
     // Still available via the cutNotes hotkey. (See ui-polish todos.)

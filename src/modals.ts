@@ -1756,7 +1756,16 @@ export class DueDatePickerModal extends Modal {
     const period: "am" | "pm" = h24 >= 12 ? "pm" : "am";
     const seedH = h24 === 0 ? 12 : (h24 > 12 ? h24 - 12 : h24);
 
-    const pop = doc.body.createDiv({ cls: "stashpad-when-popover stashpad-due-time-pop" });
+    // 0.122.10: host the popover INSIDE the modal element, not doc.body. When
+    // it lived in body (outside the modal's focusable subtree) the modal's
+    // focus management pulled focus back to the first field (the date input)
+    // the instant the time picker focused its hour field — so clicking the
+    // clock landed you in the date box. Keeping it inside modalEl mirrors the
+    // search When-builder (whose picker is hosted in its own focusable region)
+    // and lets the hour field keep focus. position:fixed still anchors to the
+    // viewport. Falls back to doc.body if modalEl is somehow unavailable.
+    const host = (this.modalEl as HTMLElement | undefined) ?? doc.body;
+    const pop = host.createDiv({ cls: "stashpad-when-popover stashpad-due-time-pop" });
     // Above the modal (Obsidian modals sit ~var(--layer-modal)).
     pop.setCssStyles({ position: "fixed", zIndex: "9999" });
 
@@ -1793,6 +1802,9 @@ export class DueDatePickerModal extends Modal {
     setTimeout(() => {
       doc.addEventListener("mousedown", outside, true);
       doc.addEventListener("keydown", onKey, true);
+      // 0.122.10: re-assert focus on the hour field after the modal's own
+      // focus handling has settled, so the picker opens ready for numeric entry.
+      pop.querySelector<HTMLInputElement>(".stashpad-when-time-field")?.focus();
     }, 0);
   }
 
