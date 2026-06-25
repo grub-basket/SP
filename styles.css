@@ -3460,7 +3460,7 @@ body.is-mobile .stashpad-okf-cta {
    buttons. Reserve space on the controls' side: top-RIGHT on Windows/Linux,
    top-LEFT on macOS. Native-frame windows (OS draws the frame) have neither
    class, so they're unaffected. (Unverified on Windows — reasoned from
-   Obsidian's mod-*/is-frameless body classes.) */
+   Obsidian's mod-* and is-frameless body classes.) */
 body.is-frameless.mod-windows .stashpad-tiny-header,
 body.is-hidden-frameless.mod-windows .stashpad-tiny-header,
 body.is-frameless.mod-linux .stashpad-tiny-header,
