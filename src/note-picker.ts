@@ -1345,6 +1345,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       ): void => {
         if (currentPopoverClose) currentPopoverClose();
         const pop = anchor.createDiv({ cls: "stashpad-when-popover" });
+        // 0.122.3 (#4): bind the outside-click listener on the ANCHOR's document
+        // so it works when the search modal is in a popout window (the popover
+        // itself is already a child of `anchor`, so it renders in that window).
+        const doc = anchor.ownerDocument ?? document;
         // 0.69.34: parent = chipScope's parent (this.scope) so unhandled
         // keys (arrows etc) cascade to SuggestModal's handlers, same
         // reasoning as chipScope above.
@@ -1359,7 +1363,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           if (closed) return;
           closed = true;
           pop.remove();
-          document.removeEventListener("mousedown", outside, true);
+          doc.removeEventListener("mousedown", outside, true);
           try { (this.app as any).keymap?.popScope(popScope); } catch { /* ignore */ }
           if (currentPopoverClose === close) currentPopoverClose = null;
         };
@@ -1393,7 +1397,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         // Belt-and-suspenders: if the modal closes with this popover
         // still open, ensure the scope is popped on close.
         this.pendingCleanups.push(close);
-        setTimeout(() => document.addEventListener("mousedown", outside, true), 0);
+        setTimeout(() => doc.addEventListener("mousedown", outside, true), 0);
       };
 
       tfBtn.addEventListener("click", (e) => {

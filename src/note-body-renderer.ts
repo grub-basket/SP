@@ -104,6 +104,19 @@ export class NoteBodyRenderer {
     return !!c && c.mtime === file.stat.mtime;
   }
 
+  /** 0.122.6 (#13): drop a file's cached render so the next render recomputes
+   *  from fresh content. Wired to the modify event. The mtime-keyed cache can be
+   *  poisoned: a render that runs while `cachedRead` is momentarily stale — seen
+   *  on a network drive or after an external/coworker edit — stamps the NEW
+   *  mtime onto OLD content, so it then serves a truncated / attachment-less body
+   *  until reload. Evicting on modify forces a recompute after the render
+   *  debounce (by when cachedRead is fresh), breaking that sticky-stale state. */
+  evict(file: TFile): void {
+    const c = this.renderCache as { evict?: (p: string) => void; delete?: (p: string) => void };
+    if (c.evict) c.evict(file.path);
+    else if (c.delete) c.delete(file.path);
+  }
+
   /** Register a deferred render for a cold row: run `fn` once the container
    *  nears the viewport. */
   defer(container: HTMLElement, fn: () => void): void {

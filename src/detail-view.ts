@@ -27,6 +27,11 @@ export class StashpadDetailView extends ItemView {
   private unsubscribeSelection: (() => void) | null = null;
   /** Coalesces a burst of selection/modify events into one render. */
   private renderTimer: number | null = null;
+  /** 0.122.5 (#12): re-entrancy guard. render() is async (awaits cachedRead +
+   *  MarkdownRenderer); without this, two overlapping renders (fast level/tab
+   *  switches) both append a composer to the live root → stacked input boxes.
+   *  Each render captures a token; after an await it aborts if superseded. */
+  private renderToken = 0;
   /** 0.74.2: ids of children-list rows currently expanded into their
    *  own subtrees — same pattern as StashpadPanelsView.expanded. Key
    *  is "<folder>|<id>" so expansion state is scoped per folder
@@ -129,11 +134,21 @@ export class StashpadDetailView extends ItemView {
       this.displayedId = null;
     }
     const sel = this.plugin.getActiveStashpadSelection();
-    if (sel) this.displayedId = sel.id;
-    return sel;
+    if (sel) { this.displayedId = sel.id; return sel; }
+    // 0.122.5 (#12b): nothing selected — fall back to the focused PARENT note so
+    // the panel previews the current level instead of "no note selected". Not
+    // pinned (no displayedId): re-derived each render, so selecting a child
+    // immediately takes over. Home (ROOT, no file) falls through to empty.
+    const view = this.plugin.lastActiveStashpadLeaf?.view as any;
+    if (view?.getViewType?.() === STASHPAD_VIEW_TYPE && view.tree?.get && view.focusId) {
+      const node = view.tree.get(view.focusId);
+      if (node?.file) return { folder: view.noteFolder as string, id: view.focusId as StashpadId, file: node.file as TFile };
+    }
+    return null;
   }
 
   private async render(): Promise<void> {
+    const token = ++this.renderToken;
     const root = this.contentEl;
     // 0.74.4: preserve composer focus + caret across the rebuild so a
     // re-render mid-typing doesn't drop the user out of the textarea.
@@ -204,6 +219,10 @@ export class StashpadDetailView extends ItemView {
     } catch (e) {
       bodyWrap.createDiv({ cls: "stashpad-detail-error", text: `Couldn't read \`${file.path}\`: ${(e as Error).message}` });
     }
+
+    // 0.122.5 (#12): a newer render started while we awaited — abort so we don't
+    // append a second composer (etc.) onto the root it already rebuilt.
+    if (token !== this.renderToken) return;
 
     // Footer metadata — author, contributors, modified, children count.
     this.renderFooterMeta(scroll, file, fm, sel);

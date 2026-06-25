@@ -1737,6 +1737,11 @@ export class DueDatePickerModal extends Modal {
   private tinyClosePopover: (() => void) | null = null;
   private openTimeNumpad(anchor: HTMLElement, timeInput: HTMLInputElement): void {
     this.tinyClosePopover?.();
+    // 0.122.3 (#4): build the popover + bind its listeners in the ANCHOR's
+    // document so it lands in the same (possibly popout) window as the modal —
+    // not always the main window.
+    const doc = anchor.ownerDocument ?? document;
+    const win = doc.defaultView ?? window;
     // Seed from the current time value, else the current clock time.
     let h24 = 9, mm = 0;
     if (timeInput.value) {
@@ -1751,15 +1756,15 @@ export class DueDatePickerModal extends Modal {
     const period: "am" | "pm" = h24 >= 12 ? "pm" : "am";
     const seedH = h24 === 0 ? 12 : (h24 > 12 ? h24 - 12 : h24);
 
-    const pop = document.body.createDiv({ cls: "stashpad-when-popover stashpad-due-time-pop" });
+    const pop = doc.body.createDiv({ cls: "stashpad-when-popover stashpad-due-time-pop" });
     // Above the modal (Obsidian modals sit ~var(--layer-modal)).
     pop.setCssStyles({ position: "fixed", zIndex: "9999" });
 
     let onEnter: (() => void) | null = null;
     const close = (): void => {
       pop.remove();
-      document.removeEventListener("mousedown", outside, true);
-      document.removeEventListener("keydown", onKey, true);
+      doc.removeEventListener("mousedown", outside, true);
+      doc.removeEventListener("keydown", onKey, true);
       if (this.tinyClosePopover === close) this.tinyClosePopover = null;
     };
     const outside = (e: MouseEvent): void => {
@@ -1782,12 +1787,12 @@ export class DueDatePickerModal extends Modal {
 
     const rect = anchor.getBoundingClientRect();
     pop.setCssStyles({
-      left: `${Math.max(8, Math.min(rect.left, window.innerWidth - 220))}px`,
+      left: `${Math.max(8, Math.min(rect.left, win.innerWidth - 220))}px`,
       top: `${rect.bottom + 4}px`,
     });
     setTimeout(() => {
-      document.addEventListener("mousedown", outside, true);
-      document.addEventListener("keydown", onKey, true);
+      doc.addEventListener("mousedown", outside, true);
+      doc.addEventListener("keydown", onKey, true);
     }, 0);
   }
 

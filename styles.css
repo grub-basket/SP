@@ -471,8 +471,18 @@
   font-weight: 600;
 }
 .stashpad-view-popover-main { display: flex; align-items: center; gap: 8px; }
+/* 0.122.7: leading icon on the view-menu mode rows + "By author". */
+.stashpad-view-popover-icon { display: inline-flex; align-items: center; flex: 0 0 auto; color: var(--text-muted); }
+.stashpad-view-popover-icon .svg-icon { width: 15px; height: 15px; }
+.stashpad-view-popover-row.is-active .stashpad-view-popover-icon { color: var(--interactive-accent); }
 .stashpad-view-popover-label { white-space: nowrap; }
 .stashpad-view-popover-desc {
+  /* 0.122.1: descriptions are hidden everywhere now (were mobile-only) to keep
+     the view/filter menu compact — it was getting cut off when the header
+     collapses into the combined ⋯ menu at narrow widths. The full, expanded
+     explanations live in docs/public/view-menu-guide.md; the View dropdown
+     button still carries per-mode tooltips. */
+  display: none;
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
   white-space: normal;
@@ -950,6 +960,10 @@
    dark background in light mode. Inherit the notice's text color instead, which
    is guaranteed to contrast its background in any theme. */
 .stashpad-progress-done .stashpad-progress-sub { color: inherit; opacity: 0.9; }
+/* 0.122.0 (#5): the IN-PROGRESS sub line was --text-muted (grey/dim) — same
+   legibility problem on the notice's dark background. Inherit the notice color
+   so the initial "Counting notes… / <label> · N%" reads bright like the rest. */
+.stashpad-progress-notice .stashpad-progress-sub { color: inherit; opacity: 0.85; }
 .stashpad-progress-done .stashpad-progress-title { color: var(--text-success, var(--interactive-accent)); }
 .stashpad-progress-error .stashpad-progress-title { color: var(--text-error); }
 /* 0.117.0: "jump to level" button pinned at the right end of the breadcrumb
@@ -2885,6 +2899,54 @@ body.is-mobile .stashpad-jd-actions .setting-item-control {
 .stashpad-settings-section:last-child {
   padding-bottom: 16px;
 }
+/* 0.122.4 (#7): at narrow widths a setting's control (especially multi-input
+   ones like the folder-icon picker: dropdown + text + preview) squeezed the
+   description down to ~1 character. Let the control WRAP below the info instead,
+   and keep the info from collapsing. Scoped to Stashpad's settings sections. */
+.stashpad-settings-section .setting-item {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.stashpad-settings-section .setting-item .setting-item-info {
+  /* don't let the name+description collapse (it was wrapping to ~1ch). */
+  min-width: 50%;
+  flex: 1 1 auto;
+}
+.stashpad-settings-section .setting-item .setting-item-control {
+  /* 0.122.7: keep the control at its natural size so it WRAPS to its own
+     full-width line when the row is too narrow — instead of shrinking its
+     inputs and squeezing the description. */
+  flex-shrink: 0;
+  max-width: 100%;
+  justify-content: flex-start;
+}
+/* 0.121.14: Obsidian 1.13's MOBILE settings use a 20px horizontal gutter
+   (measured: .setting-item padding-left = 20px). Several stashpad insets were
+   still at the older 14px, so they didn't line up with Obsidian's own rows —
+   the "nothing is consistent" problem. Bump EVERY settings inset to 20px on
+   mobile so it all aligns. Desktop keeps its existing gutter. */
+body.is-mobile .stashpad-settings-section > p,
+body.is-mobile .stashpad-settings-section > h2,
+body.is-mobile .stashpad-settings-section > h3,
+body.is-mobile .stashpad-settings-section > h4,
+body.is-mobile .stashpad-settings-section > ol,
+body.is-mobile .stashpad-settings-section > ul,
+body.is-mobile .stashpad-settings-section > .setting-item-description,
+body.is-mobile .stashpad-folder-list,
+body.is-mobile .stashpad-authored-folders-list,
+body.is-mobile .stashpad-folder-placement-group,
+body.is-mobile .stashpad-known-authors-list,
+body.is-mobile .stashpad-encryption-section > .setting-item-description,
+body.is-mobile .stashpad-okf-howto,
+body.is-mobile .stashpad-beta-row {
+  padding-left: 20px;
+  padding-right: 20px;
+}
+body.is-mobile .stashpad-ai-disclaimer,
+body.is-mobile .stashpad-okf-cta {
+  margin-left: 20px;
+  margin-right: 20px;
+}
 .stashpad-ai-disclaimer {
   margin: 4px 14px 12px; padding: 10px 12px; border-radius: var(--radius-m, 6px);
   border: 1px solid var(--color-red, #e24b4a);
@@ -3392,6 +3454,42 @@ body.is-mobile .stashpad-jd-actions .setting-item-control {
   padding: 4px 6px;
   border-bottom: 1px solid var(--background-modifier-border);
   font-size: 0.85em;
+}
+/* 0.122.4 (#1): when the window is FRAMELESS (Obsidian draws min/max/close
+   inside the content area), the tiny-header controls sit under those window
+   buttons. Reserve space on the controls' side: top-RIGHT on Windows/Linux,
+   top-LEFT on macOS. Native-frame windows (OS draws the frame) have neither
+   class, so they're unaffected. (Unverified on Windows — reasoned from
+   Obsidian's mod-*/is-frameless body classes.) */
+body.is-frameless.mod-windows .stashpad-tiny-header,
+body.is-hidden-frameless.mod-windows .stashpad-tiny-header,
+body.is-frameless.mod-linux .stashpad-tiny-header,
+body.is-hidden-frameless.mod-linux .stashpad-tiny-header {
+  padding-right: 140px;
+}
+body.is-frameless.mod-macos .stashpad-tiny-header,
+body.is-hidden-frameless.mod-macos .stashpad-tiny-header {
+  padding-left: 80px;
+}
+/* 0.122.9 (F3): in frameless mode the tiny-header bar sits where the OS would
+   otherwise expose a draggable titlebar — and the reserved padding above
+   extends the (non-draggable) header box over the macOS traffic-light strip,
+   so the window could no longer be moved. Make the header itself a drag region
+   and exempt its interactive children so they stay clickable. Scoped to
+   frameless only; native-frame windows drag via the OS frame. */
+body.is-frameless .stashpad-tiny-header,
+body.is-hidden-frameless .stashpad-tiny-header {
+  -webkit-app-region: drag;
+}
+body.is-frameless .stashpad-tiny-header button,
+body.is-frameless .stashpad-tiny-header input,
+body.is-frameless .stashpad-tiny-header .stashpad-tiny-sticky,
+body.is-frameless .stashpad-tiny-header .stashpad-folder-btn,
+body.is-hidden-frameless .stashpad-tiny-header button,
+body.is-hidden-frameless .stashpad-tiny-header input,
+body.is-hidden-frameless .stashpad-tiny-header .stashpad-tiny-sticky,
+body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
+  -webkit-app-region: no-drag;
 }
 /* 0.77.0-feat: tiny-window transparency button + slider popover. */
 .stashpad-tiny-opacity-btn.is-active { color: var(--text-accent); }

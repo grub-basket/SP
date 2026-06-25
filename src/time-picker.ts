@@ -85,12 +85,16 @@ export function buildTimePickerInto(pop: HTMLElement, opts: BuildTimePickerOpts)
   };
 
   const clamp = (el: HTMLInputElement): void => {
+    // 0.122.7 (#11): keep EXACTLY what was typed (incl. leading zeros like
+    // "00" / "09") so the field renders it — only rewrite when it's out of
+    // range (hours > 24 → 24, minutes > 59 → 59). Previously `String(n)`
+    // collapsed "00" → "0", so a zero could never be seen/entered.
     const v = el.value.replace(/\D/g, "").slice(0, 2);
-    if (v === "") { el.value = ""; if (el === hField) syncAmpmEnabled(); return; }
-    let n = parseInt(v, 10);
-    if (el === hField) { if (n > 24) n = 24; }
-    else { if (n > 59) n = 59; }
-    el.value = String(n);
+    el.value = v;
+    if (v === "") { if (el === hField) syncAmpmEnabled(); return; }
+    const n = parseInt(v, 10);
+    const max = el === hField ? 24 : 59;
+    if (n > max) el.value = String(max);
     if (el === hField) syncAmpmEnabled();
   };
   for (const el of [hField, mField]) el.addEventListener("input", () => clamp(el));

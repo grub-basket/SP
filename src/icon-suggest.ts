@@ -37,9 +37,13 @@ export class IconSuggest extends AbstractInputSuggest<string> {
     }
     const match = (id: string): boolean => tokens.every((t) => id.toLowerCase().includes(t));
     const out = tokens.length ? ids.filter(match) : ids;
-    // Cap the list — the popover only renders a window anyway, and an unfiltered
-    // getIconIds() is ~1.5k entries.
-    return out.sort().slice(0, 50);
+    out.sort();
+    // 0.122.0 (#8): a narrowing search only needs a small window, but with NO
+    // query the user is BROWSING — cap of 50 stranded them in the "a…" icons.
+    // Render a much larger window so scrolling reaches the rest of the alphabet.
+    // (AbstractInputSuggest has no scroll hook for true infinite-load; this is
+    // the pragmatic middle ground — still bounded so it stays snappy.)
+    return out.slice(0, tokens.length ? 50 : 300);
   }
 
   renderSuggestion(id: string, el: HTMLElement): void {

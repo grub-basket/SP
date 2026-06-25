@@ -705,6 +705,7 @@ export class StashpadView extends ItemView {
   private renderSuppressed(): boolean {
     return this.bulkRenderDepth > 0
       || this.bulkSettleTimer != null
+      || this.autoSyncDeferActive
       || this.plugin.rebootstrapInProgress
       || this.plugin.okfRebuildingFolders.has(this.noteFolder);
   }
@@ -729,6 +730,48 @@ export class StashpadView extends ItemView {
       this.tree.rebuild(this.noteFolder);
       this.render();
     }, settleMs);
+  }
+
+  // --- Auto sync-burst deferral (0.122.8, F7) -----------------------------
+  // Obsidian Sync (and any external bulk write) fires a stream of `modify`/
+  // `create` events that none of the explicit bulk flags above cover — each
+  // one would otherwise repaint the list, which on mobile makes it unusable
+  // for the duration of a sync. Detect a burst of file events, engage the
+  // same render suppression, surface a notice, and repaint ONCE when it
+  // settles.
+  private syncBurstTimes: number[] = [];
+  private autoSyncDeferActive = false;
+  private autoSyncSettleTimer: number | null = null;
+  private autoSyncNotice: Notice | null = null;
+
+  /** Record an external file event; returns true when the render should be
+   *  deferred (a burst is in progress). Resets the settle timer on every
+   *  event so the notice stays up for the whole sync, then clears. */
+  private deferDuringSyncBurst(): boolean {
+    // Rebootstrap has its own suppression + one-shot repaint flow — don't
+    // double up a notice on top of it.
+    if (this.plugin.rebootstrapInProgress) return false;
+    const now = Date.now();
+    this.syncBurstTimes.push(now);
+    const cutoff = now - 2000;
+    while (this.syncBurstTimes.length && this.syncBurstTimes[0] < cutoff) this.syncBurstTimes.shift();
+    if (!this.autoSyncDeferActive && this.syncBurstTimes.length >= 6) {
+      this.autoSyncDeferActive = true;
+      this.autoSyncNotice = new Notice("Stashpad: syncing — list updates paused until it settles…", 0);
+    }
+    if (!this.autoSyncDeferActive) return false;
+    if (this.autoSyncSettleTimer != null) window.clearTimeout(this.autoSyncSettleTimer);
+    this.autoSyncSettleTimer = window.setTimeout(() => this.endAutoSyncDefer(), 1500);
+    return true;
+  }
+
+  private endAutoSyncDefer(): void {
+    this.autoSyncSettleTimer = null;
+    this.autoSyncDeferActive = false;
+    this.syncBurstTimes = [];
+    this.autoSyncNotice?.hide();
+    this.autoSyncNotice = null;
+    this.forceReconcileRender();
   }
 
   /** Public: a one-shot rebuild + render. Used by the plugin after rebootstrap
@@ -830,6 +873,9 @@ export class StashpadView extends ItemView {
     this.focusedMiniObserver?.disconnect();
     this.focusedMiniObserver = null;
     if (this.treeReconcileTimer != null) { window.clearTimeout(this.treeReconcileTimer); this.treeReconcileTimer = null; }
+    if (this.autoSyncSettleTimer != null) { window.clearTimeout(this.autoSyncSettleTimer); this.autoSyncSettleTimer = null; }
+    this.autoSyncNotice?.hide();
+    this.autoSyncNotice = null;
     this.composerAutocomplete?.detach();
     this.composerAutocomplete = null;
     for (const d of this.slugDebouncers.values()) d.cancel();
@@ -3813,10 +3859,12 @@ export class StashpadView extends ItemView {
    *  caller can close the wrapping popover/accordion. */
   private populateViewMenuBody(container: HTMLElement, onPicked: () => void): void {
     const current = this.currentViewMode();
-    const addRow = (mode: ViewMode, desc: string): void => {
+    const addRow = (mode: ViewMode, desc: string, icon: string): void => {
       const row = container.createDiv({ cls: "stashpad-view-popover-row" });
       if (mode === current) row.addClass("is-active");
       const main = row.createDiv({ cls: "stashpad-view-popover-main" });
+      // 0.122.7: leading icon (matches the View dropdown button's icons).
+      setIcon(main.createSpan({ cls: "stashpad-view-popover-icon" }), icon);
       main.createSpan({ cls: "stashpad-view-popover-label", text: VIEW_MODE_LABELS[mode] });
       row.createDiv({ cls: "stashpad-view-popover-desc", text: desc });
       row.onclick = async (e) => {
@@ -3828,9 +3876,12 @@ export class StashpadView extends ItemView {
         this.render();
       };
     };
-    addRow("nested", "Tree of immediate children (default).");
-    addRow("flat", "All descendants of the current focus, flat by sort.");
-    addRow("everything", "All descendants PLUS non-Stashpad files in the folder.");
+    // 0.122.7: dividers between each mode for clearer separation.
+    addRow("nested", "Tree of immediate children (default).", "list-tree");
+    container.createDiv({ cls: "stashpad-view-popover-divider" });
+    addRow("flat", "All descendants of the current focus, flat by sort.", "list");
+    container.createDiv({ cls: "stashpad-view-popover-divider" });
+    addRow("everything", "All descendants PLUS non-Stashpad files in the folder.", "layout-grid");
 
     container.createDiv({ cls: "stashpad-view-popover-divider" });
 
@@ -3955,8 +4006,12 @@ export class StashpadView extends ItemView {
       const a = parseAuthorRef(this.app.metadataCache.getFileCache(f)?.frontmatter?.author);
       if (a) authors.set(a.id, a.name);
     }
-    const authRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
+    // 0.122.7: divider above "By author" + a leading icon; dropped the
+    // -toggle class so it isn't indented like the checkbox rows.
+    container.createDiv({ cls: "stashpad-view-popover-divider" });
+    const authRow = container.createDiv({ cls: "stashpad-view-popover-row" });
     const authMain = authRow.createDiv({ cls: "stashpad-view-popover-main" });
+    setIcon(authMain.createSpan({ cls: "stashpad-view-popover-icon" }), "user");
     authMain.createSpan({ cls: "stashpad-view-popover-label", text: "By author" });
     const authSel = authMain.createEl("select", { cls: "stashpad-view-author-select" });
     const allO = authSel.createEl("option", { text: "All authors", value: "" });
@@ -4729,6 +4784,9 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     const file = node.file;
     const wrap = parent.createDiv({ cls: "stashpad-focused" });
+    // 0.122.2 (#9): the focused-note header gets the same right-click menu as a
+    // list row (it IS a note — Copy/Cut/Move/Task/Delete all apply to it).
+    wrap.oncontextmenu = (evt) => { evt.preventDefault(); this.openNoteMenu(evt, node); };
 
     // meta column: timestamp + a transparent grip-shaped spacer so the
     // body's left edge column-aligns with each list row's body.
@@ -8624,6 +8682,9 @@ export class StashpadView extends ItemView {
     this.render(policy);
     this.refreshHeaderTitle();
     this.viewRoot.focus({ preventScroll: true });
+    // 0.122.7 (F2): back/forward changed the cursor — notify so the detail panel
+    // re-resolves to the new selection instead of staying pinned to the old one.
+    this.plugin.notifyStashpadSelectionChanged();
   }
 
   private navigateUp(): void {
@@ -8676,6 +8737,10 @@ export class StashpadView extends ItemView {
     this.refreshHeaderTitle();
     // Belt-and-suspenders reveal in the fallback case.
     if (idx < 0) this.revealCursorRow();
+    // 0.122.7 (F2): navigating OUT moves the cursor to the note we exited;
+    // notify so the detail panel (pinned to the child we were on) re-resolves to
+    // this new selection (the parent) instead of staying on the stale child.
+    this.plugin.notifyStashpadSelectionChanged();
   }
   private openBookmarks(): void {
     const bookmarks = (this.app as any).internalPlugins?.plugins?.bookmarks?.instance?.items ?? [];
@@ -10917,6 +10982,11 @@ export class StashpadView extends ItemView {
   private onFileModify = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
+    // 0.122.6 (#13): drop this file's (possibly stale-content-but-fresh-mtime)
+    // render-cache entry so the debounced re-render below recomputes from fresh
+    // content — fixes the truncated/attachment-less "earlier version" render
+    // that stuck until reload (network drive / external edits).
+    this.bodyRenderer.evict(file);
     this.scheduleSlugRename(file);
     this.scheduleAttachmentSync(file);
     // 0.72.4: classify self vs external and queue the contributor stamp.
@@ -10926,11 +10996,15 @@ export class StashpadView extends ItemView {
     // metadataCache hook only fires for metadata-affecting edits — pure
     // body changes (e.g. pasting a long block of plain text) wouldn't
     // otherwise trigger a re-render, leaving stale clamp state.
+    // 0.122.8 (F7): during a sync/bulk-write burst, hold the repaint and let
+    // deferDuringSyncBurst do one render when it settles.
+    if (this.deferDuringSyncBurst()) return;
     this.debouncedRender();
   };
   private onFileCreate = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
+    if (this.deferDuringSyncBurst()) return;
     this.debouncedRender();
   };
 
@@ -11150,11 +11224,18 @@ export class StashpadView extends ItemView {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       void this.cmdClone();
     }));
+    // 0.122.2 (#9): copy the note's text, or cut the whole note (for paste/move).
+    // `focusClicked` (defined below) normalises selection to the right-clicked row.
+    menu.addItem((it: any) => it.setTitle("Copy text").setIcon("copy").onClick(() => { focusClicked(); void this.cmdCopy(); }));
+    // 0.122.7: "Cut note" pulled from the menu for now — cut/paste has known bugs
+    // and cutting a parent/home note from the context menu is too easy a footgun.
+    // Still available via the cutNotes hotkey. (See ui-polish todos.)
     menu.addItem((it: any) => it.setTitle("Fork into a separate note…").setIcon("git-branch").onClick(() => {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
       this.cmdForkNote();
     }));
-    menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
+    // 0.122.2 (#9): "Insert template…" removed from the right-click menu to keep
+    // it compact — still available via command palette + its hotkey.
     menu.addItem((it: any) => it.setTitle("Export to .stash").setIcon("package").onClick(() => {
       // Multi-select normalisation (matches Clone / Delete / Set color):
       // if the right-clicked row isn't in the selection, treat the
@@ -11235,6 +11316,9 @@ export class StashpadView extends ItemView {
         const isDone = this.isCompleted(node);
         target.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => { focusClicked(); void this.cmdToggleComplete(); }));
       } else {
+        // 0.122.2 (#10): let non-tasks be marked complete too (sets `completed`;
+        // the note then counts as a task via the bare-completed field).
+        target.addItem((it: any) => it.setTitle("Mark complete").setIcon("check-circle").onClick(() => { focusClicked(); void this.toggleCompletedForNode(node); }));
         target.addItem((it: any) => it.setTitle("Turn into task").setIcon("check-square").onClick(() => { focusClicked(); void this.cmdToggleTask(); }));
       }
       target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => { focusClicked(); this.cmdAssign(); }));
