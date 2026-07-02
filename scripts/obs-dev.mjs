@@ -73,9 +73,30 @@ async function cdp(method, params) {
   return out;
 }
 
-async function evalExpr(expr) {
-  const wrapped = `(async () => { try { const __r = await (async () => { ${expr} })(); return JSON.stringify(__r); } catch (e) { return JSON.stringify({ __error: String(e && e.stack || e) }); } })()`;
-  const r = await cdp("Runtime.evaluate", { expression: wrapped, awaitPromise: true, returnByValue: true });
+async function rawEval(wrapped) {
+  return cdp("Runtime.evaluate", { expression: wrapped, awaitPromise: true, returnByValue: true });
+}
+
+// Run `body` as an async-function body, JSON-stringifying its return value.
+// `?? "undefined"` so a void body still prints a string rather than nothing.
+const wrapBody = (body) =>
+  `(async () => { try { const __r = await (async () => { ${body} })(); return JSON.stringify(__r) ?? "undefined"; } catch (e) { return JSON.stringify({ __error: String(e && e.stack || e) }); } })()`;
+
+async function evalExpr(code) {
+  // Ergonomics: accept BOTH a bare expression (`String(2+2)` → auto-returned,
+  // like a REPL) and statement code that uses its own `return` (the form
+  // verify/eval-file rely on). Try expression-mode first; if it's a *syntax*
+  // error (i.e. the code is multiple statements / already has `return`), fall
+  // back to statement-mode. Only SyntaxErrors fall back, so a runtime-throwing
+  // expression isn't executed twice.
+  let r = await rawEval(wrapBody(`return (${code})`));
+  const syntaxErr = r.exceptionDetails &&
+    /SyntaxError/.test(r.exceptionDetails.exception?.description || r.exceptionDetails.text || "");
+  if (syntaxErr) r = await rawEval(wrapBody(code));
+  if (r.exceptionDetails && !r.result?.value) {
+    const d = r.exceptionDetails;
+    return JSON.stringify({ __error: d.exception?.description || d.text });
+  }
   return r.result?.value;
 }
 

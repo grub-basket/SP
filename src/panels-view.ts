@@ -11,6 +11,9 @@ import {
   type StashpadId,
 } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
+import { DueDatePickerModal } from "./modals";
+import { collectTasks as collectTasksShared, titleFromTaskFile, type TaskItem } from "./task-collect";
+import { TaskReviewModal } from "./task-review-modal";
 
 /** 0.74.3: render a child-count badge into `host` (replaces the old
  *  caret expander in the Pinned + detail panels). Collapsed shows a
@@ -25,21 +28,7 @@ export function renderCountBadge(host: HTMLElement, count: number, expanded: boo
 }
 
 /** 0.76.2: one task row in the Tasks panel. */
-interface TaskItem {
-  file: TFile;
-  folder: string;
-  id: string;
-  title: string;
-  task: boolean;
-  completed: boolean;
-  due: number | null;
-  dueRaw: string | null;
-  color: string | null;
-  /** 0.78.2: assignment. assignedTo = people the task is assigned to;
-   *  assignedBy = who delegated it (or null). */
-  assignedTo: Array<{ id: string; name: string }>;
-  assignedBy: { id: string; name: string } | null;
-}
+// TaskItem now lives in ./task-collect (shared with the Daily-review modal).
 
 /** Panel ids registered with the StashpadPanelsView. Future panels
  *  (e.g. recent activity, search results, attachments) add to this
@@ -454,10 +443,7 @@ export class StashpadPanelsView extends ItemView {
   /** Display title from a TFile — strip the trailing "-id" suffix and
    *  un-hyphenate. */
   private titleFromFile(file: TFile): string {
-    return file.basename
-      .replace(/-[a-z0-9]{4,12}$/, "")
-      .replace(/-/g, " ")
-      .trim() || file.basename;
+    return titleFromTaskFile(file);
   }
 
   // ---------- Actions ----------
@@ -778,10 +764,16 @@ export class StashpadPanelsView extends ItemView {
    *  span folders now (v1 grouped by folder; v2 groups by status). */
   private renderTasksPanel(parent: HTMLElement): void {
     const list = parent.createDiv({ cls: "stashpad-panel-tasks" });
+    // 0.126.0: open the roomier Daily-review modal (the panel is cramped).
+    const reviewBar = list.createDiv({ cls: "stashpad-task-review-bar" });
+    const reviewBtn = reviewBar.createEl("button", { cls: "stashpad-task-review-open" });
+    setIcon(reviewBtn.createSpan({ cls: "stashpad-btn-icon" }), "maximize-2");
+    reviewBtn.createSpan({ text: "Daily review" });
+    reviewBtn.onclick = () => new TaskReviewModal(this.app, this.plugin).open();
     const allTasks = this.collectTasks();
     if (allTasks.length === 0) {
       list.createDiv({ cls: "stashpad-tasks-empty" })
-        .setText("No tasks yet — press H on a note to mark it a task, or D to give it a due date.");
+        .setText("No tasks yet — press G on a note to mark it a task, or D to give it a due date.");
       return;
     }
 
@@ -994,14 +986,38 @@ export class StashpadPanelsView extends ItemView {
         chip.title = meId && a.id === meId ? `${a.name} (you)` : a.name;
       }
     }
+    // 0.125.0: snooze button — reschedule the due date via the existing
+    // due-date picker (date-only). Sits at the row end.
+    const snoozeBtn = row.createEl("button", { cls: "stashpad-task-snooze" });
+    setIcon(snoozeBtn, "alarm-clock");
+    snoozeBtn.title = "Snooze — reschedule due date";
+    snoozeBtn.onclick = (e) => { e.stopPropagation(); this.snoozeTask(t); };
     row.oncontextmenu = (e) => {
       e.preventDefault();
       const menu = new Menu();
       menu.addItem((it: any) => it.setTitle("Open").setIcon("arrow-right").onClick(() => {
         void this.openTaskFromPanel(t.folder, t.id);
       }));
+      menu.addItem((it: any) => it.setTitle("Snooze (reschedule)…").setIcon("alarm-clock").onClick(() => {
+        this.snoozeTask(t);
+      }));
       menu.showAtMouseEvent(e);
     };
+  }
+
+  /** 0.125.0: Snooze a task straight from the panel — opens the shared
+   *  due-date picker (date-only, no assignee section) pre-filled with the
+   *  current due, and writes the new due directly (mirrors toggleTaskCompleted;
+   *  reschedule-only, so assignees are untouched). */
+  private snoozeTask(t: TaskItem): void {
+    const current = t.dueRaw ?? (t.due != null ? new Date(t.due).toISOString() : null);
+    new DueDatePickerModal(this.app, current, (result) => {
+      void this.app.fileManager.processFrontMatter(t.file, (m: any) => {
+        if (result.iso === null) delete m.due;
+        else { m.due = result.iso; m.task = true; }
+      }).then(() => this.scheduleRender())
+        .catch((e: any) => new Notice(`Couldn't snooze: ${(e as Error).message}`));
+    }, { title: "Snooze — reschedule", hideAssignees: true, quickAdjusts: this.plugin.settings.dueQuickAdjusts }).open();
   }
 
   /** 0.76.6: compact due label honouring the user's display format +
@@ -1041,48 +1057,7 @@ export class StashpadPanelsView extends ItemView {
   }
 
   private collectTasks(): TaskItem[] {
-    const folders = this.plugin.discoverStashpadFolders();
-    const folderSet = new Set(folders);
-    const out: TaskItem[] = [];
-    for (const f of this.app.vault.getMarkdownFiles()) {
-      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-      if (!folderSet.has(dir)) continue;
-      const fm = (this.app.metadataCache.getFileCache(f)?.frontmatter ?? {}) as any;
-      const id = typeof fm.id === "string" ? fm.id : null;
-      if (!id || id === ROOT_ID) continue;
-      const completed = fm.completed === true;
-      // 0.76.3: a note is a task when it carries the `task` tag, or
-      // (legacy) the 0.76.1 `task: true` boolean, or a bare
-      // `completed` field set by an earlier complete-toggle.
-      const task = fmHasTag(fm, "task") || fm.task === true || fm.completed !== undefined;
-      const dueRaw = typeof fm.due === "string" || typeof fm.due === "number" ? String(fm.due) : null;
-      // `due` can be either a moment-parseable date string or a raw
-      // ISO timestamp number. Try Date.parse — if NaN, keep dueRaw for
-      // display but leave due=null so sort doesn't mis-order it.
-      let due: number | null = null;
-      if (dueRaw) {
-        const t = Date.parse(dueRaw);
-        if (!Number.isNaN(t)) due = t;
-      }
-      // 0.76.2: include anything flagged as a task, plus the legacy
-      // signals (completed / due) so notes from before the `task`
-      // field still surface.
-      if (!task && !completed && due == null && !dueRaw) continue;
-      out.push({
-        file: f,
-        folder: dir,
-        id,
-        title: this.titleFromFile(f),
-        task,
-        completed,
-        due,
-        dueRaw,
-        color: typeof fm.color === "string" ? fm.color : null,
-        assignedTo: parseAssignees(fm),
-        assignedBy: parseAuthorRef(fm.assignedBy),
-      });
-    }
-    return out;
+    return collectTasksShared(this.app, this.plugin);
   }
 }
 

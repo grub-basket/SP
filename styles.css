@@ -1806,6 +1806,10 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 /* Suggest modal (pick/search) */
 .stashpad-suggest-item { padding: 6px 8px; }
 .stashpad-suggest-title { font-weight: 500; }
+/* 0.124.0: locked (encrypted) search result — lock icon inline with the label. */
+.stashpad-suggest-locked { display: inline-flex; align-items: center; gap: 6px; }
+.stashpad-suggest-locked-icon { display: inline-flex; align-items: center; color: var(--text-muted); flex: 0 0 auto; }
+.stashpad-suggest-locked-icon .svg-icon { width: 14px; height: 14px; }
 .stashpad-suggest-preview {
   margin-top: 4px;
   font-size: var(--font-ui-smaller);
@@ -2418,12 +2422,15 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 .stashpad-focused-mini {
   position: sticky;
-  /* Pull the sticky element UP into the view's flex `gap` between the
-     breadcrumb and the list (8px) PLUS the list's own 4px top padding
-     so it sits flush against the breadcrumb's bottom border. Without
-     this, rows scroll through the visible gap above the sticky bar
-     before disappearing under it. */
-  top: -12px;
+  /* 0.123.7: stick at the LIST's top edge — `top: -4px` exactly cancels the
+     list's 4px top-padding so the bar's background covers the strip where rows
+     would otherwise peek above it, WITHOUT the old `-12px` over-pull that
+     yanked the bar into the list's overflow-clip zone and shaved the centered
+     button's top. Measured: rows no longer peek (elementFromPoint above the bar
+     is breadcrumb/view-bg, never a note row) and the button sits +6px below the
+     clip line. The few px between the breadcrumb and the list is the view's own
+     background (same color), not notes. */
+  top: -4px;
   z-index: 5;
   display: none;
   align-items: center;
@@ -2433,7 +2440,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   border-bottom: 1px solid var(--background-modifier-border);
   font-size: var(--font-ui-small);
   color: var(--text-muted);
-  margin: -4px 0 4px;
+  margin: 0 0 4px;
 }
 .stashpad-focused-mini.is-visible { display: flex; }
 .stashpad-focused-mini-text {
@@ -2475,7 +2482,6 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   width: 14px;
   height: 14px;
 }
-
 /* Mobile: tighten padding inside the focused header (the new shared
    row layout already handles columns). Keep the 1-line clamp for the
    inner text so the parent note doesn't dominate the screen. */
@@ -3288,6 +3294,39 @@ body.is-mobile .stashpad-okf-cta {
 .stashpad-due-date::-webkit-datetime-edit-month-field:first-child,
 .stashpad-due-date::-webkit-datetime-edit-year-field:first-child,
 .stashpad-due-date::-webkit-datetime-edit-day-field:first-child { padding-left: 0; margin-left: 0; }
+/* 0.125.1: quick relative-adjust row in the due/snooze picker — a +/- flip
+   followed by amount buttons. Wraps on narrow widths. */
+.stashpad-due-quickadjust {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 2px;
+}
+.stashpad-due-adjust-flip {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  font-weight: 700;
+  font-size: 1.05em;
+  cursor: pointer;
+}
+.stashpad-due-adjust-flip.is-minus { color: var(--text-error); border-color: var(--text-error); }
+.stashpad-due-adjust-btn {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.stashpad-due-adjust-btn:hover { background: var(--interactive-hover); }
 .stashpad-due-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -4331,6 +4370,129 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
   white-space: nowrap;
 }
 .stashpad-task-due.is-overdue { color: var(--text-error); }
+/* 0.125.0: snooze (reschedule) button at the end of a task row. Subtle until
+   hover, like the row's other affordances. */
+.stashpad-task-snooze {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  padding: 2px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+.stashpad-task-row:hover .stashpad-task-snooze { color: var(--text-muted); }
+.stashpad-task-snooze:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-task-snooze .svg-icon { width: 14px; height: 14px; }
+/* 0.126.0: "Daily review" launcher at the top of the Tasks panel. */
+.stashpad-task-review-bar { display: flex; margin-bottom: 6px; }
+.stashpad-task-review-open {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal); color: var(--text-normal);
+  cursor: pointer; font-size: var(--font-ui-small);
+}
+.stashpad-task-review-open:hover { background: var(--interactive-hover); }
+.stashpad-task-review-open .svg-icon { width: 14px; height: 14px; }
+/* 0.126.0: Daily-review modal — roomier task triage. */
+.stashpad-task-review-modal { width: min(680px, 92vw); }
+.stashpad-review-summary { color: var(--text-muted); font-size: var(--font-ui-small); margin-bottom: 10px; }
+/* 0.126.2: task-triage filter bar (assignment + folder selects) + status chips,
+   matching the Tasks panel's options. Shared by the review modal + All-tasks tab. */
+.stashpad-triage-filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.stashpad-triage-select {
+  flex: 1 1 auto; min-width: 120px; max-width: 240px;
+  padding: 4px 6px; border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal); color: var(--text-normal);
+  font-size: var(--font-ui-small);
+}
+.stashpad-triage-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.stashpad-triage-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal); color: var(--text-muted);
+  font-size: var(--font-ui-smaller); cursor: pointer;
+}
+.stashpad-triage-chip.is-active { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
+.stashpad-triage-chip-count { opacity: 0.75; font-variant-numeric: tabular-nums; }
+/* 0.128.0: trash view-mode toolbar (reuses the triage chip look) + kind badge. */
+.stashpad-trash-modes { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 12px; }
+.stashpad-trash-kind { display: inline-flex; align-items: center; margin-right: 6px; color: var(--text-muted); flex: 0 0 auto; }
+.stashpad-trash-kind.is-enc { color: var(--text-accent); }
+.stashpad-trash-kind .svg-icon { width: 13px; height: 13px; }
+.stashpad-review-section {
+  display: flex; align-items: center; gap: 6px;
+  margin: 14px 0 6px; font-weight: 600; color: var(--text-muted);
+  font-size: var(--font-ui-smaller); text-transform: uppercase; letter-spacing: 0.03em;
+}
+.stashpad-review-section.is-overdue { color: var(--text-error); }
+.stashpad-review-section-icon { display: inline-flex; }
+.stashpad-review-section-icon .svg-icon { width: 14px; height: 14px; }
+.stashpad-review-section-count { margin-left: auto; opacity: 0.7; }
+.stashpad-review-list { display: flex; flex-direction: column; gap: 4px; }
+.stashpad-review-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 8px 10px; border-radius: 8px;
+  background: var(--background-secondary);
+}
+.stashpad-review-row.is-completed .stashpad-review-title { text-decoration: line-through; color: var(--text-muted); }
+.stashpad-review-check { flex: 0 0 auto; cursor: pointer; color: var(--text-muted); margin-top: 1px; }
+.stashpad-review-check .svg-icon { width: 18px; height: 18px; }
+.stashpad-review-main { flex: 1 1 auto; min-width: 0; }
+.stashpad-review-title { cursor: pointer; font-weight: 500; }
+.stashpad-review-title:hover { color: var(--text-accent); }
+.stashpad-review-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 3px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-review-due.is-overdue { color: var(--text-error); }
+.stashpad-review-due.is-none { opacity: 0.6; }
+.stashpad-review-folder { opacity: 0.8; }
+.stashpad-review-assignee { background: var(--background-modifier-border); border-radius: 4px; padding: 0 5px; }
+.stashpad-review-author { opacity: 0.75; }
+.stashpad-review-actions { flex: 0 0 auto; display: flex; gap: 4px; }
+.stashpad-review-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  /* 0.127.1: shorter button so there's less empty space above/below the icon;
+     the icon keeps its 15px size. */
+  width: 28px; height: 18px; padding: 0;
+  border-radius: 6px; border: 1px solid var(--background-modifier-border);
+  background: transparent; color: var(--text-muted); cursor: pointer;
+}
+.stashpad-review-btn:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-review-btn .svg-icon { width: 15px; height: 15px; }
+/* 0.127.1: searchable author filter input in the task-triage bar. */
+.stashpad-triage-authorsearch {
+  flex: 1 1 auto; min-width: 120px; max-width: 200px;
+  padding: 4px 6px; border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary); color: var(--text-normal);
+  font-size: var(--font-ui-small);
+}
+/* 0.131.0: reset buttons (task-filter row + aggregate mode-chip bar) + author × */
+.stashpad-triage-reset, .stashpad-agg-reset {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 26px; padding: 0;
+  border-radius: 6px; border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal); color: var(--text-muted); cursor: pointer;
+}
+.stashpad-triage-reset:hover, .stashpad-agg-reset:hover { background: var(--interactive-hover); color: var(--text-normal); }
+.stashpad-triage-reset .svg-icon, .stashpad-agg-reset .svg-icon { width: 14px; height: 14px; }
+.stashpad-triage-authorwrap { position: relative; display: inline-flex; align-items: center; flex: 1 1 auto; min-width: 120px; max-width: 200px; }
+.stashpad-triage-authorwrap .stashpad-triage-authorsearch { flex: 1 1 auto; max-width: none; padding-right: 24px; }
+.stashpad-triage-authorclear {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; padding: 0; border: none; border-radius: 4px;
+  background: transparent; color: var(--text-muted); cursor: pointer;
+}
+.stashpad-triage-authorclear:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-triage-authorclear .svg-icon { width: 12px; height: 12px; }
 /* 0.76.3: clickable checkbox in the Tasks panel. */
 .stashpad-task-checkbox { cursor: pointer; }
 /* 0.78.2: assignment filter dropdown + assignee chips. */

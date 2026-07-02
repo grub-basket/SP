@@ -8,6 +8,7 @@ import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
 import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE } from "./types";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
+import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, writeRotatedBlob, commitRotatedBlob, cleanupRotTemps, listRotTemps, deletedBlobsForKeyId, rewrapDeletedSidecar, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs } from "./encryption-ops";
@@ -1178,6 +1179,12 @@ export default class StashpadPlugin extends Plugin {
       name: "Open “All archived” (every archive folder)",
       callback: () => void openAggregateView(this, "archived"),
     });
+    // 0.126.1: tasks as a full tab too (alongside the sidebar panel + review modal).
+    this.addCommand({
+      id: "stashpad-open-all-tasks",
+      name: "Open “All tasks” (every task across folders)",
+      callback: () => void openAggregateView(this, "tasks"),
+    });
     // v2 backfill: "Encrypt items sent to trash" only covers going-forward
     // deletes — this sweeps what's ALREADY sitting in plaintext in `.trash/`.
     this.addCommand({
@@ -1427,6 +1434,8 @@ export default class StashpadPlugin extends Plugin {
         },
       });
     }
+    // 0.126.0: roomier full-modal task triage (the panel is cramped).
+    this.addCommand({ id: "stashpad-task-review", name: "Open daily task review", callback: () => new TaskReviewModal(this.app, this).open() });
     this.addCommand({ id: "stashpad-swap-with-parent", name: "Swap with parent (ouroboros)", callback: () => call("cmdSwapWithParent") });
     this.addCommand({ id: "stashpad-toggle-pin", name: "Pin / unpin selected note (sidebar)", callback: () => call("cmdTogglePin") });
     this.addCommand({ id: "stashpad-list-pin", name: "Pin / unpin to top of list", callback: () => call("cmdToggleListPin") });
@@ -3291,6 +3300,29 @@ export default class StashpadPlugin extends Plugin {
     return out;
   }
 
+  /** 0.124.0: ALL locked-subtree stubs in `folder` (every parent), for search.
+   *  Same registry-first + on-disk-fallback sources as lockedSubtreesFor, just
+   *  not filtered by parentId — so encrypted notes are findable in search even
+   *  though they aren't tree nodes. */
+  lockedSubtreesInFolder(folder: string): Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null }> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const out: Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null }> = [];
+    const seen = new Set<string>();
+    for (const e of this.settings.lockedSubtrees ?? []) {
+      if ((e.folder ?? "").replace(/\/+$/, "") !== cleaned) continue;
+      out.push({ blob: e.blob, title: e.title ?? "", count: e.count ?? 0, created: e.created ?? "", rootId: e.rootId, parentId: e.parentId ?? ROOT_ID });
+      seen.add(e.blob);
+    }
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension !== "stashenc") continue;
+      if (seen.has(f.path)) continue;
+      const fdir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (fdir !== cleaned || fdir === "_deleted" || fdir.startsWith("_deleted/")) continue;
+      out.push({ blob: f.path, title: f.basename, count: 0, created: "", rootId: undefined, parentId: ROOT_ID });
+    }
+    return out;
+  }
+
   /** Ensure encryption is configured + unlocked, prompting for the password if
    *  locked. Returns true once the session key is available. */
   async ensureEncryptionUnlocked(): Promise<boolean> {
@@ -3967,6 +3999,92 @@ export default class StashpadPlugin extends Plugin {
     this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => !blobs.has(e.blob));
     await this.saveSettings();
     return n;
+  }
+
+  /** 0.126.3: list Stashpad-origin notes sitting UNENCRYPTED in Obsidian's
+   *  `.trash/` (where plain deletes go when "Encrypt items sent to trash" is
+   *  off). Heuristic: a markdown file whose frontmatter carries both `id` and
+   *  `parent` (Stashpad's reserved keys). Read via the adapter since `.trash` is
+   *  not indexed by the metadata cache. */
+  async listRawTrashStashpadNotes(): Promise<Array<{ path: string; name: string; title: string; mtime: number }>> {
+    const dir = OBSIDIAN_TRASH_DIR;
+    const out: Array<{ path: string; name: string; title: string; mtime: number }> = [];
+    try {
+      if (!(await this.app.vault.adapter.exists(dir))) return out;
+      const listing = await this.app.vault.adapter.list(dir);
+      for (const p of listing.files) {
+        if (!p.endsWith(".md")) continue;
+        let content = "";
+        try { content = await this.app.vault.adapter.read(p); } catch { continue; }
+        const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---/.exec(content);
+        if (!fmMatch) continue;
+        const fm = fmMatch[1];
+        if (!/^id:\s*\S/m.test(fm) || !/^parent:\s*/m.test(fm)) continue; // Stashpad-origin heuristic
+        const base = p.split("/").pop() || p;
+        const title = base.replace(/\.md$/, "").replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || base;
+        let mtime = 0;
+        try { mtime = (await this.app.vault.adapter.stat(p))?.mtime ?? 0; } catch { /* ignore */ }
+        out.push({ path: p, name: base, title, mtime });
+      }
+    } catch { /* ignore */ }
+    return out;
+  }
+
+  /** Restore one raw-trash note back into the default Stashpad folder. Origin
+   *  folder isn't recorded on disk, so this is best-effort: the note keeps its
+   *  `id`/`parent` frontmatter, so the tree re-nests it under its parent if that
+   *  parent lives in the default folder; otherwise it lands at the folder root
+   *  (recoverable, never lost). */
+  async restoreRawTrashNote(path: string): Promise<boolean> {
+    const dest = (this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
+    const base = path.split("/").pop() || path;
+    try {
+      if (!(await this.app.vault.adapter.exists(dest))) { try { await this.app.vault.createFolder(dest); } catch { /* exists race */ } }
+      let target = `${dest}/${base}`;
+      if (await this.app.vault.adapter.exists(target)) target = `${dest}/${base.replace(/\.md$/, "")}-restored-${Date.now()}.md`;
+      await this.app.vault.adapter.rename(path, target);
+      this.notifications.show({ message: `Restored "${base}" to ${dest}/. If its parent lives in another folder, move it from there.`, kind: "success", category: "system", folder: dest });
+      return true;
+    } catch (e) {
+      new Notice(`Couldn't restore: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  /** 0.129.0: plain (unencrypted) Stashpad notes living in an archive folder —
+   *  the ones the "All archived" view was missing (it only showed locked
+   *  subtrees). Markdown files under `folder` whose frontmatter carries an `id`. */
+  archivedPlainNotesIn(folder: string): TFile[] {
+    const clean = folder.replace(/\/+$/, "");
+    const prefix = clean + "/";
+    const out: TFile[] = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!(dir === clean || dir.startsWith(prefix))) continue;
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id === "string" && id) out.push(f);
+    }
+    return out;
+  }
+
+  /** Un-archive a plain note: move it out of the archive folder into the default
+   *  Stashpad folder. Borrows restoreRawTrashNote's best-effort approach — the
+   *  note keeps its id/parent, so the tree re-nests it under its parent if that
+   *  parent is in the default folder; else it lands at the folder root. */
+  async unarchiveNote(file: TFile): Promise<boolean> {
+    const dest = (this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
+    if ((file.parent?.path ?? "") === dest) { new Notice("Already in the default folder."); return false; }
+    try {
+      if (!(await this.app.vault.adapter.exists(dest))) { try { await this.app.vault.createFolder(dest); } catch { /* race */ } }
+      let target = `${dest}/${file.name}`;
+      if (await this.app.vault.adapter.exists(target)) target = `${dest}/${file.basename}-restored-${Date.now()}.md`;
+      await this.app.fileManager.renameFile(file, target);
+      this.notifications.show({ message: `Un-archived "${file.basename}" to ${dest}/.`, kind: "success", category: "system", folder: dest });
+      return true;
+    } catch (e) {
+      new Notice(`Couldn't un-archive: ${(e as Error).message}`);
+      return false;
+    }
   }
 
   /** List the encrypted-trash contents (blob path + sidecar metadata). */
@@ -5433,8 +5551,23 @@ export default class StashpadPlugin extends Plugin {
       slugStopWords: Array.isArray(data?.slugStopWords)
         ? data.slugStopWords
         : [...DEFAULT_STOPWORDS],
+      migratedToggleTaskG: data?.migratedToggleTaskG === true,
+      dueQuickAdjusts: Array.isArray(data?.dueQuickAdjusts)
+        ? data.dueQuickAdjusts.filter((x: unknown): x is string => typeof x === "string")
+        : ["5m", "15m", "30m", "1h", "1d", "1w"],
     };
     setSettings(this.settings);
+    // 0.124.1: one-time migration of the "Toggle task" default H → G. Installs
+    // persist the FULL bindings map, so changing the default alone never reaches
+    // existing users. Flip a still-default `H` to `G` once, then mark it done so
+    // a later deliberate rebind to H sticks.
+    if (!this.settings.migratedToggleTaskG) {
+      if (this.settings.bindings.toggleTask?.primary === "H") {
+        this.settings.bindings.toggleTask.primary = "G";
+      }
+      this.settings.migratedToggleTaskG = true;
+      await this.saveSettings();
+    }
     // Sync the notification service's mute set from settings. Safe to
     // call before any toasts fire — the service no-ops on empty mute
     // sets. Cast through string[] → NotificationCategory[] since the

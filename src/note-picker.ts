@@ -175,6 +175,22 @@ export interface PickerItem {
   crossId?: string;
   /** For "folder-open" items: the folder path to open in a new tab. */
   folder?: string;
+  /** 0.124.0: set when this result is an encrypted (locked) note rather than a
+   *  tree node. The caller navigates to the stub's parent so the user can find +
+   *  unlock it. The label is the real title, or the "Locked note" placeholder
+   *  when titles are hidden. */
+  locked?: LockedNote;
+}
+
+/** 0.124.0: a locked-subtree stub surfaced as a search candidate. Mirrors the
+ *  shape returned by `plugin.lockedSubtreesInFolder`. */
+export interface LockedNote {
+  blob: string;
+  title: string;
+  count: number;
+  created: string;
+  rootId?: string;
+  parentId?: string | null;
 }
 
 /** A cross-folder note loaded from another Stashpad. Shaped to plug into
@@ -208,6 +224,9 @@ interface NoteBody {
   body: string;
   /** When set, this entry is from another Stashpad. */
   cross?: CrossFolderNote;
+  /** 0.124.0: when set, this entry is an encrypted/locked note (no node, no
+   *  searchable body — only its visible label/placeholder matches). */
+  locked?: LockedNote;
 }
 
 export class StashpadSuggest extends SuggestModal<PickerItem> {
@@ -268,6 +287,12 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
        *  to render the folder badge on LOCAL suggestion rows (parity
        *  with how cross-folder rows show their source folder). */
       localFolder?: string;
+      /** 0.124.0: source of encrypted/locked notes for the active folder so
+       *  they're findable in search even though they aren't tree nodes. */
+      lockedNotes?: () => LockedNote[];
+      /** 0.124.0: when true, locked notes show the "Locked note" placeholder
+       *  instead of their real title (matches the list's hideLockedTitles). */
+      hideLockedTitles?: boolean;
     },
   ) {
     super(app);
@@ -294,6 +319,17 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     };
     if (rootNode.file) this.notes.push({ node: rootNode, title: localHomeTitle, body: "" });
     for (const c of this.tree.getChildren(ROOT_ID)) walk(c.id, 1);
+
+    // 0.124.0: locked (encrypted) notes — not tree nodes, so add them as their
+    // own candidates. Body can't be searched (it's encrypted); only the visible
+    // label matches. When titles are hidden (or the on-disk title is empty), the
+    // label IS the "Locked note" placeholder, so they still surface in results.
+    if (this.opts.lockedNotes) {
+      for (const lk of this.opts.lockedNotes()) {
+        const hidden = (this.opts.hideLockedTitles ?? false) || !lk.title;
+        this.notes.push({ node: null, title: hidden ? "Locked note" : lk.title, body: "", locked: lk });
+      }
+    }
 
     // lazy-read bodies in background
     for (const n of this.notes) {
@@ -324,6 +360,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
   private createdMsFor(n: NoteBody): number | null {
     if (n.node?.created) {
       const ms = Date.parse(n.node.created);
+      if (!Number.isNaN(ms)) return ms;
+    }
+    if (n.locked?.created) {
+      const ms = Date.parse(n.locked.created);
       if (!Number.isNaN(ms)) return ms;
     }
     if (n.cross?.file?.stat?.ctime != null) return n.cross.file.stat.ctime;
@@ -451,7 +491,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       // Folder-qualify cross-folder ids: home notes all share ROOT_ID, so a bare
       // `cross:${id}` collided across folders (one home borrowed another's body/
       // title). The raw id rides along in `crossId` for lookups.
-      id: n.cross ? `cross:${n.cross.folder}:${n.cross.id}` : n.node!.id,
+      id: n.locked ? `locked:${n.locked.blob}` : n.cross ? `cross:${n.cross.folder}:${n.cross.id}` : n.node!.id,
       label: n.title,
       node: n.node,
       kind: "note",
@@ -460,6 +500,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       crossFolder: n.cross?.folder,
       crossFile: n.cross?.file,
       crossId: n.cross?.id,
+      locked: n.locked,
     });
 
     const matchTier = (tier: NoteBody[]): PickerItem[] => {
@@ -657,6 +698,22 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       setIcon(icon, "folder-search");
       row.createSpan({ text: item.label });
       el.createDiv({ cls: "stashpad-suggest-preview", text: "Include folders you've excluded from search (e.g. to move a note there)." });
+      return;
+    }
+    // 0.124.0: locked (encrypted) note — no node/body to render; show a lock
+    // icon + the visible label (real title or "Locked note" placeholder) + a
+    // "locked" sub-line. Picking it navigates to where the stub lives.
+    if (item.locked) {
+      el.addClass("stashpad-suggest-row", "is-locked");
+      const body = el.createDiv({ cls: "stashpad-suggest-body" });
+      const top = body.createDiv({ cls: "stashpad-suggest-title stashpad-suggest-locked" });
+      setIcon(top.createSpan({ cls: "stashpad-suggest-locked-icon" }), "lock");
+      const tokens = parseSearchQuery((this as any).inputEl?.value ?? "").text;
+      this.highlightInto(top.createSpan(), item.label, tokens);
+      body.createDiv({
+        cls: "stashpad-suggest-preview",
+        text: item.locked.count > 1 ? `${item.locked.count} notes · locked` : "Encrypted — locked",
+      });
       return;
     }
     if (item.crossFolder) el.addClass("is-cross-folder");

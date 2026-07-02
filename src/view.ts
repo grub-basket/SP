@@ -679,8 +679,10 @@ export class StashpadView extends ItemView {
     // hasn't fired.
     this.registerDomEvent(window, "beforeunload", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
     this.registerDomEvent(window, "blur", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
-    // Auto-focus the composer so users can type immediately on open.
-    this.focusComposer();
+    // 0.132.0: on open, focus the composer only when opted in; otherwise focus
+    // the LIST so arrow-key navigation works right away (composer no longer
+    // grabs focus every time). focusComposer() self-gates on the same setting.
+    if (getSettings().focusComposerOnOpen) this.focusComposer(); else this.focusView();
     // Re-focus whenever this Stashpad leaf becomes the active one (e.g. user closes
     // a sibling tab via Cmd+W and lands back here, or switches into a Stashpad tab).
     // Also release the sticky-bottom flag when the user switches AWAY from this
@@ -688,7 +690,7 @@ export class StashpadView extends ItemView {
     // shouldn't yank the view to the bottom on the next render. Re-arming the flag
     // is the composer-submit / scrollToBottomOnNextRender path's job.
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
-      if (leaf === this.leaf) this.focusComposer();
+      if (leaf === this.leaf) { if (getSettings().focusComposerOnOpen) this.focusComposer(); else this.focusView(); }
       else this.stickToListBottom = false;
     }));
   }
@@ -829,7 +831,7 @@ export class StashpadView extends ItemView {
     // across renders — focusComposerOnNextRender — is separate and
     // still works: it only re-focuses when the composer already had
     // focus.)
-    if (!getSettings().autofocusComposerAfterSend) return;
+    if (!getSettings().focusComposerOnOpen) return; // 0.132.0: decoupled from after-send
     const tryFocus = () => {
       if (!this.viewRoot?.isConnected) return;
       // 0.76.21: skip the activation auto-focus during the suppression
@@ -957,6 +959,9 @@ export class StashpadView extends ItemView {
       if ("folderOverride" in s) this.folderOverride = s.folderOverride ?? null;
       if (s.timeFilter) this.timeFilter = s.timeFilter;
       if (s.focusId) this.focusId = s.focusId;
+      // 0.132.0: a fresh tab opened "in context" from search carries the note id
+      // to cursor/reveal once the list renders.
+      if ((s as { cursorId?: string }).cursorId) this.pendingCursorId = (s as { cursorId?: string }).cursorId as StashpadId;
       if ("tagFilter" in s) this.tagFilter = s.tagFilter ?? null;
       if ("colorFilter" in s) this.colorFilter = s.colorFilter ?? null;
       if ("timeFilterCalendar" in s) this.timeFilterCalendar = !!s.timeFilterCalendar;
@@ -4744,15 +4749,17 @@ export class StashpadView extends ItemView {
    *  installFocusedMiniObserver). */
   private renderFocusedHeaderMini(parent: HTMLElement, node: TreeNode): void {
     if (!node.file) return;
-    const file = node.file;
     const mini = parent.createDiv({ cls: "stashpad-focused-mini" });
     mini.dataset.id = node.id;
     const text = mini.createDiv({ cls: "stashpad-focused-mini-text" });
     text.setText(this.titleForNode(node).trim());
-    const pencil = mini.createEl("button", { cls: "stashpad-pencil stashpad-focused-mini-pencil" });
-    setIcon(pencil, "pencil");
-    pencil.title = "Edit in new tab";
-    pencil.onclick = (e) => { e.stopPropagation(); void this.openFileAtEnd(file); };
+    // 0.123.0: match the full focused header — the sticky preview's lone edit
+    // pencil becomes the context-menu button so the actions are consistent
+    // wherever the focused note's controls appear on mobile.
+    const moreBtn = mini.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-mini-more" });
+    setIcon(moreBtn, "more-horizontal"); // 0.123.1: horizontal kebab, matches the full header
+    moreBtn.title = "Actions";
+    moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
   }
 
   /** IntersectionObserver: hide the sticky mini preview while the full
@@ -4803,27 +4810,43 @@ export class StashpadView extends ItemView {
     // header behaves consistently with rows.
     body.addEventListener("click", (e) => this.handleRenderedClick(e, node));
 
-    // actions column: edit pencil + duplicate-tab button. Same shape as
-    // a list row's actions (pencil + arrow) so the icons line up.
+    // actions column. On DESKTOP: edit pencil + duplicate-tab button (same
+    // shape as a list row's actions so the icons line up). On MOBILE (0.123.0):
+    // ONE button that opens the context menu — exactly like a list row's
+    // mobile action — replacing the cramped edit + open-in-new-tab pair. The
+    // menu already carries Focus / Open in editor / Copy / everything.
     const actions = wrap.createDiv({ cls: "stashpad-focused-actions" });
-    const pencil = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-pencil" });
-    setIcon(pencil, "pencil");
-    pencil.title = "Edit in new tab";
-    pencil.onclick = () => void this.openFileAtEnd(file);
+    let toggleAnchor: HTMLElement;
+    if (Platform.isMobile) {
+      const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-more" });
+      // 0.123.1: horizontal kebab in the focused header — its shorter vertical
+      // footprint can't clip at the top in the slim home-note header row (the
+      // vertical ellipsis did). List rows keep the vertical kebab.
+      setIcon(moreBtn, "more-horizontal");
+      moreBtn.title = "Actions";
+      moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
+      toggleAnchor = moreBtn;
+    } else {
+      const pencil = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-pencil" });
+      setIcon(pencil, "pencil");
+      pencil.title = "Edit in new tab";
+      pencil.onclick = () => void this.openFileAtEnd(file);
 
-    const dupBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-dup" });
-    // "copy" — the lucide icon is two overlapping document shapes,
-    // which reads as "duplicate" / "clone the tab" at a glance.
-    setIcon(dupBtn, "copy");
-    dupBtn.title = "Open this Stashpad in a new tab (clone)";
-    dupBtn.onclick = () => this.cmdOpenInNewStashpadTab(node);
+      const dupBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-dup" });
+      // "copy" — the lucide icon is two overlapping document shapes,
+      // which reads as "duplicate" / "clone the tab" at a glance.
+      setIcon(dupBtn, "copy");
+      dupBtn.title = "Open this Stashpad in a new tab (clone)";
+      dupBtn.onclick = () => this.cmdOpenInNewStashpadTab(node);
+      toggleAnchor = pencil;
+    }
 
     this.renderNoteBody(body, node, {
       clamp: Platform.isMobile,
-      // Toggle slots into the actions cluster, BEFORE the pencil — so
-      // the order (when present) reads: [More] [Edit] [Duplicate].
+      // Toggle slots into the actions cluster, BEFORE the first button — so
+      // the order reads [More] [⋯] on mobile / [More] [Edit] [Duplicate] on desktop.
       toggleHost: actions,
-      toggleAnchor: pencil,
+      toggleAnchor,
     });
   }
 
@@ -7091,6 +7114,14 @@ export class StashpadView extends ItemView {
         // 0.96.0: when "Search results open in a new tab" is on (default), pick
         // opens the result in a fresh tab; off = the old in-place navigation.
         const newTab = this.plugin.settings.searchOpensInNewTab !== false;
+        // 0.124.0: a locked (encrypted) result isn't a tree node — navigate to
+        // its parent so the locked stub is visible in the list, ready to unlock.
+        if (item.locked) {
+          const pid = item.locked.parentId ?? ROOT_ID;
+          if (newTab) void this.openNoteInNewTab(this.noteFolder, pid);
+          else this.navigateTo(pid);
+          return;
+        }
         if (item.crossFolder && item.crossFile) {
           // Cross-Stashpad result: switch this view's folder and focus
           // the picked note. The setState path rebuilds the tree, so by
@@ -7101,8 +7132,14 @@ export class StashpadView extends ItemView {
           return;
         }
         if (item.node) {
-          if (newTab) void this.openNoteInNewTab(this.noteFolder, item.node.id);
-          else this.navigateTo(item.node.id);
+          // 0.132.0: "open in context" focuses the note's PARENT (so the note is
+          // a row in its list) and cursors/scrolls to it, instead of focusing
+          // INTO the note (which lands on the focused-header). Off = old behavior.
+          const ctx = this.plugin.settings.searchOpensInContext !== false;
+          const focusTarget = ctx ? (item.node.parent ?? ROOT_ID) : item.node.id;
+          const cursor = ctx ? item.node.id : undefined;
+          if (newTab) void this.openNoteInNewTab(this.noteFolder, focusTarget, cursor);
+          else { if (cursor) this.pendingCursorId = cursor as StashpadId; this.navigateTo(focusTarget); }
         }
       },
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
@@ -7117,6 +7154,9 @@ export class StashpadView extends ItemView {
       showFilterChips: true,
       // 0.69.3: show the active folder badge on local results too.
       localFolder: this.noteFolder,
+      // 0.124.0: surface encrypted/locked notes in search (placeholder when titles hidden).
+      lockedNotes: () => this.plugin.lockedSubtreesInFolder(this.noteFolder),
+      hideLockedTitles: this.plugin.settings.hideLockedTitles ?? false,
     });
     this.openSearchInstance = instance;
     // Wrap onClose to clear our tracked reference when the modal closes.
@@ -8961,7 +9001,7 @@ export class StashpadView extends ItemView {
    *  note (in its own folder). Mirrors openFolderInNewTab but lands on a note
    *  instead of the folder root. Used by the search modal when
    *  searchOpensInNewTab is on. */
-  private async openNoteInNewTab(folder: string, noteId: string): Promise<void> {
+  private async openNoteInNewTab(folder: string, noteId: string, cursorId?: string): Promise<void> {
     const cleaned = (folder || "").trim().replace(/^\/+|\/+$/g, "");
     if (!cleaned || !noteId) return;
     const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
@@ -8973,6 +9013,9 @@ export class StashpadView extends ItemView {
       state: {
         focusId: noteId,
         folderOverride: cleaned === settingsFolder ? null : cleaned,
+        // 0.132.0: "search opens in context" focuses the parent (noteId) and
+        // cursors the child (cursorId) once the fresh tab renders.
+        ...(cursorId ? { cursorId } : {}),
       },
     });
     ws.setActiveLeaf(leaf, { focus: true });
@@ -9388,13 +9431,33 @@ export class StashpadView extends ItemView {
     const currentAssignees = parseAssignees(curFm ?? {});
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees);
-    }, { knownAuthors, currentAssignees }).open();
+    }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts }).open();
+  }
+
+  /** 0.125.0: Snooze — reschedule a task's due date. Reuses the due-date picker
+   *  (date-only: the assignee section is hidden) and writes the new due via
+   *  applyDue in dueOnly mode, so existing assignees are preserved. The quick
+   *  "+1h / tomorrow / next week" buttons are future work (task-scheduling). */
+  cmdSnooze(node?: TreeNode): void {
+    let targets: TreeNode[];
+    if (node) targets = [node];
+    else {
+      targets = this.getActionTargets();
+      if (targets.length === 0) { const f = this.tree.get(this.focusId); if (f?.file) targets = [f]; }
+    }
+    if (targets.length === 0) { new Notice("Nothing to snooze."); return; }
+    const first = targets[0];
+    const curFm = first.file ? this.app.metadataCache.getFileCache(first.file)?.frontmatter as any : null;
+    const current = curFm && (typeof curFm.due === "string" || typeof curFm.due === "number") ? String(curFm.due) : null;
+    new DueDatePickerModal(this.app, current, (result) => {
+      void this.applyDue(targets, result.iso, [], true);
+    }, { title: "Snooze — reschedule", hideAssignees: true, quickAdjusts: this.plugin.settings.dueQuickAdjusts }).open();
   }
 
   /** Write the chosen due value (or clear it) across `targets`, with
    *  undo. Setting a date also flips `task: true`; clearing leaves the
    *  task flag intact (clearing a due ≠ "no longer a task"). */
-  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = []): Promise<void> {
+  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false): Promise<void> {
     const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean }[] = [];
     const changedIds: StashpadId[] = [];
     // 0.78.1: who is doing the assigning (the local user) — stamped as
@@ -9415,6 +9478,10 @@ export class StashpadView extends ItemView {
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
         else { m.due = iso; m.task = true; }
+        // 0.125.0: Snooze passes dueOnly — reschedule the due date WITHOUT
+        // touching assignees (the plain applyDue would clear them on an empty
+        // list). Skip all assignee writes in that mode.
+        if (dueOnly) return;
         // Assignment: empty list clears it; any assignment also flips the
         // task flag (assigning makes it a task even without a due date).
         if (assignLinks.length > 0) {
@@ -11324,6 +11391,8 @@ export class StashpadView extends ItemView {
       }
       target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => { focusClicked(); this.cmdAssign(); }));
       if (isTaskNote) {
+        // 0.125.0: Snooze — reschedule the due date (date-only picker).
+        target.addItem((it: any) => it.setTitle("Snooze (reschedule)…").setIcon("alarm-clock").onClick(() => { focusClicked(); this.cmdSnooze(node); }));
         target.addItem((it: any) => it.setTitle("Remove from tasks").setIcon("square").onClick(() => { focusClicked(); void this.cmdToggleTask(); }));
       }
     };

@@ -16,6 +16,24 @@ export interface DuePickerOptions {
   /** Modal title. Defaults to "Set due date". The "Assign to" command
    *  opens this same modal with a different title. */
   title?: string;
+  /** 0.125.0: hide the "Assign to" section — used by Snooze, which only
+   *  reschedules the due date and must not touch assignees. */
+  hideAssignees?: boolean;
+  /** 0.125.1: quick relative time-adjust presets (e.g. ["5m","1h","1d"]). When
+   *  non-empty, a row of +/- buttons nudges the entered date/time by each
+   *  amount; a flip toggle switches between adding and subtracting. */
+  quickAdjusts?: string[];
+}
+
+/** 0.125.1: parse a compact duration token ("5m", "15m", "1h", "2d", "1w") into
+ *  minutes. Returns null when unparseable so callers can skip bad presets. */
+export function parseAdjustMinutes(raw: string): number | null {
+  const m = /^\s*(\d+)\s*(m|h|d|w)\s*$/i.exec(raw);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = { m: 1, h: 60, d: 1440, w: 10080 }[m[2].toLowerCase()] ?? 1;
+  return n * unit;
 }
 import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
@@ -1658,10 +1676,49 @@ export class DueDatePickerModal extends Modal {
       timeInput.value = this.toTimeValue(initial);
     }
 
+    // 0.125.1: quick relative adjust row — a +/- flip toggle plus one button per
+    // configured preset. Clicking nudges the entered date+time by ±amount; if no
+    // date/time is entered yet, it bases off "now" so a single tap schedules
+    // e.g. "+1h from now". Reschedule-friendly for Snooze.
+    const adjusts = (this.opts.quickAdjusts ?? [])
+      .map((s) => ({ raw: s, min: parseAdjustMinutes(s) }))
+      .filter((a): a is { raw: string; min: number } => a.min != null);
+    if (adjusts.length > 0) {
+      let sign = 1; // +1 add, -1 subtract
+      const row = wrap.createDiv({ cls: "stashpad-due-quickadjust" });
+      const flip = row.createEl("button", { cls: "stashpad-due-adjust-flip", attr: { type: "button" } });
+      const syncFlip = (): void => {
+        flip.setText(sign > 0 ? "+" : "−");
+        flip.toggleClass("is-minus", sign < 0);
+        flip.title = sign > 0 ? "Adding time (click to subtract)" : "Subtracting time (click to add)";
+      };
+      syncFlip();
+      flip.onclick = () => { sign = -sign; syncFlip(); };
+      const adjustBy = (deltaMin: number): void => {
+        // Base: entered date+time, else today/now filled in for the missing part.
+        const now = new Date();
+        let y: number, mo: number, d: number;
+        if (dateInput.value) { const [yy, mm, dd] = dateInput.value.split("-").map((n) => parseInt(n, 10)); y = yy; mo = mm - 1; d = dd; }
+        else { y = now.getFullYear(); mo = now.getMonth(); d = now.getDate(); }
+        let hh: number, mi: number;
+        if (timeInput.value) { const [h, m] = timeInput.value.split(":").map((n) => parseInt(n, 10)); hh = h; mi = m; }
+        else { hh = now.getHours(); mi = now.getMinutes(); }
+        const base = new Date(y, mo, d, hh, mi, 0, 0);
+        base.setMinutes(base.getMinutes() + sign * deltaMin);
+        dateInput.value = this.toDateValue(base);
+        timeInput.value = this.toTimeValue(base);
+      };
+      for (const a of adjusts) {
+        const b = row.createEl("button", { cls: "stashpad-due-adjust-btn", text: a.raw, attr: { type: "button" } });
+        b.onclick = () => adjustBy(a.min);
+      }
+    }
+
     // 0.78.1: "Assign to" section — chips for current assignees + an
     // autocomplete input to add known authors (Sift) or a free-entry name
     // (mints a new author id). Multiple assignees supported.
-    this.renderAssignSection(wrap);
+    // 0.125.0: Snooze passes hideAssignees — it only reschedules, so omit it.
+    if (!this.opts.hideAssignees) this.renderAssignSection(wrap);
 
     // 0.76.5: presets (top row) + actions (bottom row) share ONE
     // 3-column grid so the six buttons line up in two tidy rows.

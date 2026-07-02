@@ -1,11 +1,13 @@
-import { ItemView, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
+import { ItemView, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
 import type StashpadPlugin from "./main";
 import { STASHPAD_AGGREGATE_VIEW_TYPE } from "./types";
+import { renderTaskTriage, defaultTaskTriageState, type TaskTriageState } from "./task-render";
+import { renderAggModeBar, type AggMode } from "./agg-modes";
 
 // Obsidian types `moment` as a namespace (not callable); cast to a callable.
 const momentFn = moment as unknown as (...args: unknown[]) => { fromNow: () => string };
 
-export type AggregateMode = "encrypted" | "archived";
+export type AggregateMode = "encrypted" | "archived" | "tasks";
 
 interface AggregateState { mode: AggregateMode }
 
@@ -24,16 +26,20 @@ interface AggregateState { mode: AggregateMode }
  *  The "deleted" aggregate is the existing `StashpadTrashView`. */
 export class StashpadAggregateView extends ItemView {
   private mode: AggregateMode = "encrypted";
+  /** 0.126.2: filter state for the "tasks" mode (persists across re-renders). */
+  private taskState: TaskTriageState = defaultTaskTriageState();
+  /** 0.130.0: view mode for the "archived" tab (same chip set as Trash). */
+  private archiveSubMode: AggMode = "byfolder";
 
   constructor(leaf: WorkspaceLeaf, private plugin: StashpadPlugin) { super(leaf); }
 
   getViewType(): string { return STASHPAD_AGGREGATE_VIEW_TYPE; }
-  getDisplayText(): string { return this.mode === "archived" ? "All archived" : "All encrypted"; }
-  getIcon(): string { return this.mode === "archived" ? "archive" : "lock"; }
+  getDisplayText(): string { return this.mode === "archived" ? "All archived" : this.mode === "tasks" ? "All tasks" : "All encrypted"; }
+  getIcon(): string { return this.mode === "archived" ? "archive" : this.mode === "tasks" ? "check-square" : "lock"; }
 
   getState(): Record<string, unknown> { return { ...super.getState(), mode: this.mode }; }
   async setState(state: AggregateState, result: unknown): Promise<void> {
-    if (state?.mode === "archived" || state?.mode === "encrypted") this.mode = state.mode;
+    if (state?.mode === "archived" || state?.mode === "encrypted" || state?.mode === "tasks") this.mode = state.mode;
     await super.setState(state, result as ViewStateResult);
     await this.render();
   }
@@ -76,6 +82,12 @@ export class StashpadAggregateView extends ItemView {
     refresh.setAttr("aria-label", "Refresh");
     refresh.onclick = () => void this.render();
 
+    if (this.mode === "tasks") {
+      renderTaskTriage(root.createDiv(), this.app, this.plugin, this.taskState, {
+        onOpen: (folder, id) => void this.plugin.revealNoteByRef(folder, id),
+      });
+      return;
+    }
     if (this.mode === "archived") { this.renderArchived(root); return; }
     this.renderEncrypted(root);
   }
@@ -136,33 +148,102 @@ export class StashpadAggregateView extends ItemView {
       if (!archiveSet.has(f)) continue;
       (byFolder.get(f) ?? byFolder.set(f, []).get(f)!).push(e);
     }
-    const total = [...byFolder.values()].reduce((n, a) => n + a.length, 0);
-    root.createDiv({ cls: "stashpad-aggregate-sub", text: `${folders.length} archive ${folders.length === 1 ? "folder" : "folders"}, ${total} archived ${total === 1 ? "item" : "items"}.` });
-
+    // 0.129.0: also the PLAIN (unencrypted) notes living in each archive folder —
+    // the "All archived" view used to show only locked subtrees. Borrows the
+    // per-row restore pattern from the unified trash view.
+    const plainByFolder = new Map<string, TFile[]>();
+    let plainTotal = 0;
     for (const folder of folders) {
-      const items = byFolder.get(folder) ?? [];
+      const notes = this.plugin.archivedPlainNotesIn(folder);
+      plainByFolder.set(folder, notes);
+      plainTotal += notes.length;
+    }
+    const lockedTotal = [...byFolder.values()].reduce((n, a) => n + a.length, 0);
+    const total = plainTotal + lockedTotal;
+    const allPlain = folders.flatMap((f) => plainByFolder.get(f) ?? []);
+    const allLocked = folders.flatMap((f) => byFolder.get(f) ?? []);
+    root.createDiv({ cls: "stashpad-aggregate-sub", text: `${folders.length} archive ${folders.length === 1 ? "folder" : "folders"}, ${total} archived ${total === 1 ? "item" : "items"} (${plainTotal} plain · ${lockedTotal} locked).` });
+
+    // 0.130.0: same view-mode chips as the Trash tab.
+    renderAggModeBar(root, this.archiveSubMode, { total, enc: lockedTotal, dec: plainTotal },
+      (m) => { this.archiveSubMode = m; void this.render(); });
+    const mode = this.archiveSubMode;
+
+    if (mode === "mixed") {
+      type U = { ts: number; kind: "plain" | "locked"; f?: TFile; e?: typeof locked[number] };
+      const rows: U[] = [];
+      for (const f of allPlain) rows.push({ ts: f.stat.mtime || 0, kind: "plain", f });
+      for (const e of allLocked) rows.push({ ts: e.created ? (Date.parse(e.created) || 0) : 0, kind: "locked", e });
+      rows.sort((a, b) => b.ts - a.ts);
+      const group = root.createDiv({ cls: "stashpad-trash-group" });
+      for (const u of rows) { if (u.kind === "plain" && u.f) this.archivePlainRow(group, u.f); else if (u.e) this.archiveLockedRow(group, u.e); }
+      return;
+    }
+
+    if (mode === "byfolder") {
+      for (const folder of folders) {
+        const items = byFolder.get(folder) ?? [];
+        const plain = plainByFolder.get(folder) ?? [];
+        const group = root.createDiv({ cls: "stashpad-trash-group" });
+        const head = group.createDiv({ cls: "stashpad-trash-group-head" });
+        setIcon(head.createSpan({ cls: "stashpad-trash-group-icon" }), "archive");
+        head.createSpan({ text: folder.split("/").pop() || folder });
+        head.createSpan({ cls: "stashpad-trash-group-count", text: String(items.length + plain.length) });
+        const open = head.createEl("button", { cls: "stashpad-trash-iconbtn", text: "Open" });
+        open.onclick = () => void this.plugin.activateViewForFolder(folder);
+        if (items.length === 0 && plain.length === 0) { group.createDiv({ cls: "stashpad-trash-sub", text: "No archived items." }); continue; }
+        for (const f of plain) this.archivePlainRow(group, f);
+        for (const e of items) this.archiveLockedRow(group, e);
+      }
+      return;
+    }
+
+    // separated / encrypted / unencrypted → flat kind sections.
+    const showPlain = mode !== "encrypted" && allPlain.length > 0;
+    const showLocked = mode !== "unencrypted" && allLocked.length > 0;
+    if (!showPlain && !showLocked) { root.createDiv({ cls: "stashpad-trash-empty", text: "Nothing in this view." }); return; }
+    if (showPlain) {
       const group = root.createDiv({ cls: "stashpad-trash-group" });
       const head = group.createDiv({ cls: "stashpad-trash-group-head" });
-      setIcon(head.createSpan({ cls: "stashpad-trash-group-icon" }), "archive");
-      head.createSpan({ text: folder.split("/").pop() || folder });
-      head.createSpan({ cls: "stashpad-trash-group-count", text: String(items.length) });
-      const open = head.createEl("button", { cls: "stashpad-trash-iconbtn", text: "Open" });
-      open.onclick = () => void this.plugin.activateViewForFolder(folder);
-      if (items.length === 0) { group.createDiv({ cls: "stashpad-trash-sub", text: "No archived (locked) items." }); continue; }
-      for (const e of items) {
-        const row = group.createDiv({ cls: "stashpad-trash-row" });
-        const main = row.createDiv({ cls: "stashpad-trash-row-main" });
-        main.createSpan({ cls: "stashpad-trash-title", text: e.title || "Locked note" });
-        const when = e.created ? `archived ${momentFn(e.created).fromNow()}` : "archived";
-        const count = e.count > 1 ? ` · ${e.count} notes` : "";
-        main.createSpan({ cls: "stashpad-trash-sub", text: when + count });
-        const exp = row.createEl("button", { cls: "stashpad-trash-iconbtn", text: "Export" });
-        exp.setAttr("aria-label", "Export to .stash (encrypted with a password you choose)");
-        exp.onclick = () => void this.plugin.exportLockedSubtree(e.blob);
-        const lock = row.createSpan({ cls: "stashpad-aggregate-lockbadge" });
-        setIcon(lock, "lock");
-      }
+      setIcon(head.createSpan({ cls: "stashpad-trash-group-icon" }), "file-text");
+      head.createSpan({ text: "Plain notes" });
+      head.createSpan({ cls: "stashpad-trash-group-count", text: String(allPlain.length) });
+      for (const f of allPlain) this.archivePlainRow(group, f);
     }
+    if (showLocked) {
+      const group = root.createDiv({ cls: "stashpad-trash-group" });
+      const head = group.createDiv({ cls: "stashpad-trash-group-head" });
+      setIcon(head.createSpan({ cls: "stashpad-trash-group-icon" }), "lock");
+      head.createSpan({ text: "Locked (encrypted)" });
+      head.createSpan({ cls: "stashpad-trash-group-count", text: String(allLocked.length) });
+      for (const e of allLocked) this.archiveLockedRow(group, e);
+    }
+  }
+
+  /** One plain archived note — Restore un-archives to the default folder. */
+  private archivePlainRow(container: HTMLElement, f: TFile): void {
+    const row = container.createDiv({ cls: "stashpad-trash-row" });
+    const main = row.createDiv({ cls: "stashpad-trash-row-main" });
+    main.createSpan({ cls: "stashpad-trash-title", text: f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || f.basename });
+    main.createSpan({ cls: "stashpad-trash-sub", text: `archived ${momentFn(f.stat.mtime).fromNow()}` });
+    const restore = row.createEl("button", { cls: "stashpad-trash-restore", text: "Restore" });
+    setIcon(restore.createSpan({ cls: "stashpad-btn-icon" }), "rotate-ccw");
+    restore.onclick = async () => { restore.disabled = true; const ok = await this.plugin.unarchiveNote(f); if (ok) void this.render(); else restore.disabled = false; };
+  }
+
+  /** One locked archived subtree — Export (un-archiving encrypted needs a password). */
+  private archiveLockedRow(container: HTMLElement, e: { blob: string; title?: string; count?: number; created?: string }): void {
+    const row = container.createDiv({ cls: "stashpad-trash-row" });
+    const main = row.createDiv({ cls: "stashpad-trash-row-main" });
+    main.createSpan({ cls: "stashpad-trash-title", text: e.title || "Locked note" });
+    const when = e.created ? `archived ${momentFn(e.created).fromNow()}` : "archived";
+    const count = (e.count ?? 0) > 1 ? ` · ${e.count} notes` : "";
+    main.createSpan({ cls: "stashpad-trash-sub", text: when + count });
+    const exp = row.createEl("button", { cls: "stashpad-trash-iconbtn", text: "Export" });
+    exp.setAttr("aria-label", "Export to .stash (encrypted with a password you choose)");
+    exp.onclick = () => void this.plugin.exportLockedSubtree(e.blob);
+    const lock = row.createSpan({ cls: "stashpad-aggregate-lockbadge" });
+    setIcon(lock, "lock");
   }
 
   async onClose(): Promise<void> { this.contentEl.empty(); }

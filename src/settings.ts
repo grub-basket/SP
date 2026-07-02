@@ -133,7 +133,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "swapWithParent",  label: "Swap with parent (ouroboros)",  desc: "Promote the cursor row above its current parent; the parent slides under it (carrying its other children). No default — bind in this tab.", defaultPrimary: "" },
   { id: "togglePin",       label: "Pin / unpin selected note",     desc: "Default: P — toggle the sidebar pin state of the cursor row (or focused note).", defaultPrimary: "P" },
   { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. No default chord.", defaultPrimary: "" },
-  { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: H — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "H" },
+  { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: G — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "G" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
   { id: "jumpToTop",       label: "Jump to top of list",           desc: "Default: Home — move the cursor to the first note in the current list.", defaultPrimary: "Home" },
   { id: "jumpToBottom",    label: "Jump to bottom of list",        desc: "Default: End — move the cursor to the last note in the current list.", defaultPrimary: "End" },
@@ -265,6 +265,15 @@ export interface StashpadSettings {
    *  Enter-submit so you can keep typing the next note. Off = focus stays
    *  in the list so arrow-keys keep working without an extra click. */
   autofocusComposerAfterSend: boolean;
+  /** 0.132.0: focus the COMPOSER when a Stashpad note/view is opened or
+   *  re-activated. Off (default) focuses the list instead, so you can keyboard-
+   *  navigate immediately rather than the composer grabbing focus every time.
+   *  Separate from autofocusComposerAfterSend (which is post-send only). */
+  focusComposerOnOpen: boolean;
+  /** 0.132.0: when a search result is picked, open the LIST that contains the
+   *  note (focus its parent) and scroll/cursor to the note — so you land with it
+   *  in context, not stuck in the focused-header/composer. On by default. */
+  searchOpensInContext: boolean;
   /** When true (default), the "open in new window" button duplicates
    *  the current tab into the popout window (original stays open in the
    *  main window). When false, the leaf is moved — the original tab
@@ -294,6 +303,15 @@ export interface StashpadSettings {
    *  instead) so a glance at the vault doesn't reveal what's locked. Default OFF
    *  (titles shown). Global for now; per-folder/trash scoping is future work. */
   hideLockedTitles: boolean;
+  /** 0.124.1: one-time migration marker — the default "Toggle task" hotkey
+   *  changed from H to G. Existing installs persist the full bindings map, so
+   *  the default change alone wouldn't reach them; on first load we flip a
+   *  still-default `H` to `G` once, then set this so it never re-flips (the user
+   *  can rebind to H afterwards and it sticks). */
+  migratedToggleTaskG: boolean;
+  /** 0.125.1: quick relative time-adjust presets shown in the due-date / snooze
+   *  picker (e.g. ["5m","15m","1h","1d"]). A +/- flip toggles add vs subtract. */
+  dueQuickAdjusts: string[];
   /** 0.98.25 (Phase 4): archive folders — notes MOVED into one of these Stashpad
    *  folders are automatically encrypted (locked). Opt-in per folder via the
    *  folder panel; requires an explicit confirm when marking (lock permanently
@@ -553,12 +571,16 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   confirmBulkDelete: true,
   confirmAttachmentDelete: true,
   autofocusComposerAfterSend: true,
+  focusComposerOnOpen: false,
+  searchOpensInContext: true,
   popoutDuplicates: true,
   encryption: defaultEncryptionConfig(),
   encryptTrash: false,
   encryptTrashFilenames: false,
   encryptionIdleLockMinutes: 0,
   hideLockedTitles: false,
+  migratedToggleTaskG: false,
+  dueQuickAdjusts: ["5m", "15m", "30m", "1h", "1d", "1w"],
   archiveFolders: [],
   folderEncPrefs: {},
   folderIcons: {},
@@ -1349,6 +1371,21 @@ export class StashpadSettingTab extends PluginSettingTab {
           t.onChange(async (v) => { this.plugin.settings.dateDisplayTimezone = (v || "").trim(); await set(); refreshSample(); });
         });
       }, ["timezone", "tz", "date", "iana"]));
+      cats.datesTime.push(this.renderDef("Quick due-date adjustments", "Comma-separated relative amounts shown as quick +/- buttons in the due-date and snooze pickers (e.g. 5m, 15m, 1h, 1d, 1w). Units: m=minutes, h=hours, d=days, w=weeks. A +/- flip in the picker toggles add vs subtract. Leave blank to hide the row.", (s) => {
+        s.addText((t) => {
+          t.setPlaceholder("5m, 15m, 1h, 1d, 1w");
+          t.setValue((this.plugin.settings.dueQuickAdjusts ?? []).join(", "));
+          t.onChange(async (v) => {
+            // Keep only well-formed tokens (N + m/h/d/w); normalise to lowercase,
+            // no spaces. Invalid/in-progress tokens are dropped silently.
+            const parts = v.split(",").map((x) => x.trim())
+              .filter((x) => /^\d+\s*[mhdw]$/i.test(x))
+              .map((x) => x.replace(/\s+/g, "").toLowerCase());
+            this.plugin.settings.dueQuickAdjusts = parts;
+            await set();
+          });
+        });
+      }, ["quick", "adjust", "snooze", "due", "preset", "increment", "decrement"]));
       cats.datesTime.push({
         name: "Date sample", searchable: false,
         render: (s: Setting) => {
@@ -1448,6 +1485,10 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.composerCopy.push(toggle("Autofocus composer after sending", "After Enter-submitting a note, return focus to the composer so you can keep typing. Off keeps focus in the list — useful if you want arrow keys to work without an extra click.",
       () => this.plugin.settings.autofocusComposerAfterSend, (v) => { this.plugin.settings.autofocusComposerAfterSend = v; }, ["composer", "focus", "send"]));
+    cats.composerCopy.push(toggle("Focus composer when opening a note", "Focus the composer when you open or switch into a Stashpad view. OFF (default) focuses the LIST instead, so arrow-key navigation works right away instead of the composer grabbing focus every time. (Separate from 'after sending' above.)",
+      () => this.plugin.settings.focusComposerOnOpen, (v) => { this.plugin.settings.focusComposerOnOpen = v; }, ["composer", "focus", "open", "navigate", "list"]));
+    cats.windowsTabs.push(toggle("Search opens the note in its list (in context)", "When you pick a search result, open the LIST that contains the note (focus its parent) and scroll to the note — so you see it in context instead of landing on the focused-note header. On by default.",
+      () => this.plugin.settings.searchOpensInContext, (v) => { this.plugin.settings.searchOpensInContext = v; }, ["search", "context", "list", "scroll", "parent"]));
     cats.windowsTabs.push(toggle("Open in new window — duplicate tab", "ON: the new-window button (in the time-filter row) duplicates the current Stashpad tab — original stays open in the main window. OFF: the leaf is MOVED to the new window, closing the original tab.",
       () => this.plugin.settings.popoutDuplicates, (v) => { this.plugin.settings.popoutDuplicates = v; }, ["popout", "window", "duplicate"]));
     cats.windowsTabs.push(toggle("Search results open in a new tab", "When you pick a result in the Search modal, open it in a new Stashpad tab instead of navigating the current tab. Applies to same-folder and cross-Stashpad results alike. On by default.",
