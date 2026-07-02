@@ -28,6 +28,7 @@ import { matchBinding, humanCombo } from "./view-keys";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
 import { NoteBodyRenderer } from "./note-body-renderer";
+import { returnToOriginOnClose } from "./leaf-return";
 import { computeSortedIds } from "./view-sort";
 import {
   SHEET_KEY,
@@ -8966,27 +8967,9 @@ export class StashpadView extends ItemView {
     });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
-    // 0.57.5: same return-to-origin one-shot as openFolderInNewTab /
-    // openFileAtEnd — when this spawned tab closes, the originating
-    // Stashpad tab regains focus.
-    const off = ws.on("active-leaf-change", () => {
-      const stillOpen = (() => {
-        let found = false;
-        ws.iterateAllLeaves((l) => { if (l === leaf) found = true; });
-        return found;
-      })();
-      if (stillOpen) return;
-      ws.offref(off);
-      const originStillOpen = (() => {
-        let found = false;
-        ws.iterateAllLeaves((l) => { if (l === originLeaf) found = true; });
-        return found;
-      })();
-      if (originStillOpen) {
-        ws.setActiveLeaf(originLeaf, { focus: true });
-        ws.revealLeaf(originLeaf);
-      }
-    });
+    // 0.57.5: when this spawned tab closes, the originating Stashpad tab
+    // regains focus (see returnToOriginOnClose — shared by every opener).
+    returnToOriginOnClose(ws, leaf, originLeaf);
   }
 
   /** Open a Stashpad folder's home in a new tab (any folder, not just
@@ -9006,6 +8989,7 @@ export class StashpadView extends ItemView {
     if (!cleaned || !noteId) return;
     const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
     const ws = this.app.workspace;
+    const originLeaf = this.leaf;
     const leaf = ws.getLeaf("tab");
     await leaf.setViewState({
       type: STASHPAD_VIEW_TYPE,
@@ -9020,6 +9004,9 @@ export class StashpadView extends ItemView {
     });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
+    // 0.133.0: closing the search-opened tab returns to the tab you searched
+    // from, not the tab to the right.
+    returnToOriginOnClose(ws, leaf, originLeaf);
   }
 
   private async openFolderInNewTab(folder: string): Promise<void> {
@@ -9041,27 +9028,8 @@ export class StashpadView extends ItemView {
     });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
-
-    // One-shot: when the spawned leaf closes, restore focus to the
-    // originating Stashpad tab.
-    const off = ws.on("active-leaf-change", () => {
-      const stillOpen = (() => {
-        let found = false;
-        ws.iterateAllLeaves((l) => { if (l === leaf) found = true; });
-        return found;
-      })();
-      if (stillOpen) return;
-      ws.offref(off);
-      const originStillOpen = (() => {
-        let found = false;
-        ws.iterateAllLeaves((l) => { if (l === originLeaf) found = true; });
-        return found;
-      })();
-      if (originStillOpen) {
-        ws.setActiveLeaf(originLeaf, { focus: true });
-        ws.revealLeaf(originLeaf);
-      }
-    });
+    // When the spawned leaf closes, restore focus to the originating tab.
+    returnToOriginOnClose(ws, leaf, originLeaf);
   }
 
   // --- Open shortcuts ---
@@ -9103,29 +9071,9 @@ export class StashpadView extends ItemView {
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
 
-    // One-shot listener: when the active leaf changes AND our edit leaf is
-    // no longer in the workspace (closed), reveal the originating Stashpad
-    // leaf instead of whatever Obsidian picked.
-    const off = ws.on("active-leaf-change", () => {
-      const stillOpen = (() => {
-        let found = false;
-        ws.iterateAllLeaves((l) => { if (l === leaf) found = true; });
-        return found;
-      })();
-      if (stillOpen) return;
-      // Edit leaf is gone. Detach this listener and (if the origin leaf
-      // is still around) make it active.
-      ws.offref(off);
-      const originStillOpen = (() => {
-        let found = false;
-        ws.iterateAllLeaves((l) => { if (l === originLeaf) found = true; });
-        return found;
-      })();
-      if (originStillOpen) {
-        ws.setActiveLeaf(originLeaf, { focus: true });
-        ws.revealLeaf(originLeaf);
-      }
-    });
+    // When the edit tab closes, reveal the originating Stashpad leaf instead
+    // of whatever Obsidian picked (the tab to the right).
+    returnToOriginOnClose(ws, leaf, originLeaf);
 
     const view: any = leaf.view;
     const editor: any = view?.editor;

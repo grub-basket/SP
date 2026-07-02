@@ -3,6 +3,7 @@ import type StashpadPlugin from "./main";
 import { STASHPAD_AGGREGATE_VIEW_TYPE } from "./types";
 import { renderTaskTriage, defaultTaskTriageState, type TaskTriageState } from "./task-render";
 import { renderAggModeBar, type AggMode } from "./agg-modes";
+import { returnToOriginOnClose } from "./leaf-return";
 
 // Obsidian types `moment` as a namespace (not callable); cast to a callable.
 const momentFn = moment as unknown as (...args: unknown[]) => { fromNow: () => string };
@@ -256,7 +257,11 @@ export async function openAggregateView(plugin: StashpadPlugin, mode: AggregateM
   const existing = workspace.getLeavesOfType(STASHPAD_AGGREGATE_VIEW_TYPE)
     .find((l) => (l.view as StashpadAggregateView)?.getState?.().mode === mode);
   if (existing) { workspace.revealLeaf(existing); return; }
+  // 0.133.0: remember the tab we opened from so closing this aggregate view
+  // returns there, not to the tab on the right.
+  const originLeaf = workspace.getMostRecentLeaf();
   const leaf = workspace.getLeaf("tab");
   await leaf.setViewState({ type: STASHPAD_AGGREGATE_VIEW_TYPE, active: true, state: { mode } });
   workspace.revealLeaf(leaf);
+  returnToOriginOnClose(workspace, leaf, originLeaf);
 }
