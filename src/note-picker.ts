@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, Platform, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
+import { App, FuzzySuggestModal, Notice, Platform, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
 import type { TreeIndex } from "./tree-index";
 import type { TreeNode } from "./types";
 import { ROOT_ID } from "./types";
@@ -111,8 +111,13 @@ export function parseSearchQuery(query: string): ParsedQuery {
   // Patterns:
   //   bracketed:  key: [value with spaces]
   //   greedy:     key: value (multi-word; stops at next key: or $)
-  const filterRe = /\b(in|before|after|on):\s*(?:\[([^\]]*)\]|([^]*?)(?=\s+(?:in|before|after|on):|$))/gi;
-  let remaining = raw;
+  // (?<![\w-]) not \b: a plain \b matches right after a hyphen, so free text like
+  // `check-in: desk` was hijacked into an `in:` filter. Require the qualifier to
+  // start at a real word boundary (not mid-hyphenated-word). 0.140.17
+  const filterRe = /(?<![\w-])(in|before|after|on):\s*(?:\[([^\]]*)\]|([^]*?)(?=\s+(?:in|before|after|on):|$))/gi;
+  // Blank matched spans by their exact index in `raw` (a `.replace(m[0])` hit the
+  // FIRST occurrence in a diverging copy, which could be the wrong slice). 0.140.17
+  const rawChars = raw.split("");
   let m: RegExpExecArray | null;
   while ((m = filterRe.exec(raw)) != null) {
     const key = m[1].toLowerCase();
@@ -155,9 +160,9 @@ export function parseSearchQuery(query: string): ParsedQuery {
     }
     // Only strip the slice once the filter actually applied — an unparseable
     // date stays in the query as free text (see `applied` above). 0.140.14
-    if (applied) remaining = remaining.replace(m[0], " ");
+    if (applied) for (let k = m.index; k < m.index + m[0].length; k++) rawChars[k] = " ";
   }
-  for (const tok of remaining.split(/\s+/)) {
+  for (const tok of rawChars.join("").split(/\s+/)) {
     if (tok) out.text.push(tok.toLowerCase());
   }
   return out;
@@ -839,7 +844,9 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     const ranges: Array<[number, number]> = [];
     for (const t of cleanTokens) {
       let i = 0;
-      while ((i = lower.indexOf(t, i)) !== -1) { ranges.push([i, i + t.length]); i += t.length; }
+      // Advance by 1, not t.length, so OVERLAPPING occurrences are all captured
+      // ("aa" in "aaa" → [0,2] and [1,3], merged below to [0,3]). 0.140.17
+      while ((i = lower.indexOf(t, i)) !== -1) { ranges.push([i, i + t.length]); i += 1; }
     }
     if (!ranges.length) { el.appendText(text); return; }
     ranges.sort((a, b) => a[0] - b[0]);
@@ -1762,7 +1769,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       // `in: [work] meeting notes` creates a note titled "meeting notes", not the
       // literal query. Case preserved (unlike parseSearchQuery's tokens). 0.140.14
       const rawTitle = (this as any).inputEl?.value ?? "";
-      const cleanTitle = rawTitle.replace(/\b(in|before|after|on):\s*(?:\[[^\]]*\]|[^]*?(?=\s+(?:in|before|after|on):|$))/gi, " ").replace(/\s+/g, " ").trim();
+      const cleanTitle = rawTitle.replace(/(?<![\w-])(in|before|after|on):\s*(?:\[[^\]]*\]|[^]*?(?=\s+(?:in|before|after|on):|$))/gi, " ").replace(/\s+/g, " ").trim();
       this.opts.onCreate(cleanTitle || rawTitle);
       return;
     }
@@ -1819,6 +1826,12 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         }, 0);
       };
       sub.open();
+      return;
+    }
+    // The candidate set is snapshotted on open; a note deleted while the picker
+    // was up hands the caller a stale TFile. Guard the local-note case. 0.140.17
+    if (item.node?.file && !this.app.vault.getAbstractFileByPath(item.node.file.path)) {
+      new Notice("That note no longer exists.");
       return;
     }
     this.opts.onPick(item);

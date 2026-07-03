@@ -1349,22 +1349,33 @@ export class StashpadSettingTab extends PluginSettingTab {
     cats.foldersStorage.push(this.renderDef("Stashpad notes folder", "Vault-relative folder where Stashpad stores its notes and attachments. Created on demand.", (s) => {
       s.addText((t) => {
         new FolderSuggest(this.app, t.inputEl);
-        t.setValue(this.plugin.settings.folder).setPlaceholder("Stashpad").onChange(async (v) => {
-          const cleaned = (v || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.folder;
-          const last = cleaned.split("/").filter(Boolean).pop() ?? "";
+        t.setValue(this.plugin.settings.folder).setPlaceholder("Stashpad");
+        // 0.140.16: validate + persist on COMMIT (blur/Enter), not per keystroke —
+        // the old onChange wrote settings.folder for every prefix ("S", "St", …),
+        // so other subsystems reading it mid-type (or a settings-close mid-type)
+        // saw a bogus folder. Also check EVERY path segment against the FULL
+        // reserved set (was last-segment-only and missing the Stashpad reserved
+        // subfolders), so the notes folder can't be nested inside archive/_deleted/etc.
+        const commit = async (): Promise<void> => {
+          const cleaned = (t.getValue() || "").trim().replace(/^\/+|\/+$/g, "") || DEFAULT_SETTINGS.folder;
+          const segs = cleaned.split("/").filter(Boolean);
           const reserved = new Set([
             this.plugin.settings.importDropFolder,
             this.plugin.settings.exportFolder,
-            "_attachments",
-            "_processed",
+            // Stashpad-reserved subfolders — a notes folder must not BE or live under one.
+            "_attachments", "_processed", "_authors", "_deleted", "archive", "trash", ".stashpad",
           ].map((x) => (x ?? "").trim().replace(/^\/+|\/+$/g, "")).filter(Boolean));
-          if (reserved.has(last)) {
+          if (segs.some((seg) => reserved.has(seg))) {
             new Notice(`"${cleaned}" uses a reserved Stashpad subfolder name. Pick something else.`);
+            t.setValue(this.plugin.settings.folder); // restore the last valid value
             return;
           }
+          if (cleaned === this.plugin.settings.folder) return;
           this.plugin.settings.folder = cleaned;
           await set();
-        });
+        };
+        t.inputEl.addEventListener("blur", () => void commit());
+        t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
       });
     }, ["folder", "path", "location", "notes"]));
 
@@ -3105,6 +3116,15 @@ export class StashpadSettingTab extends PluginSettingTab {
       const slotDefault = which === "primary" ? meta.defaultPrimary : (meta.defaultSecondary ?? "");
       input.onclick = () => {
         startHotkeyRecording(input, async (chord) => {
+          // Non-blocking conflict warning: if this chord is already bound to a
+          // DIFFERENT command, whichever matchBinding runs first in view.ts wins,
+          // so a silent double-bind is confusing. Still allow it. 0.140.16
+          const clash = COMMAND_META.find((m) => {
+            if (m.id === meta.id) return false;
+            const b = this.plugin.settings.bindings[m.id];
+            return !!b && (b.primary === chord || b.secondary === chord);
+          });
+          if (clash) new Notice(`Note: ${prettifyChord(chord)} is also bound to "${clash.label}". Both will trigger; the first match wins.`, 6000);
           this.plugin.settings.bindings[meta.id][which] = chord;
           input.value = prettifyChord(chord);
           syncSize();

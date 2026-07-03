@@ -91,10 +91,14 @@ export class LogModal extends Modal {
     this.filterSelEl.onchange = () => this.setTypeFilter(this.filterSelEl!.value || null);
     this.refreshTypeFilter();
 
-    const revealBtn = toolbar.createEl("button", { text: "Reveal JSONL" });
-    revealBtn.onclick = () => this.shellAct("reveal");
-    const openBtn = toolbar.createEl("button", { text: "Open in default app" });
-    openBtn.onclick = () => this.shellAct("open");
+    // Reveal/Open shell out via electron, which doesn't exist on mobile — only
+    // offer them on desktop (the Copy button below covers mobile). 0.140.17
+    if (!Platform.isMobile) {
+      const revealBtn = toolbar.createEl("button", { text: "Reveal JSONL" });
+      revealBtn.onclick = () => this.shellAct("reveal");
+      const openBtn = toolbar.createEl("button", { text: "Open in default app" });
+      openBtn.onclick = () => this.shellAct("open");
+    }
 
     const copyBtn = toolbar.createEl("button", { text: "Copy raw JSONL" });
     let copyResetTimer: number | null = null;

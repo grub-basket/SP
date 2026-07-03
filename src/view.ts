@@ -591,7 +591,12 @@ export class StashpadView extends ItemView {
     });
     (this.app.vault as any).on("modify", this.onFileModify);
     (this.app.vault as any).on("create", this.onFileCreate);
-    window.addEventListener("keydown", this.onDocKeyDown, true);
+    // Bind to the leaf's OWN window — a popout/tiny-window leaf lives in its own
+    // Electron window with its own document, so keydowns there never reach the
+    // main window's listener and list-level shortcuts were dead. Equals `window`
+    // for normal leaves. Captured so onClose removes it from the same one. 0.140.17
+    this.keydownWindow = (this.containerEl?.ownerDocument?.defaultView ?? window) as Window;
+    this.keydownWindow.addEventListener("keydown", this.onDocKeyDown, true);
     this.loadConfig();
     // 0.71.36: bootstrap can throw "Folder already exists" when the
     // vault state races our cache check on tab open/close. Swallow
@@ -864,11 +869,13 @@ export class StashpadView extends ItemView {
     // Cancel any pending debounced render so it can't fire post-close (the
     // render() isConnected guard also catches it — belt and suspenders). 0.140.9
     (this.debouncedRender as any)?.cancel?.();
+    // Tear down the tiny-opacity popover's document listeners if it's still open. 0.140.17
+    this.tinyOpacityClose?.();
     this.detachTreeHook?.();
     this.detachSettings?.();
     (this.app.vault as any).off("modify", this.onFileModify);
     (this.app.vault as any).off("create", this.onFileCreate);
-    window.removeEventListener("keydown", this.onDocKeyDown, true);
+    this.keydownWindow.removeEventListener("keydown", this.onDocKeyDown, true);
     this.listResizeObserver?.disconnect();
     this.listResizeObserver = null;
     this.stickyRowObserver?.disconnect();
@@ -4337,6 +4344,7 @@ export class StashpadView extends ItemView {
   /** 0.77.0-feat: handle to the open opacity popover so a second click
    *  (or click-outside) closes it. */
   private tinyOpacityPopover: HTMLElement | null = null;
+  private tinyOpacityClose: (() => void) | null = null;
   private toggleTinyOpacityPopover(anchor: HTMLElement): void {
     if (this.tinyOpacityPopover) {
       this.tinyOpacityPopover.remove();
@@ -4378,6 +4386,7 @@ export class StashpadView extends ItemView {
     const close = () => {
       pop.remove();
       this.tinyOpacityPopover = null;
+      this.tinyOpacityClose = null;
       document.removeEventListener("mousedown", onDoc, true);
       document.removeEventListener("keydown", onKey, true);
     };
@@ -4386,6 +4395,9 @@ export class StashpadView extends ItemView {
       document.addEventListener("keydown", onKey, true);
     }, 0);
     this.tinyOpacityPopover = pop;
+    // Expose close() so onClose can tear down the document listeners if the view
+    // is closed while this popover is still open. 0.140.17
+    this.tinyOpacityClose = close;
     slider.focus();
   }
 
@@ -6204,6 +6216,9 @@ export class StashpadView extends ItemView {
 
   // --- Document-level keyboard ---
 
+  /** The window the keydown listener is bound to — the leaf's own (popout-aware).
+   *  Defaults to the main window; set in onOpen. 0.140.17 */
+  private keydownWindow: Window = window;
   private onDocKeyDown = (e: KeyboardEvent): void => {
     if (!this.viewRoot.isConnected) return;
     // Run when our Stashpad leaf is the active one, regardless of where focus
@@ -7317,35 +7332,53 @@ export class StashpadView extends ItemView {
     if (!targets.length) return;
     const moved: TreeNode[] = [];
     const skipped: string[] = [];
+    // 0.140.17: capture each move so the whole outdent is ONE undo entry (was N),
+    // and suppress the per-move toast (silentSuccess) so a clean outdent shows a
+    // single summary toast instead of N "Reparented" ones.
+    const priorParents: { id: StashpadId; path: string; oldParent: StashpadId | null; newParent: StashpadId }[] = [];
     for (const t of targets) {
       const parent = t.parent ? this.tree.get(t.parent) : null;
       if (!parent || parent.id === ROOT_ID) { skipped.push(t.id); continue; }
       const grandparent = parent.parent ?? ROOT_ID;
-      await this.changeParent(t, grandparent);
+      priorParents.push({ id: t.id, path: t.file?.path ?? "", oldParent: t.parent ?? null, newParent: grandparent });
+      await this.changeParent(t, grandparent, { record: false, silentSuccess: true });
       moved.push(t);
     }
     if (moved.length === 0) {
       new Notice(skipped.length ? "Already at the top level." : "Nothing to outdent.");
       return;
     }
+    const outdentFolder = this.noteFolder;
+    this.plugin.getUndoStack(outdentFolder).push({
+      label: `Outdent (${moved.length})`,
+      undo: async () => {
+        for (const p of priorParents) {
+          const f = this.fileForNote(p.id, p.path);
+          if (f) await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = p.oldParent ?? ROOT_ID; });
+        }
+        this.tree.rebuild(outdentFolder); this.render();
+      },
+      redo: async () => {
+        for (const p of priorParents) {
+          const f = this.fileForNote(p.id, p.path);
+          if (f) await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = p.newParent; });
+        }
+        this.tree.rebuild(outdentFolder); this.render();
+      },
+    });
     this.render();
-    if (skipped.length) {
-      // 0.97.x fix: `moved` already holds the outdented TreeNodes — the old code
-      // ran them back through tree.get() (which wants an id), getting undefined
-      // for every entry so the message listed nothing; and passed node objects
-      // as affectedIds. Use the nodes directly + map to ids.
-      this.plugin.notifications.show({
-        message: this.bulkActionMessage({
-          verb: "Outdented",
-          nodes: moved,
-          suffix: skipped.length ? `(${skipped.length} already at root)` : undefined,
-        }),
-        kind: "success",
-        category: "move",
-        affectedIds: moved.map((n) => n.id),
-        folder: this.noteFolder,
-      });
-    }
+    // One summary toast, always (not only when some were skipped).
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({
+        verb: "Outdented",
+        nodes: moved,
+        suffix: skipped.length ? `(${skipped.length} already at root)` : undefined,
+      }),
+      kind: "success",
+      category: "move",
+      affectedIds: moved.map((n) => n.id),
+      folder: this.noteFolder,
+    });
     // 0.72.6 / 0.73.8: optionally follow the outdented note(s) into
     // their new (shared) grandparent. Works only when every moved
     // target shares the same destination; mixed-source outdents

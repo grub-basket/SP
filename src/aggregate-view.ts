@@ -390,8 +390,11 @@ export class StashpadAggregateView extends ItemView {
  *  the same mode if one is open. */
 export async function openAggregateView(plugin: StashpadPlugin, mode: AggregateMode): Promise<void> {
   const { workspace } = plugin.app;
+  // Read mode from the LEAF's persisted view state, not the view instance — an
+  // inactive leaf may hold a DeferredView whose getState() lacks `mode`, so the
+  // old check missed a deferred existing tab and opened a duplicate. 0.140.17
   const existing = workspace.getLeavesOfType(STASHPAD_AGGREGATE_VIEW_TYPE)
-    .find((l) => (l.view as StashpadAggregateView)?.getState?.().mode === mode);
+    .find((l) => ((l.getViewState()?.state as { mode?: string } | undefined)?.mode) === mode);
   if (existing) { workspace.revealLeaf(existing); return; }
   // 0.133.0: remember the tab we opened from so closing this aggregate view
   // returns there, not to the tab on the right.
