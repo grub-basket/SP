@@ -39,18 +39,23 @@ function parseDateToken(raw: string): number | null {
   // Try to extract a time-of-day component first so it doesn't confuse
   // the date keyword/ISO parsers below. Matches "10am", "10:30am",
   // "14:00", "9pm" etc.
-  const timeRe = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/;
+  // Global so we can scan PAST leading date digits to the real time token.
+  // Non-global exec found the first `\b\d{1,2}\b` (e.g. the month "01" in
+  // "2025-01-15 14:30"), which lacked a colon/am-pm so time-detection failed and
+  // the whole strict-format date parse then failed → the filter was dropped.
+  // Iterate to the first match that's actually shaped like a time. 0.140.14
+  const timeRe = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/gi;
   let timeOffsetMs = 0;
   let timeMatched = false;
   let dateStr = t;
-  const tm = timeRe.exec(t);
-  // Only treat as a time component when it's actually shaped like one
-  // — i.e. has am/pm OR has a colon (otherwise standalone digits like
-  // "2025" would falsely match).
-  if (tm && (tm[3] || tm[2])) {
+  let tm: RegExpExecArray | null = null;
+  for (let mt = timeRe.exec(t); mt != null; mt = timeRe.exec(t)) {
+    if (mt[3] || mt[2]) { tm = mt; break; } // am/pm OR colon-minutes = a real time
+  }
+  if (tm) {
     let hours = parseInt(tm[1], 10);
     const mins = tm[2] ? parseInt(tm[2], 10) : 0;
-    const ampm = tm[3];
+    const ampm = tm[3]?.toLowerCase();
     if (ampm === "pm" && hours < 12) hours += 12;
     if (ampm === "am" && hours === 12) hours = 0;
     if (hours >= 0 && hours < 24 && mins >= 0 && mins < 60) {
@@ -64,8 +69,10 @@ function parseDateToken(raw: string): number | null {
 
   // Keywords (date part only — empty dateStr means "today" implicit).
   if (dateStr === "" || dateStr === "today") return applyTime(startOfDay(now));
-  if (dateStr === "yesterday") return applyTime(startOfDay(now) - 86_400_000);
-  if (dateStr === "tomorrow") return applyTime(startOfDay(now) + 86_400_000);
+  // Calendar-day arithmetic via moment, not ±86.4e6 ms — a DST transition makes a
+  // day 23 or 25h, so fixed-ms math lands yesterday/tomorrow at the wrong hour. 0.140.14
+  if (dateStr === "yesterday") return applyTime(momentFn(now).startOf("day").subtract(1, "day").valueOf());
+  if (dateStr === "tomorrow") return applyTime(momentFn(now).startOf("day").add(1, "day").valueOf());
   // Day names (Sun-Sat) — return the most recent past occurrence (or
   // today if today matches).
   const dayNames = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
@@ -113,17 +120,23 @@ export function parseSearchQuery(query: string): ParsedQuery {
     // present (allows empty `[]` as a "no value" placeholder).
     const value = (m[2] !== undefined ? m[2] : m[3] ?? "").trim();
     if (!value) continue;
+    // Track whether the filter was actually applied. An unparseable date must
+    // NOT be stripped from `remaining` — otherwise `before: 2025` (or greedy
+    // `before: today blue`) silently drops the whole clause and the query
+    // degenerates to "match everything". Leave it as free text instead. 0.140.14
+    let applied = false;
     if (key === "in") {
-      out.filters.in = value.toLowerCase();
+      out.filters.in = value.toLowerCase(); applied = true;
     } else if (key === "before") {
       const ts = parseDateToken(value);
-      if (ts != null) out.filters.before = ts;
+      if (ts != null) { out.filters.before = ts; applied = true; }
     } else if (key === "after") {
       const ts = parseDateToken(value);
-      if (ts != null) out.filters.after = ts;
+      if (ts != null) { out.filters.after = ts; applied = true; }
     } else if (key === "on") {
       const ts = parseDateToken(value);
       if (ts != null) {
+        applied = true;
         // 0.69.45: if the value includes a time-of-day component (e.g.
         // "on: 9:45pm", "on: 2025-01-15 14:30"), narrow the window to
         // ±60 seconds around that exact moment. Without a time, fall
@@ -134,14 +147,15 @@ export function parseSearchQuery(query: string): ParsedQuery {
         if (hasTime) {
           out.filters.on = { start: ts - 60_000, end: ts + 60_000 };
         } else {
-          const start = momentFn(ts).startOf("day").valueOf();
-          out.filters.on = { start, end: start + 86_400_000 };
+          const startM = momentFn(ts).startOf("day");
+          // DST-safe day end (add 1 calendar day, not fixed 24h). 0.140.14
+          out.filters.on = { start: startM.valueOf(), end: startM.clone().add(1, "day").valueOf() };
         }
       }
     }
-    // Remove the matched filter slice from remaining so it doesn't
-    // double-count as free text.
-    remaining = remaining.replace(m[0], " ");
+    // Only strip the slice once the filter actually applied — an unparseable
+    // date stays in the query as free text (see `applied` above). 0.140.14
+    if (applied) remaining = remaining.replace(m[0], " ");
   }
   for (const tok of remaining.split(/\s+/)) {
     if (tok) out.text.push(tok.toLowerCase());
@@ -643,6 +657,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     for (const c of this.opts.excludedFolderNotes()) {
       this.notes.push({ node: null, title: c.title, body: c.body, cross: c });
     }
+    // Invalidate the lazily-built cross-folder breadcrumb index — it was cached
+    // from the pre-merge note set, so newly-merged excluded notes would render
+    // with empty breadcrumbs otherwise. 0.140.14
+    this.crossFolderIndex = null;
     for (const n of this.notes) {
       if (!n.cross || n.body || !n.cross.file) continue;
       this.app.vault.cachedRead(n.cross.file).then((md) => { n.body = this.stripFm(md); });
@@ -1740,7 +1758,12 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
 
   onChooseSuggestion(item: PickerItem): void {
     if (item.kind === "create" && this.opts.onCreate) {
-      this.opts.onCreate((this as any).inputEl?.value ?? "");
+      // Strip filter qualifiers (in:/before:/after:/on:) so a query like
+      // `in: [work] meeting notes` creates a note titled "meeting notes", not the
+      // literal query. Case preserved (unlike parseSearchQuery's tokens). 0.140.14
+      const rawTitle = (this as any).inputEl?.value ?? "";
+      const cleanTitle = rawTitle.replace(/\b(in|before|after|on):\s*(?:\[[^\]]*\]|[^]*?(?=\s+(?:in|before|after|on):|$))/gi, " ").replace(/\s+/g, " ").trim();
+      this.opts.onCreate(cleanTitle || rawTitle);
       return;
     }
     // 0.69.3: collapsed folder-open entry → open a sub-picker of every
@@ -1771,7 +1794,12 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       const appRef = (this as any).app as App;
       sub.onClose = (): void => {
         onClose();
-        if (!picked) {
+        // Obsidian's SuggestModal calls close() BEFORE onChooseSuggestion, so on a
+        // real folder pick `picked` is still false at close time. Defer the
+        // "nothing picked → re-open search" check one tick so onPicked runs first
+        // — otherwise the search modal re-opens over the folder we just opened. 0.140.14
+        setTimeout(() => {
+          if (picked) return;
           const restored = new StashpadSuggest(appRef, tree, titleFn, opts);
           restored.open();
           // 0.69.45: always focus the restored modal's inputEl after
@@ -1788,7 +1816,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
             ie.focus();
             ie.setSelectionRange(ie.value.length, ie.value.length);
           }, 0);
-        }
+        }, 0);
       };
       sub.open();
       return;

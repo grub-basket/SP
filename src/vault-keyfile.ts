@@ -113,6 +113,19 @@ export class KeyfileStore {
     return (await this.load()) !== null;
   }
 
+  /** True if a keyfile FILE is present on disk (primary or any backup), even if
+   *  it's corrupt/unreadable. Distinguishes "keyfile unreadable right now" (a
+   *  sync tool mid-write, a lagging `_keys/`) from "genuinely never set up" — so
+   *  destructive first-time paths (v1 migration, fresh setup) can REFUSE rather
+   *  than clobber a real-but-unreadable keyfile with a fresh single-slot one. 0.140.13 */
+  async hasAnyFile(): Promise<boolean> {
+    try { if (await this.a.exists(PRIMARY)) return true; } catch { /* fall through */ }
+    try {
+      const list = await this.a.list(BACKUP_DIR);
+      return (list.files || []).some((f) => /\/keys-\d+\.json$/.test(f));
+    } catch { return false; }
+  }
+
   private async ensureDir(dir: string): Promise<void> {
     try { if (!(await this.a.exists(dir))) await this.a.mkdir(dir); } catch { /* race / exists */ }
   }

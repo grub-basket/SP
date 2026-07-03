@@ -47,10 +47,17 @@ export class StashpadAggregateView extends ItemView {
 
   async onOpen(): Promise<void> {
     this.containerEl.addClass("stashpad-aggregate-view");
-    // Refresh when locked bundles appear/disappear anywhere outside _deleted/.
-    const touch = (p: string) => p.endsWith(".stashenc") && !p.startsWith("_deleted/");
+    // Refresh when locked bundles appear/disappear outside _deleted/, AND when
+    // plain notes are archived/un-archived (the Archived tab lists plain .md in
+    // any `archive/` subfolder — those changes are renames/creates, not .stashenc
+    // events). 0.140.12: previously only .stashenc create/delete fired, so
+    // .stashenc RENAMES and all plain-archive changes left the view stale.
+    const touchEnc = (p: string) => p.endsWith(".stashenc") && !p.startsWith("_deleted/");
+    const touchArchiveMd = (p: string) => p.endsWith(".md") && /(^|\/)archive\//.test(p);
+    const touch = (p: string) => touchEnc(p) || touchArchiveMd(p);
     this.registerEvent(this.app.vault.on("create", (f) => { if (touch(f.path)) this.scheduleRender(); }));
     this.registerEvent(this.app.vault.on("delete", (f) => { if (touch(f.path)) this.scheduleRender(); }));
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => { if (touch(f.path) || touch(oldPath)) this.scheduleRender(); }));
     await this.render();
   }
 

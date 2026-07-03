@@ -281,6 +281,11 @@ export class EncryptionService {
   async setup(password: string, remember = false, label?: string): Promise<void> {
     await this.refresh();
     if (this.isConfigured()) throw new Error("Encryption is already set up in this vault.");
+    // 0.140.13: isConfigured() is also false when the keyfile is present but
+    // transiently UNREADABLE (sync mid-write, lagging backups). Minting a fresh
+    // DEK here would clobber the real keyfile and orphan all existing encrypted
+    // content. Refuse unless there's genuinely no keyfile on disk.
+    if (await this.keyfiles.hasAnyFile()) throw new Error("A keyfile exists but couldn't be read right now (sync in progress?). Not overwriting it — try again in a moment.");
     if (!password) throw new Error("Password required.");
     const dek = crypto.getRandomValues(new Uint8Array(DEK_LEN));
     const id = await this.mintIdentity(password, label);
@@ -303,6 +308,14 @@ export class EncryptionService {
     const cfg = this.load();
     // v1 → v2 migration: legacy wrapped DEK, no keyfile yet.
     if (!this.kf && cfg.wrappedKey) {
+      // 0.140.13: `!this.kf` is also true when a v2 keyfile EXISTS but couldn't
+      // be read this cycle (transient sync/backup-lag). Migrating then would
+      // write a fresh single-slot keyfile OVER the real one, dropping every
+      // collaborator slot + folderKeys (folder-keyed blobs become undecryptable).
+      // Only migrate when there is genuinely no keyfile file on disk.
+      if (await this.keyfiles.hasAnyFile()) {
+        throw new Error("A vault keyfile exists but couldn't be read right now (sync in progress?). Not migrating over it — try again in a moment.");
+      }
       let dek: Uint8Array;
       try { dek = await decryptStash(fromB64(cfg.wrappedKey), password); } catch { return false; }
       const id = await this.mintIdentity(password, cfg.identityLabel ?? undefined);
@@ -410,7 +423,10 @@ export class EncryptionService {
     if (!fks) return null;
     let p = this.cleanFolder(folder);
     while (p) {
-      if (fks[p]) return p;
+      // hasOwnProperty, NOT `fks[p]` truthiness: a folder literally named
+      // `constructor`/`toString`/etc. would otherwise hit Object.prototype and
+      // be treated as having its own (function) key. 0.140.13
+      if (Object.prototype.hasOwnProperty.call(fks, p)) return p;
       const i = p.lastIndexOf("/");
       if (i < 0) break;
       p = p.slice(0, i);
@@ -419,7 +435,7 @@ export class EncryptionService {
   }
   /** True only if THIS exact folder has its own key (not inherited) — for settings
    *  UI decisions ("Set folder password" vs "Unlock/Change"). */
-  hasOwnFolderKey(folder: string): boolean { return !!this.kf?.folderKeys?.[this.cleanFolder(folder)]; }
+  hasOwnFolderKey(folder: string): boolean { const fks = this.kf?.folderKeys; return !!fks && Object.prototype.hasOwnProperty.call(fks, this.cleanFolder(folder)); }
   /** The keyfile entry governing a folder — its own, or the nearest ancestor's
    *  (inheritance). Null → the folder uses the vault DEK. */
   folderKeyEntry(folder: string): FolderKeyEntry | null {
@@ -438,7 +454,9 @@ export class EncryptionService {
    *  content (matches the vault shared-password path). If there are somehow zero
    *  active slots, return none (don't silently fall back to deprecated ones). */
   private folderActiveSlots(entry: FolderKeyEntry): KeyfilePasswordSlot[] {
-    return entry.passwordSlots.filter((s) => !s.label.startsWith("[deprecated]"));
+    // Defensive: a malformed/older synced entry may lack passwordSlots — treat as
+    // no active slots instead of throwing TypeError out of unlockFolder. 0.140.13
+    return (entry.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"));
   }
   /** Is the effective key for this folder available right now? (Session is keyed by
    *  the OWNING folder, so an inheriting subfolder reports the owner's state.) */

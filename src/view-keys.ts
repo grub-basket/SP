@@ -1,9 +1,24 @@
 import { Platform } from "obsidian";
 
+/** Physical key identity matching hotkey-recorder's normalizeKey: letters and
+ *  top-row digits come from `e.code` (KeyE→"e", Digit1→"1") so they're immune to
+ *  Shift ("!"→"1") and Alt/Option dead-key glyphs (Option+E→"†"/"Dead") and
+ *  layout remaps — the recorder stores that same identity, so the matcher MUST
+ *  use it too or Shift+digit and (macOS) Alt+letter bindings never fire. Named
+ *  keys + symbols fall back to `e.key`. 0.140.15 */
+function eventKeyId(e: KeyboardEvent): string {
+  const code = e.code || "";
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter) return letter[1].toLowerCase();
+  const digit = /^Digit(\d)$/.exec(code);
+  if (digit) return digit[1];
+  return (e.key || "").toLowerCase();
+}
+
 export function matchKey(e: KeyboardEvent, key: string): boolean {
   if (!key) return false;
   if (e.metaKey || e.ctrlKey || e.altKey) return false;
-  return e.key.toLowerCase() === key.toLowerCase();
+  return eventKeyId(e) === key.toLowerCase();
 }
 
 /** Try a chord regardless of whether it's a single key or a Mod combo. */
@@ -64,5 +79,5 @@ export function matchMod(e: KeyboardEvent, combo: string): boolean {
     if (!wantCtrl && e.ctrlKey) return false;
     if (!wantCmd && e.metaKey) return false;
   }
-  return e.key.toLowerCase() === keyPart;
+  return eventKeyId(e) === keyPart;
 }

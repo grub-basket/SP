@@ -861,6 +861,9 @@ export class StashpadView extends ItemView {
 
   async onClose(): Promise<void> {
     clearActiveView(this);
+    // Cancel any pending debounced render so it can't fire post-close (the
+    // render() isConnected guard also catches it — belt and suspenders). 0.140.9
+    (this.debouncedRender as any)?.cancel?.();
     this.detachTreeHook?.();
     this.detachSettings?.();
     (this.app.vault as any).off("modify", this.onFileModify);
@@ -1331,6 +1334,17 @@ export class StashpadView extends ItemView {
     return { notes: noteSnaps, attachments: attSnaps };
   }
 
+  /** Resolve a note's TFile id-first, falling back to a captured path. Undo/redo
+   *  closures run long after capture; Stashpad renames a note's file ~30s after a
+   *  body edit (slug change), so a path captured at command time goes stale and a
+   *  path-only lookup silently returns null → the undo no-ops while the stack
+   *  advances. The id is stable, so `tree.get(id)?.file` finds the note at its
+   *  current path; the path fallback covers notes not (yet) in the tree. 0.140.10 */
+  private fileForNote(id: StashpadId | null | undefined, path: string): TFile | null {
+    const byId = id ? this.tree.get(id)?.file : null;
+    return (byId ?? this.app.vault.getAbstractFileByPath(path)) as TFile | null;
+  }
+
   /** Recreate notes/attachments from a snapshot (skip ones that already exist). */
   private async restoreSnapshots(
     snap: { notes: { path: string; content: string }[]; attachments: { path: string; data: ArrayBuffer }[] },
@@ -1345,6 +1359,15 @@ export class StashpadView extends ItemView {
     }
     for (const n of snap.notes) {
       try {
+        // 0.140.9: guard against re-minting a DUPLICATE id. Undo closures capture
+        // the snapshot PATH, but Stashpad renames files ~30s after a body edit
+        // (slug change). If the note is still alive at a renamed path, its old
+        // path is now free — creating there would put TWO files under one id in
+        // the tree. Skip when a live note already carries this id.
+        const fmHead = n.content.split("\n---")[0] ?? "";
+        const idm = /^id:\s*["']?([^"'\s]+)/m.exec(fmHead);
+        const nid = idm?.[1] as StashpadId | undefined;
+        if (nid && this.tree.get(nid)?.file) continue;
         if (!(await this.app.vault.adapter.exists(n.path))) {
           await this.app.vault.create(n.path, n.content);
         }
@@ -2329,6 +2352,13 @@ export class StashpadView extends ItemView {
   /** public: called by extracted command modules (commands/*.ts). */
   render(policy?: ScrollPolicy): void {
     if (perf.enabled) this._renderT0 = performance.now();
+    // 0.140.9: bail if the view was torn down. A debounced/deferred render
+    // firing after onClose would rebuild the whole UI on detached DOM AND
+    // construct a fresh ComposerAutocomplete whose document-level capture
+    // keydown never gets detached (onClose already ran, nulling the old one) —
+    // a permanent listener leak per occurrence. Every timer-driven render path
+    // funnels through here, so one guard covers them all.
+    if (!this.viewRoot?.isConnected) return;
     // 0.56.3: unannotated render() calls default to "preserve". That kills
     // the bouncing class of regressions where metadataCache-driven
     // re-renders (color change, frontmatter mod, fmSync rewrites) would
@@ -6691,6 +6721,10 @@ export class StashpadView extends ItemView {
       this.plugin.getUndoStack(src).push({
         label: `Archive (plaintext, ${roots0.length})`,
         undo: async () => { for (const m of moves) { const fl = this.app.vault.getAbstractFileByPath(m.to); if (fl instanceof TFile) { try { await this.app.fileManager.renameFile(fl, m.from); } catch (e) { console.warn("[Stashpad] plaintext archive undo failed", m.to, e); } } } this.tree.rebuild(src); this.render(); },
+        // 0.140.9: re-apply the archive move on redo. Without a redo the entry
+        // was undo-only — Cmd+Shift+Z would "succeed" without re-archiving, then
+        // the next Cmd+Z ran the restore against already-restored paths.
+        redo: async () => { for (const m of moves) { const fl = this.app.vault.getAbstractFileByPath(m.from); if (fl instanceof TFile) { try { await this.app.fileManager.renameFile(fl, m.to); } catch (e) { console.warn("[Stashpad] plaintext archive redo failed", m.from, e); } } } this.tree.rebuild(src); this.render(); },
       });
       return;
     }
@@ -7374,9 +7408,9 @@ export class StashpadView extends ItemView {
         // removes the color frontmatter entirely if there was none).
         const undoFolder = this.noteFolder;
         const newColor = color;
-        const applyColors = async (mapping: { path: string; col: string | null }[]) => {
+        const applyColors = async (mapping: { id: StashpadId; path: string; col: string | null }[]) => {
           for (const m of mapping) {
-            const file = this.app.vault.getAbstractFileByPath(m.path) as TFile | null;
+            const file = this.fileForNote(m.id, m.path);
             if (!file) continue;
             try {
               await this.app.fileManager.processFrontMatter(file, (fm) => {
@@ -7390,8 +7424,8 @@ export class StashpadView extends ItemView {
         };
         this.plugin.getUndoStack(undoFolder).push({
           label: priors.length === 1 ? "Color change" : `Color change (${priors.length})`,
-          undo: () => applyColors(priors.map((p) => ({ path: p.path, col: p.was }))),
-          redo: () => applyColors(priors.map((p) => ({ path: p.path, col: newColor }))),
+          undo: () => applyColors(priors.map((p) => ({ id: p.id, path: p.path, col: p.was }))),
+          redo: () => applyColors(priors.map((p) => ({ id: p.id, path: p.path, col: newColor }))),
         });
       },
       async (color) => {
@@ -7743,7 +7777,7 @@ export class StashpadView extends ItemView {
     const oldestOriginal = await this.app.vault.read(oldest.file);
     const deletedSnap = await this.snapshotNotes(targets.slice(1), false);
     // Capture parent reassignments so we can undo them.
-    const reassignments: { childId: StashpadId; childPath: string; oldParent: StashpadId | null }[] = [];
+    const reassignments: { childId: StashpadId; childPath: string; oldParent: StashpadId | null; newParent: StashpadId }[] = [];
 
     const bodies: string[] = [];
     for (const t of targets) {
@@ -7753,7 +7787,18 @@ export class StashpadView extends ItemView {
     }
     const newBody = bodies.map((b) => b.trim()).filter(Boolean).join("\n");
     const oldestRaw = await this.app.vault.read(oldest.file);
-    const fmEnd = oldestRaw.startsWith("---") ? oldestRaw.indexOf("\n---", 3) + 4 : 0;
+    // 0.140.9: guard a malformed frontmatter block. If the kept note opens with
+    // `---` but has no closing `\n---`, indexOf returns -1 and `-1 + 4 = 3` would
+    // slice off just "---", destroying the note's real frontmatter (id included).
+    const fmClose = oldestRaw.startsWith("---") ? oldestRaw.indexOf("\n---", 3) : -1;
+    if (oldestRaw.startsWith("---") && fmClose < 0) {
+      this.plugin.notifications.show({
+        message: "Can't merge — the kept note's frontmatter is malformed (no closing ---).",
+        kind: "warning", category: "merge", folder: this.noteFolder,
+      });
+      return;
+    }
+    const fmEnd = oldestRaw.startsWith("---") ? fmClose + 4 : 0;
     const fmBlock = oldestRaw.slice(0, fmEnd);
     const newOldestContent = `${fmBlock}\n${newBody}\n`;
     await this.app.vault.modify(oldest.file, newOldestContent);
@@ -7762,8 +7807,14 @@ export class StashpadView extends ItemView {
       const t = targets[i];
       if (!t.file) continue;
       for (const c of this.tree.getChildren(t.id)) {
-        if (c.file) reassignments.push({ childId: c.id, childPath: c.file.path, oldParent: c.parent });
-        await this.changeParent(c, oldest.id, { record: false });
+        const oldParent = c.parent;
+        // If the KEPT note is itself a child of this merged-away target, it can't
+        // be re-parented to itself (changeParent refuses) — move it up to the
+        // merged-away note's own parent instead. Record ONLY moves that actually
+        // happened, else redo would replay a refused move as parent:<self>. 0.140.9
+        const dest = c.id === oldest.id ? (t.parent ?? ROOT_ID) : oldest.id;
+        const moved = await this.changeParent(c, dest, { record: false });
+        if (moved && c.file) reassignments.push({ childId: c.id, childPath: c.file.path, oldParent, newParent: dest });
       }
       await this.app.fileManager.trashFile(t.file);
       await this.log.append({ type: "delete", id: t.id, payload: { mergedInto: oldest.id } });
@@ -7814,11 +7865,11 @@ export class StashpadView extends ItemView {
         // surviving id via render()'s pendingFocusIds resolution).
         await this.restoreSnapshots(deletedSnap, targets.map((t) => t.id));
         // Revert the kept (oldest) note's body.
-        const f = this.app.vault.getAbstractFileByPath(oldestPath) as TFile | null;
+        const f = this.fileForNote(oldest.id, oldestPath);
         if (f) await this.app.vault.modify(f, oldestOriginal);
         // Restore each child's parent.
         for (const r of reassignments) {
-          const cf = this.app.vault.getAbstractFileByPath(r.childPath) as TFile | null;
+          const cf = this.fileForNote(r.childId, r.childPath);
           if (cf) await this.app.fileManager.processFrontMatter(cf, (fm) => { fm.parent = r.oldParent; });
         }
         this.pendingFocusIds = targets.map((t) => t.id);
@@ -7829,12 +7880,15 @@ export class StashpadView extends ItemView {
         // Re-trash the merged-away notes.
         await this.trashNotesAndAttachments(deletedSnap);
         // Re-write the kept note.
-        const f = this.app.vault.getAbstractFileByPath(oldestPath) as TFile | null;
+        const f = this.fileForNote(oldest.id, oldestPath);
         if (f) await this.app.vault.modify(f, newOldestContent);
         // Re-reassign children.
         for (const r of reassignments) {
-          const cf = this.app.vault.getAbstractFileByPath(r.childPath) as TFile | null;
-          if (cf) await this.app.fileManager.processFrontMatter(cf, (fm) => { fm.parent = oldest.id; });
+          const cf = this.fileForNote(r.childId, r.childPath);
+          // Use the recorded destination, NOT oldest.id — the kept note (if it
+          // was a child of a merged-away target) was reparented to that target's
+          // parent, so replaying oldest.id here would write parent:<self>. 0.140.9
+          if (cf) await this.app.fileManager.processFrontMatter(cf, (fm) => { fm.parent = r.newParent; });
         }
         this.tree.rebuild(folder);
         this.render();
@@ -8005,19 +8059,36 @@ export class StashpadView extends ItemView {
    *  Discoverability: the command surfaces "clone, copy, duplicate" so
    *  fuzzy lookup hits all three terms. */
   async cmdClone(): Promise<void> {
-    const roots = this.getActionTargets();
-    if (!roots.length) { new Notice("Nothing to clone."); return; }
+    const targets = this.getActionTargets();
+    if (!targets.length) { new Notice("Nothing to clone."); return; }
+    // Collapse nested selections: a descendant already gets cloned inside its
+    // selected ancestor's subtree, so cloning it again as a sibling would
+    // duplicate it. Same root-filter cmdLockSelection/archiveSources use. 0.140.9
+    const ids = new Set(targets.map((t) => t.id));
+    const roots = targets.filter((t) => {
+      let p = t.parent;
+      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      return true;
+    });
     const folder = this.noteFolder;
     const createdPaths: string[] = [];
     const newRootIds: StashpadId[] = [];
-    for (const r of roots) {
-      if (!r.file) continue;
-      // Sibling of the source: same parent. Falls back to the current
-      // focused subtree if the source somehow lacks a parent (shouldn't
-      // happen for non-root nodes).
-      const parent = r.parent ?? this.focusId;
-      const id = await this.cloneSubtree(r, parent, createdPaths);
-      if (id) newRootIds.push(id);
+    try {
+      for (const r of roots) {
+        if (!r.file) continue;
+        // Sibling of the source: same parent. Falls back to the current
+        // focused subtree if the source somehow lacks a parent (shouldn't
+        // happen for non-root nodes).
+        const parent = r.parent ?? this.focusId;
+        const id = await this.cloneSubtree(r, parent, createdPaths);
+        if (id) newRootIds.push(id);
+      }
+    } catch (e) {
+      // A mid-loop failure (name collision, adapter error) would otherwise leave
+      // already-created clone files with no undo entry. Notice, then fall through
+      // so the undo below still covers whatever got created. 0.140.9
+      console.warn("[Stashpad] clone failed partway", e);
+      new Notice(`Clone stopped early: ${(e as Error).message}`);
     }
     if (!newRootIds.length) return;
     this.tree.rebuild(folder);
@@ -9911,7 +9982,7 @@ export class StashpadView extends ItemView {
       label: `Move + reorder (${sourceIds.length})`,
       undo: async () => {
         for (const p of priorParents) {
-          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+          const f = this.fileForNote(p.id, p.path);
           if (!f) continue;
           await this.app.fileManager.processFrontMatter(f, (fm) => {
             if (p.oldParent === null || p.oldParent === undefined) fm.parent = ROOT_ID;
@@ -9942,7 +10013,7 @@ export class StashpadView extends ItemView {
       },
       redo: async () => {
         for (const p of priorParents) {
-          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+          const f = this.fileForNote(p.id, p.path);
           if (!f) continue;
           await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = targetParentId; });
           this.order.removeChild(folder, p.id);
@@ -10778,19 +10849,26 @@ export class StashpadView extends ItemView {
         this.plugin.getUndoStack(folder).push({
           label: remote ? "Send note" : "Create note",
           undo: async () => {
-            const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+            // id-first: the just-created note may have been slug-renamed before
+            // the user hits undo, making the captured path stale. 0.140.10
+            const f = this.fileForNote(id, path);
             if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
             // Restore the body to the composer so the send/create can be
             // re-typed. (For remote sends the destination is gone after
             // submit, but the text returning is still the useful part.)
-            this.composerDraft = originalBody;
-            void this.saveDraft(originalBody);
-            void this.recordLastSubmitted("");
-            if (this.composerInputEl) {
-              this.composerInputEl.value = originalBody;
-              const end = originalBody.length;
-              this.composerInputEl.setSelectionRange(end, end);
-              this.composerInputEl.focus();
+            // 0.140.9: only if the composer is empty — don't destroy a draft the
+            // user started typing after submitting.
+            const curDraft = this.composerInputEl?.value ?? this.composerDraft;
+            if (!curDraft.trim()) {
+              this.composerDraft = originalBody;
+              void this.saveDraft(originalBody);
+              void this.recordLastSubmitted("");
+              if (this.composerInputEl) {
+                this.composerInputEl.value = originalBody;
+                const end = originalBody.length;
+                this.composerInputEl.setSelectionRange(end, end);
+                this.composerInputEl.focus();
+              }
             }
             if (!remote) this.tree.rebuild(this.noteFolder);
             this.render();
@@ -11906,7 +11984,7 @@ export class StashpadView extends ItemView {
       this.plugin.getUndoStack(folder).push({
         label: "Move note",
         undo: async () => {
-          const f = this.app.vault.getAbstractFileByPath(filePath) as TFile | null;
+          const f = this.fileForNote(movedId, filePath);
           if (!f) return;
           await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = oldParent; });
           this.pendingFocusIds = [movedId];
@@ -11938,7 +12016,7 @@ export class StashpadView extends ItemView {
           }
         },
         redo: async () => {
-          const f = this.app.vault.getAbstractFileByPath(filePath) as TFile | null;
+          const f = this.fileForNote(movedId, filePath);
           if (!f) return;
           await this.app.fileManager.processFrontMatter(f, (fm) => { fm.parent = newParent; });
           this.pendingFocusIds = [movedId];

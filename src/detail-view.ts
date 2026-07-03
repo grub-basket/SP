@@ -1,4 +1,4 @@
-import { App, ItemView, MarkdownRenderer, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { App, Component, ItemView, MarkdownRenderer, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
 import { renderCountBadge } from "./panels-view";
 import { ComposerAutocomplete } from "./composer-autocomplete";
@@ -31,6 +31,10 @@ export class StashpadDetailView extends ItemView {
   /** Path of the note currently displayed. Used to detect whether a
    *  vault.modify event is relevant to this panel. */
   private displayedPath: string | null = null;
+  /** Per-render child component that owns the rendered markdown's sub-components
+   *  (embeds, code-block processors). Unloaded + replaced each render so they
+   *  don't accumulate on the view for its whole lifetime. 0.140.12 */
+  private bodyComponent: Component | null = null;
   private unsubscribeSelection: (() => void) | null = null;
   /** Coalesces a burst of selection/modify events into one render. */
   private renderTimer: number | null = null;
@@ -95,6 +99,15 @@ export class StashpadDetailView extends ItemView {
     }));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (this.displayedPath && file.path === this.displayedPath) this.scheduleRender();
+    }));
+    // Keep tracking the note across a rename (slug re-slug on body edit, or an
+    // external/Sync rename) so the panel doesn't silently stop live-updating
+    // when its path changes out from under it. 0.140.12
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (this.displayedPath && oldPath === this.displayedPath) {
+        this.displayedPath = file.path;
+        this.scheduleRender();
+      }
     }));
     this.registerEvent(this.app.metadataCache.on("changed", (file) => {
       if (this.displayedPath && file.path === this.displayedPath) this.scheduleRender();
@@ -225,7 +238,14 @@ export class StashpadDetailView extends ItemView {
     try {
       const raw = await this.app.vault.cachedRead(file);
       const stripped = this.stripFrontmatter(raw);
-      await MarkdownRenderer.render(this.app, stripped, bodyWrap, file.path, this);
+      // Unload the previous render's markdown sub-components before making new
+      // ones; passing a fresh child Component (not `this`) means they're tied to
+      // this render, not the whole view lifetime. 0.140.12
+      if (this.bodyComponent) { this.removeChild(this.bodyComponent); this.bodyComponent = null; }
+      const bodyComp = new Component();
+      this.addChild(bodyComp);
+      this.bodyComponent = bodyComp;
+      await MarkdownRenderer.render(this.app, stripped, bodyWrap, file.path, bodyComp);
     } catch (e) {
       bodyWrap.createDiv({ cls: "stashpad-detail-error", text: `Couldn't read \`${file.path}\`: ${(e as Error).message}` });
     }

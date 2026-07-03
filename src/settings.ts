@@ -960,16 +960,22 @@ export class StashpadSettingTab extends PluginSettingTab {
     const categories = Object.keys(CATEGORY_LABELS) as NotificationCategory[];
     return [
       this.renderDef("Notification history limit", "Maximum number of notifications kept in the persistent history. Set to 0 for unlimited (the file size grows with usage; expect a few hundred KB per ~5000 entries). Default: 5000.", (s) =>
-        s.addText((t) => t
-          .setValue(String(this.plugin.settings.notificationHistoryLimit ?? 5000))
-          .setPlaceholder("5000")
-          .onChange(async (v) => {
-            const n = parseInt(v, 10);
-            if (!Number.isFinite(n)) return;
+        s.addText((t) => {
+          t.setValue(String(this.plugin.settings.notificationHistoryLimit ?? 5000)).setPlaceholder("5000");
+          // Commit on blur/Enter, NOT per keystroke: setHistoryLimit prunes, so
+          // typing "5000" would transiently apply 5 and a notification arriving
+          // mid-type would truncate the history to 5 permanently. Reject NaN /
+          // negatives (restore the prior value). 0.140.11
+          const commit = async () => {
+            const n = parseInt(t.getValue(), 10);
+            if (!Number.isFinite(n) || n < 0) { t.setValue(String(this.plugin.settings.notificationHistoryLimit ?? 5000)); return; }
             this.plugin.settings.notificationHistoryLimit = n;
             this.plugin.notifications.setHistoryLimit(n);
             await this.plugin.saveSettings();
-          })), ["notification", "history", "limit"]),
+          };
+          t.inputEl.addEventListener("blur", () => void commit());
+          t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
+        }), ["notification", "history", "limit"]),
 
       {
         type: "group",
@@ -1793,7 +1799,11 @@ export class StashpadSettingTab extends PluginSettingTab {
                   const n = await this.plugin.purgeAllLockedContent();
                   new Notice(`Deleted ${n} locked item${n === 1 ? "" : "s"}.`);
                   void runRemoval();
-                }).open();
+                },
+                "Cancel",
+                // Irreversible — focus Cancel so a stray Enter (e.g. after an Esc
+                // that opened this from the fork above) can't purge everything. 0.140.11
+                /*dangerous*/ true).open();
             };
             const decryptAll = async (): Promise<void> => {
               await this.plugin.unlockAllInVault(); // prompts for the password if locked
@@ -1867,7 +1877,11 @@ export class StashpadSettingTab extends PluginSettingTab {
               new ConfirmModal(this.app, "Discard encrypted trash?",
                 "The encrypted-trash items will be PERMANENTLY lost the moment the key is erased — there is no recovery. Continue?",
                 "Confirm",
-                (discard) => { if (discard) proceedToConfirm(" ⚠️ The encrypted trash is being permanently discarded.", true); }).open();
+                (discard) => { if (discard) proceedToConfirm(" ⚠️ The encrypted trash is being permanently discarded.", true); },
+                "Cancel",
+                // Esc on the fork above routes here — focus Cancel so a reflex
+                // Enter can't confirm the permanent discard. 0.140.11
+                /*dangerous*/ true).open();
             };
             new ConfirmModal(this.app, "Encrypted notes in the trash",
               "There are encrypted, deleted notes in the trash. Removing encryption makes them PERMANENTLY unreadable.\n\n• Decrypt Trash — restore them to their original folders first (recommended).\n• Discard trash — let them be permanently erased with the key.",
@@ -2335,25 +2349,44 @@ export class StashpadSettingTab extends PluginSettingTab {
     const items: SettingDefinitionItem[] = [];
     items.push(this.renderDef("Author name",
       "Your display name. Used in the note footer + as the author/contributor link target. Leave blank to opt out (notes won't be stamped).",
-      (s) => s.addText((t) => t.setValue(this.plugin.settings.authorName).onChange(async (v) => {
-        this.plugin.settings.authorName = v.trim();
-        if (this.plugin.settings.authorName && !this.plugin.settings.authorId) this.plugin.settings.authorId = newId();
-        await this.plugin.saveSettings();
-        await this.plugin.syncAuthorFilesToName();
-      })), ["author", "name", "identity", "stamp"]));
+      (s) => s.addText((t) => {
+        t.setValue(this.plugin.settings.authorName).onChange(async (v) => {
+          // Persist the name per keystroke (cheap) so it's saved even if the
+          // settings close before blur — but DON'T run the vault-wide stub
+          // rename here: syncAuthorFilesToName renamed every _authors stub to
+          // each intermediate ("j-…", "ja-…") and logged junk into the rename
+          // history. Defer it to commit (blur/Enter). 0.140.11
+          this.plugin.settings.authorName = v.trim();
+          if (this.plugin.settings.authorName && !this.plugin.settings.authorId) this.plugin.settings.authorId = newId();
+          await this.plugin.saveSettings();
+        });
+        const commit = () => void this.plugin.syncAuthorFilesToName();
+        t.inputEl.addEventListener("blur", commit);
+        t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") commit(); });
+      }), ["author", "name", "identity", "stamp"]));
     items.push(this.renderDef("Author id (auto-assigned)",
       "Stable id appended to your name on links so coworkers with the same name don't collide. Generated once and shouldn't change. To reset it, clear and retype your author name.",
       (s) => s.addText((t) => t.setValue(this.plugin.settings.authorId).setDisabled(true)), ["author", "id"]));
     items.push(this.renderDef("Title / role",
       "Optional. Shown on your author page (e.g. \"Engineer\", \"PM\", \"Designer\").",
-      (s) => s.addText((t) => t.setValue(this.plugin.settings.authorRole).onChange(async (v) => {
-        this.plugin.settings.authorRole = v.trim(); await this.plugin.saveSettings(); await this.plugin.syncAuthorFilesToName();
-      })), ["role", "title", "job"]));
+      (s) => s.addText((t) => {
+        t.setValue(this.plugin.settings.authorRole).onChange(async (v) => {
+          this.plugin.settings.authorRole = v.trim(); await this.plugin.saveSettings();
+        });
+        const commit = () => void this.plugin.syncAuthorFilesToName(); // rewrite stubs on commit, not per keystroke (0.140.11)
+        t.inputEl.addEventListener("blur", commit);
+        t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") commit(); });
+      }), ["role", "title", "job"]));
     items.push(this.renderDef("Department / team",
       "Optional. Shown on your author page (e.g. \"Engineering\", \"Growth\").",
-      (s) => s.addText((t) => t.setValue(this.plugin.settings.authorDepartment).onChange(async (v) => {
-        this.plugin.settings.authorDepartment = v.trim(); await this.plugin.saveSettings(); await this.plugin.syncAuthorFilesToName();
-      })), ["department", "team"]));
+      (s) => s.addText((t) => {
+        t.setValue(this.plugin.settings.authorDepartment).onChange(async (v) => {
+          this.plugin.settings.authorDepartment = v.trim(); await this.plugin.saveSettings();
+        });
+        const commit = () => void this.plugin.syncAuthorFilesToName();
+        t.inputEl.addEventListener("blur", commit);
+        t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") commit(); });
+      }), ["department", "team"]));
     const footerToggle = (name: string, get: () => boolean, put: (v: boolean) => void, aliases: string[]): SettingDefinitionItem =>
       this.renderDef(name, "", (s) => s.addToggle((t) => t.setValue(get()).onChange(async (v) => { put(v); await this.plugin.saveSettings(); })), aliases);
     items.push(footerToggle("Show author in note footer", () => this.plugin.settings.showAuthor, (v) => { this.plugin.settings.showAuthor = v; }, ["author", "footer", "show"]));
