@@ -105,24 +105,39 @@ export class StashpadFolderPanelView extends ItemView {
       pending = f;
       pinnedSection.style.flex = `0 0 ${(f * 100).toFixed(2)}%`;
     };
-    const onUp = (ev: PointerEvent) => {
+    // 0.140.3 (review): tear the document listeners down on pointerup AND
+    // pointercancel (mobile scroll/palm-rejection ends a gesture with cancel,
+    // not up), and expose the cleanup so onClose can run it if the view is
+    // detached mid-drag — the old code leaked the document listeners + left the
+    // resizing cursor class stuck when either happened.
+    const cleanup = () => {
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
       document.body.removeClass("stashpad-folderpanel-resizing");
+      this.dividerCleanup = null;
+    };
+    const onUp = (ev: PointerEvent) => {
       try { divider.releasePointerCapture(ev.pointerId); } catch { /* noop */ }
-      if (pending != null) {
+      if (ev.type === "pointerup" && pending != null) {
         this.plugin.settings.folderPanelPinnedFraction = pending;
         void this.plugin.saveSettings();
       }
+      cleanup();
     };
-    divider.addEventListener("pointerdown", (ev: PointerEvent) => {
+    this.registerDomEvent(divider, "pointerdown", (ev: PointerEvent) => {
       ev.preventDefault();
       document.body.addClass("stashpad-folderpanel-resizing");
       try { divider.setPointerCapture(ev.pointerId); } catch { /* noop */ }
       document.addEventListener("pointermove", onMove);
       document.addEventListener("pointerup", onUp);
+      document.addEventListener("pointercancel", onUp);
+      this.dividerCleanup = cleanup;
     });
   }
+
+  /** 0.140.3: run any in-flight divider-drag cleanup (see attachDividerDrag). */
+  private dividerCleanup: (() => void) | null = null;
 
   // ---------- pinned notes (top) ----------
 
@@ -497,7 +512,8 @@ export class StashpadFolderPanelView extends ItemView {
     // 0.118.0: a user-set per-folder icon wins; otherwise archive folders show
     // the archive glyph and everything else the generic folder icon.
     setIcon(folderIcon, this.plugin.getFolderIcon(folder) ?? (isArchive ? "archive" : "folder"));
-    if (isArchive) folderIcon.setAttr("aria-label", "Archive folder — notes moved in are auto-encrypted");
+    // 0.134.4 (B3): archives are plaintext by default now — don't claim auto-encryption.
+    if (isArchive) folderIcon.setAttr("aria-label", "Archive folder — de-indexed from search");
     const homeColor = this.folderHomeColor(folder);
     if (homeColor) folderIcon.style.color = homeColor;
 
@@ -626,44 +642,10 @@ export class StashpadFolderPanelView extends ItemView {
         menu.addItem((i) => i.setTitle("Decrypt (unlock) all notes in folder").setIcon("unlock")
           .onClick(() => void this.plugin.unlockFolder(folder)));
       }
-      // 0.98.25 (Phase 4): archive folder toggle. Marking requires an explicit
-      // confirm — auto-lock permanently deletes the arriving note's plaintext.
-      const cleaned = folder.replace(/\/+$/, "");
-      const isArchive = this.plugin.isArchiveFolder(cleaned);
-      menu.addItem((i) => i.setTitle(isArchive ? "Unmark archive folder" : "Mark as archive folder…").setIcon("archive")
-        .onClick(async () => {
-          if (isArchive) {
-            this.plugin.settings.archiveFolders = (this.plugin.settings.archiveFolders ?? []).filter((f) => f !== cleaned);
-            await this.plugin.saveSettings();
-            new Notice(`"${cleaned.split("/").pop()}" is no longer an archive folder. Existing locked notes stay locked.`, 0);
-            this.render();
-            return;
-          }
-          new ConfirmModal(
-            this.app,
-            `Make "${cleaned.split("/").pop()}" an archive folder?`,
-            [
-              `An archive folder automatically LOCKS (encrypts) any note you move into it.`,
-              ``,
-              `What that means in plain terms:`,
-              `• "Encrypting" scrambles the note with your encryption password so its text can't be read by anyone — or any app — without that password.`,
-              `• The normal, readable copy is permanently removed from your vault. What's left is an unreadable, locked 🔒 placeholder.`,
-              `• To read or edit the note again, you unlock it with your encryption password (one click on the placeholder). Then you can re-archive it later.`,
-              `• If you ever lose your encryption password, the locked notes are gone for good — there is no backdoor or recovery, on purpose.`,
-              `• Notes ALREADY in this folder are not touched — only notes moved in from now on. (To lock the ones already here, use "Encrypt all notes in folder".)`,
-              ``,
-              `Good for folders of things you want kept private at rest: finished or sensitive material you'd rather not have readable if someone opened your vault.`,
-            ].join("\n"),
-            "Make it an archive folder",
-            async (ok) => {
-              if (!ok) return;
-              this.plugin.settings.archiveFolders = [...(this.plugin.settings.archiveFolders ?? []), cleaned];
-              await this.plugin.saveSettings();
-              new Notice(`"${cleaned.split("/").pop()}" is now an archive folder — notes moved in will be encrypted.`, 0);
-              this.render();
-            },
-          ).open();
-        }));
+      // (0.136.0: "Mark as archive folder" is gone — every folder owns an
+      // `archive/` subfolder now; use "Move selection to archive" in a list, or
+      // the aggregated Archived view to browse. Encryption of archived notes is
+      // the per-folder "Encrypt archived notes" setting.)
 
       // 0.98.31: open the encrypted-trash tab (recoverable secure-deleted notes).
       menu.addItem((i) => i.setTitle("Open encrypted trash").setIcon("rotate-ccw")
@@ -688,13 +670,14 @@ export class StashpadFolderPanelView extends ItemView {
       const parent = tf.parent?.path && tf.parent.path !== "/" ? `${tf.parent.path}/` : "";
       const target = `${parent}${safe}`;
       if (this.app.vault.getAbstractFileByPath(target)) { new Notice(`"${safe}" already exists.`); return; }
+      // 0.140.3 (review): re-validate — the folder could've moved/been deleted
+      // by sync while the rename modal sat open.
+      if (!(this.app.vault.getAbstractFileByPath(cleaned) instanceof TFolder)) { new Notice("That folder no longer exists."); return; }
       try {
         await this.app.fileManager.renameFile(tf, target);
-        // Keep the configured default folder pointing at the renamed path.
-        if ((this.plugin.settings.folder || "").replace(/\/+$/, "") === cleaned) {
-          this.plugin.settings.folder = target;
-          await this.plugin.saveSettings();
-        }
+        // 0.140.3: carry ALL path-keyed settings (default folder + placement +
+        // archive + per-folder prefs, incl. descendants) to the new path.
+        await this.plugin.remapFolderPathInSettings(cleaned, target);
         new Notice(`Renamed to "${safe}".`);
       } catch (err) {
         console.warn("[Stashpad] folder rename failed", err);
@@ -725,6 +708,10 @@ export class StashpadFolderPanelView extends ItemView {
       },
     ).open();
   }
+
+  /** 0.140.3 (review): run any in-flight divider-drag cleanup on view close so
+   *  a mid-drag detach doesn't leak the document pointer listeners. */
+  async onClose(): Promise<void> { this.dividerCleanup?.(); this.contentEl.empty(); }
 }
 
 /** Tiny single-input modal for renaming a folder. */

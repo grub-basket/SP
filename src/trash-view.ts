@@ -1,4 +1,4 @@
-import { ItemView, WorkspaceLeaf, moment, setIcon } from "obsidian";
+import { ItemView, Notice, WorkspaceLeaf, moment, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
 import { STASHPAD_TRASH_VIEW_TYPE } from "./types";
 import { ConfirmModal } from "./modals";
@@ -58,7 +58,10 @@ export class StashpadTrashView extends ItemView {
    *  flat render order (for shift-range); `anchorIdx` is the last clicked row. */
   private selected = new Set<string>();
   private order: string[] = [];
-  private anchorIdx: number | null = null;
+  /** Shift-range anchor stored as a BLOB PATH (not an index): a restore/purge
+   *  rebuilds `order` shorter, so an index anchor would point at the wrong row
+   *  afterward. We re-derive the index from this path at shift-click. (0.140.7) */
+  private anchorBlob: string | null = null;
   /** 0.130.0: shared view mode (same set as the Archive tab). Default per-folder. */
   private trashMode: AggMode = "byfolder";
 
@@ -67,6 +70,9 @@ export class StashpadTrashView extends ItemView {
     const root = this.contentEl;
     root.empty();
     root.addClass("stashpad-trash-view-body");
+    // Reset the shift-range order at the TOP so "mixed" mode (which returns
+    // before the old reset point) can't leave a stale list for Mod+A. (0.140.7)
+    this.order = [];
 
     const header = root.createDiv({ cls: "stashpad-trash-view-header" });
     header.createEl("h3", { text: "Trash" });
@@ -110,7 +116,16 @@ export class StashpadTrashView extends ItemView {
         const bar = root.createDiv({ cls: "stashpad-trash-selbar" });
         bar.createSpan({ cls: "stashpad-trash-selcount", text: `${this.selected.size} selected` });
         const restoreSel = bar.createEl("button", { cls: "stashpad-trash-restore", text: "Restore selected" });
-        restoreSel.onclick = async () => { restoreSel.disabled = true; for (const b of [...this.selected]) await this.plugin.restoreDeletedAt(b, { silent: true }); this.clearSelection(); await this.render(); };
+        restoreSel.onclick = async () => {
+          restoreSel.disabled = true;
+          // Surface partial failures — silent:true suppresses per-item notices,
+          // so without this a key-locked item left behind reads as success. (0.140.7)
+          let failed = 0;
+          for (const b of [...this.selected]) { if (!(await this.plugin.restoreDeletedAt(b, { silent: true }))) failed++; }
+          if (failed > 0) new Notice(`${failed} item${failed === 1 ? "" : "s"} couldn't be restored (locked key?) — still in trash.`);
+          this.clearSelection();
+          await this.render();
+        };
         const delSel = bar.createEl("button", { cls: "stashpad-trash-delete mod-warning", text: "Delete selected" });
         delSel.onclick = () => this.confirmPurge([...this.selected]);
         const clear = bar.createEl("button", { cls: "stashpad-trash-iconbtn", text: "Clear" });
@@ -239,29 +254,32 @@ export class StashpadTrashView extends ItemView {
     }
   }
 
-  private clearSelection(): void { this.selected.clear(); this.anchorIdx = null; }
+  private clearSelection(): void { this.selected.clear(); this.anchorBlob = null; }
 
   /** Select every trash item (Mod+A). No-op when the list is empty. */
   private selectAll(): void {
     if (this.order.length === 0) return;
     for (const b of this.order) this.selected.add(b);
-    this.anchorIdx = this.order.length - 1;
+    this.anchorBlob = this.order[this.order.length - 1] ?? null;
     void this.render();
   }
 
   /** Selection click with cmd/ctrl (toggle), shift (range), plain (single). */
   private onRowClick(idx: number, blob: string, e: MouseEvent): void {
-    if (e.shiftKey && this.anchorIdx !== null) {
-      const [a, b] = this.anchorIdx < idx ? [this.anchorIdx, idx] : [idx, this.anchorIdx];
+    // Re-derive the anchor index from its blob path — a restore/purge may have
+    // shifted rows since the anchor was set. A vanished anchor → treat as none.
+    const anchorIdx = this.anchorBlob !== null ? this.order.indexOf(this.anchorBlob) : -1;
+    if (e.shiftKey && anchorIdx >= 0) {
+      const [a, b] = anchorIdx < idx ? [anchorIdx, idx] : [idx, anchorIdx];
       this.selected.clear();
       for (let i = a; i <= b; i++) this.selected.add(this.order[i]);
     } else if (e.metaKey || e.ctrlKey) {
       if (this.selected.has(blob)) this.selected.delete(blob); else this.selected.add(blob);
-      this.anchorIdx = idx;
+      this.anchorBlob = blob;
     } else {
       if (this.selected.size === 1 && this.selected.has(blob)) this.selected.clear();
       else { this.selected.clear(); this.selected.add(blob); }
-      this.anchorIdx = idx;
+      this.anchorBlob = blob;
     }
     void this.render();
   }
@@ -278,7 +296,12 @@ export class StashpadTrashView extends ItemView {
         for (const b of blobs) await this.plugin.purgeDeletedAt(b);
         this.clearSelection();
         await this.render();
-      }).open();
+      },
+      "Cancel",
+      // Permanent, undecryptable delete — focus Cancel so a stray Enter can't
+      // purge irreversibly. (0.140.7)
+      /*dangerous*/ true,
+    ).open();
   }
 
   async onClose(): Promise<void> { this.contentEl.empty(); }
@@ -294,5 +317,5 @@ export async function openTrashView(plugin: StashpadPlugin): Promise<void> {
   const leaf = workspace.getLeaf("tab");
   await leaf.setViewState({ type: STASHPAD_TRASH_VIEW_TYPE, active: true });
   workspace.revealLeaf(leaf);
-  returnToOriginOnClose(workspace, leaf, originLeaf);
+  returnToOriginOnClose(workspace, leaf, originLeaf, (ref) => plugin.registerEvent(ref));
 }

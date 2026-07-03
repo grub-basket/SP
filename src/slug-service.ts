@@ -47,7 +47,13 @@ export function buildFilename(slug: string, id: string): string {
 }
 
 export function parseIdFromFilename(basename: string): string | null {
-  const m = basename.match(/-([a-z0-9]{4,12})$/);
+  // Match EXACTLY what buildFilename emits: a trailing `-<id>` where <id> is
+  // 6 chars from id-service's alphabet (no l/o/0/1). The old {4,12} + full
+  // a-z0-9 class matched ordinary trailing words — `meeting-notes` and
+  // `quick-notes` both parsed to the same "notes", colliding the synthetic
+  // node ids minted for non-Stashpad files. (0.140.5 review.) The `-N`
+  // rename uniquifier keeps `-<id>` last, so this still recovers the id.
+  const m = basename.match(/-([abcdefghijkmnpqrstuvwxyz23456789]{6})$/);
   return m ? m[1] : null;
 }
 

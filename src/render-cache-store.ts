@@ -95,6 +95,10 @@ export class RenderCacheStore implements RenderCacheLike {
         const obj = { schema: CACHE_SCHEMA, entries: Object.fromEntries(this.map) };
         await this.app.vault.adapter.write(this.path, JSON.stringify(obj));
       } catch (e) {
+        // Re-arm dirty so the next set()/evict() retries the write. Losing it
+        // here would strand an evicted (deleted/locked) note's plaintext in the
+        // cache file after a transient failure — defeating secure-delete. (0.140.5)
+        this.dirty = true;
         console.warn("[Stashpad] render cache save failed", e);
       }
     });

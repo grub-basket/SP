@@ -5,11 +5,13 @@ import {
 } from "obsidian";
 import {
   ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
+  archiveSubfolderOf, isArchiveSubfolderPath,
   type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
 } from "./types";
 import { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
 import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
+import { parseRecurrence, nextDueOnComplete } from "./recurrence";
 import { OrderStore } from "./order-store";
 import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
@@ -1838,7 +1840,7 @@ export class StashpadView extends ItemView {
     // 0.98.14: optionally hide the real title (privacy) — show a generic label.
     // Also fall back to generic when the on-disk title is empty (it was locked with
     // hide-titles on, so the real title lives only inside the blob).
-    const hideTitle = (this.plugin.settings.hideLockedTitles ?? false) || !lk.title;
+    const hideTitle = !lk.title; // 0.137.1: hidden iff hidden AT LOCK TIME (empty stored title)
     row.createSpan({ cls: "stashpad-locked-title", text: hideTitle ? "Locked note" : lk.title });
     row.createSpan({ cls: "stashpad-locked-count", text: lk.count > 1 ? `${lk.count} notes · locked` : "locked" });
     const unlockBtn = row.createEl("button", { cls: "stashpad-locked-unlock", text: "Unlock" });
@@ -6632,31 +6634,20 @@ export class StashpadView extends ItemView {
     }
   }
 
-  /** 0.98.28 (Phase 4): move the selected note(s) into an archive folder, which
-   *  auto-encrypts them on arrival. Uses the default archive folder if set; else
-   *  the only archive folder if there's just one; else offers a pick-list. */
+  /** 0.136.0: move the selected note(s) into THIS folder's own `archive/`
+   *  subfolder (plaintext unless the folder's "Encrypt archived notes" is on). */
   async cmdMoveToArchive(): Promise<void> {
     const targets = this.getActionTargets();
     if (targets.length === 0) return;
     const cur = (this.noteFolder ?? "").replace(/\/+$/, "");
-    // If we're ALREADY in an archive folder, don't silently re-home to a DIFFERENT
-    // archive (the old bug: the current folder was filtered out, so the default was
-    // ignored and a different archive was picked). The note is already archived.
-    if (this.plugin.isArchiveFolder(cur)) {
-      new Notice(`These notes are already in an archive folder (“${cur.split("/").pop()}”).`, 6000);
+    // 0.136.0 (per-folder archive): archiving ALWAYS targets this folder's own
+    // `archive/` subfolder — no picker, no default-archive setting, no separate
+    // dedicated archive folders.
+    if (isArchiveSubfolderPath(cur)) {
+      new Notice("These notes are already in an archive.", 6000);
       return;
     }
-    const archives = (this.plugin.settings.archiveFolders ?? []).map((f) => f.replace(/\/+$/, "")).filter((f) => f !== cur);
-    if (archives.length === 0) {
-      new Notice("No archive folder available. Mark a folder as archive first (Settings → Stashpad → Encryption → Per-folder, or the folder panel right-click).", 8000);
-      return;
-    }
-    const def = (this.plugin.settings.defaultArchiveFolder ?? "").replace(/\/+$/, "");
-    const dest = (def && archives.includes(def)) ? def : (archives.length === 1 ? archives[0] : null);
-    const go = (folder: string) => { void this.archiveSources(targets, folder); };
-    if (dest) { go(dest); return; }
-    // Several archives, no (valid) default → pick one.
-    new ArchiveFolderSuggestModal(this.app, archives, go).open();
+    void this.archiveSources(targets, archiveSubfolderOf(cur));
   }
 
   /** 0.98.34 (Phase 4): archive the given notes into `dest` — encrypt each root's
@@ -6667,12 +6658,14 @@ export class StashpadView extends ItemView {
    *  no async hook, so undo is a clean self-contained reversal. */
   private async archiveSources(sources: TreeNode[], dest: string): Promise<void> {
     const src = this.noteFolder;
-    // Archiving currently encrypts the moved notes (under the destination folder's
-    // key, or the vault key as fallback). If the destination is set to NOT encrypt
-    // its archive ("Encrypt archived notes" off = plaintext archive), that's a
-    // plaintext move — not wired into this command yet, so guide rather than fail.
     const cleanDest = dest.replace(/\/+$/, "");
-    const encryptDest = (this.plugin.settings.folderEncPrefs ?? {})[cleanDest]?.archiveEncryptContent ?? true;
+    // 0.136.0: dest is `<parent>/archive` — the encrypt-or-not pref lives on the
+    // PARENT folder (folderEncPrefs[parent].archiveEncryptContent, plaintext
+    // default via the shared B1 resolver).
+    const parentFolder = cleanDest.replace(/\/archive$/, "");
+    const encryptDest = this.plugin.archiveEncryptFor(parentFolder);
+    // The subfolder may not exist yet — create it before any move/blob write.
+    try { if (!(await this.app.vault.adapter.exists(cleanDest))) await this.app.vault.createFolder(cleanDest); } catch { /* race / exists */ }
     if (!encryptDest) {
       // Plaintext archive (encryption off): MOVE the subtree's files into the
       // destination (de-indexed via the archive flag, but not encrypted). Stashpad's
@@ -6702,7 +6695,7 @@ export class StashpadView extends ItemView {
       return;
     }
     if (!this.plugin.encryption?.isConfigured?.()) {
-      new Notice(`Archiving encrypts the notes, but encryption isn't set up yet (Settings → Stashpad → Encryption). Set it up — or turn off “Encrypt archived notes” for “${cleanDest.split("/").pop()}” to make it a plaintext archive.`, 9000);
+      new Notice(`Archiving here encrypts the notes ("Encrypt archived notes" is on for “${parentFolder.split("/").pop()}”), but encryption isn't set up yet (Settings → Stashpad → Encryption). Set it up — or turn that toggle off for a plaintext archive.`, 9000);
       return;
     }
     const ids = new Set(sources.map((t) => t.id));
@@ -6729,8 +6722,16 @@ export class StashpadView extends ItemView {
       label: `Archive (${blobs.length})`,
       undo: async () => {
         // Restore the blobs back to the SOURCE folder (not the archive folder).
-        for (const b of blobs) { try { await this.plugin.unlockBundleAt(b, { silent: true, destFolder: src }); } catch (e) { console.warn("[Stashpad] archive undo failed", b, e); } }
-        blobs = [];
+        // 0.140.2: only DROP the ones that actually restored — if a restore
+        // failed (key prompt declined, error), keep it in `blobs` so undo can be
+        // retried and redo doesn't rebuild from a phantom-empty state.
+        const failed: string[] = [];
+        for (const b of blobs) {
+          try { if (!(await this.plugin.unlockBundleAt(b, { silent: true, destFolder: src }))) failed.push(b); }
+          catch (e) { failed.push(b); console.warn("[Stashpad] archive undo failed", b, e); }
+        }
+        blobs = failed;
+        if (failed.length) new Notice(`Undo incomplete: ${failed.length} archived item${failed.length === 1 ? "" : "s"} couldn't be restored (they're still in the archive). Try again, or restore from the Archived view.`, 8000);
         this.tree.rebuild(src); this.render();
       },
       redo: async () => {
@@ -6804,8 +6805,14 @@ export class StashpadView extends ItemView {
     this.plugin.getUndoStack(folder).push({
       label: `Secure delete (${blobs.length})`,
       undo: async () => {
-        for (const b of blobs) { try { await this.plugin.restoreDeletedAt(b, { silent: true }); } catch (e) { console.warn("[Stashpad] secure-delete undo failed", b, e); } }
-        blobs = [];
+        // 0.140.2: keep the ones that failed to restore so undo is retryable.
+        const failed: string[] = [];
+        for (const b of blobs) {
+          try { if (!(await this.plugin.restoreDeletedAt(b, { silent: true }))) failed.push(b); }
+          catch (e) { failed.push(b); console.warn("[Stashpad] secure-delete undo failed", b, e); }
+        }
+        blobs = failed;
+        if (failed.length) new Notice(`Undo incomplete: ${failed.length} deleted item${failed.length === 1 ? "" : "s"} couldn't be restored (still in Trash). Try again, or restore from the Trash view.`, 8000);
         this.tree.rebuild(folder); this.render();
       },
       redo: async () => {
@@ -7157,7 +7164,7 @@ export class StashpadView extends ItemView {
       localFolder: this.noteFolder,
       // 0.124.0: surface encrypted/locked notes in search (placeholder when titles hidden).
       lockedNotes: () => this.plugin.lockedSubtreesInFolder(this.noteFolder),
-      hideLockedTitles: this.plugin.settings.hideLockedTitles ?? false,
+      hideLockedTitles: false, // 0.137.1: global option removed; picker falls back to !lk.title
     });
     this.openSearchInstance = instance;
     // Wrap onClose to clear our tracked reference when the modal closes.
@@ -8969,7 +8976,7 @@ export class StashpadView extends ItemView {
     ws.revealLeaf(leaf);
     // 0.57.5: when this spawned tab closes, the originating Stashpad tab
     // regains focus (see returnToOriginOnClose — shared by every opener).
-    returnToOriginOnClose(ws, leaf, originLeaf);
+    returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
   }
 
   /** Open a Stashpad folder's home in a new tab (any folder, not just
@@ -9006,7 +9013,7 @@ export class StashpadView extends ItemView {
     ws.revealLeaf(leaf);
     // 0.133.0: closing the search-opened tab returns to the tab you searched
     // from, not the tab to the right.
-    returnToOriginOnClose(ws, leaf, originLeaf);
+    returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
   }
 
   private async openFolderInNewTab(folder: string): Promise<void> {
@@ -9029,7 +9036,7 @@ export class StashpadView extends ItemView {
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
     // When the spawned leaf closes, restore focus to the originating tab.
-    returnToOriginOnClose(ws, leaf, originLeaf);
+    returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
   }
 
   // --- Open shortcuts ---
@@ -9073,7 +9080,7 @@ export class StashpadView extends ItemView {
 
     // When the edit tab closes, reveal the originating Stashpad leaf instead
     // of whatever Obsidian picked (the tab to the right).
-    returnToOriginOnClose(ws, leaf, originLeaf);
+    returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
 
     const view: any = leaf.view;
     const editor: any = view?.editor;
@@ -9228,22 +9235,44 @@ export class StashpadView extends ItemView {
     // more useful: if any are incomplete, mark all complete).
     const anyIncomplete = targets.some((t) => !this.isCompleted(t));
     const newState = anyIncomplete; // true means "mark complete"
-    const priorStates: { id: StashpadId; path: string; was: boolean }[] = [];
+    // 0.140.1: capture the pre-toggle due + whether it rolled, so undo/redo can
+    // reverse a recurrence roll (not just the `completed` flag).
+    const priorStates: { id: StashpadId; path: string; was: boolean; dueBefore: string | null; rolledTo: string | null }[] = [];
 
     const changedIds: StashpadId[] = [];
+    const rolled: Array<{ title: string; when: number }> = []; // recurring tasks rescheduled
     for (const t of targets) {
       if (!t.file) continue;
       const was = this.isCompleted(t);
-      priorStates.push({ id: t.id, path: t.file.path, was });
+      const rec0 = this.app.metadataCache.getFileCache(t.file)?.frontmatter;
+      const dueBefore = rec0?.due != null ? String(rec0.due) : null;
+      const ps = { id: t.id, path: t.file.path, was, dueBefore, rolledTo: null as string | null };
+      priorStates.push(ps);
       if (was === newState) continue;
+      let didRoll = false;
       await this.app.fileManager.processFrontMatter(t.file, (fm) => {
-        if (newState) fm.completed = true;
+        // 0.140.0: completing a REPEATING task rolls it forward (stays an active
+        // task with a new due) instead of just going strikethrough.
+        const rec = newState ? parseRecurrence(fm.repeat as string | undefined) : null;
+        if (rec) {
+          const oldDue = fm.due != null ? Date.parse(String(fm.due)) : NaN;
+          const next = nextDueOnComplete(rec, Number.isFinite(oldDue) ? oldDue : null, Date.now());
+          fm.due = new Date(next).toISOString();
+          delete fm.completed;
+          ps.rolledTo = fm.due as string;
+          rolled.push({ title: (t.file!.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim()) || "task", when: next });
+          didRoll = true;
+        } else if (newState) fm.completed = true;
         else delete fm.completed;
       });
-      this.completedState.set(t.file.path, newState); // 0.76.11
+      // A rolled task is NOT completed — reflect its real (incomplete) state.
+      this.completedState.set(t.file.path, didRoll ? false : newState);
       changedIds.push(t.id);
     }
     this.render();
+    for (const r of rolled) {
+      this.plugin.notifications.show({ message: `🔁 Rescheduled “${r.title}” → ${formatDateTime(r.when, this.plugin.settings)}.`, kind: "success", category: "system", folder: this.noteFolder });
+    }
     if (changedIds.length > 0) {
       await this.log.append({
         type: newState ? "complete" : "uncomplete",
@@ -9272,7 +9301,12 @@ export class StashpadView extends ItemView {
           const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
           if (!f) continue;
           await this.app.fileManager.processFrontMatter(f, (fm) => {
-            if (p.was) fm.completed = true;
+            if (p.rolledTo != null) {
+              // 0.140.1: reverse a recurrence roll — restore the old due, keep
+              // it an active (incomplete) task.
+              if (p.dueBefore != null) fm.due = p.dueBefore; else delete fm.due;
+              delete fm.completed;
+            } else if (p.was) fm.completed = true;
             else delete fm.completed;
           });
           if (changedIds.includes(p.id)) reverted.push(p.id);
@@ -9292,7 +9326,8 @@ export class StashpadView extends ItemView {
           const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
           if (!f) continue;
           await this.app.fileManager.processFrontMatter(f, (fm) => {
-            if (newState) fm.completed = true;
+            if (p.rolledTo != null) { fm.due = p.rolledTo; delete fm.completed; } // re-roll
+            else if (newState) fm.completed = true;
             else delete fm.completed;
           });
         }
@@ -9378,8 +9413,17 @@ export class StashpadView extends ItemView {
     const knownAuthors = this.plugin.collectKnownAuthors();
     const currentAssignees = parseAssignees(curFm ?? {});
     new DueDatePickerModal(this.app, current, (result) => {
-      void this.applyDue(targets, result.iso, result.assignees);
-    }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts }).open();
+      void this.applyDue(targets, result.iso, result.assignees, false, {
+        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery,
+      });
+    }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts,
+      // 0.140.1: recurrence is a per-note concept — only show/write it for a
+      // single target, else a multi-select would clobber 2..n's rules with #1's.
+      showRecurrence: targets.length === 1,
+      currentRepeat: typeof curFm?.repeat === "string" ? curFm.repeat : "",
+      currentAutoDoneAfter: typeof curFm?.autoDoneAfter === "string" ? curFm.autoDoneAfter : "",
+      currentRemindEvery: typeof curFm?.remindEvery === "string" ? curFm.remindEvery : "",
+    }).open();
   }
 
   /** 0.125.0: Snooze — reschedule a task's due date. Reuses the due-date picker
@@ -9405,8 +9449,8 @@ export class StashpadView extends ItemView {
   /** Write the chosen due value (or clear it) across `targets`, with
    *  undo. Setting a date also flips `task: true`; clearing leaves the
    *  task flag intact (clearing a due ≠ "no longer a task"). */
-  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false): Promise<void> {
-    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean }[] = [];
+  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string }): Promise<void> {
+    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown }[] = [];
     const changedIds: StashpadId[] = [];
     // 0.78.1: who is doing the assigning (the local user) — stamped as
     // assignedBy so the "assigned by me" filter works. Null if the user
@@ -9422,10 +9466,21 @@ export class StashpadView extends ItemView {
       if (!t.file) continue;
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
       const wasTagged = this.isTaskTagged(t);
-      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged });
+      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery });
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
         else { m.due = iso; m.task = true; }
+        // 0.140.0: recurrence + reminder fields — an empty string clears the
+        // field; a non-empty one sets it (and implies task-ness).
+        if (recur) {
+          const set3 = (k: "repeat" | "autoDoneAfter" | "remindEvery", v?: string) => {
+            const val = (v ?? "").trim();
+            if (val) { m[k] = val; m.task = true; } else delete m[k];
+          };
+          set3("repeat", recur.repeat);
+          set3("autoDoneAfter", recur.autoDoneAfter);
+          set3("remindEvery", recur.remindEvery);
+        }
         // 0.125.0: Snooze passes dueOnly — reschedule the due date WITHOUT
         // touching assignees (the plain applyDue would clear them on an empty
         // list). Skip all assignee writes in that mode.
@@ -9473,6 +9528,10 @@ export class StashpadView extends ItemView {
             if (p.task === undefined) delete m.task; else m.task = p.task;
             if (p.assignedTo === undefined) delete m.assignedTo; else m.assignedTo = p.assignedTo;
             if (p.assignedBy === undefined) delete m.assignedBy; else m.assignedBy = p.assignedBy;
+            // 0.140.1: restore recurrence/reminder fields too (else undo left them).
+            if (p.repeat === undefined) delete m.repeat; else m.repeat = p.repeat;
+            if (p.autoDoneAfter === undefined) delete m.autoDoneAfter; else m.autoDoneAfter = p.autoDoneAfter;
+            if (p.remindEvery === undefined) delete m.remindEvery; else m.remindEvery = p.remindEvery;
           });
           this.taskTaggedState.set(p.path, p.wasTagged); // 0.85.1
         }
@@ -9924,25 +9983,28 @@ export class StashpadView extends ItemView {
       });
       return;
     }
-    // For nesting: prevent dropping onto a descendant of the source (would create a cycle).
-    if (position === "into") {
-      for (const src of sourceNodes) {
-        if (this.isDescendant(targetId, src.id)) {
-          this.plugin.notifications.show({
-            message: `Can't nest "${this.titleForNode(src)}" under one of its own descendants — that would create a cycle.`,
-            kind: "warning",
-            category: "move",
-            folder: this.noteFolder,
-          });
-          return;
-        }
-      }
-    }
-
     // Decide which parent the sources will end up under.
     const newParentId = position === "into"
       ? targetId
       : ((targetNode.parent as StashpadId) ?? ROOT_ID);
+
+    // Cycle guard — applies to ALL positions, not just "into" (0.140.4 review).
+    // For "before"/"after" the destination parent is targetNode.parent, so
+    // dropping a parent adjacent to its own child (newParent === the source) or
+    // to a deeper descendant (newParent is a descendant of the source) would
+    // write a self-parent / cycle to frontmatter. The tree-index guard would
+    // reset it in-memory, but the on-disk `parent` field would still be corrupt.
+    for (const src of sourceNodes) {
+      if (newParentId === src.id || this.isDescendant(newParentId, src.id)) {
+        this.plugin.notifications.show({
+          message: `Can't move "${this.titleForNode(src)}" under itself or one of its own descendants — that would create a cycle.`,
+          kind: "warning",
+          category: "move",
+          folder: this.noteFolder,
+        });
+        return;
+      }
+    }
 
     // Detect cross-parent sources (relative to the new destination).
     const isCross = sourceNodes.some((n) => (n.parent ?? ROOT_ID) !== newParentId);
@@ -10169,7 +10231,7 @@ export class StashpadView extends ItemView {
     const _delFolder = (this.noteFolder ?? "").replace(/\/+$/, "");
     const _delFp = (this.plugin.settings.folderEncPrefs ?? {})[_delFolder] ?? {};
     const _encryptTrash = _delFp.trashEncryptContent ?? this.plugin.settings.encryptTrash ?? false;
-    const _followObsidian = _delFp.trashHandling ? _delFp.trashHandling === "obsidian" : (this.plugin.settings.encryptTrashFollowObsidian ?? false);
+    const _followObsidian = _delFp.trashHandling === "obsidian"; // 0.137.1: global follow-Obsidian option removed
     if (_encryptTrash && !_followObsidian) {
       if (!this.plugin.encryption?.isConfigured?.()) {
         // Don't silently fall back to the plaintext trash the user asked to avoid.
@@ -11957,23 +12019,8 @@ export class StashpadView extends ItemView {
 export { matchBinding } from "./view-keys";
 export { properCaseFolderPath } from "./view-helpers";
 
-/** 0.98.28: tiny fuzzy picker over archive folders, for "Move to archive" when
- *  more than one archive exists and no default is set. */
-class ArchiveFolderSuggestModal extends SuggestModal<string> {
-  constructor(app: App, private folders: string[], private onPick: (folder: string) => void) {
-    super(app);
-    this.setPlaceholder("Move to which archive folder?");
-  }
-  getSuggestions(query: string): string[] {
-    const q = query.toLowerCase();
-    return this.folders.filter((f) => f.toLowerCase().includes(q));
-  }
-  renderSuggestion(folder: string, el: HTMLElement): void {
-    el.createDiv({ text: folder.split("/").pop() || folder });
-    el.createEl("small", { text: folder, cls: "stashpad-suggest-path" });
-  }
-  onChooseSuggestion(folder: string): void { this.onPick(folder); }
-}
+// (0.136.0: ArchiveFolderSuggestModal removed — archiving always targets the
+// current folder's own `archive/` subfolder now, so there's nothing to pick.)
 
 /** 0.98.29: minimal restore picker over the encrypted trash. The richer grouped
  *  trash VIEW is separate; this is the keyboard/command path. Entries are

@@ -443,7 +443,8 @@ export class StashpadPanelsView extends ItemView {
   /** Display title from a TFile — strip the trailing "-id" suffix and
    *  un-hyphenate. */
   private titleFromFile(file: TFile): string {
-    return titleFromTaskFile(file);
+    const id = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+    return titleFromTaskFile(file, typeof id === "string" ? id : null);
   }
 
   // ---------- Actions ----------

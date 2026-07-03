@@ -52,6 +52,17 @@ export interface EncryptionConfig {
    *  private key, the only secret stored on this device. */
   identityPrivWrapped: string | null;
   identityPrivKdf: StashKdf | null;
+  /** 0.136.0: every keychain id this device has ever written (primary, parked
+   *  `-r<stamp>`, `-d-<slotId>`, folder keys). Obsidian's secretStorage has NO
+   *  list API, so without this registry parked entries are unreachable — with
+   *  it, unlock flows can cycle through every known candidate before ever
+   *  prompting. */
+  knownKeychainIds?: string[];
+  /** 0.140.1: the user chose "Forget on this device" — suppress auto-unlock
+   *  entirely (the cycle-unlock would otherwise resurrect a PARKED password and
+   *  silently undo the forget). Cleared the next time a password is explicitly
+   *  remembered. */
+  keychainForgotten?: boolean;
 }
 
 export function defaultEncryptionConfig(): EncryptionConfig {
@@ -85,16 +96,17 @@ export class EncryptionService {
    *  folder path. Overlay on the vault DEK — a folder with no entry here uses the
    *  vault `sessionKey`. Zeroed on lock()/idle alongside the vault key. */
   private folderSessionKeys = new Map<string, Uint8Array>();
-  private idleTimer: number | null = null;
   private keyfiles: KeyfileStore;
   /** In-memory cache of the synced keyfile (refreshed via init()/refresh()). */
   private kf: VaultKeyfile | null = null;
 
+  // (0.135.0: the idle auto-lock timer is gone — armIdle/clearIdle/idleMinutes
+  // removed. The session key lives until Obsidian closes or encryption is
+  // removed/re-passworded.)
   constructor(
     private app: App,
     private load: () => EncryptionConfig,
     private save: (cfg: EncryptionConfig) => Promise<void>,
-    private idleMinutes: () => number = () => 0,
   ) { this.keyfiles = new KeyfileStore(app); }
 
   argonProbe(): Promise<boolean> { return argon2Available(); }
@@ -146,31 +158,96 @@ export class EncryptionService {
     if (!pw) return false;
     try { return await this.verifyPassword(pw); } catch { return false; }
   }
-  private async remember(password: string): Promise<void> {
-    try { await this.secretStore()?.setSecret(this.keychainId(), password); }
-    catch (e) { console.warn("[Stashpad] couldn't save password to keychain", e); }
-  }
-  async forgetKeychain(): Promise<void> {
+  /** 0.135.1: NEVER overwrite a keychain entry — if `id` already holds a
+   *  different secret, park the old value under `<id>-r<stamp>` first (Obsidian
+   *  secret ids: /^[a-z0-9-]{1,64}$/, so the base is bounded to leave room).
+   *  Universal retention at the write bottleneck — the change-password flows'
+   *  `-d-<slotId>` parking still applies on top for nicer names. */
+  private async parkThenSet(id: string, next: string): Promise<void> {
     const ss = this.secretStore();
     if (!ss) return;
+    const touched: string[] = [id];
+    try {
+      const cur = ss.getSecret(id);
+      if (cur && cur !== next) {
+        const stamp = Date.now().toString(36); // ~8 lowercase alnum chars
+        const parkId = `${id.slice(0, 64 - (stamp.length + 2))}-r${stamp}`;
+        await ss.setSecret(parkId, cur);
+        touched.push(parkId);
+      }
+    } catch { /* best-effort retention — never block the new write */ }
+    await ss.setSecret(id, next);
+    await this.recordKeychainIds(touched);
+  }
+
+  /** 0.136.0: remember every keychain id we write (secretStorage can't list),
+   *  so unlock flows can cycle through all candidates. */
+  private async recordKeychainIds(ids: string[]): Promise<void> {
+    try {
+      const cfg = this.load();
+      const known = new Set(cfg.knownKeychainIds ?? []);
+      let dirty = false;
+      for (const id of ids) if (id && !known.has(id)) { known.add(id); dirty = true; }
+      if (dirty) await this.save({ ...cfg, knownKeychainIds: [...known] });
+    } catch { /* best-effort */ }
+  }
+
+  /** Every keychain candidate this device knows about: current + legacy ids +
+   *  everything ever written (parked, deprecated-slot, folder keys). */
+  private keychainCandidateIds(): string[] {
+    const ids = [this.keychainId(), this.legacyAppIdKeychainId(), LEGACY_KEYCHAIN_ID, ...(this.load().knownKeychainIds ?? [])];
+    return [...new Set(ids)];
+  }
+  private async remember(password: string): Promise<void> {
+    try { await this.parkThenSet(this.keychainId(), password); }
+    catch (e) { console.warn("[Stashpad] couldn't save password to keychain", e); }
+    // 0.140.1: an explicit remember re-arms auto-unlock (clears a prior forget).
+    try { const cfg = this.load(); if (cfg.keychainForgotten) await this.save({ ...cfg, keychainForgotten: false }); } catch { /* best-effort */ }
+  }
+  async forgetKeychain(): Promise<void> {
+    // 0.140.1: mark forgotten so tryAutoUnlock won't resurrect a parked password
+    // — this is the whole point of "Forget on this device".
+    try { await this.save({ ...this.load(), keychainForgotten: true }); } catch { /* best-effort */ }
+    const ss = this.secretStore();
+    if (!ss) return;
+    // 0.135.1: park the current value first (no-delete policy) — forgetting
+    // drops the ACTIVE entry but the old password stays recoverable.
+    try { const cur = ss.getSecret(this.keychainId()); if (cur) await this.parkThenSet(this.keychainId(), ""); return; } catch { /* fall through */ }
     try { if (ss.removeSecret) await ss.removeSecret(this.keychainId()); else await ss.setSecret(this.keychainId(), ""); }
     catch (e) { console.warn("[Stashpad] couldn't clear keychain", e); }
   }
+  /** 0.136.0: cycle EVERY known keychain candidate (current id, legacy ids,
+   *  parked `-r`/`-d` copies, even folder-key values) before giving up — one
+   *  stale primary entry no longer means a prompt (or a scare) when a working
+   *  password is sitting one id over. On a hit from a non-primary id, the
+   *  winning password is promoted to the primary id (old value parks). */
   async tryAutoUnlock(): Promise<boolean> {
     if (!this.isConfigured() || this.isUnlocked()) return this.isUnlocked();
+    // 0.140.1: honor an explicit "Forget on this device" — don't cycle parked
+    // passwords back into an unlock.
+    if (this.load().keychainForgotten) return false;
     // Can't auto-unlock unless this device can unlock at all: a member (its own
     // slot) or any device when a shared password is enabled.
     if (this.accessState() !== "member" && !this.hasSharedPassword()) return false;
     const ss = this.secretStore();
-    let stored: string | null = null;
-    try { stored = ss?.getSecret(this.keychainId()) ?? null; } catch { stored = null; }
-    if (stored) return this.unlock(stored);
-    let legacy: string | null = null;
-    try { legacy = ss?.getSecret(LEGACY_KEYCHAIN_ID) ?? null; } catch { legacy = null; }
-    if (!legacy) return false;
-    const ok = await this.unlock(legacy);
-    if (ok) { await this.remember(legacy); try { if (ss?.removeSecret) await ss.removeSecret(LEGACY_KEYCHAIN_ID); else await ss?.setSecret(LEGACY_KEYCHAIN_ID, ""); } catch { /* */ } }
-    return ok;
+    if (!ss) return false;
+    const primary = this.keychainId();
+    const tried = new Set<string>();
+    for (const id of this.keychainCandidateIds()) {
+      let pw: string | null = null;
+      try { pw = ss.getSecret(id) ?? null; } catch { pw = null; }
+      if (!pw || tried.has(pw)) continue;
+      tried.add(pw);
+      // verify first (cheap KDF check) so a wrong candidate doesn't spam
+      // failed-unlock side effects.
+      let ok = false;
+      try { ok = await this.verifyPassword(pw); } catch { ok = false; }
+      if (!ok) continue;
+      if (!(await this.unlock(pw))) continue;
+      if (id !== primary) await this.remember(pw); // promote (parks the stale primary)
+      return true;
+    }
+    return false;
   }
 
   // ---- state ----
@@ -217,7 +294,6 @@ export class EncryptionService {
     // explicit "Forget on this device" button and remove-encryption, so a password the
     // user asked us to keep can't be silently zeroed by going through a later flow.
     if (remember) await this.remember(password);
-    this.armIdle();
   }
 
   /** Unlock the session DEK with this device's password. Returns false on wrong
@@ -240,7 +316,6 @@ export class EncryptionService {
       // auto-unlock calls unlock() with remember=false; force-forgetting would
       // wipe the very password it just used to unlock.)
       if (remember) await this.remember(password);
-      this.armIdle();
       return true;
     }
     // Member (device-approval) path — unwrap my private key, then the DEK from my
@@ -253,9 +328,11 @@ export class EncryptionService {
         try {
           const dek = await unwrapDekWith(slot, priv);
           priv.fill(0);
+          // 0.140.2: a tampered slot could yield a wrong-length "DEK" — reject
+          // rather than silently AES-key on garbage (which would corrupt/mislead).
+          if (dek.length !== DEK_LEN) { dek.fill(0); return false; }
           this.sessionKey = dek;
           if (remember) await this.remember(password);
-          this.armIdle();
           return true;
         } catch { priv.fill(0); }
       } catch { /* wrong password for my key — try shared password below */ }
@@ -267,9 +344,9 @@ export class EncryptionService {
     for (const ps of (this.kf?.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"))) {
       try {
         const dek = await decryptStash(fromB64(ps.wrapped), password);
+        if (dek.length !== DEK_LEN) { dek.fill(0); continue; } // 0.140.2: reject wrong-length DEK
         this.sessionKey = dek;
         if (remember) await this.remember(password);
-        this.armIdle();
         return true;
       } catch { /* not this slot */ }
     }
@@ -293,7 +370,7 @@ export class EncryptionService {
     const prevActive = (this.kf.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"));
     const oldPw = this.rememberedPassword();
     if (oldPw && prevActive[0]) {
-      try { await this.secretStore()?.setSecret(`${this.keychainId()}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort retention */ }
+      try { await this.parkThenSet(`${this.keychainId()}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort retention */ }
     }
     const wrapped = await encryptStash(this.sessionKey, passphrase);
     const retained = (this.kf.passwordSlots ?? []).map((s) => s.label.startsWith("[deprecated]") ? s : { ...s, label: `[deprecated] ${s.label}` });
@@ -376,7 +453,6 @@ export class EncryptionService {
     if (!owner) return this.getSessionKey();
     const k = this.folderSessionKeys.get(owner);
     if (!k) return null;
-    this.armIdle();
     return k.slice();
   }
 
@@ -405,7 +481,6 @@ export class EncryptionService {
     await this.keyfiles.save(this.kf);
     this.folderSessionKeys.set(f, dek);
     if (remember) await this.rememberFolder(this.folderKcIdFor(entry), password);
-    this.armIdle();
   }
 
   /** Unlock a folder's own key with `password`. False on wrong password / no entry. */
@@ -420,7 +495,6 @@ export class EncryptionService {
         this.folderSessionKeys.set(entry.folderPath, dek); // key the session by the OWNING folder
         const kcId = this.folderKcIdFor(entry);
         if (remember || this.isFolderRemembered(kcId)) await this.rememberFolder(kcId, password);
-        this.armIdle();
         return true;
       } catch { /* try next slot */ }
     }
@@ -431,9 +505,26 @@ export class EncryptionService {
   async tryAutoUnlockFolder(folder: string): Promise<boolean> {
     const entry = this.folderKeyEntry(folder);
     if (!entry || this.isFolderUnlocked(folder)) return this.isFolderUnlocked(folder);
-    const pw = this.rememberedFolderPassword(this.folderKcIdFor(entry));
-    if (!pw) return false;
-    return this.unlockFolder(folder, pw);
+    const kcId = this.folderKcIdFor(entry);
+    // Primary id first, then (0.136.0) cycle every other known candidate —
+    // parked copies included. A hit from a non-primary id is promoted.
+    const pw = this.rememberedFolderPassword(kcId);
+    if (pw && await this.unlockFolder(folder, pw)) return true;
+    const ss = this.secretStore();
+    if (!ss) return false;
+    const tried = new Set<string>(pw ? [pw] : []);
+    for (const id of this.keychainCandidateIds()) {
+      if (id === kcId) continue;
+      let cand: string | null = null;
+      try { cand = ss.getSecret(id) ?? null; } catch { cand = null; }
+      if (!cand || tried.has(cand)) continue;
+      tried.add(cand);
+      if (await this.unlockFolder(folder, cand)) {
+        await this.rememberFolder(kcId, cand); // promote (parks any stale value)
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Cheap "Change password" for a folder: re-wrap the SAME DEK under a new
@@ -459,7 +550,7 @@ export class EncryptionService {
     const kcId = this.folderKcIdFor(entry);
     const oldPw = this.rememberedFolderPassword(kcId);
     if (oldPw && prevActive[0]) {
-      try { await this.secretStore()?.setSecret(`${kcId}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort retention */ }
+      try { await this.parkThenSet(`${kcId}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort retention */ }
     }
     const wrapped = await encryptStash(dek, newPassword);
     // Relabel every prior slot as [deprecated] (retained), prepend the new active one.
@@ -496,7 +587,7 @@ export class EncryptionService {
     const prevActive = (entry?.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"));
     const oldPw = oldKcId ? this.rememberedFolderPassword(oldKcId) : null;
     if (oldPw && prevActive[0]) {
-      try { await this.secretStore()?.setSecret(`${oldKcId}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort */ }
+      try { await this.parkThenSet(`${oldKcId}-d-${prevActive[0].id}`, oldPw); } catch { /* best-effort */ }
     }
     const wrapped = await encryptStash(newDek, newPassword);
     const retained = (entry?.passwordSlots ?? []).map((s) => s.label.startsWith("[deprecated]") ? s : { ...s, label: `[deprecated] ${s.label}` });
@@ -539,7 +630,7 @@ export class EncryptionService {
     try { return this.secretStore()?.getSecret(kcId) || null; } catch { return null; }
   }
   private async rememberFolder(kcId: string, password: string): Promise<void> {
-    try { await this.secretStore()?.setSecret(kcId, password); }
+    try { await this.parkThenSet(kcId, password); }
     catch (e) { console.warn("[Stashpad] couldn't save folder password to keychain", e); }
   }
   async forgetFolderKeychain(folder: string): Promise<void> {
@@ -548,6 +639,8 @@ export class EncryptionService {
     const ss = this.secretStore();
     if (!ss) return;
     const id = this.folderKcIdFor(entry);
+    // 0.135.1: park before forgetting (no-delete policy), same as forgetKeychain.
+    try { const cur = ss.getSecret(id); if (cur) { await this.parkThenSet(id, ""); return; } } catch { /* fall through */ }
     try { if (ss.removeSecret) await ss.removeSecret(id); else await ss.setSecret(id, ""); }
     catch (e) { console.warn("[Stashpad] couldn't clear folder keychain", e); }
   }
@@ -581,7 +674,6 @@ export class EncryptionService {
     // already saved here (the old one is now invalid — replace it so auto-unlock
     // doesn't keep trying a stale password). Explicit forgetting lives elsewhere.
     if (remember || this.isRemembered()) await this.remember(newPassword);
-    this.armIdle();
     return true;
   }
 
@@ -651,7 +743,6 @@ export class EncryptionService {
     // the explicit Lock command should drop ALL key material from memory).
     for (const k of this.folderSessionKeys.values()) k.fill(0);
     this.folderSessionKeys.clear();
-    this.clearIdle();
   }
 
   /** Lock a SINGLE folder's key (leave the vault key + other folders unlocked).
@@ -666,22 +757,40 @@ export class EncryptionService {
   private cleanFolder(p: string): string { return (p || "").replace(/\/+$/, ""); }
 
   /** Remove encryption entirely (caller gates on "no .stashenc exists"): wipe the
-   *  session key, this device's identity, the legacy wrap, AND the synced keyfile
-   *  + backups (no encrypted content remains, so this is safe). */
+   *  session key, this device's identity, the legacy wrap, and the ACTIVE keyfile.
+   *
+   *  0.135.0: the `_keys/` rolling backups are PARKED, not deleted. The old code
+   *  wiped every backup, so one Remove-encryption run destroyed all key history —
+   *  hostile if the user ever needs an old key back. Backups now move to
+   *  `_keys/removed-<stamp>/`, which KeyfileStore.load() never reads (it only
+   *  lists `_keys/` top-level files), so the vault still comes up "not encrypted"
+   *  while the wrapped keys stay recoverable by hand. */
   async clear(): Promise<void> {
     this.lock();
     await this.forgetKeychain();
     try {
       const a = this.app.vault.adapter;
       for (const p of [".stashpad/keys.json"]) { try { if (await a.exists(p)) await a.remove(p); } catch { /* */ } }
-      try { const list = await a.list("_keys"); for (const f of (list.files || [])) { if (/\/keys-\d+\.json$/.test(f)) { try { await a.remove(f); } catch { /* */ } } } } catch { /* */ }
+      try {
+        const list = await a.list("_keys");
+        const backups = (list.files || []).filter((f) => /\/keys-\d+\.json$/.test(f));
+        if (backups.length) {
+          const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+          const parkDir = `_keys/removed-${stamp}`;
+          try { if (!(await a.exists(parkDir))) await a.mkdir(parkDir); } catch { /* race */ }
+          for (const f of backups) {
+            const name = f.split("/").pop()!;
+            try { await a.write(`${parkDir}/${name}`, await a.read(f)); await a.remove(f); }
+            catch { /* keep the original rather than risk losing it */ }
+          }
+        }
+      } catch { /* */ }
     } catch { /* best-effort */ }
     this.kf = null;
     await this.save(defaultEncryptionConfig());
   }
 
   getSessionKey(): Uint8Array | null {
-    if (this.sessionKey) this.armIdle();
     return this.sessionKey ? this.sessionKey.slice() : null;
   }
 
@@ -703,13 +812,5 @@ export class EncryptionService {
     return { id: id.id, label: id.label, pubKey: id.pub, addedAt: new Date().toISOString() };
   }
 
-  private armIdle(): void {
-    this.clearIdle();
-    const mins = this.idleMinutes();
-    if (mins > 0) this.idleTimer = window.setTimeout(() => this.lock(), mins * 60_000);
-  }
-  private clearIdle(): void {
-    if (this.idleTimer != null) { window.clearTimeout(this.idleTimer); this.idleTimer = null; }
-  }
   dispose(): void { this.lock(); }
 }

@@ -10,7 +10,19 @@ export class IntegrityWatcher {
    * to entries under `folder` before diffing — otherwise switching folders
    * would log every note in the previously focused folder as missing.
    */
+  /** Serialize sweeps: the read-modify-write of the shared state file must be
+   *  atomic across a whole sweep, or two folders sweeping concurrently (e.g.
+   *  workspace restore opening two Stashpad leaves) each read the same base
+   *  and the second writeState clobbers the first folder's fresh snapshot. */
+  private sweepChain: Promise<void> = Promise.resolve();
+
   async sweep(folder?: string): Promise<void> {
+    const next = this.sweepChain.then(() => this.doSweep(folder), () => this.doSweep(folder));
+    this.sweepChain = next.catch(() => {});
+    return next;
+  }
+
+  private async doSweep(folder?: string): Promise<void> {
     const prev = await this.log.readState();
     const cur = this.tree.snapshot();
 

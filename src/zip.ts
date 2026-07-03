@@ -19,7 +19,16 @@
  *  verbatim (with slashes intact) so each caller can apply the right zip-slip
  *  defense: `safeZipEntryName` (flatten) for `.stash`, `safeTrashRelPath`
  *  (preserve nested dirs) for rawtrash. */
-import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from "fflate";
+import { strFromU8, strToU8, unzipSync, zipSync, type Zippable, type UnzipFileInfo } from "fflate";
+
+/** 0.140.2: decompression-bomb caps. fflate's sync `unzipSync` decompresses
+ *  everything at once, but its `filter` runs off the central directory — which
+ *  carries each entry's UNCOMPRESSED size — so we can reject a bomb BEFORE it
+ *  inflates. Generous enough for real note+attachment bundles; blocks the
+ *  ~KB-that-inflates-to-GB attack that could freeze/OOM every synced device. */
+const MAX_TOTAL_INFLATED = 512 * 1024 * 1024; // 512 MiB across all entries
+const MAX_ENTRY_INFLATED = 256 * 1024 * 1024; // 256 MiB single entry
+const MAX_ENTRIES = 20_000;
 
 export interface ZipEntry {
   name: string;
@@ -50,5 +59,14 @@ export function bytesToStr(b: Uint8Array): string {
  *  by fflate; names are returned verbatim (slashes intact) — sanitize per call site. */
 export function unzipFiles(buf: Uint8Array | ArrayBuffer): Promise<Record<string, Uint8Array>> {
   const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  return Promise.resolve(unzipSync(u8));
+  let total = 0, count = 0;
+  const filter = (f: UnzipFileInfo): boolean => {
+    count += 1;
+    if (count > MAX_ENTRIES) throw new Error(`Refusing to unzip: too many entries (>${MAX_ENTRIES}) — possible zip bomb.`);
+    if (f.originalSize > MAX_ENTRY_INFLATED) throw new Error(`Refusing to unzip: entry "${f.name}" is ${Math.round(f.originalSize / 1048576)} MiB — possible zip bomb.`);
+    total += f.originalSize;
+    if (total > MAX_TOTAL_INFLATED) throw new Error(`Refusing to unzip: total size >${Math.round(MAX_TOTAL_INFLATED / 1048576)} MiB — possible zip bomb.`);
+    return true;
+  };
+  return Promise.resolve(unzipSync(u8, { filter }));
 }

@@ -2,12 +2,60 @@
 # Reset a Claude Dev Vault TEST folder to its canonical state — fast vault reset
 # between tests. ONLY Alpha/Beta; NEVER the "Stashpad" folder (real data) or
 # "_deleted". Usage: scripts/reset-test-folder {Alpha|Beta}
+#
+# 2026-07-02: routes through obs-dev when the dedicated dev instance is up (it
+# OWNS the Claude Dev Vault, so the obsidian-cli can't reach it), else falls back
+# to the obsidian-cli. Both calls are wrapped in a hard timeout so a driver that
+# can't reach the vault fails FAST instead of hanging forever (the overnight bug:
+# reset-test-folder blocked >2min because `obs` targeted the main instance while
+# obs-dev held the vault, with no timeout).
 DIR="$(cd "$(dirname "$0")" && pwd)"
-OBS="$DIR/obs"
 F="$1"
 case "$F" in
   Alpha|Beta) ;;
   *) echo "usage: reset-test-folder {Alpha|Beta}  (never touches Stashpad)" >&2; exit 1;;
 esac
-"$OBS" eval code="window.__resetFolder='$F'" >/dev/null 2>&1
-"$OBS" eval-file "$DIR/reset-test-folder.js"
+
+# Portable 45s timeout: use timeout/gtimeout if present (Linux / brew coreutils),
+# else a pure-sh shim (macOS ships neither). Returns 124 on timeout, like GNU.
+TIMEOUT_SECS=45
+if command -v timeout >/dev/null 2>&1; then
+  run() { timeout "$TIMEOUT_SECS" "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+  run() { gtimeout "$TIMEOUT_SECS" "$@"; }
+else
+  run() {
+    "$@" & cmd_pid=$!
+    ( sleep "$TIMEOUT_SECS"; kill -TERM "$cmd_pid" 2>/dev/null ) & watch_pid=$!
+    wait "$cmd_pid" 2>/dev/null; rc=$?
+    # Discriminator: if the watcher is STILL alive (sleeping), the command
+    # finished first → keep its real rc and cancel the watcher. If the watcher
+    # is already gone, it fired the TERM → this was a timeout (124).
+    if kill -0 "$watch_pid" 2>/dev/null; then
+      kill "$watch_pid" 2>/dev/null; wait "$watch_pid" 2>/dev/null
+    else
+      rc=124
+    fi
+    return "$rc"
+  }
+fi
+
+# Which driver owns the vault? obs-dev listens on :9222 when running. Its eval
+# takes JS positionally; the obsidian-cli takes it as `code=<js>`.
+if curl -s --max-time 2 "http://localhost:9222/json/version" >/dev/null 2>&1; then
+  echo "reset-test-folder: using obs-dev (dedicated instance holds the vault)"
+  run "$DIR/obs-dev" eval "window.__resetFolder='$F'" >/dev/null 2>&1
+  run "$DIR/obs-dev" eval-file "$DIR/reset-test-folder.js"
+  rc=$?
+else
+  echo "reset-test-folder: using obsidian-cli (obs-dev not running)"
+  run "$DIR/obs" eval code="window.__resetFolder='$F'" >/dev/null 2>&1
+  run "$DIR/obs" eval-file "$DIR/reset-test-folder.js"
+  rc=$?
+fi
+
+if [ "$rc" = 124 ]; then
+  echo "reset-test-folder: TIMED OUT after 45s — is the right instance holding the Claude Dev Vault?" >&2
+  echo "  (obs-dev running? it's used automatically. Else put your main Obsidian on the Claude Dev Vault.)" >&2
+fi
+exit "$rc"

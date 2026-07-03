@@ -83,11 +83,26 @@ export class OrderStore {
 
   private async doWrite(folder: string): Promise<void> {
     const map = this.cache.get(folder) ?? {};
+    const path = `${folder}/${ORDER_FILE}`;
+    const adapter = this.app.vault.adapter;
+    // 0.140.3 (review): a mutation (setOrder/appendChild) that fires BEFORE this
+    // folder's load() has resolved seeds the cache with ONLY the touched parent,
+    // so writing it verbatim would clobber every other parent's saved order.
+    // Merge in any on-disk parents we DIDN'T touch this session (cache wins per
+    // key) so untouched orders survive.
+    try {
+      if (await adapter.exists(path)) {
+        const parsed = JSON.parse(await adapter.read(path));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (!(k in map) && Array.isArray(v) && v.every((x) => typeof x === "string")) map[k] = v as string[];
+          }
+        }
+      }
+    } catch { /* unreadable / absent — write what we have */ }
     const trimmed: Record<string, string[]> = {};
     for (const [k, v] of Object.entries(map)) if (v.length > 0) trimmed[k] = v;
     this.cache.set(folder, trimmed);
-    const path = `${folder}/${ORDER_FILE}`;
-    const adapter = this.app.vault.adapter;
     try {
       if (Object.keys(trimmed).length === 0) {
         // Skip the exists() probe — remove() throws "file not found" if

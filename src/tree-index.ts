@@ -1,5 +1,5 @@
 import { TFile, TFolder, type App } from "obsidian";
-import { ROOT_ID, RESERVED_SUBFOLDER_NAMES, isInReservedSubfolder, type StashpadId, type TreeNode } from "./types";
+import { ROOT_ID, isReservedSubfolderName, isInReservedSubfolder, type StashpadId, type TreeNode } from "./types";
 
 /** Walk a Stashpad folder's TFolder subtree and return every .md file under
  *  it. Iterative DFS rather than recursive to avoid a deep-recursion blow-up
@@ -18,10 +18,11 @@ function collectMarkdown(app: App, folderPath: string): TFile[] {
         if (child.extension === "md") out.push(child);
       } else if (child instanceof TFolder) {
         // 0.79.12: never descend into reserved Stashpad subfolders
-        // (_archive / _attachments / _authors / …) — their files aren't
-        // notes, and an archived original carrying a Stashpad id would
-        // otherwise surface as a phantom duplicate note.
-        if (!RESERVED_SUBFOLDER_NAMES.has(child.name)) stack.push(child);
+        // (_archive / _attachments / _authors / … and, 0.136.0, the per-folder
+        // archive/ + trash/) — their files aren't the folder's live notes, and
+        // an archived note carrying a Stashpad id would otherwise surface as a
+        // phantom duplicate. (`child` is always in subfolder position here.)
+        if (!isReservedSubfolderName(child.name)) stack.push(child);
       }
     }
   }
@@ -126,6 +127,23 @@ export class TreeIndex {
         created: (fm?.created as string) ?? "",
       });
       this.byPath.set(f.path, id);
+    }
+
+    // 0.140.3 (review): break MULTI-node parent cycles (A.parent=B, B.parent=A —
+    // e.g. two devices moving notes in opposite directions before sync merges).
+    // A cycle member reaches neither ROOT nor a live ancestor, so its whole
+    // subtree would silently vanish from the UI and any recursive child-walk
+    // would loop forever. Walk each node's parent chain; on a revisit, reparent
+    // that node to ROOT so the tree stays acyclic + visible.
+    for (const node of this.nodes.values()) {
+      if (node.id === ROOT_ID) continue;
+      const seen = new Set<string>([node.id]);
+      let p = node.parent ?? ROOT_ID;
+      while (p !== ROOT_ID && this.nodes.has(p)) {
+        if (seen.has(p)) { node.parent = ROOT_ID; break; }
+        seen.add(p);
+        p = this.nodes.get(p)!.parent ?? ROOT_ID;
+      }
     }
 
     for (const node of this.nodes.values()) {
@@ -375,7 +393,12 @@ export class TreeIndex {
       return changed;
     }
 
-    const parentId = ((fm?.parent as string | null | undefined) ?? ROOT_ID);
+    let parentId = ((fm?.parent as string | null | undefined) ?? ROOT_ID);
+    // 0.140.3 (review): the self-parent guard existed only in rebuild() — a note
+    // declaring itself its own parent (hand-edited / synced) arriving via the
+    // incremental `changed` event would attach as its OWN child, hanging every
+    // recursive child-walk. Pin it to ROOT here too.
+    if (parentId === id) parentId = ROOT_ID;
     const created = (fm?.created as string) ?? "";
 
     // Safety net: if the declared parent isn't ROOT and isn't in the

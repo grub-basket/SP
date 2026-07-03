@@ -130,9 +130,36 @@ export const RESERVED_SUBFOLDER_NAMES: ReadonlySet<string> = new Set([
   "_attachments", "_authors", "_exports", "_imports", "_processed",
   "_archive", ".archive", // .archive is legacy (pre-0.79.10)
 ]);
-/** True if any path segment is a reserved Stashpad subfolder. */
+
+/** 0.136.0 (per-folder archive/trash overhaul): every Stashpad folder owns an
+ *  `archive/` (and, Phase 2, a `trash/`) subfolder. These names are reserved
+ *  ONLY as subfolders — a TOP-LEVEL folder literally named "archive"/"trash"
+ *  stays a normal folder. NOTE: a pre-existing user SUBfolder named
+ *  `archive`/`trash` becomes that folder's archive/trash — its notes stay
+ *  reachable via the aggregated views. */
+export const SUBFOLDER_ONLY_RESERVED_NAMES: ReadonlySet<string> = new Set(["archive", "trash"]);
+
+/** A reserved name in SUBFOLDER position (never applies to a path's first
+ *  segment for archive/trash; always applies for the underscore names). */
+export function isReservedSubfolderName(name: string): boolean {
+  return RESERVED_SUBFOLDER_NAMES.has(name) || SUBFOLDER_ONLY_RESERVED_NAMES.has(name);
+}
+
+/** 0.136.0: the archive subfolder for a Stashpad folder. */
+export function archiveSubfolderOf(folder: string): string {
+  return `${(folder || "").replace(/\/+$/, "")}/archive`;
+}
+/** 0.136.0: is `path` (a folder or file path) inside some folder's `archive/`
+ *  subfolder? Matches any `archive` segment except a leading one (a top-level
+ *  folder literally named "archive" is a normal folder, not a subfolder). */
+export function isArchiveSubfolderPath(path: string): boolean {
+  return (path || "").replace(/\/+$/, "").split("/").slice(1).includes("archive");
+}
+/** True if any path segment is a reserved Stashpad subfolder. archive/trash
+ *  count only in SUBfolder position (see SUBFOLDER_ONLY_RESERVED_NAMES). */
 export function isInReservedSubfolder(path: string): boolean {
-  return path.split("/").some((seg) => RESERVED_SUBFOLDER_NAMES.has(seg));
+  return path.split("/").some((seg, i) =>
+    RESERVED_SUBFOLDER_NAMES.has(seg) || (i > 0 && SUBFOLDER_ONLY_RESERVED_NAMES.has(seg)));
 }
 /** True if the path lives under an archive subfolder (`_archive`/`.archive`)
  *  — the import-originals graveyard, excluded from search + link surfaces. */
@@ -259,7 +286,10 @@ export type LogEventType =
   | "complete" | "uncomplete"
   | "stash_export" | "stash_import"
   | "attachment_add" | "attachment_remove"
-  | "palette_color_add" | "palette_color_remove";
+  | "palette_color_add" | "palette_color_remove"
+  // 0.136.0: one-time move of legacy dedicated-archive contents into the
+  // folder's own archive/ subfolder (per-folder archive overhaul).
+  | "archive_migration";
 
 export interface LogEvent {
   ts: string;

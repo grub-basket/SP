@@ -227,7 +227,7 @@ export async function processStashFile(view: StashpadView, file: TFile): Promise
     // 0.85.4: try a passphrase remembered for this filename first (silent).
     const buf = await resolveStashBytes(view.app, raw, { secretId: secretIdForStashName(file.basename) });
     if (!buf) return; // user cancelled the password prompt — leave the file as-is
-    const summary = await importStashZip(view.app, buf, view.noteFolder, collectExistingIds(view));
+    const summary = await importStashZip(view.app, buf, view.noteFolder, collectExistingIds(view), { stripReserved: true });
     view.tree.rebuild(view.noteFolder);
     view.render();
     await view.log.append({

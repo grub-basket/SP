@@ -64,12 +64,26 @@ export class ImportLog {
     return null;
   }
 
+  /** Cap so a heavy drop-folder auto-import user can't grow the in-memory
+   *  array (and the on-disk jsonl, re-read whole on startup) without bound.
+   *  Newest entries win. 0.140.4 (review). */
+  private static readonly MAX_ENTRIES = 5000;
+
   append(entry: ImportLogEntry): void {
     this.entries.push(entry);
+    const overflow = this.entries.length > ImportLog.MAX_ENTRIES;
+    if (overflow) this.entries = this.entries.slice(-ImportLog.MAX_ENTRIES);
     this.writeChain = this.writeChain.then(async () => {
       try {
         await this.ensureDir();
-        await this.app.vault.adapter.append(this.path, JSON.stringify(entry) + "\n");
+        if (overflow) {
+          // Rewrite the whole trimmed log so the file tracks the capped array
+          // instead of appending forever.
+          const body = this.entries.map((e) => JSON.stringify(e)).join("\n");
+          await this.app.vault.adapter.write(this.path, body + "\n");
+        } else {
+          await this.app.vault.adapter.append(this.path, JSON.stringify(entry) + "\n");
+        }
       } catch (e) {
         console.warn("[Stashpad] import log append failed", e);
       }

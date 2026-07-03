@@ -7,8 +7,21 @@ import { newId } from "./id-service";
 import type { ImportLogEntry } from "./import-log";
 
 export interface AssigneeRef { id: string; name: string }
-export interface DuePickResult { iso: string | null; assignees: AssigneeRef[] }
+export interface DuePickResult {
+  iso: string | null;
+  assignees: AssigneeRef[];
+  /** 0.140.0: recurrence + reminder rules (empty string = clear the field).
+   *  Present only when the picker showed the "Repeat & reminders" section. */
+  repeat?: string;
+  autoDoneAfter?: string;
+  remindEvery?: string;
+}
 export interface DuePickerOptions {
+  /** 0.140.0: show the "Repeat & reminders" section, pre-filled from these. */
+  showRecurrence?: boolean;
+  currentRepeat?: string;
+  currentAutoDoneAfter?: string;
+  currentRemindEvery?: string;
   /** Known authors to offer in the assignee picker (from the registry). */
   knownAuthors?: AssigneeRef[];
   /** Assignees already on the note, to pre-fill the chips. */
@@ -252,6 +265,8 @@ export class LogModal extends Modal {
         if (this.footerEl) this.footerEl.empty();
         new Notice("Log cleared.");
       },
+      "Cancel",
+      /*dangerous*/ true,
     ).open();
   }
 
@@ -1174,6 +1189,9 @@ export class TypeToConfirmModal extends Modal {
 export class CustomColorModal extends Modal {
   private value: string;
   private delivered = false;
+  /** Whether the user actually changed the color. A dismiss (Esc/click-out)
+   *  without touching anything must NOT apply the seeded default. (0.140.6) */
+  private touched = false;
   constructor(
     app: App,
     seed: string | null,
@@ -1207,6 +1225,7 @@ export class CustomColorModal extends Modal {
     const sync = (next: string) => {
       const v = next.startsWith("#") ? next : "#" + next;
       if (!/^#[0-9a-f]{6}$/i.test(v)) return;
+      this.touched = true;
       this.value = v;
       preview.style.background = v;
       wheel.value = v;
@@ -1236,9 +1255,10 @@ export class CustomColorModal extends Modal {
     this.onResult(this.value, opts);
   }
   onClose(): void {
-    if (!this.delivered) {
-      // Click-out / Esc → apply hastily (no palette persistence), matching
-      // the user's "skip adding" intent.
+    if (!this.delivered && this.touched) {
+      // Click-out / Esc AFTER changing the color → apply hastily (no palette
+      // persistence), matching the user's "skip adding" intent. An UNtouched
+      // dismiss is a cancel — don't paint the seeded default over the note.
       this.delivered = true;
       this.onResult(this.value, { addToPalette: false });
     }
@@ -1265,6 +1285,9 @@ export class ColorPickerModal extends Modal {
 
   /** Active grid index for keyboard nav. -1 = no focus yet. */
   private focusIdx = -1;
+  /** Guard so re-rendering the grid (handleDelete → onOpen) doesn't stack a
+   *  second copy of the keyboard handlers on the persistent scope. (0.140.6) */
+  private scopeBound = false;
   /** Snapshot of selectable tiles in render order. The "+" tile is `kind:
    *  "add"` and opens CustomColorModal rather than committing directly. */
   private items: { kind: "none" | "preset" | "custom" | "add"; color: string | null; el: HTMLElement }[] = [];
@@ -1332,12 +1355,17 @@ export class ColorPickerModal extends Modal {
     this.focusIdx = seedIdx >= 0 ? seedIdx : 0;
     this.refreshActive();
 
-    // Keyboard nav: arrows move focus; Enter activates.
-    this.scope.register([], "ArrowRight", (e) => { e.preventDefault(); this.moveFocus(1); });
-    this.scope.register([], "ArrowLeft",  (e) => { e.preventDefault(); this.moveFocus(-1); });
-    this.scope.register([], "ArrowDown",  (e) => { e.preventDefault(); this.moveFocus(this.columns()); });
-    this.scope.register([], "ArrowUp",    (e) => { e.preventDefault(); this.moveFocus(-this.columns()); });
-    this.scope.register([], "Enter",      (e) => { e.preventDefault(); this.activate(this.focusIdx); });
+    // Keyboard nav: arrows move focus; Enter activates. Registered once — the
+    // handlers read live this.focusIdx/this.items, so they survive a grid
+    // rebuild; re-registering (handleDelete → onOpen) would stack duplicates.
+    if (!this.scopeBound) {
+      this.scope.register([], "ArrowRight", (e) => { e.preventDefault(); this.moveFocus(1); });
+      this.scope.register([], "ArrowLeft",  (e) => { e.preventDefault(); this.moveFocus(-1); });
+      this.scope.register([], "ArrowDown",  (e) => { e.preventDefault(); this.moveFocus(this.columns()); });
+      this.scope.register([], "ArrowUp",    (e) => { e.preventDefault(); this.moveFocus(-this.columns()); });
+      this.scope.register([], "Enter",      (e) => { e.preventDefault(); this.activate(this.focusIdx); });
+      this.scopeBound = true;
+    }
 
     // After paint, focus the modal so arrow keys land here, not in the
     // background view.
@@ -1428,6 +1456,9 @@ export class ConfirmModal extends Modal {
     private confirmText: string,
     private onChoose: (confirmed: boolean) => void,
     private cancelText: string = "Cancel",
+    /** When true (destructive confirms like "Clear log"), focus Cancel instead
+     *  of Confirm so a stray Enter doesn't fire the irreversible action. */
+    private dangerous: boolean = false,
   ) { super(app); }
   onOpen(): void {
     this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
@@ -1446,8 +1477,9 @@ export class ConfirmModal extends Modal {
     cancel.onclick = () => { this.didChoose = true; this.close(); this.onChoose(false); };
     const ok = row.createEl("button", { cls: "mod-cta", text: this.confirmText });
     ok.onclick = () => { this.didChoose = true; this.close(); this.onChoose(true); };
-    // Focus the confirm button so Enter accepts.
-    requestAnimationFrame(() => ok.focus());
+    // Focus the confirm button so Enter accepts — but for destructive confirms
+    // focus Cancel instead, so a stray Enter cancels rather than fires. (0.140.6)
+    requestAnimationFrame(() => (this.dangerous ? cancel : ok).focus());
   }
   onClose(): void {
     this.contentEl.empty();
@@ -1746,6 +1778,32 @@ export class DueDatePickerModal extends Modal {
       timeInput.value = "";
       dateInput.focus();
     };
+    // 0.140.0: optional "Repeat & reminders" section (collapsible). Three
+    // free-text fields; recurrence uses natural language ("every weekday",
+    // "every 30 days when done"). Only shown/returned when opts.showRecurrence.
+    let repeatIn: HTMLInputElement | null = null;
+    let autoIn: HTMLInputElement | null = null;
+    let remindIn: HTMLInputElement | null = null;
+    if (this.opts.showRecurrence) {
+      const det = wrap.createEl("details", { cls: "stashpad-due-recur" });
+      if (this.opts.currentRepeat || this.opts.currentAutoDoneAfter || this.opts.currentRemindEvery) det.open = true;
+      det.createEl("summary", { text: "🔁 Repeat & reminders" });
+      const mkRow = (label: string, ph: string, val?: string): HTMLInputElement => {
+        const r = det.createDiv({ cls: "stashpad-due-recur-row" });
+        r.createEl("label", { text: label });
+        const inp = r.createEl("input", { type: "text", attr: { placeholder: ph } });
+        if (val) inp.value = val;
+        return inp;
+      };
+      repeatIn = mkRow("Repeat", 'e.g. "every weekday", "every 30 days when done"', this.opts.currentRepeat);
+      autoIn = mkRow("Auto-complete after", 'e.g. "1d" — mark done once this overdue', this.opts.currentAutoDoneAfter);
+      remindIn = mkRow("Remind every", 'e.g. "2h" — re-notify until done', this.opts.currentRemindEvery);
+    }
+    const recur = (): Pick<DuePickResult, "repeat" | "autoDoneAfter" | "remindEvery"> =>
+      this.opts.showRecurrence
+        ? { repeat: repeatIn!.value.trim(), autoDoneAfter: autoIn!.value.trim(), remindEvery: remindIn!.value.trim() }
+        : {};
+
     const cancel = grid.createEl("button", { cls: "stashpad-due-btn", text: "Cancel" });
     cancel.onclick = () => { this.didChoose = true; this.close(); };
     const ok = grid.createEl("button", { cls: "stashpad-due-btn mod-cta", text: "Set" });
@@ -1755,7 +1813,7 @@ export class DueDatePickerModal extends Modal {
       if (!dateInput.value) {
         this.didChoose = true;
         this.close();
-        this.onPick({ iso: null, assignees: this.assignees });
+        this.onPick({ iso: null, assignees: this.assignees, ...recur() });
         return;
       }
       // Default time to 09:00 when only a date was chosen.
@@ -1765,7 +1823,7 @@ export class DueDatePickerModal extends Modal {
       const due = new Date(y, m - 1, d, hh, mm, 0, 0);
       this.didChoose = true;
       this.close();
-      this.onPick({ iso: due.toISOString(), assignees: this.assignees });
+      this.onPick({ iso: due.toISOString(), assignees: this.assignees, ...recur() });
     };
     requestAnimationFrame(() => dateInput.focus());
   }
@@ -1975,6 +2033,8 @@ export class NotificationHistoryModal extends Modal {
           this.service.clearHistory();
           // service.clearHistory emits — our subscriber refreshes.
         },
+        "Cancel",
+        /*dangerous*/ true,
       ).open();
     };
 
@@ -2253,6 +2313,46 @@ export class OkfExportModal extends Modal {
       this.onConfirm(name.value.trim() || this.base, { zip: zip.checked, targz: targz.checked, stash: stash.checked });
     };
     requestAnimationFrame(() => name.focus());
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.138.0 (re-encrypt sweep): ONE review modal listing everything that should
+ *  be encrypted but is plaintext — per-subtree rows, checkboxes pre-ticked.
+ *  Confirm passes the CHECKED indices; nothing encrypts without it. */
+export class ReEncryptReviewModal extends Modal {
+  constructor(
+    app: App,
+    private items: Array<{ label: string; detail: string }>,
+    private onConfirm: (chosenIndices: number[]) => void | Promise<void>,
+  ) { super(app); }
+
+  onOpen(): void {
+    this.titleEl.setText("Re-encrypt everything applicable?");
+    const { contentEl } = this;
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "These notes should be encrypted (they were unlocked/restored, or their folder is set to encrypt) but are currently plaintext. Untick anything you want to leave readable.",
+    });
+    const list = contentEl.createDiv({ cls: "stashpad-reenc-list" });
+    const boxes: HTMLInputElement[] = [];
+    this.items.forEach((it) => {
+      const row = list.createEl("label", { cls: "stashpad-reenc-row" });
+      const cb = row.createEl("input", { type: "checkbox" });
+      cb.checked = true;
+      boxes.push(cb);
+      const body = row.createDiv({ cls: "stashpad-reenc-body" });
+      body.createDiv({ cls: "stashpad-reenc-label", text: it.label });
+      body.createDiv({ cls: "stashpad-reenc-detail", text: it.detail });
+    });
+    const btns = contentEl.createDiv({ cls: "modal-button-container" });
+    const go = btns.createEl("button", { cls: "mod-cta", text: `Re-encrypt checked` });
+    go.onclick = () => {
+      const chosen = boxes.map((b, i) => (b.checked ? i : -1)).filter((i) => i >= 0);
+      this.close();
+      if (chosen.length) void this.onConfirm(chosen);
+    };
+    btns.createEl("button", { text: "Cancel" }).onclick = () => this.close();
   }
   onClose(): void { this.contentEl.empty(); }
 }

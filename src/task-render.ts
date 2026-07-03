@@ -236,7 +236,12 @@ function renderRow(
   if (t.author) meta.createSpan({ cls: "stashpad-review-author", text: `by ${t.author.name}` });
   if (t.due != null) {
     const overdue = t.due < now && !t.completed;
-    const isToday = t.due >= now - 86_400_000 && t.due < now + 86_400_000;
+    // Calendar "today" (midnight→midnight), matching the bucket boundaries —
+    // a ±24h window mislabels yesterday-11pm / tomorrow-9am as today and then
+    // renders them time-only with no date. (0.140.5 review.)
+    const startToday = new Date(now); startToday.setHours(0, 0, 0, 0);
+    const startTodayMs = startToday.getTime();
+    const isToday = t.due >= startTodayMs && t.due < startTodayMs + 86_400_000;
     const dueEl = meta.createSpan({
       cls: "stashpad-review-due",
       text: isToday ? formatTimeOnly(t.due, plugin.settings) : formatDateOnly(t.due, plugin.settings),

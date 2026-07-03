@@ -383,12 +383,9 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // run token-order-agnostic match against title/body.
     const parsed = parseSearchQuery(query);
     const tokens = parsed.text;
-    // 0.64.2 diagnostic — use console.log (not debug) so it shows
-    // at the default DevTools log level. Always fires while we're
-    // debugging the filter pipeline.
-    console.log("[Stashpad] search query parsed", {
-      query, text: parsed.text, filters: parsed.filters,
-    });
+    // 0.140.1: removed a leftover `console.log` that dumped every typed search
+    // query to the DevTools console on every keystroke (info-leak on a shared
+    // machine + production noise). Was tagged "always fires while debugging".
     const matchesAll = (haystack: string): boolean => {
       if (!tokens.length) return true;
       for (const t of tokens) if (!haystack.includes(t)) return false;

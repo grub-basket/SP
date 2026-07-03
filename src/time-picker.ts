@@ -31,6 +31,7 @@ export interface BuildTimePickerOpts {
 
 /** Convert a typed (hh 1–24, period) into 24-hour hours. */
 function to24(hh: number, period: "am" | "pm"): number {
+  if (hh === 0) return 0;                       // explicit midnight (24-hour entry)
   if (hh > 12) return hh >= 24 ? 0 : hh;       // already 24-hour
   if (period === "am") return hh === 12 ? 0 : hh;
   return hh === 12 ? 12 : hh + 12;
@@ -101,9 +102,13 @@ export function buildTimePickerInto(pop: HTMLElement, opts: BuildTimePickerOpts)
   syncAmpmEnabled();
 
   const finalize = (): void => {
-    const hh = parseInt(hField.value || "12", 10) || 12;
+    // Distinguish a typed 0/00 (midnight) from an empty field. `|| 12` would
+    // coerce a real 0 to 12 and re-interpret it through the am/pm toggle
+    // (00:30+PM → 12:30 noon). Empty stays 12; a typed 0 stays 0. (0.140.5)
+    const hParsed = parseInt(hField.value, 10);
+    const hh = Number.isNaN(hParsed) ? 12 : hParsed;
     const mm = parseInt(mField.value || "0", 10) || 0;
-    const is24 = hh > 12;
+    const is24 = hh > 12 || hh === 0;
     opts.onFinalize({
       hours24: to24(hh, period),
       minutes: mm,

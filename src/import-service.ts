@@ -2,6 +2,7 @@ import { Notice, TFile, TFolder } from "obsidian";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink } from "./types";
 import { newId } from "./id-service";
+import { formatDateOnly } from "./format";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { splitFrontmatter, serializeNote, importStashZip, STASH_EXT } from "./stash-package";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
@@ -13,11 +14,8 @@ import { ConfirmModal, ImportDupChoiceModal } from "./modals";
 const RESERVED_SUBFOLDERS = new Set([
   "_attachments", "_authors", "_exports", "_imports", "_processed", "_archive",
   ".archive", // legacy (pre-0.79.10) — keep ignoring any that exist
+  "archive", "trash", // 0.136.0: per-folder archive/trash subfolders
 ]);
-/** Where import originals are preserved. 0.79.10: a normal reserved folder
- *  (NOT dot-prefixed) — Obsidian hides/ignores dot-folders, which made
- *  renameFile/getAbstractFileByPath into `.archive` unreliable. */
-const ARCHIVE_DIR = "_archive";
 
 /** Extensions that must NEVER be turned into a note/attachment by any import
  *  path. `.stash` is handled by the dedicated stash-import path (not a note);
@@ -71,6 +69,16 @@ export class ImportService {
   constructor(private plugin: StashpadPlugin) {}
 
   private get app() { return this.plugin.app; }
+
+  /** 0.136.0: import originals live in the folder's own archive subfolder,
+   *  dated: `<folder>/archive/_imported/<date>/`. The date segment follows the
+   *  user's date-format preference, sanitized for path safety (e.g. the "us"
+   *  format's slashes become dashes). */
+  private importedOriginalsDir(folder: string): string {
+    const raw = formatDateOnly(Date.now(), this.plugin.settings);
+    const seg = raw.replace(/[/\\:]+/g, "-").replace(/\s+/g, " ").trim() || "undated";
+    return `${folder}/archive/_imported/${seg}`;
+  }
 
   /** Called from the vault create/rename watcher. Cheap pre-filter, then
    *  queue + (re)arm the debounced drain. */
@@ -284,8 +292,10 @@ export class ImportService {
     const raw = await this.app.vault.read(file);
     const { fm, body } = splitFrontmatter(raw);
 
-    // Archive the original verbatim under _archive (unique name).
-    const archiveDir = `${folder}/${ARCHIVE_DIR}`;
+    // 0.136.0: archive the original verbatim under the folder's own
+    // archive/_imported/<date>/ (unique name). Date follows the user's
+    // date-format preference, path-sanitized.
+    const archiveDir = this.importedOriginalsDir(folder);
     await this.ensureFolder(archiveDir);
     const archivePath = await this.uniquePath(archiveDir, file.name);
     await this.app.fileManager.renameFile(file, archivePath);
@@ -380,10 +390,10 @@ export class ImportService {
   private async importFolder(folder: TFolder): Promise<ImportRecord | null> {
     const root = folder.parent!.path.replace(/\/+$/, "");
     const name = folder.name;
-    // Move the whole folder to _archive first; we then build notes by
-    // reading from its archived location, so non-md notes link to the
-    // final (archived) path and md content is cloned from there.
-    const archiveDir = `${root}/${ARCHIVE_DIR}`;
+    // Move the whole folder into archive/_imported/<date>/ first; we then
+    // build notes by reading from its archived location, so non-md notes link
+    // to the final (archived) path and md content is cloned from there.
+    const archiveDir = this.importedOriginalsDir(root);
     await this.ensureFolder(archiveDir);
     const archivePath = await this.uniquePath(archiveDir, name);
     await this.app.fileManager.renameFile(folder, archivePath);
@@ -841,7 +851,7 @@ export class ImportService {
       // 0.85.4: try a passphrase remembered for this filename before prompting.
       const buf = await resolveStashBytes(this.app, rawBytes, { ...promptOpts, secretId: secretIdForStashName(file.basename) });
       if (!buf) return false; // cancelled / "remind me later" — leave the file
-      const summary = await importStashZip(this.app, buf, root, existingIds);
+      const summary = await importStashZip(this.app, buf, root, existingIds, { stripReserved: true });
       // Merge any hex→name color aliases the bundle carried (e.g. from the web
       // importer) into the destination folder, so the names show in the color UI.
       if (summary.colorAliases) {

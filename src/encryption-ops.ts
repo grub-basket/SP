@@ -165,6 +165,20 @@ async function purgeSubtreePlaintext(
   }
   for (const [path, af] of subtreeAtts) {
     if (sharedExternally.has(path)) continue;
+    // Same mid-lock-edit guard as notes: if the attachment changed since it was
+    // baselined (re-pasted image, sync write) its newer bytes aren't in the blob
+    // — keep the plaintext rather than destroy the newer copy. (0.140.8)
+    const baseline = mtimes?.get(path);
+    if (baseline != null) {
+      try {
+        const st = await app.vault.adapter.stat(path);
+        if (st && st.mtime !== baseline) {
+          console.warn("[Stashpad] attachment changed since it was bundled — keeping plaintext", path);
+          unpurged.push(path);
+          continue;
+        }
+      } catch { /* stat failed — fall through and let delete try */ }
+    }
     try { await app.vault.delete(af); }
     catch (e) { console.warn("[Stashpad] couldn't delete exclusive attachment", path, e); unpurged.push(path); }
   }
@@ -188,6 +202,11 @@ export async function lockSubtree(
   const mtimes = new Map<string, number>();
   for (const n of allNodes) {
     try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline → delete proceeds unguarded */ }
+    // Baseline the note's exclusive attachments too, so purge skips one edited
+    // mid-lock (its newer bytes aren't in the blob). (0.140.8)
+    for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
+      try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
+    }
   }
 
   const zip = await buildStashZip(app, {
@@ -304,6 +323,16 @@ export async function deletedRestoreDest(app: App, blobPath: string, meta: Delet
     try { origin = safeVaultFolder(new TextDecoder().decode(await decryptWithKey(b64ToBytes(meta.originalFolderEnc), dek))); }
     catch { origin = null; } // wrong key / tampered — fall back
   }
+  const blobDir = blobPath.replace(/\/[^/]*$/, "");
+  // 0.140.1: for a PER-FOLDER trash blob (`X/trash/…`) whose sidecar origin no
+  // longer exists, the blob's OWN location is authoritative — the trash travels
+  // with its folder on rename (A→B moves A/trash into B/trash), so a stale
+  // sidecar `originalFolder: A` would resurrect a dead folder A and restore
+  // there instead of B. Prefer the blob's parent folder in that case.
+  const trashParent = /(^|\/)trash$/.test(blobDir) ? blobDir.replace(/\/?trash$/, "") : "";
+  if (origin && trashParent && origin !== trashParent && !(await app.vault.adapter.exists(origin))) {
+    origin = trashParent || null;
+  }
   if (origin) {
     // Recreate a missing origin folder rather than falling back: for trash
     // blobs the fallback would be `_deleted/` itself — decrypted plaintext
@@ -311,8 +340,15 @@ export async function deletedRestoreDest(app: App, blobPath: string, meta: Delet
     if (!(await app.vault.adapter.exists(origin))) await app.vault.adapter.mkdir(origin);
     return origin;
   }
-  const blobDir = blobPath.replace(/\/[^/]*$/, "");
   if (blobDir === DELETED_DIR || blobDir.startsWith(`${DELETED_DIR}/`)) {
+    throw new Error("This deleted note's origin folder is unknown (missing or tampered sidecar) — can't restore it safely. The encrypted copy was kept.");
+  }
+  // 0.137.0: a per-folder trash blob with no usable sidecar restores to the
+  // trash's PARENT folder (that IS its origin) — never into the reserved
+  // trash/ dir itself, where the plaintext would be hidden from every list.
+  if (/(^|\/)trash$/.test(blobDir)) {
+    const parent = blobDir.replace(/\/?trash$/, "");
+    if (parent) { if (!(await app.vault.adapter.exists(parent))) await app.vault.adapter.mkdir(parent); return parent; }
     throw new Error("This deleted note's origin folder is unknown (missing or tampered sidecar) — can't restore it safely. The encrypted copy was kept.");
   }
   return blobDir;
@@ -332,6 +368,9 @@ export async function deletedRestoreDest(app: App, blobPath: string, meta: Delet
  *  back. `deletedAt` is passed in (callers stamp it — keeps this pure-ish). */
 export async function deleteEncryptSubtree(
   app: App, folder: string, rootId: StashpadId, dek: Uint8Array, deletedAt: string, hideTitle = false, keyId?: string,
+  /** 0.137.0: where the blob lands. Defaults to the legacy vault-level
+   *  `_deleted/`; per-folder trash passes `<folder>/trash`. */
+  destDir: string = DELETED_DIR,
 ): Promise<{ blobPath: string; noteCount: number; rootId: StashpadId; originalFolder: string; title: string; unpurged: string[] }> {
   const sub = await collectSubtree(app, folder, rootId);
   if (!sub) throw new Error("Couldn't find that note to delete.");
@@ -341,6 +380,9 @@ export async function deleteEncryptSubtree(
   const mtimes = new Map<string, number>();
   for (const n of allNodes) {
     try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline */ }
+    for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
+      try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
+    }
   }
 
   const zip = await buildStashZip(app, {
@@ -354,13 +396,18 @@ export async function deleteEncryptSubtree(
   if (back.length !== zip.length) throw new Error("Encryption self-check failed (size).");
   for (let i = 0; i < zip.length; i++) if (back[i] !== zip[i]) throw new Error("Encryption self-check failed (content).");
 
-  if (!(await app.vault.adapter.exists(DELETED_DIR))) await app.vault.adapter.mkdir(DELETED_DIR);
+  // 0.137.0: dest may be nested (X/trash) — mkdir intermediates.
+  {
+    const parts = destDir.replace(/\/+$/, "").split("/").filter(Boolean);
+    let cur = "";
+    for (const p of parts) { cur = cur ? `${cur}/${p}` : p; try { if (!(await app.vault.adapter.exists(cur))) await app.vault.adapter.mkdir(cur); } catch { /* race */ } }
+  }
   const cleanedFolder = folder.replace(/\/+$/, "");
   const folderSlug = cleanedFolder.split("/").pop() || "vault";
   // Readable name groups by folder; opaque (rootId) when hiding titles.
   const base = hideTitle ? safeBlobBase(rootId) : safeBlobBase(`${folderSlug} ${titleFromFile(rootNote.file)}`);
-  let blobPath = `${DELETED_DIR}/${base}.${STASHENC_EXT}`;
-  for (let n = 1; await app.vault.adapter.exists(blobPath); n++) blobPath = `${DELETED_DIR}/${base} (${n}).${STASHENC_EXT}`;
+  let blobPath = `${destDir}/${base}.${STASHENC_EXT}`;
+  for (let n = 1; await app.vault.adapter.exists(blobPath); n++) blobPath = `${destDir}/${base} (${n}).${STASHENC_EXT}`;
   await writeBlobVerified(app, blobPath, blob);
 
   const all = allNodes;
@@ -376,7 +423,15 @@ export async function deleteEncryptSubtree(
     ...(keyId ? { keyId } : {}),
   };
   try { await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta)); }
-  catch (e) { console.warn("[Stashpad] couldn't write deleted sidecar", e); }
+  catch (e) {
+    // The sidecar carries the restore metadata (origin folder + parent). Without
+    // it a _deleted/ blob is UNRESTORABLE from the UI (deletedRestoreDest hard-
+    // throws). Purging here would strand the content. Roll back the blob and
+    // fail the op — the note stays intact as plaintext, nothing lost. (0.140.8)
+    console.warn("[Stashpad] couldn't write deleted sidecar — aborting delete, keeping plaintext", e);
+    try { await app.vault.adapter.remove(blobPath); } catch { /* leave orphan blob; plaintext is safe */ }
+    throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
+  }
 
   const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes);
   return { blobPath, noteCount: all.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
@@ -564,10 +619,12 @@ export async function rewrapDeletedSidecar(app: App, blobPath: string, oldDek: U
   await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta));
 }
 
-/** Trash blob paths in `_deleted/` whose sidecar `keyId` matches `keyId`. */
-export async function deletedBlobsForKeyId(app: App, keyId: string): Promise<string[]> {
+/** Trash blob paths (legacy `_deleted/` + per-folder trash dirs) whose sidecar
+ *  `keyId` matches. Rotation callers MUST pass their trash dirs (0.137.0) or
+ *  per-folder trash blobs would silently keep the retired key. */
+export async function deletedBlobsForKeyId(app: App, keyId: string, extraDirs: string[] = []): Promise<string[]> {
   const out: string[] = [];
-  for (const b of await listDeletedBlobs(app)) {
+  for (const b of await listDeletedBlobs(app, extraDirs)) {
     const m = await readDeletedMeta(app, b);
     if (m?.keyId === keyId) out.push(b);
   }
@@ -708,11 +765,21 @@ export async function listRawFolderBlobs(app: App): Promise<{ folder: string; bl
   return out;
 }
 
-/** All encrypted-deleted blob paths in `_deleted/`. */
-export async function listDeletedBlobs(app: App): Promise<string[]> {
-  if (!(await app.vault.adapter.exists(DELETED_DIR))) return [];
-  try {
-    const listing = await app.vault.adapter.list(DELETED_DIR);
-    return listing.files.filter((f) => f.endsWith(`.${STASHENC_EXT}`));
-  } catch { return []; }
+/** 0.137.0: a Stashpad folder's own trash subfolder (per-folder trash). */
+export function trashSubfolderOf(folder: string): string {
+  return `${(folder || "").replace(/\/+$/, "")}/trash`;
+}
+
+/** All encrypted-deleted blob paths: the legacy vault-level `_deleted/` UNION
+ *  (0.137.0) every per-folder `trash/` subfolder passed in `extraDirs`. */
+export async function listDeletedBlobs(app: App, extraDirs: string[] = []): Promise<string[]> {
+  const out: string[] = [];
+  for (const dir of [DELETED_DIR, ...extraDirs]) {
+    try {
+      if (!(await app.vault.adapter.exists(dir))) continue;
+      const listing = await app.vault.adapter.list(dir);
+      out.push(...listing.files.filter((f) => f.endsWith(`.${STASHENC_EXT}`)));
+    } catch { /* skip unreadable dir */ }
+  }
+  return out;
 }

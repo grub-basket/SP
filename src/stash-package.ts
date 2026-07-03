@@ -1,7 +1,7 @@
 import { App, TFile, parseYaml, stringifyYaml } from "obsidian";
 import { bytesToStr, unzipFiles, zipFiles, type ZipEntry } from "./zip";
 import { newId } from "./id-service";
-import { ROOT_ID, attachmentLinkPath, toAttachmentLink, type StashpadId } from "./types";
+import { ROOT_ID, RESERVED_FRONTMATTER, attachmentLinkPath, toAttachmentLink, type StashpadId } from "./types";
 
 export const STASH_EXT = "stash";
 export const SCHEMA_VERSION = 1;
@@ -121,7 +121,7 @@ export async function importStashZip(
   buf: ArrayBuffer | Uint8Array,
   destFolder: string,
   existingIds: Set<StashpadId>,
-  opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null } = {},
+  opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null; stripReserved?: boolean } = {},
 ): Promise<ImportSummary> {
   const zip = await unzipFiles(buf);
   const manifestBytes = zip["manifest.json"];
@@ -144,8 +144,13 @@ export async function importStashZip(
     // Security: flatten to a safe single-segment name (zip-slip defense).
     // Fall back to the note id (or a generated name) if the entry name is
     // empty/traversal-only; a later collision check still de-dupes.
+    // Defense-in-depth: run the id fallback through safeZipEntryName too, so a
+    // future change to the note-entry filter can't let an attacker-controlled
+    // YAML `id` (e.g. "../../evil") escape the destination. Today the fallback
+    // is unreachable (note entries always end in .md), but don't rely on that.
     const safeName = safeZipEntryName(name.slice("notes/".length))
-      || `${(fm.id as string) || "imported-" + newId(4)}.md`;
+      || safeZipEntryName(`${(fm.id as string) || "imported-" + newId(4)}.md`)
+      || `imported-${newId(4)}.md`;
     parsed.push({ originalName: safeName, fm, body });
   }
 
@@ -248,8 +253,28 @@ export async function importStashZip(
     // or a reused existing file when deduping).
     const rewrittenBody = rewriteImportedAttachmentLinks(p.body, attRoute, attachmentsFolder);
 
+    // For UNTRUSTED imports (external `.stash` bundles) strip reserved
+    // frontmatter the same way the markdown drop-import does, so a crafted
+    // bundle can't inject pin/due/assignee/position/parentLink state or forge
+    // structural fields. Authorship (who wrote it) and the original timestamps
+    // are retained; attachments are kept for the link-remap below. Trusted
+    // callers (unlock/restore, internal cut-paste) omit stripReserved so their
+    // own notes keep every field intact. (0.140.6 review — documented invariant.)
+    let srcFm: Record<string, any> = p.fm;
+    if (opts.stripReserved) {
+      const filtered: Record<string, any> = {};
+      for (const [k, v] of Object.entries(p.fm)) {
+        if (!RESERVED_FRONTMATTER.includes(k)) filtered[k] = v;
+      }
+      if (p.fm.author !== undefined) filtered.author = p.fm.author;
+      if (p.fm.contributors !== undefined) filtered.contributors = p.fm.contributors;
+      if (p.fm.created !== undefined) filtered.created = p.fm.created;
+      if (p.fm.modified !== undefined) filtered.modified = p.fm.modified;
+      if (Array.isArray(p.fm.attachments)) filtered.attachments = p.fm.attachments;
+      srcFm = filtered;
+    }
     const newFm: Record<string, any> = {
-      ...p.fm,
+      ...srcFm,
       id: newIdVal,
       parent: newParent,
       import_date: importDate,

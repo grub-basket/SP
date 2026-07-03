@@ -113,6 +113,18 @@ export class SortStore {
     const map = this.cache.get(folder) ?? {};
     const path = `${folder}/${SORT_FILE}`;
     const adapter = this.app.vault.adapter;
+    // 0.140.3 (review): merge on-disk parents we didn't touch this session, so a
+    // mutation before load() resolves can't clobber other parents' sort modes.
+    try {
+      if (await adapter.exists(path)) {
+        const parsed = JSON.parse(await adapter.read(path));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (!(k in map) && typeof v === "string" && VALID_MODES.has(v as SortMode)) map[k] = v as SortMode;
+          }
+        }
+      }
+    } catch { /* unreadable / absent — write what we have */ }
     try {
       if (Object.keys(map).length === 0) {
         // Skip the exists() probe — remove() throws if it's missing, which

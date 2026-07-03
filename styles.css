@@ -2924,7 +2924,11 @@ body.is-mobile .stashpad-jd-actions .setting-item-control {
      inputs and squeezing the description. */
   flex-shrink: 0;
   max-width: 100%;
-  justify-content: flex-start;
+  /* 0.134.0: right-align controls, matching Obsidian's own setting rows (they
+     were flex-start, which left every section control — the per-folder
+     encryption panel especially — drifting toward the middle while the plain
+     rows above sat at the right edge; the mix read as "randomly positioned"). */
+  justify-content: flex-end;
 }
 /* 0.121.14: Obsidian 1.13's MOBILE settings use a 20px horizontal gutter
    (measured: .setting-item padding-left = 20px). Several stashpad insets were
@@ -5408,8 +5412,98 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
   background: rgba(var(--color-red-rgb, 224, 49, 49), 0.12);
   border-left: 3px solid var(--color-red, #e03131);
   /* 0.121.5: a touch more vertical padding + more bottom breathing room so the
-     advice banner doesn't feel cramped (L/R stays at the section's 14px inset). */
+     advice banner doesn't feel cramped. */
   padding: 11px 12px;
   border-radius: 4px;
-  margin: 4px 0 18px;
+  /* 0.134.3: now a single merged multi-paragraph callout at the top of the
+     Vault Encryption section (was three separate warnings) — inset 14px to
+     line up with the section's setting rows. */
+  margin: 4px 14px 18px;
+  font-size: 13px;
+  line-height: 1.5;
 }
+.stashpad-enc-warning p { margin: 0; }
+.stashpad-enc-warning p + p { margin-top: 8px; }
+/* 0.137.4: collapsible "how encryption works" concepts block — one toggle-free
+   reference so the individual setting rows can stay one-liners. Collapsed by
+   default (details), neutral (not a warning). */
+.stashpad-enc-info {
+  margin: 0 14px 14px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.stashpad-enc-info > summary {
+  cursor: pointer;
+  padding: 9px 12px;
+  font-weight: 600;
+  color: var(--text-normal);
+  list-style-position: inside;
+}
+.stashpad-enc-info[open] > summary { border-bottom: 1px solid var(--background-modifier-border); }
+.stashpad-enc-info-item { margin: 0; padding: 9px 12px; color: var(--text-muted); }
+.stashpad-enc-info-item + .stashpad-enc-info-item { border-top: 1px solid var(--background-modifier-border); }
+.stashpad-enc-info-item strong { color: var(--text-normal); }
+/* 0.134.3: Obsidian's mod-warning buttons are solid bright red with white text —
+   glaring, and the white text reads poorly on it. Within Stashpad's settings
+   sections (Remove encryption, Rotate key, Turn off shared password, …) use a
+   quieter danger style: red tint + red text + red border, matching the
+   .stashpad-enc-warning callout language. Hover deepens the tint. */
+.stashpad-settings-section button.mod-warning {
+  background: rgba(var(--color-red-rgb, 224, 49, 49), 0.14);
+  color: var(--color-red, #e03131);
+  border: 1px solid rgba(var(--color-red-rgb, 224, 49, 49), 0.45);
+  text-shadow: none;
+}
+.stashpad-settings-section button.mod-warning:hover {
+  background: rgba(var(--color-red-rgb, 224, 49, 49), 0.25);
+  color: var(--color-red, #e03131);
+}
+/* 0.136.0: loading state for slow-running buttons (Remove encryption's state
+   check on slow drives). Dims the button and sweeps a loading bar across it;
+   clicks are swallowed in JS while the class is on. */
+button.stashpad-btn-loading {
+  position: relative;
+  opacity: 0.55;
+  pointer-events: none;
+  overflow: hidden;
+}
+button.stashpad-btn-loading::after {
+  content: "";
+  position: absolute;
+  left: 0; bottom: 0;
+  height: 2px; width: 40%;
+  background: currentColor;
+  animation: stashpad-btn-loading-sweep 1.1s ease-in-out infinite;
+}
+@keyframes stashpad-btn-loading-sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
+/* 0.138.0: re-encrypt sweep — review modal rows + the watch view's Removed
+   section. Reuses the trash row classes for the view itself. */
+.stashpad-reenc-list { max-height: 50vh; overflow-y: auto; margin: 8px 0 12px; }
+.stashpad-reenc-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 8px 6px; border-radius: 6px; cursor: pointer;
+}
+.stashpad-reenc-row:hover { background: var(--background-modifier-hover); }
+.stashpad-reenc-row input[type="checkbox"] { margin-top: 3px; }
+.stashpad-reenc-label { font-weight: 500; }
+.stashpad-reenc-detail { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-watch-removed { margin-top: 16px; }
+.stashpad-watch-removed > summary {
+  cursor: pointer; font-size: var(--font-ui-smaller); color: var(--text-muted);
+  padding: 4px 0;
+}
+/* 0.139.0: per-note peek override input in the "Previously encrypted" view. */
+.stashpad-watch-peek { width: 56px; text-align: center; }
+/* 0.140.0: recurring/reminder fields in the due-date picker. */
+.stashpad-due-recur { margin-top: 10px; border-top: 1px solid var(--background-modifier-border); padding-top: 8px; }
+.stashpad-due-recur > summary { cursor: pointer; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-due-recur-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+.stashpad-due-recur-row label { flex: 0 0 130px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-due-recur-row input { flex: 1; }

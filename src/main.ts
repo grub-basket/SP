@@ -1,9 +1,10 @@
 import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon, debounce } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
-import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, type PinnedNoteRef, type StashpadId } from "./types";
+import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId } from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
 import { StashpadTrashView, openTrashView } from "./trash-view";
+import { ReEncryptScheduler } from "./reencrypt-scheduler";
 import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
 import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE } from "./types";
@@ -11,8 +12,8 @@ import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelI
 import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, writeRotatedBlob, commitRotatedBlob, cleanupRotTemps, listRotTemps, deletedBlobsForKeyId, rewrapDeletedSidecar, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal } from "./modals";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, backfillTrashEncrypt, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, writeRotatedBlob, commitRotatedBlob, cleanupRotTemps, listRotTemps, deletedBlobsForKeyId, rewrapDeletedSidecar, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs } from "./encryption-ops";
+import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
@@ -26,6 +27,7 @@ import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { ROOT_ID, parseAssignees } from "./types";
+import { parseRecurrence, nextDueOnComplete, parseDuration } from "./recurrence";
 import { OrderStore } from "./order-store";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
@@ -45,6 +47,7 @@ interface FileSnapshot { path: string; binary: boolean; text?: string; data?: Ar
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
+  private reEncryptScheduler: ReEncryptScheduler | null = null;
   /** 0.108.2: in-memory debug trace ring buffer. Populated by trace() only
    *  when settings.debugTrace is on; copied out from the Diagnostics tab.
    *  Purely local — no network, no file writes. Capped so a long session
@@ -171,6 +174,9 @@ export default class StashpadPlugin extends Plugin {
     // Cancel pending archive-sweep timers — firing after unload would run
     // lockNoteSubtree against disposed services (key just wiped).
     try { for (const p of this.archivePending.values()) window.clearTimeout(p.timer); this.archivePending.clear(); } catch { /* best-effort */ }
+    // 0.140.1: stop any in-flight peek countdown — a raw setInterval firing
+    // post-unload would write stale settings over the reloaded instance.
+    try { this.reEncryptScheduler?.dispose(); } catch { /* best-effort */ }
     // 0.83.2: flush any pending render-cache writes (the store's save is
     // debounced, so a recent change could still be in the buffer).
     try { await this._renderCacheStore?.save(); } catch { /* best-effort */ }
@@ -457,7 +463,10 @@ export default class StashpadPlugin extends Plugin {
       // field isn't a Stashpad note.
       if (!fm || !("parent" in fm)) continue;
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-      if (dir && !this.pathHasExcludedSegment(dir)) folders.add(dir);
+      // 0.136.0: reserved subfolders (archive/, trash/, _archive/, …) are never
+      // Stashpad folders of their own — their notes surface via the aggregated
+      // views instead of the folder pickers.
+      if (dir && !this.pathHasExcludedSegment(dir) && !isInReservedSubfolder(dir)) folders.add(dir);
     }
     const sorted = [...folders].sort();
     this.knownStashpadFolders = new Set(sorted);
@@ -487,6 +496,38 @@ export default class StashpadPlugin extends Plugin {
 
   /** Drop a folder (and anything nested under it) from the folder-panel
    *  placement lists. Persists only if something changed. */
+  /** 0.140.3 (review): when a folder is RENAMED, carry every path-keyed setting
+   *  (placement, archive, per-folder encryption/view prefs) from the old path to
+   *  the new — for the folder AND its descendants — else pins/hides/archive
+   *  semantics silently orphan. Mirrors prunePlacementFor but rewrites. */
+  async remapFolderPathInSettings(oldPath: string, newPath: string): Promise<void> {
+    const from = oldPath.replace(/\/+$/, ""), to = newPath.replace(/\/+$/, "");
+    if (!from || !to || from === to) return;
+    const s = this.settings;
+    const remapOne = (p: string): string =>
+      p === from ? to : (p.startsWith(from + "/") ? to + p.slice(from.length) : p);
+    const remapArr = (arr: string[] | undefined): string[] | undefined =>
+      arr ? arr.map(remapOne) : arr;
+    const remapRec = <T,>(rec: Record<string, T> | undefined): Record<string, T> | undefined => {
+      if (!rec) return rec;
+      const out: Record<string, T> = {};
+      for (const [k, v] of Object.entries(rec)) out[remapOne(k)] = v;
+      return out;
+    };
+    s.folderPanelPinned = remapArr(s.folderPanelPinned) ?? s.folderPanelPinned;
+    s.folderPanelDownranked = remapArr(s.folderPanelDownranked) ?? s.folderPanelDownranked;
+    s.folderPanelHidden = remapArr(s.folderPanelHidden) ?? s.folderPanelHidden;
+    s.archiveFolders = remapArr(s.archiveFolders) ?? s.archiveFolders;
+    s.searchIncludedFolders = remapArr(s.searchIncludedFolders) ?? s.searchIncludedFolders;
+    s.searchExcludedFolders = remapArr(s.searchExcludedFolders) ?? s.searchExcludedFolders;
+    if (s.defaultArchiveFolder) s.defaultArchiveFolder = remapOne(s.defaultArchiveFolder);
+    if ((s.folder || "").replace(/\/+$/, "") === from || (s.folder || "").startsWith(from + "/")) s.folder = remapOne((s.folder || "").replace(/\/+$/, ""));
+    s.folderEncPrefs = remapRec(s.folderEncPrefs) ?? s.folderEncPrefs;
+    s.viewModes = remapRec(s.viewModes) ?? s.viewModes;
+    if (s.encryptionFilter) s.encryptionFilter = remapRec(s.encryptionFilter);
+    await this.saveSettings();
+  }
+
   private async prunePlacementFor(cleaned: string): Promise<void> {
     const s = this.settings;
     const prune = (arr: string[] | undefined): string[] =>
@@ -712,7 +753,6 @@ export default class StashpadPlugin extends Plugin {
       // satisfies the v2 identity fields (they read as null until set up).
       () => ({ ...defaultEncryptionConfig(), ...(this.settings.encryption ?? {}) }),
       async (cfg) => { this.settings.encryption = cfg; await this.saveSettings(); },
-      () => this.settings.encryptionIdleLockMinutes ?? 0,
     );
     // Load the synced keyfile into the service's cache FIRST (isConfigured /
     // accessState / tryAutoUnlock all read it), then auto-unlock if a password is
@@ -722,6 +762,9 @@ export default class StashpadPlugin extends Plugin {
     // adapter (not the file index), but deferring keeps it off the onload hot path
     // and consistent with the registry reconcile below.
     this.app.workspace.onLayoutReady(() => { void this.resumeRotations(); });
+    // 0.139.0: peek auto-re-encrypt scheduler (opt-in; no-ops until a delay is set).
+    this.reEncryptScheduler = new ReEncryptScheduler(this);
+    this.reEncryptScheduler.start();
     // Reconcile the locked-subtree registry from on-disk `.stashmeta` sidecars
     // (recovers placeholder placement after a settings desync or cross-device
     // sync). Deferred to onLayoutReady (below) so it runs AFTER the vault has
@@ -782,6 +825,23 @@ export default class StashpadPlugin extends Plugin {
       // Vault is fully indexed now — safe to reconcile locked placeholders
       // (drop entries whose blob is truly gone, add cross-device blobs).
       void this.reconcileLockedRegistry();
+      // 0.136.0/0.137.0: one-time migrations to per-folder archive + trash
+      // subfolders, then (B5) prune any zombie legacy entries.
+      window.setTimeout(async () => {
+        try { await this.migrateArchiveFoldersToSubfolders(); } catch (e) { console.error("[Stashpad] archive migration failed", e); }
+        try { await this.migrateDeletedToTrashSubfolders(); } catch (e) { console.error("[Stashpad] trash migration failed", e); }
+        void this.pruneZombieArchiveEntries();
+      }, 5000);
+      // 0.138.0: opt-in nudge — previously-encrypted notes still plaintext.
+      window.setTimeout(() => {
+        if (!this.settings.reEncryptNudge) return;
+        const k = this.reEncryptWatching().length;
+        if (k === 0) return;
+        const n = new Notice("", 0);
+        n.noticeEl.createSpan({ text: `\u{1F513} ${k} previously-encrypted note${k === 1 ? " is" : "s are"} still plaintext. ` });
+        const b = n.noticeEl.createEl("button", { text: "Review" });
+        b.onclick = () => { n.hide(); void openAggregateView(this, "watch"); };
+      }, 8000);
       // 0.99.19: fire reminders for tasks that came due while Obsidian was
       // closed (delay so the metadata cache is populated), then re-check on an
       // interval so tasks coming due while it's open also surface.
@@ -1085,17 +1145,9 @@ export default class StashpadPlugin extends Plugin {
       name: "Focus folder panel",
       callback: () => void this.focusFolderPanel(),
     });
-    // 0.97.2: forget the in-memory encryption key (re-prompt on next use). The
-    // explicit alternative to background auto-relock.
-    this.addCommand({
-      id: "stashpad-lock-encryption",
-      name: "Lock encryption (forget password)",
-      callback: () => {
-        if (!this.encryption.isConfigured()) { new Notice("Encryption isn't set up."); return; }
-        this.encryption.lock();
-        new Notice("Encryption locked.");
-      },
-    });
+    // (0.135.0: the "Lock encryption (forget password)" command is removed along
+    // with the settings "Lock now" buttons and the idle auto-lock — the session
+    // key now simply lives until Obsidian closes.)
 
     const call = (method: string) => {
       const v = getActiveView();
@@ -1155,7 +1207,7 @@ export default class StashpadPlugin extends Plugin {
     });
     this.addCommand({
       id: "stashpad-move-to-archive",
-      name: "Move selection to archive (encrypt)",
+      name: "Move selection to archive",
       callback: () => call("cmdMoveToArchive"),
     });
     this.addCommand({
@@ -1165,25 +1217,36 @@ export default class StashpadPlugin extends Plugin {
     });
     this.addCommand({
       id: "stashpad-restore-trash",
-      name: "Open encrypted trash (restore deleted)…",
+      name: "Open aggregated Trash view",
       callback: () => this.openEncryptedTrash(),
     });
     // Per-folder overhaul (Phase A): the on-the-fly aggregate tabs.
     this.addCommand({
       id: "stashpad-open-all-encrypted",
-      name: "Open “All encrypted” (every locked note, by folder)",
+      name: "Open aggregated Encrypted notes view",
       callback: () => void openAggregateView(this, "encrypted"),
     });
     this.addCommand({
       id: "stashpad-open-all-archived",
-      name: "Open “All archived” (every archive folder)",
+      name: "Open aggregated Archived view",
       callback: () => void openAggregateView(this, "archived"),
     });
     // 0.126.1: tasks as a full tab too (alongside the sidebar panel + review modal).
     this.addCommand({
       id: "stashpad-open-all-tasks",
-      name: "Open “All tasks” (every task across folders)",
+      name: "Open aggregated Tasks view",
       callback: () => void openAggregateView(this, "tasks"),
+    });
+    // 0.138.0: re-encrypt sweep — the review view + the one-modal batch command.
+    this.addCommand({
+      id: "stashpad-open-watchlist",
+      name: "Open aggregated Previously encrypted view",
+      callback: () => void openAggregateView(this, "watch"),
+    });
+    this.addCommand({
+      id: "stashpad-encrypt-applicable",
+      name: "Encrypt everything applicable (re-encrypt sweep)",
+      callback: () => void this.encryptEverythingApplicable(),
     });
     // v2 backfill: "Encrypt items sent to trash" only covers going-forward
     // deletes — this sweeps what's ALREADY sitting in plaintext in `.trash/`.
@@ -2064,6 +2127,11 @@ export default class StashpadPlugin extends Plugin {
             const f2 = this.app.vault.getAbstractFileByPath(targetPath) as TFile | null;
             if (f2) target = f2;
           } catch (e) {
+            // The rename never fired, so the reverse listener won't consume
+            // these guard entries — drop them here or they leak forever and
+            // later swallow a genuine user rename to/from one of these paths.
+            this.authorRenameInFlight.delete(file.path);
+            this.authorRenameInFlight.delete(targetPath);
             console.warn("[Stashpad] author file rename failed", e);
             continue;
           }
@@ -2113,7 +2181,12 @@ export default class StashpadPlugin extends Plugin {
    *  update settings.authorName. The forward sync runs after to
    *  propagate the change to author stubs in other Stashpad folders. */
   private async maybeAdoptAuthorRename(file: TFile, oldPath: string): Promise<void> {
-    if (this.authorRenameInFlight.delete(file.path) || this.authorRenameInFlight.delete(oldPath)) return;
+    // Delete BOTH guard entries (syncAuthorFilesToName adds the old AND the
+    // target path) — a short-circuiting `||` would consume only one and leak
+    // the other permanently. Non-short-circuiting so both always run.
+    const wasSelf = this.authorRenameInFlight.delete(file.path);
+    const wasOld = this.authorRenameInFlight.delete(oldPath);
+    if (wasSelf || wasOld) return;
     const parsed = this.parseAuthorFilePath(file.path);
     if (!parsed) return;
     const id = (this.settings.authorId ?? "").trim();
@@ -2308,7 +2381,7 @@ export default class StashpadPlugin extends Plugin {
           if (typeof id === "string") existingIds.add(id);
         }
       }
-      const summary = await importStashZip(this.app, buf, destFolder, existingIds);
+      const summary = await importStashZip(this.app, buf, destFolder, existingIds, { stripReserved: true });
       try {
         await this.newLog().append({
           type: "stash_import",
@@ -3055,10 +3128,11 @@ export default class StashpadPlugin extends Plugin {
         // tab on the same folder (e.g., main + tiny side by side).
         const openAnywayFiltered = openAnywayItems.filter((it) => matchesAll(it.label) || matchesAll("folder" in it ? it.folder : ""));
         filtered.push(...openAnywayFiltered);
-        // 0.98.37: encrypted-trash entry, pinned to the very bottom. Only when
-        // encryption is set up; matches on "trash"/"deleted"/"encrypted".
-        if (plugin.encryption?.isConfigured?.() && matchesAll("trash deleted encrypted")) {
-          filtered.push({ kind: "trash", label: "Open encrypted trash", icon: "trash-2" });
+        // Trash entry, pinned to the very bottom. Unified trash (plaintext +
+        // encrypted) — shown regardless of encryption setup. Matches on
+        // "trash"/"deleted"/"encrypted".
+        if (matchesAll("trash deleted encrypted")) {
+          filtered.push({ kind: "trash", label: "Open Trash", icon: "trash-2" });
         }
         return filtered;
       }
@@ -3392,11 +3466,18 @@ export default class StashpadPlugin extends Plugin {
    *  NOT dependent on `pendingEncBlobs`. The only location `getFiles()` misses is
    *  the `.trash/` DOT-folder; for any IRREVERSIBLE decision use
    *  `encryptionStateStrict()`, which adapter-confirms `_deleted/` + `.trash/`. */
+  /** 0.140.1: is a `.stashenc` blob in a TRASH store (recoverable), not live
+   *  locked content? Covers the legacy vault-level `_deleted/` AND every
+   *  per-folder `<folder>/trash/` (0.137.0). CRITICAL for Remove-encryption:
+   *  before this, per-folder trash blobs were misclassified as live-locked and
+   *  could be irreversibly purged / restored into the reserved dir. */
+  isTrashBlobPath(p: string): boolean {
+    const dir = p.replace(/\/[^/]*$/, "").replace(/\/+$/, "");
+    return dir === "_deleted" || dir.startsWith("_deleted/") || dir === "trash" || dir.endsWith("/trash");
+  }
+
   encryptionState(): { live: boolean; trash: boolean } {
-    const isTrash = (p: string): boolean => {
-      const dir = p.replace(/\/[^/]*$/, "");
-      return dir === "_deleted" || dir.startsWith("_deleted/");
-    };
+    const isTrash = (p: string): boolean => this.isTrashBlobPath(p);
     let live = false, trash = false;
     for (const f of this.app.vault.getFiles()) {
       if (f.extension !== "stashenc") continue;
@@ -3421,7 +3502,7 @@ export default class StashpadPlugin extends Plugin {
     const s = this.encryptionState();
     let trash = s.trash;
     if (!trash) {
-      try { trash = (await listDeletedBlobs(this.app)).length > 0; } catch { /* ignore */ }
+      try { trash = (await listDeletedBlobs(this.app, this.trashSubfolderDirs())).length > 0; } catch { /* ignore */ }
     }
     if (!trash) {
       try {
@@ -3430,6 +3511,114 @@ export default class StashpadPlugin extends Plugin {
       } catch { /* no .trash dir — fine */ }
     }
     return { live: s.live, trash };
+  }
+
+  // ---- 0.138.0: re-encrypt watchlist (smart sweep) ----
+  // A subtree that WAS encrypted and got unlocked to plaintext goes on the
+  // watchlist; locking it again (any path — manual, sweep, folder batch, which
+  // all funnel through lockNoteSubtree) takes it off. MUTATES settings only;
+  // callers are responsible for the saveSettings they already perform.
+
+  /** Upsert a watch entry (a fresh unlock reactivates a dismissed entry). */
+  watchReEncrypt(e: { folder: string; rootId: StashpadId; title: string; count: number; via: "unlock" | "restore" }): void {
+    const folder = e.folder.replace(/\/+$/, "");
+    const rest = (this.settings.reEncryptWatch ?? []).filter((w) => !(w.folder === folder && w.rootId === e.rootId));
+    this.settings.reEncryptWatch = [...rest, { folder, rootId: e.rootId, title: e.title, count: e.count, via: e.via, unlockedAt: new Date().toISOString() }];
+  }
+
+  /** Drop entries for subtrees that just got locked (or securely deleted). */
+  unwatchReEncrypt(folder: string, rootId: StashpadId): void {
+    const cleaned = folder.replace(/\/+$/, "");
+    const before = this.settings.reEncryptWatch ?? [];
+    const after = before.filter((w) => !(w.folder === cleaned && w.rootId === rootId));
+    if (after.length !== before.length) this.settings.reEncryptWatch = after;
+  }
+
+  /** Active (non-dismissed) watch entries. */
+  reEncryptWatching(): import("./settings").ReEncryptWatchEntry[] {
+    return (this.settings.reEncryptWatch ?? []).filter((w) => !w.removed);
+  }
+
+  /** 0.138.0: drop watch entries whose rootId is no longer a live PLAINTEXT
+   *  note in its folder — it was deleted, moved, or re-locked by some path that
+   *  didn't clear it. Keeps ghost rows out of the view + sweep. Returns true if
+   *  it changed anything (caller saves). Cheap: metadataCache id scan per entry. */
+  pruneReEncryptWatch(): boolean {
+    const entries = this.settings.reEncryptWatch ?? [];
+    if (entries.length === 0) return false;
+    const livePlainInFolder = (folder: string): Set<string> => {
+      const set = new Set<string>();
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== folder) continue;
+        const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+        if (typeof id === "string") set.add(id);
+      }
+      return set;
+    };
+    const byFolder = new Map<string, Set<string>>();
+    const kept = entries.filter((w) => {
+      const folder = w.folder.replace(/\/+$/, "");
+      if (!byFolder.has(folder)) byFolder.set(folder, livePlainInFolder(folder));
+      return byFolder.get(folder)!.has(w.rootId);
+    });
+    if (kept.length === entries.length) return false;
+    this.settings.reEncryptWatch = kept;
+    return true;
+  }
+
+  /** 0.138.0: the sweep — gather everything that SHOULD be encrypted but is
+   *  currently plaintext (watchlist entries ∪ prefs-derived candidates), show
+   *  ONE review modal (per-subtree rows, pre-ticked), and lock what's confirmed.
+   *  Nothing encrypts without this explicit confirmation. */
+  async encryptEverythingApplicable(): Promise<void> {
+    if (this.pruneReEncryptWatch()) await this.saveSettings(); // no ghosts in the sweep
+    type Cand = { label: string; detail: string; run: () => Promise<boolean> };
+    const cands: Cand[] = [];
+    // (a) watchlist: previously-encrypted subtrees now plaintext.
+    for (const w of this.reEncryptWatching()) {
+      cands.push({
+        label: w.title || "(untitled)",
+        detail: `${w.folder} — ${w.via === "restore" ? "restored from trash" : "unlocked"} (was encrypted)`,
+        run: async () => !!(await this.lockNoteSubtree(w.folder, w.rootId, null, { silent: true })),
+      });
+    }
+    // (b) folders set to encrypt their notes that still hold plaintext notes.
+    const lockedRoots = new Set((this.settings.lockedSubtrees ?? []).map((e) => e.rootId));
+    for (const [folder, p] of Object.entries(this.settings.folderEncPrefs ?? {})) {
+      if (!p?.encryptContent) continue;
+      const plain = this.app.vault.getMarkdownFiles().filter((f) => {
+        if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== folder) return false;
+        const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+        return typeof id === "string" && id !== ROOT_ID && !lockedRoots.has(id);
+      }).length;
+      if (plain > 0) cands.push({
+        label: `Everything in “${folder.split("/").pop() || folder}” (${plain} plaintext note${plain === 1 ? "" : "s"})`,
+        detail: `${folder} — the folder is set to encrypt its notes`,
+        run: async () => { await this.lockFolder(folder); return true; },
+      });
+    }
+    // (c) folders that encrypt their archive but have plain archived notes.
+    for (const [folder, p] of Object.entries(this.settings.folderEncPrefs ?? {})) {
+      if (!p?.archiveEncryptContent) continue;
+      const n = this.archivedPlainNotesIn(archiveSubfolderOf(folder)).length;
+      if (n > 0) cands.push({
+        label: `${n} archived note${n === 1 ? "" : "s"} in “${folder.split("/").pop() || folder}/archive”`,
+        detail: `${folder} — the folder encrypts its archive`,
+        run: async () => { await this.encryptExistingArchiveNotes(folder); return true; },
+      });
+    }
+    if (cands.length === 0) { new Notice("Nothing needs re-encrypting — everything applicable is already locked."); return; }
+    new ReEncryptReviewModal(this.app, cands.map(({ label, detail }) => ({ label, detail })), async (chosen) => {
+      let ok = 0, failed = 0;
+      const prog = chosen.length > 2 ? new Notice("", 0) : null;
+      for (let i = 0; i < chosen.length; i++) {
+        prog?.setMessage(`🔒 Re-encrypting ${i + 1}/${chosen.length}…`);
+        try { (await cands[chosen[i]].run()) ? ok++ : failed++; }
+        catch (e) { failed++; console.warn("[Stashpad] sweep item failed", cands[chosen[i]].label, e); }
+      }
+      prog?.hide();
+      this.notifications.show({ message: `Re-encrypt sweep: ${ok} done${failed ? `, ${failed} FAILED (see console)` : ""}, ${cands.length - chosen.length} skipped.`, kind: failed ? "warning" : "success", category: "system", folder: "" });
+    }).open();
   }
 
   async lockNoteSubtree(folder: string, rootId: StashpadId, prevSibling: StashpadId | null = null, opts: { silent?: boolean; blobFolder?: string } = {}): Promise<LockResult | null> {
@@ -3445,7 +3634,7 @@ export default class StashpadPlugin extends Plugin {
       // else its live-notes pref — falling back to the global hide-titles setting.
       const isArchiveLock = !!opts.blobFolder && opts.blobFolder.replace(/\/+$/, "") !== folder.replace(/\/+$/, "");
       const fp = (this.settings.folderEncPrefs ?? {})[keyFolder] ?? {};
-      const hideTitle = (isArchiveLock ? fp.archiveEncryptFilenames : fp.encryptFilenames) ?? this.settings.hideLockedTitles ?? false;
+      const hideTitle = (isArchiveLock ? fp.archiveEncryptFilenames : fp.encryptFilenames) ?? false; // 0.137.1: per-folder only
       const r = await lockSubtree(this.app, folder, rootId, dek, prevSibling, hideTitle, opts.blobFolder);
       this.pendingEncBlobs.add(r.blobPath); // fast-state index: cover the pre-vault-index window
       // Record a placeholder registry entry so the list shows a 🔒 stub where
@@ -3456,6 +3645,10 @@ export default class StashpadPlugin extends Plugin {
         ...(this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== r.blobPath),
         { folder: blobFolder, blob: r.blobPath, parentId: r.parentId, title: r.title, count: r.noteCount, created: r.created, rootId: r.rootId, prevSibling },
       ];
+      // 0.138.0: locked again → off the re-encrypt watchlist (source folder AND
+      // blob folder — archive locks register under the destination).
+      this.unwatchReEncrypt(folder, r.rootId);
+      this.unwatchReEncrypt(blobFolder, r.rootId);
       await this.saveSettings();
       if (r.unpurged.length > 0) {
         // The blob is good but readable plaintext is STILL on disk (delete
@@ -3504,6 +3697,12 @@ export default class StashpadPlugin extends Plugin {
       // Blob is removed via raw adapter (no vault 'delete' event) — prune the
       // fast-index pending entry directly so it can't falsely report "locked".
       this.pendingEncBlobs.delete(blobPath);
+      // 0.138.0: this subtree WAS encrypted and is now plaintext → watchlist.
+      // Grab its registry entry (rootId/title/count) before filtering it out.
+      const wasLocked = (this.settings.lockedSubtrees ?? []).find((e) => e.blob === blobPath);
+      if (wasLocked?.rootId) {
+        this.watchReEncrypt({ folder, rootId: wasLocked.rootId, title: wasLocked.title ?? "", count: wasLocked.count ?? r.notesWritten, via: "unlock" });
+      }
       this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== blobPath);
       await this.saveSettings();
       if (!opts.silent) this.notifications.show({ message: `Unlocked ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"}.`, kind: "success", category: "system", folder });
@@ -3586,11 +3785,13 @@ export default class StashpadPlugin extends Plugin {
    *  everything" safety valve. Each blob is independent + skip-on-error. */
   async unlockAllInVault(): Promise<number> {
     if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return 0; }
-    // Exclude the `_deleted/` trash store — those are DELETED notes, not locked
-    // ones; "unlocking" them would wrongly restore them into _deleted/. Use the
-    // trash-restore flow for those.
+    // Exclude ALL trash stores (`_deleted/` + per-folder `<folder>/trash/`) —
+    // those are DELETED notes, not locked ones; "unlocking" them would restore
+    // them INTO the reserved trash dir (invisible to every view). Use the
+    // trash-restore flow for those. 0.140.1: was `_deleted`-only — per-folder
+    // trash blobs leaked through and got restored into `<folder>/trash/`.
     const blobs = this.app.vault.getFiles()
-      .filter((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") !== "_deleted")
+      .filter((f) => f.extension === "stashenc" && !this.isTrashBlobPath(f.path))
       .map((f) => f.path);
     if (blobs.length === 0) { new Notice("No locked notes anywhere in the vault."); return 0; }
     const prog = blobs.length > 3 ? new Notice("", 0) : null;
@@ -3815,7 +4016,7 @@ export default class StashpadPlugin extends Plugin {
     // Per-folder trash keys: the folder's TRASH blobs (in _deleted/, identified by
     // the sidecar keyId) must rotate too, or they'd be orphaned under the old DEK.
     const ownerKeyId = this.encryption.folderKeyEntry(cleaned)?.keyId;
-    const trashBlobs = ownerKeyId ? await deletedBlobsForKeyId(this.app, ownerKeyId) : [];
+    const trashBlobs = ownerKeyId ? await deletedBlobsForKeyId(this.app, ownerKeyId, this.trashSubfolderDirs()) : [];
     const blobs = [...liveBlobs, ...trashBlobs];
     const newDek = crypto.getRandomValues(new Uint8Array(32));
     const rotId = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -3870,7 +4071,7 @@ export default class StashpadPlugin extends Plugin {
         // Trash blobs (in _deleted/) keyed to this folder — commit their .rot too
         // (byte copy; the keyfile already holds the new DEK). Hidden-origin sidecars
         // can't be re-wrapped here (the old DEK is gone) — a rare crash edge.
-        if (entry?.keyId) { for (const tb of await deletedBlobsForKeyId(this.app, entry.keyId)) { try { await commitRotatedBlob(this.app, tb); } catch (e) { console.warn("[Stashpad] resume trash-commit failed", tb, e); } } }
+        if (entry?.keyId) { for (const tb of await deletedBlobsForKeyId(this.app, entry.keyId, this.trashSubfolderDirs())) { try { await commitRotatedBlob(this.app, tb); } catch (e) { console.warn("[Stashpad] resume trash-commit failed", tb, e); } } }
         new Notice(`Finished an interrupted key rotation for “${folder.split("/").pop()}”.`, 0);
       } else {
         try { await cleanupRotTemps(this.app, folder); } catch { /* */ }
@@ -3897,10 +4098,16 @@ export default class StashpadPlugin extends Plugin {
       // the general hide-locked-titles setting is off. This folder's
       // trashEncryptFilenames pref takes precedence over the globals.
       const _trFp = (this.settings.folderEncPrefs ?? {})[folder.replace(/\/+$/, "")] ?? {};
-      const hideTitle = (_trFp.trashEncryptFilenames ?? false) || (this.settings.hideLockedTitles ?? false) || (this.settings.encryptTrashFilenames ?? false);
+      const hideTitle = (_trFp.trashEncryptFilenames ?? false) || (this.settings.encryptTrashFilenames ?? false); // 0.137.1: global hideLockedTitles removed
       const keyId = this.encryption.folderKeyEntry(folder)?.keyId; // undefined ⇒ vault-keyed
-      const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle, keyId);
+      // 0.137.0 (per-folder trash): the blob lands in THIS folder's own trash/
+      // subfolder instead of the vault-level _deleted/ (which stays readable
+      // for legacy blobs until they're restored or migrated).
+      const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle, keyId, trashSubfolderOf(folder));
       this.pendingEncBlobs.add(r.blobPath); // fast-state index
+      // 0.138.0: secure-deleted → no longer plaintext, so off the watchlist.
+      this.unwatchReEncrypt(folder, rootId);
+      await this.saveSettings();
       if (r.unpurged.length > 0) {
         new Notice(`⚠️ Sent to encrypted trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
       }
@@ -3959,6 +4166,12 @@ export default class StashpadPlugin extends Plugin {
       }
       const r = await restoreDeleted(this.app, blobPath, dek, existing);
       this.pendingEncBlobs.delete(blobPath);
+      // 0.138.0: restore-from-trash counts as an unlock (user decision) — the
+      // note WAS encrypted and is plaintext again. Sidecar carries the identity.
+      if (meta?.rootId) {
+        this.watchReEncrypt({ folder: r.restoredTo, rootId: meta.rootId, title: meta.title || "", count: meta.count ?? r.notesWritten, via: "restore" });
+        await this.saveSettings();
+      }
       if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo });
       return true;
     } catch (e) {
@@ -3987,7 +4200,10 @@ export default class StashpadPlugin extends Plugin {
    *  Delete locked content" for when the password is lost. Excludes `_deleted/`
    *  trash (that's handled separately). Caller MUST confirm. Returns the count. */
   async purgeAllLockedContent(): Promise<number> {
-    const isTrash = (p: string): boolean => { const d = p.replace(/\/[^/]*$/, ""); return d === "_deleted" || d.startsWith("_deleted/"); };
+    // 0.140.1: was `_deleted`-only — per-folder `<folder>/trash/` blobs slipped
+    // through and got IRREVERSIBLY PURGED even though the trash has its own
+    // decrypt-vs-discard step. Use the trash-aware predicate.
+    const isTrash = (p: string): boolean => this.isTrashBlobPath(p);
     const blobs = new Set<string>();
     for (const f of this.app.vault.getFiles()) if (f.extension === "stashenc" && !isTrash(f.path)) blobs.add(f.path);
     for (const p of this.pendingEncBlobs) if (!isTrash(p)) blobs.add(p);
@@ -4072,7 +4288,15 @@ export default class StashpadPlugin extends Plugin {
    *  note keeps its id/parent, so the tree re-nests it under its parent if that
    *  parent is in the default folder; else it lands at the folder root. */
   async unarchiveNote(file: TFile): Promise<boolean> {
-    const dest = (this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
+    // 0.136.0: a note in `X/archive/...` un-archives back to X (its own folder),
+    // not the global default. Legacy dedicated-archive notes (no /archive
+    // segment) still fall back to the default folder — their origin is unknown.
+    const dir = (file.parent?.path ?? "").replace(/\/+$/, "");
+    const segs = dir.split("/");
+    const archIdx = segs.indexOf("archive");
+    const dest = archIdx > 0
+      ? segs.slice(0, archIdx).join("/")
+      : ((this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad");
     if ((file.parent?.path ?? "") === dest) { new Notice("Already in the default folder."); return false; }
     try {
       if (!(await this.app.vault.adapter.exists(dest))) { try { await this.app.vault.createFolder(dest); } catch { /* race */ } }
@@ -4087,9 +4311,15 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** Every per-folder trash/ subfolder (0.137.0) — the extra dirs the
+   *  encrypted-trash listing unions with the legacy _deleted/. */
+  trashSubfolderDirs(): string[] {
+    return this.discoverStashpadFolders().map((f) => trashSubfolderOf(f));
+  }
+
   /** List the encrypted-trash contents (blob path + sidecar metadata). */
   async listDeletedTrash(): Promise<Array<{ blob: string; meta: DeletedMeta | null }>> {
-    const blobs = await listDeletedBlobs(this.app);
+    const blobs = await listDeletedBlobs(this.app, this.trashSubfolderDirs());
     const out: Array<{ blob: string; meta: DeletedMeta | null }> = [];
     for (const b of blobs) out.push({ blob: b, meta: await readDeletedMeta(this.app, b) });
     return out;
@@ -4122,7 +4352,7 @@ export default class StashpadPlugin extends Plugin {
     const dek = this.encryption.getSessionKey();
     if (!dek) return false;
     try {
-      const hideTitle = (this.settings.hideLockedTitles ?? false) || (this.settings.encryptTrashFilenames ?? false);
+      const hideTitle = this.settings.encryptTrashFilenames ?? false; // 0.137.1: global hideLockedTitles removed
       const r = await backfillTrashEncrypt(this.app, dek, new Date().toISOString(), hideTitle);
       if (!r) { new Notice(`Obsidian's vault trash (${OBSIDIAN_TRASH_DIR}/) is empty — nothing to encrypt. (Files in the system/OS trash can't be reached.)`, 8000); return false; }
       if (r.unpurged.length > 0) {
@@ -4138,10 +4368,11 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  /** Open the recoverable encrypted-trash TAB. (The `_` arg keeps the old
+  /** Open the recoverable Trash TAB. Unified across all folders — lists both
+   *  plaintext (`.trash/`) and encrypted (`_deleted/`) deleted notes — so it no
+   *  longer requires encryption to be set up. (The `_` arg keeps the old
    *  per-folder call sites working; the tab groups by origin folder anyway.) */
   openEncryptedTrash(_scopeFolder?: string): void {
-    if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return; }
     void openTrashView(this);
   }
 
@@ -4160,13 +4391,224 @@ export default class StashpadPlugin extends Plugin {
 
   // --- 0.98.25 (Phase 4): archive folders — auto-encrypt notes moved in ---
 
+  /** 0.136.0 (per-folder archive): "is this an archive?" now means "is this a
+   *  folder's `archive/` subfolder (or inside one)?". The legacy dedicated
+   *  archive-folder model (archiveFolders[] ∪ folderEncPrefs[f].archive) is
+   *  still honored DURING the transition so un-migrated vaults keep their
+   *  search exclusion + icons until the one-time migration has run. */
   isArchiveFolder(folder: string): boolean {
     const cleaned = folder.replace(/\/+$/, "");
-    // Single source of truth: the legacy archiveFolders[] list UNION the per-folder
-    // pref (folderEncPrefs[f].archive). The settings toggle keeps both in sync, but
-    // unioning here means any future writer of either can't make this lie.
+    if (isArchiveSubfolderPath(cleaned)) return true;
     if ((this.settings.archiveFolders ?? []).includes(cleaned)) return true;
     return !!(this.settings.folderEncPrefs ?? {})[cleaned]?.archive;
+  }
+
+  /** 0.134.4 (B1): the ONE resolver for "does archiving into `folder` encrypt?".
+   *  Both the move-in sweep and the Move-to-archive command must use this —
+   *  they previously had opposite defaults (sweep `?? true`, command `?? false`),
+   *  so a drag encrypted while the command moved plaintext. Default is PLAINTEXT;
+   *  encryption is opt-in per folder via "Encrypt archived notes". */
+  archiveEncryptFor(folder: string): boolean {
+    let cleaned = folder.replace(/\/+$/, "");
+    // 0.136.0: when handed an `X/archive` subfolder path (the move-in sweep
+    // does), the pref lives on the PARENT folder X.
+    if (cleaned.endsWith("/archive")) cleaned = cleaned.slice(0, -"/archive".length);
+    return (this.settings.folderEncPrefs ?? {})[cleaned]?.archiveEncryptContent ?? false;
+  }
+
+  /** 0.136.0: ONE-TIME migration to per-folder archive subfolders ("Option D"
+   *  phase 1, docs/archive-trash-subfolders-plan.md, migration option b).
+   *  Each legacy dedicated archive folder F becomes a normal folder again; its
+   *  plain notes move into F's OWN `archive/` subfolder. Locked `.stashenc`
+   *  blobs stay where they are (the lockedSubtrees registry paths must not
+   *  break; they remain visible in the aggregated views). Legacy folders keep
+   *  auto-encrypt semantics: archiveEncryptContent is stamped TRUE when unset
+   *  (they were created under the encrypt-on-arrival regime). Persistent
+   *  notice + a log entry per folder, then the legacy settings are cleared. */
+  /** True while the one-time archive migration is moving files — gates the
+   *  auto-encrypt sweep (its rename events must not look like new arrivals). */
+  private archiveMigrationInFlight = false;
+
+  async migrateArchiveFoldersToSubfolders(): Promise<void> {
+    if (this.settings.migratedArchiveToSubfolders) return;
+    this.archiveMigrationInFlight = true;
+    try {
+      await this.migrateArchiveFoldersToSubfoldersInner();
+    } finally {
+      // Keep the gate up through the sweep's 1800ms settle window — rename
+      // events fired by the last migration move are still queued when the
+      // inner function returns.
+      window.setTimeout(() => { this.archiveMigrationInFlight = false; }, 4000);
+    }
+  }
+
+  private async migrateArchiveFoldersToSubfoldersInner(): Promise<void> {
+    const legacy = new Set<string>((this.settings.archiveFolders ?? []).map((f) => f.replace(/\/+$/, "")));
+    for (const [f, p] of Object.entries(this.settings.folderEncPrefs ?? {})) if (p?.archive) legacy.add(f.replace(/\/+$/, ""));
+    const log = this.newLog();
+    const lines: string[] = [];
+    let totalFailed = 0;
+    // Recovery journal: every planned + completed move, persisted BEFORE the
+    // settings flip so a crash mid-migration leaves a trail to restore from.
+    const journal: Array<{ folder: string; from: string; to: string; ok: boolean }> = [];
+    const journalPath = `${this.pluginPrivatePath()}/archive-migration-journal.json`;
+    const writeJournal = async () => {
+      try { await this.app.vault.adapter.write(journalPath, JSON.stringify({ ts: new Date().toISOString(), moves: journal }, null, 1)); } catch { /* best-effort */ }
+    };
+    for (const folder of [...legacy].sort()) {
+      const tf = this.app.vault.getAbstractFileByPath(folder);
+      if (!(tf instanceof TFolder)) continue; // zombie entry — nothing to move
+      const dest = archiveSubfolderOf(folder);
+      try { if (!(await this.app.vault.adapter.exists(dest))) await this.app.vault.createFolder(dest); } catch { /* race */ }
+      let moved = 0, failed = 0;
+      // Direct .md children only: locked blobs + reserved subfolders stay put,
+      // and nested subfolders are their own Stashpad folders.
+      for (const child of [...tf.children]) {
+        if (!(child instanceof TFile) || child.extension !== "md") continue;
+        // Keep the folder's HOME note (id: root) — archiving it would destroy
+        // the folder's identity as a Stashpad folder (caught in live testing).
+        // Read the id from DISK: at layout-ready+5s the metadataCache can still
+        // be cold (big vault / network drive), and a cold cache would return
+        // undefined for the home note and let it be moved.
+        let fmId: unknown;
+        try { fmId = splitFrontmatter(await this.app.vault.read(child)).fm.id; }
+        catch { failed++; totalFailed++; continue; } // unreadable → leave in place
+        if (fmId === ROOT_ID) continue;
+        let to = `${dest}/${child.name}`;
+        const from = child.path;
+        try {
+          for (let n = 1; await this.app.vault.adapter.exists(to); n++) to = `${dest}/${child.basename}-${n}.md`;
+          journal.push({ folder, from, to, ok: false });
+          await this.app.fileManager.renameFile(child, to);
+          // Verify the move actually landed (the 0.79.21 import lesson: a
+          // silently-failed rename must never be counted as done).
+          if (!(this.app.vault.getAbstractFileByPath(to) instanceof TFile)) throw new Error("rename did not land");
+          journal[journal.length - 1].ok = true;
+          moved++;
+        } catch (e) { failed++; totalFailed++; console.warn("[Stashpad] archive migration move failed", from, e); }
+      }
+      await writeJournal();
+      // Do NOT stamp archiveEncryptContent — since 0.134.4 the effective
+      // default for these folders is already plaintext, and stamping TRUE made
+      // the migration's own moves trigger the auto-encrypt sweep, silently
+      // encrypting every previously-plaintext archived note (caught in live
+      // testing — a data-loss-grade surprise). Encryption stays opt-in.
+      // De-flag prefs.archive only when THIS folder migrated cleanly — a folder
+      // marked only via the pref must stay in the retry set otherwise.
+      if (failed === 0) {
+        const prefs = { ...(this.settings.folderEncPrefs ?? {}) };
+        const cur = { ...(prefs[folder] ?? {}) };
+        delete cur.archive;
+        prefs[folder] = cur;
+        this.settings.folderEncPrefs = prefs;
+      }
+      lines.push(`"${folder}": ${moved} note${moved === 1 ? "" : "s"} → ${dest}/${failed ? ` (${failed} failed — left in place)` : ""}`);
+      void log.append({ type: "archive_migration", id: "", payload: { folder, dest, moved, failed } as Record<string, unknown> });
+    }
+    // Only finalize when EVERY move landed. On any failure the legacy settings
+    // stay put and the marker stays false, so the next launch retries the
+    // leftovers (already-moved notes are gone from the root, so a retry is a
+    // no-op for them). No data is ever deleted either way — a failed move
+    // leaves the note exactly where it was.
+    if (totalFailed === 0) {
+      this.settings.archiveFolders = [];
+      this.settings.defaultArchiveFolder = undefined;
+      this.settings.migratedArchiveToSubfolders = true;
+      await this.saveSettings();
+    } else {
+      await this.saveSettings(); // persist any prefs.archive de-flags that DID complete
+      new Notice(`Stashpad archive update: ${totalFailed} note${totalFailed === 1 ? "" : "s"} couldn't be moved (see the developer console). Nothing was deleted — the migration will retry on the next launch. A recovery journal of every move is at ${this.pluginPrivatePath()}/archive-migration-journal.json.`, 0);
+    }
+    if (lines.length) {
+      new Notice(`Stashpad archive update: dedicated archive folders are now regular folders — archived notes moved into each folder's own "archive/" subfolder.\n\n${lines.join("\n")}\n\nFind everything in the aggregated Archived view. (This notice stays until dismissed.)`, 0);
+    }
+  }
+
+  /** 0.137.0: ONE-TIME migration of the vault-level encrypted trash into
+   *  per-folder `trash/` subfolders. Conservative by design: ONLY `deleted`
+   *  blobs whose sidecar names a plaintext origin folder that still exists
+   *  move to `<origin>/trash/`; everything else (rawtrash/rawfolder backfills,
+   *  hidden-origin sidecars, unreadable sidecars, missing folders) STAYS in
+   *  `_deleted/`, which remains fully listed/restorable forever. Copy →
+   *  byte-verify → remove, via the adapter (no vault events, so no sweep or
+   *  import interactions). Journal + retry like the archive migration. */
+  async migrateDeletedToTrashSubfolders(): Promise<void> {
+    if (this.settings.migratedTrashToSubfolders) return;
+    const a = this.app.vault.adapter;
+    const log = this.newLog();
+    let moved = 0, left = 0, failed = 0;
+    const journal: Array<{ from: string; to: string; ok: boolean }> = [];
+    const journalPath = `${this.pluginPrivatePath()}/trash-migration-journal.json`;
+    try {
+      const blobs = await listDeletedBlobs(this.app); // legacy _deleted/ only
+      for (const blob of blobs) {
+        const meta = await readDeletedMeta(this.app, blob);
+        const origin = (meta?.kind === "deleted" && meta.originalFolder) ? meta.originalFolder.replace(/\/+$/, "") : "";
+        if (!origin || !(this.app.vault.getAbstractFileByPath(origin) instanceof TFolder)) { left++; continue; }
+        const destDir = trashSubfolderOf(origin);
+        try {
+          if (!(await a.exists(destDir))) await a.mkdir(destDir);
+          const name = blob.split("/").pop()!;
+          let to = `${destDir}/${name}`;
+          for (let n = 1; await a.exists(to); n++) to = `${destDir}/${name.replace(/\.stashenc$/, "")} (${n}).stashenc`;
+          journal.push({ from: blob, to, ok: false });
+          // blob: copy → verify bytes → remove
+          const bytes = new Uint8Array(await a.readBinary(blob));
+          await a.writeBinary(to, bytes.slice().buffer as ArrayBuffer);
+          // 0.140.1: FULL byte-compare before removing the only copy — a
+          // same-length corruption (flaky network drive) passed the old
+          // length-only check → AEAD-unrestorable blob, permanent loss.
+          const back = new Uint8Array(await a.readBinary(to));
+          if (back.length !== bytes.length) throw new Error("copy verify failed (length)");
+          for (let i = 0; i < bytes.length; i++) if (back[i] !== bytes[i]) throw new Error("copy verify failed (content)");
+          // sidecar FIRST, and verify it too — a truncated sidecar loses keyId/
+          // originalFolderEnc → folder-keyed blob unrestorable. Copy+verify the
+          // sidecar and remove the blob LAST (crash → harmless duplicate, never
+          // a sidecar-less orphan in _deleted/).
+          const sc = blob.replace(/\.stashenc$/, ".stashmeta");
+          const scTo = to.replace(/\.stashenc$/, ".stashmeta");
+          try {
+            if (await a.exists(sc)) {
+              const scBody = await a.read(sc);
+              await a.write(scTo, scBody);
+              if ((await a.read(scTo)) !== scBody) throw new Error("sidecar verify failed");
+              await a.remove(sc);
+            }
+          } catch (e) { throw new Error(`sidecar copy failed: ${(e as Error).message}`); }
+          await a.remove(blob);
+          journal[journal.length - 1].ok = true;
+          moved++;
+        } catch (e) { failed++; console.warn("[Stashpad] trash migration move failed", blob, e); }
+      }
+      try { await a.write(journalPath, JSON.stringify({ ts: new Date().toISOString(), moves: journal }, null, 1)); } catch { /* best-effort */ }
+    } catch (e) { console.error("[Stashpad] trash migration failed", e); return; }
+    void log.append({ type: "archive_migration", id: "", payload: { what: "trash-subfolders", moved, left, failed } as Record<string, unknown> });
+    if (failed === 0) {
+      this.settings.migratedTrashToSubfolders = true;
+      await this.saveSettings();
+    }
+    if (moved > 0 || failed > 0) {
+      new Notice(`Stashpad trash update: ${moved} encrypted-trash item${moved === 1 ? "" : "s"} moved into per-folder "trash/" subfolders${left ? ` (${left} stayed in _deleted/ — unknown or missing origin)` : ""}${failed ? ` — ${failed} failed; will retry next launch` : ""}. Everything stays visible in the Trash view.`, 0);
+    }
+  }
+
+  /** 0.134.4 (B5): drop archiveFolders[] entries (and a defaultArchiveFolder)
+   *  pointing at folders that no longer exist. Folder deletion never cleaned
+   *  these up, so zombies accumulated. Conservative: folderEncPrefs entries are
+   *  left alone (inert when the folder is gone, and they may describe a folder
+   *  that exists on another synced device). */
+  async pruneZombieArchiveEntries(): Promise<void> {
+    const exists = (f: string) => this.app.vault.getAbstractFileByPath(f) instanceof TFolder;
+    const before = this.settings.archiveFolders ?? [];
+    const kept = before.filter((f) => exists(f.replace(/\/+$/, "")));
+    let dirty = kept.length !== before.length;
+    const def = (this.settings.defaultArchiveFolder ?? "").replace(/\/+$/, "");
+    if (def && !exists(def)) { this.settings.defaultArchiveFolder = undefined; dirty = true; }
+    if (dirty) {
+      this.settings.archiveFolders = kept;
+      await this.saveSettings();
+      console.info(`[Stashpad] pruned ${before.length - kept.length} stale archive-folder entr${before.length - kept.length === 1 ? "y" : "ies"}.`);
+    }
   }
 
   /** Ensure the OKF template note exists and remember its path (called when OKF
@@ -4327,7 +4769,9 @@ export default class StashpadPlugin extends Plugin {
   ): Promise<{ rootIds: StashpadId[]; noteCount: number; undo: () => Promise<void>; redo: () => Promise<void> } | null> {
     const cleanDest = destFolder.replace(/\/+$/, "");
     if (this.isArchiveFolder(cleanDest)) {
-      new Notice(`"${cleanDest.split("/").pop()}" auto-encrypts notes moved in, so cross-folder paste is disabled there. Use the "Move to archive" command — it checks the encryption key first.`);
+      // 0.134.4 (B4): archives default to plaintext now — the block stays (paste
+      // bypasses the archive flow entirely) but the copy shouldn't claim encryption.
+      new Notice(`"${cleanDest.split("/").pop()}" is an archive folder, so cross-folder paste is disabled there. Use the "Move selection to archive" command instead — it runs the proper archive flow (and encrypts, if that folder encrypts its archive).`);
       return null;
     }
     // Gather source subtree(s) from DISK (authoritative; the source folder's view
@@ -4566,6 +5010,19 @@ export default class StashpadPlugin extends Plugin {
     }, 1800);
   }
 
+  /** 0.137.2 (retro-apply): when "Encrypt archived notes" turns ON for a
+   *  folder, offer to lock the plain notes ALREADY sitting in its archive/
+   *  subfolder — the pref used to apply only to future arrivals. Reuses the
+   *  proven arrival sweep (root-resolution, key selection, loud-on-locked). */
+  async encryptExistingArchiveNotes(folder: string): Promise<number> {
+    const sub = archiveSubfolderOf(folder.replace(/\/+$/, ""));
+    const plain = this.archivedPlainNotesIn(sub).map((f) => f.path);
+    if (plain.length === 0) return 0;
+    await this.archiveSweep(sub, plain);
+    // Report how many got locked (the sweep may be cancelled at the prompt).
+    return plain.length - this.archivedPlainNotesIn(sub).length;
+  }
+
   /** Lock the notes that just arrived in an archive folder. Among the arrivals,
    *  only subtree ROOTS are locked (a child whose parent also arrived rides
    *  inside the parent's bundle). Skips the Home note, already-locked roots, and
@@ -4573,12 +5030,16 @@ export default class StashpadPlugin extends Plugin {
    *  locked and the user declines to unlock — silent failure here would mean
    *  plaintext sitting in a folder the user believes is encrypted. */
   private async archiveSweep(folder: string, arrivedPaths: string[]): Promise<void> {
+    // 0.136.0: the one-time subfolder migration re-shelves notes; its moves
+    // must NEVER count as "new arrivals to encrypt" (caught in live testing:
+    // the sweep mass-encrypted every migrated note).
+    if (this.archiveMigrationInFlight) return;
     if (!this.isArchiveFolder(folder)) return; // unmarked while settling
     const cleaned = folder.replace(/\/+$/, "");
-    // Per-folder overhaul: an archive folder can be PLAINTEXT (de-indexed but not
-    // encrypted) when its archiveEncryptContent pref is off. Default ON to preserve
-    // existing auto-encrypt-on-move-in behavior for archives marked before this.
-    if (!((this.settings.folderEncPrefs ?? {})[cleaned]?.archiveEncryptContent ?? true)) return;
+    // 0.134.4 (B1): shared resolver — plaintext default, same as the
+    // Move-to-archive command (they used to disagree: drag encrypted, command
+    // didn't). Encryption is opt-in via "Encrypt archived notes" per folder.
+    if (!this.archiveEncryptFor(cleaned)) return;
     type Arr = { id: StashpadId; parent: StashpadId | null };
     const arrived: Arr[] = [];
     for (const p of arrivedPaths) {
@@ -4935,32 +5396,87 @@ export default class StashpadPlugin extends Plugin {
    *  same task+due never re-fires — a changed due date re-keys and reminds again),
    *  shows a PERSISTENT notification under the "reminder" category (so it lands in
    *  the history log + respects mute), then records it. */
+  /** 0.140.0: resolve an "un-failable" task that's past due by its grace.
+   *  Repeating → roll due forward (stays active); one-off → mark complete. */
+  private async autoResolveDueTask(f: TFile, _dueMs: number, now: number): Promise<void> {
+    try {
+      await this.app.fileManager.processFrontMatter(f, (fm) => {
+        // 0.140.1: re-read `due` INSIDE the callback — the metadataCache dueMs
+        // the caller passed can be stale (a concurrent sweep / another device
+        // may have just rolled it), which would re-roll from the wrong anchor
+        // and skip/duplicate a cycle.
+        const curDue = fm.due != null ? Date.parse(String(fm.due)) : NaN;
+        if (Number.isFinite(curDue) && curDue > now) return; // already rolled forward — done
+        const rec = parseRecurrence(fm.repeat as string | undefined);
+        if (rec) { fm.due = new Date(nextDueOnComplete(rec, Number.isFinite(curDue) ? curDue : null, now)).toISOString(); delete fm.completed; }
+        else fm.completed = true;
+      });
+    } catch (e) { console.warn("[Stashpad] auto-resolve failed", f.path, e); }
+  }
+
   async checkDueReminders(): Promise<void> {
     const now = Date.now();
     const notified = new Set(this.settings.notifiedDueKeys ?? []);
     const myId = (this.settings.authorId ?? "").trim();
     const due: Array<{ id: string; folder: string; file: TFile; dueMs: number; key: string }> = [];
+    // 0.140.0: persistent-reminder re-fire bookkeeping (id → last-notified ms).
+    const persistLog = { ...(this.settings.persistReminderLog ?? {}) };
+    let persistDirty = false;
+    const activePersistIds = new Set<string>(); // 0.140.1: for pruning the log
     for (const f of this.app.vault.getMarkdownFiles()) {
       if (f.path.includes("/_authors/")) continue;
-      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown } | undefined;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown; completed?: unknown; repeat?: unknown; autoDoneAfter?: unknown; remindEvery?: unknown } | undefined;
       if (!fm || fm.due == null) continue;
       const id = typeof fm.id === "string" ? fm.id : "";
       if (!id) continue;
       const dueRaw = String(fm.due);
       const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(dueRaw);
       if (!Number.isFinite(dueMs) || dueMs > now) continue; // not due yet
-      // Assignee scoping: a task assigned to specific people only reminds THOSE
-      // people (so I only get a reminder for a task assigned to me). An
-      // UNASSIGNED task reminds everyone (i.e. me too).
+
+      // 0.140.0: auto-complete-after ("un-failable" tasks) — once past due by
+      // the configured grace, resolve WITHOUT reminding. A repeating task rolls
+      // forward; a one-off just gets marked complete. Runs before assignee
+      // scoping so it applies regardless of who'd be reminded.
+      if (fm.completed !== true) {
+        const grace = parseDuration(fm.autoDoneAfter as string | undefined);
+        if (grace != null && now >= dueMs + grace) {
+          await this.autoResolveDueTask(f, dueMs, now);
+          continue;
+        }
+      }
+      if (fm.completed === true) continue; // completed one-offs: nothing to do
+
       const assignees = parseAssignees(fm);
       if (assignees.length > 0 && !(myId && assignees.some((a) => a.id === myId))) continue;
+
+      // 0.140.0: persistent reminders re-fire every `remindEvery` until done —
+      // otherwise the once-per-(id@due) key suppresses repeats.
+      const every = parseDuration(fm.remindEvery as string | undefined);
+      if (every != null) {
+        activePersistIds.add(id);
+        const last = persistLog[id] ?? 0;
+        if (now - last >= every) {
+          persistLog[id] = now; persistDirty = true;
+          due.push({ id, folder: (f.parent?.path ?? "").replace(/\/+$/, ""), file: f, dueMs, key: `${id}@persist` });
+        }
+        continue; // persistent tasks bypass the once-only key path
+      }
+
       const key = `${id}@${dueRaw}`;
       if (notified.has(key)) continue;
       due.push({ id, folder: (f.parent?.path ?? "").replace(/\/+$/, ""), file: f, dueMs, key });
     }
+    // 0.140.1: actually prune the persist log (the old code only wrote it back)
+    // — drop ids that are no longer a live persistent+due task, so it can't grow
+    // unbounded after tasks complete/lose remindEvery.
+    for (const kId of Object.keys(persistLog)) if (!activePersistIds.has(kId)) { delete persistLog[kId]; persistDirty = true; }
+    if (persistDirty) { this.settings.persistReminderLog = persistLog; await this.saveSettings(); }
     if (due.length === 0) return;
     // Record up front so the interval / a fast re-entry can't double-fire.
-    this.settings.notifiedDueKeys = [...(this.settings.notifiedDueKeys ?? []), ...due.map((d) => d.key)].slice(-2000);
+    // 0.140.1: EXCLUDE `@persist` keys — they're never read back (the persist
+    // path bypasses `notified`), so appending them just churned the 2000-cap
+    // ring and evicted legit `id@due` keys (→ old past-due one-offs re-notify).
+    this.settings.notifiedDueKeys = [...(this.settings.notifiedDueKeys ?? []), ...due.filter((d) => !d.key.endsWith("@persist")).map((d) => d.key)].slice(-2000);
     await this.saveSettings();
     const titleOf = async (file: TFile): Promise<string> => {
       try {
@@ -5482,6 +5998,9 @@ export default class StashpadPlugin extends Plugin {
 
   async loadSettings(): Promise<void> {
     const data = (await this.loadData()) ?? {};
+    // 0.137.3: collision guard — remember the on-disk write generation we
+    // loaded from, so a save can detect that another instance wrote since.
+    this.lastSeenSettingsRev = typeof data?.settingsRev === "number" ? data.settingsRev : 0;
     // Migrate legacy `confirmMultiDelete` (split in 0.51.12 into two flags:
     // confirmBulkDelete + confirmAttachmentDelete). Preserve the user's
     // previous choice by seeding both new flags from the old value when
@@ -5557,6 +6076,9 @@ export default class StashpadPlugin extends Plugin {
         : ["5m", "15m", "30m", "1h", "1d", "1w"],
     };
     setSettings(this.settings);
+    // 0.137.3: collision guard — baseline what the protected keys looked like
+    // at load, so a later save can tell "we changed it" from "someone else did".
+    this.snapshotSettingsBaseline();
     // 0.124.1: one-time migration of the "Toggle task" default H → G. Installs
     // persist the FULL bindings map, so changing the default alone never reaches
     // existing users. Flip a still-default `H` to `G` once, then mark it done so
@@ -5771,9 +6293,64 @@ export default class StashpadPlugin extends Plugin {
     // Snapshot the settings reference at queue time. saveData itself does
     // a synchronous JSON.stringify, but we still chain so two in-flight
     // writes can't interleave their adapter.write calls.
-    const next = this.writeChain.then(() => this.saveData(this.settings));
+    const next = this.writeChain.then(() => this.guardedSave());
     this.writeChain = next.catch(() => {});
     return next;
+  }
+
+  /** 0.137.3: MULTI-WRITER COLLISION GUARD. Two Obsidian instances on the same
+   *  vault (dual-open, network drives, sync tools) each hold settings in
+   *  memory; last-save-wins used to let a STALE writer silently revert the
+   *  other's changes — including the encryption identity, which manifests as
+   *  "my password stopped working". Every save now re-reads data.json first;
+   *  if another writer bumped the rev since we last saw it, the SECURITY-
+   *  CRITICAL keys we haven't touched this session are adopted from disk
+   *  instead of clobbered (keys we DID change: ours win — we're the active
+   *  editor). Best-effort (not a lock — simultaneous writes can still race),
+   *  but it turns the common interleaving from silent key-loss into a merge +
+   *  a loud notice. */
+  private static readonly COLLISION_PROTECTED_KEYS = ["encryption", "lockedSubtrees", "folderEncPrefs", "archiveFolders"] as const;
+  private lastSeenSettingsRev = 0;
+  private settingsBaseline: Record<string, string | undefined> = {};
+
+  private snapshotSettingsBaseline(): void {
+    for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
+      this.settingsBaseline[k] = JSON.stringify((this.settings as unknown as Record<string, unknown>)[k]);
+    }
+  }
+
+  private async guardedSave(): Promise<void> {
+    let disk: Record<string, unknown> | null = null;
+    try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { /* first write / unreadable */ }
+    const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
+    // 0.140.2: adopt on CONTENT change, not just a higher rev. Two instances
+    // that both loaded rev N and write near-simultaneously both stamp N+1, so a
+    // rev-gated check (`diskRev > lastSeen`) misses the collision and silently
+    // clobbers the other's protected keys. Comparing the on-disk protected-key
+    // content against OUR baseline catches it whenever the other write already
+    // landed — regardless of rev — which is the common "minutes apart" case.
+    if (disk) {
+      const adopted: string[] = [];
+      for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
+        const oursChanged = JSON.stringify((this.settings as unknown as Record<string, unknown>)[k]) !== this.settingsBaseline[k];
+        const diskChanged = JSON.stringify(disk[k]) !== this.settingsBaseline[k];
+        if (!oursChanged && diskChanged && disk[k] !== undefined) {
+          (this.settings as unknown as Record<string, unknown>)[k] = disk[k];
+          adopted.push(k);
+        }
+      }
+      if (adopted.length) {
+        console.warn(`[Stashpad] settings collision: on-disk protected keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
+        new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${adopted.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
+        setSettings(this.settings);
+      }
+      if (diskRev > this.lastSeenSettingsRev) this.lastSeenSettingsRev = diskRev;
+    }
+    const rev = Math.max(diskRev, this.lastSeenSettingsRev) + 1;
+    (this.settings as unknown as Record<string, unknown>).settingsRev = rev;
+    await this.saveData(this.settings);
+    this.lastSeenSettingsRev = rev;
+    this.snapshotSettingsBaseline();
   }
 
   async saveSettings(): Promise<void> {

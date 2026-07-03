@@ -11,6 +11,13 @@ import {
   type StashpadId,
 } from "./types";
 
+/** A valid #RGB / #RRGGBB color. Read-path guard so untrusted frontmatter
+ *  (shared/imported notes) can't slip a `url(...)` or other CSS value into an
+ *  inline style. The write path already enforces #RRGGBB. */
+function isHexColor(s: string): boolean {
+  return /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(s);
+}
+
 /** 0.74.1: right-sidebar detail panel. Mirrors the cursored note in the
  *  active Stashpad view — title + rendered body + metadata + children
  *  list. Counterpart to the left-side panels view (Pinned/Shared/Tasks):
@@ -193,7 +200,10 @@ export class StashpadDetailView extends ItemView {
 
     const metaRow = header.createDiv({ cls: "stashpad-detail-metarow" });
     if (sel.folder) metaRow.createSpan({ cls: "stashpad-detail-meta-chip", text: sel.folder.split("/").pop() || sel.folder });
-    if (typeof fm.color === "string" && fm.color) {
+    if (typeof fm.color === "string" && isHexColor(fm.color)) {
+      // Validate on READ, not just write: a shared/imported note carrying
+      // `color: url(http://attacker/pixel)` would otherwise trigger an external
+      // fetch (CSS tracking/exfil) when this panel renders it. (0.140.6 review.)
       const c = metaRow.createSpan({ cls: "stashpad-detail-meta-color" });
       c.style.background = fm.color;
       c.title = fm.color;
@@ -351,10 +361,14 @@ export class StashpadDetailView extends ItemView {
     folder: string,
     node: { id: string; file: TFile | null },
     depth: number,
+    seen: Set<string> = new Set(),
   ): void {
     if (!node.file) return;
+    // Cycle guard: a corrupted tree whose parent chain loops would otherwise
+    // recurse forever and blow the stack when the row is expanded. (0.140.6)
+    if (seen.has(node.id)) return;
     const fm = (this.app.metadataCache.getFileCache(node.file)?.frontmatter ?? {}) as any;
-    const color = typeof fm.color === "string" ? fm.color : null;
+    const color = typeof fm.color === "string" && isHexColor(fm.color) ? fm.color : null;
     const completed = fm.completed === true;
     const grandchildren = tree.getChildren(node.id) as Array<{ id: string; file: TFile | null }>;
     const hasGrandkids = grandchildren.length > 0;
@@ -457,8 +471,9 @@ export class StashpadDetailView extends ItemView {
     label.onclick = () => { if (view?.navigateTo) view.navigateTo(node.id); };
 
     if (hasGrandkids && isExpanded) {
+      const nextSeen = new Set(seen).add(node.id);
       for (const grandchild of grandchildren) {
-        this.renderDetailChildRow(parent, view, tree, folder, grandchild, depth + 1);
+        this.renderDetailChildRow(parent, view, tree, folder, grandchild, depth + 1, nextSeen);
       }
     }
   }

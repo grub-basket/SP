@@ -21,7 +21,10 @@ export class UndoStack {
   async undo(): Promise<UndoAction | null> {
     const a = this.undoStack.pop();
     if (!a) return null;
-    try { await a.undo(); } catch (e) { console.error("Stashpad: undo failed", e); throw e; }
+    // On failure (e.g. a file transiently locked on a network vault) push the
+    // action BACK onto the undo stack so it stays retryable — otherwise it's
+    // lost from both stacks, possibly after a partial mutation. (0.140.5)
+    try { await a.undo(); } catch (e) { this.undoStack.push(a); console.error("Stashpad: undo failed", e); throw e; }
     this.redoStack.push(a);
     return a;
   }
@@ -31,7 +34,7 @@ export class UndoStack {
     if (!a) return null;
     // Undo-only actions have no redo handler — moving them back to the undo
     // stack without re-applying is correct (and was previously a crash).
-    if (a.redo) { try { await a.redo(); } catch (e) { console.error("Stashpad: redo failed", e); throw e; } }
+    if (a.redo) { try { await a.redo(); } catch (e) { this.redoStack.push(a); console.error("Stashpad: redo failed", e); throw e; } }
     this.undoStack.push(a);
     return a;
   }
