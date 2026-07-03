@@ -757,7 +757,15 @@ export default class StashpadPlugin extends Plugin {
     // Load the synced keyfile into the service's cache FIRST (isConfigured /
     // accessState / tryAutoUnlock all read it), then auto-unlock if a password is
     // remembered on this device.
-    void this.encryption.init().then(() => this.encryption.tryAutoUnlock());
+    void this.encryption.init().then(async () => {
+      // keyfile-removal Phase 3: transparently relocate any legacy keyfile folder
+      // keys into per-folder `.stashkey` files (additive; keyfile kept as backup).
+      try {
+        const n = await this.encryption.migrateKeyfileToStashKeys();
+        if (n > 0) new Notice(`Stashpad: moved ${n} folder key${n === 1 ? "" : "s"} to the new per-folder format.`);
+      } catch (e) { console.warn("[Stashpad] folder-key migration failed (keyfile still works)", e); }
+      await this.encryption.tryAutoUnlock();
+    });
     // Resume any crash-interrupted key rotation AFTER layout-ready — it reads the
     // adapter (not the file index), but deferring keeps it off the onload hot path
     // and consistent with the registry reconcile below.

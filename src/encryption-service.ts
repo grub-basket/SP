@@ -3,6 +3,7 @@ import { encryptStash, decryptStash, argon2Available, type StashKdf } from "./st
 import { newId } from "./id-service";
 import { generateIdentityKeys, wrapDekTo, unwrapDekWith } from "./vault-keyring";
 import { KeyfileStore, emptyKeyfile, type VaultKeyfile, type KeyfileIdentity, type KeyfileJoinRequest, type FolderKeyEntry, type KeyfilePasswordSlot } from "./vault-keyfile";
+import { FolderKeystore, type StashKey } from "./folder-keystore";
 
 /** Legacy global keychain id (pre-0.99.24). Namespaced per-vault now — see
  *  `keychainId()`; kept for a one-time migration read. */
@@ -99,6 +100,13 @@ export class EncryptionService {
   private keyfiles: KeyfileStore;
   /** In-memory cache of the synced keyfile (refreshed via init()/refresh()). */
   private kf: VaultKeyfile | null = null;
+  /** Keyfile-removal (Phase 2b): per-folder `.stashkey` files, keyed by cleaned
+   *  folder path. This is the NEW source of truth; the central keyfile above is a
+   *  read-only fallback for folders not yet migrated. Scanned once per session
+   *  (dirty flag re-scans after a mutation). See docs/encryption-keyfile-removal-plan.md. */
+  private folderKeystore: FolderKeystore;
+  private folderKeyFiles = new Map<string, StashKey>();
+  private stashKeysIndexed = false;
 
   // (0.135.0: the idle auto-lock timer is gone — armIdle/clearIdle/idleMinutes
   // removed. The session key lives until Obsidian closes or encryption is
@@ -107,14 +115,93 @@ export class EncryptionService {
     private app: App,
     private load: () => EncryptionConfig,
     private save: (cfg: EncryptionConfig) => Promise<void>,
-  ) { this.keyfiles = new KeyfileStore(app); }
+  ) { this.keyfiles = new KeyfileStore(app); this.folderKeystore = new FolderKeystore(app); }
 
   argonProbe(): Promise<boolean> { return argon2Available(); }
 
   /** Load the synced keyfile into the in-memory cache. Call on plugin load and
    *  before any operation that needs a fresh view of collaborators. */
   async init(): Promise<void> { await this.refresh(); }
-  async refresh(): Promise<void> { this.kf = await this.keyfiles.load(); }
+  async refresh(): Promise<void> {
+    this.kf = await this.keyfiles.load();
+    if (!this.stashKeysIndexed) await this.indexStashKeys();
+  }
+
+  /** Force a re-scan of `.stashkey` files on the next refresh (after a folder key
+   *  is created/removed, or on explicit reload). */
+  invalidateStashKeyIndex(): void { this.stashKeysIndexed = false; }
+
+  /** Phase 3 migration: relocate each legacy keyfile `folderKeys` entry's ACTIVE
+   *  wrap into a per-folder `.stashkey`. Pure WRAP RELOCATION — the DEK is
+   *  unchanged, no decryption, no content rewrite. ADDITIVE + reversible: the
+   *  keyfile entry is left in place (dual-read then prefers the `.stashkey`), and
+   *  a write that doesn't verify is rolled back. Idempotent (skips folders that
+   *  already have a `.stashkey`). Returns the count migrated. */
+  async migrateKeyfileToStashKeys(): Promise<number> {
+    await this.refresh();
+    const fks = this.kf?.folderKeys;
+    if (!fks) return 0;
+    let migrated = 0;
+    for (const [path, entry] of Object.entries(fks)) {
+      const f = this.cleanFolder(path);
+      if (this.folderKeyFiles.has(f) || await this.folderKeystore.hasFile(f)) continue; // already migrated
+      const active = (entry.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"));
+      if (!active.length) continue; // no active wrap to carry over
+      const sk: StashKey = {
+        v: 1, keyId: entry.keyId, folderPath: f,
+        slots: active.map((s, i) => ({ id: s.id, label: i === 0 ? "Folder password" : s.label, wrapped: s.wrapped, kdf: s.kdf, createdAt: s.createdAt })),
+        createdAt: entry.createdAt,
+      };
+      try {
+        await this.folderKeystore.write(f, sk);
+        const back = await this.folderKeystore.read(f);
+        // Verify the primary wrap round-tripped byte-for-byte before trusting it.
+        if (!back || back.slots[0]?.wrapped !== sk.slots[0].wrapped) { await this.folderKeystore.remove(f); continue; }
+        this.folderKeyFiles.set(f, sk); // keyfile entry LEFT IN PLACE (backup)
+        migrated++;
+      } catch { /* leave the keyfile entry as the working fallback */ }
+    }
+    return migrated;
+  }
+
+  /** Scan the vault for per-folder `.stashkey` files and cache them. Bounded walk
+   *  (skips .git/.obsidian/node_modules). Once per session unless invalidated. */
+  private async indexStashKeys(): Promise<void> {
+    const found = new Map<string, StashKey>();
+    const SKIP = new Set([".git", ".obsidian", "node_modules"]);
+    const walk = async (dir: string): Promise<void> => {
+      let listing: { files: string[]; folders: string[] };
+      try { listing = await this.app.vault.adapter.list(dir); } catch { return; }
+      for (const f of listing.files ?? []) {
+        if (f === ".stashkey" || f.endsWith("/.stashkey")) {
+          const folder = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : "";
+          const sk = await this.folderKeystore.read(folder);
+          if (sk) found.set(this.cleanFolder(folder), sk);
+        }
+      }
+      for (const sub of listing.folders ?? []) {
+        if (SKIP.has(sub.split("/").pop() ?? "")) continue;
+        await walk(sub);
+      }
+    };
+    await walk("");
+    this.folderKeyFiles = found;
+    this.stashKeysIndexed = true;
+  }
+
+  /** Present a `.stashkey` as a FolderKeyEntry so the existing unlock/session code
+   *  works unchanged. Its slots (primary + optional recovery) map to active
+   *  passwordSlots; there are no `[deprecated]` slots in the new model. */
+  private stashKeyToEntry(sk: StashKey, folderPath: string): FolderKeyEntry {
+    return {
+      keyId: sk.keyId,
+      folderPath: this.cleanFolder(folderPath),
+      label: sk.slots[0]?.label ?? "Folder password",
+      kcId: this.folderKcId(folderPath, sk.keyId),
+      passwordSlots: sk.slots.map((s) => ({ id: s.id, label: s.label, wrapped: s.wrapped, kdf: s.kdf, createdAt: s.createdAt })),
+      createdAt: sk.createdAt,
+    };
+  }
 
   // ---- keychain (per-device convenience copy of the unlock password) ----
   private secretStore(): SecretStore | null {
@@ -420,13 +507,13 @@ export class EncryptionService {
    *  a note in `Projects/Sub` is owned by `Projects` if only `Projects` has a key. */
   private owningFolder(folder: string): string | null {
     const fks = this.kf?.folderKeys;
-    if (!fks) return null;
     let p = this.cleanFolder(folder);
     while (p) {
-      // hasOwnProperty, NOT `fks[p]` truthiness: a folder literally named
-      // `constructor`/`toString`/etc. would otherwise hit Object.prototype and
-      // be treated as having its own (function) key. 0.140.13
-      if (Object.prototype.hasOwnProperty.call(fks, p)) return p;
+      // Dual-read: a `.stashkey` (new) OR a keyfile entry (legacy) makes this the
+      // owning folder. hasOwnProperty (not `fks[p]`) so a folder named
+      // `constructor` doesn't hit Object.prototype. 0.140.13 / keyfile-removal.
+      if (this.folderKeyFiles.has(p)) return p;
+      if (fks && Object.prototype.hasOwnProperty.call(fks, p)) return p;
       const i = p.lastIndexOf("/");
       if (i < 0) break;
       p = p.slice(0, i);
@@ -435,18 +522,27 @@ export class EncryptionService {
   }
   /** True only if THIS exact folder has its own key (not inherited) — for settings
    *  UI decisions ("Set folder password" vs "Unlock/Change"). */
-  hasOwnFolderKey(folder: string): boolean { const fks = this.kf?.folderKeys; return !!fks && Object.prototype.hasOwnProperty.call(fks, this.cleanFolder(folder)); }
+  hasOwnFolderKey(folder: string): boolean {
+    const f = this.cleanFolder(folder);
+    if (this.folderKeyFiles.has(f)) return true;
+    const fks = this.kf?.folderKeys;
+    return !!fks && Object.prototype.hasOwnProperty.call(fks, f);
+  }
   /** The keyfile entry governing a folder — its own, or the nearest ancestor's
    *  (inheritance). Null → the folder uses the vault DEK. */
   folderKeyEntry(folder: string): FolderKeyEntry | null {
     const owner = this.owningFolder(folder);
-    return owner ? (this.kf!.folderKeys![owner] ?? null) : null;
+    if (!owner) return null;
+    const sk = this.folderKeyFiles.get(owner);
+    if (sk) return this.stashKeyToEntry(sk, owner);       // .stashkey (new)
+    return this.kf?.folderKeys?.[owner] ?? null;          // keyfile (legacy)
   }
   hasFolderKey(folder: string): boolean { return this.owningFolder(folder) !== null; }
   /** The folder path whose key has this keyId, or null — for resolving which key a
    *  trash blob was encrypted under (its sidecar stores the keyId). */
   folderPathByKeyId(keyId: string): string | null {
-    for (const [path, e] of Object.entries(this.kf?.folderKeys ?? {})) if (e.keyId === keyId) return path;
+    for (const [path, sk] of this.folderKeyFiles) if (sk.keyId === keyId) return path; // .stashkey (new)
+    for (const [path, e] of Object.entries(this.kf?.folderKeys ?? {})) if (e.keyId === keyId) return path; // keyfile (legacy)
     return null;
   }
   /** Active (non-deprecated) password slots for a folder, newest first. Deprecated
@@ -482,23 +578,21 @@ export class EncryptionService {
     await this.refresh();
     if (!this.kf) throw new Error("Set up vault encryption first.");
     const f = this.cleanFolder(folder);
-    if (this.kf.folderKeys?.[f]) throw new Error("This folder already has its own key.");
+    if (this.hasOwnFolderKey(f)) throw new Error("This folder already has its own key.");
     // Inheritance: a subfolder of an already-keyed folder uses the ancestor's key —
     // don't let it mint a separate (nested) key.
     const ancestor = this.owningFolder(f);
     if (ancestor && ancestor !== f) throw new Error(`A parent folder (“${ancestor.split("/").pop()}”) already has its own password; this folder inherits it.`);
-    const dek = crypto.getRandomValues(new Uint8Array(DEK_LEN));
-    const wrapped = await encryptStash(dek, password);
-    const keyId = newId(8);
-    const entry: FolderKeyEntry = {
-      keyId, folderPath: f, label, kcId: this.folderKcId(label, keyId),
-      passwordSlots: [{ id: newId(8), label: "Folder password", wrapped: toB64(wrapped.data), kdf: wrapped.kdf, createdAt: new Date().toISOString() }],
-      createdAt: new Date().toISOString(),
-    };
-    this.kf.folderKeys = { ...(this.kf.folderKeys ?? {}), [f]: entry };
-    await this.keyfiles.save(this.kf);
+    // keyfile-removal: new folder keys are written as a per-folder `.stashkey`,
+    // NOT into the central keyfile. `label` is retained for the caller's contract
+    // but the on-disk key file is minimal. (dek is cached; the copy here is owned
+    // by the session map.)
+    void label;
+    const { sk, dek } = await this.folderKeystore.create(f, password);
+    await this.folderKeystore.write(f, sk);
+    this.folderKeyFiles.set(f, sk);
     this.folderSessionKeys.set(f, dek);
-    if (remember) await this.rememberFolder(this.folderKcIdFor(entry), password);
+    if (remember) await this.rememberFolder(this.folderKcId(f, sk.keyId), password);
   }
 
   /** Unlock a folder's own key with `password`. False on wrong password / no entry. */
@@ -562,6 +656,18 @@ export class EncryptionService {
     const owner = entry.folderPath; // inheritance: operate on the key-owning folder
     const dek = this.folderSessionKeys.get(owner);
     if (!dek) throw new Error("Unlock this folder first.");
+    // keyfile-removal: a `.stashkey`-backed folder re-wraps the primary slot in
+    // place (recovery slot preserved) — no deprecated-slot retention, no keyfile.
+    const skNow = this.folderKeyFiles.get(owner);
+    if (skNow) {
+      const next = await this.folderKeystore.changePassword(skNow, dek, newPassword);
+      await this.folderKeystore.write(owner, next);
+      this.folderKeyFiles.set(owner, next);
+      const kcId2 = this.folderKcId(owner, next.keyId);
+      if (remember || this.isFolderRemembered(kcId2)) await this.rememberFolder(kcId2, newPassword);
+      return;
+    }
+    if (!this.kf) throw new Error("This folder has no key.");
     // Retain the OLD keychain password under a deprecated id (never delete) so an
     // old export emailed months ago can still be looked up / decrypted.
     const prevActive = entry.passwordSlots.filter((s) => !s.label.startsWith("[deprecated]"));
@@ -803,9 +909,24 @@ export class EncryptionService {
           }
         }
       } catch { /* */ }
+      // keyfile-removal: also remove every per-folder `.stashkey` (a folder key is
+      // meaningless once its content is decrypted / encryption is being removed).
+      if (!this.stashKeysIndexed) await this.indexStashKeys();
+      for (const folder of this.folderKeyFiles.keys()) { try { await this.folderKeystore.remove(folder); } catch { /* best-effort */ } }
+      this.folderKeyFiles.clear();
     } catch { /* best-effort */ }
     this.kf = null;
     await this.save(defaultEncryptionConfig());
+  }
+
+  /** Remove a SINGLE folder's `.stashkey` (called when that folder's encryption is
+   *  removed and its content decrypted). Zeros + drops the session key too. */
+  async removeFolderKeyFile(folder: string): Promise<void> {
+    const f = this.cleanFolder(folder);
+    await this.folderKeystore.remove(f);
+    this.folderKeyFiles.delete(f);
+    this.folderSessionKeys.get(f)?.fill(0);
+    this.folderSessionKeys.delete(f);
   }
 
   getSessionKey(): Uint8Array | null {

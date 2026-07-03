@@ -134,7 +134,26 @@ export class KeyfileStore {
   async save(kf: VaultKeyfile): Promise<void> {
     const body = JSON.stringify(kf, null, 2);
     await this.ensureDir(PRIMARY_DIR);
-    await this.a.write(PRIMARY, body);
+    // 0.140.18: atomic-ish primary write. Write a temp file, then rename it over
+    // the primary — a crash mid-write corrupts only the temp, never the live
+    // keyfile (rename within one directory is atomic on desktop). This removes
+    // the "partial primary write" precondition behind the stale-backup rollback.
+    // Falls back to a direct write if rename isn't supported (some mobile adapters).
+    const tmp = `${PRIMARY}.tmp`;
+    let wrote = false;
+    try {
+      await this.a.write(tmp, body);
+      try {
+        await this.a.rename(tmp, PRIMARY);            // atomic overwrite (POSIX)
+      } catch {
+        try { await this.a.remove(PRIMARY); } catch { /* may not exist */ }
+        await this.a.rename(tmp, PRIMARY);            // retry after clearing dst (Windows)
+      }
+      wrote = true;
+    } catch {
+      try { if (await this.a.exists(tmp)) await this.a.remove(tmp); } catch { /* best-effort */ }
+    }
+    if (!wrote) await this.a.write(PRIMARY, body);    // last-resort direct write
     await this.ensureDir(BACKUP_DIR);
     for (let i = BACKUP_KEEP - 1; i >= 1; i--) {
       const src = `${BACKUP_DIR}/keys-${i}.json`, dst = `${BACKUP_DIR}/keys-${i + 1}.json`;
