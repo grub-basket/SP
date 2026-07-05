@@ -50,7 +50,7 @@ export interface ModShortcuts {
 /** All keyboard-bindable commands, in display order. The labels and
  *  descriptions live in COMMAND_META below. */
 export type CommandId =
-  | "move" | "pickMove" | "merge" | "copy" | "copyTree" | "openEditor" | "openTab"
+  | "move" | "pickMove" | "merge" | "copy" | "copyTree" | "copyLink" | "openEditor" | "openTab"
   | "split" | "copyOutline"
   | "toggleSplit" | "pickDestination" | "search" | "searchInParent" | "delete" | "undo" | "redo"
   | "toggleComplete" | "moveUp" | "moveDown" | "moveToTop" | "moveToBottom"
@@ -100,6 +100,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "merge",           label: "Merge",                         desc: "Concatenate selected notes into the oldest one.",                                        defaultPrimary: "&" },
   { id: "copy",            label: "Copy",                          desc: "Copy selected note bodies to clipboard.",                                                defaultPrimary: "C" },
   { id: "copyTree",        label: "Copy tree",                     desc: "Copy the focused note + all descendants, indented.",                                     defaultPrimary: "Y" },
+  { id: "copyLink",        label: "Copy Stashpad link",            desc: "Copy an obsidian://stashpad deep link to the cursor row (or first selected note) — click it anywhere to jump back. No default chord.", defaultPrimary: "" },
   { id: "openEditor",      label: "Open in editor",                desc: "Open the cursor row (or focused note) in a regular Obsidian markdown tab.",              defaultPrimary: "E" },
   { id: "openTab",         label: "Open in new Stashpad tab",      desc: "Open the cursor row (or focused note) in a new Stashpad tab focused on it.",             defaultPrimary: "T" },
   { id: "split",           label: "Split note",                    desc: "Split the cursor row (or focused note) into two notes at a chosen line.",                defaultPrimary: "S" },

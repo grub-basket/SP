@@ -22,6 +22,7 @@ import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
 import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
 import { StashpadSuggest } from "./note-picker";
+import { buildStashpadLink } from "./deep-link";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
 import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
@@ -6506,6 +6507,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.cutNotes) && !window.getSelection()?.toString()) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCutNotes(); return; }
       // (pasteNotes is handled above the block — it doesn't need a target.)
       if (matchBinding(e, sb.copyTree)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyTree(); return; }
+      if (matchBinding(e, sb.copyLink)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyStashpadLink(); return; }
       if (matchBinding(e, sb.copyOutline)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyOutline(); return; }
       if (matchBinding(e, sb.copyCodeBlock)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyCodeBlock(); return; }
       if (matchBinding(e, sb.openEditor)) {
@@ -9265,6 +9267,26 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** Copy an `obsidian://stashpad?…` deep link to the cursor row (or first
+   *  selected note). Paste it anywhere — clicking it lands back on this exact
+   *  note. Uses the note's stable frontmatter `id`, so it survives renames. */
+  async cmdCopyStashpadLink(node?: TreeNode): Promise<void> {
+    const target = node ?? this.getActionTargets()[0];
+    if (!target?.id) { new Notice("No note selected to link to."); return; }
+    const link = buildStashpadLink({
+      vault: this.app.vault.getName(),
+      folder: this.noteFolder,
+      note: target.id,
+      run: ["reveal"],
+    });
+    try {
+      await navigator.clipboard.writeText(link);
+      new Notice("Stashpad link copied.");
+    } catch {
+      new Notice("Couldn't copy the link to the clipboard.");
+    }
+  }
+
   /** Open the focused-parent note in a new editor tab — useful when
    *  you've drilled into a child and want to jump back to editing the
    *  parent without navigating up first. */
@@ -11532,6 +11554,7 @@ export class StashpadView extends ItemView {
       void this.openFileAtEnd(file);
     }));
     menu.addItem((it: any) => it.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => this.navigateTo(node.id)));
+    menu.addItem((it: any) => it.setTitle("Copy Stashpad link").setIcon("link").onClick(() => void this.cmdCopyStashpadLink(node)));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
     // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
