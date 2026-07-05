@@ -27,6 +27,7 @@ import { setActiveView, clearActiveView } from "./active-view";
 import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, humanCombo } from "./view-keys";
+import { openAggregateView } from "./aggregate-view";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
 import { NoteBodyRenderer } from "./note-body-renderer";
@@ -6692,13 +6693,13 @@ export class StashpadView extends ItemView {
       const prevSibling = idx > 0 ? order[idx - 1] : null;
       // Silent per-item; one summary toast below (a batch shouldn't spam).
       const r = await this.plugin.lockNoteSubtree(this.noteFolder, t.id, prevSibling, { silent: true });
-      if (r) locked++;
+      if (r) { locked++; await this.log.append({ type: "lock", id: t.id }); }
     }
     if (locked > 0) {
       this.selection.clear();
       this.lastSelected = null;
       this.render();
-      this.plugin.notifications.show({ message: `Locked ${locked} stash${locked === 1 ? "" : "es"}.`, kind: "success", category: "system", folder: this.noteFolder });
+      this.plugin.notifications.show({ message: `Locked ${locked} stash${locked === 1 ? "" : "es"}.`, kind: "success", category: "system", folder: this.noteFolder, actions: [{ label: "All encrypted", onClick: () => void openAggregateView(this.plugin, "encrypted") }] });
     }
   }
 
@@ -6754,8 +6755,9 @@ export class StashpadView extends ItemView {
         try { await this.app.fileManager.renameFile(f, to); moves.push({ from: fromPath, to }); } catch (e) { console.warn("[Stashpad] plaintext archive move failed", fromPath, e); }
       }
       this.selection.clear(); this.lastSelected = null; this.tree.rebuild(src); this.render();
+      if (moves.length > 0) for (const rt of roots0) await this.log.append({ type: "archive", id: rt.id, payload: { to: cleanDest, encrypted: false } });
       const nm = cleanDest.split("/").pop() || cleanDest;
-      this.plugin.notifications.show({ message: `Moved ${moves.length} note${moves.length === 1 ? "" : "s"} → plaintext archive “${nm}” (de-indexed, not encrypted). Undo to bring ${moves.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder: src });
+      this.plugin.notifications.show({ message: `Moved ${moves.length} note${moves.length === 1 ? "" : "s"} → plaintext archive “${nm}” (de-indexed, not encrypted). Undo to bring ${moves.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder: src, actions: [{ label: "All archived", onClick: () => void openAggregateView(this.plugin, "archived") }] });
       this.plugin.getUndoStack(src).push({
         label: `Archive (plaintext, ${roots0.length})`,
         undo: async () => { for (const m of moves) { const fl = this.app.vault.getAbstractFileByPath(m.to); if (fl instanceof TFile) { try { await this.app.fileManager.renameFile(fl, m.from); } catch (e) { console.warn("[Stashpad] plaintext archive undo failed", m.to, e); } } } this.tree.rebuild(src); this.render(); },
@@ -6784,12 +6786,12 @@ export class StashpadView extends ItemView {
       const idx = order.indexOf(t.id);
       const prevSibling = idx > 0 ? order[idx - 1] : null;
       const r = await this.plugin.lockNoteSubtree(src, t.id, prevSibling, { silent: true, blobFolder: dest });
-      if (r) blobs.push(r.blobPath);
+      if (r) { blobs.push(r.blobPath); await this.log.append({ type: "archive", id: t.id, payload: { to: dest, encrypted: true } }); }
     }
     if (blobs.length === 0) return;
     this.selection.clear(); this.lastSelected = null; this.tree.rebuild(src); this.render();
     const name = dest.split("/").pop() || dest;
-    this.plugin.notifications.show({ message: `Archived ${blobs.length} note${blobs.length === 1 ? "" : "s"} → “${name}”. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder: src });
+    this.plugin.notifications.show({ message: `Archived ${blobs.length} note${blobs.length === 1 ? "" : "s"} → “${name}”. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder: src, actions: [{ label: "All archived", onClick: () => void openAggregateView(this.plugin, "archived") }] });
     this.plugin.getUndoStack(src).push({
       label: `Archive (${blobs.length})`,
       undo: async () => {
@@ -6911,7 +6913,7 @@ export class StashpadView extends ItemView {
     const folder = this.noteFolder;
     const rootIds = roots.map((r) => r.id);
     let blobs: string[] = [];
-    for (const id of rootIds) { const b = await this.plugin.plaintextDeleteSubtree(folder, id); if (b) blobs.push(b); }
+    for (const id of rootIds) { const b = await this.plugin.plaintextDeleteSubtree(folder, id); if (b) { blobs.push(b); await this.log.append({ type: "delete", id, payload: { to: "trash", bundle: b } }); } }
     if (blobs.length === 0) return;
     this.selection.clear(); this.lastSelected = null; this.tree.rebuild(folder); this.render();
     this.plugin.notifications.show({ message: `Deleted ${blobs.length} note${blobs.length === 1 ? "" : "s"} → Trash. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder, actions: [{ label: "Open Trash", onClick: () => this.plugin.openEncryptedTrash() }] });

@@ -552,7 +552,10 @@ export class ImportService {
       duration: 0,
       folder,
       affectedPaths: records.flatMap((r) => this.recordNotePaths(r)),
-      actions: [{ label: "Undo import", onClick: () => void doUndo() }],
+      actions: [
+        ...(folder ? [{ label: "Go to folder", onClick: () => void this.plugin.activateViewForFolder(folder) }] : []),
+        { label: "Undo import", onClick: () => void doUndo() },
+      ],
     });
     // Also put it on the folder's undo stack so Mod+Z / the undo command
     // reverses the import. Redo is a no-op (re-importing would need the

@@ -319,7 +319,8 @@ export class LogModal extends Modal {
       case "delete": {
         const atts = Array.isArray(p.attachmentsRemoved) ? p.attachmentsRemoved.length : 0;
         const merged = p.mergedInto ? ` (merged into ${p.mergedInto})` : "";
-        return `Deleted ${ev.id}${merged}${atts ? ` — also removed ${atts} attachment${atts === 1 ? "" : "s"}` : ""}`;
+        const toTrash = p.to === "trash" ? " → Trash" : "";
+        return `Deleted ${ev.id}${toTrash}${merged}${atts ? ` — also removed ${atts} attachment${atts === 1 ? "" : "s"}` : ""}`;
       }
       case "missing": return `Missing: ${p.lastPath ?? ev.id}`;
       case "parent_change": {
@@ -359,6 +360,10 @@ export class LogModal extends Modal {
       case "attachment_remove": return `Removed attachment ${p.path ?? ev.id}`;
       case "palette_color_add": return `Added palette color ${p.color ?? ev.id}`;
       case "palette_color_remove": return `Removed palette color ${p.color ?? ev.id}`;
+      case "lock": return `Locked (encrypted) ${ev.id}`;
+      case "unlock": return `Unlocked ${ev.id}`;
+      case "archive": return `Archived ${ev.id}${p.to ? ` → ${p.to}` : ""}${p.encrypted === false ? " (plaintext)" : ""}`;
+      case "restore": return `Restored ${ev.id}${p.to ? ` → ${p.to}` : ""} from trash`;
       default: return JSON.stringify(p);
     }
   }

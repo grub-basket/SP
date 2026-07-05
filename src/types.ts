@@ -289,7 +289,10 @@ export type LogEventType =
   | "palette_color_add" | "palette_color_remove"
   // 0.136.0: one-time move of legacy dedicated-archive contents into the
   // folder's own archive/ subfolder (per-folder archive overhaul).
-  | "archive_migration";
+  | "archive_migration"
+  // 0.146.0: encryption / archive / trash lifecycle — previously surfaced only
+  // as notifications; now also recorded in the per-folder action log.
+  | "lock" | "unlock" | "archive" | "restore";
 
 export interface LogEvent {
   ts: string;

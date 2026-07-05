@@ -3788,7 +3788,7 @@ export default class StashpadPlugin extends Plugin {
       if (await this.lockNoteSubtree(cleaned, id, prevSibling, { silent: true })) count++;
     }
     prog?.hide();
-    if (count > 0) this.notifications.show({ message: `Locked ${count} note${count === 1 ? "" : "s"} in “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned });
+    if (count > 0) this.notifications.show({ message: `Locked ${count} note${count === 1 ? "" : "s"} in “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned, actions: [{ label: "All encrypted", onClick: () => void openAggregateView(this, "encrypted") }] });
     return count;
   }
 
@@ -4098,6 +4098,7 @@ export default class StashpadPlugin extends Plugin {
         }
         const r = await restorePlaintextDeleted(this.app, blobPath, existing);
         this.pendingEncBlobs.delete(blobPath);
+        try { await this.newLog().append({ type: "restore", id: meta?.rootId || ROOT_ID, payload: { to: r.restoredTo, from: "trash", encrypted: false } }); } catch { /* log best-effort */ }
         if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo, actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(r.restoredTo) }] });
         return true;
       } catch (e) {
@@ -4149,6 +4150,7 @@ export default class StashpadPlugin extends Plugin {
       }
       const r = await restoreDeleted(this.app, blobPath, dek, existing);
       this.pendingEncBlobs.delete(blobPath);
+      try { await this.newLog().append({ type: "restore", id: meta?.rootId || ROOT_ID, payload: { to: r.restoredTo, from: "trash", encrypted: true } }); } catch { /* log best-effort */ }
       // 0.138.0: restore-from-trash counts as an unlock (user decision) — the
       // note WAS encrypted and is plaintext again. Sidecar carries the identity.
       if (meta?.rootId) {
@@ -5040,7 +5042,7 @@ export default class StashpadPlugin extends Plugin {
     for (const r of roots) {
       if (await this.lockNoteSubtree(cleaned, r.id, null, { silent: true })) count++;
     }
-    if (count > 0) this.notifications.show({ message: `Archived (encrypted) ${count} note${count === 1 ? "" : "s"} moved into “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned });
+    if (count > 0) this.notifications.show({ message: `Archived (encrypted) ${count} note${count === 1 ? "" : "s"} moved into “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned, actions: [{ label: "All archived", onClick: () => void openAggregateView(this, "archived") }] });
   }
 
   /** Open a fresh Stashpad tab focused on a specific folder via the
