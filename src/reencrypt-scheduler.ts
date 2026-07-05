@@ -70,7 +70,9 @@ export class ReEncryptScheduler {
   private keyReady(folder: string): boolean {
     const enc = this.plugin.encryption;
     if (!enc?.isConfigured?.()) return false;
-    return enc.hasOwnFolderKey(folder) ? enc.isFolderUnlocked(folder) : enc.isUnlocked();
+    // 0.143.0: per-folder only — the re-lock key is ready iff this folder's own key
+    // is unlocked. An unkeyed folder has no key to re-lock under.
+    return enc.hasFolderKey(folder) && enc.isFolderUnlocked(folder);
   }
 
   private async poll(): Promise<void> {

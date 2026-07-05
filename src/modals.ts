@@ -1072,11 +1072,12 @@ export class EncryptionPasswordModal extends Modal {
       const row = this.contentEl.createDiv({ cls: "stashpad-export-remember" });
       rememberCb = row.createEl("input", { type: "checkbox" });
       rememberCb.id = "stashpad-enc-remember";
+      rememberCb.checked = true; // 0.143.0: default ON for seamless auto-unlock; untick to require re-typing.
       const lbl = row.createEl("label", { text: "Remember on this device (keychain) — auto-unlock here without re-typing." });
       lbl.htmlFor = rememberCb.id;
       const note = this.contentEl.createDiv({ cls: "stashpad-export-remember-note" });
       note.setText("Stored only in this device's keychain — doesn't sync to your other devices. Anyone with access to this unlocked device + keychain could decrypt.");
-      note.setCssStyles({ display: "none" });
+      note.setCssStyles({ display: rememberCb.checked ? "" : "none" });
       rememberCb.onchange = () => { note.setCssStyles({ display: rememberCb!.checked ? "" : "none" }); };
     }
 

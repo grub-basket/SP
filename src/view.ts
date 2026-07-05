@@ -214,6 +214,13 @@ export class StashpadView extends ItemView {
   /** public: read by ViewDnD (the host interface). */
   listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
+  // Composer controls whose appearance depends on split/enter mode. Held so a
+  // mode toggle can update them IN PLACE instead of a full render() (which
+  // rebuilds the list — scroll jump + collapses the button group).
+  private composerSplitBtn: HTMLElement | null = null;
+  private composerEnterBtn: HTMLElement | null = null;
+  private composerHelperEl: HTMLElement | null = null;
+  private composerDestBtn: HTMLElement | null = null;
   private composerDraft = "";
   private draftsLoadedFor: string | null = null;
   private autoSelectNewest = false;
@@ -5693,6 +5700,7 @@ export class StashpadView extends ItemView {
     const expandedGroup = btnRail.createDiv({ cls: "stashpad-composer-btn-group" });
     const splitBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn" });
     setIcon(splitBtn, "list-end");
+    this.composerSplitBtn = splitBtn;
     const splitModeLabel = SPLIT_MODE_LABELS[getSettings().splitMode].toLowerCase();
     splitBtn.title = splitMode
       ? `Split: ON — ${splitModeLabel} (Mod+/ to toggle, right-click to change)`
@@ -5712,13 +5720,14 @@ export class StashpadView extends ItemView {
           .onClick(async () => {
             this.plugin.settings.splitMode = m;
             await this.plugin.saveSettings();
-            this.render();
+            this.syncComposerModeUI();
           }));
       });
       menu.showAtMouseEvent(e);
     };
 
-    const destBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn" });
+    const destBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-dest" });
+    this.composerDestBtn = destBtn;
     setIcon(destBtn, "map-pin");
     if (this.nextDestination) {
       destBtn.createSpan({ text: ` ${this.destinationLabel()}`, cls: "stashpad-btn-text" });
@@ -5741,6 +5750,7 @@ export class StashpadView extends ItemView {
     };
 
     const enterBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn" });
+    this.composerEnterBtn = enterBtn;
     setIcon(enterBtn, enterSubmits ? "corner-down-left" : "arrow-big-down-dash");
     enterBtn.title = enterSubmits
       ? "Enter sends (click to switch to Shift+Enter)"
@@ -5748,10 +5758,12 @@ export class StashpadView extends ItemView {
     enterBtn.onmousedown = (e) => e.preventDefault();
     enterBtn.onclick = (e) => {
       e.preventDefault();
-      this.modeEnterSubmits = !enterSubmits;
-      this.render();
-      // After render, `ta` is detached — use the freshly mounted composerInputEl.
-      this.composerInputEl?.focus();
+      // Toggle the Enter mode IN PLACE (a full render() would rebuild the list —
+      // scroll jump + collapse the button group). The keydown handler reads
+      // this.modeEnterSubmits live, so nothing to rebind.
+      this.modeEnterSubmits = !this.modeEnterSubmits;
+      this.syncComposerModeUI();
+      ta.focus();
     };
 
     const appendLink = (link: string) => {
@@ -5787,6 +5799,11 @@ export class StashpadView extends ItemView {
       ta.focus();
     });
 
+    // Button order (per product decision): destination · attachment · send-mode ·
+    // split. append() moves the already-created nodes into this order without
+    // disturbing their handlers or the appendLink/fileInput dependency above.
+    expandedGroup.append(destBtn, clipBtn, enterBtn, splitBtn);
+
     // 0.61.4: render the expand-toggle on BOTH mobile and desktop. CSS
     // controls when it's actually visible — by default desktop hides it
     // (the secondary buttons fit), but when the composer is narrow
@@ -5814,7 +5831,12 @@ export class StashpadView extends ItemView {
     // composer drops below 700px wide. Also do an immediate eager
     // class assignment so the first paint already reflects narrow
     // state without waiting for the observer's first callback.
-    const computeNarrow = () => composer.clientWidth < 700;
+    // 0.142.7: collapse only when the rail genuinely can't fit the fanned-out
+    // buttons. Desktop keeps the 700px feel (secondary buttons sit inline beside
+    // a wide textarea); on mobile the rail is its own row below the textarea, so a
+    // normal phone (~360px+) has room to show them expanded. "Smartphones aren't
+    // getting smaller" — only truly tiny widths collapse.
+    const computeNarrow = () => composer.clientWidth < (Platform.isMobile ? 360 : 700);
     const applyNarrow = () => {
       const narrow = computeNarrow();
       composer.toggleClass("is-narrow", narrow);
@@ -5937,6 +5959,7 @@ export class StashpadView extends ItemView {
     });
 
     const helper = parent.createDiv({ cls: "stashpad-composer-help" });
+    this.composerHelperEl = helper;
     helper.setText(this.composerHelperText(enterSubmits, splitMode));
   }
 
@@ -6850,7 +6873,7 @@ export class StashpadView extends ItemView {
     for (const id of rootIds) { const b = await this.plugin.encryptDeleteSubtree(folder, id); if (b) blobs.push(b); }
     if (blobs.length === 0) return;
     this.selection.clear(); this.lastSelected = null; this.tree.rebuild(folder); this.render();
-    this.plugin.notifications.show({ message: `Securely deleted ${blobs.length} note${blobs.length === 1 ? "" : "s"} → encrypted trash. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder });
+    this.plugin.notifications.show({ message: `Securely deleted ${blobs.length} note${blobs.length === 1 ? "" : "s"} → encrypted trash. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder, actions: [{ label: "Open Trash", onClick: () => this.plugin.openEncryptedTrash() }] });
     this.plugin.getUndoStack(folder).push({
       label: `Secure delete (${blobs.length})`,
       undo: async () => {
@@ -6908,7 +6931,9 @@ export class StashpadView extends ItemView {
       for (const lk of this.plugin.lockedSubtreesFor(this.noteFolder, focusedId)) blobs.add(lk.blob);
     }
     if (blobs.size === 0) { new Notice("No locked notes to unlock here."); return; }
-    if (!(await this.plugin.ensureEncryptionUnlocked())) return;
+    // 0.143.0: per-folder only — unlock THIS view's folder key (each blob then
+    // resolves the folder key it was locked under).
+    if (!(await this.plugin.ensureFolderUnlocked(this.noteFolder))) return;
     let unlocked = 0;
     for (const blob of blobs) {
       // unlockBundleAt re-checks the file exists + is a valid encrypted envelope
@@ -6925,10 +6950,50 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** Update the composer controls that depend on split/enter mode WITHOUT a full
+   *  render(). Split/enter mode never change the list — only the split button's
+   *  active state/title, the enter button's icon/title, the textarea placeholder,
+   *  and the helper text. A render() here caused the list scroll to jump and the
+   *  expanded button group to re-collapse. */
+  private syncComposerModeUI(): void {
+    const split = this.modeSplit ?? getSettings().splitOnLines;
+    const enter = this.modeEnterSubmits;
+    if (this.composerSplitBtn) {
+      this.composerSplitBtn.toggleClass("is-active", split);
+      const label = SPLIT_MODE_LABELS[getSettings().splitMode].toLowerCase();
+      this.composerSplitBtn.title = split
+        ? `Split: ON — ${label} (Mod+/ to toggle, right-click to change)`
+        : `Split into notes (Mod+/) — right-click to choose: ${label}`;
+    }
+    if (this.composerEnterBtn) {
+      setIcon(this.composerEnterBtn, enter ? "corner-down-left" : "arrow-big-down-dash");
+      this.composerEnterBtn.title = enter
+        ? "Enter sends (click to switch to Shift+Enter)"
+        : "Shift+Enter sends (click to switch to Enter)";
+    }
+    if (this.composerInputEl) this.composerInputEl.placeholder = this.composerPlaceholder(enter, split);
+    if (this.composerHelperEl) this.composerHelperEl.setText(this.composerHelperText(enter, split));
+  }
+
+  /** Rebuild the destination button (icon + optional label + active state) and
+   *  the helper text IN PLACE — picking a destination only changes the composer,
+   *  never the list, so a full render() (scroll jump + group collapse) is wrong.
+   *  0.142.7 */
+  private refreshDestButton(): void {
+    const btn = this.composerDestBtn;
+    if (btn) {
+      btn.empty();
+      setIcon(btn, "map-pin");
+      if (this.nextDestination) btn.createSpan({ text: ` ${this.destinationLabel()}`, cls: "stashpad-btn-text" });
+      btn.toggleClass("is-active", !!this.nextDestination);
+    }
+    this.syncComposerModeUI(); // the helper text embeds the destination label
+  }
+
   toggleSplit(): void {
     const cur = this.modeSplit ?? getSettings().splitOnLines;
     this.modeSplit = !cur;
-    this.render();
+    this.syncComposerModeUI();
     this.composerInputEl?.focus();
   }
 
@@ -6968,14 +7033,14 @@ export class StashpadView extends ItemView {
             ? "Home"
             : (item.crossFile?.basename ?? "note").replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
           this.nextDestinationLabel = `${folderName} ▸ ${noteTitle}`;
-          this.render();
+          this.refreshDestButton();
           this.composerInputEl?.focus();
           return;
         }
         this.nextDestination = item.id;
         this.nextDestinationFolder = null;
         this.nextDestinationLabel = null;
-        this.render();
+        this.refreshDestButton();
         this.composerInputEl?.focus();
       },
       onCreate: async (q) => {
@@ -8018,7 +8083,7 @@ export class StashpadView extends ItemView {
     const body = this.stripFrontmatter(oldRaw);
     const sourceFm = (this.app.metadataCache.getFileCache(sourceFile)?.frontmatter ?? {}) as Record<string, any>;
 
-    const cloneId = newId();
+    const cloneId = this.plugin.mintNoteId();
     const slug = bodyToSlug(body, this.activeStopwords());
     const filename = buildFilename(slug, cloneId);
     const path = `${this.noteFolder}/${filename}`;
@@ -10318,8 +10383,15 @@ export class StashpadView extends ItemView {
     });
   }
 
+  /** Delete selection via Obsidian's OWN trash routing (system trash or `.trash`,
+   *  per Obsidian's "Deleted files" setting), unencrypted — bypasses the "Encrypt
+   *  items sent to trash" override so it hands the notes straight to Obsidian even
+   *  when that folder encrypts its trash. (0.143.1: an explicit "just delete it the
+   *  normal Obsidian way" escape hatch; counterpart to "Encrypt (lock) & delete".) */
+  async cmdDeleteUnencrypted(): Promise<void> { await this.cmdDelete({ forcePlaintext: true }); }
+
   /** Mod+Backspace handler: delete the selected notes (or cursor row, or focused note). */
-  async cmdDelete(): Promise<void> {
+  async cmdDelete(opts: { forcePlaintext?: boolean } = {}): Promise<void> {
     let targets = this.getActionTargets();
     if (targets.length === 0) {
       const focused = this.tree.get(this.focusId);
@@ -10336,7 +10408,11 @@ export class StashpadView extends ItemView {
     const _delFp = (this.plugin.settings.folderEncPrefs ?? {})[_delFolder] ?? {};
     const _encryptTrash = _delFp.trashEncryptContent ?? this.plugin.settings.encryptTrash ?? false;
     const _followObsidian = _delFp.trashHandling === "obsidian"; // 0.137.1: global follow-Obsidian option removed
-    if (_encryptTrash && !_followObsidian) {
+    // 0.143.1: `forcePlaintext` (the "Delete to Obsidian trash (unencrypted)"
+    // command) opts out of the encrypt-trash override — hands the notes to
+    // Obsidian's native trash (deleteNote/multi-delete use fileManager.trashFile)
+    // instead of the folder's encrypted trash.
+    if (_encryptTrash && !_followObsidian && !opts.forcePlaintext) {
       if (!this.plugin.encryption?.isConfigured?.()) {
         // Don't silently fall back to the plaintext trash the user asked to avoid.
         new Notice("“Encrypt items sent to trash” is ON but encryption isn't set up (Settings → Stashpad → Encryption). Nothing was deleted.");
@@ -10736,7 +10812,7 @@ export class StashpadView extends ItemView {
     const folder = (opts.targetFolder ?? this.noteFolder).replace(/\/+$/, "");
     const remote = folder !== this.noteFolder;
     await this.ensureFolder(folder);
-    const id = newId();
+    const id = this.plugin.mintNoteId();
 
     // Per-Stashpad template: if the user has set one for this folder, fold
     // its body into the new note's body. Frontmatter overlay happens AFTER

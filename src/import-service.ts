@@ -1,7 +1,6 @@
 import { Notice, TFile, TFolder } from "obsidian";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink } from "./types";
-import { newId } from "./id-service";
 import { formatDateOnly } from "./format";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { splitFrontmatter, serializeNote, importStashZip, STASH_EXT } from "./stash-package";
@@ -312,7 +311,7 @@ export class ImportService {
     for (const [k, v] of Object.entries(fm)) {
       if (!RESERVED_FRONTMATTER.includes(k)) cloneFm[k] = v;
     }
-    cloneFm.id = newId();
+    cloneFm.id = this.plugin.mintNoteId();
     cloneFm.parent = ROOT_ID;
     // 0.79.21: preserve the original timestamps — don't stamp "now" over a
     // note that already has a created/modified (e.g. re-imported export).
@@ -344,7 +343,7 @@ export class ImportService {
     await this.app.fileManager.renameFile(file, attachmentPath);
 
     const title = file.basename;
-    const id = newId();
+    const id = this.plugin.mintNoteId();
     const fm: Record<string, any> = {
       id,
       parent: ROOT_ID,
@@ -436,7 +435,7 @@ export class ImportService {
   /** Create a "parent note" for a folder (a titled Stashpad note under
    *  `parentId`). Returns its id so children can point at it. */
   private async createFolderNote(root: string, title: string, parentId: string, notePaths: string[], existingIds: Set<string>): Promise<string> {
-    const id = newId();
+    const id = this.plugin.mintNoteId();
     existingIds.add(id);
     const fm: Record<string, any> = {
       id, parent: parentId, created: new Date().toISOString(), attachments: [],
@@ -496,7 +495,7 @@ export class ImportService {
           // Stashpad note (has an id) and that id is free in the destination,
           // keep it; otherwise (no id, or id-collision) mint a fresh one.
           const incomingId = typeof fm.id === "string" && fm.id ? fm.id : null;
-          const id = incomingId && !existingIds.has(incomingId) ? incomingId : newId();
+          const id = incomingId && !existingIds.has(incomingId) ? incomingId : this.plugin.mintNoteId();
           existingIds.add(id);
           cloneFm.id = id;
           cloneFm.parent = parentId;
@@ -514,7 +513,7 @@ export class ImportService {
           continue;
         } else {
           // Link the archived file (no _attachments copy).
-          const id = newId();
+          const id = this.plugin.mintNoteId();
           const fm: Record<string, any> = {
             id, parent: parentId, created: new Date().toISOString(),
             attachments: [toAttachmentLink(child.path)],

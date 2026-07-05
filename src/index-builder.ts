@@ -1,7 +1,6 @@
 import { App, Modal, Notice, Setting, TFile, TFolder } from "obsidian";
 import type StashpadPlugin from "./main";
 import type { StashpadSettings } from "./settings";
-import { newId } from "./id-service";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { ROOT_ID } from "./types";
 
@@ -312,7 +311,7 @@ export async function buildJdIndexNotes(
           fm.jdPrefix = prefix;
           if (parentId) fm.parent = parentId;
           if (!fm.id || typeof fm.id !== "string") {
-            fm.id = newId();
+            fm.id = plugin.mintNoteId();
           }
           if (!fm.created) {
             fm.created = new Date().toISOString();
@@ -338,7 +337,7 @@ export async function buildJdIndexNotes(
 
     // Create new.
     try {
-      const id = newId();
+      const id = plugin.mintNoteId();
       prefixToId.set(prefix, id);
       const slug = bodyToSlug(title, settings.slugStopWords);
       const filename = buildFilename(slug, id);

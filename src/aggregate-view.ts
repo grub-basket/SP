@@ -328,7 +328,7 @@ export class StashpadAggregateView extends ItemView {
     const row = (host: HTMLElement, w: (typeof all)[number], inRemoved: boolean): void => {
       const r = host.createDiv({ cls: "stashpad-trash-row" });
       const main = r.createDiv({ cls: "stashpad-trash-row-main" });
-      main.createSpan({ cls: "stashpad-trash-title", text: w.title || "(untitled)" });
+      main.createSpan({ cls: "stashpad-trash-title", text: this.plugin.reEncryptDisplayTitle(w) });
       const when = momentFn(w.unlockedAt).fromNow();
       const count = w.count > 1 ? ` \u00b7 ${w.count} notes` : "";
       main.createSpan({ cls: "stashpad-trash-sub", text: `${w.via === "restore" ? "restored" : "unlocked"} ${when} \u00b7 ${w.folder.split("/").pop() || w.folder}${count}` });

@@ -1,15 +1,14 @@
 import type { App } from "obsidian";
-import type { KeySlot } from "./vault-keyring";
 import type { StashKdf } from "./stash-crypto";
 
-/** The synced vault keyfile — distributes the single vault DEK to collaborators
- *  by public key (see docs/branches/encryption-collab.md). Everything in it is
- *  either public (pubkeys) or DEK-wrapped-to-a-pubkey, so it's safe to sync.
+/** The legacy synced vault keyfile. (0.143.0: the vault-wide DEK it distributed is
+ *  gone — encryption is per-folder now. This is READ ONLY for back-compat: its
+ *  `folderKeys` still feed folders not yet migrated to a `.stashkey`, and
+ *  `migrateKeyfileToStashKeys` relocates them. The vault-DEK fields
+ *  (`slots`/`identities`/`joinRequests`/`passwordSlots`) are dead — parsed but
+ *  never used. Phase 5 retires the file entirely.)
  *
- *  Lives in vault CONTENT (so it syncs — the plugin's own folder is per-device):
- *  primary at `.stashpad/keys.json`, with rolling backups in `_keys/` (the
- *  keyfile is the only thing between a collaborator and the DEK, so a corrupt or
- *  un-synced primary must not be fatal). */
+ *  Primary at `.stashpad/keys.json`, rolling backups in `_keys/`. */
 
 export interface KeyfileIdentity { id: string; label: string; pubKey: string; addedAt: string; }
 export interface KeyfileJoinRequest { id: string; label: string; pubKey: string; requestedAt: string; }
@@ -44,24 +43,21 @@ export interface FolderKeyEntry {
    *  the keychain rather than an opaque random id. Optional for back-compat: entries
    *  created before this fall back to a keyId-based id. */
   kcId?: string;
-  /** The folder DEK wrapped under the folder password(s). Old (rotated/changed)
-   *  slots are kept with `deprecated: true` rather than deleted. */
+  /** The folder DEK wrapped under the folder password(s). Old (changed) slots are
+   *  kept with `deprecated: true` rather than deleted. */
   passwordSlots: KeyfilePasswordSlot[];
   createdAt: string;
-  /** Whole key retired after a Phase-B rotation; kept only as a recovery artifact. */
+  /** Legacy: whole key retired; kept only as a recovery artifact. (Phase-B rotation
+   *  that set this is removed as of 0.142.0 — read-only back-compat now.) */
   deprecated?: boolean;
-  /** Rotation nonce — stamped by commitFolderRotation when the keyfile is swapped to
-   *  a new key. resumeRotations() compares it to the rotation lock's nonce to tell,
-   *  unambiguously, whether the keyfile swap actually landed before a crash (so it
-   *  knows whether to COMMIT the .rot temps or DROP them). */
-  rotId?: string;
 }
 
 export interface VaultKeyfile {
   v: 2;
   keyId: string;
+  /** Dead vault-DEK fields — parsed for validation of old keyfiles, never used. */
   identities: KeyfileIdentity[];
-  slots: KeySlot[];
+  slots: unknown[];
   joinRequests: KeyfileJoinRequest[];
   /** Optional — present only when a shared password is enabled (vault-wide DEK). */
   passwordSlots?: KeyfilePasswordSlot[];

@@ -2172,9 +2172,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    primary affordance). The textarea reserves right-padding so text
    doesn't run under the rail. */
 .stashpad-view.is-mobile .stashpad-composer {
-  position: relative;
-  /* 0.119.2: was 6px; trimmed so the toolbar sits closer above the composer
-     (less dead space between the button row and the input). */
+  /* 0.142.7: column layout — the button rail is a real row BELOW the textarea,
+     not an absolute overlay over its bottom padding. So tapping a button never
+     lands on (or scrolls) the text, and text never underlaps the buttons. */
+  flex-direction: column;
+  align-items: stretch;
   padding-top: 2px;
 }
 .stashpad-view.is-mobile .stashpad-composer-input-wrap {
@@ -2182,29 +2184,20 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   flex: 1 1 100%;
 }
 .stashpad-view.is-mobile .stashpad-composer-input {
-  /* 0.119.3: the button rail is now a full-width strip along the bottom
-     (folder/search left, send right), so reserve bottom space instead of a
-     right gutter. */
-  padding-right: 12px;
-  padding-bottom: 40px;
+  /* 0.142.7: the rail is now a real row below (not an overlay), so no bottom
+     reservation is needed and text can use the full textarea. */
   min-height: 72px;
   max-height: 220px;
 }
 .stashpad-view.is-mobile .stashpad-composer-btn-rail {
-  position: absolute;
-  /* 0.119.3: span the full width so the nav cluster can sit at the LEFT
-     (easily reachable) while send stays at the right. */
-  left: 8px;
-  right: 8px;
-  bottom: 6px;
+  /* 0.142.7: a static full-width row directly below the textarea (was an absolute
+     overlay). nav cluster sits at the LEFT (margin-right:auto below), the
+     collapse chevron + secondary group + send anchor to the RIGHT. */
+  width: 100%;
+  margin-top: 4px;
   gap: 0;
-  pointer-events: none;
   display: flex;
   align-items: center;
-  /* 0.119.8 (item 4): right-anchor the toggle+send cluster so the collapse
-     chevron sits in a FIXED spot whether the secondary group is collapsed or
-     expanded. nav's margin-right:auto already pushes the cluster right when
-     present; flex-end keeps it anchored even if it isn't. */
   justify-content: flex-end;
 }
 /* 0.119.8 (item 4): order the collapsible group BEFORE the toggle so it
@@ -2663,6 +2656,14 @@ body.is-mobile .stashpad-binding-slot-btns { flex-direction: column; gap: 3px; }
 .stashpad-settings-section .setting-item-heading {
   margin-top: 16px;
   padding-top: 4px;
+}
+/* 0.143.0: the per-folder "Folder" picker reads as a heading-sized selector — the
+   selected folder is the subject of every option below it. */
+.stashpad-folderenc-picker {
+  font-size: var(--font-ui-large, 1.1em);
+  font-weight: var(--font-semibold, 600);
+  height: auto;
+  padding: 4px 8px;
 }
 /* 0.121.13: the FIRST sub-heading of a folded tab (top of Behavior / Org
    Systems) gets extra top room so it doesn't crowd the page title. */
