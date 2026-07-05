@@ -84,8 +84,15 @@ export class StashpadTrashView extends ItemView {
     // 0.126.3: unified trash — encrypted (`_deleted/`) AND unencrypted Stashpad
     // notes sitting in Obsidian's `.trash/` (where plain deletes go when
     // "Encrypt items sent to trash" is off). Either may be empty.
-    const items = this.plugin.encryption?.isConfigured?.() ? await this.plugin.listDeletedTrash() : [];
+    const encItems = this.plugin.encryption?.isConfigured?.() ? await this.plugin.listDeletedTrash() : [];
     if (gen !== this.renderGen) return; // a newer render superseded this one
+    // 0.145.0: plaintext trash bundles (default encryption-off deletes) live in the
+    // same per-folder trash/ and share the {blob,meta} shape + restore/purge path, so
+    // they ride in `items` — grouped by origin folder in the default byfolder view.
+    // No key needed, so they list even when encryption isn't configured.
+    const plainItems = await this.plugin.listPlaintextTrash();
+    if (gen !== this.renderGen) return;
+    const items = [...encItems, ...plainItems];
     const rawItems = await this.plugin.listRawTrashStashpadNotes();
     if (gen !== this.renderGen) return;
 
@@ -157,8 +164,9 @@ export class StashpadTrashView extends ItemView {
         // separated / encrypted-only → one flat "Encrypted" section.
         const group = root.createDiv({ cls: "stashpad-trash-group" });
         const head = group.createDiv({ cls: "stashpad-trash-group-head" });
-        setIcon(head.createSpan({ cls: "stashpad-trash-group-icon" }), "lock");
-        head.createSpan({ text: "Encrypted" });
+        // Mixed encrypted + plaintext bundles now — neutral label + icon.
+        setIcon(head.createSpan({ cls: "stashpad-trash-group-icon" }), "trash-2");
+        head.createSpan({ text: "Stashpad trash" });
         head.createSpan({ cls: "stashpad-trash-group-count", text: String(items.length) });
         for (const it of items) this.encRow(group, it, !it.meta?.title);
       }
@@ -205,14 +213,15 @@ export class StashpadTrashView extends ItemView {
     for (const u of rows) {
       const row = list.createDiv({ cls: "stashpad-trash-row" });
       const main = row.createDiv({ cls: "stashpad-trash-row-main" });
+      const isPlain = u.kind === "enc" && u.enc?.meta?.encrypted === false;
       const badge = main.createSpan({ cls: `stashpad-trash-kind is-${u.kind}` });
-      setIcon(badge, u.kind === "enc" ? "lock" : "trash");
+      setIcon(badge, u.kind === "enc" && !isPlain ? "lock" : "trash");
       if (u.kind === "enc" && u.enc) {
         const it = u.enc;
-        const hidden = !it.meta?.title;
-        main.createSpan({ cls: "stashpad-trash-title", text: hidden ? "Locked note" : (it.meta?.title || "Locked note") });
+        const hidden = !it.meta?.title && !isPlain;
+        main.createSpan({ cls: "stashpad-trash-title", text: it.meta?.title || (isPlain ? "Deleted note" : "Locked note") });
         const when = it.meta?.deletedAt ? `deleted ${momentFn(it.meta.deletedAt).fromNow()}` : "deleted";
-        main.createSpan({ cls: "stashpad-trash-sub", text: `${when} · encrypted` });
+        main.createSpan({ cls: "stashpad-trash-sub", text: `${when} · ${isPlain ? "unencrypted" : "encrypted"}` });
         const btn = row.createEl("button", { cls: "stashpad-trash-restore", text: "Restore" });
         setIcon(btn.createSpan({ cls: "stashpad-btn-icon" }), "rotate-ccw");
         btn.onclick = async () => { btn.disabled = true; const ok = await this.plugin.restoreDeletedAt(it.blob); if (ok) await this.render(); else btn.disabled = false; };

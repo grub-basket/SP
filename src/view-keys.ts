@@ -18,6 +18,14 @@ function eventKeyId(e: KeyboardEvent): string {
 export function matchKey(e: KeyboardEvent, key: string): boolean {
   if (!key) return false;
   if (e.metaKey || e.ctrlKey || e.altKey) return false;
+  // Single-character SYMBOL bindings (e.g. "&", "/", ";") match the produced
+  // glyph directly. eventKeyId normalizes a shifted digit to its base digit
+  // (Shift+7 → "7"), so a glyph default like "&" would never match — the merge
+  // hotkey defaulted to "&" and was silently dead. Comparing against e.key makes
+  // it fire on any layout that produces the glyph (US/UK Shift+7, AZERTY's
+  // unshifted &), and plain "7" still won't trigger it (e.key is "7", not "&").
+  // 0.144.0
+  if (key.length === 1 && !/[a-z0-9]/i.test(key)) return e.key === key;
   return eventKeyId(e) === key.toLowerCase();
 }
 

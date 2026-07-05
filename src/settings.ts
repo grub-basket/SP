@@ -1793,19 +1793,40 @@ export class StashpadSettingTab extends PluginSettingTab {
         b.buttonEl.addClass("mod-warning");
       });
 
-      // Phase 5: retire the LEGACY central keyfile (shown only if one is still
-      // present). Encryption is per-folder now; the old `.stashpad/keys.json` is
-      // just a read-only backup. Retiring PARKS it (reversible, nothing deleted).
+      // Phase 5: retire the LEGACY central keyfile. Encryption is per-folder now; the
+      // old `.stashpad/keys.json` is just a read-only backup. Retiring PARKS it
+      // (reversible, KEEPS a recoverable backup); a separate hard-wipe permanently
+      // deletes all old key material for users who want a clean removal (finding #1).
+      const hardWipe = (): void => {
+        new TypeToConfirmModal(this.app, {
+          title: "Permanently delete the old key material?",
+          body: "This PERMANENTLY deletes the old central keyfile (.stashpad/keys.json), its _keys/ backups, and any retired-keyfile backups — with NO copy kept and NO way to recover them. It does NOT touch your per-folder passwords or currently-encrypted content (use “Remove all encryption” above for those). Only do this if you're sure you'll never need the old key material back.",
+          phrase: "DELETE KEY MATERIAL",
+          confirmText: "Permanently delete",
+          onConfirm: async () => {
+            const n = await enc.wipeLegacyKeyMaterial();
+            new Notice(n > 0 ? `Permanently deleted the old key material (${n} item${n === 1 ? "" : "s"}). Not recoverable.` : "No old key material found to delete.", 9000);
+            this.update?.();
+          },
+        }).open();
+      };
       if (enc.hasLegacyKeyfile()) {
         new Setting(host).setName("Retire the old encryption keyfile")
-          .setDesc("This vault still has the old central keyfile (.stashpad/keys.json), kept only as a read-only backup now that encryption is per-folder. Retiring MOVES it and its _keys/ backups into .stashpad/retired-keyfile-<date>/ — reversible, nothing is deleted. Blocked if any folder's key still lives only in the old keyfile.")
-          .addButton((b) => b.setButtonText("Retire old keyfile").onClick(async () => {
+          .setDesc("This vault still has the old central keyfile (.stashpad/keys.json), kept only as a read-only backup now that encryption is per-folder. “Retire” MOVES it and its _keys/ backups into .stashpad/retired-keyfile-<date>/ — reversible, and a recoverable copy is KEPT (nothing is deleted). “Permanently delete” instead removes all old key material with no backup. Retire is blocked if any folder's key still lives only in the old keyfile.")
+          .addButton((b) => b.setButtonText("Retire (keep backup)").onClick(async () => {
             try {
               const n = await enc.retireLegacyKeyfile();
-              new Notice(`Retired the old keyfile — ${n} file${n === 1 ? "" : "s"} moved into .stashpad/retired-keyfile-… Reversible; nothing was deleted.`, 9000);
+              new Notice(`Retired the old keyfile — ${n} file${n === 1 ? "" : "s"} moved into .stashpad/retired-keyfile-… Reversible; a copy is kept.`, 9000);
               this.update?.();
             } catch (e) { new Notice((e as Error).message, 12000); }
-          }));
+          }))
+          .addButton((b) => { b.setButtonText("Permanently delete…").onClick(hardWipe); b.buttonEl.addClass("mod-warning"); });
+      } else if (enc.hasRecoverableKeyMaterial()) {
+        // No live keyfile, but a prior retire left recoverable backups on disk — let
+        // the user finish the job with a clean, permanent removal.
+        new Setting(host).setName("Delete retired keyfile backups")
+          .setDesc("The old keyfile was retired, but a recoverable backup is still on disk (.stashpad/retired-keyfile-… / _keys/). Permanently delete it if you no longer want it recoverable. Doesn't touch your per-folder passwords or encrypted content.")
+          .addButton((b) => { b.setButtonText("Permanently delete…").onClick(hardWipe); b.buttonEl.addClass("mod-warning"); });
       }
 
       // (0.143.0: vault-wide setup/unlock/change-device/shared-password/collaborator

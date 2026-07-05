@@ -64,6 +64,11 @@ export class EncryptionService {
   private folderKeystore: FolderKeystore;
   private folderKeyFiles = new Map<string, StashKey>();
   private stashKeysIndexed = false;
+  /** Cached: is there still-recoverable legacy key material on disk — a live
+   *  `_keys/` backup OR a parked `.stashpad/retired-keyfile-*` dir from a prior
+   *  retire? Refreshed in refresh(); drives the settings "hard-wipe" affordance so
+   *  it's reachable even after the live keyfile is already parked. (0.144.1) */
+  private parkedKeyMaterial = false;
 
   // (0.135.0: the idle auto-lock timer is gone — armIdle/clearIdle/idleMinutes
   // removed. The session key lives until Obsidian closes or encryption is
@@ -78,10 +83,31 @@ export class EncryptionService {
 
   /** Load the synced keyfile into the in-memory cache. Call on plugin load and
    *  before any operation that needs a fresh view of collaborators. */
-  async init(): Promise<void> { await this.refresh(); }
+  async init(): Promise<void> {
+    await this.refresh();
+    // Detect recoverable legacy key material ONCE on load (not in refresh — that's on
+    // the folder-unlock hot path). retire()/wipe() keep the flag current in-session.
+    this.parkedKeyMaterial = await this.detectParkedKeyMaterial();
+  }
   async refresh(): Promise<void> {
     this.kf = await this.keyfiles.load();
     if (!this.stashKeysIndexed) await this.indexStashKeys();
+  }
+
+  /** Cheap disk check: any recoverable legacy key material still on disk —
+   *  `_keys/` backups (top-level or a prior remove-encryption `removed-*` dir) or a
+   *  parked `.stashpad/retired-keyfile-*` dir. Two `adapter.list` calls. */
+  private async detectParkedKeyMaterial(): Promise<boolean> {
+    const a = this.app.vault.adapter;
+    try {
+      const l = await a.list("_keys");
+      if ((l.files || []).some((f) => /\.json$/.test(f)) || (l.folders || []).length) return true;
+    } catch { /* no _keys */ }
+    try {
+      const l = await a.list(".stashpad");
+      if ((l.folders || []).some((f) => /\/retired-keyfile-/.test(f))) return true;
+    } catch { /* no .stashpad */ }
+    return false;
   }
 
   /** Force a re-scan of `.stashkey` files on the next refresh (after a folder key
@@ -622,7 +648,39 @@ export class EncryptionService {
       }
     } catch { /* no _keys */ }
     this.kf = null; // stop consulting the (now-parked) keyfile
+    // The parked copies ARE recoverable material — keep the hard-wipe reachable.
+    this.parkedKeyMaterial = true;
     return parked;
+  }
+
+  /** True if any recoverable legacy key material is still on disk — a live keyfile /
+   *  `_keys/` backup, or a parked `retired-keyfile-*` dir from a prior retire. Sync
+   *  (cached); drives the settings hard-wipe affordance. (0.144.1) */
+  hasRecoverableKeyMaterial(): boolean { return !!this.kf || this.parkedKeyMaterial; }
+
+  /** HARD-WIPE all legacy key material — no backup, not reversible. Removes the live
+   *  `.stashpad/keys.json`, the whole `_keys/` dir, and every parked
+   *  `.stashpad/retired-keyfile-*` dir. For users who want a clean removal rather
+   *  than the reversible park. (Per-folder `.stashkey` files and folder-password
+   *  keychain entries are NOT touched — those govern live per-folder encryption; use
+   *  "Remove all encryption" for those.) Caller MUST hard-confirm first. Returns the
+   *  number of paths removed. (0.144.1) */
+  async wipeLegacyKeyMaterial(): Promise<number> {
+    const a = this.app.vault.adapter;
+    let removed = 0;
+    const rm = async (p: string, dir: boolean): Promise<void> => {
+      try { if (await a.exists(p)) { if (dir) await a.rmdir(p, true); else await a.remove(p); removed++; } }
+      catch { /* best-effort; leave what won't delete */ }
+    };
+    await rm(".stashpad/keys.json", false);
+    await rm("_keys", true);
+    try {
+      const l = await a.list(".stashpad");
+      for (const d of (l.folders || [])) if (/\/retired-keyfile-/.test(d)) await rm(d, true);
+    } catch { /* no .stashpad */ }
+    this.kf = null;
+    this.parkedKeyMaterial = false;
+    return removed;
   }
 
   dispose(): void { this.lock(); }

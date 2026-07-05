@@ -6895,6 +6895,46 @@ export class StashpadView extends ItemView {
     });
   }
 
+  /** 0.145.0: the DEFAULT (encryption-off) delete — bundle the source subtrees into
+   *  Stashpad's own per-folder trash/ as plaintext `.stashpack` bundles (recoverable
+   *  from the Trash view), plaintext gone from the folder, and push ONE undo entry
+   *  that restores them. Mirrors secureDeleteSources without the crypto; no confirm
+   *  (undo + the Trash view are the safety net, same as the encrypted path). */
+  private async plaintextDeleteToStashpadTrash(sources: TreeNode[]): Promise<void> {
+    const ids = new Set(sources.map((t) => t.id));
+    const roots = sources.filter((t) => {
+      let p = t.parent;
+      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      return true;
+    });
+    if (roots.length === 0) return;
+    const folder = this.noteFolder;
+    const rootIds = roots.map((r) => r.id);
+    let blobs: string[] = [];
+    for (const id of rootIds) { const b = await this.plugin.plaintextDeleteSubtree(folder, id); if (b) blobs.push(b); }
+    if (blobs.length === 0) return;
+    this.selection.clear(); this.lastSelected = null; this.tree.rebuild(folder); this.render();
+    this.plugin.notifications.show({ message: `Deleted ${blobs.length} note${blobs.length === 1 ? "" : "s"} → Trash. Undo to bring ${blobs.length === 1 ? "it" : "them"} back.`, kind: "success", category: "system", folder, actions: [{ label: "Open Trash", onClick: () => this.plugin.openEncryptedTrash() }] });
+    this.plugin.getUndoStack(folder).push({
+      label: `Delete (${blobs.length})`,
+      undo: async () => {
+        const failed: string[] = [];
+        for (const b of blobs) {
+          try { if (!(await this.plugin.restoreDeletedAt(b, { silent: true }))) failed.push(b); }
+          catch (e) { failed.push(b); console.warn("[Stashpad] plaintext-trash undo failed", b, e); }
+        }
+        blobs = failed;
+        if (failed.length) new Notice(`Undo incomplete: ${failed.length} deleted item${failed.length === 1 ? "" : "s"} couldn't be restored (still in Trash). Try again, or restore from the Trash view.`, 8000);
+        this.tree.rebuild(folder); this.render();
+      },
+      redo: async () => {
+        blobs = [];
+        for (const id of rootIds) { const b = await this.plugin.plaintextDeleteSubtree(folder, id); if (b) blobs.push(b); }
+        this.tree.rebuild(folder); this.render();
+      },
+    });
+  }
+
   /** 0.98.12: decrypt (unlock) locked stashes back into place. Counterpart to
    *  cmdLockSelection. Recursively unlocks every locked stash under the action
    *  target's subtree (0.98.12.02), falling back to the focused view's locked set.
@@ -10419,6 +10459,15 @@ export class StashpadView extends ItemView {
         return;
       }
       await this.secureDeleteSources(targets);
+      return;
+    }
+    // 0.145.0: the DEFAULT delete (encryption OFF) now lands in Stashpad's OWN
+    // per-folder trash/ as a recoverable plaintext bundle — surfaced in the Trash
+    // view — instead of Obsidian's trash. Only `forcePlaintext` (the explicit
+    // "Delete to Obsidian's trash (unencrypted)" command) or the folder's
+    // trashHandling="obsidian" pref routes to Obsidian's native trash below.
+    if (!opts.forcePlaintext && !_followObsidian) {
+      await this.plaintextDeleteToStashpadTrash(targets);
       return;
     }
     if (targets.length === 1) { await this.deleteNote(targets[0]); return; }

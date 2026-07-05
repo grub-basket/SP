@@ -13,7 +13,7 @@ import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelI
 import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs } from "./encryption-ops";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT } from "./encryption-ops";
 import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
@@ -4051,9 +4051,61 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** DEFAULT (encryption-off) delete → Stashpad's own per-folder `trash/` as an
+   *  UNENCRYPTED `.stashpack` bundle, recoverable from the Trash view. Returns the
+   *  bundle path, or null on failure (plaintext kept intact). 0.145.0 */
+  async plaintextDeleteSubtree(folder: string, rootId: StashpadId): Promise<string | null> {
+    try {
+      const deletedAt = new Date().toISOString();
+      const r = await deletePlaintextSubtree(this.app, folder, rootId, deletedAt, trashSubfolderOf(folder));
+      this.unwatchReEncrypt(folder, rootId); // no longer in the folder
+      if (r.unpurged.length > 0) {
+        new Notice(`⚠️ Sent to trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in place (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
+      }
+      return r.blobPath;
+    } catch (e) {
+      console.warn("[Stashpad] plaintext trash delete failed", e);
+      new Notice(`Couldn't delete to trash: ${(e as Error).message}`, 0);
+      return null;
+    }
+  }
+
+  /** List plaintext trash bundles (`.stashpack`) across per-folder trash dirs, with
+   *  their sidecar meta — for the Trash view. Independent of encryption being
+   *  configured (these need no key). 0.145.0 */
+  async listPlaintextTrash(): Promise<Array<{ blob: string; meta: DeletedMeta | null }>> {
+    const blobs = await listPlaintextTrashBundles(this.app, this.trashSubfolderDirs());
+    const out: Array<{ blob: string; meta: DeletedMeta | null }> = [];
+    for (const b of blobs) out.push({ blob: b, meta: await readDeletedMeta(this.app, b) });
+    return out;
+  }
+
   /** Restore an encrypted-deleted blob back into its original folder. */
   async restoreDeletedAt(blobPath: string, opts: { silent?: boolean } = {}): Promise<boolean> {
     const meta = await readDeletedMeta(this.app, blobPath);
+    // Plaintext trash bundle (default encryption-off delete): no key, no decrypt.
+    // Detected by extension (authoritative) with meta.encrypted as a cross-check.
+    if (blobPath.endsWith(`.${STASHPACK_EXT}`) || meta?.encrypted === false) {
+      try {
+        // Existing ids from DISK frontmatter (cache lags after restore churn), same
+        // as the encrypted path — prevents importStashZip re-pinning a child to ROOT.
+        const destGuess = await deletedRestoreDest(this.app, blobPath, meta);
+        const existing = new Set<StashpadId>();
+        for (const f of this.app.vault.getMarkdownFiles()) {
+          if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== destGuess.replace(/\/+$/, "")) continue;
+          try { const id = splitFrontmatter(await this.app.vault.read(f)).fm.id; if (typeof id === "string") existing.add(id); }
+          catch { /* unreadable — skip */ }
+        }
+        const r = await restorePlaintextDeleted(this.app, blobPath, existing);
+        this.pendingEncBlobs.delete(blobPath);
+        if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo, actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(r.restoredTo) }] });
+        return true;
+      } catch (e) {
+        console.warn("[Stashpad] restore plaintext trash failed", e);
+        new Notice(`Couldn't restore: ${(e as Error).message}`, 0);
+        return false;
+      }
+    }
     // Per-folder trash keys: resolve the key this blob was encrypted under via its
     // sidecar keyId (the owning folder's key); else the vault DEK (legacy/vault-keyed).
     // 0.143.0: per-folder only — resolve the key this blob was encrypted under via
@@ -4263,7 +4315,9 @@ export default class StashpadPlugin extends Plugin {
   async restoreAllTrash(): Promise<number> {
     // 0.143.0: per-folder only — restoreDeletedAt unlocks each blob's owning folder
     // key on demand (and skips any it can't), so no vault-wide unlock gate here.
-    const items = await this.listDeletedTrash();
+    // 0.145.0: include plaintext trash bundles (no key needed) so "Restore all"
+    // doesn't silently skip default (encryption-off) deletes.
+    const items = [...await this.listDeletedTrash(), ...await this.listPlaintextTrash()];
     if (items.length === 0) { new Notice("Nothing to restore."); return 0; }
     const prog = items.length > 3 ? new Notice("", 0) : null;
     let count = 0;

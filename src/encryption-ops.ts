@@ -12,8 +12,14 @@ export const STASHENC_EXT = "stashenc";
  *  the 🔒 stub in the right spot — survives a lost settings registry AND travels
  *  with the blob across devices. Never the note contents (those stay encrypted). */
 export const STASHMETA_EXT = "stashmeta";
+/** Plaintext trash-bundle extension — an UNENCRYPTED zip of a Stashpad subtree,
+ *  parked in `<folder>/trash/` so a DEFAULT (encryption-off) delete is still
+ *  recoverable from the Trash view. Same sidecar + restore shape as the encrypted
+ *  `.stashenc` path, minus the crypto. Distinct ext so the encrypted-only
+ *  listing/rotation code never picks these up. 0.145.0 */
+export const STASHPACK_EXT = "stashpack";
 export interface LockedMeta { v: number; parentId: string | null; title: string; count: number; created: string; rootId: string; prevSibling: string | null; }
-function sidecarPath(blobPath: string): string { return blobPath.replace(/\.stashenc$/, `.${STASHMETA_EXT}`); }
+function sidecarPath(blobPath: string): string { return blobPath.replace(/\.(stashenc|stashpack)$/, `.${STASHMETA_EXT}`); }
 export async function readLockedMeta(app: App, blobPath: string): Promise<LockedMeta | null> {
   try { return JSON.parse(await app.vault.adapter.read(sidecarPath(blobPath))) as LockedMeta; }
   catch { return null; }
@@ -302,6 +308,10 @@ export interface DeletedMeta {
    *  vault DEK (legacy / vault-keyed folders). Restore resolves the right key by this
    *  id; rotation re-encrypts the trash blobs whose keyId matches the rotated key. */
   keyId?: string;
+  /** false ⇒ this is an UNENCRYPTED plaintext trash bundle (`.stashpack`, a default
+   *  encryption-off delete). Absent/true ⇒ encrypted `.stashenc` blob. Restore skips
+   *  key resolution + decrypt when false. 0.145.0 */
+  encrypted?: boolean;
 }
 
 function bytesToB64(bytes: Uint8Array): string {
@@ -459,6 +469,101 @@ export async function restoreDeleted(
 export async function readDeletedMeta(app: App, blobPath: string): Promise<DeletedMeta | null> {
   try { return JSON.parse(await app.vault.adapter.read(sidecarPath(blobPath))) as DeletedMeta; }
   catch { return null; }
+}
+
+/** DEFAULT (encryption-off) delete: bundle a subtree into an UNENCRYPTED `.stashpack`
+ *  zip in `destDir` (`<folder>/trash/`), write the restore sidecar, then permanently
+ *  delete the plaintext originals. The bundle is the recoverable copy (Trash view →
+ *  restore). Mirrors `deleteEncryptSubtree` with the crypto removed — same
+ *  build-verify-sidecar-purge ordering, so the plaintext is only removed after the
+ *  bundle is confirmed on disk AND its sidecar written. No title-hiding (there's
+ *  nothing to hide — it's plaintext). */
+export async function deletePlaintextSubtree(
+  app: App, folder: string, rootId: StashpadId, deletedAt: string, destDir: string,
+): Promise<{ blobPath: string; noteCount: number; rootId: StashpadId; originalFolder: string; title: string; unpurged: string[] }> {
+  const sub = await collectSubtree(app, folder, rootId);
+  if (!sub) throw new Error("Couldn't find that note to delete.");
+  const { rootNote, descendants, parentId } = sub;
+
+  const allNodes = [rootNote, ...descendants];
+  const mtimes = new Map<string, number>();
+  for (const n of allNodes) {
+    try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline */ }
+    for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
+      try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
+    }
+  }
+
+  const zip = await buildStashZip(app, {
+    rootNotes: [{ id: rootNote.id, file: rootNote.file }],
+    allDescendants: descendants.map((d) => ({ id: d.id, file: d.file })),
+    sourceFolder: folder,
+  });
+
+  // dest may be nested (X/trash) — mkdir intermediates.
+  {
+    const parts = destDir.replace(/\/+$/, "").split("/").filter(Boolean);
+    let cur = "";
+    for (const p of parts) { cur = cur ? `${cur}/${p}` : p; try { if (!(await app.vault.adapter.exists(cur))) await app.vault.adapter.mkdir(cur); } catch { /* race */ } }
+  }
+  const cleanedFolder = folder.replace(/\/+$/, "");
+  const folderSlug = cleanedFolder.split("/").pop() || "vault";
+  const base = safeBlobBase(`${folderSlug} ${titleFromFile(rootNote.file)}`);
+  let blobPath = `${destDir}/${base}.${STASHPACK_EXT}`;
+  for (let n = 1; await app.vault.adapter.exists(blobPath); n++) blobPath = `${destDir}/${base} (${n}).${STASHPACK_EXT}`;
+  await writeBlobVerified(app, blobPath, zip);
+
+  const meta: DeletedMeta = {
+    v: 1, kind: "deleted",
+    originalFolder: cleanedFolder,
+    parentId,
+    title: titleFromFile(rootNote.file), count: allNodes.length,
+    created: rootNote.created, rootId, deletedAt,
+    encrypted: false,
+  };
+  try { await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta)); }
+  catch (e) {
+    // Same guarantee as the encrypted path: without the sidecar the bundle is
+    // unrestorable from the UI, so roll back the bundle and keep the plaintext.
+    console.warn("[Stashpad] couldn't write trash sidecar — aborting delete, keeping plaintext", e);
+    try { await app.vault.adapter.remove(blobPath); } catch { /* leave orphan bundle; plaintext is safe */ }
+    throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
+  }
+
+  const { unpurged } = await purgeSubtreePlaintext(app, allNodes, mtimes);
+  return { blobPath, noteCount: allNodes.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
+}
+
+/** Restore a plaintext trash bundle (`.stashpack`) back into its origin folder,
+ *  then remove the bundle + sidecar. No key, no decrypt — mirrors `restoreDeleted`
+ *  minus the crypto. */
+export async function restorePlaintextDeleted(
+  app: App, blobPath: string, existingIds: Set<StashpadId>,
+): Promise<{ notesWritten: number; restoredTo: string }> {
+  const zip = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
+  const meta = await readDeletedMeta(app, blobPath);
+  // No dek: plaintext bundles never hide their origin, so `originalFolder` (or the
+  // blob's own trash-parent fallback) is always the source of truth.
+  const dest = await deletedRestoreDest(app, blobPath, meta);
+  const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true });
+  await app.vault.adapter.remove(blobPath);
+  try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* may not exist */ }
+  return { notesWritten: summary.notesWritten, restoredTo: dest };
+}
+
+/** List plaintext trash bundles (`.stashpack`) across the given per-folder trash
+ *  dirs. Kept separate from `listDeletedBlobs` (encrypted-only) so rotation /
+ *  re-encrypt / removal code never mistakes a plaintext bundle for an encrypted one. */
+export async function listPlaintextTrashBundles(app: App, dirs: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const dir of dirs) {
+    try {
+      if (!(await app.vault.adapter.exists(dir))) continue;
+      const listing = await app.vault.adapter.list(dir);
+      out.push(...listing.files.filter((f) => f.endsWith(`.${STASHPACK_EXT}`)));
+    } catch { /* skip unreadable dir */ }
+  }
+  return out;
 }
 
 /** Permanently delete an encrypted-trash item: the `.stashenc` blob AND its
