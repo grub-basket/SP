@@ -14,12 +14,12 @@ import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal } from "./modals";
+import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
 } from "./settings";
-import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename } from "./slug-service";
+import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { ensureOkfTemplate, okfFolders, rebuildOkfForFolder, OKF_DEFAULT_TEMPLATE_PATH } from "./okf";
@@ -27,7 +27,7 @@ import { buildOkfBundleFiles, zipBundle, tarGzBundle } from "./okf-export";
 import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
-import { parseRunActions, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
+import { parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
 import { ROOT_ID, parseAssignees } from "./types";
 import { parseRecurrence, nextDueOnComplete, parseDuration } from "./recurrence";
 import { OrderStore } from "./order-store";
@@ -1369,6 +1369,11 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-copy-link",
       name: "Copy Stashpad link (deep link / URL) to note",
       callback: () => call("cmdCopyStashpadLink"),
+    });
+    this.addCommand({
+      id: "stashpad-open-link",
+      name: "Open Stashpad link (paste a deep link / URL)",
+      callback: () => this.openDeepLinkModal(),
     });
     this.addCommand({
       id: "stashpad-copy-outline",
@@ -2726,10 +2731,16 @@ export default class StashpadPlugin extends Plugin {
       return p === dir;
     });
     for (const file of files) {
-      const id = parseIdFromFilename(file.basename);
+      const fmIdRaw = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+      const fmId = typeof fmIdRaw === "string" ? fmIdRaw : null;
+      // Prefer the filename's `-<id>` suffix; fall back to the FRONTMATTER id
+      // when the filename lacks one — but ONLY if it's a real 6-char note id, so
+      // a hand-renamed Stashpad note (name stripped of its id) gets repaired
+      // without ever renaming a foreign file that merely carries an `id:` field.
+      const fnId = parseIdFromFilename(file.basename);
+      const id = fnId ?? (isNoteId(fmId) ? fmId : null);
       if (!id || id === ROOT_ID) continue;
       // Confirm it's actually a Stashpad note (id matches frontmatter).
-      const fmId = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
       if (fmId !== id) continue;
       try {
         const raw = await this.app.vault.cachedRead(file);
@@ -5224,6 +5235,18 @@ export default class StashpadPlugin extends Plugin {
       }
       console.warn(`[stashpad] deep link: unknown action “${token}” — skipped.`);
     }
+  }
+
+  /** Prompt for a pasted `obsidian://stashpad?…` link and open it — the manual
+   *  path for apps that won't hyperlink `obsidian://` URLs. Same routing as a
+   *  clicked link (`handleDeepLink`), so folder/note resolution + loud failures
+   *  are shared. */
+  openDeepLinkModal(): void {
+    new OpenDeepLinkModal(this.app, (raw) => {
+      const parsed = parseStashpadLink(raw);
+      if (!parsed) { new Notice("That doesn't look like a Stashpad link."); return; }
+      void this.handleDeepLink(parsed);
+    }).open();
   }
 
   /** Tidy Stashpad tabs: PRUNE orphans (focused on a note that no longer

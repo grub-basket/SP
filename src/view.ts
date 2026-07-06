@@ -17,7 +17,7 @@ import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { buildFileActions } from "./notifications";
 import { newId } from "./id-service";
-import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, DEFAULT_STOPWORDS } from "./slug-service";
+import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, DEFAULT_STOPWORDS } from "./slug-service";
 import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
 import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
@@ -3274,6 +3274,14 @@ export class StashpadView extends ItemView {
       e.preventDefault();
       this.openMobileActionsMenu(moreBtn);
     };
+
+    // Paste-and-open a Stashpad deep link. Sits next to ⚡; on narrow widths it's
+    // hidden by CSS (`@container`) and folds into the ⚡ actions menu instead
+    // (which always carries the same "Open Stashpad link…" item).
+    const openLinkBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn stashpad-open-link-btn" });
+    setIconSafe(openLinkBtn, "link", "🔗");
+    openLinkBtn.title = "Open a Stashpad link (paste a deep link / URL)";
+    openLinkBtn.onclick = (e) => { e.preventDefault(); this.plugin.openDeepLinkModal(); };
   }
 
   /** Action menu for mobile — a single Menu with the most common
@@ -3297,6 +3305,7 @@ export class StashpadView extends ItemView {
     // looks reverted to a stale state. Kept here in the top (selection-independent)
     // group so it's visible without scrolling past the selection commands.
     menu.addItem((it: any) => it.setTitle("Reload without saving").setIcon("rotate-ccw").onClick(() => this.plugin.reloadAppForUpdate()));
+    menu.addItem((it: any) => it.setTitle("Open Stashpad link…").setIcon("link").onClick(() => this.plugin.openDeepLinkModal()));
     menu.addSeparator();
     // List-wide expand/collapse — operate on every note, independent of selection.
     menu.addItem((it: any) => it.setTitle("Expand all").setIcon("unfold-vertical").onClick(() => this.cmdExpandAll()));
@@ -4616,32 +4625,22 @@ export class StashpadView extends ItemView {
     }
 
     const PER_CRUMB_MAX = 28;     // hard per-crumb char cap (then per-CSS visual ellipsis)
-    const TOTAL_CHAR_BUDGET = 100; // path length budget across all crumbs (excluding "Home")
 
     type Crumb = { id: StashpadId; label: string; isEllipsis?: boolean };
     const path = this.tree.pathTo(this.focusId);
+    // Warm body text for any crumb not cached yet so titleForNode shows the
+    // note's first line, not its filename slug (repaints once when ready).
+    this.warmCrumbTitles(path);
     const crumbs: Crumb[] = path.map((n) => {
       const raw = this.titleForNode(n);
       const label = raw.length > PER_CRUMB_MAX ? raw.slice(0, PER_CRUMB_MAX - 1) + "…" : raw;
       return { id: n.id, label };
     });
 
-    const lengthOf = (cs: Crumb[]): number =>
-      cs.reduce((sum, c) => sum + c.label.length + 3 /* " / " */, 0);
-
-    // Collapse middle crumbs (left-to-right after Home) until under budget.
-    // Always preserve: first crumb (top of subtree) and last crumb (current focus).
-    if (lengthOf(crumbs) > TOTAL_CHAR_BUDGET && crumbs.length > 2) {
-      let inserted = false;
-      // Drop crumbs at index 1 (just after the first non-Home crumb) repeatedly.
-      while (lengthOf(crumbs) > TOTAL_CHAR_BUDGET && crumbs.length > 2) {
-        crumbs.splice(1, 1);
-        if (!inserted) {
-          crumbs.splice(1, 0, { id: "__ellipsis__", label: "…", isEllipsis: true });
-          inserted = true;
-        }
-      }
-    }
+    // No total-path character budget (removed 0.148.2): the row is full-width,
+    // so let every crumb render and let CSS overflow handle the rare over-long
+    // path. Only the per-crumb cap above remains, to stop a single giant title
+    // dominating.
 
     // 0.117.0: on mobile the row already has a flex `gap` between items, so
     // the spaces around the slash double the spacing and look wasteful at
@@ -4897,6 +4896,11 @@ export class StashpadView extends ItemView {
 
     this.renderNoteBody(body, node, {
       clamp: Platform.isMobile,
+      // The focused header is a single, always-visible element (and on desktop
+      // lives outside the list's lazy-render observer), so render its body now
+      // rather than deferring — otherwise a cold (uncached) note stays on the
+      // title placeholder instead of showing its body.
+      immediate: true,
       // Toggle slots into the actions cluster, BEFORE the first button — so
       // the order reads [More] [⋯] on mobile / [More] [Edit] [Duplicate] on desktop.
       toggleHost: actions,
@@ -4991,8 +4995,39 @@ export class StashpadView extends ItemView {
     if (!node.file) return "Untitled";
     const cache = this.app.metadataCache.getFileCache(node.file);
     const firstHeading = cache?.headings?.[0]?.heading;
-    if (firstHeading) return firstHeading;
+    if (firstHeading) return firstHeading.trim();
+    // Prefer the note's first body line (what the row / focused header shows)
+    // over the filename: a filename can be a short slug that doesn't match its
+    // content (e.g. `grand.md` whose body is "Grandchild under child A of
+    // Alpha."). The persisted render cache holds body text synchronously once a
+    // note has been shown; `warmCrumbTitles` (called from renderBreadcrumb) warms
+    // any crumb not cached yet. Falls back to the filename slug on a miss.
+    const bodyText = this.plugin.renderCacheStore.get(node.file.path)?.text;
+    const firstLine = bodyText?.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+    if (firstLine) return firstLine;
     return node.file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
+  }
+
+  /** Warm the render cache for breadcrumb nodes that have no heading and no
+   *  cached body yet (e.g. a deep-link jump straight to a note, before its
+   *  ancestors were ever shown), so titleForNode can use their body's first line
+   *  instead of the filename. Async + fire-once re-render; guarded against loops
+   *  by only re-rendering when something was actually warmed. */
+  private warmCrumbTitles(nodes: TreeNode[]): void {
+    const cold = nodes.filter((n) => {
+      if (!n.file) return false;
+      if (this.app.metadataCache.getFileCache(n.file)?.headings?.[0]?.heading) return false;
+      // Cold = no cache ENTRY at all. A cached-but-empty body (text === "")
+      // legitimately falls back to the filename, so don't re-warm it every paint.
+      return !this.plugin.renderCacheStore.get(n.file.path);
+    });
+    if (!cold.length) return;
+    void Promise.all(cold.map((n) => this.bodyRenderer.getOrComputeRender(n.file!).catch(() => null)))
+      .then((results) => {
+        // Only repaint if at least one warm produced usable text (avoids a
+        // render loop when a node genuinely has an empty body).
+        if (results.some((r) => r && r.text && r.text.trim())) this.debouncedRender();
+      });
   }
 
   /** Force a parent's sort mode back to "manual" after any operation that
@@ -5270,12 +5305,16 @@ export class StashpadView extends ItemView {
   private renderNoteBody(
     container: HTMLElement,
     node: TreeNode,
-    opts: { clamp?: boolean; toggleHost?: HTMLElement; toggleAnchor?: HTMLElement } = { clamp: true },
+    opts: { clamp?: boolean; toggleHost?: HTMLElement; toggleAnchor?: HTMLElement; immediate?: boolean } = { clamp: true },
   ): void {
     if (!node.file) return;
     // Warm rows (cached HTML) render instantly — no deferral needed. Cold
     // rows (the expensive cachedRead misses) get a placeholder + observer.
-    if (this.bodyRenderer.hasFreshRenderCache(node.file) || !this.bodyRenderer.isArmed()) {
+    // `immediate` forces the now-path for elements the list's IntersectionObserver
+    // doesn't cover — notably the desktop focused header, which is rendered into
+    // `root` (outside the observed list), so a deferred render would never fire
+    // and it'd stay stuck on the title placeholder (0.147.3 fix).
+    if (opts.immediate || this.bodyRenderer.hasFreshRenderCache(node.file) || !this.bodyRenderer.isArmed()) {
       this.renderNoteBodyNow(container, node, opts);
       return;
     }
@@ -11361,8 +11400,14 @@ export class StashpadView extends ItemView {
     d();
   }
   private async maybeRenameForSlug(file: TFile): Promise<void> {
-    const id = parseIdFromFilename(file.basename);
+    const fmIdRaw = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+    const fmId = typeof fmIdRaw === "string" ? fmIdRaw : null;
+    // Filename id, else the frontmatter id when it's a real note id — so a note
+    // whose filename lost its `-<id>` suffix still gets re-slugged on edit.
+    const fnId = parseIdFromFilename(file.basename);
+    const id = fnId ?? (isNoteId(fmId) ? fmId : null);
     if (!id || id === ROOT_ID) return;
+    if (fmId !== id) return; // must be a genuine Stashpad note
     const raw = await this.app.vault.cachedRead(file);
     const body = this.stripFrontmatter(raw);
     const newSlug = bodyToSlug(body, this.activeStopwords());

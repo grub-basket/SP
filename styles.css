@@ -53,6 +53,14 @@
   padding: 2px 0 4px;
   border-bottom: 1px solid var(--background-modifier-border);
 }
+/* Match the breadcrumb: on desktop the filter bar bleeds full-width too, so its
+   divider lines up edge-to-edge with the breadcrumb's below it. Negate
+   .stashpad-view's 12px padding + re-inset the content. Mobile keeps its own
+   bottom-toolbar layout. */
+.stashpad-view:not(.is-mobile) .stashpad-time-filter-bar {
+  margin-inline: -12px;
+  padding-inline: 12px;
+}
 .stashpad-folder-btn {
   flex: 0 0 auto;
   display: inline-flex;
@@ -870,7 +878,13 @@
 .stashpad-breadcrumb {
   font-size: var(--font-ui-small);
   color: var(--text-muted);
-  padding: 4px 2px;
+  /* Full-bleed: negate .stashpad-view's 12px horizontal padding so the row +
+     its bottom border span the entire plugin width, edge to edge, instead of
+     stopping ~12px short of the route button. The 14px inline padding (12 to
+     offset the negative margin + the original 2) keeps the crumb text aligned
+     where it was. */
+  margin-inline: -12px;
+  padding: 4px 14px;
   border-bottom: 1px solid var(--background-modifier-border);
   flex: 0 0 auto;
   display: flex;
@@ -971,13 +985,45 @@
    in-flow button at the end would clip exactly when crumbs overflow — which is
    when it's needed). The bar reserves right padding so crumbs clip BEHIND it. */
 .stashpad-breadcrumb { position: relative; }
-.stashpad-breadcrumb:has(.stashpad-crumb-levels-btn) { padding-right: 40px; }
-.stashpad-view.is-mobile .stashpad-breadcrumb:has(.stashpad-crumb-levels-btn) { padding-right: 40px; }
+/* +12px to match the full-bleed inline padding above (was 40, now 40+12). */
+.stashpad-breadcrumb:has(.stashpad-crumb-levels-btn) { padding-right: 52px; }
+.stashpad-view.is-mobile .stashpad-breadcrumb:has(.stashpad-crumb-levels-btn) { padding-right: 52px; }
 .stashpad-crumb-levels-btn.stashpad-mobile-action-btn {
   position: absolute;
-  right: 4px;
+  /* 16px = 12px content inset + the original 4px, so the button stays visually
+     put now that the breadcrumb bleeds 12px further right to the pane edge. */
+  right: 16px;
   top: 50%;
   transform: translateY(-50%);
+}
+/* Open-Stashpad-link modal: input fills the row, Paste button pinned at the far
+   right (aligned above the Open button). width:100% on the row overrides the
+   modal-content shrink-wrap; width:auto on the input overrides the base
+   .stashpad-export-name width:100% so the flex sizing takes over. */
+.stashpad-open-link-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+}
+.stashpad-open-link-row .stashpad-export-name {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+.stashpad-open-link-paste {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.stashpad-open-link-paste-icon {
+  display: inline-flex;
+}
+.stashpad-open-link-paste-icon .svg-icon {
+  width: 15px;
+  height: 15px;
 }
 /* 0.117.0: breadcrumb levels modal — full-width clickable rows, indented
    by depth. Mobile-responsive via the compact-modal base + fluid width. */
@@ -2373,6 +2419,9 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   flex: 0 0 auto;
   min-width: 16px;
 }
+/* The open-link (🔗) button sits right of the ⚡ actions button in the cluster on
+   every platform, including mobile (0.148.2 — was hidden under 480px before, but
+   it's wanted on phones). The same action also stays in the ⚡ actions menu. */
 
 /* Bottom Home/Back/Bookmarks toolbar is redundant now that the
    breadcrumb has a house-icon Home button + Alt+Left for back. Hide

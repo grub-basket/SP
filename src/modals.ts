@@ -1196,6 +1196,67 @@ export class TypeToConfirmModal extends Modal {
   onClose(): void { this.contentEl.empty(); }
 }
 
+/** Paste an `obsidian://stashpad?…` link and open it — the manual counterpart to
+ *  clicking a hyperlinked deep link, for apps that won't render `obsidian://`
+ *  URLs as clickable links. Prefills from the clipboard when it holds a Stashpad
+ *  link so the common case is just Enter. */
+export class OpenDeepLinkModal extends Modal {
+  constructor(app: App, private onSubmit: (raw: string) => void) { super(app); }
+  onOpen(): void {
+    this.contentEl.empty();
+    this.modalEl.addClass("stashpad-export-modal");
+    this.titleEl.setText("Open Stashpad link");
+    this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: "Paste an obsidian://stashpad link to jump to the note it points to." });
+
+    // Input + an explicit Paste button on one row. The button matters on mobile
+    // (and anywhere clipboard auto-read is blocked) where the auto-prefill below
+    // can't run — one tap fills the field.
+    const row = this.contentEl.createDiv({ cls: "stashpad-open-link-row" });
+    // Paste on the LEFT, input fills the rest of the row.
+    const pasteBtn = row.createEl("button", { cls: "stashpad-open-link-paste" });
+    setIcon(pasteBtn.createSpan({ cls: "stashpad-open-link-paste-icon" }), "clipboard-paste");
+    pasteBtn.createSpan({ text: "Paste" });
+    pasteBtn.title = "Paste from clipboard";
+    const input = row.createEl("input", { type: "text" });
+    input.addClass("stashpad-export-name");
+    input.placeholder = "obsidian://stashpad?folder=…&note=…";
+    pasteBtn.onclick = async () => {
+      try {
+        const t = (await navigator.clipboard?.readText?.())?.trim();
+        if (t) { input.value = t; }
+        input.focus();
+      } catch { new Notice("Couldn't read the clipboard — paste manually."); }
+    };
+
+    const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
+    footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    const go = footer.createEl("button", { cls: "mod-cta", text: "Open" });
+
+    const run = () => {
+      const v = input.value.trim();
+      if (!v) return;
+      this.close();
+      this.onSubmit(v);
+    };
+    go.onclick = () => run();
+    this.scope.register([], "Enter", (e) => { e.preventDefault(); run(); });
+
+    requestAnimationFrame(() => {
+      input.focus();
+      // Prefill from the clipboard when it already holds a Stashpad link — the
+      // whole point is pasting, so save the paste. Selected so the user can
+      // overwrite with a real paste if it's the wrong link. Best-effort.
+      void navigator.clipboard?.readText?.().then((t) => {
+        if (!input.value && t && /obsidian:\/\/stashpad\?/i.test(t.trim())) {
+          input.value = t.trim();
+          input.select();
+        }
+      }).catch(() => { /* clipboard blocked — user pastes manually */ });
+    });
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
 export class CustomColorModal extends Modal {
   private value: string;
   private delivered = false;

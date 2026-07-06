@@ -57,6 +57,15 @@ export function parseIdFromFilename(basename: string): string | null {
   return m ? m[1] : null;
 }
 
+/** True for a real generated Stashpad note id: exactly 6 chars from id-service's
+ *  alphabet — the same shape `parseIdFromFilename` recovers, so a filename built
+ *  with it round-trips. Used to safely fall back to the FRONTMATTER id when a
+ *  file's name lacks the `-<id>` suffix (repairing hand-renamed notes) without
+ *  ever renaming a foreign file that merely carries some other `id:` value. */
+export function isNoteId(id: unknown): id is string {
+  return typeof id === "string" && /^[abcdefghijkmnpqrstuvwxyz23456789]{6}$/.test(id);
+}
+
 /** Place an attachment's uniquifier stamp at the END of the filename (just
  *  before the extension) rather than the start:
  *  `buildAttachmentName("photo.png", "lqf3k2a9") === "photo-lqf3k2a9.png"`.

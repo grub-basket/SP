@@ -42,6 +42,48 @@ export function buildStashpadLink(parts: StashpadLinkParts): string {
   return `obsidian://${STASHPAD_PROTOCOL_ACTION}?${q.join("&")}`;
 }
 
+/** Params a pasted link resolves to — the shape `Plugin.handleDeepLink` accepts. */
+export interface StashpadLinkParams {
+  vault?: string;
+  folder?: string;
+  note?: string;
+  run?: string;
+  action?: string;
+}
+
+/** Parse a pasted `obsidian://stashpad?…` link (or a bare query string) into
+ *  handler params. Tolerant of surrounding whitespace, a leading `?`, and a
+ *  missing scheme (`folder=…&note=…` works too). Returns null when it isn't a
+ *  recognizable Stashpad link — either the wrong `obsidian://` action or no
+ *  `folder` param. Values come back URL-decoded (via URLSearchParams), matching
+ *  what Obsidian hands the live protocol handler. */
+export function parseStashpadLink(raw: string): StashpadLinkParams | null {
+  const text = (raw || "").trim();
+  if (!text) return null;
+
+  let query: string;
+  if (/^obsidian:\/\//i.test(text)) {
+    const m = text.match(/^obsidian:\/\/([^?]*)(?:\?(.*))?$/i);
+    if (!m) return null;
+    const act = decodeURIComponent(m[1].replace(/\/+$/, "")).toLowerCase();
+    if (act !== STASHPAD_PROTOCOL_ACTION) return null;
+    query = m[2] ?? "";
+  } else {
+    query = text.replace(/^\?/, "");
+  }
+
+  const params = new URLSearchParams(query);
+  const folder = params.get("folder");
+  if (!folder) return null; // folder is required to route a Stashpad link
+
+  const out: StashpadLinkParams = { folder };
+  const vault = params.get("vault"); if (vault) out.vault = vault;
+  const note = params.get("note"); if (note) out.note = note;
+  const run = params.get("run"); if (run) out.run = run;
+  const action = params.get("action"); if (action) out.action = action;
+  return out;
+}
+
 /** Parse the macro list from a protocol handler's params. Prefers `run`; falls
  *  back to `action` only when it isn't the reserved host name. Lower-cased,
  *  trimmed, empties dropped, defaults to `["reveal"]`. */
