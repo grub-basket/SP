@@ -501,6 +501,35 @@ export default class StashpadPlugin extends Plugin {
     return closed;
   }
 
+  /** 0.149.2: re-point every open Stashpad tab (live AND deferred) off a folder
+   *  that was just renamed `oldPath` → `newPath` (or nested under it), by updating
+   *  its persisted `folderOverride`. Without this the view keeps the stale
+   *  `noteFolder`, and its next write recreates the old-named folder (see the
+   *  rename listener that calls this). `setViewState` re-hydrates a live view onto
+   *  the new folder and rewrites a deferred leaf's persisted state so it loads
+   *  correctly next session. */
+  private retargetStashpadViewsForFolderRename(oldPath: string, newPath: string): void {
+    const from = (oldPath || "").replace(/\/+$/, "");
+    const to = (newPath || "").replace(/\/+$/, "");
+    if (!from || from === to) return;
+    const remap = (p: string | null | undefined): string | null => {
+      const c = (p ?? "").replace(/\/+$/, "");
+      if (c === from) return to;
+      if (c.startsWith(from + "/")) return to + c.slice(from.length);
+      return null;
+    };
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const vs = leaf.getViewState();
+      const st = (vs.state ?? {}) as { folderOverride?: string | null };
+      // Live views carry the resolved folder on `noteFolder` (may be the default,
+      // with folderOverride null); deferred leaves only have the persisted override.
+      const liveFolder = !(leaf as any).isDeferred ? ((leaf.view as any)?.noteFolder as string | undefined) : undefined;
+      const target = remap(liveFolder ?? st.folderOverride);
+      if (!target) continue;
+      void leaf.setViewState({ ...vs, state: { ...(vs.state ?? {}), folderOverride: target } });
+    }
+  }
+
   /** Drop a folder (and anything nested under it) from the folder-panel
    *  placement lists. Persists only if something changed. */
   /** 0.140.3 (review): when a folder is RENAMED, carry every path-keyed setting
@@ -521,6 +550,11 @@ export default class StashpadPlugin extends Plugin {
       for (const [k, v] of Object.entries(rec)) out[remapOne(k)] = v;
       return out;
     };
+    // Snapshot the path-keyed fields so we only persist when something actually
+    // moved — this method now runs twice per rename (folder-panel call + the vault
+    // rename listener), and an idempotent second pass must not spawn a redundant
+    // saveData (which bumps settingsRev + can fire a spurious collision notice).
+    const snap = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter]);
     s.folderPanelPinned = remapArr(s.folderPanelPinned) ?? s.folderPanelPinned;
     s.folderPanelDownranked = remapArr(s.folderPanelDownranked) ?? s.folderPanelDownranked;
     s.folderPanelHidden = remapArr(s.folderPanelHidden) ?? s.folderPanelHidden;
@@ -532,7 +566,8 @@ export default class StashpadPlugin extends Plugin {
     s.folderEncPrefs = remapRec(s.folderEncPrefs) ?? s.folderEncPrefs;
     s.viewModes = remapRec(s.viewModes) ?? s.viewModes;
     if (s.encryptionFilter) s.encryptionFilter = remapRec(s.encryptionFilter);
-    await this.saveSettings();
+    const after = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter]);
+    if (after !== snap) await this.saveSettings();
   }
 
   private async prunePlacementFor(cleaned: string): Promise<void> {
@@ -2003,6 +2038,19 @@ export default class StashpadPlugin extends Plugin {
     // create/edit, so a note being written can't be locked out from under you.
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (file instanceof TFile) this.maybeArchiveOnMoveIn(file, oldPath);
+    }));
+
+    // 0.149.2: a FOLDER was renamed (panel, file explorer, or a synced device).
+    // Re-point every open Stashpad tab off the old path AND remap the path-keyed
+    // settings — otherwise a tab left on the old name keeps writing there
+    // (createNoteUnder / ensureAuthorFile / bootstrapFolder's ensureFolder+
+    // ensureHomeNote on reload) and RESURRECTS the old folder. Fires for every
+    // rename source, so it also covers file-explorer renames the panel path missed.
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      if (file instanceof TFolder) {
+        this.retargetStashpadViewsForFolderRename(oldPath, file.path);
+        void this.remapFolderPathInSettings(oldPath, file.path);
+      }
     }));
 
     // 0.79.1: auto-import — any file appearing directly in a Stashpad
@@ -6378,7 +6426,12 @@ export default class StashpadPlugin extends Plugin {
    *  editor). Best-effort (not a lock — simultaneous writes can still race),
    *  but it turns the common interleaving from silent key-loss into a merge +
    *  a loud notice. */
-  private static readonly COLLISION_PROTECTED_KEYS = ["encryption", "lockedSubtrees", "folderEncPrefs", "archiveFolders"] as const;
+  // 0.149.2: folder-panel placement is synced (data.json), but it wasn't in this
+  // list — so a `saveData` on one device silently CLOBBERED a pin/downrank/hide a
+  // synced device had just made (only these keys get the re-read-and-adopt merge
+  // below). That's why folder-panel state diverged per device and "didn't sync."
+  // Protecting them makes a change on one device get ADOPTED rather than lost.
+  private static readonly COLLISION_PROTECTED_KEYS = ["encryption", "lockedSubtrees", "folderEncPrefs", "archiveFolders", "folderPanelPinned", "folderPanelDownranked", "folderPanelHidden", "folderPanelPinnedGrouping"] as const;
   private lastSeenSettingsRev = 0;
   private settingsBaseline: Record<string, string | undefined> = {};
 
