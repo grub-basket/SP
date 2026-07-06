@@ -2053,6 +2053,17 @@ export default class StashpadPlugin extends Plugin {
       }
     }));
 
+    // 0.149.3: live-adopt settings that arrive from ANOTHER device (Obsidian Sync
+    // rewriting our data.json) — so folder-panel pins/hides sync in WITHOUT a
+    // reload. The "raw" vault event fires for files under `.obsidian/`. We filter
+    // to our own data.json, then re-read + adopt the collision-protected keys and
+    // refresh the folder panel. Our own writes are skipped via the settingsRev
+    // guard in onExternalDataJsonChange.
+    const dataJsonPath = `${(this.manifest as any).dir.replace(/\/+$/, "")}/data.json`;
+    this.registerEvent((this.app.vault as any).on("raw", (changedPath: string) => {
+      if (changedPath === dataJsonPath) this.scheduleExternalDataJsonReload();
+    }));
+
     // 0.79.1: auto-import — any file appearing directly in a Stashpad
     // folder root (not a reserved subfolder, not an existing note) gets
     // turned into a note. The service guards + debounces internally.
@@ -6434,6 +6445,38 @@ export default class StashpadPlugin extends Plugin {
   private static readonly COLLISION_PROTECTED_KEYS = ["encryption", "lockedSubtrees", "folderEncPrefs", "archiveFolders", "folderPanelPinned", "folderPanelDownranked", "folderPanelHidden", "folderPanelPinnedGrouping"] as const;
   private lastSeenSettingsRev = 0;
   private settingsBaseline: Record<string, string | undefined> = {};
+  private externalReloadDebounced = debounce(() => void this.onExternalDataJsonChange(), 600, false);
+
+  /** Coalesce a burst of `raw` data.json events (a sync often writes in chunks). */
+  private scheduleExternalDataJsonReload(): void { this.externalReloadDebounced(); }
+
+  /** data.json changed on disk from OUTSIDE our own save (another device via
+   *  Obsidian Sync, or another window). Re-read it and adopt the
+   *  collision-protected keys whose value differs from ours — then refresh the
+   *  folder panel so synced pins/hides show without a reload. Skips our own writes
+   *  via the settingsRev guard (our writes never raise diskRev above lastSeen). */
+  private async onExternalDataJsonChange(): Promise<void> {
+    let disk: Record<string, unknown> | null = null;
+    try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { return; }
+    if (!disk) return;
+    const diskRev = typeof disk.settingsRev === "number" ? (disk.settingsRev as number) : 0;
+    if (diskRev <= this.lastSeenSettingsRev) return; // our own write (or nothing newer)
+    const s = this.settings as unknown as Record<string, unknown>;
+    let panelChanged = false, anyChanged = false;
+    for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
+      if (disk[k] === undefined) continue;
+      if (JSON.stringify(disk[k]) === JSON.stringify(s[k])) continue;
+      s[k] = disk[k];
+      anyChanged = true;
+      if (k.startsWith("folderPanel")) panelChanged = true;
+    }
+    this.lastSeenSettingsRev = diskRev;
+    if (anyChanged) {
+      setSettings(this.settings);
+      this.snapshotSettingsBaseline();
+      if (panelChanged) this.refreshFolderPanels();
+    }
+  }
 
   private snapshotSettingsBaseline(): void {
     for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
@@ -6465,6 +6508,8 @@ export default class StashpadPlugin extends Plugin {
         console.warn(`[Stashpad] settings collision: on-disk protected keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
         new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${adopted.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
         setSettings(this.settings);
+        // Reflect adopted folder-panel placement immediately — no reload needed.
+        if (adopted.some((k) => k.startsWith("folderPanel"))) this.refreshFolderPanels();
       }
       if (diskRev > this.lastSeenSettingsRev) this.lastSeenSettingsRev = diskRev;
     }
