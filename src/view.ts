@@ -1919,6 +1919,17 @@ export class StashpadView extends ItemView {
           this.pendingCursorId = rootId;
         }
         this.render();
+        // Undo = re-lock the just-decrypted subtree; redo = unlock again. A
+        // re-lock mints a new blob path, so track it for the next redo.
+        if (rootId) {
+          const undoFolder = this.noteFolder;
+          let curBlob = lk.blob;
+          this.plugin.getUndoStack(undoFolder).push({
+            label: "Unlock note",
+            undo: async () => { const rr = await this.plugin.lockNoteSubtree(undoFolder, rootId, prevSibling, { silent: true }); if (rr) curBlob = rr.blobPath; this.render(); },
+            redo: async () => { try { await this.plugin.unlockBundleAt(curBlob, { silent: true }); } catch { /* leave */ } this.render(); },
+          });
+        }
       }
     };
     unlockBtn.onclick = doUnlock;
@@ -1928,8 +1939,40 @@ export class StashpadView extends ItemView {
     const openLockedMenu = (e: MouseEvent) => {
       e.preventDefault(); e.stopPropagation();
       const menu = new Menu();
-      menu.addItem((i: any) => i.setTitle("Decrypt (unlock)").setIcon("unlock")
-        .onClick(() => void doUnlock(e)));
+      // 0.152.0: locked rows present the SAME menu as normal notes (agreed
+      // design). Actions that need the DECRYPTED note show an "unlock first"
+      // notice instead of doing nothing; the rest act on the ciphertext bundle
+      // directly. Items mirror openNoteMenu; kept a flat verbatim copy for now —
+      // DRY-ing into a shared builder is a later cleanup.
+      const unlockFirst = (verb: string) => new Notice(`Unlock this note first to ${verb}.`);
+      menu.addItem((i: any) => i.setTitle("Open in new Stashpad tab").setIcon("layout-grid").onClick(() => unlockFirst("open it in a tab")));
+      menu.addItem((i: any) => i.setTitle("Open in editor").setIcon("file-text").onClick(() => unlockFirst("open it in the editor")));
+      menu.addItem((i: any) => i.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => unlockFirst("focus it")));
+      // Copy deep link works without decrypting (the id is known); greyed when
+      // this bundle has no recorded rootId.
+      menu.addItem((i: any) => {
+        i.setTitle("Copy Stashpad link").setIcon("link");
+        if (lk.rootId) {
+          i.onClick(() => {
+            const link = buildStashpadLink({ vault: this.app.vault.getName(), folder: this.noteFolder, note: lk.rootId!, run: ["reveal"] });
+            void navigator.clipboard.writeText(link).then(() => new Notice("Stashpad link copied."), () => new Notice("Couldn't copy the link."));
+          });
+        } else {
+          i.setDisabled(true);
+        }
+      });
+      menu.addSeparator();
+      menu.addItem((i: any) => i.setTitle("Split note…").setIcon("split").onClick(() => unlockFirst("split it")));
+      menu.addItem((i: any) => i.setTitle("Copy text").setIcon("copy").onClick(() => unlockFirst("copy its text")));
+      menu.addItem((i: any) => i.setTitle("Clone (duplicate / copy)").setIcon("files").onClick(() => unlockFirst("clone it")));
+      menu.addItem((i: any) => i.setTitle("Fork into a separate note…").setIcon("git-branch").onClick(() => unlockFirst("fork it")));
+      // Export the ENCRYPTED bundle as-is — no decryption needed.
+      menu.addItem((i: any) => i.setTitle("Export to .stash…").setIcon("package").onClick(() => { void this.plugin.exportLockedSubtree(lk.blob); }));
+      if (this.plugin.settings.okfEnabled) {
+        menu.addItem((i: any) => i.setTitle("Export as OKF…").setIcon("book-marked").onClick(() => unlockFirst("export it as OKF")));
+      }
+      // Decrypt (in place of the normal menu's "Encrypt" — this is already locked).
+      menu.addItem((i: any) => i.setTitle("Decrypt (unlock)").setIcon("unlock").onClick(() => void doUnlock(e)));
       if (!Platform.isMobile) {
         const osManager = Platform.isMacOS ? "Finder" : Platform.isWin ? "File Explorer" : "file manager";
         menu.addItem((i: any) => i.setTitle(`Show in ${osManager}`).setIcon("folder-search").onClick(() => {
@@ -1940,9 +1983,6 @@ export class StashpadView extends ItemView {
           } catch (err) { console.warn("[Stashpad] showItemInFolder failed", err); }
         }));
       }
-      menu.addItem((i: any) => i.setTitle("Export to .stash…").setIcon("package").onClick(() => {
-        void this.plugin.exportLockedSubtree(lk.blob);
-      }));
       menu.addItem((i: any) => i.setTitle("Copy encrypted file path").setIcon("copy").onClick(() => {
         // 0.98.32: full absolute path on desktop (pasteable into Finder/Explorer);
         // mobile has no usable filesystem path, so fall back to the vault-relative one.
@@ -1953,15 +1993,90 @@ export class StashpadView extends ItemView {
         void navigator.clipboard.writeText(path);
         new Notice("Path copied.");
       }));
+      menu.addSeparator();
+      menu.addItem((i: any) => i.setTitle("Move to…").setIcon("move").onClick(() => unlockFirst("move it")));
+      menu.addItem((i: any) => i.setTitle("Move to Home").setIcon("home").onClick(() => unlockFirst("move it")));
+      menu.addItem((i: any) => i.setTitle("Pin to sidebar").setIcon("pin").onClick(() => unlockFirst("pin it")));
+      menu.addItem((i: any) => i.setTitle("Pin to top of list").setIcon("arrow-up-to-line").onClick(() => unlockFirst("pin it")));
+      menu.addItem((i: any) => i.setTitle("Set color…").setIcon("palette").onClick(() => unlockFirst("set its color")));
+      menu.addItem((i: any) => i.setTitle("Task").setIcon("check-circle-2").onClick(() => unlockFirst("change its task state")));
+      // Delete the encrypted bundle. Removing the ciphertext needs no password;
+      // routed through Obsidian's trash so it's recoverable (the password is
+      // still required to READ it if restored). Confirm first — it may hold
+      // several notes.
+      menu.addItem((i: any) => {
+        i.setTitle(lk.count > 1 ? "Delete encrypted notes…" : "Delete encrypted note…").setIcon("trash-2");
+        i.setWarning?.(true);
+        i.onClick(() => {
+          new ConfirmModal(
+            this.app,
+            lk.count > 1 ? `Delete ${lk.count} encrypted notes?` : "Delete encrypted note?",
+            "The encrypted file moves to Obsidian's trash (recoverable there). You'll still need your password to read it if you restore it.",
+            "Delete",
+            async (ok: boolean) => {
+              if (!ok) return;
+              const blobPath = lk.blob;
+              const metaPath = blobPath.replace(/\.stashenc$/, ".stashmeta");
+              const adapter = this.app.vault.adapter;
+              // Capture everything needed to restore BEFORE removing anything:
+              // the ciphertext bytes, the sidecar JSON, and the registry entry.
+              let blobData: ArrayBuffer | null = null;
+              let metaData: string | null = null;
+              try { blobData = await adapter.readBinary(blobPath); } catch { blobData = null; }
+              if (!blobData) { new Notice("Couldn't read the encrypted file to delete it."); return; }
+              try { if (await adapter.exists(metaPath)) metaData = await adapter.read(metaPath); } catch { metaData = null; }
+              const prevEntry = (this.plugin.settings.lockedSubtrees ?? []).find((x) => x.blob === blobPath) ?? null;
+
+              // Trash both files (Obsidian trash when the TFile is indexed —
+              // recoverable there; adapter.remove as a fallback when the index
+              // lags, e.g. right after a redo-restore). Contents are captured
+              // above, so the undo entry can restore either way.
+              const removeBoth = async (): Promise<boolean> => {
+                const trashByPath = async (path: string) => {
+                  const tf = this.app.vault.getAbstractFileByPath(path);
+                  if (tf) { try { await this.app.fileManager.trashFile(tf); return; } catch { /* fall through */ } }
+                  try { if (await adapter.exists(path)) await adapter.remove(path); } catch { /* non-fatal */ }
+                };
+                await trashByPath(blobPath);
+                await trashByPath(metaPath);
+                return true;
+              };
+              const doDelete = async () => {
+                await removeBoth();
+                this.plugin.settings.lockedSubtrees = (this.plugin.settings.lockedSubtrees ?? []).filter((x) => x.blob !== blobPath);
+                await this.plugin.saveSettings();
+                this.render();
+              };
+              const doRestore = async () => {
+                await adapter.writeBinary(blobPath, blobData!);
+                if (metaData != null) { try { await adapter.write(metaPath, metaData); } catch { /* non-fatal */ } }
+                if (prevEntry && !(this.plugin.settings.lockedSubtrees ?? []).some((x) => x.blob === blobPath)) {
+                  this.plugin.settings.lockedSubtrees = [...(this.plugin.settings.lockedSubtrees ?? []), prevEntry];
+                  await this.plugin.saveSettings();
+                }
+                this.render();
+              };
+
+              await doDelete();
+              this.plugin.getUndoStack(this.noteFolder).push({
+                label: lk.count > 1 ? "Delete encrypted notes" : "Delete encrypted note",
+                undo: doRestore,
+                redo: doDelete,
+              });
+              new Notice(lk.count > 1 ? "Encrypted notes deleted — undo to restore." : "Encrypted note deleted — undo to restore.");
+            },
+          ).open();
+        });
+      });
       menu.showAtMouseEvent(e);
     };
     row.oncontextmenu = openLockedMenu;
-    if (Platform.isMobile) {
-      const menuBtn = row.createEl("button", { cls: "stashpad-locked-menu" });
-      setIcon(menuBtn, "more-vertical");
-      menuBtn.setAttr("aria-label", "Locked note menu");
-      menuBtn.onclick = (e) => openLockedMenu(e);
-    }
+    // 0.150.0: menu button now shows on desktop too (was mobile-only), for
+    // parity with a normal row's ⋯ button. Desktop right-click still works.
+    const menuBtn = row.createEl("button", { cls: "stashpad-pencil stashpad-locked-menu" });
+    setIcon(menuBtn, "more-vertical");
+    menuBtn.setAttr("aria-label", "Locked note menu");
+    menuBtn.onclick = (e) => openLockedMenu(e);
     // 0.98.8: only the Unlock button decrypts — clicking elsewhere on the row
     // must NOT trigger the (heavyweight, password-prompting) decrypt by accident.
     row.setAttr("aria-label", `${hideTitle ? "Locked note" : `Locked: ${lk.title}`}. Use the Unlock button to decrypt.`);
@@ -5216,6 +5331,13 @@ export class StashpadView extends ItemView {
       setIcon(enterBtn, "arrow-right");
       enterBtn.title = "Open in Stashpad view";
       enterBtn.onclick = (e) => { e.stopPropagation(); this.navigateTo(node.id); };
+      // "More actions" button — opens the same context menu as right-click
+      // (Copy Stashpad link, Delete, Split, Move, …). One menu button keeps the
+      // row uncluttered as the action set grows, instead of a button per action.
+      const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
+      setIcon(moreBtn, "ellipsis-vertical");
+      moreBtn.title = "More actions";
+      moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = pencil;
     }
 
@@ -6726,6 +6848,7 @@ export class StashpadView extends ItemView {
     });
     if (roots.length === 0) { new Notice("Nothing to lock (already locked)."); return; }
     let locked = 0;
+    const lockedItems: Array<{ rootId: StashpadId; prevSibling: StashpadId | null; blob: string }> = [];
     for (const t of roots) {
       // Capture the preceding sibling in any explicit manual order, so unlock can
       // drop the note back into the same slot (mirrors the context-menu handler).
@@ -6734,13 +6857,21 @@ export class StashpadView extends ItemView {
       const prevSibling = idx > 0 ? order[idx - 1] : null;
       // Silent per-item; one summary toast below (a batch shouldn't spam).
       const r = await this.plugin.lockNoteSubtree(this.noteFolder, t.id, prevSibling, { silent: true });
-      if (r) { locked++; await this.log.append({ type: "lock", id: t.id }); }
+      if (r) { locked++; lockedItems.push({ rootId: t.id, prevSibling, blob: r.blobPath }); await this.log.append({ type: "lock", id: t.id }); }
     }
     if (locked > 0) {
       this.selection.clear();
       this.lastSelected = null;
       this.render();
-      this.plugin.notifications.show({ message: `Locked ${locked} stash${locked === 1 ? "" : "es"}.`, kind: "success", category: "system", folder: this.noteFolder, actions: [{ label: "All encrypted", onClick: () => void openAggregateView(this.plugin, "encrypted") }] });
+      // Undo = unlock (decrypt) the just-locked bundles; redo = re-lock. A
+      // re-lock mints a NEW blob path, so update each item's blob for the next undo.
+      const folder = this.noteFolder;
+      this.plugin.getUndoStack(folder).push({
+        label: `Lock ${locked} stash${locked === 1 ? "" : "es"}`,
+        undo: async () => { for (const it of lockedItems) { try { await this.plugin.unlockBundleAt(it.blob, { silent: true }); } catch { /* leave the rest */ } } this.render(); },
+        redo: async () => { for (const it of lockedItems) { const rr = await this.plugin.lockNoteSubtree(folder, it.rootId, it.prevSibling, { silent: true }); if (rr) it.blob = rr.blobPath; } this.render(); },
+      });
+      this.plugin.notifications.show({ message: `Locked ${locked} stash${locked === 1 ? "" : "es"} — undo to unlock.`, kind: "success", category: "system", folder: this.noteFolder, actions: [{ label: "All encrypted", onClick: () => void openAggregateView(this.plugin, "encrypted") }] });
     }
   }
 
@@ -10509,7 +10640,13 @@ export class StashpadView extends ItemView {
     // trashEncryptContent + trashHandling (stashpad/obsidian) take precedence.
     const _delFolder = (this.noteFolder ?? "").replace(/\/+$/, "");
     const _delFp = (this.plugin.settings.folderEncPrefs ?? {})[_delFolder] ?? {};
-    const _encryptTrash = _delFp.trashEncryptContent ?? this.plugin.settings.encryptTrash ?? false;
+    // 0.151.1: encrypted-trash is strictly PER-FOLDER now. Dropped the legacy
+    // `settings.encryptTrash` global fallback: its UI was removed when encryption
+    // went per-folder, but a stale saved `true` kept forcing the encrypt-trash
+    // path on folders that never opted in — so deleting in an unconfigured folder
+    // wrongly hit "…encryption isn't set up. Nothing was deleted." Now a folder
+    // with no `trashEncryptContent` pref just uses the default (Stashpad) trash.
+    const _encryptTrash = _delFp.trashEncryptContent ?? false;
     const _followObsidian = _delFp.trashHandling === "obsidian"; // 0.137.1: global follow-Obsidian option removed
     // 0.143.1: `forcePlaintext` (the "Delete to Obsidian trash (unencrypted)"
     // command) opts out of the encrypt-trash override — hands the notes to

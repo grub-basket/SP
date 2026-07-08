@@ -1,17 +1,22 @@
 #!/bin/sh
 # In-Obsidian "Claude is testing" banner + countdown, so the user gets a loud,
-# in-app heads-up even when they're not watching the Claude chat.
+# in-app heads-up even when they're not watching the Claude chat — AND a
+# machine-readable lock so a SECOND Claude session can detect that the vault is
+# already being driven and back off instead of colliding.
 #
-# Why: automated Obsidian looks identical to a normal one. If the user pokes the
-# UI mid-test, their clicks collide with the automation. The chat 🔴/✅ handshake
-# only helps if they're looking at the chat — this pushes the warning into
-# Obsidian itself, with a grace period to back off.
+# Why: automated Obsidian looks identical to a normal one. Two risks:
+#   (a) the USER pokes the UI mid-test → chat 🔴/✅ + the loud banner cover this.
+#   (b) ANOTHER Claude chat drives the same instance at the same time → the
+#       banner alone doesn't stop that (a human isn't reading it). So the banner
+#       now has a data twin: window.__claudeVaultLock, an advisory mutex every
+#       driving session checks first. Banner = human-facing; lock = machine-facing.
 #
 # Usage:
-#   scripts/obs-test-guard start [seconds]   # show banner, wait N s (default 10), then "testing now"
-#   scripts/obs-test-guard ensure            # INSTANT banner (no wait) — re-raise it before any
-#                                            #   driving eval if you're unsure it's still up
-#   scripts/obs-test-guard end               # clear banner, show transient "safe to use" notice
+#   scripts/obs-test-guard start [seconds]   # claim lock, show banner, wait N s, then "testing now"
+#   scripts/obs-test-guard ensure            # INSTANT re-claim + banner (no wait) before a driving eval
+#   scripts/obs-test-guard end               # release MY lock, clear banner, show "safe to use"
+#   scripts/obs-test-guard status            # read-only: who (if anyone) holds the lock right now
+#   scripts/obs-test-guard steal             # force-claim a lock you're SURE is stale (crashed session)
 #   scripts/obs-test-guard note 'message'    # ad-hoc persistent banner with a custom message
 #
 # PROTOCOL: run `start` ONCE at the beginning of a testing session and `end`
@@ -20,12 +25,33 @@
 # testing. If you already ended (or aren't sure), call `ensure` (instant, no
 # countdown — the user was already warned) before the next driving eval.
 #
+# THE LOCK (layer 1 — same-instance advisory mutex):
+#   window.__claudeVaultLock = { owner, label, startedAt, expiresAt }
+#   * owner  = $CLAUDE_CODE_SESSION_ID — stable per chat, unique across chats.
+#   * `start`/`ensure`/`steal` refresh expiresAt = now + TTL (default 300s,
+#     override with $OBS_GUARD_TTL). A crashed/forgotten session's lock therefore
+#     self-expires within TTL and the next session can claim it cleanly.
+#   * `start`/`ensure` ABORT (exit 3) if a DIFFERENT, non-expired owner holds it.
+#   * `end` clears the lock ONLY if it's mine — it never clobbers another chat's.
+#   Scope + caveats: this coordinates multiple drivers of the SAME renderer
+#   (e.g. two chats both hitting the shared obs-dev / CLI instance) — the real
+#   collision case. It canNOT see a different Obsidian instance (obs-dev has its
+#   own renderer, isolated by design) or sense the user's own clicks; the banner
+#   + chat handshake still cover those. It's advisory, not a hard OS lock.
+#
 # The banner Notice is persistent (duration 0) and tracked on
 # window.__claudeTestBanner so `end` can dismiss it. `start` does the wait in the
 # SHELL (not inside eval — obs eval has a ~1s ceiling).
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS="$DIR/obs"
+
+# Owner identity: the chat's session id (stable across this script's separate
+# start/ensure/end invocations, distinct from any other chat). Fall back to a
+# per-process token if the harness ever doesn't export it (degrades gracefully —
+# worst case a session fails to recognize its own lock and refuses, i.e. safe).
+OWNER="${CLAUDE_CODE_SESSION_ID:-nosession-$$}"
+LOCK_TTL="${OBS_GUARD_TTL:-300}"
 
 show() {
   # show <js-string-literal-message> — (re)uses the single tracked banner Notice.
@@ -38,6 +64,69 @@ show() {
     }
     return 'shown';
   })()" >/dev/null 2>&1
+}
+
+# claim <label> — try to acquire/refresh the lock for OWNER. Echoes JSON:
+#   {"ok":true,...}                        acquired or refreshed (it was free/mine/stale)
+#   {"ok":false,"owner":..,"label":..,     held by a DIFFERENT live session — caller must abort
+#    "heldForSec":N,"expiresInSec":N}
+claim() {
+  "$OBS" eval code="(() => {
+    const now = Date.now();
+    const mine = '$OWNER';
+    const ttl = ${LOCK_TTL} * 1000;
+    const cur = window.__claudeVaultLock;
+    if (cur && cur.owner && cur.owner !== mine && cur.expiresAt > now) {
+      return JSON.stringify({
+        ok: false, owner: cur.owner, label: cur.label || '',
+        heldForSec: Math.round((now - (cur.startedAt || now)) / 1000),
+        expiresInSec: Math.round((cur.expiresAt - now) / 1000)
+      });
+    }
+    const startedAt = (cur && cur.owner === mine && cur.startedAt) ? cur.startedAt : now;
+    window.__claudeVaultLock = { owner: mine, label: '$1', startedAt: startedAt, expiresAt: now + ttl };
+    return JSON.stringify({ ok: true });
+  })()" 2>/dev/null
+}
+
+# release — clear the lock, but only if it's mine (never clobber another session).
+release() {
+  "$OBS" eval code="(() => {
+    const mine = '$OWNER';
+    const cur = window.__claudeVaultLock;
+    if (cur && cur.owner && cur.owner !== mine) {
+      return JSON.stringify({ cleared: false, owner: cur.owner });
+    }
+    window.__claudeVaultLock = null;
+    return JSON.stringify({ cleared: true });
+  })()" 2>/dev/null
+}
+
+# jsonstr <field> — pull a string field's value from the last JSON blob on stdin.
+jsonstr() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+# jsonnum <field> — pull a numeric field's value.
+jsonnum() { sed -n "s/.*\"$1\":\([0-9-]*\).*/\1/p"; }
+
+# abort_if_held <claim-output> — print a loud abort + exit 3 if the claim was refused.
+abort_if_held() {
+  case "$1" in
+    *'"ok":true'*) return 0 ;;
+    *)
+      own=$(printf '%s' "$1" | jsonstr owner)
+      lbl=$(printf '%s' "$1" | jsonstr label)
+      held=$(printf '%s' "$1" | jsonnum heldForSec)
+      exp=$(printf '%s' "$1" | jsonnum expiresInSec)
+      if [ -z "$own" ]; then
+        echo "✋ GUARD ABORT: couldn't read the vault lock (no response from the CLI)." >&2
+        echo "   Is an Obsidian instance running? Fix that before driving." >&2
+      else
+        echo "✋ GUARD ABORT: another Claude session is already testing this vault." >&2
+        echo "   Held by session ${own} (${lbl:-no label}), started ~${held:-?}s ago; lock expires in ~${exp:-?}s." >&2
+        echo "   Do NOT drive. Coordinate with that chat, wait for its all-clear, or —" >&2
+        echo "   if you're CERTAIN it crashed/was abandoned — run: scripts/obs-test-guard steal" >&2
+      fi
+      exit 3 ;;
+  esac
 }
 
 # verify — confirm the CLI is talking to the THROWAWAY dev vault before any
@@ -72,8 +161,40 @@ case "$1" in
   verify)
     verify; exit $?
     ;;
+  status)
+    # Read-only: report the current lock holder without touching it. Safe to run
+    # from any chat BEFORE deciding to start, so you can see if someone's testing.
+    out="$("$OBS" eval code="(() => {
+      const now = Date.now();
+      const cur = window.__claudeVaultLock;
+      if (!cur || !cur.owner || cur.expiresAt <= now) return JSON.stringify({ held: false });
+      return JSON.stringify({
+        held: true, owner: cur.owner, label: cur.label || '', mine: cur.owner === '$OWNER',
+        heldForSec: Math.round((now - (cur.startedAt || now)) / 1000),
+        expiresInSec: Math.round((cur.expiresAt - now) / 1000)
+      });
+    })()" 2>/dev/null)"
+    case "$out" in
+      *'"held":false'*) echo "lock: FREE — no session is testing this vault." ;;
+      *'"held":true'*)
+        own=$(printf '%s' "$out" | jsonstr owner)
+        lbl=$(printf '%s' "$out" | jsonstr label)
+        held=$(printf '%s' "$out" | jsonnum heldForSec)
+        exp=$(printf '%s' "$out" | jsonnum expiresInSec)
+        case "$out" in
+          *'"mine":true'*) whose="ME (this chat)" ;;
+          *) whose="another chat" ;;
+        esac
+        echo "lock: HELD by ${whose} — session ${own} (${lbl:-no label}), ~${held:-?}s ago, expires in ~${exp:-?}s." ;;
+      *)
+        echo "lock: UNKNOWN — no response from the CLI (is an Obsidian instance running?)." >&2
+        exit 1 ;;
+    esac
+    ;;
   start)
     verify || exit 1
+    out="$(claim 'start')"
+    abort_if_held "$out"
     secs="${2:-5}"
     show "'🤖 Claude is about to run an automated Stashpad test.\n✋ Please STOP interacting — starting in about ${secs} seconds…'"
     i="$secs"
@@ -83,18 +204,37 @@ case "$1" in
       show "'🤖 Claude is testing Stashpad.\n✋ Please don\\'t touch — starting in ${i}s…'"
     done
     show "'🤖 Claude is TESTING Stashpad now.\n✋ Please don\\'t touch until you see the all-clear.'"
-    echo "guard: banner up, ${secs}s grace elapsed — safe to drive"
+    echo "guard: lock acquired (owner ${OWNER}), banner up, ${secs}s grace elapsed — safe to drive"
     ;;
   ensure)
     # Instant re-raise (no countdown) — for follow-up driving evals when the
     # banner may have been ended. The user was already warned by the session's
-    # initial `start`, so no grace period is needed. Still re-verifies the vault
-    # (the user could have switched windows between evals).
+    # initial `start`, so no grace period is needed. Re-verifies the vault AND
+    # re-claims/refreshes the lock (aborts if another chat grabbed it meanwhile).
     verify || exit 1
+    out="$(claim 'ensure')"
+    abort_if_held "$out"
     show "'🤖 Claude is TESTING Stashpad now.\n✋ Please don\\'t touch until you see the all-clear.'"
-    echo "guard: banner ensured (instant)"
+    echo "guard: lock refreshed, banner ensured (instant)"
+    ;;
+  steal)
+    # Force-claim a lock you're CERTAIN is stale (the holding chat crashed or was
+    # abandoned and you don't want to wait out the TTL). Overwrites ownership.
+    verify || exit 1
+    "$OBS" eval code="(() => {
+      const now = Date.now();
+      window.__claudeVaultLock = { owner: '$OWNER', label: 'steal', startedAt: now, expiresAt: now + ${LOCK_TTL} * 1000 };
+      return 'stolen';
+    })()" >/dev/null 2>&1
+    show "'🤖 Claude is TESTING Stashpad now.\n✋ Please don\\'t touch until you see the all-clear.'"
+    echo "guard: lock forcibly claimed (steal), banner up"
     ;;
   end)
+    rel="$(release)"
+    case "$rel" in
+      *'"cleared":false'*)
+        echo "guard: NOTE — the lock is held by another session; left it alone (only cleared the banner)." >&2 ;;
+    esac
     "$OBS" eval code="(() => {
       if (window.__claudeTestBanner && typeof window.__claudeTestBanner.hide === 'function') {
         try { window.__claudeTestBanner.hide(); } catch (e) {}
@@ -103,7 +243,7 @@ case "$1" in
       new Notice('✅ Safe to use Stashpad again — Claude has finished testing.', 0);
       return 'cleared';
     })()" >/dev/null 2>&1
-    echo "guard: banner cleared, all-clear shown"
+    echo "guard: lock released, banner cleared, all-clear shown"
     ;;
   note)
     [ -n "$2" ] || { echo "usage: obs-test-guard note 'message'" >&2; exit 1; }
@@ -113,7 +253,7 @@ case "$1" in
     echo "guard: custom banner shown"
     ;;
   *)
-    echo "usage: obs-test-guard {verify|start [seconds]|ensure|end|note 'message'}" >&2
+    echo "usage: obs-test-guard {verify|status|start [seconds]|ensure|steal|end|note 'message'}" >&2
     exit 1
     ;;
 esac

@@ -5280,9 +5280,10 @@ export default class StashpadPlugin extends Plugin {
       if (!file) { new Notice(`Stashpad link: note “${noteId}” not found in ${folder}.`); return; }
     }
 
-    // 3. Activate the view + reveal the note (or just open the folder).
-    if (noteId) await this.revealNoteByRef(folder, noteId);
-    else await this.openFolderInStashpad(folder);
+    // 3. Open the target WITHOUT hijacking the current tab. A deep link should
+    // land in its own tab (focusing an existing background tab on that folder
+    // if there is one), never overwrite whatever the user is currently viewing.
+    await this.openDeepLinkTarget(folder, noteId);
 
     // 4. Run the macro, in order. `reveal` is already satisfied by step 3.
     // Unknown tokens are skipped with a warning — one bad token never aborts.
@@ -5294,6 +5295,27 @@ export default class StashpadPlugin extends Plugin {
       }
       console.warn(`[stashpad] deep link: unknown action “${token}” — skipped.`);
     }
+  }
+
+  /** Open a deep-link target without hijacking the currently-active tab.
+   *  Unlike `revealNoteByRef` (which reuses ANY matching folder tab, the active
+   *  one included), a deep link should never overwrite what the user is looking
+   *  at: focus an existing BACKGROUND tab on that folder if there is one, else
+   *  open a brand-new tab. `noteId` is optional (folder-only links). */
+  async openDeepLinkTarget(folder: string, noteId: string): Promise<void> {
+    const clean = folder.replace(/\/+$/, "");
+    const active = this.app.workspace.activeLeaf;
+    const existing = await this.findStashpadLeafForFolder(clean);
+    // Reuse an existing tab only if it isn't the one currently in front —
+    // reusing the active leaf is exactly the "opens inside it" overwrite.
+    if (existing && existing !== active) {
+      this.app.workspace.revealLeaf(existing);
+      this.app.workspace.setActiveLeaf(existing, { focus: true });
+      if (noteId) this.navigateLeafTo(existing, clean, noteId);
+      return;
+    }
+    const leaf = await this.activateViewForFolder(clean); // getLeaf("tab") → new tab
+    if (noteId) this.navigateLeafTo(leaf, clean, noteId);
   }
 
   /** Prompt for a pasted `obsidian://stashpad?…` link and open it — the manual
