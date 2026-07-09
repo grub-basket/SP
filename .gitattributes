@@ -1,2 +1,20 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Line endings: store LF in the repo AND check out LF on every platform
+# (macOS + Windows), so there's no CRLF churn, noisy diffs, or broken shell
+# scripts when the repo is used cross-platform. Git auto-detects text vs binary;
+# the explicit `binary` rules below are belt-and-suspenders so EOL conversion is
+# never applied to assets (a mangled .stash fixture or PNG would be bad).
+* text=auto eol=lf
+
+# Binary assets — no EOL conversion, no diffing.
+*.stash binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.zip   binary
+*.wasm  binary

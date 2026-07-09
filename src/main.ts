@@ -1261,6 +1261,11 @@ export default class StashpadPlugin extends Plugin {
       callback: () => call("cmdLockSelection"),
     });
     this.addCommand({
+      id: "stashpad-lock-selection-hide-name",
+      name: "Encrypt (lock) selection + hide filename (override folder setting)",
+      callback: () => call("cmdLockSelectionHideName"),
+    });
+    this.addCommand({
       id: "stashpad-unlock-all",
       name: "Decrypt (unlock) locked notes in view",
       callback: () => call("cmdUnlockAll"),
@@ -3738,7 +3743,7 @@ export default class StashpadPlugin extends Plugin {
     }).open();
   }
 
-  async lockNoteSubtree(folder: string, rootId: StashpadId, prevSibling: StashpadId | null = null, opts: { silent?: boolean; blobFolder?: string } = {}): Promise<LockResult | null> {
+  async lockNoteSubtree(folder: string, rootId: StashpadId, prevSibling: StashpadId | null = null, opts: { silent?: boolean; blobFolder?: string; hideTitle?: boolean } = {}): Promise<LockResult | null> {
     // Encrypt under the key of the folder the BLOB will live in (archive moves put
     // the blob in opts.blobFolder, not the source folder), so opening that folder
     // later decrypts it. Falls back to the vault DEK when the folder has no own key.
@@ -3751,7 +3756,8 @@ export default class StashpadPlugin extends Plugin {
       // else its live-notes pref — falling back to the global hide-titles setting.
       const isArchiveLock = !!opts.blobFolder && opts.blobFolder.replace(/\/+$/, "") !== folder.replace(/\/+$/, "");
       const fp = (this.settings.folderEncPrefs ?? {})[keyFolder] ?? {};
-      const hideTitle = (isArchiveLock ? fp.archiveEncryptFilenames : fp.encryptFilenames) ?? false; // 0.137.1: per-folder only
+      // A per-note override (the "hide filename" command) wins over the folder pref.
+      const hideTitle = opts.hideTitle ?? ((isArchiveLock ? fp.archiveEncryptFilenames : fp.encryptFilenames) ?? false); // 0.137.1: per-folder only
       const r = await lockSubtree(this.app, folder, rootId, dek, prevSibling, hideTitle, opts.blobFolder);
       this.pendingEncBlobs.add(r.blobPath); // fast-state index: cover the pre-vault-index window
       // Record a placeholder registry entry so the list shows a 🔒 stub where
@@ -5251,15 +5257,16 @@ export default class StashpadPlugin extends Plugin {
   /** Handle an `obsidian://stashpad?…` deep link. Resolve → activate → reveal →
    *  run macro. Any unresolved target is a LOUD failure (Notice), never a silent
    *  no-op. See `docs/deep-links-plan.md`. */
-  async handleDeepLink(params: { folder?: string; note?: string; run?: string; action?: string; vault?: string }): Promise<void> {
+  async handleDeepLink(params: { folder?: string; note?: string; run?: string; action?: string; vault?: string }, opts: { forceNewTab?: boolean } = {}): Promise<boolean> {
     const folder = (params.folder || "").replace(/^\/+|\/+$/g, "");
     const noteId = (params.note || "").trim();
     const actions = parseRunActions(params);
 
-    // 1. Guard + resolve.
-    if (!folder) { new Notice("Stashpad link: missing “folder”."); return; }
+    // 1. Guard + resolve. Returns false (not thrown) on a bad link so a batch
+    // caller can tally how many actually opened.
+    if (!folder) { new Notice("Stashpad link: missing “folder”."); return false; }
     const dir = this.app.vault.getAbstractFileByPath(folder);
-    if (!(dir instanceof TFolder)) { new Notice(`Stashpad link: folder “${folder}” not found.`); return; }
+    if (!(dir instanceof TFolder)) { new Notice(`Stashpad link: folder “${folder}” not found.`); return false; }
 
     // 2. Wait for the workspace to settle. On a cross-vault jump Obsidian may
     // still be laying out when the handler fires, so activate/reveal would find
@@ -5277,13 +5284,14 @@ export default class StashpadPlugin extends Plugin {
         file = this.resolveNoteFileInFolder(folder, noteId);
         if (!file) await new Promise((r) => window.setTimeout(r, 150));
       }
-      if (!file) { new Notice(`Stashpad link: note “${noteId}” not found in ${folder}.`); return; }
+      if (!file) { new Notice(`Stashpad link: note “${noteId}” not found in ${folder}.`); return false; }
     }
 
     // 3. Open the target WITHOUT hijacking the current tab. A deep link should
     // land in its own tab (focusing an existing background tab on that folder
     // if there is one), never overwrite whatever the user is currently viewing.
-    await this.openDeepLinkTarget(folder, noteId);
+    // `forceNewTab` (batch/multi-link) always opens a fresh tab per link.
+    await this.openDeepLinkTarget(folder, noteId, opts);
 
     // 4. Run the macro, in order. `reveal` is already satisfied by step 3.
     // Unknown tokens are skipped with a warning — one bad token never aborts.
@@ -5295,6 +5303,7 @@ export default class StashpadPlugin extends Plugin {
       }
       console.warn(`[stashpad] deep link: unknown action “${token}” — skipped.`);
     }
+    return true;
   }
 
   /** Open a deep-link target without hijacking the currently-active tab.
@@ -5302,17 +5311,22 @@ export default class StashpadPlugin extends Plugin {
    *  one included), a deep link should never overwrite what the user is looking
    *  at: focus an existing BACKGROUND tab on that folder if there is one, else
    *  open a brand-new tab. `noteId` is optional (folder-only links). */
-  async openDeepLinkTarget(folder: string, noteId: string): Promise<void> {
+  async openDeepLinkTarget(folder: string, noteId: string, opts: { forceNewTab?: boolean } = {}): Promise<void> {
     const clean = folder.replace(/\/+$/, "");
-    const active = this.app.workspace.activeLeaf;
-    const existing = await this.findStashpadLeafForFolder(clean);
-    // Reuse an existing tab only if it isn't the one currently in front —
-    // reusing the active leaf is exactly the "opens inside it" overwrite.
-    if (existing && existing !== active) {
-      this.app.workspace.revealLeaf(existing);
-      this.app.workspace.setActiveLeaf(existing, { focus: true });
-      if (noteId) this.navigateLeafTo(existing, clean, noteId);
-      return;
+    // 0.155.3: `forceNewTab` skips the reuse-existing-tab path so a BATCH of
+    // links (multi-link paste) opens each in its own tab — even several links
+    // into the same folder, which would otherwise collapse onto one reused tab.
+    if (!opts.forceNewTab) {
+      const active = this.app.workspace.activeLeaf;
+      const existing = await this.findStashpadLeafForFolder(clean);
+      // Reuse an existing tab only if it isn't the one currently in front —
+      // reusing the active leaf is exactly the "opens inside it" overwrite.
+      if (existing && existing !== active) {
+        this.app.workspace.revealLeaf(existing);
+        this.app.workspace.setActiveLeaf(existing, { focus: true });
+        if (noteId) this.navigateLeafTo(existing, clean, noteId);
+        return;
+      }
     }
     const leaf = await this.activateViewForFolder(clean); // getLeaf("tab") → new tab
     if (noteId) this.navigateLeafTo(leaf, clean, noteId);
@@ -5324,9 +5338,24 @@ export default class StashpadPlugin extends Plugin {
    *  are shared. */
   openDeepLinkModal(): void {
     new OpenDeepLinkModal(this.app, (raw) => {
-      const parsed = parseStashpadLink(raw);
-      if (!parsed) { new Notice("That doesn't look like a Stashpad link."); return; }
-      void this.handleDeepLink(parsed);
+      // 0.155.3: accept a MULTI-link paste (e.g. from a multi-select "Copy
+      // Stashpad link"). Links are whitespace/newline-separated and never
+      // contain literal spaces (URLs are percent-encoded), so split on \s+.
+      const candidates = raw.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+      const parsed = candidates
+        .map((c) => parseStashpadLink(c))
+        .filter((p): p is NonNullable<typeof p> => !!p);
+      if (parsed.length === 0) { new Notice("That doesn't look like a Stashpad link."); return; }
+      if (parsed.length === 1) { void this.handleDeepLink(parsed[0]); return; }
+      // Multiple → open each in its OWN new tab, then report the tally.
+      void (async () => {
+        let opened = 0;
+        for (const p of parsed) { if (await this.handleDeepLink(p, { forceNewTab: true })) opened++; }
+        const failed = parsed.length - opened;
+        new Notice(failed === 0
+          ? `Opened ${opened} Stashpad links in new tabs.`
+          : `Opened ${opened} of ${parsed.length} Stashpad links (${failed} couldn't be found).`);
+      })();
     }).open();
   }
 

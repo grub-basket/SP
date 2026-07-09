@@ -1,6 +1,10 @@
-import { ItemView, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
+import { ItemView, Menu, Notice, Platform, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
 import type StashpadPlugin from "./main";
+import { populateLockedMenu } from "./locked-menu";
 import { STASHPAD_AGGREGATE_VIEW_TYPE, archiveSubfolderOf } from "./types";
+
+/** One row of the locked-subtree registry (`settings.lockedSubtrees`). */
+type LockedEntry = { folder: string; blob: string; parentId?: string | null; title?: string; count?: number; created?: string; rootId?: string; prevSibling?: string | null };
 import { renderTaskTriage, defaultTaskTriageState, type TaskTriageState } from "./task-render";
 import { renderAggModeBar, type AggMode } from "./agg-modes";
 import { returnToOriginOnClose } from "./leaf-return";
@@ -143,6 +147,7 @@ export class StashpadAggregateView extends ItemView {
         exp.onclick = () => void this.plugin.exportLockedSubtree(e.blob);
         const lock = row.createSpan({ cls: "stashpad-aggregate-lockbadge" });
         setIcon(lock, "lock");
+        this.attachLockedRowMenu(row, e, { archived: false });
       }
     }
   }
@@ -244,10 +249,46 @@ export class StashpadAggregateView extends ItemView {
     const restore = row.createEl("button", { cls: "stashpad-trash-restore", text: "Restore" });
     setIcon(restore.createSpan({ cls: "stashpad-btn-icon" }), "rotate-ccw");
     restore.onclick = async () => { restore.disabled = true; const ok = await this.plugin.unarchiveNote(f); if (ok) void this.render(); else restore.disabled = false; };
+    this.attachPlainRowMenu(row, f, restore);
+  }
+
+  /** ⋯ + right-click menu for a plain (unencrypted) archived note. Lighter than
+   *  the locked menu — the full note menu lives in the folder view; here we just
+   *  open, restore, and surface the file. */
+  private attachPlainRowMenu(row: HTMLElement, f: TFile, restoreBtn: HTMLButtonElement): void {
+    const buildMenu = (): Menu => {
+      const menu = new Menu();
+      menu.addItem((i) => i.setTitle("Open note").setIcon("file-text").onClick(() => void this.app.workspace.getLeaf(false).openFile(f)));
+      menu.addItem((i) => i.setTitle("Restore (un-archive)").setIcon("rotate-ccw").onClick(() => restoreBtn.click()));
+      menu.addSeparator();
+      if (!Platform.isMobile) {
+        menu.addItem((i) => i.setTitle("Show in Finder").setIcon("folder-open").onClick(() => {
+          try {
+            const shell = (window as unknown as { require?: (m: string) => { shell?: { showItemInFolder?: (p: string) => void } } }).require?.("electron")?.shell;
+            const fullPath = (this.app.vault.adapter as unknown as { getFullPath?: (p: string) => string })?.getFullPath?.(f.path);
+            if (fullPath && shell?.showItemInFolder) shell.showItemInFolder(fullPath);
+          } catch (err) { console.warn("[Stashpad] showItemInFolder failed", err); }
+        }));
+      }
+      menu.addItem((i) => i.setTitle("Copy file path").setIcon("copy").onClick(() => {
+        let path = f.path;
+        if (!Platform.isMobile) {
+          try { path = (this.app.vault.adapter as unknown as { getFullPath?: (p: string) => string })?.getFullPath?.(f.path) || f.path; } catch { /* keep relative */ }
+        }
+        void navigator.clipboard.writeText(path);
+        new Notice("Path copied.");
+      }));
+      return menu;
+    };
+    row.oncontextmenu = (evt: MouseEvent) => { evt.preventDefault(); buildMenu().showAtMouseEvent(evt); };
+    const more = row.createEl("button", { cls: "stashpad-trash-iconbtn stashpad-agg-more" });
+    setIcon(more, "ellipsis-vertical");
+    more.setAttr("aria-label", "More actions");
+    more.onclick = (evt) => { evt.stopPropagation(); buildMenu().showAtMouseEvent(evt as MouseEvent); };
   }
 
   /** One locked archived subtree — Restore (unlock, needs the password) + Export. */
-  private archiveLockedRow(container: HTMLElement, e: { blob: string; title?: string; count?: number; created?: string }): void {
+  private archiveLockedRow(container: HTMLElement, e: LockedEntry): void {
     const row = container.createDiv({ cls: "stashpad-trash-row" });
     const main = row.createDiv({ cls: "stashpad-trash-row-main" });
     main.createSpan({ cls: "stashpad-trash-title", text: e.title || "Locked note" });
@@ -278,6 +319,42 @@ export class StashpadAggregateView extends ItemView {
     exp.onclick = () => void this.plugin.exportLockedSubtree(e.blob);
     const lock = row.createSpan({ cls: "stashpad-aggregate-lockbadge" });
     setIcon(lock, "lock");
+    this.attachLockedRowMenu(row, e, { archived: true });
+  }
+
+  /** Attach a ⋯ button + right-click menu to a locked-bundle row. Delegates to
+   *  the shared `populateLockedMenu` builder (locked-menu.ts) — same source of
+   *  truth as the folder-view locked menu. `fullParity: false` gives the trimmed
+   *  aggregate item set; archived rows unlock-and-restore to the archive parent. */
+  private attachLockedRowMenu(row: HTMLElement, e: LockedEntry, opts: { archived: boolean }): void {
+    const buildMenu = (): Menu => {
+      const menu = new Menu();
+      populateLockedMenu(menu, {
+        app: this.app,
+        plugin: this.plugin,
+        descriptor: { blob: e.blob, rootId: e.rootId, count: e.count ?? 1, folder: this.cleanFolder(e.folder) },
+        unlockLabel: opts.archived ? "Unlock & restore" : "Decrypt (unlock)",
+        onUnlock: async () => {
+          let dest: string | undefined;
+          if (opts.archived) {
+            const segs = e.blob.split("/");
+            const archIdx = segs.lastIndexOf("archive");
+            dest = archIdx > 0 ? segs.slice(0, archIdx).join("/") : undefined;
+          }
+          const ok = await this.plugin.unlockBundleAt(e.blob, dest ? { destFolder: dest } : {});
+          if (ok) void this.render();
+        },
+        onChange: () => void this.render(),
+        fullParity: false,
+        confirmDelete: false,
+      });
+      return menu;
+    };
+    row.oncontextmenu = (evt: MouseEvent) => { evt.preventDefault(); buildMenu().showAtMouseEvent(evt); };
+    const more = row.createEl("button", { cls: "stashpad-trash-iconbtn stashpad-agg-more" });
+    setIcon(more, "ellipsis-vertical");
+    more.setAttr("aria-label", "More actions");
+    more.onclick = (evt) => { evt.stopPropagation(); buildMenu().showAtMouseEvent(evt as MouseEvent); };
   }
 
   /** 0.138.0 "Previously encrypted": subtrees that WERE encrypted and are now

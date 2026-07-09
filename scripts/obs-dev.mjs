@@ -210,8 +210,32 @@ async function screenshot(path) {
 
 async function reload() {
   await verifyVault();
-  await cdp("Page.reload", { ignoreCache: true });
+  // Reload from inside the page (Obsidian's own "app:reload", falling back to
+  // location.reload) rather than a raw CDP Page.reload. Page.reload tears the
+  // target down while we're still awaiting its response, which wedges the
+  // socket and has coincided with the dev instance dying outright. Fire it on a
+  // short timer so this eval returns before the navigation starts.
+  try {
+    await rawEval(wrapBody(`
+      const reloadNow = () => {
+        try { if (app.commands?.commands?.["app:reload"]) { app.commands.executeCommandById("app:reload"); return; } } catch {}
+        location.reload();
+      };
+      setTimeout(reloadNow, 50);
+      return "reloading";
+    `));
+  } catch { /* the socket may drop as the page navigates; that's expected */ }
   console.log("reloading dev instance renderer (picks up the latest deploy)…");
+  // Poll the port + re-verify like start(), so reload only returns once the
+  // instance is actually back — instead of leaving the next command to trip
+  // over a renderer that's still mid-reload (or gone).
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 700));
+    if (!(await portReady())) continue;
+    try { await verifyVault(); console.log("reload complete — instance healthy."); return; } catch { /* still booting */ }
+  }
+  throw new Error("dev instance did not come back after reload within 30s — run `obs-dev start` to relaunch.");
 }
 
 // ---- dispatch -------------------------------------------------------------

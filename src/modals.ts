@@ -38,6 +38,12 @@ export interface DuePickerOptions {
   quickAdjusts?: string[];
 }
 
+/** 0.155.0: fallback quick-adjust presets. Mirrors DEFAULT_SETTINGS.dueQuickAdjusts.
+ *  Used when a caller passes no `quickAdjusts` so the +/- row shows from EVERY
+ *  entry point (the row used to silently vanish when a call site — e.g. Assign —
+ *  forgot to pass the option). A caller can still explicitly pass `[]` to hide it. */
+export const DEFAULT_QUICK_ADJUSTS = ["5m", "15m", "30m", "1h", "1d", "1w"];
+
 /** 0.125.1: parse a compact duration token ("5m", "15m", "1h", "2d", "1w") into
  *  minutes. Returns null when unparseable so callers can skip bad presets. */
 export function parseAdjustMinutes(raw: string): number | null {
@@ -1206,18 +1212,19 @@ export class OpenDeepLinkModal extends Modal {
     this.contentEl.empty();
     this.modalEl.addClass("stashpad-export-modal");
     this.titleEl.setText("Open Stashpad link");
-    this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: "Paste an obsidian://stashpad link to jump to the note it points to." });
+    this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: "Paste one or more obsidian://stashpad links (one per line) to jump to the notes they point to. Multiple links each open in their own tab." });
 
     // Input + an explicit Paste button on one row. The button matters on mobile
     // (and anywhere clipboard auto-read is blocked) where the auto-prefill below
-    // can't run — one tap fills the field.
+    // can't run — one tap fills the field. 0.155.3: a textarea (not a single-line
+    // input) so a multi-link paste keeps its newlines.
     const row = this.contentEl.createDiv({ cls: "stashpad-open-link-row" });
     // Paste on the LEFT, input fills the rest of the row.
     const pasteBtn = row.createEl("button", { cls: "stashpad-open-link-paste" });
     setIcon(pasteBtn.createSpan({ cls: "stashpad-open-link-paste-icon" }), "clipboard-paste");
     pasteBtn.createSpan({ text: "Paste" });
     pasteBtn.title = "Paste from clipboard";
-    const input = row.createEl("input", { type: "text" });
+    const input = row.createEl("textarea", { attr: { rows: "3" } });
     input.addClass("stashpad-export-name");
     input.placeholder = "obsidian://stashpad?folder=…&note=…";
     pasteBtn.onclick = async () => {
@@ -1783,7 +1790,7 @@ export class DueDatePickerModal extends Modal {
     // configured preset. Clicking nudges the entered date+time by ±amount; if no
     // date/time is entered yet, it bases off "now" so a single tap schedules
     // e.g. "+1h from now". Reschedule-friendly for Snooze.
-    const adjusts = (this.opts.quickAdjusts ?? [])
+    const adjusts = (this.opts.quickAdjusts ?? DEFAULT_QUICK_ADJUSTS)
       .map((s) => ({ raw: s, min: parseAdjustMinutes(s) }))
       .filter((a): a is { raw: string; min: number } => a.min != null);
     if (adjusts.length > 0) {

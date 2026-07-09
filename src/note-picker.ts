@@ -519,43 +519,78 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       locked: n.locked,
     });
 
+    // 0.155.0: relevance + recency ranking. Sift alone is a boolean filter (see
+    // docs/sift.md) — matches used to render in raw tree order, so an exact-phrase
+    // title hit could sit below shallower token hits, and nothing was ordered by
+    // last-edited. Now each match gets a relevance BAND (exact title > title
+    // prefix > phrase-in-title > all-tokens-in-title > phrase-in-body >
+    // token-in-body) and, within a band, sorts by mtime desc. An EMPTY query
+    // sorts purely by most-recently-edited. In pick mode (the Move / destination
+    // picker) each folder's HOME note gets a small boost so it floats to the top
+    // of its results — homes are the common "move here" target.
+    const mtimeFor = (n: NoteBody): number =>
+      n.node?.file?.stat?.mtime ?? n.cross?.file?.stat?.mtime ?? 0;
+    const isHome = (n: NoteBody): boolean => n.node?.id === ROOT_ID || n.cross?.id === ROOT_ID;
+    const pinHomes = this.opts.mode === "pick";
+    const relevanceBand = (n: NoteBody): number => {
+      let band: number;
+      if (!q) {
+        band = 0; // empty query → recency only
+      } else {
+        const t = n.title.toLowerCase();
+        const b = n.body.toLowerCase();
+        if (t === q) band = 6;
+        else if (t.startsWith(q)) band = 5;
+        else if (t.includes(q)) band = 4;                 // exact phrase in title
+        else if (tokens.every((x) => t.includes(x))) band = 3; // all tokens in title
+        else if (b.includes(q)) band = 2;                 // exact phrase in body
+        else band = 1;                                    // token(s) in body only
+      }
+      if (pinHomes && isHome(n)) band += 0.5; // destination picker: float homes up
+      return band;
+    };
+
     const matchTier = (tier: NoteBody[]): PickerItem[] => {
-      const out: PickerItem[] = [];
+      // 1. Collect the notes that match (+ their per-line clusters for search).
+      const matched: { n: NoteBody; matchLines: number[] }[] = [];
       for (const n of tier) {
         // 0.64.0: structured filters always apply, even when there's no
         // free text — `in:work` alone should narrow to that folder.
         if (!passesFilters(n)) continue;
         if (this.opts.mode === "search") {
-          if (!q) { out.push(buildItem(n, -1)); continue; }
+          if (!q) { matched.push({ n, matchLines: [] }); continue; }
           const titleHit = matchesAll(n.title.toLowerCase());
           const lines = n.body.split(/\r?\n/);
-          // 0.69.12: collect ALL per-line matches, then cluster nearby
-          // matches together (within 5 lines) and emit one PickerItem
-          // per cluster — so a long note with multiple distinct
-          // matches surfaces each as its own result with surrounding
-          // context. Capped at 5 cluster rows per note to avoid spam.
+          // 0.69.12: collect ALL per-line matches; clustered into rows below.
           const matchLines: number[] = [];
           for (let i = 0; i < lines.length; i++) {
             if (lineMatchesAll(lines[i])) matchLines.push(i);
           }
           const bodyHit = matchLines.length > 0 || matchesAll(n.body.toLowerCase());
           if (!titleHit && !bodyHit) continue;
-          if (matchLines.length === 0) {
-            // Title-only / body-anywhere hit — no per-line preview.
-            out.push(buildItem(n, -1));
-          } else {
-            const clusterHeads: number[] = [];
-            let last = -100;
-            for (const ln of matchLines) {
-              if (ln - last > 5) clusterHeads.push(ln);
-              last = ln;
-            }
-            const CAP = 5;
-            for (const ml of clusterHeads.slice(0, CAP)) out.push(buildItem(n, ml));
-          }
+          matched.push({ n, matchLines });
         } else {
           // pick mode — tokens must all appear in title OR body.
           if (q && !matchesAll(n.title.toLowerCase()) && !matchesAll(n.body.toLowerCase())) continue;
+          matched.push({ n, matchLines: [] });
+        }
+      }
+      // 2. Rank: relevance band desc, then most-recently-edited. Precompute the
+      //    keys (band does substring work) so the comparator stays cheap. Array
+      //    sort is stable, so same-band/same-mtime ties keep tree order.
+      const scored = matched.map((m) => ({ ...m, band: relevanceBand(m.n), mtime: mtimeFor(m.n) }));
+      scored.sort((a, b) => (b.band - a.band) || (b.mtime - a.mtime));
+      // 3. Emit rows — one per note (title/body hit) or one per match cluster
+      //    (search mode, capped at 5) so a long note surfaces each hit in context.
+      const out: PickerItem[] = [];
+      for (const { n, matchLines } of scored) {
+        if (this.opts.mode === "search" && q && matchLines.length > 0) {
+          const clusterHeads: number[] = [];
+          let last = -100;
+          for (const ln of matchLines) { if (ln - last > 5) clusterHeads.push(ln); last = ln; }
+          const CAP = 5;
+          for (const ml of clusterHeads.slice(0, CAP)) out.push(buildItem(n, ml));
+        } else {
           out.push(buildItem(n, -1));
         }
       }
