@@ -4816,7 +4816,7 @@ export class StashpadView extends ItemView {
     // pencil becomes the context-menu button so the actions are consistent
     // wherever the focused note's controls appear on mobile.
     const moreBtn = mini.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-mini-more" });
-    setIcon(moreBtn, "more-vertical"); // 0.163.0: vertical kebab, matches the full header + list rows
+    setIcon(moreBtn, "ellipsis-vertical"); // 0.163.1: true vertical kebab (more-vertical is rotated 90° by Obsidian on iOS/macOS)
     moreBtn.title = "Actions";
     moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
   }
@@ -4878,11 +4878,12 @@ export class StashpadView extends ItemView {
     let toggleAnchor: HTMLElement;
     if (Platform.isMobile) {
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-more" });
-      // 0.163.0: vertical kebab (⋮) in the focused header to match the list rows
-      // (was more-horizontal per 0.123.1 to dodge top-clipping in the slim
-      // home-note row — the header CSS below keeps the button vertically centred so
-      // it no longer clips).
-      setIcon(moreBtn, "more-vertical");
+      // 0.163.1: vertical kebab (⋮) matching the list rows. Use `ellipsis-vertical`,
+      // NOT `more-vertical` — Obsidian's app.css rotates `.lucide-more-vertical` 90°
+      // on iOS/macOS (to the platform's horizontal-dots convention), so `more-vertical`
+      // actually renders as a HORIZONTAL meatball there. `ellipsis-vertical` isn't
+      // rotated, so it stays a true vertical kebab like the note rows use.
+      setIcon(moreBtn, "ellipsis-vertical");
       moreBtn.title = "Actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = moreBtn;
