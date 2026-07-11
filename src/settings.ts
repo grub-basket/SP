@@ -238,6 +238,18 @@ export interface StashpadSettings {
   folderPanelPinned: string[];
   folderPanelDownranked: string[];
   folderPanelHidden: string[];
+  /** 0.164.0: pin-order key for pinned FOLDERS, mirroring a note's `pinnedAt`
+   *  frontmatter. Lets pinned folders interleave + drag-reorder with pinned notes
+   *  in the Pinned section (one shared numeric order), and drives the pinned
+   *  folders' order in the Folders section. Keyed by cleaned folder path; a
+   *  missing entry is backfilled from the folder's position in `folderPanelPinned`. */
+  folderPanelPinnedAt: Record<string, number>;
+  /** 0.164.3: the WITHIN-GROUP order for the Pinned section's "group by folder"
+   *  view — a separate store from `pinnedAt` so the two modes keep independent
+   *  arrangements (switching modes never resets either). Keyed by folder path →
+   *  an ordered list of item keys (`f:<folder>` for the folder itself, `n:<folder>:<id>`
+   *  for a note). Items not listed sort after, by pin order; new pins append. */
+  folderPanelGroupItemOrder: Record<string, string[]>;
   /** 0.95.1: how the folder-panel Pinned section orders its notes.
    *  "pin-order" (default) = flat list in pin order; "folder" = grouped under
    *  per-Stashpad headers. */
@@ -597,6 +609,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   inheritObsidianExclusions: true,
   folderPanelPinnedFraction: 0.5,
   folderPanelPinned: [],
+  folderPanelPinnedAt: {},
+  folderPanelGroupItemOrder: {},
   folderPanelDownranked: [],
   folderPanelHidden: [],
   folderPanelPinnedGrouping: "pin-order",

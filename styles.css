@@ -4432,6 +4432,11 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 .stashpad-panel-pinned.is-flat .stashpad-pinned-folder { display: inline; }
 /* the folder panel's Pinned list never shows the per-row folder badge */
 .stashpad-folderpanel-pins .stashpad-pinned-folder { display: none; }
+/* 0.164.4: in the Pinned section, a folder row drops the "open in a tab" dot and
+   the pin icon — every folder here IS pinned (so the pin mark is redundant) and the
+   open-state dot belongs to the Folders section below. */
+.stashpad-folderpanel-pins .stashpad-folderpanel-dot,
+.stashpad-folderpanel-pins .stashpad-folderpanel-pinmark { display: none; }
 /* 0.95.3: Pinned panel head row — Home shortcut tucked in, view-options button
    to its right filling the rest of the line. */
 .stashpad-pinned-headrow { display: flex; align-items: center; gap: 4px; }
@@ -4691,16 +4696,34 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
   font-size: var(--font-ui-smaller);
 }
 
-/* 0.68.1 — drag-reorder visuals for pinned rows. */
-.stashpad-pinned-row.is-dragging {
-  opacity: 0.4;
+/* 0.68.1 / 0.164.1 — drag-reorder visuals for the folder panel's pinned rows AND
+   folder rows. The row being dragged FADES so it doesn't obscure the target, and a
+   clear accent drop-line renders on a layer ABOVE the rows (z-index) so you can see
+   exactly where the item will land — including in the Folders section. */
+.stashpad-pinned-row,
+.stashpad-folderpanel-folder-row { position: relative; }
+.stashpad-pinned-row.is-dragging,
+.stashpad-folderpanel-folder-row.is-dragging { opacity: 0.35; }
+.stashpad-pinned-row.drop-before::before,
+.stashpad-pinned-row.drop-after::after,
+.stashpad-folderpanel-folder-row.drop-before::before,
+.stashpad-folderpanel-folder-row.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  background: var(--interactive-accent);
+  border-radius: 2px;
+  /* 1px ring in the panel bg so the line reads crisply against any row color. */
+  box-shadow: 0 0 0 1px var(--background-primary);
+  z-index: 10;
+  pointer-events: none;
 }
-.stashpad-pinned-row.drop-before {
-  box-shadow: inset 0 2px 0 0 var(--interactive-accent);
-}
-.stashpad-pinned-row.drop-after {
-  box-shadow: inset 0 -2px 0 0 var(--interactive-accent);
-}
+.stashpad-pinned-row.drop-before::before,
+.stashpad-folderpanel-folder-row.drop-before::before { top: -1px; }
+.stashpad-pinned-row.drop-after::after,
+.stashpad-folderpanel-folder-row.drop-after::after { bottom: -1px; }
 
 /* 0.68.2 — completed pinned notes get the strikethrough + muted treatment,
    mirroring the in-list completed-row look. */
@@ -5240,6 +5263,18 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
 }
 .stashpad-folderpanel-heading-title { flex: 1 1 auto; }
 .stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn { height: 20px; width: 20px; }
+/* 0.164.5: the three section-header buttons (Pinned view options, New folder,
+   Open trash) get a thin border in the user's accent color so they read as
+   buttons rather than bare glyphs; hover fills with the accent. Scoped to the
+   heading row so note-row icon buttons are untouched. */
+.stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn {
+  border: 1px solid var(--interactive-accent);
+  color: var(--interactive-accent);
+}
+.stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn:hover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
 /* 0.98.37: the Folders heading doubles as the folder-switcher button. */
 .stashpad-folderpanel-heading-switch { cursor: pointer; border-radius: 4px; padding: 1px 4px; margin: -1px -4px; }
 .stashpad-folderpanel-heading-switch:hover { color: var(--text-normal); background: var(--background-modifier-hover); }

@@ -4,6 +4,17 @@ import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type Stas
 import { renderCountBadge } from "./panels-view";
 import { ConfirmModal } from "./modals";
 
+/** 0.164.0: a pinned item in the folder panel's shared pin order — either a
+ *  pinned FOLDER or a pinned NOTE. `at` is the shared numeric order key. */
+type PinnedItem =
+  | { kind: "folder"; folder: string; at: number }
+  | { kind: "note"; folder: string; id: string; file: TFile; at: number };
+
+/** Stable secondary sort key so items with an equal `at` don't jitter. */
+function pinTieKey(it: PinnedItem): string {
+  return it.kind === "folder" ? `f:${it.folder}` : `n:${it.folder}:${it.id}`;
+}
+
 /** 0.86.0: a left-sidebar folder picker, designed for mobile (swipe the left
  *  panel in, tap a folder to jump). Two stacked scrollable lists: pinned notes
  *  on top, Stashpad folders on the bottom (within thumb reach). Each folder row
@@ -165,82 +176,188 @@ export class StashpadFolderPanelView extends ItemView {
     this.render();
   }
 
+  // 0.164.0 unified pin ordering ------------------------------------------------
+
+  /** A pinned item — a folder OR a note — with its shared numeric order key. */
+  private unifiedPinnedItems(): PinnedItem[] {
+    const items: PinnedItem[] = [];
+    for (const f of this.plugin.discoverStashpadFolders()) {
+      if (this.folderState(f) === "pinned") {
+        items.push({ kind: "folder", folder: StashpadFolderPanelView.clean(f), at: this.folderPinnedAt(f) });
+      }
+    }
+    for (const p of this.plugin.listPinnedNotes()) {
+      items.push({ kind: "note", folder: p.folder, id: p.id, file: p.file, at: p.pinnedAt });
+    }
+    // One shared order: `at` ascending → newest pins (largest `at`) at the bottom.
+    // Deterministic tiebreak so equal keys don't jitter between renders.
+    items.sort((a, b) => a.at - b.at || pinTieKey(a).localeCompare(pinTieKey(b)));
+    return items;
+  }
+
+  /** A pinned folder's order key (parallel to a note's `pinnedAt`). Falls back to
+   *  the folder's index in `folderPanelPinned` when unset — small values sort
+   *  ahead of real timestamps, so legacy folder-pins stay near the top. */
+  private folderPinnedAt(folder: string): number {
+    const c = StashpadFolderPanelView.clean(folder);
+    const at = (this.plugin.settings.folderPanelPinnedAt ?? {})[c];
+    if (typeof at === "number") return at;
+    const idx = (this.plugin.settings.folderPanelPinned ?? []).indexOf(c);
+    return idx >= 0 ? idx : 0;
+  }
+
+  /** Backfill order keys for pinned folders missing one + drop keys for folders no
+   *  longer pinned. Persists at most once (only when something actually changed),
+   *  so it's safe to call at the top of every render. */
+  private ensureFolderPinOrder(): void {
+    const s = this.plugin.settings;
+    s.folderPanelPinnedAt = s.folderPanelPinnedAt ?? {};
+    let changed = false;
+    (s.folderPanelPinned ?? []).forEach((f, i) => {
+      const c = StashpadFolderPanelView.clean(f);
+      if (typeof s.folderPanelPinnedAt[c] !== "number") { s.folderPanelPinnedAt[c] = i; changed = true; }
+    });
+    for (const k of Object.keys(s.folderPanelPinnedAt)) {
+      if (!(s.folderPanelPinned ?? []).includes(k)) { delete s.folderPanelPinnedAt[k]; changed = true; }
+    }
+    if (changed) void this.plugin.saveSettings();
+  }
+
   private renderPinned(list: HTMLElement): void {
-    // 0.102.x: pinned FOLDERS mix into the top "Pinned" section (above the pinned
-    // notes), using the same folder rows as the list below. The bottom Folders
-    // subsection is unchanged — pinned folders still appear there ranked-first.
-    const pinnedFolders = this.plugin.discoverStashpadFolders().filter((f) => this.folderState(f) === "pinned");
-    const pins = this.plugin.listPinnedNotes();
-    if (pinnedFolders.length === 0 && pins.length === 0) {
+    this.ensureFolderPinOrder();
+    const items = this.unifiedPinnedItems();
+    if (items.length === 0) {
       list.createDiv({ cls: "stashpad-folderpanel-empty", text: "Nothing pinned yet — pin a note or folder from its right-click menu." });
       return;
     }
-    if (pinnedFolders.length > 0) {
-      const open = this.openFolders();
-      for (const folder of pinnedFolders) this.renderFolderRow(list, folder, open);
-    }
-    if (pins.length === 0) return;
+    const open = this.openFolders();
     const grouping = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
-    if (grouping === "folder") {
-      // Group by Stashpad, MRU folder floated to the top (mirrors the Pinned panel).
-      const groups = new Map<string, Array<{ folder: string; id: string; file: TFile; idx: number }>>();
-      pins.forEach((pin, idx) => {
-        let bucket = groups.get(pin.folder);
-        if (!bucket) { bucket = []; groups.set(pin.folder, bucket); }
-        bucket.push({ ...pin, idx });
+    const idxOf = new Map<PinnedItem, number>();
+    items.forEach((it, i) => idxOf.set(it, i));
+
+    if (grouping !== "folder") {
+      // Flat, shared pin order: folders and notes interleave and drag-reorder together.
+      for (const it of items) this.renderPinnedItem(list, it, idxOf.get(it)!, open, true);
+      return;
+    }
+
+    // Group-by-folder: notes group under per-Stashpad headers. A pinned FOLDER
+    // nests under its own group's header only if that group has pinned notes; else
+    // it's a standalone row ahead of the groups. Groups order by their EARLIEST pin
+    // (stable — navigating doesn't reshuffle them, unlike the old MRU float), and
+    // each group's items drag-reorder WITHIN the group with the order persisted in
+    // `folderPanelGroupItemOrder` — a store separate from pin-order mode's `at`, so
+    // switching modes never resets either arrangement.
+    const notes = items.filter((i): i is Extract<PinnedItem, { kind: "note" }> => i.kind === "note");
+    const folders = items.filter((i): i is Extract<PinnedItem, { kind: "folder" }> => i.kind === "folder");
+    const noteGroups = new Map<string, PinnedItem[]>();
+    for (const n of notes) { let b = noteGroups.get(n.folder); if (!b) { b = []; noteGroups.set(n.folder, b); } b.push(n); }
+    for (const fi of folders.filter((f) => !noteGroups.has(f.folder)).sort((a, b) => a.at - b.at)) {
+      this.renderPinnedItem(list, fi, idxOf.get(fi)!, open, false); // standalone folder
+    }
+    const groupMinAt = (folder: string): number => {
+      let m = Infinity;
+      const fi = folders.find((f) => f.folder === folder); if (fi) m = Math.min(m, fi.at);
+      for (const n of noteGroups.get(folder) ?? []) m = Math.min(m, n.at);
+      return m;
+    };
+    const groupKeys = [...noteGroups.keys()].sort((a, b) => groupMinAt(a) - groupMinAt(b) || a.localeCompare(b));
+    const activeFolder = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
+    for (const folder of groupKeys) {
+      const header = list.createDiv({ cls: "stashpad-pinned-group-header" });
+      if (folder === activeFolder) header.addClass("is-active-folder");
+      header.createSpan({ cls: "stashpad-pinned-group-name", text: folder.split("/").pop() || folder });
+      const groupItems: PinnedItem[] = [];
+      const matching = folders.find((fi) => fi.folder === folder);
+      if (matching) groupItems.push(matching);
+      groupItems.push(...(noteGroups.get(folder) ?? []));
+      const orderedItems = this.orderedGroupItems(folder, groupItems);
+      const keys = orderedItems.map(pinTieKey);
+      orderedItems.forEach((it, i) => {
+        const row = it.kind === "folder"
+          ? this.renderFolderRow(list, it.folder, open)
+          : this.renderPinNote(list, it.folder, it.id, it.file, i, false);
+        this.attachGroupItemDrag(row, folder, i, keys);
       });
-      const mru = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
-      const order = Array.from(groups.keys());
-      if (mru && groups.has(mru)) { order.splice(order.indexOf(mru), 1); order.unshift(mru); }
-      for (const folder of order) {
-        const header = list.createDiv({ cls: "stashpad-pinned-group-header" });
-        if (folder === mru) header.addClass("is-active-folder");
-        header.createSpan({ cls: "stashpad-pinned-group-name", text: folder.split("/").pop() || folder });
-        for (const p of groups.get(folder) ?? []) this.renderPinNote(list, p.folder, p.id, p.file, p.idx);
-      }
-    } else {
-      pins.forEach((pin, idx) => this.renderPinNote(list, pin.folder, pin.id, pin.file, idx));
     }
   }
 
-  /** Drag-reorder a pin by rewriting its `pinnedAt` to fall between its new
-   *  neighbors (the synced ordering key). Mirrors the Pinned panel. */
-  private async reorderPin(fromIdx: number, toIdx: number): Promise<void> {
-    const list = this.plugin.listPinnedNotes();
-    if (fromIdx < 0 || fromIdx >= list.length) return;
-    const moved = list[fromIdx];
-    const without = list.filter((_, i) => i !== fromIdx);
-    const insertAt = Math.max(0, Math.min(toIdx > fromIdx ? toIdx - 1 : toIdx, without.length));
-    const prev = without[insertAt - 1];
-    const next = without[insertAt];
-    let at: number;
-    if (!prev && !next) at = Date.now();
-    else if (!prev) at = next.pinnedAt - 1000;
-    else if (!next) at = prev.pinnedAt + 1000;
-    else at = (prev.pinnedAt + next.pinnedAt) / 2;
-    try {
-      await this.app.fileManager.processFrontMatter(moved.file, (fm: any) => { fm.pinnedAt = at; });
-    } catch (e) { console.warn("[Stashpad] pin reorder failed", e); }
+  /** A group's items ordered by the stored within-group order
+   *  (`folderPanelGroupItemOrder`). Items not yet stored fall to the end by pin
+   *  order (`at`), so newly-pinned items append. */
+  private orderedGroupItems(folder: string, groupItems: PinnedItem[]): PinnedItem[] {
+    const stored = (this.plugin.settings.folderPanelGroupItemOrder ?? {})[StashpadFolderPanelView.clean(folder)] ?? [];
+    const rank = new Map<string, number>(stored.map((k, i) => [k, i]));
+    return groupItems.slice().sort((a, b) => {
+      const ra = rank.has(pinTieKey(a)) ? rank.get(pinTieKey(a))! : Infinity;
+      const rb = rank.has(pinTieKey(b)) ? rank.get(pinTieKey(b))! : Infinity;
+      return ra - rb || a.at - b.at;
+    });
+  }
+
+  /** Persist a new within-group order after a within-group drag. */
+  private async reorderGroupItem(folder: string, keys: string[], fromIdx: number, toIdx: number): Promise<void> {
+    if (fromIdx < 0 || fromIdx >= keys.length) return;
+    const arr = keys.slice();
+    const [moved] = arr.splice(fromIdx, 1);
+    const insertAt = toIdx > fromIdx ? toIdx - 1 : toIdx;
+    arr.splice(Math.max(0, Math.min(insertAt, arr.length)), 0, moved);
+    this.plugin.settings.folderPanelGroupItemOrder = this.plugin.settings.folderPanelGroupItemOrder ?? {};
+    this.plugin.settings.folderPanelGroupItemOrder[StashpadFolderPanelView.clean(folder)] = arr;
+    await this.plugin.saveSettings();
     this.render();
   }
 
-  /** One top-level pinned note: color tint, completed style, and an expandable
-   *  child-count badge (borrowed from the Pinned panel). Reuses the
-   *  `.stashpad-pinned-*` classes so styling + note colors stay identical. */
-  private renderPinNote(list: HTMLElement, folder: string, id: string, file: TFile, idx: number): void {
-    const fm = (this.app.metadataCache.getFileCache(file)?.frontmatter ?? {}) as any;
-    const color = typeof fm.color === "string" ? fm.color : null;
-    const completed = fm.completed === true;
-    const children = this.childrenOf(folder, id);
-    const hasChildren = children.length > 0;
-    const key = `${folder}|${id}`;
-    const isExpanded = this.pinExpanded.has(key);
+  /** Within-group HTML5 drag-reorder (group-by-folder mode only). A private
+   *  dataTransfer type keeps it separate from the flat pin-order drag, and a drop
+   *  is accepted only from the SAME group (this reorders within a group, never
+   *  across groups). */
+  private attachGroupItemDrag(row: HTMLElement, folder: string, idx: number, keys: string[]): void {
+    const TYPE = "application/x-stashpad-groupitem";
+    row.draggable = true;
+    row.addEventListener("dragstart", (e) => {
+      e.dataTransfer?.setData(TYPE, JSON.stringify({ folder, idx }));
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+      row.addClass("is-dragging");
+    });
+    row.addEventListener("dragend", () => row.removeClass("is-dragging"));
+    row.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types?.includes(TYPE)) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = "move";
+      const rect = row.getBoundingClientRect();
+      const before = (e.clientY - rect.top) < rect.height / 2;
+      row.toggleClass("drop-before", before); row.toggleClass("drop-after", !before);
+    });
+    row.addEventListener("dragleave", () => { row.removeClass("drop-before"); row.removeClass("drop-after"); });
+    row.addEventListener("drop", (e) => {
+      if (!e.dataTransfer?.types?.includes(TYPE)) return;
+      e.preventDefault(); row.removeClass("drop-before"); row.removeClass("drop-after");
+      let data: { folder: string; idx: number } | null = null;
+      try { data = JSON.parse(e.dataTransfer.getData(TYPE) || "null"); } catch { data = null; }
+      if (!data || data.folder !== folder || data.idx === idx) return; // same-group only
+      const rect = row.getBoundingClientRect();
+      const before = (e.clientY - rect.top) < rect.height / 2;
+      void this.reorderGroupItem(folder, keys, data.idx, before ? idx : idx + 1);
+    });
+  }
 
-    const row = list.createDiv({ cls: "stashpad-pinned-row" });
-    if (color) { row.addClass("has-color"); row.style.setProperty("--stashpad-note-color", color); }
-    if (completed) row.addClass("is-completed");
+  /** Render one unified pinned item (folder or note). `draggable` wires the shared
+   *  drag-reorder — enabled ONLY in pin-order mode, where the visual order equals
+   *  the shared `at` order the drag math relies on. In group-by-folder mode the
+   *  visual order is grouped (MRU-first), so a drop would land between the wrong
+   *  neighbors — so drag is disabled there to keep behavior predictable. */
+  private renderPinnedItem(list: HTMLElement, it: PinnedItem, idx: number, open: Set<string>, draggable: boolean): void {
+    if (it.kind === "folder") {
+      const row = this.renderFolderRow(list, it.folder, open);
+      if (draggable) this.attachPinDrag(row, idx);
+    } else {
+      this.renderPinNote(list, it.folder, it.id, it.file, idx, draggable);
+    }
+  }
 
-    // HTML5 drag-reorder (mirrors the Pinned panel). pinnedAt is the synced key.
+  /** Shared HTML5 drag-reorder for a pinned row (folder or note), keyed by its
+   *  index in `unifiedPinnedItems()`. */
+  private attachPinDrag(row: HTMLElement, idx: number): void {
     row.draggable = true;
     row.dataset.pinIdx = String(idx);
     row.addEventListener("dragstart", (e) => {
@@ -265,8 +382,55 @@ export class StashpadFolderPanelView extends ItemView {
       if (!Number.isFinite(fromIdx) || fromIdx === idx) return;
       const rect = row.getBoundingClientRect();
       const before = (e.clientY - rect.top) < rect.height / 2;
-      void this.reorderPin(fromIdx, before ? idx : idx + 1);
+      void this.reorderPinnedItem(fromIdx, before ? idx : idx + 1);
     });
+  }
+
+  /** Drag-reorder any pinned item (folder or note) by rewriting the moved item's
+   *  order key to fall between its new neighbors. Notes write `pinnedAt`
+   *  frontmatter (synced); folders write `folderPanelPinnedAt` (settings). */
+  private async reorderPinnedItem(fromIdx: number, toIdx: number): Promise<void> {
+    const items = this.unifiedPinnedItems();
+    if (fromIdx < 0 || fromIdx >= items.length) return;
+    const moved = items[fromIdx];
+    const without = items.filter((_, i) => i !== fromIdx);
+    const insertAt = Math.max(0, Math.min(toIdx > fromIdx ? toIdx - 1 : toIdx, without.length));
+    const prev = without[insertAt - 1];
+    const next = without[insertAt];
+    let at: number;
+    if (!prev && !next) at = Date.now();
+    else if (!prev) at = next.at - 1000;
+    else if (!next) at = prev.at + 1000;
+    else at = (prev.at + next.at) / 2;
+    if (moved.kind === "folder") {
+      this.plugin.settings.folderPanelPinnedAt = this.plugin.settings.folderPanelPinnedAt ?? {};
+      this.plugin.settings.folderPanelPinnedAt[moved.folder] = at;
+      await this.plugin.saveSettings();
+    } else {
+      try { await this.app.fileManager.processFrontMatter(moved.file, (fm: any) => { fm.pinnedAt = at; }); }
+      catch (e) { console.warn("[Stashpad] pin reorder failed", e); }
+    }
+    this.render();
+  }
+
+  /** One top-level pinned note: color tint, completed style, and an expandable
+   *  child-count badge (borrowed from the Pinned panel). Reuses the
+   *  `.stashpad-pinned-*` classes so styling + note colors stay identical. */
+  private renderPinNote(list: HTMLElement, folder: string, id: string, file: TFile, idx: number, draggable: boolean): HTMLElement {
+    const fm = (this.app.metadataCache.getFileCache(file)?.frontmatter ?? {}) as any;
+    const color = typeof fm.color === "string" ? fm.color : null;
+    const completed = fm.completed === true;
+    const children = this.childrenOf(folder, id);
+    const hasChildren = children.length > 0;
+    const key = `${folder}|${id}`;
+    const isExpanded = this.pinExpanded.has(key);
+
+    const row = list.createDiv({ cls: "stashpad-pinned-row" });
+    if (color) { row.addClass("has-color"); row.style.setProperty("--stashpad-note-color", color); }
+    if (completed) row.addClass("is-completed");
+
+    // Shared drag-reorder (pinnedAt is the synced key) — only in pin-order mode.
+    if (draggable) this.attachPinDrag(row, idx);
 
     const toggle = row.createSpan({ cls: "stashpad-pinned-toggle" });
     if (hasChildren) {
@@ -298,6 +462,7 @@ export class StashpadFolderPanelView extends ItemView {
       const box = list.createDiv({ cls: "stashpad-pinned-children" });
       this.renderPinSubtree(box, folder, id, 1);
     }
+    return row;
   }
 
   private renderPinSubtree(parent: HTMLElement, folder: string, parentId: StashpadId, depth: number): void {
@@ -412,9 +577,18 @@ export class StashpadFolderPanelView extends ItemView {
     s.folderPanelPinned = (s.folderPanelPinned ?? []).filter((f) => f !== c);
     s.folderPanelDownranked = (s.folderPanelDownranked ?? []).filter((f) => f !== c);
     s.folderPanelHidden = (s.folderPanelHidden ?? []).filter((f) => f !== c);
-    if (state === "pinned") s.folderPanelPinned.push(c);
-    else if (state === "downranked") s.folderPanelDownranked.push(c);
-    else if (state === "hidden") s.folderPanelHidden.push(c);
+    s.folderPanelPinnedAt = s.folderPanelPinnedAt ?? {};
+    if (state === "pinned") {
+      s.folderPanelPinned.push(c);
+      // 0.164.0: newly-pinned folder gets `now` so it lands at the BOTTOM of the
+      // shared pin order (mixed with the most-recent note pins).
+      s.folderPanelPinnedAt[c] = Date.now();
+    } else {
+      // No longer pinned — drop its order key so it doesn't linger.
+      delete s.folderPanelPinnedAt[c];
+      if (state === "downranked") s.folderPanelDownranked.push(c);
+      else if (state === "hidden") s.folderPanelHidden.push(c);
+    }
     await this.plugin.saveSettings();
     this.render();
   }
@@ -442,11 +616,11 @@ export class StashpadFolderPanelView extends ItemView {
       return;
     }
     this.rebuildHomeColors();
+    this.ensureFolderPinOrder();
     const open = this.openFolders();
 
-    // Partition by placement (discoverStashpadFolders is already alpha-sorted, so
-    // each group preserves alphabetical order). Hidden folders drop out of the
-    // main list and surface in the collapsible "Hidden" section below.
+    // Partition by placement. Hidden folders drop out of the main list and surface
+    // in the collapsible "Hidden" section below.
     const pinned: string[] = [], normal: string[] = [], downranked: string[] = [], hidden: string[] = [];
     for (const folder of folders) {
       switch (this.folderState(folder)) {
@@ -457,17 +631,81 @@ export class StashpadFolderPanelView extends ItemView {
       }
     }
 
+    // 0.164.0: pinned folders in their shared pin order (drag-reorderable); the
+    // remaining folders alphabetical, CASE-INSENSITIVE (by display name).
+    pinned.sort((a, b) => this.folderPinnedAt(a) - this.folderPinnedAt(b)
+      || StashpadFolderPanelView.clean(a).localeCompare(StashpadFolderPanelView.clean(b)));
+    const ciName = (f: string) => (f.split("/").pop() || f).toLowerCase();
+    normal.sort((a, b) => ciName(a).localeCompare(ciName(b)));
+    downranked.sort((a, b) => ciName(a).localeCompare(ciName(b)));
+
     const ordered = [...pinned, ...normal, ...downranked];
     if (ordered.length === 0 && hidden.length === 0) {
       list.createDiv({ cls: "stashpad-folderpanel-empty", text: "No Stashpad folders yet." });
       return;
     }
-    for (const folder of ordered) this.renderFolderRow(list, folder, open);
+    for (const folder of ordered) {
+      const row = this.renderFolderRow(list, folder, open);
+      // Pinned folders here are drag-reorderable among themselves (writes the same
+      // shared order key, so the Pinned section above stays consistent).
+      if (this.folderState(folder) === "pinned") this.attachFolderSectionDrag(row, pinned.indexOf(folder), pinned);
+    }
 
     if (hidden.length > 0) this.renderHiddenSection(list, hidden);
   }
 
-  private renderFolderRow(list: HTMLElement, folder: string, open: Set<string>): void {
+  /** Drag-reorder a PINNED folder within the Folders section. Uses a private
+   *  dataTransfer type so it never mixes with the Pinned section's row drags, and
+   *  writes the shared `folderPanelPinnedAt` order key. */
+  private attachFolderSectionDrag(row: HTMLElement, idx: number, pinned: string[]): void {
+    const TYPE = "application/x-stashpad-folder";
+    row.draggable = true;
+    row.addEventListener("dragstart", (e) => {
+      e.dataTransfer?.setData(TYPE, String(idx));
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+      row.addClass("is-dragging");
+    });
+    row.addEventListener("dragend", () => row.removeClass("is-dragging"));
+    row.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types?.includes(TYPE)) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = "move";
+      const rect = row.getBoundingClientRect();
+      const before = (e.clientY - rect.top) < rect.height / 2;
+      row.toggleClass("drop-before", before); row.toggleClass("drop-after", !before);
+    });
+    row.addEventListener("dragleave", () => { row.removeClass("drop-before"); row.removeClass("drop-after"); });
+    row.addEventListener("drop", (e) => {
+      if (!e.dataTransfer?.types?.includes(TYPE)) return;
+      e.preventDefault(); row.removeClass("drop-before"); row.removeClass("drop-after");
+      const fromIdx = parseInt(e.dataTransfer.getData(TYPE) ?? "", 10);
+      if (!Number.isFinite(fromIdx) || fromIdx === idx) return;
+      const rect = row.getBoundingClientRect();
+      const before = (e.clientY - rect.top) < rect.height / 2;
+      void this.reorderPinnedFolders(pinned, fromIdx, before ? idx : idx + 1);
+    });
+  }
+
+  /** Reorder a pinned folder among the pinned folders by rewriting its shared
+   *  order key to fall between its new neighbors. */
+  private async reorderPinnedFolders(pinned: string[], fromIdx: number, toIdx: number): Promise<void> {
+    if (fromIdx < 0 || fromIdx >= pinned.length) return;
+    const moved = pinned[fromIdx];
+    const without = pinned.filter((_, i) => i !== fromIdx);
+    const insertAt = Math.max(0, Math.min(toIdx > fromIdx ? toIdx - 1 : toIdx, without.length));
+    const prev = without[insertAt - 1];
+    const next = without[insertAt];
+    let at: number;
+    if (!prev && !next) at = Date.now();
+    else if (!prev) at = this.folderPinnedAt(next) - 1000;
+    else if (!next) at = this.folderPinnedAt(prev) + 1000;
+    else at = (this.folderPinnedAt(prev) + this.folderPinnedAt(next)) / 2;
+    this.plugin.settings.folderPanelPinnedAt = this.plugin.settings.folderPanelPinnedAt ?? {};
+    this.plugin.settings.folderPanelPinnedAt[StashpadFolderPanelView.clean(moved)] = at;
+    await this.plugin.saveSettings();
+    this.render();
+  }
+
+  private renderFolderRow(list: HTMLElement, folder: string, open: Set<string>): HTMLElement {
     const state = this.folderState(folder);
     const isOpen = open.has(StashpadFolderPanelView.clean(folder));
     const row = list.createDiv({ cls: "stashpad-folderpanel-row stashpad-folderpanel-folder-row" });
@@ -561,6 +799,7 @@ export class StashpadFolderPanelView extends ItemView {
         prow.onclick = () => { this.onNavigateAway(); void this.plugin.revealNoteInStashpad(f); };
       }
     }
+    return row;
   }
 
   /** A folder's ROOT-level (Home) list-pinned notes — backs the folder-panel
