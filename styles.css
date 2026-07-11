@@ -2241,7 +2241,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
      collapse chevron + secondary group + send anchor to the RIGHT. */
   width: 100%;
   margin-top: 4px;
-  gap: 0;
+  /* 0.162.0: one flex gap spaces EVERY rail item — the secondary group, the
+     collapse chevron, and Send — by the same amount, at any width. (The nav
+     cluster stays hard-left via its own margin-right:auto below, so this gap only
+     governs the right-hand run.) Previously the gap was 0 and Send carried its own
+     margin, which lined up at desktop width but drifted on a real phone. */
+  gap: 6px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -2297,8 +2302,26 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile .stashpad-composer-send {
   background: var(--interactive-accent);
   color: var(--text-on-accent);
+  /* 0.162.0: Send is the SAME 32px box as every other rail button, so the rail's
+     6px flex gap puts its icon on the exact same 38px rhythm as every other pair —
+     equidistant at any width, no per-element margin to drift. The accent fill
+     alone marks it as the primary action; an invisible ::before (below) extends
+     the tap target well past the box so it stays easy to hit near the edge. */
+  margin-right: 4px; /* small inset so it isn't flush to the screen edge */
+  border-radius: 8px;
+  position: relative;
 }
 .stashpad-view.is-mobile .stashpad-composer-send:hover { color: var(--text-on-accent); }
+/* 0.162.0: invisible hit-area extender — grows the tappable region ~8px in every
+   direction (to ~48px) WITHOUT changing the 32px visual box or the layout, so the
+   primary action is forgiving to tap without breaking the equidistant spacing. */
+.stashpad-view.is-mobile .stashpad-composer-send::before {
+  content: "";
+  position: absolute;
+  /* Left is only -6px so the extended hit area stops at the 6px flex gap and
+     never overlaps the split button's tap zone; the other sides go -8px. */
+  inset: -8px -8px -8px -6px;
+}
 
 /* 0.119.0 (mobile-ui-changes-2): mobile layout — move the filter/view/time
    toolbar to the bottom (above the composer); the breadcrumb trail stays at top.
@@ -2325,7 +2348,9 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile .stashpad-composer-btn-group {
   display: inline-flex;
   align-items: center;
-  gap: 0;
+  /* 0.161.0: 6px between the secondary buttons so the whole rail is evenly
+     spaced (icon centres 38px apart) and Send's 4px margin matches that rhythm. */
+  gap: 6px;
   max-width: 0;
   overflow: hidden;
   opacity: 0;

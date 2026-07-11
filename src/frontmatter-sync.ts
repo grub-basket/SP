@@ -57,6 +57,28 @@ export class FrontmatterSyncQueue {
    *  active work. */
   private static readonly PACING_MS = 100;
 
+  /** 0.160.0: paths we just wrote frontmatter to (parentLink/children), with the
+   *  timestamp of the write. The `vault.modify` event our write triggers arrives
+   *  shortly after; the view consults `wasRecentSelfWrite` in its modify handler
+   *  so it can skip the render-cache evict + re-read (the body is provably
+   *  unchanged — we only touched frontmatter). One-shot per write. */
+  private recentSelfWrites = new Map<string, number>();
+  /** How long after our frontmatter write the resulting `modify` event may take
+   *  to arrive. Generous for a slow network share (the write itself can be ~600ms
+   *  and the echo can lag). Kept tight enough that an unrelated later edit isn't
+   *  swept up (and it's one-shot besides). */
+  private static readonly SELF_WRITE_GRACE_MS = 2500;
+
+  /** True (once) if `path` had a frontmatter-only self-write within the grace
+   *  window. Consumes the flag so only the FIRST modify after our write is
+   *  treated as ours — a later genuine body edit is handled normally. */
+  wasRecentSelfWrite(path: string): boolean {
+    const t = this.recentSelfWrites.get(path);
+    if (t == null) return false;
+    this.recentSelfWrites.delete(path); // one-shot
+    return Date.now() - t < FrontmatterSyncQueue.SELF_WRITE_GRACE_MS;
+  }
+
   constructor(
     private app: App,
     private getTree: () => TreeIndex,
@@ -221,6 +243,11 @@ export class FrontmatterSyncQueue {
     const parentLink = this.computeParentLink(node);
     const childrenLinks = this.computeChildrenLinks(node);
     try {
+      // 0.160.0: mark this as our own frontmatter-only write so the view's modify
+      // handler can skip the render-cache evict/re-read it would otherwise trigger
+      // (the body is unchanged). Marked right before the write so the timestamp is
+      // as close as possible to the resulting modify event.
+      this.recentSelfWrites.set(node.file.path, Date.now());
       await perf.timeAsync("write.fmSync", () => this.app.fileManager.processFrontMatter(node.file!, (fm) => {
         if (parentLink) fm[PARENT_LINK_FIELD] = parentLink;
         else delete fm[PARENT_LINK_FIELD];

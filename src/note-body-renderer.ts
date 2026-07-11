@@ -70,6 +70,27 @@ export class NoteBodyRenderer {
     return entry;
   }
 
+  /** 0.159.0: seed the render cache for a JUST-created note from the body we
+   *  already hold in RAM — no `cachedRead` (the slow network round-trip) and no
+   *  filename-title placeholder. Called by `createNoteUnder` right after the
+   *  file is written, before `render()`, so the new row paints its real body
+   *  immediately and stays stable. `rawBody` is the note's body text WITHOUT
+   *  frontmatter (what the composer produced); it's run through the same
+   *  attachment-split + MarkdownRenderer path as a normal read so the primed
+   *  entry is byte-identical to what a later read would compute. Best-effort:
+   *  a failure just leaves the row to render the normal (slower) way. */
+  async primeRender(file: TFile, rawBody: string): Promise<void> {
+    try {
+      const { text, attachments } = this.splitAttachments(this.host.stripFrontmatter(rawBody));
+      const detached = createDiv({ cls: "stashpad-note-text" });
+      await MarkdownRenderer.render(this.host.app, text, detached, file.path, this.component);
+      const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html: detached.innerHTML };
+      this.renderCache.set(file.path, entry);
+    } catch (e) {
+      console.warn("[Stashpad] primeRender failed", e);
+    }
+  }
+
   /** (Re)create the lazy-body IntersectionObserver for the current paint.
    *  Root is the view's scroll host; rootMargin pre-renders a screenful
    *  above/below so scrolling rarely catches a placeholder. */
@@ -115,6 +136,16 @@ export class NoteBodyRenderer {
     const c = this.renderCache as { evict?: (p: string) => void; delete?: (p: string) => void };
     if (c.evict) c.evict(file.path);
     else if (c.delete) c.delete(file.path);
+  }
+
+  /** 0.160.0: move a cached render entry to a NEW mtime without recomputing —
+   *  used when a frontmatter-only self-write (fmSync recovery links) bumps the
+   *  file's mtime but leaves the body unchanged. Without this, the mtime-keyed
+   *  cache would look stale and force a re-read on a slow drive (the second
+   *  create flash). No-ops if there's no entry (nothing rendered yet). */
+  retagMtime(path: string, mtime: number): void {
+    const c = this.renderCache.get(path);
+    if (c && c.mtime !== mtime) this.renderCache.set(path, { ...c, mtime });
   }
 
   /** Register a deferred render for a cold row: run `fn` once the container

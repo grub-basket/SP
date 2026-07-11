@@ -4816,7 +4816,7 @@ export class StashpadView extends ItemView {
     // pencil becomes the context-menu button so the actions are consistent
     // wherever the focused note's controls appear on mobile.
     const moreBtn = mini.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-mini-more" });
-    setIcon(moreBtn, "more-horizontal"); // 0.123.1: horizontal kebab, matches the full header
+    setIcon(moreBtn, "more-vertical"); // 0.163.0: vertical kebab, matches the full header + list rows
     moreBtn.title = "Actions";
     moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
   }
@@ -4878,10 +4878,11 @@ export class StashpadView extends ItemView {
     let toggleAnchor: HTMLElement;
     if (Platform.isMobile) {
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-more" });
-      // 0.123.1: horizontal kebab in the focused header — its shorter vertical
-      // footprint can't clip at the top in the slim home-note header row (the
-      // vertical ellipsis did). List rows keep the vertical kebab.
-      setIcon(moreBtn, "more-horizontal");
+      // 0.163.0: vertical kebab (⋮) in the focused header to match the list rows
+      // (was more-horizontal per 0.123.1 to dodge top-clipping in the slim
+      // home-note row — the header CSS below keeps the button vertically centred so
+      // it no longer clips).
+      setIcon(moreBtn, "more-vertical");
       moreBtn.title = "Actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = moreBtn;
@@ -11060,6 +11061,12 @@ export class StashpadView extends ItemView {
             this.tree.insertSynthetic({
               id, parent: parentId, children: [], file: f as TFile, created,
             });
+            // 0.159.0: seed the render cache from the body we JUST wrote, so the
+            // new row paints its real body immediately — no filename-title
+            // placeholder and no `cachedRead` (the slow network round-trip). On a
+            // slow/network drive this is the difference between an instant, stable
+            // new row and the body→title→body flash while the read resolves.
+            await this.bodyRenderer.primeRender(f as TFile, body);
             // Batched splits defer the render to a single pass at the end
             // (see createNotesBatch) so a long paste doesn't repaint per note.
             if (!opts.deferRender) this.render();
@@ -11406,6 +11413,18 @@ export class StashpadView extends ItemView {
   private onFileModify = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
+    // 0.160.0: our OWN recovery-field write (fmSync parentLink/children) only
+    // touches frontmatter — the body is provably unchanged, so the rendered body
+    // is still correct. Evicting + re-rendering here would flash the filename
+    // placeholder and re-read the body over the network (the SECOND create flash
+    // on a slow drive). Instead just move the cache entry to the new mtime so it
+    // stays a hit, and skip the re-render + slug/attachment/authorship handling
+    // (none apply to a frontmatter-only write). One-shot per write, so a genuine
+    // later body edit is still handled below.
+    if (this.fmSync.wasRecentSelfWrite(file.path)) {
+      this.bodyRenderer.retagMtime(file.path, file.stat.mtime);
+      return;
+    }
     // 0.122.6 (#13): drop this file's (possibly stale-content-but-fresh-mtime)
     // render-cache entry so the debounced re-render below recomputes from fresh
     // content — fixes the truncated/attachment-less "earlier version" render
