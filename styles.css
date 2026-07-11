@@ -5265,15 +5265,12 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
 .stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn { height: 20px; width: 20px; }
 /* 0.164.5: the three section-header buttons (Pinned view options, New folder,
    Open trash) get a thin border in the user's accent color so they read as
-   buttons rather than bare glyphs; hover fills with the accent. Scoped to the
-   heading row so note-row icon buttons are untouched. */
+   buttons rather than bare glyphs. 0.164.6: ONLY the border carries the accent —
+   the glyph stays the plain muted icon color (and normal hover), so the accent
+   reads as an outline, not a tint. Scoped to the heading row so note-row icon
+   buttons are untouched. */
 .stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn {
   border: 1px solid var(--interactive-accent);
-  color: var(--interactive-accent);
-}
-.stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn:hover {
-  background: var(--interactive-accent);
-  color: var(--text-on-accent);
 }
 /* 0.98.37: the Folders heading doubles as the folder-switcher button. */
 .stashpad-folderpanel-heading-switch { cursor: pointer; border-radius: 4px; padding: 1px 4px; margin: -1px -4px; }
