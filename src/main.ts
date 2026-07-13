@@ -475,7 +475,15 @@ export default class StashpadPlugin extends Plugin {
       // views instead of the folder pickers.
       if (dir && !this.pathHasExcludedSegment(dir) && !isInReservedSubfolder(dir)) folders.add(dir);
     }
-    const sorted = [...folders].sort();
+    // 0.165.0: sort alphabetically, case-INSENSITIVELY, so the Folders lists in
+    // settings (and every other folder picker) read A→Z regardless of casing
+    // instead of clustering all-uppercase names ahead of lowercase ones (the
+    // default `.sort()` is ASCII-ordered). Deterministic case-sensitive tiebreak
+    // for names that differ only by case.
+    const sorted = [...folders].sort(
+      (a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })
+        || (a < b ? -1 : a > b ? 1 : 0),
+    );
     this.knownStashpadFolders = new Set(sorted);
     return sorted;
   }
@@ -1619,14 +1627,12 @@ export default class StashpadPlugin extends Plugin {
       callback: () => call("cmdRedo"),
     });
     this.addCommand({
+      // 0.167.0: one unified export command (the modal picks .stash / OKF / plain
+      // .zip + content). Keeps the id so existing keybinds survive; OKF's separate
+      // command was retired.
       id: "stashpad-export-stash",
-      name: "Export selection to .stash",
+      name: "Export selection (.stash / OKF / plain .zip)…",
       callback: () => call("cmdExportStash"),
-    });
-    this.addCommand({
-      id: "stashpad-export-okf",
-      name: "Export selection as OKF bundle (.zip / .tar.gz / .stash)",
-      callback: () => call("cmdExportOkf"),
     });
     this.addCommand({
       id: "stashpad-import-stash",

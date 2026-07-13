@@ -1,9 +1,9 @@
 import { FuzzySuggestModal, Notice, TFile, moment } from "obsidian";
 import { ROOT_ID, type StashpadId, type TreeNode } from "../types";
-import { buildStashZip, importStashZip, STASH_EXT } from "../stash-package";
+import { buildStashZip, buildFilteredZip, importStashZip, STASH_EXT, type ExportContent } from "../stash-package";
 import { argon2Available, encryptStash, decryptWithKey, resolveStashBytes, STASH_KDF_INFO } from "../stash-crypto";
 import { secretIdForStashName } from "../passphrase";
-import { ExportStashModal, OkfExportModal } from "../modals";
+import { ExportStashModal } from "../modals";
 import { readLockedMeta } from "../encryption-ops";
 import type { StashpadView } from "../view";
 import type StashpadPlugin from "../main";
@@ -29,10 +29,13 @@ export async function cmdExportStash(view: StashpadView, rootNode?: TreeNode): P
   const defaultBase = roots.length === 1
     ? view.titleForNode(roots[0])
     : `${folderTag}-${roots.length}notes`;
-  // 0.84.2: confirm name (+ later: optional encryption) in a modal first.
-  new ExportStashModal(view.app, defaultBase, all.length, (chosen, password, remember) => {
-    void runExport(view, roots, all, chosen, password, remember);
-  }, argon2Available).open();
+  // 0.167.0: unified export modal — pick Content (full/frontmatter/body) + Format
+  // (.stash / OKF / plain .zip). Route by the effective format the modal returns.
+  new ExportStashModal(view.app, defaultBase, all.length, (c) => {
+    if (c.format === "stash") void runExport(view, roots, all, c.baseName, c.password, c.remember);
+    else if (c.format === "okf") void runOkfExport(view, roots, all, c.baseName, c.okf);
+    else void runPlainZipExport(view, roots, all, c.baseName, c.content);
+  }, { kdfProbe: argon2Available, okfEnabled: view.plugin.settings.okfEnabled }).open();
 }
 
 /** Export an ALREADY-LOCKED subtree (a `.stashenc` blob) as a shareable `.stash`.
@@ -55,9 +58,9 @@ export async function cmdExportLockedBlob(plugin: StashpadPlugin, blobPath: stri
   const entry = (plugin.settings.lockedSubtrees ?? []).find((x) => x.blob === blobPath);
   const base = entry?.title || meta?.title || "locked-note";
   const count = entry?.count ?? meta?.count ?? 1;
-  new ExportStashModal(plugin.app, base, count, (chosen, password, remember) => {
-    void deliverLockedExport(plugin, residentFolder, chosen, zip, password, remember);
-  }, argon2Available).open();
+  new ExportStashModal(plugin.app, base, count, (c) => {
+    void deliverLockedExport(plugin, residentFolder, c.baseName, zip, c.password, c.remember);
+  }, { kdfProbe: argon2Available, locked: true }).open();
 }
 
 async function deliverLockedExport(plugin: StashpadPlugin, folder: string, baseName: string, zip: Uint8Array, password: string | null, remember = false): Promise<void> {
@@ -87,28 +90,19 @@ async function deliverLockedExport(plugin: StashpadPlugin, folder: string, baseN
   finally { try { zip.fill(0); } catch { /* */ } } // wipe the decrypted plaintext copy
 }
 
-/** Export the selection/cursor subtree as an OKF bundle (.zip / .tar.gz) and/or a
- *  Stashpad .stash, via plugin.exportOkf. */
-export async function cmdExportOkf(view: StashpadView, rootNode?: TreeNode): Promise<void> {
-  const roots = collectExportRoots(view, rootNode);
-  if (roots.length === 0) { new Notice("Nothing to export."); return; }
-  const all = collectExportSubtree(view, roots);
-  if (all.length === 0) { new Notice("No exportable notes."); return; }
-  const folderTag = (view.noteFolder.split("/").pop() || view.noteFolder).trim();
-  const defaultBase = roots.length === 1 ? view.titleForNode(roots[0]) : `${folderTag}-okf`;
-  new OkfExportModal(view.app, defaultBase, all.length, (base, formats) => {
-    void (async () => {
-      try {
-        const written = await view.plugin.exportOkf(view.noteFolder, roots.map((r) => r.id), base, formats);
-        if (!written.length) { new Notice("Nothing exported."); return; }
-        view.plugin.notifications.show({
-          message: `Exported OKF — ${written.length} file${written.length === 1 ? "" : "s"} → \`${view.noteFolder}/${(view.plugin.settings.exportFolder || "_exports")}\``,
-          kind: "success", category: "export", affectedPaths: written, folder: view.noteFolder, duration: 0,
-        });
-        await view.log.append({ type: "stash_export", id: roots[0].id, payload: { okf: true, paths: written, noteCount: all.length, rootIds: roots.map((r) => r.id) } });
-      } catch (e) { new Notice(`OKF export failed: ${(e as Error).message}`); console.error(e); }
-    })();
-  }).open();
+/** 0.167.0: OKF bundle delivery (invoked from the unified export modal when Format
+ *  = OKF). Delegates the actual bundle build to plugin.exportOkf (okf-export.ts). */
+async function runOkfExport(view: StashpadView, roots: TreeNode[], all: TreeNode[], baseName: string, okf: { zip: boolean; targz: boolean }): Promise<void> {
+  try {
+    const written = await view.plugin.exportOkf(view.noteFolder, roots.map((r) => r.id), baseName, { zip: okf.zip, targz: okf.targz });
+    if (!written.length) { new Notice("Nothing exported."); return; }
+    view.plugin.notifications.show({
+      message: `Exported OKF — ${written.length} file${written.length === 1 ? "" : "s"} → \`${view.noteFolder}/${(view.plugin.settings.exportFolder || "_exports")}\``,
+      kind: "success", category: "export", affectedPaths: written, folder: view.noteFolder,
+      actions: written[0] ? view.actionsForFile(written[0]) : undefined, duration: 0,
+    });
+    await view.log.append({ type: "stash_export", id: roots[0].id, payload: { okf: true, paths: written, noteCount: all.length, rootIds: roots.map((r) => r.id) } });
+  } catch (e) { new Notice(`OKF export failed: ${(e as Error).message}`); console.error(e); }
 }
 
 /** Build + write the .stash with the chosen base name, optionally encrypted,
@@ -168,6 +162,54 @@ async function runExport(view: StashpadView, roots: TreeNode[], all: TreeNode[],
       // keepOpen:true on the file actions, the user often wants to
       // click Reveal, glance, come back, and click Show in OS. The
       // 4s auto-dismiss was cutting that flow short.
+      duration: 0,
+    });
+  } catch (e) {
+    view.plugin.notifications.show({
+      message: `Stashpad: export failed\nError: ${(e as Error).message}\nCheck disk space + write permissions on the export folder.`,
+      kind: "error",
+      category: "export",
+    });
+    console.error(e);
+  }
+}
+
+/** 0.167.0: plain-.zip export (Format = plain .zip, any Content). Bundles the
+ *  filtered markdown WITH referenced attachments — NOT a re-importable .stash
+ *  (stripping frontmatter/body drops the id/parent structure re-import needs; and
+ *  even for full content, this is the "open anywhere" archive without a manifest). */
+async function runPlainZipExport(
+  view: StashpadView,
+  roots: TreeNode[],
+  all: TreeNode[],
+  baseName: string,
+  content: ExportContent,
+): Promise<void> {
+  try {
+    const notes = all.filter((n) => !!n.file).map((n) => ({ file: n.file! }));
+    const buf = await buildFilteredZip(view.app, notes, content);
+
+    const stamp = (moment as any)().format("YYYYMMDD-HHmmss");
+    const safe = safeBaseName(baseName);
+    const exportSub = (view.plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
+    const exportFolder = `${view.noteFolder}/${exportSub}`;
+    await view.ensureFolder(exportFolder);
+    const outPath = `${exportFolder}/${safe}-${stamp}.zip`;
+    await view.app.vault.createBinary(outPath, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
+
+    const scope = content === "frontmatter" ? "frontmatter only" : content === "body" ? "body only" : "full notes";
+    await view.log.append({
+      type: "stash_export",
+      id: roots[0].id,
+      payload: { path: outPath, noteCount: notes.length, rootIds: roots.map((r) => r.id), content },
+    });
+    view.plugin.notifications.show({
+      message: `Exported ${notes.length} note${notes.length === 1 ? "" : "s"} (${scope}, plain .zip) → \`${outPath}\``,
+      kind: "success",
+      category: "export",
+      affectedPaths: [outPath],
+      folder: view.noteFolder,
+      actions: view.actionsForFile(outPath),
       duration: 0,
     });
   } catch (e) {

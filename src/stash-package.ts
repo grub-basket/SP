@@ -114,6 +114,48 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
   return zipFiles(entries, 6);
 }
 
+/** 0.167.0: build a PLAIN .zip (no manifest, not re-importable) of the given
+ *  notes, filtered by ExportContent, WITH their referenced attachments. Reuses
+ *  buildStashZip's attachment collection + link-rewrite so `![[path]]` becomes
+ *  `![[basename]]` and the binaries ride along under `attachments/`. Frontmatter-
+ *  only skips attachments (no body → nothing to view). Notes land under `notes/`. */
+export async function buildFilteredZip(
+  app: App,
+  notes: { file: TFile }[],
+  content: ExportContent,
+): Promise<Uint8Array> {
+  const entries: ZipEntry[] = [];
+  const collectedAtts = new Map<string, ArrayBuffer>();
+  const warnings: string[] = [];
+  const usedNames = new Set<string>();
+
+  for (const n of notes) {
+    let md = await app.vault.read(n.file);
+    // Collect + rewrite attachments before filtering (frontmatter-only has no
+    // body to reference them, so skip that case).
+    if (content !== "frontmatter") {
+      for (const ref of extractAttachmentRefs(md)) {
+        const af = app.metadataCache.getFirstLinkpathDest(ref, n.file.path);
+        if (!af) { warnings.push(`Missing attachment "${ref}" in ${n.file.path}`); continue; }
+        const basename = af.name;
+        if (!collectedAtts.has(basename)) collectedAtts.set(basename, await app.vault.readBinary(af));
+        md = rewriteAttachmentRef(md, ref, basename);
+      }
+      md = rewriteFrontmatterAttachmentList(md, app, n.file.path);
+    }
+    const data = filterNoteContent(md, content);
+    // Flat, collision-free filenames (the subtree may span nested folders).
+    let name = n.file.name;
+    while (usedNames.has(name)) name = `${n.file.basename}-${newId(4)}.md`;
+    usedNames.add(name);
+    entries.push({ name: `notes/${name}`, data });
+  }
+
+  for (const [name, buf] of collectedAtts) entries.push({ name: `attachments/${name}`, data: buf });
+  if (warnings.length) entries.push({ name: "warnings.txt", data: warnings.join("\n") });
+  return zipFiles(entries, 6);
+}
+
 // ---------------- Import ----------------
 
 export async function importStashZip(
@@ -419,6 +461,25 @@ export function splitFrontmatter(content: string): { fm: Record<string, any>; bo
 export function serializeNote(fm: Record<string, any>, body: string): string {
   const yaml = stringifyYaml(fm).trimEnd();
   return `---\n${yaml}\n---\n${body}`;
+}
+
+/** 0.166.0: content scope for exports (a forum request). "full" is the whole
+ *  note (the only re-importable option); "frontmatter" keeps just the leading
+ *  `---` fenced block; "body" keeps just the content after it. Non-"full"
+ *  exports are shareable plain zips, NOT re-importable .stash/OKF bundles — they
+ *  drop the id/parent structure Stashpad needs to rebuild the tree. */
+export type ExportContent = "full" | "frontmatter" | "body";
+
+/** Apply an ExportContent filter to a note's RAW markdown. Works on raw text (no
+ *  YAML parse/round-trip) so frontmatter isn't reformatted, reordered, or quoted
+ *  differently than the user wrote it. A note with no frontmatter fence yields ""
+ *  for "frontmatter" and the whole note for "body". */
+export function filterNoteContent(content: string, mode: ExportContent): string {
+  if (mode === "full") return content;
+  const fence = content.match(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/);
+  if (mode === "frontmatter") return fence ? fence[0] : "";
+  // body: strip the leading frontmatter fence (if any) + any leading blank lines
+  return fence ? content.slice(fence[0].length).replace(/^\s*\n/, "") : content;
 }
 
 async function ensureFolder(app: App, path: string): Promise<void> {

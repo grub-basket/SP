@@ -3078,6 +3078,39 @@ body.is-mobile .stashpad-okf-cta {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* 0.166.0: export "Content" segmented control (Full / Frontmatter only / Body
+   only) + the plain-zip warning shown for the non-full modes. */
+.stashpad-export-content { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.stashpad-export-content-seg { display: flex; gap: 6px; flex-wrap: wrap; }
+.stashpad-export-content-opt {
+  flex: 1 1 0;
+  min-width: 96px;
+  padding: 5px 10px;
+  font-size: var(--font-ui-smaller);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-export-content-opt:hover { color: var(--text-normal); }
+.stashpad-export-content-opt.is-active {
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+}
+.stashpad-export-format { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.stashpad-okf-formats { margin-top: 8px; }
+.stashpad-export-zipwarn {
+  margin-top: 8px;
+  padding: 8px 10px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  border-left: 3px solid var(--text-warning, var(--interactive-accent));
+  border-radius: 4px;
+}
 .stashpad-export-footer {
   display: flex;
   justify-content: flex-end;

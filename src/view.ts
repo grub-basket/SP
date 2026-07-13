@@ -10958,7 +10958,6 @@ export class StashpadView extends ItemView {
   // Implementations live in commands/io-cmds.ts; these thin delegators keep
   // the public method names stable for the keydown dispatcher + main.ts.
   cmdExportStash(rootNode?: TreeNode): Promise<void> { return ioCmds.cmdExportStash(this, rootNode); }
-  cmdExportOkf(rootNode?: TreeNode): Promise<void> { return ioCmds.cmdExportOkf(this, rootNode); }
   cmdImportStash(): Promise<void> { return ioCmds.cmdImportStash(this); }
   processStashFile(file: TFile): Promise<void> { return ioCmds.processStashFile(this, file); }
 
@@ -11677,10 +11676,9 @@ export class StashpadView extends ItemView {
         if (node) it.onClick(() => void this.cmdCopyStashpadLink(opts.normalizeToNode ? node : undefined));
         else it.setDisabled(true);
       });
-      target.addItem((it: any) => it.setTitle("Export to .stash…").setIcon("package").onClick(() => { norm(); void this.cmdExportStash(); }));
-      if (this.plugin.settings.okfEnabled) {
-        target.addItem((it: any) => it.setTitle("Export as OKF…").setIcon("book-marked").onClick(() => { norm(); void this.cmdExportOkf(); }));
-      }
+      // 0.167.0: one unified "Export…" entry — the modal now picks .stash / OKF /
+      // plain .zip + content scope, so the two old items collapsed into one.
+      target.addItem((it: any) => it.setTitle("Export…").setIcon("package").onClick(() => { norm(); void this.cmdExportStash(); }));
     };
     menu.addItem((it: any) => {
       it.setTitle("Share & export").setIcon("share-2");

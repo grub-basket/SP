@@ -4,6 +4,7 @@ import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
+import type { ExportContent } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
 
 export interface AssigneeRef { id: string; name: string }
@@ -629,28 +630,79 @@ export class SplitNoteModal extends Modal {
  *  — the timestamp is appended automatically so reusing a name never clobbers
  *  a prior export. Returns the chosen base name (sanitized by the caller), or
  *  nothing if cancelled. */
+/** 0.166.0: shared "Content" segmented control (Full note / Frontmatter only /
+ *  Body only) for both export modals. Fires onChange with the picked mode on
+ *  every click (and once with the initial "full"). */
+function buildExportContentPicker(
+  host: HTMLElement,
+  onChange: (mode: ExportContent) => void,
+): void {
+  const wrap = host.createDiv({ cls: "stashpad-export-content" });
+  wrap.createEl("label", { cls: "stashpad-export-label", text: "Content" });
+  const seg = wrap.createDiv({ cls: "stashpad-export-content-seg" });
+  const opts: Array<{ id: ExportContent; label: string }> = [
+    { id: "full", label: "Full note" },
+    { id: "frontmatter", label: "Frontmatter only" },
+    { id: "body", label: "Body only" },
+  ];
+  const btns = new Map<ExportContent, HTMLButtonElement>();
+  const select = (m: ExportContent) => {
+    btns.forEach((b, k) => b.toggleClass("is-active", k === m));
+    onChange(m);
+  };
+  for (const o of opts) {
+    const b = seg.createEl("button", { cls: "stashpad-export-content-opt", text: o.label });
+    b.onclick = (e) => { e.preventDefault(); select(o.id); };
+    btns.set(o.id, b);
+  }
+  select("full");
+}
+
+/** 0.167.0: the unified export modal's result. `format` is the chosen output;
+ *  `content` filters the note markdown (only "full" can re-import). `okf` carries
+ *  the OKF sub-formats when `format === "okf"`. */
+export interface ExportChoice {
+  baseName: string;
+  content: ExportContent;
+  format: "stash" | "okf" | "zip";
+  okf: { zip: boolean; targz: boolean };
+  password: string | null;
+  remember: boolean;
+}
+
+export interface ExportModalOpts {
+  /** Probe (cached) for whether Argon2id can run here, so the modal can state up
+   *  front whether this export will use the strong suite or the fallback. */
+  kdfProbe?: () => Promise<boolean>;
+  /** Offer the OKF format option (gated by the okfEnabled setting). */
+  okfEnabled?: boolean;
+  /** Locked-bundle re-export: the payload is an opaque encrypted blob, so Content
+   *  + Format are hidden — only filename + the password UI apply. */
+  locked?: boolean;
+}
+
 export class ExportStashModal extends Modal {
   private delivered = false;
   constructor(
     app: App,
     private defaultBaseName: string,
     private noteCount: number,
-    private onConfirm: (baseName: string, password: string | null, remember: boolean) => void,
-    /** Probe (cached) for whether Argon2id can run here, so the modal can state
-     *  up front whether this export will use the strong suite or the fallback.
-     *  Optional so callers/tests can omit it (the text just stays generic). */
-    private kdfProbe?: () => Promise<boolean>,
+    private onConfirm: (choice: ExportChoice) => void,
+    private opts: ExportModalOpts = {},
   ) {
     super(app);
   }
   onOpen(): void {
     this.contentEl.empty();
-    this.titleEl.setText("Export to .stash");
+    const locked = !!this.opts.locked;
+    this.titleEl.setText(locked ? "Export encrypted bundle" : "Export");
     this.modalEl.addClass("stashpad-export-modal");
 
     this.contentEl.createEl("p", {
       cls: "stashpad-export-desc",
-      text: `${this.noteCount} note${this.noteCount === 1 ? "" : "s"} will be bundled into a single .stash file.`,
+      text: locked
+        ? `Re-export this locked bundle (${this.noteCount} note${this.noteCount === 1 ? "" : "s"}) as a shareable .stash.`
+        : `Export ${this.noteCount} note${this.noteCount === 1 ? "" : "s"}.`,
     });
 
     const field = this.contentEl.createDiv({ cls: "stashpad-export-field" });
@@ -662,6 +714,58 @@ export class ExportStashModal extends Modal {
     // Live preview of the final on-disk filename (timestamp appended at
     // export; "-encrypted" tag added when encryption is on — see below).
     const preview = this.contentEl.createEl("div", { cls: "stashpad-export-preview" });
+
+    // 0.166.0 / 0.167.0: what to export — the whole note, only its frontmatter, or
+    // only its body. Non-"full" drops the structure Stashpad needs to re-import, so
+    // it forces a plain .zip. Hidden entirely for locked (opaque) bundles.
+    let content: ExportContent = "full";
+    let rerender: () => void = () => {}; // set to refresh() once it exists (avoids TDZ)
+    const contentHost = this.contentEl.createDiv();
+    buildExportContentPicker(contentHost, (m) => { content = m; rerender(); });
+    if (locked) contentHost.setCssStyles({ display: "none" });
+
+    // 0.167.0: format — the output kind. Only meaningful for full-content,
+    // non-locked exports (filtered exports force "zip"; locked forces "stash").
+    let format: "stash" | "okf" | "zip" = "stash";
+    const fmtWrap = this.contentEl.createDiv({ cls: "stashpad-export-format" });
+    fmtWrap.createEl("label", { cls: "stashpad-export-label", text: "Format" });
+    const fmtSeg = fmtWrap.createDiv({ cls: "stashpad-export-content-seg" });
+    const fmtOpts: Array<{ id: "stash" | "okf" | "zip"; label: string }> = [
+      { id: "stash", label: "Stashpad .stash" },
+      ...(this.opts.okfEnabled ? [{ id: "okf" as const, label: "OKF bundle" }] : []),
+      { id: "zip", label: "Plain .zip" },
+    ];
+    const fmtBtns = new Map<string, HTMLButtonElement>();
+    for (const o of fmtOpts) {
+      const b = fmtSeg.createEl("button", { cls: "stashpad-export-content-opt", text: o.label });
+      b.toggleClass("is-active", o.id === format);
+      b.onclick = (e) => {
+        e.preventDefault();
+        format = o.id;
+        fmtBtns.forEach((bb, k) => bb.toggleClass("is-active", k === format));
+        rerender();
+      };
+      fmtBtns.set(o.id, b);
+    }
+    // OKF sub-formats (only when format === "okf").
+    const okfSub = this.contentEl.createDiv({ cls: "stashpad-okf-formats" });
+    const mkOkf = (label: string, checked: boolean): HTMLInputElement => {
+      const row = okfSub.createDiv({ cls: "stashpad-okf-fmt" });
+      const c = row.createEl("input", { type: "checkbox" }); c.checked = checked;
+      row.createEl("label", { text: label });
+      c.onchange = () => rerender();
+      return c;
+    };
+    const okfZip = mkOkf(".zip — OKF bundle (portable)", true);
+    const okfTar = mkOkf(".tar.gz — OKF bundle (tarball)", false);
+    const okfHint = okfSub.createDiv({ cls: "stashpad-export-pw-hint is-error" });
+    okfHint.setText("Pick at least one OKF format.");
+    okfHint.setCssStyles({ display: "none" });
+    if (locked) fmtWrap.setCssStyles({ display: "none" });
+
+    const zipWarn = this.contentEl.createDiv({ cls: "stashpad-export-zipwarn" });
+    zipWarn.setText("Frontmatter-only / body-only exports save as a plain .zip of the selected markdown (with referenced attachments) — not a re-importable .stash.");
+    zipWarn.setCssStyles({ display: "none" });
 
     // --- 0.84.3: optional password encryption (opt-in, default off) ---
     const encWrap = this.contentEl.createDiv({ cls: "stashpad-export-encrypt" });
@@ -730,8 +834,8 @@ export class ExportStashModal extends Modal {
     // fallback — rather than describing both abstractly.
     const suite = pwArea.createEl("div", { cls: "stashpad-export-pw-suite" });
     suite.setText("Encryption: AES-256-GCM. Checking key-derivation suite for this device…");
-    if (this.kdfProbe) {
-      void this.kdfProbe().then((argonOk) => {
+    if (this.opts.kdfProbe) {
+      void this.opts.kdfProbe().then((argonOk) => {
         suite.toggleClass("is-weak", !argonOk);
         suite.setText(
           argonOk
@@ -754,6 +858,10 @@ export class ExportStashModal extends Modal {
     const secretStorage = (this.app as App & { secretStorage?: SecretStorage }).secretStorage;
     const rememberRow = pwArea.createDiv({ cls: "stashpad-export-remember" });
     const rememberCb = rememberRow.createEl("input", { type: "checkbox" });
+    // 0.167.1: ticked by default — most people export to re-import on the same
+    // device, so pre-saving the passphrase to this device's keychain is the common
+    // case. Untick to keep it out of the keychain (e.g. exports only for others).
+    rememberCb.checked = true;
     rememberCb.id = "stashpad-export-remember-cb";
     const rememberLabel = rememberRow.createEl("label", {
       text: "Remember in this vault (this device) — skips the prompt when you re-import here.",
@@ -765,7 +873,7 @@ export class ExportStashModal extends Modal {
     rememberNote.setText(
       "Saved only in this device's keychain — it doesn't sync to your other devices and isn't shared with anyone you send this file to. Keep the passphrase somewhere safe if you'll open this export elsewhere.",
     );
-    rememberNote.setCssStyles({ display: "none" });
+    rememberNote.setCssStyles({ display: rememberCb.checked ? "" : "none" });
     rememberCb.onchange = () => {
       rememberNote.setCssStyles({ display: rememberCb.checked ? "" : "none" });
     };
@@ -774,11 +882,21 @@ export class ExportStashModal extends Modal {
     // 0.84.13: encrypted exports get an "-encrypted" tag in the filename so
     // secure bundles are identifiable at a glance. The preview reflects it live
     // as the checkbox toggles.
+    // Effective format after the content/locked constraints: filtered → plain zip;
+    // locked → stash; otherwise the picked format.
+    const effFormat = (): "stash" | "okf" | "zip" =>
+      locked ? "stash" : (content !== "full" ? "zip" : format);
     const effectiveBase = (): string => {
       const b = input.value.trim() || this.defaultBaseName;
-      return cb.checked ? `${b}-encrypted` : b;
+      if (!locked && content !== "full") return `${b}-${content}`;
+      return (effFormat() === "stash" && cb.checked) ? `${b}-encrypted` : b;
     };
-    const renderPreview = () => preview.setText(`Saves as:  ${effectiveBase()}-<timestamp>.stash`);
+    const renderPreview = () => {
+      const f = effFormat();
+      if (f === "stash") { preview.setText(`Saves as:  ${effectiveBase()}-<timestamp>.stash`); return; }
+      if (f === "okf") { preview.setText(`Saves as:  ${effectiveBase()}-<timestamp>.zip / .tar.gz  (OKF bundle)`); return; }
+      preview.setText(`Saves as:  ${effectiveBase()}-<timestamp>.zip  (plain archive — not re-importable)`);
+    };
     input.oninput = renderPreview;
 
     const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
@@ -798,14 +916,31 @@ export class ExportStashModal extends Modal {
     };
 
     const refresh = () => {
-      const enc = cb.checked;
+      // 0.167.0: Content ≠ full (and non-locked) forces a plain .zip; Format picks
+      // the output otherwise. Encryption applies only to .stash. Show/hide each
+      // block to match, and gate Export on the active sub-choices.
+      const filtered = !locked && content !== "full";
+      const f = effFormat();
+      fmtWrap.setCssStyles({ display: (!locked && !filtered) ? "" : "none" });
+      okfSub.setCssStyles({ display: (!locked && !filtered && format === "okf") ? "" : "none" });
+      zipWarn.setCssStyles({ display: filtered ? "" : "none" });
+
+      const encAllowed = f === "stash"; // covers locked (effFormat → stash) too
+      encWrap.setCssStyles({ display: encAllowed ? "" : "none" });
+      const enc = encAllowed && cb.checked;
       pwArea.setCssStyles({ display: enc ? "" : "none" });
+
       let ok = true;
       if (enc) {
         if (!pw1.value) { hint.setText("Enter a password to encrypt this export."); hint.removeClass("is-error"); ok = false; }
         else if (pw1.value !== pw2.value) { hint.setText("Passwords don't match."); hint.addClass("is-error"); ok = false; }
         else { hint.setText("⚠️ If you lose this password, the export can't be recovered."); hint.removeClass("is-error"); }
       }
+      // OKF needs at least one sub-format.
+      const okfEmpty = !locked && !filtered && format === "okf" && !okfZip.checked && !okfTar.checked;
+      okfHint.setCssStyles({ display: okfEmpty ? "" : "none" });
+      if (okfEmpty) ok = false;
+
       renderStrength();
       pwSyncers.forEach((fn) => fn()); // Paste↔Copy per field as values change
       go.disabled = !ok;
@@ -836,10 +971,21 @@ export class ExportStashModal extends Modal {
     cb.onchange = refresh;
     pw1.oninput = refresh;
     pw2.oninput = refresh;
+    rerender = refresh; // content/format-picker clicks now re-render the modal
     refresh();
 
-    const deliver = () =>
-      this.commit(effectiveBase(), cb.checked ? pw1.value : null, cb.checked && rememberCb.checked);
+    const deliver = () => {
+      const f = effFormat();
+      const pw = (f === "stash" && cb.checked) ? pw1.value : null;
+      this.commit({
+        baseName: effectiveBase(),
+        content,
+        format: f,
+        okf: { zip: okfZip.checked, targz: okfTar.checked },
+        password: pw,
+        remember: !!pw && rememberCb.checked,
+      });
+    };
     go.onclick = deliver;
 
     // Enter confirms (when not blocked); Esc / click-out cancels (modal
@@ -852,12 +998,12 @@ export class ExportStashModal extends Modal {
     // Focus + select-all so the prefilled name is ready to type over.
     requestAnimationFrame(() => { input.focus(); input.select(); });
   }
-  private commit(raw: string, password: string | null, remember: boolean): void {
-    const base = raw.trim() || this.defaultBaseName;
-    const pw = password && password.length ? password : null;
+  private commit(choice: ExportChoice): void {
+    const base = choice.baseName.trim() || this.defaultBaseName;
+    const pw = choice.password && choice.password.length ? choice.password : null;
     this.delivered = true;
     this.close();
-    this.onConfirm(base, pw, !!pw && remember);
+    this.onConfirm({ ...choice, baseName: base, password: pw, remember: !!pw && choice.remember });
   }
   onClose(): void {
     // No delivery on cancel/Esc/click-out — the export simply doesn't run.
@@ -2357,42 +2503,6 @@ export class ImportDupChoiceModal extends Modal {
     anyway.onclick = () => { this.chose = true; this.close(); this.onChoose("anyway"); };
   }
   onClose(): void { if (!this.chose) this.onChoose("skip"); this.contentEl.empty(); }
-}
-
-/** OKF export: pick a name + one or more container formats. Delegates the actual
- *  bundle build to plugin.exportOkf (see okf-export.ts). */
-export class OkfExportModal extends Modal {
-  private base: string;
-  constructor(app: App, defaultBase: string, private noteCount: number, private onConfirm: (base: string, formats: { zip: boolean; targz: boolean; stash: boolean }) => void) {
-    super(app); this.base = defaultBase;
-  }
-  onOpen(): void {
-    this.contentEl.empty();
-    this.modalEl.addClass("stashpad-export-modal");
-    this.titleEl.setText("Export as OKF");
-    this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: `Export ${this.noteCount} note${this.noteCount === 1 ? "" : "s"} as an Open Knowledge Format bundle. Pick one or more formats.` });
-    const name = this.contentEl.createEl("input", { type: "text" });
-    name.addClass("stashpad-export-name"); name.value = this.base; name.placeholder = "Export name";
-    const mk = (label: string, checked: boolean): HTMLInputElement => {
-      const row = this.contentEl.createDiv({ cls: "stashpad-okf-fmt" });
-      const cb = row.createEl("input", { type: "checkbox" }); cb.checked = checked;
-      row.createEl("label", { text: label });
-      return cb;
-    };
-    const zip = mk(".zip — OKF bundle (portable)", true);
-    const targz = mk(".tar.gz — OKF bundle (tarball)", false);
-    const stash = mk(".stash — Stashpad format (re-importable)", false);
-    const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
-    footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
-    const go = footer.createEl("button", { cls: "mod-cta", text: "Export" });
-    go.onclick = () => {
-      if (!zip.checked && !targz.checked && !stash.checked) { new Notice("Pick at least one format."); return; }
-      this.close();
-      this.onConfirm(name.value.trim() || this.base, { zip: zip.checked, targz: targz.checked, stash: stash.checked });
-    };
-    requestAnimationFrame(() => name.focus());
-  }
-  onClose(): void { this.contentEl.empty(); }
 }
 
 /** 0.138.0 (re-encrypt sweep): ONE review modal listing everything that should

@@ -125,7 +125,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "toggleExpand",    label: "Show more / show less (expand toggle)", desc: "Default: Shift+? — toggle the clamp on the cursor row (or every selected row).", defaultPrimary: "Shift+?" },
   { id: "expandAll",       label: "Expand all (show every note's full body)", desc: "Un-clamp every note in the current list at once.", defaultPrimary: "" },
   { id: "collapseAll",     label: "Collapse all (clamp every note's body)", desc: "Re-clamp every note in the current list at once.", defaultPrimary: "" },
-  { id: "exportStash",     label: "Export selection to .stash",    desc: "Export the selected subtree(s) as a .stash bundle (notes + attachments).",                defaultPrimary: "" },
+  { id: "exportStash",     label: "Export selection…",             desc: "Open the export dialog for the selected subtree(s) — pick .stash / OKF / plain .zip and full/frontmatter/body content.", defaultPrimary: "" },
   { id: "importStash",     label: "Import .stash file",            desc: "Open the .stash bundle picker and import its notes into this Stashpad.",                  defaultPrimary: "" },
   { id: "pickFolder",      label: "Open / switch / create Stashpad folder", desc: "Default: Mod+S — opens the unified folder picker (reveal, switch, create, convert).", defaultPrimary: "Mod+S" },
   { id: "cloneStashpadTab",label: "Clone (duplicate / copy) this Stashpad tab", desc: "Open a second tab on the same folder + focus, mirroring the \"copy\" button in the focused-header actions.", defaultPrimary: "" },
