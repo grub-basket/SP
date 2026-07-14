@@ -1025,6 +1025,23 @@
   width: 15px;
   height: 15px;
 }
+/* 0.172.x: green "link automatically pasted" confirmation, shown only when the
+   field was auto-filled from the clipboard. */
+.stashpad-open-link-autohint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-success, var(--color-green, #44d07b));
+}
+.stashpad-open-link-autohint-icon {
+  display: inline-flex;
+}
+.stashpad-open-link-autohint-icon .svg-icon {
+  width: 14px;
+  height: 14px;
+}
 /* 0.117.0: breadcrumb levels modal — full-width clickable rows, indented
    by depth. Mobile-responsive via the compact-modal base + fluid width. */
 /* Size to content (don't sit at the compact-modal's fixed 440px with empty
@@ -1149,6 +1166,13 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
      a stable header strip and scroll-on-demand. */
   max-height: calc(var(--font-text-size, 16px) * 1.5 * 3);
   overflow-y: auto;
+}
+/* 0.171.1: when the focused note is expanded via the Show more toggle, drop
+   the header's own height cap so the whole note shows (the text clamp alone
+   wasn't enough — this container capped it independently). */
+.stashpad-focused-body.is-body-expanded {
+  max-height: none;
+  overflow-y: visible;
 }
 .stashpad-focused-body > :first-child { margin-top: 0; }
 .stashpad-focused-body > :last-child { margin-bottom: 0; }
@@ -2218,8 +2242,46 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-split-done-title { font-size: var(--font-ui-large); color: var(--text-success, var(--color-green)); }
 .stashpad-split-countdown { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .stashpad-split-done-btns { display: flex; gap: 8px; margin-top: 4px; }
-/* Mobile: tighter modal padding, smaller line list. */
-.is-mobile .stashpad-split-modal { width: min(420px, 96vw); }
+/* Mobile (0.172.0): full-height sheet with a scrollable body and a pinned
+   action bar. Previously the modal sized to content with the action bar at the
+   end of the flow, so a long note (tall textarea) pushed Save/Cancel off-screen
+   and — with the keyboard up — behind it. Now the content scrolls and the
+   actions stick to the bottom of the visible area, always reachable. */
+.is-mobile .stashpad-split-modal {
+  width: 100vw;
+  max-width: 100vw;
+  height: 100%;
+  max-height: 100%;
+  display: flex;
+  flex-direction: column;
+  border-radius: 0;
+}
+.is-mobile .stashpad-split-modal .modal-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  -webkit-overflow-scrolling: touch;
+}
+/* Pinned, full-bleed action bar (Save/Cancel/pop-out). Sticks to the bottom of
+   the scrollport so it stays visible above the keyboard; wraps on narrow width. */
+.is-mobile .stashpad-split-modal .stashpad-split-actions {
+  position: sticky;
+  bottom: 0;
+  margin: 8px -12px -10px;
+  padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+  background: var(--background-primary);
+  border-top: 1px solid var(--background-modifier-border);
+  flex-wrap: wrap;
+  gap: 8px;
+  z-index: 3;
+}
+/* On a phone the primary Save spans the row; secondary actions wrap under it. */
+.is-mobile .stashpad-split-modal .stashpad-split-actions-right {
+  gap: 8px;
+}
 .is-mobile .stashpad-split-list { max-height: 40vh; font-size: var(--font-ui-small); }
 .is-mobile .stashpad-split-line { padding: 6px 12px; }
 /* Tap-friendly line picker — make each line look interactable. */
@@ -3742,6 +3804,53 @@ body.is-mobile .stashpad-okf-cta {
 .stashpad-notice-action:focus-visible {
   outline: 2px solid var(--interactive-accent);
   outline-offset: 1px;
+}
+
+/* 0.171.1: whole-card-clickable toast (due reminder → open the task). The
+   click target is the actual `.notice` element (wired in show()), so the whole
+   toast surface — Obsidian's padding included — opens the task. */
+.notice.stashpad-notice-clickable {
+  cursor: pointer;
+}
+.notice.stashpad-notice-clickable:hover {
+  filter: brightness(1.08);
+}
+/* has-overlay: reserve room for the corner control + anchor its absolute
+   position to the content wrap. */
+.stashpad-notice.has-overlay {
+  position: relative;
+  padding-right: 84px;
+}
+/* Overlay control (Snooze) — layered above the card, top-right. Its click
+   handler stopPropagation()s so it never triggers the body's open-task click. */
+.stashpad-notice-overlay {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: var(--font-ui-smaller);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 80ms ease;
+}
+.stashpad-notice-overlay:hover {
+  background: var(--interactive-hover);
+}
+.stashpad-notice-overlay:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+.stashpad-notice-overlay .svg-icon {
+  width: 14px;
+  height: 14px;
 }
 
 /* Notification history modal — extends the existing log-modal layout

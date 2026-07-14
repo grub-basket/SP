@@ -4903,7 +4903,12 @@ export class StashpadView extends ItemView {
     }
 
     this.renderNoteBody(body, node, {
-      clamp: Platform.isMobile,
+      // 0.170.6: clamp on desktop too (was mobile-only), so the focused header
+      // gets the same Show more / Show less toggle as list rows when the note
+      // overflows — respecting the user's expand-bodies-by-default setting.
+      // Previously the desktop focused header rendered un-clamped with no
+      // toggle at all, so a long focused note had no collapse affordance.
+      clamp: true,
       // The focused header is a single, always-visible element (and on desktop
       // lives outside the list's lazy-render observer), so render its body now
       // rather than deferring — otherwise a cold (uncached) note stays on the
@@ -5362,6 +5367,11 @@ export class StashpadView extends ItemView {
       const textEl = container.createDiv({ cls: "stashpad-note-text" });
       const expanded = this.isNoteExpanded(node.id);
       if (opts.clamp && !expanded) textEl.addClass("is-clamped");
+      // 0.171.1: the focused-header body has its own height cap
+      // (.stashpad-focused-body max-height) that the text clamp doesn't
+      // control. Mirror the expanded state onto the container so that cap
+      // drops when the note is expanded (harmless class on list rows).
+      container.toggleClass("is-body-expanded", opts.clamp === true && expanded);
       // 0.71.23: in compact/tiny modes the row is too short to host
       // rendered markdown — headings overflow, code blocks get clipped
       // mid-line, lists wrap awkwardly. Render the raw text instead so
@@ -6592,6 +6602,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.listPin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin(); return; }
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
+      if (matchBinding(e, sb.openAllTasks)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void openAggregateView(this.plugin, "tasks"); return; }
     }
     // Jump to top/bottom: no selection required — only a non-empty list.
     if (this.currentChildren.length > 0) {
@@ -9707,11 +9718,15 @@ export class StashpadView extends ItemView {
    *  (or clear) the `due` frontmatter. Setting a due date also marks
    *  the note(s) as a task so they surface in the Tasks panel. Bound
    *  to D by default. Pre-fills from the first target's existing due. */
-  cmdSetDue(): void {
-    let targets = this.getActionTargets();
-    if (targets.length === 0) {
-      const focused = this.tree.get(this.focusId);
-      if (focused?.file) targets = [focused];
+  cmdSetDue(node?: TreeNode): void {
+    let targets: TreeNode[];
+    if (node) targets = [node];
+    else {
+      targets = this.getActionTargets();
+      if (targets.length === 0) {
+        const focused = this.tree.get(this.focusId);
+        if (focused?.file) targets = [focused];
+      }
     }
     if (targets.length === 0) { new Notice("Nothing to schedule."); return; }
     const first = targets[0];
@@ -11069,6 +11084,19 @@ export class StashpadView extends ItemView {
       }
     }
 
+    // 0.176.0: a leading checkbox prefix makes the note a task. "[]" / "[ ]" →
+    // open task; "[x]" / "[X]" → completed. The prefix (and any trailing space)
+    // is stripped from the stored body, so the slug/title/first-line are clean.
+    // Requires actual content after the bracket, so a bare "[]" isn't swallowed.
+    let taskPrefix: { completed: boolean } | null = null;
+    {
+      const m = body.match(/^\s*\[([ xX]?)\]\s*(?=\S)/);
+      if (m) {
+        taskPrefix = { completed: /[xX]/.test(m[1]) };
+        body = body.slice(m[0].length);
+      }
+    }
+
     const slug = bodyToSlug(body, this.activeStopwords());
     const filename = buildFilename(slug, id);
     const path = `${folder}/${filename}`;
@@ -11099,6 +11127,8 @@ export class StashpadView extends ItemView {
     } else {
       fmLines.push("attachments: []");
     }
+    // 0.176.0: a "[]"/"[x]" body prefix made this note a task on creation.
+    if (taskPrefix) fmLines.push("task: true", `completed: ${taskPrefix.completed}`);
     // No trailing newline — keeps the file ending tight on the body's last
     // character. (Editors that auto-add a final newline on save will still
     // append one, but freshly-created notes start clean.)

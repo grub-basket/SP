@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, SuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon, debounce } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon, debounce, type App } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId } from "./id-service";
 import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId } from "./types";
@@ -46,6 +46,24 @@ const UNGHOST_FLAG = "stashpad:unghost-after-reload";
 
 /** A captured file's content, for snapshot-backed undo/redo of file operations. */
 interface FileSnapshot { path: string; binary: boolean; text?: string; data?: ArrayBuffer; }
+
+/** 0.174.0: picker shown when several Stashpad notes embed the same attachment —
+ *  choose which parent note to open. Label = the note's first heading (or a
+ *  de-slugged basename) + its folder. */
+class AttachmentParentPicker extends FuzzySuggestModal<TFile> {
+  constructor(app: App, private notes: TFile[], private onChoose: (f: TFile) => void) {
+    super(app);
+    this.setPlaceholder("Multiple notes attach this file — pick one to open");
+  }
+  getItems(): TFile[] { return this.notes; }
+  getItemText(f: TFile): string {
+    const heading = this.app.metadataCache.getFileCache(f)?.headings?.[0]?.heading;
+    const title = (heading || f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ")).trim();
+    const folder = f.parent?.path ?? "";
+    return folder ? `${title} — ${folder}` : title;
+  }
+  onChooseItem(f: TFile): void { this.onChoose(f); }
+}
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
@@ -1110,6 +1128,18 @@ export default class StashpadPlugin extends Plugin {
           .onClick(() => void this.openFolderInStashpad(path));
       });
     }));
+    // 0.174.0: "Open in Stashpad" on a non-md ATTACHMENT file — jumps to the
+    // Stashpad note that embeds it (picker when several do). Only shows when at
+    // least one Stashpad note actually references the file.
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (!(file instanceof TFile) || file.extension === "md") return;
+      const notes = this.findStashpadNotesEmbedding(file);
+      if (notes.length === 0) return;
+      menu.addItem((item) => item
+        .setTitle(notes.length > 1 ? "Open in Stashpad…" : "Open in Stashpad")
+        .setIcon("layout-list")
+        .onClick(() => void this.revealAttachmentInStashpad(file, notes)));
+    }));
     // Existing popouts at plugin-load time (e.g. after a reload while
     // a tiny window was open) — walk all known windows and inject.
     setTimeout(() => {
@@ -1593,10 +1623,20 @@ export default class StashpadPlugin extends Plugin {
       name: "Open this note in Stashpad",
       checkCallback: (checking: boolean) => {
         const file = this.app.workspace.getActiveFile();
-        const ok = !!file && file.extension === "md" && this.isStashpadNoteFile(file);
-        if (checking) return ok;
-        if (ok && file) void this.revealNoteInStashpad(file);
-        return ok;
+        if (!file) return false;
+        // A Stashpad note → jump to it. A non-md attachment → jump to the note(s)
+        // that embed it (0.174.0). Anything else → command hidden.
+        if (file.extension === "md" && this.isStashpadNoteFile(file)) {
+          if (!checking) void this.revealNoteInStashpad(file);
+          return true;
+        }
+        if (file.extension !== "md") {
+          const notes = this.findStashpadNotesEmbedding(file);
+          if (notes.length === 0) return false;
+          if (!checking) void this.revealAttachmentInStashpad(file, notes);
+          return true;
+        }
+        return false;
       },
     });
     // 0.73.11: per-panel shortcuts — open the sidebar panels view AND
@@ -3180,6 +3220,12 @@ export default class StashpadPlugin extends Plugin {
       seenLeafFolders.add(folder);
       seenOpen.add(folder);
       const label = folder.split("/").pop() || folder;
+      // 0.174.0: "Folders always open in a new tab" drops the reveal-existing-tab
+      // option — the folder just gets a plain "open in new tab" entry like any other.
+      if (this.settings.foldersAlwaysNewTab) {
+        baseItems.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: this.isArchiveFolder(folder) ? "archive" : "layout-template" });
+        continue;
+      }
       // 0.98.37: archive folders carry the archive icon so they read at a glance.
       baseItems.push({ kind: "reveal", folder, label: `Reveal "${label}" tab`, leaf, icon: this.isArchiveFolder(folder) ? "archive" : "layout-grid" });
       openAnywayItems.push({ kind: "open-anyway", folder, label: `Open "${label}" in another new tab`, icon: "layout-template" });
@@ -5203,6 +5249,10 @@ export default class StashpadPlugin extends Plugin {
   async openFolderInStashpad(folder: string): Promise<void> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
     if (!cleaned) return;
+    // 0.174.0: "Folders always open in a new tab" — skip the reuse-existing-tab
+    // path entirely and open a fresh tab at the home note. Propagates to every
+    // caller of this method (folders-panel row click, file-explorer menu, …).
+    if (this.settings.foldersAlwaysNewTab) { await this.activateViewForFolder(cleaned); return; }
     const existing = await this.findStashpadLeafForFolder(cleaned);
     if (existing) {
       this.app.workspace.revealLeaf(existing);
@@ -5255,6 +5305,44 @@ export default class StashpadPlugin extends Plugin {
     await this.revealNoteByRef(folder, id);
   }
 
+  /** 0.174.0: Stashpad notes (in a discovered folder, with an id) that reference
+   *  `attachment` — either via a body embed/link (metadataCache.resolvedLinks)
+   *  or via the canonical `attachments` frontmatter array. Deduped, folder order.
+   *  Backs "Open in Stashpad" on a non-md attachment file. */
+  findStashpadNotesEmbedding(attachment: TFile): TFile[] {
+    const target = attachment.path;
+    const resolved = this.app.metadataCache.resolvedLinks || {};
+    const norm = (a: string): string =>
+      a.replace(/^!?\[\[/, "").replace(/\]\]$/, "").replace(/^\/+/, "").split("|")[0].split("#")[0].trim();
+    const out: TFile[] = [];
+    for (const md of this.app.vault.getMarkdownFiles()) {
+      if (!this.isStashpadNoteFile(md)) continue;
+      let refs = !!resolved[md.path]?.[target]; // body ![[…]] / [[…]]
+      if (!refs) {
+        const fm = this.app.metadataCache.getFileCache(md)?.frontmatter as { attachments?: unknown } | undefined;
+        const atts = Array.isArray(fm?.attachments) ? (fm!.attachments as unknown[]) : [];
+        for (const a of atts) {
+          if (typeof a !== "string") continue;
+          const dest = this.app.metadataCache.getFirstLinkpathDest(norm(a), md.path);
+          if (dest && dest.path === target) { refs = true; break; }
+        }
+      }
+      if (refs) out.push(md);
+    }
+    return out;
+  }
+
+  /** 0.174.0: "Open in Stashpad" for a non-md attachment — reveal the Stashpad
+   *  note that embeds it. If several notes embed the same file, pick one from a
+   *  list of the parent notes. `preNotes` avoids a second scan when the caller
+   *  (the menu builder) already computed the matches. */
+  async revealAttachmentInStashpad(file: TFile, preNotes?: TFile[]): Promise<void> {
+    const notes = preNotes ?? this.findStashpadNotesEmbedding(file);
+    if (notes.length === 0) { new Notice("No Stashpad note references this attachment."); return; }
+    if (notes.length === 1) { await this.revealNoteInStashpad(notes[0]); return; }
+    new AttachmentParentPicker(this.app, notes, (note) => void this.revealNoteInStashpad(note)).open();
+  }
+
   /** Open a note by folder+id: REUSE an existing Stashpad tab on that folder
    *  (deferred ones included) and navigate it; only open a NEW tab when there
    *  isn't one. The single entry point for every "jump to this note" click —
@@ -5275,6 +5363,22 @@ export default class StashpadPlugin extends Plugin {
     // landing on Home and navigating only on the second.
     const leaf = await this.activateViewForFolder(clean);
     this.navigateLeafTo(leaf, clean, id);
+  }
+
+  /** 0.171.0: open the due-date / assignee scheduler for a task referenced by
+   *  folder + id — backs the due-reminder toast's Snooze control. Reveals the
+   *  note in its Stashpad view first (so undo + authorship bind to that view
+   *  and the user sees the task), then opens the scheduler on that node. */
+  async openSchedulerForRef(folder: string, id: StashpadId): Promise<void> {
+    await this.revealNoteByRef(folder, id);
+    const clean = folder.replace(/\/+$/, "");
+    const leaf = await this.findStashpadLeafForFolder(clean);
+    const view = leaf?.view;
+    if (view instanceof StashpadView) {
+      view.cmdSetDue(view.tree.get(id));
+    } else {
+      new Notice("Couldn’t open the scheduler for that task.");
+    }
   }
 
   /** Resolve a note's frontmatter `id` → its TFile within `folder` (direct
@@ -5706,7 +5810,13 @@ export default class StashpadPlugin extends Plugin {
         this.notifications.show({
           message: `⏰ Task due: “${title}” (${formatDateTime(d.dueMs, this.settings)})`,
           kind: "warning", category: "reminder", duration: 0, folder: d.folder, affectedIds: [d.id],
-          actions: [{ label: "Open", onClick: () => void this.revealNoteByRef(d.folder, d.id) }],
+          // 0.171.0: whole card opens the task; the corner Snooze control opens
+          // the scheduler/assigner modal instead (layered above, stopPropagation).
+          onBodyClick: () => void this.revealNoteByRef(d.folder, d.id),
+          overlayAction: {
+            label: "Snooze", icon: "alarm-clock-check", title: "Snooze / reschedule…",
+            onClick: () => void this.openSchedulerForRef(d.folder, d.id),
+          },
         });
       }
     } else {

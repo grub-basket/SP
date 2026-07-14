@@ -1,4 +1,4 @@
-import { Notice, Platform, TFile, type App } from "obsidian";
+import { Notice, Platform, TFile, setIcon, type App } from "obsidian";
 import type { StashpadId } from "./types";
 
 /** Visual severity. Drives the toast's color + the history panel's
@@ -72,6 +72,24 @@ export interface NotifyOptions {
    *  scale with kind: info/success 4s, warning 6s, error 10s. */
   duration?: number;
   actions?: NotificationAction[];
+  /** 0.171.0: makes the WHOLE toast body clickable (e.g. a due reminder →
+   *  open the task). Fires on a click anywhere on the card except on an
+   *  action button or the overlay control (those `stopPropagation`). The
+   *  toast dismisses after firing. */
+  onBodyClick?: () => void | Promise<void>;
+  /** 0.171.0: a small control layered ABOVE the card (top-right corner)
+   *  whose click does NOT trigger `onBodyClick`. Used for the reminder
+   *  "snooze" affordance that opens the scheduler instead of the task. */
+  overlayAction?: {
+    label: string;
+    /** Tooltip; defaults to `label`. */
+    title?: string;
+    /** Optional lucide icon id (via setIcon), shown before the label. */
+    icon?: string;
+    onClick: () => void | Promise<void>;
+    /** When true, clicking doesn't dismiss the toast. Default false. */
+    keepOpen?: boolean;
+  };
   /** Whichever author identity produced this notification — usually
    *  the local user, but cross-user collaboration may stamp another
    *  authorId so multiplayer filters can pivot on "who did this". */
@@ -184,7 +202,31 @@ export class NotificationService {
 
     const frag = this.buildContent(opts, kind);
     const duration = opts.duration ?? DEFAULT_DURATION[kind];
-    return new Notice(frag, duration);
+    const notice = new Notice(frag, duration);
+
+    // 0.171.1: whole-card click (open the task for a due reminder). Wired onto
+    // the ACTUAL `.notice` element — not the inner content wrap — so the entire
+    // toast surface (including Obsidian's padding) is the target. A click on the
+    // overlay/action buttons is ignored here (they stopPropagation, and we also
+    // guard on the event target). Fires the handler, then dismisses.
+    if (opts.onBodyClick) {
+      const onBodyClick = opts.onBodyClick;
+      // The `.notice` element is exposed as `containerEl` (Obsidian's
+      // `noticeEl` is the inner `.notice-message`). Guard both for version drift.
+      const noticeEl = (notice as unknown as { containerEl?: HTMLElement; noticeEl?: HTMLElement }).containerEl
+        ?? (notice as unknown as { noticeEl?: HTMLElement }).noticeEl;
+      if (noticeEl) {
+        noticeEl.classList.add("stashpad-notice-clickable");
+        noticeEl.addEventListener("click", (e) => {
+          const t = e.target as HTMLElement;
+          if (t.closest(".stashpad-notice-action, .stashpad-notice-overlay")) return;
+          void Promise.resolve().then(() => onBodyClick())
+            .catch((err) => console.warn("[Stashpad] notification body click failed", err));
+          notice.hide();
+        });
+      }
+    }
+    return notice;
   }
 
   /** Subscribe to history changes. The history panel uses this to
@@ -308,6 +350,33 @@ export class NotificationService {
         row.appendChild(btn);
       }
       wrap.appendChild(row);
+    }
+    // 0.171.1: the whole-card open-task click is wired in show() onto the
+    // actual `.notice` element (not this inner wrap), because Obsidian's
+    // `.notice` has padding the wrap doesn't fill — taps in that band missed
+    // the old wrap listener entirely. See show().
+    // 0.171.0: overlay control (e.g. Snooze) — sits above the card, its click
+    // never reaches the whole-card open handler (stopPropagation).
+    if (opts.overlayAction) {
+      const ov = opts.overlayAction;
+      wrap.classList.add("has-overlay");
+      const btn = document.createElement("button");
+      btn.className = "stashpad-notice-overlay";
+      if (ov.icon) setIcon(btn, ov.icon);
+      const lbl = document.createElement("span");
+      lbl.textContent = ov.label;
+      btn.appendChild(lbl);
+      btn.title = ov.title ?? ov.label;
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void Promise.resolve().then(() => ov.onClick())
+          .catch((err) => console.warn("[Stashpad] notification overlay action failed", err));
+        if (!ov.keepOpen) {
+          const noticeEl = btn.closest(".notice");
+          if (noticeEl && noticeEl.parentElement) noticeEl.parentElement.removeChild(noticeEl);
+        }
+      });
+      wrap.appendChild(btn);
     }
     frag.appendChild(wrap);
     return frag;

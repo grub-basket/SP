@@ -936,7 +936,7 @@ export class NoteWorkbench {
     const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 22;
     // 0.170.3: the Edit surface is a real writing space — let the editor grow much
     // taller than in Split mode (where it stays compact next to the split controls).
-    const maxLines = this.surface === "edit" ? (Platform.isMobile ? 14 : 40) : (Platform.isMobile ? 3 : 12);
+    const maxLines = this.surface === "edit" ? (Platform.isMobile ? 10 : 40) : (Platform.isMobile ? 3 : 12);
     const minLines = 2;
     const fit = (): void => {
       ta.setCssStyles({ height: "auto" });
@@ -1916,10 +1916,21 @@ export class OpenDeepLinkModal extends Modal {
     pasteBtn.onclick = async () => {
       try {
         const t = (await navigator.clipboard?.readText?.())?.trim();
-        if (t) { input.value = t; }
+        if (t) { input.value = t; autoHint.hide(); }
         input.focus();
       } catch { new Notice("Couldn't read the clipboard — paste manually."); }
     };
+    // A manual paste or edit means the field is no longer the auto-pasted link —
+    // drop the green confirmation so it isn't misleading.
+    input.addEventListener("input", () => autoHint.hide());
+
+    // 0.172.x: green confirmation shown ONLY when the link was auto-pasted from
+    // the clipboard (the auto-prefill below), so it's clear the field wasn't
+    // pre-populated by magic — Stashpad read a link off your clipboard.
+    const autoHint = this.contentEl.createEl("div", { cls: "stashpad-open-link-autohint" });
+    setIcon(autoHint.createSpan({ cls: "stashpad-open-link-autohint-icon" }), "clipboard-check");
+    autoHint.createSpan({ text: "Link automatically pasted from your clipboard." });
+    autoHint.hide();
 
     const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
     footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
@@ -1943,6 +1954,7 @@ export class OpenDeepLinkModal extends Modal {
         if (!input.value && t && /obsidian:\/\/stashpad\?/i.test(t.trim())) {
           input.value = t.trim();
           input.select();
+          autoHint.show(); // green "auto-pasted" confirmation
         }
       }).catch(() => { /* clipboard blocked — user pastes manually */ });
     });

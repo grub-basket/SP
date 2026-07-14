@@ -63,7 +63,7 @@ export type CommandId =
   | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
   | "swapWithParent"
   | "togglePin" | "listPin"
-  | "toggleTask" | "setDue"
+  | "toggleTask" | "setDue" | "openAllTasks"
   | "jumpToTop" | "jumpToBottom"
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
   | "copyNotes" | "cutNotes" | "pasteNotes"
@@ -140,6 +140,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. No default chord.", defaultPrimary: "" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: G — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "G" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
+  { id: "openAllTasks",    label: "Open all tasks (aggregate view)", desc: "Default: Shift+T — open the aggregate “All tasks” view collecting tasks across every Stashpad folder.", defaultPrimary: "Shift+T" },
   { id: "jumpToTop",       label: "Jump to top of list",           desc: "Default: Home — move the cursor to the first note in the current list.", defaultPrimary: "Home" },
   { id: "jumpToBottom",    label: "Jump to bottom of list",        desc: "Default: End — move the cursor to the last note in the current list.", defaultPrimary: "End" },
   { id: "commandPalette",  label: "Command palette (Stashpad only)", desc: "Default: Mod+K — open a command palette listing only Stashpad's commands, with Sift search.", defaultPrimary: "Mod+K" },
@@ -387,6 +388,11 @@ export interface StashpadSettings {
    *  notes (jump straight to one). Off by default to keep the picker focused on
    *  folders. */
   folderSwitcherIncludePinned: boolean;
+  /** 0.174.0: when ON, clicking a folder (folders panel, folder switcher,
+   *  file-explorer "Open folder in Stashpad") always opens it in a NEW tab at the
+   *  home note instead of reusing/revealing an already-open tab — and the folder
+   *  switcher drops its "Reveal <folder> tab" (reuse) option. */
+  foldersAlwaysNewTab: boolean;
   /** Comma-separated subfolder-name prefixes (default "_") that EXCLUDE a folder from
    *  Stashpad discovery + import — it stays local, not surfaced/pulled in. A path is
    *  excluded if any of its segments starts with a listed prefix. */
@@ -646,6 +652,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   folderEncPrefs: {},
   folderIcons: {},
   folderSwitcherIncludePinned: false,
+  foldersAlwaysNewTab: false,
   importExcludePrefixes: "_",
   lockedSubtrees: [],
   searchOpensInNewTab: true,
@@ -1617,6 +1624,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.popoutDuplicates, (v) => { this.plugin.settings.popoutDuplicates = v; }, ["popout", "window", "duplicate"]));
     cats.windowsTabs.push(toggle("Search results open in a new tab", "When you pick a result in the Search modal, open it in a new Stashpad tab instead of navigating the current tab. Applies to same-folder and cross-Stashpad results alike. On by default.",
       () => this.plugin.settings.searchOpensInNewTab, (v) => { this.plugin.settings.searchOpensInNewTab = v; }, ["search", "new tab", "results", "open"]));
+    cats.windowsTabs.push(toggle("Folders always open in a new tab", "When you open a folder (folders panel, folder switcher, or the file-explorer “Open folder in Stashpad”), always open a NEW tab at the home note instead of reusing an already-open tab. The folder switcher also drops its “Reveal <folder> tab” option. Off by default (reuses an existing tab when there is one).",
+      () => this.plugin.settings.foldersAlwaysNewTab, (v) => { this.plugin.settings.foldersAlwaysNewTab = v; }, ["folder", "new tab", "reveal", "open", "panel"]));
     cats.composerCopy.push(toggle("Prefix timestamps when copying", "Include each note's timestamp before its body when copying with C or Y.",
       () => this.plugin.settings.prefixTimestampsOnCopy, (v) => { this.plugin.settings.prefixTimestampsOnCopy = v; }, ["copy", "timestamp", "prefix"]));
 
