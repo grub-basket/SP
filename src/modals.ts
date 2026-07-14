@@ -1,4 +1,4 @@
-import { App, Modal, Platform, moment, Notice, setIcon, type SecretStorage } from "obsidian";
+import { App, Modal, ItemView, WorkspaceLeaf, Platform, moment, Notice, setIcon, type SecretStorage } from "obsidian";
 import { splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
@@ -423,71 +423,142 @@ export class ConfirmDeleteModal extends Modal {
   onClose(): void { this.contentEl.empty(); }
 }
 
-export class SplitNoteModal extends Modal {
+/** 0.168.1: word-level diff (LCS over whitespace-delimited tokens) for the split
+ *  modal's read-only "Changes" panel. Returns runs of equal / inserted / deleted
+ *  text; whitespace is kept as its own tokens so the reconstruction reads naturally
+ *  (newlines included, rendered with `white-space: pre-wrap`). */
+type SplitDiffPart = { t: "eq" | "ins" | "del"; s: string };
+function splitWordDiff(a: string, b: string): SplitDiffPart[] {
+  const ax = a.split(/(\s+)/);
+  const bx = b.split(/(\s+)/);
+  const n = ax.length, m = bx.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = ax[i] === bx[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out: SplitDiffPart[] = [];
+  const push = (t: SplitDiffPart["t"], s: string): void => {
+    const last = out[out.length - 1];
+    if (last && last.t === t) last.s += s; else out.push({ t, s });
+  };
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (ax[i] === bx[j]) { push("eq", ax[i]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { push("del", ax[i]); i++; }
+    else { push("ins", bx[j]); j++; }
+  }
+  while (i < n) { push("del", ax[i]); i++; }
+  while (j < m) { push("ins", bx[j]); j++; }
+  return out;
+}
+
+/** 0.169.0: the split UI's live state — carried to the popped-out tab so it
+ *  continues where the modal left off. */
+export interface SplitUIState {
+  mode: "line" | "cursor" | "preset";
+  presetMode: SplitMode;
+  nest: boolean;
+  cursorText: string;
+  lineCursorIdx: number;
+}
+
+export interface SplitUICallbacks {
+  onSplitAtLine: (firstLineOfSecondPart: number, nest: boolean) => void | Promise<void>;
+  onSplitAtChar: (text: string, charIndex: number, nest: boolean) => void | Promise<void>;
+  onSplitMany: (parts: string[], nest: boolean) => void | Promise<void>;
+  /** Dismiss the host WITHOUT committing (Cancel / Esc). */
+  close: () => void;
+  /** Called AFTER a successful commit — the host decides what happens (the modal
+   *  closes; the popped-out tab runs a countdown then closes + refocuses). */
+  onDone: () => void;
+  /** When present, an "Open in a tab" button appears; called with the live state. */
+  popOut?: (state: SplitUIState) => void;
+}
+
+/** 0.169.0: the split UI extracted from the modal so it can render into EITHER a
+ *  modal or a full leaf ("pop out"). Owns all state + rendering; the host wires
+ *  keys to `commit()` / `moveDivider()`. */
+export class SplitUI {
   private lines: string[];
-  /** Line mode: index of the FIRST line of the second part (1..lines.length-1). */
   private lineCursorIdx: number;
-  private mode: "line" | "cursor" = "line";
+  private mode: "line" | "cursor" | "preset" = "line";
+  private presetMode: SplitMode = "paragraphs";
+  private nest = false;
   private cursorTextarea: HTMLTextAreaElement | null = null;
+  private cursorText: string;
+  private collapsed: { orig: boolean; changes: boolean; edit: boolean };
+
   constructor(
-    app: App,
+    private app: App,
+    private host: HTMLElement,
     private body: string,
-    private onSplitAtLine: (firstLineOfSecondPart: number) => void,
-    private onSplitAtChar: (charIndex: number) => void,
-    private onSplitMany: (parts: string[]) => void,
+    init: Partial<SplitUIState>,
+    private cb: SplitUICallbacks,
   ) {
-    super(app);
+    this.cursorText = init.cursorText ?? body;
+    this.collapsed = { orig: Platform.isMobile, changes: Platform.isMobile, edit: false };
     this.lines = body.replace(/\r\n/g, "\n").split("\n");
-    this.lineCursorIdx = Math.max(1, Math.min(this.lines.length - 1, Math.floor(this.lines.length / 2)));
-    // Single-line notes can only be split via cursor mode.
-    if (this.lines.length < 2) this.mode = "cursor";
-  }
-
-  onOpen(): void {
-    this.titleEl.setText("Split note");
-    this.modalEl.addClass("stashpad-split-modal");
+    this.lineCursorIdx = init.lineCursorIdx ?? Math.max(1, Math.min(this.lines.length - 1, Math.floor(this.lines.length / 2)));
+    if (init.mode) this.mode = init.mode;
+    else if (this.lines.length < 2) this.mode = "cursor"; // single-line → cursor only
+    if (init.presetMode) this.presetMode = init.presetMode;
+    if (init.nest != null) this.nest = init.nest;
+    // 0.169.4: wrap Tab focus within the split content — Shift+Tab on the first
+    // control jumps to the last, Tab on the last wraps to the first (rather than
+    // escaping to the modal × or getting stuck).
+    this.host.addEventListener("keydown", (e) => this.onTabKey(e));
     this.render();
-    // Tab toggles modes when both are available.
-    this.scope.register([], "Tab", (e) => {
-      if (this.lines.length < 2) return;
-      e.preventDefault();
-      this.mode = this.mode === "line" ? "cursor" : "line";
-      this.render();
-    });
-    // Enter (no mods): commit in line mode; in cursor mode, let textarea insert a newline.
-    this.scope.register([], "Enter", (e) => {
-      if (this.mode !== "line") return; // pass through to textarea
-      e.preventDefault();
-      this.commitLine();
-    });
-    // Mod+Enter: commit in cursor mode.
-    this.scope.register(["Mod"], "Enter", (e) => {
-      if (this.mode !== "cursor") return;
-      e.preventDefault();
-      this.commitCursor();
-    });
-    // Arrows: in line mode, move the divider. In cursor mode, let textarea handle them.
-    this.scope.register([], "ArrowUp", (e) => {
-      if (this.mode !== "line") return;
-      e.preventDefault();
-      this.lineCursorIdx = Math.max(1, this.lineCursorIdx - 1);
-      this.render();
-    });
-    this.scope.register([], "ArrowDown", (e) => {
-      if (this.mode !== "line") return;
-      e.preventDefault();
-      this.lineCursorIdx = Math.min(this.lines.length - 1, this.lineCursorIdx + 1);
-      this.render();
-    });
   }
 
-  private commitLine(): void {
-    const idx = this.lineCursorIdx;
-    this.close();
-    this.onSplitAtLine(idx);
+  private visibleFocusables(): HTMLElement[] {
+    const sel = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    return Array.from(this.host.querySelectorAll<HTMLElement>(sel)).filter((el) => el.offsetParent !== null);
   }
 
-  private commitCursor(): void {
+  private onTabKey(e: KeyboardEvent): void {
+    if (e.key !== "Tab") return;
+    const items = this.visibleFocusables();
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && active === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && active === last) { e.preventDefault(); first.focus(); }
+  }
+
+  /** Snapshot for handoff to the popped-out tab. */
+  getState(): SplitUIState {
+    return {
+      mode: this.mode, presetMode: this.presetMode, nest: this.nest,
+      cursorText: this.cursorTextarea?.value ?? this.cursorText,
+      lineCursorIdx: this.lineCursorIdx,
+    };
+  }
+
+  /** 0.168.3: single dispatch for the Split button + Mod+Enter. 0.169.3: awaits the
+   *  split, then calls onDone so the host can act once the job is complete. */
+  async commit(): Promise<void> {
+    if (this.mode === "line") await this.commitLine();
+    else if (this.mode === "cursor") await this.commitCursor();
+    else await this.commitPreset();
+  }
+
+  /** Move the line-mode divider by ±1. Returns true if it applied (line mode). */
+  moveDivider(delta: number): boolean {
+    if (this.mode !== "line") return false;
+    this.lineCursorIdx = Math.max(1, Math.min(this.lines.length - 1, this.lineCursorIdx + delta));
+    this.render();
+    return true;
+  }
+
+  private async commitLine(): Promise<void> {
+    await this.cb.onSplitAtLine(this.lineCursorIdx, this.nest);
+    this.cb.onDone();
+  }
+
+  private async commitCursor(): Promise<void> {
     const ta = this.cursorTextarea;
     if (!ta) return;
     const ch = ta.selectionStart;
@@ -495,74 +566,127 @@ export class SplitNoteModal extends Modal {
       new Notice("Move the cursor inside the text — neither end can be empty.");
       return;
     }
-    this.close();
-    this.onSplitAtChar(ch);
+    // 0.168.0: split the CURRENT (possibly edited) textarea content at the cursor.
+    await this.cb.onSplitAtChar(ta.value, ch, this.nest);
+    this.cb.onDone();
+  }
+
+  private async commitPreset(): Promise<void> {
+    const chunks = splitIntoChunks(this.body, this.presetMode);
+    if (chunks.length < 2) { new Notice("That delimiter wouldn't split this note."); return; }
+    await this.cb.onSplitMany(chunks, this.nest);
+    this.cb.onDone();
   }
 
   private render(): void {
-    this.contentEl.empty();
+    this.host.empty();
 
-    // Quick multi-split: break the whole note into many parts at once, instead
-    // of placing a single divider. One button per delimiter; disabled when it
-    // wouldn't yield 2+ parts. The count preview shows how many you'd get.
-    const quick = this.contentEl.createDiv({ cls: "stashpad-split-quick" });
-    quick.createSpan({ cls: "stashpad-split-quick-label", text: "Split by:" });
-    (["lines", "paragraphs", "headings"] as SplitMode[]).forEach((m) => {
-      const parts = splitIntoChunks(this.body, m);
-      const btn = quick.createEl("button", {
-        cls: "stashpad-split-quick-btn",
-        text: `${SPLIT_MODE_LABELS[m]} (${parts.length})`,
-      });
-      btn.disabled = parts.length < 2;
-      btn.onmousedown = (e) => e.preventDefault();
-      btn.onclick = () => {
-        const chunks = splitIntoChunks(this.body, m);
-        if (chunks.length < 2) { new Notice("That delimiter wouldn't split this note."); return; }
-        this.close();
-        this.onSplitMany(chunks);
-      };
-    });
-
-    // Top bar: mode toggle on the left, Confirm button on the right.
-    // The confirm button is essential on mobile where Enter is hijacked
-    // by the textarea (cursor mode) or doesn't have a physical key
-    // (some on-screen keyboards send "Done" instead).
-    const bar = this.contentEl.createDiv({ cls: "stashpad-split-toggle-bar" });
-    if (this.lines.length >= 2) {
-      const lineBtn = bar.createEl("button", { text: "Line split", cls: "stashpad-split-mode-btn" });
-      if (this.mode === "line") lineBtn.addClass("is-active");
-      lineBtn.onclick = () => { this.mode = "line"; this.render(); };
-    }
-    const curBtn = bar.createEl("button", { text: "Cursor split", cls: "stashpad-split-mode-btn" });
-    if (this.mode === "cursor") curBtn.addClass("is-active");
-    curBtn.onclick = () => { this.mode = "cursor"; this.render(); };
-
-    const confirmBtn = bar.createEl("button", {
-      text: "Split", cls: "stashpad-split-confirm-btn mod-cta",
-    });
-    confirmBtn.onmousedown = (e) => e.preventDefault(); // don't blur the textarea
-    confirmBtn.onclick = () => {
-      if (this.mode === "line") this.commitLine();
-      else this.commitCursor();
+    // 0.168.3: mode selection — one segmented row across ALL split methods. Line /
+    // Cursor place a single divider you position; the preset methods (Each line /
+    // Paragraphs / Headings) auto-split into many. Every method now SELECTS a mode
+    // and PREVIEWS below; the one bottom Split button commits — no more instant,
+    // inconsistent quick-splits. A greyed preset shows no count (a count of 1 means
+    // "can't split", which read as noise).
+    const modeRow = this.host.createDiv({ cls: "stashpad-split-modes" });
+    const modeBtn = (label: string, active: boolean, onPick: () => void, disabled = false): void => {
+      const b = modeRow.createEl("button", { cls: "stashpad-split-mode-btn", text: label });
+      b.toggleClass("is-active", active);
+      b.disabled = disabled;
+      b.onmousedown = (e) => e.preventDefault();
+      if (!disabled) b.onclick = onPick;
     };
-
-    if (this.mode === "line") this.renderLineMode();
-    else this.renderCursorMode();
-
-    const help = this.contentEl.createDiv({ cls: "stashpad-split-help" });
-    if (Platform.isMobile) {
-      help.setText(this.mode === "line"
-        ? "Tap a line to position the divider, then Split."
-        : "Tap inside the text to position the cursor, then Split.");
-    } else {
-      help.setText(this.mode === "line"
-        ? "↑/↓ pick split line  ·  Enter or Split confirm  ·  Tab → cursor mode  ·  Esc cancel  ·  Children stay with the first part"
-        : "Click or arrow to position cursor  ·  Mod+Enter or Split confirm  ·  Tab → line mode  ·  Esc cancel  ·  Children stay with the first part");
+    if (this.lines.length >= 2) {
+      modeBtn("Line", this.mode === "line", () => { this.mode = "line"; this.render(); });
     }
+    modeBtn("Cursor", this.mode === "cursor", () => { this.mode = "cursor"; this.render(); });
+    (["lines", "paragraphs", "headings"] as SplitMode[]).forEach((m) => {
+      const n = splitIntoChunks(this.body, m).length;
+      const disabled = n < 2;
+      // 0.168.4: shorter label for the paragraph split in this modal only (the
+      // shared SPLIT_MODE_LABELS is still used by menus/settings).
+      const base = m === "paragraphs" ? "Blank line(s)" : SPLIT_MODE_LABELS[m];
+      const label = disabled ? base : `${base} (${n})`;
+      modeBtn(label, this.mode === "preset" && this.presetMode === m,
+        () => { this.mode = "preset"; this.presetMode = m; this.render(); }, disabled);
+    });
+
+    // Preview for the active mode.
+    if (this.mode === "line") this.renderLineMode();
+    else if (this.mode === "cursor") this.renderCursorMode();
+    else this.renderPresetMode();
+
+    const help = this.host.createDiv({ cls: "stashpad-split-help" });
+    const setHelp = (): void => {
+      // 0.168.4: hidden on PHONE (cramped, no keyboard); shown on tablet/iPad +
+      // desktop (someone may pair a keyboard). Esc + Tab hints dropped (Esc has the
+      // false-button by the ×; Tab now just cycles focus). Nest phrased by result.
+      if (Platform.isPhone) { help.setCssStyles({ display: "none" }); return; }
+      help.setCssStyles({ display: "" });
+      const nest1 = this.nest ? "New part nested under the original." : "New part added as a sibling.";
+      const nestN = this.nest ? "New parts nested under the original." : "New parts added as siblings.";
+      const confirm = "⌘/Ctrl+Enter or Split to confirm";
+      help.setText(
+        this.mode === "line" ? `↑/↓ or click to pick the split line  ·  ${confirm}  ·  ${nest1}`
+        : this.mode === "cursor" ? `Click or arrow to position the cursor  ·  ${confirm}  ·  ${nest1}`
+        : `Preview of the resulting parts  ·  ${confirm}  ·  ${nestN}`);
+    };
+    setHelp();
+
+    // 0.168.3: bottom action bar — Cancel on the left; Nest checkbox + primary
+    // Split on the right. One confirm for every mode.
+    const actions = this.host.createDiv({ cls: "stashpad-split-actions" });
+    // 0.168.5: Cancel IS the escape action, so it carries the Esc hint (the separate
+    // corner chip was redundant with both Cancel and the ×).
+    const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn", text: "Cancel (Esc)" });
+    cancel.onmousedown = (e) => e.preventDefault();
+    cancel.onclick = () => this.cb.close();
+
+    // 0.169.0: "Open in a tab" — hand the current state to a full leaf, great for
+    // long text / mobile. Only offered by the modal (the tab itself omits it).
+    if (this.cb.popOut) {
+      const pop = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
+      setIcon(pop.createSpan({ cls: "stashpad-split-popout-icon" }), "maximize-2");
+      pop.createSpan({ text: "Open in a tab" });
+      pop.setAttr("aria-label", "Open this split in a full tab");
+      pop.onmousedown = (e) => e.preventDefault();
+      pop.onclick = () => this.cb.popOut!(this.getState());
+    }
+
+    const right = actions.createDiv({ cls: "stashpad-split-actions-right" });
+    const nestWrap = right.createEl("label", { cls: "stashpad-split-nest" });
+    const nestCb = nestWrap.createEl("input", { type: "checkbox" });
+    nestCb.checked = this.nest;
+    nestWrap.createSpan({ text: "Nest under original" });
+    // Update just the help line — a full re-render would drop the cursor caret.
+    nestCb.onchange = () => { this.nest = nestCb.checked; setHelp(); };
+
+    const splitCount = this.mode === "preset" ? splitIntoChunks(this.body, this.presetMode).length : 0;
+    const splitBtn = right.createEl("button", {
+      cls: "stashpad-split-confirm-btn mod-cta",
+      text: this.mode === "preset" && splitCount >= 2 ? `Split into ${splitCount}` : "Split",
+    });
+    splitBtn.onmousedown = (e) => e.preventDefault(); // don't blur the textarea
+    splitBtn.onclick = () => this.commit();
+  }
+
+  private renderPresetMode(): void {
+    const chunks = splitIntoChunks(this.body, this.presetMode);
+    const list = this.host.createDiv({ cls: "stashpad-split-preset-list" });
+    if (chunks.length < 2) {
+      list.createDiv({ cls: "stashpad-split-empty", text: "This delimiter wouldn't split the note into more than one part." });
+      return;
+    }
+    chunks.forEach((c, i) => {
+      const card = list.createDiv({ cls: "stashpad-split-part-card" });
+      const head = card.createDiv({ cls: "stashpad-split-part-num" });
+      head.createSpan({ cls: "stashpad-split-part-title", text: `Part ${i + 1}` });
+      head.appendChild(this.makeCopyButton(() => c, `Copy part ${i + 1}`));
+      card.createDiv({ cls: "stashpad-split-part-body", text: c });
+    });
   }
 
   private renderLineMode(): void {
-    const list = this.contentEl.createDiv({ cls: "stashpad-split-list" });
+    const list = this.host.createDiv({ cls: "stashpad-split-list" });
     let divider: HTMLElement | null = null;
     for (let i = 0; i < this.lines.length; i++) {
       if (i === this.lineCursorIdx) {
@@ -588,12 +712,82 @@ export class SplitNoteModal extends Modal {
     if (divider) window.requestAnimationFrame(() => divider.scrollIntoView({ block: "center" }));
   }
 
+  /** 0.168.2: a framed section with a tucked header that is itself the
+   *  expand/collapse button (whole header tappable). Returns the section + its
+   *  body host. Collapsed state is read/written on `this.collapsed[key]` so it
+   *  persists across re-renders. */
+  private buildSplitSection(host: HTMLElement, key: "orig" | "changes" | "edit", label: string): { section: HTMLElement; body: HTMLElement } {
+    const section = host.createDiv({ cls: `stashpad-split-section stashpad-split-${key}` });
+    const header = section.createEl("button", { cls: "stashpad-split-section-header" });
+    header.setAttr("type", "button");
+    const chev = header.createSpan({ cls: "stashpad-split-chevron" });
+    setIcon(chev, "chevron-down");
+    header.createSpan({ cls: "stashpad-split-section-title", text: label });
+    const body = section.createDiv({ cls: "stashpad-split-section-body" });
+    const apply = (): void => {
+      section.toggleClass("is-collapsed", this.collapsed[key]);
+      header.setAttr("aria-expanded", String(!this.collapsed[key]));
+    };
+    header.onmousedown = (e) => e.preventDefault(); // don't blur the textarea
+    header.onclick = (e) => { e.preventDefault(); this.collapsed[key] = !this.collapsed[key]; apply(); };
+    apply();
+    return { section, body };
+  }
+
+  /** 0.169.1: a copy-to-clipboard icon button. `onmousedown`/`stopPropagation` keep
+   *  it from toggling a collapse header or blurring the textarea. */
+  private makeCopyButton(getText: () => string, label: string, cls = "stashpad-split-copy-btn"): HTMLButtonElement {
+    const btn = createEl("button", { cls });
+    setIcon(btn, "copy");
+    btn.setAttr("aria-label", label);
+    btn.onmousedown = (e) => e.preventDefault();
+    btn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const text = getText();
+      void navigator.clipboard?.writeText(text).then(
+        () => new Notice("Copied to clipboard."),
+        () => new Notice("Couldn't access the clipboard."),
+      );
+    };
+    return btn;
+  }
+
   private renderCursorMode(): void {
-    const wrap = this.contentEl.createDiv({ cls: "stashpad-split-cursor-wrap" });
-    const ta = wrap.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
-    ta.value = this.body;
+    // 0.168.1/0.168.2: when the text has been edited, a read-only ORIGINAL section
+    // and a read-only word-level DIFF section appear above the editor. All three are
+    // consistent collapsible framed sections (whole header = the toggle button).
+    const orig = this.buildSplitSection(this.host, "orig", "Original — will be replaced");
+    orig.body.createDiv({ cls: "stashpad-split-panel-body", text: this.body });
+    // 0.169.1: copy the original text (the header is a full-width collapse button,
+    // so the copy button overlays its right edge as a section sibling).
+    orig.section.appendChild(this.makeCopyButton(() => this.body, "Copy the original text", "stashpad-split-copy-btn stashpad-split-section-copy"));
+
+    const changes = this.buildSplitSection(this.host, "changes", "Changes");
+    const diffBody = changes.body.createDiv({ cls: "stashpad-split-panel-body stashpad-split-diff-body" });
+
+    const edit = this.buildSplitSection(this.host, "edit", "Your edit — the split uses this");
+    const ta = edit.body.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
+    // Seed from the persisted (possibly edited) text so toggling modes doesn't
+    // discard edits; the split acts on exactly what's shown here.
+    ta.value = this.cursorText;
     ta.readOnly = false;
     this.cursorTextarea = ta;
+
+    const renderDiff = (): void => {
+      diffBody.empty();
+      for (const part of splitWordDiff(this.body, ta.value)) {
+        const cls = part.t === "ins" ? "stashpad-diff-ins" : part.t === "del" ? "stashpad-diff-del" : "stashpad-diff-eq";
+        diffBody.createSpan({ cls, text: part.s });
+      }
+    };
+    const syncEdited = (): void => {
+      const edited = ta.value !== this.body;
+      orig.section.setCssStyles({ display: edited ? "" : "none" });
+      changes.section.setCssStyles({ display: edited ? "" : "none" });
+      if (edited) renderDiff();
+    };
+
     // Auto-size the textarea to fit content. Cap at 3 lines on mobile,
     // 12 lines on desktop. Recomputed on input in case the user edits.
     const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 22;
@@ -604,17 +798,154 @@ export class SplitNoteModal extends Modal {
       const needed = Math.min(ta.scrollHeight, lineHeight * maxLines + 16);
       ta.setCssStyles({ height: `${Math.max(needed, lineHeight * minLines + 16)}px` });
     };
+    // Set the initial edited-state synchronously (doesn't need layout) so the
+    // panels are correctly hidden on a fresh/unedited cursor render — the rAF-only
+    // path didn't reliably stick. fit() still runs in the rAF (needs layout).
+    syncEdited();
     requestAnimationFrame(() => {
       fit();
       const mid = Math.floor(ta.value.length / 2);
       ta.focus();
       ta.setSelectionRange(mid, mid);
     });
-    ta.addEventListener("input", fit);
+    ta.addEventListener("input", () => { this.cursorText = ta.value; fit(); syncEdited(); });
+  }
+}
+
+/** Callbacks a split host is handed (the host fills in `close`/`onDone`). */
+export type SplitCommandCallbacks = Omit<SplitUICallbacks, "close" | "onDone">;
+
+export const SPLIT_VIEW_TYPE = "stashpad-split-view";
+
+/** 0.169.0: thin modal host around SplitUI. */
+export class SplitNoteModal extends Modal {
+  private ui: SplitUI | null = null;
+  constructor(app: App, private body: string, private cbs: SplitCommandCallbacks) {
+    super(app);
+  }
+  onOpen(): void {
+    this.titleEl.setText("Split note");
+    this.modalEl.addClass("stashpad-split-modal");
+    this.ui = new SplitUI(this.app, this.contentEl, this.body, {}, {
+      onSplitAtLine: this.cbs.onSplitAtLine,
+      onSplitAtChar: this.cbs.onSplitAtChar,
+      onSplitMany: this.cbs.onSplitMany,
+      close: () => this.close(),
+      onDone: () => this.close(), // split ran → just dismiss the modal
+      // Popping out closes the modal first, then opens the tab with the live state.
+      popOut: this.cbs.popOut ? (state) => { this.close(); this.cbs.popOut!(state); } : undefined,
+    });
+    // Mod+Enter commits in every mode (see 0.168.5). Arrows move the line divider.
+    this.scope.register(["Mod"], "Enter", (e) => { e.preventDefault(); void this.ui?.commit(); });
+    this.scope.register([], "ArrowUp", (e) => { if (this.ui?.moveDivider(-1)) e.preventDefault(); });
+    this.scope.register([], "ArrowDown", (e) => { if (this.ui?.moveDivider(1)) e.preventDefault(); });
+  }
+  onClose(): void { this.ui = null; this.contentEl.empty(); }
+}
+
+/** Context injected into a popped-out SplitNoteView. `prevLeaf` is the tab to
+ *  refocus once the split's done. */
+export interface SplitViewContext {
+  body: string;
+  cbs: SplitCommandCallbacks;
+  init: Partial<SplitUIState>;
+  prevLeaf?: WorkspaceLeaf | null;
+}
+
+/** 0.169.0: full-leaf host around SplitUI ("pop out"). Ephemeral — needs its
+ *  context injected via setContext right after creation; a restored-but-context-less
+ *  view shows a "session ended" placeholder. 0.169.3: once the split commits, it
+ *  runs a live countdown and then closes + refocuses the previous tab. */
+export class SplitNoteView extends ItemView {
+  private ui: SplitUI | null = null;
+  private ctx: SplitViewContext | null = null;
+  private prevLeaf: WorkspaceLeaf | null = null;
+  private autoCloseTimer: number | null = null;
+  constructor(leaf: WorkspaceLeaf) { super(leaf); }
+  getViewType(): string { return SPLIT_VIEW_TYPE; }
+  getDisplayText(): string { return "Split note"; }
+  getIcon(): string { return "split"; }
+
+  setContext(ctx: SplitViewContext): void {
+    this.ctx = ctx;
+    this.prevLeaf = ctx.prevLeaf ?? null;
+    this.renderUI();
+  }
+  async onOpen(): Promise<void> { this.renderUI(); }
+
+  private renderUI(): void {
+    const c = this.contentEl;
+    c.empty();
+    c.addClass("stashpad-split-modal", "stashpad-split-view");
+    if (!this.ctx) {
+      c.createDiv({ cls: "stashpad-split-empty", text: "This split session has ended — close this tab and run “Split note” again." });
+      return;
+    }
+    this.ui = new SplitUI(this.app, c, this.ctx.body, this.ctx.init, {
+      onSplitAtLine: this.ctx.cbs.onSplitAtLine,
+      onSplitAtChar: this.ctx.cbs.onSplitAtChar,
+      onSplitMany: this.ctx.cbs.onSplitMany,
+      close: () => this.leaf.detach(),
+      onDone: () => this.finishAndClose(),
+    });
+    // Mod+Enter commits; arrows move the line divider (only acts in line mode, so
+    // arrows in the cursor textarea fall through to the textarea).
+    this.registerDomEvent(c, "keydown", (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); void this.ui?.commit(); }
+      else if (e.key === "ArrowUp") { if (this.ui?.moveDivider(-1)) e.preventDefault(); }
+      else if (e.key === "ArrowDown") { if (this.ui?.moveDivider(1)) e.preventDefault(); }
+    });
   }
 
-  onClose(): void {
-    this.cursorTextarea = null;
+  /** After the split ran: swap the UI for a "done" panel with a live countdown,
+   *  then auto-close the tab and refocus the previously-active tab. */
+  private finishAndClose(): void {
+    const c = this.contentEl;
+    c.empty();
+    this.ui = null;
+    const box = c.createDiv({ cls: "stashpad-split-done" });
+    box.createDiv({ cls: "stashpad-split-done-title", text: "✓ Split complete." });
+    const count = box.createDiv({ cls: "stashpad-split-countdown" });
+    const btns = box.createDiv({ cls: "stashpad-split-done-btns" });
+    const closeNow = btns.createEl("button", { cls: "mod-cta", text: "Close now" });
+    const keep = btns.createEl("button", { text: "Keep tab open" });
+
+    let n = 4;
+    const paint = (): void => count.setText(`Closing this tab in ${n}…`);
+    const stop = (): void => {
+      if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
+    };
+    paint();
+    this.autoCloseTimer = window.setInterval(() => {
+      n -= 1;
+      if (n <= 0) { stop(); this.closeAndRefocus(); } else paint();
+    }, 1000);
+    closeNow.onclick = () => { stop(); this.closeAndRefocus(); };
+    keep.onclick = () => {
+      stop();
+      count.setText("Done — close this tab whenever you're ready.");
+      keep.remove();
+      closeNow.setText("Close tab");
+    };
+  }
+
+  private leafStillOpen(leaf: WorkspaceLeaf): boolean {
+    let ok = false;
+    this.app.workspace.iterateAllLeaves((l) => { if (l === leaf) ok = true; });
+    return ok;
+  }
+
+  private closeAndRefocus(): void {
+    const prev = this.prevLeaf;
+    this.leaf.detach();
+    // Return the user to the tab they came from (falls back to Obsidian's default
+    // adjacent-tab focus if it's since been closed).
+    if (prev && this.leafStillOpen(prev)) this.app.workspace.setActiveLeaf(prev, { focus: true });
+  }
+
+  async onClose(): Promise<void> {
+    if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
+    this.ui = null;
     this.contentEl.empty();
   }
 }

@@ -10769,13 +10769,14 @@ export class StashpadView extends ItemView {
     if (body.trim().length < 2) { new Notice("Note is too short to split."); return; }
     const originalContent = md;
     const originalPath = file.path;
-    const performSplit = async (firstBody: string, secondBody: string, payload: Record<string, unknown>) => {
+    const performSplit = async (firstBody: string, secondBody: string, payload: Record<string, unknown>, nest = false) => {
       if (!firstBody.trim() || !secondBody.trim()) { new Notice("Split would leave one part empty."); return; }
       try {
         const fm = md.startsWith("---") ? md.slice(0, md.indexOf("\n---", 3) + 4) : "";
         const newOriginal = fm + (fm ? "\n" : "") + firstBody + "\n";
         await this.app.vault.modify(file, newOriginal);
-        const parentId = target.parent ?? ROOT_ID;
+        // 0.168.3: nest → the new part becomes a CHILD of the original; otherwise a sibling.
+        const parentId = nest ? target.id : (target.parent ?? ROOT_ID);
         // Don't record the createNoteUnder action — the split itself
         // becomes one combined undo entry. Inherit the source note's
         // `created` time PLUS 1 ms so the second half sorts immediately
@@ -10849,7 +10850,7 @@ export class StashpadView extends ItemView {
     // Multi-split: the original keeps part 1; parts 2..N become new siblings
     // (in order, via incrementing createdOverride). One bulk-render window + one
     // grouped undo, same as the composer batch.
-    const performMultiSplit = async (parts: string[]): Promise<void> => {
+    const performMultiSplit = async (parts: string[], nest = false): Promise<void> => {
       if (parts.length < 2) return;
       try {
         const fm = md.startsWith("---") ? md.slice(0, md.indexOf("\n---", 3) + 4) : "";
@@ -10857,7 +10858,8 @@ export class StashpadView extends ItemView {
         if (!firstBody.trim()) { new Notice("Split would leave the first part empty."); return; }
         const newOriginal = fm + (fm ? "\n" : "") + firstBody + "\n";
         await this.app.vault.modify(file, newOriginal);
-        const parentId = target.parent ?? ROOT_ID;
+        // 0.168.3: nest → parts 2..N become CHILDREN of the original; else siblings.
+        const parentId = nest ? target.id : (target.parent ?? ROOT_ID);
         const baseTime = Date.parse(target.created || "");
         const base = Number.isFinite(baseTime) ? baseTime : Date.now();
         const collected: Array<{ path: string; content: string }> = [];
@@ -10912,21 +10914,26 @@ export class StashpadView extends ItemView {
       }
     };
 
-    new SplitNoteModal(
-      this.app,
-      body,
-      async (lineIdx) => {
+    // 0.169.0: the split handlers, shared by the modal AND the popped-out tab.
+    const splitCore = {
+      onSplitAtLine: async (lineIdx: number, nest: boolean) => {
         const firstBody = lines.slice(0, lineIdx).join("\n").replace(/\s+$/, "");
         const secondBody = lines.slice(lineIdx).join("\n").replace(/^\s+|\s+$/g, "");
-        await performSplit(firstBody, secondBody, { mode: "line", splitAtLine: lineIdx });
+        await performSplit(firstBody, secondBody, { mode: "line", splitAtLine: lineIdx, nest }, nest);
       },
-      async (charIdx) => {
-        const firstBody = body.slice(0, charIdx).replace(/\s+$/, "");
-        const secondBody = body.slice(charIdx).replace(/^\s+|\s+$/g, "");
-        await performSplit(firstBody, secondBody, { mode: "cursor", splitAtChar: charIdx });
+      onSplitAtChar: async (text: string, charIdx: number, nest: boolean) => {
+        // 0.168.0: split the (possibly edited) text from the modal, not the
+        // original body — so edits made in the cursor textarea are honored.
+        const firstBody = text.slice(0, charIdx).replace(/\s+$/, "");
+        const secondBody = text.slice(charIdx).replace(/^\s+|\s+$/g, "");
+        await performSplit(firstBody, secondBody, { mode: "cursor", splitAtChar: charIdx, edited: text !== body, nest }, nest);
       },
-      async (parts) => { await performMultiSplit(parts); },
-    ).open();
+      onSplitMany: async (parts: string[], nest: boolean) => { await performMultiSplit(parts, nest); },
+    };
+    new SplitNoteModal(this.app, body, {
+      ...splitCore,
+      popOut: (state) => { void this.plugin.openSplitView(body, splitCore, state); },
+    }).open();
   }
 
   cmdOpenInNewStashpadTab(node?: TreeNode): void {

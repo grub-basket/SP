@@ -14,7 +14,7 @@ import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal } from "./modals";
+import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, SplitNoteView, SPLIT_VIEW_TYPE, type SplitCommandCallbacks, type SplitUIState } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
@@ -983,6 +983,11 @@ export default class StashpadPlugin extends Plugin {
     this.registerView(
       STASHPAD_FOLDER_PANEL_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadFolderPanelView(leaf, this),
+    );
+    // 0.169.0: the "pop out" full-tab host for the Split-note UI (long text / mobile).
+    this.registerView(
+      SPLIT_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new SplitNoteView(leaf),
     );
     // Deep links: `obsidian://stashpad?folder=…&note=<id>&run=reveal[,open]`.
     // Routes into the Stashpad view, reveals a note, runs a small macro. See
@@ -3976,6 +3981,19 @@ export default class StashpadPlugin extends Plugin {
   /** Export an already-locked subtree (`.stashenc`) as a shareable, password-
    *  protected `.stash` — original blob untouched (feedback #4 / Option B). */
   exportLockedSubtree(blobPath: string): Promise<void> { return cmdExportLockedBlob(this, blobPath); }
+
+  /** 0.169.0: "pop out" the Split-note UI into a full tab. Opens a fresh leaf and
+   *  injects the live context (the split handlers are closures bound to the source
+   *  note, so the tab must be seeded right away; a restored context-less view shows
+   *  a "session ended" placeholder). */
+  async openSplitView(body: string, cbs: SplitCommandCallbacks, init: Partial<SplitUIState>): Promise<void> {
+    // Remember the tab we came from so the split tab can hand focus back on close.
+    const prevLeaf = this.app.workspace.getMostRecentLeaf() ?? this.app.workspace.activeLeaf;
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: SPLIT_VIEW_TYPE, active: true });
+    if (leaf.view instanceof SplitNoteView) leaf.view.setContext({ body, cbs, init, prevLeaf });
+    this.app.workspace.revealLeaf(leaf);
+  }
 
   /** Does `folder` contain (or sit within, or contain) Stashpad notes? This is the
    *  CONTENT-based discriminator for "lock the notes" vs "bundle arbitrary files" — it
