@@ -14,7 +14,7 @@ import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, SplitNoteView, SPLIT_VIEW_TYPE, type SplitCommandCallbacks, type SplitUIState } from "./modals";
+import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState } from "./modals";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
@@ -986,8 +986,8 @@ export default class StashpadPlugin extends Plugin {
     );
     // 0.169.0: the "pop out" full-tab host for the Split-note UI (long text / mobile).
     this.registerView(
-      SPLIT_VIEW_TYPE,
-      (leaf: WorkspaceLeaf) => new SplitNoteView(leaf),
+      WORKBENCH_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new NoteWorkbenchView(leaf),
     );
     // Deep links: `obsidian://stashpad?folder=…&note=<id>&run=reveal[,open]`.
     // Routes into the Stashpad view, reveals a note, runs a small macro. See
@@ -1442,6 +1442,17 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-edit-note",
       name: "Edit note in new tab (selection)",
       callback: () => call("cmdOpenInEditor"),
+    });
+    this.addCommand({
+      // 0.170.0: the in-app editor (Edit ⇄ Split surface), not a full Obsidian tab.
+      id: "stashpad-edit-inapp",
+      name: "Edit note (in-app editor)…",
+      callback: () => call("cmdEdit"),
+    });
+    this.addCommand({
+      id: "stashpad-edit-parent-inapp",
+      name: "Edit parent note (in-app editor)…",
+      callback: () => call("cmdEditParent"),
     });
     this.addCommand({
       id: "stashpad-edit-parent",
@@ -3986,12 +3997,12 @@ export default class StashpadPlugin extends Plugin {
    *  injects the live context (the split handlers are closures bound to the source
    *  note, so the tab must be seeded right away; a restored context-less view shows
    *  a "session ended" placeholder). */
-  async openSplitView(body: string, cbs: SplitCommandCallbacks, init: Partial<SplitUIState>): Promise<void> {
+  async openWorkbench(body: string, cbs: WorkbenchCommandCallbacks, init: Partial<WorkbenchState>): Promise<void> {
     // Remember the tab we came from so the split tab can hand focus back on close.
-    const prevLeaf = this.app.workspace.getMostRecentLeaf() ?? this.app.workspace.activeLeaf;
+    const prevLeaf = this.app.workspace.getMostRecentLeaf();
     const leaf = this.app.workspace.getLeaf("tab");
-    await leaf.setViewState({ type: SPLIT_VIEW_TYPE, active: true });
-    if (leaf.view instanceof SplitNoteView) leaf.view.setContext({ body, cbs, init, prevLeaf });
+    await leaf.setViewState({ type: WORKBENCH_VIEW_TYPE, active: true });
+    if (leaf.view instanceof NoteWorkbenchView) leaf.view.setContext({ body, cbs, init, prevLeaf });
     this.app.workspace.revealLeaf(leaf);
   }
 
@@ -6221,6 +6232,11 @@ export default class StashpadPlugin extends Plugin {
         && typeof (data)?.jdIndexStashpadFolder !== "string") {
       (data).jdIndexStashpadFolder = (data).jdIndexDestFolder;
     }
+    // 0.170.2: "E" was reassigned from "Open in Obsidian editor" (openEditor) to the
+    // new in-app editor (edit). Move a STALE openEditor="E" (the old default) to its
+    // new chord so E doesn't fire two commands. Idempotent — only touches an exact "E".
+    if (data?.shortcuts && data.shortcuts.openEditor === "E") data.shortcuts.openEditor = "Mod+Shift+E";
+    if (data?.bindings?.openEditor && data.bindings.openEditor.primary === "E") data.bindings.openEditor.primary = "Mod+Shift+E";
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...data,

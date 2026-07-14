@@ -2061,6 +2061,61 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-split-confirm-btn {
   padding: 4px 14px;
 }
+/* 0.170.0: top-level Edit ⇄ Split surface toggle. */
+.stashpad-split-surface {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-split-surface-btn {
+  flex: 1;
+  padding: 5px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  box-shadow: none;
+}
+.stashpad-split-surface-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+/* 0.170.3: icons inside the split/edit buttons + the ⌘E/⌘S hints on the toggle. */
+.stashpad-split-surface-btn,
+.stashpad-split-mode-btn,
+.stashpad-split-cancel-btn,
+.stashpad-split-confirm-btn,
+.stashpad-split-case-btn { display: inline-flex; align-items: center; gap: 6px; }
+.stashpad-split-btn-icon { display: inline-flex; flex: 0 0 auto; }
+.stashpad-split-btn-icon svg { width: 14px; height: 14px; }
+.stashpad-split-kbd-hint { margin-left: auto; padding-left: 6px; opacity: 0.6; font-size: var(--font-ui-smaller); }
+/* 0.170.3: edit-surface footer — live word/char count + case-cycle. */
+.stashpad-split-edit-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.stashpad-split-count { color: var(--text-faint); font-size: var(--font-ui-smaller); font-variant-numeric: tabular-nums; }
+.stashpad-split-case-btn {
+  margin-left: auto;
+  padding: 3px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+  box-shadow: none;
+}
+.stashpad-split-case-btn:hover { color: var(--text-normal); }
+/* 0.170.3: the Edit surface is a writing space — give the editor + review room. */
+.stashpad-edit-surface .stashpad-split-panel-body { max-height: calc(1.5em * 8 + 0.8em); }
 /* 0.168.3: unified mode row (Line / Cursor / preset methods) + bottom action bar. */
 .stashpad-split-modes {
   display: flex;
@@ -5478,14 +5533,19 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
 }
 .stashpad-folderpanel-heading-title { flex: 1 1 auto; }
 .stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn { height: 20px; width: 20px; }
-/* 0.164.5: the three section-header buttons (Pinned view options, New folder,
-   Open trash) get a thin border in the user's accent color so they read as
-   buttons rather than bare glyphs. 0.164.6: ONLY the border carries the accent —
-   the glyph stays the plain muted icon color (and normal hover), so the accent
-   reads as an outline, not a tint. Scoped to the heading row so note-row icon
-   buttons are untouched. */
+/* 0.164.5–0.164.6: the three section-header buttons (Pinned view options, New
+   folder, Open trash) framed with a border. 0.169.6: flipped — the GLYPH now carries
+   the accent color and the border is a neutral grey, so the accent reads as the icon
+   tint rather than an outline. Scoped to the heading row so note-row icon buttons are
+   untouched. */
 .stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn {
-  border: 1px solid var(--interactive-accent);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--interactive-accent);
+}
+.stashpad-folderpanel-heading-row .stashpad-folderpanel-iconbtn:hover {
+  color: var(--interactive-accent);
+  border-color: var(--text-muted);
+  background: var(--background-modifier-hover);
 }
 /* 0.98.37: the Folders heading doubles as the folder-switcher button. */
 .stashpad-folderpanel-heading-switch { cursor: pointer; border-radius: 4px; padding: 1px 4px; margin: -1px -4px; }

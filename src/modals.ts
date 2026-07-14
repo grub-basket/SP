@@ -456,7 +456,9 @@ function splitWordDiff(a: string, b: string): SplitDiffPart[] {
 
 /** 0.169.0: the split UI's live state — carried to the popped-out tab so it
  *  continues where the modal left off. */
-export interface SplitUIState {
+export interface WorkbenchState {
+  /** 0.170.0: top-level surface — plain Edit, or the Split methods. Shares text. */
+  surface: "edit" | "split";
   mode: "line" | "cursor" | "preset";
   presetMode: SplitMode;
   nest: boolean;
@@ -464,25 +466,42 @@ export interface SplitUIState {
   lineCursorIdx: number;
 }
 
-export interface SplitUICallbacks {
+export interface WorkbenchCallbacks {
   onSplitAtLine: (firstLineOfSecondPart: number, nest: boolean) => void | Promise<void>;
   onSplitAtChar: (text: string, charIndex: number, nest: boolean) => void | Promise<void>;
   onSplitMany: (parts: string[], nest: boolean) => void | Promise<void>;
+  /** 0.170.0: Edit surface — write the edited body back to the note. */
+  onSave: (text: string) => void | Promise<void>;
+  /** 0.170.1: open the note in a full Obsidian markdown tab (leaves the modal). */
+  onOpenExternal?: () => void;
   /** Dismiss the host WITHOUT committing (Cancel / Esc). */
   close: () => void;
-  /** Called AFTER a successful commit — the host decides what happens (the modal
-   *  closes; the popped-out tab runs a countdown then closes + refocuses). */
+  /** Called AFTER a successful commit/save — the host decides what happens (the
+   *  modal closes; the popped-out tab runs a countdown then closes + refocuses). */
   onDone: () => void;
+  /** Host hook to reflect the current surface in its title. */
+  onTitle?: (title: string) => void;
   /** When present, an "Open in a tab" button appears; called with the live state. */
-  popOut?: (state: SplitUIState) => void;
+  popOut?: (state: WorkbenchState) => void;
 }
 
 /** 0.169.0: the split UI extracted from the modal so it can render into EITHER a
  *  modal or a full leaf ("pop out"). Owns all state + rendering; the host wires
  *  keys to `commit()` / `moveDivider()`. */
-export class SplitUI {
+/** 0.170.3: case transforms for the edit surface's cycle button. */
+function applyCase(s: string, form: "lower" | "upper" | "title" | "sentence"): string {
+  switch (form) {
+    case "lower": return s.toLowerCase();
+    case "upper": return s.toUpperCase();
+    case "title": return s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+    case "sentence": return s.toLowerCase().replace(/(^\s*\w|[.!?]\s+\w)/g, (c) => c.toUpperCase());
+  }
+}
+
+export class NoteWorkbench {
   private lines: string[];
   private lineCursorIdx: number;
+  private surface: "edit" | "split" = "split";
   private mode: "line" | "cursor" | "preset" = "line";
   private presetMode: SplitMode = "paragraphs";
   private nest = false;
@@ -494,8 +513,8 @@ export class SplitUI {
     private app: App,
     private host: HTMLElement,
     private body: string,
-    init: Partial<SplitUIState>,
-    private cb: SplitUICallbacks,
+    init: Partial<WorkbenchState>,
+    private cb: WorkbenchCallbacks,
   ) {
     this.cursorText = init.cursorText ?? body;
     this.collapsed = { orig: Platform.isMobile, changes: Platform.isMobile, edit: false };
@@ -505,6 +524,7 @@ export class SplitUI {
     else if (this.lines.length < 2) this.mode = "cursor"; // single-line → cursor only
     if (init.presetMode) this.presetMode = init.presetMode;
     if (init.nest != null) this.nest = init.nest;
+    if (init.surface) this.surface = init.surface;
     // 0.169.4: wrap Tab focus within the split content — Shift+Tab on the first
     // control jumps to the last, Tab on the last wraps to the first (rather than
     // escaping to the modal × or getting stuck).
@@ -529,8 +549,9 @@ export class SplitUI {
   }
 
   /** Snapshot for handoff to the popped-out tab. */
-  getState(): SplitUIState {
+  getState(): WorkbenchState {
     return {
+      surface: this.surface,
       mode: this.mode, presetMode: this.presetMode, nest: this.nest,
       cursorText: this.cursorTextarea?.value ?? this.cursorText,
       lineCursorIdx: this.lineCursorIdx,
@@ -540,9 +561,29 @@ export class SplitUI {
   /** 0.168.3: single dispatch for the Split button + Mod+Enter. 0.169.3: awaits the
    *  split, then calls onDone so the host can act once the job is complete. */
   async commit(): Promise<void> {
+    if (this.surface === "edit") { await this.saveEdit(); return; }
     if (this.mode === "line") await this.commitLine();
     else if (this.mode === "cursor") await this.commitCursor();
     else await this.commitPreset();
+  }
+
+  private async saveEdit(): Promise<void> {
+    const ta = this.cursorTextarea;
+    if (!ta) return;
+    await this.cb.onSave(ta.value);
+    this.cb.onDone();
+  }
+
+  /** 0.170.5: the current text differs from the note's original body → unsaved. */
+  isDirty(): boolean {
+    return (this.cursorTextarea?.value ?? this.cursorText) !== this.body;
+  }
+
+  /** 0.170.3: switch surface (Mod+E / Mod+S host shortcuts). No-op if already there. */
+  setSurface(s: "edit" | "split"): void {
+    if (this.surface === s) return;
+    this.surface = s;
+    this.render();
   }
 
   /** Move the line-mode divider by ±1. Returns true if it applied (line mode). */
@@ -580,7 +621,114 @@ export class SplitUI {
 
   private render(): void {
     this.host.empty();
+    this.host.toggleClass("stashpad-edit-surface", this.surface === "edit");
+    this.cb.onTitle?.(this.surface === "edit" ? "Edit note" : "Split note");
+    this.renderSurfaceToggle();
+    if (this.surface === "edit") { this.renderEditSurface(); return; }
+    this.renderSplitSurface();
+  }
 
+  /** 0.170.0: top-level Edit ⇄ Split toggle. Both surfaces share the text buffer,
+   *  so edits carry over when you switch and the split acts on what you edited. */
+  private renderSurfaceToggle(): void {
+    const row = this.host.createDiv({ cls: "stashpad-split-surface" });
+    const modKey = Platform.isMacOS ? "⌘" : "Ctrl+";
+    const mk = (label: string, s: "edit" | "split", icon: string, key: string): void => {
+      const b = row.createEl("button", { cls: "stashpad-split-surface-btn" });
+      setIcon(b.createSpan({ cls: "stashpad-split-btn-icon" }), icon);
+      b.createSpan({ text: label });
+      b.createSpan({ cls: "stashpad-split-kbd-hint", text: `${modKey}${key}` });
+      b.toggleClass("is-active", this.surface === s);
+      b.onmousedown = (e) => e.preventDefault();
+      b.onclick = () => this.setSurface(s);
+    };
+    mk("Edit", "edit", "pencil-line", "E");
+    mk("Split", "split", "split", "S");
+  }
+
+  /** 0.170.0: "Open in a tab" — hand the live state to a full leaf. Only the modal
+   *  provides popOut (the tab omits it). */
+  private renderPopOut(actions: HTMLElement): void {
+    if (!this.cb.popOut) return;
+    const pop = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
+    setIcon(pop.createSpan({ cls: "stashpad-split-popout-icon" }), "maximize-2");
+    pop.createSpan({ text: "Open in a tab" });
+    pop.setAttr("aria-label", "Open in a full tab");
+    pop.onmousedown = (e) => e.preventDefault();
+    pop.onclick = () => this.cb.popOut!(this.getState());
+  }
+
+  /** 0.170.1: leave for a full Obsidian markdown editor tab. */
+  private renderOpenExternal(actions: HTMLElement): void {
+    if (!this.cb.onOpenExternal) return;
+    const b = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
+    setIcon(b.createSpan({ cls: "stashpad-split-popout-icon" }), "pencil");
+    b.createSpan({ text: "Obsidian editor" });
+    b.setAttr("aria-label", "Open in a full Obsidian editor tab");
+    b.onmousedown = (e) => e.preventDefault();
+    b.onclick = () => { this.cb.onOpenExternal!(); this.cb.close(); };
+  }
+
+  /** 0.170.0: plain editing — the shared Original/Changes/editor sections + a Save. */
+  private renderEditSurface(): void {
+    this.renderEditorSections();
+
+    // 0.170.3: edit tools — live word/char count + a case-cycle button.
+    const tools = this.host.createDiv({ cls: "stashpad-split-edit-tools" });
+    const count = tools.createSpan({ cls: "stashpad-split-count" });
+    const updateCount = (): void => {
+      const t = this.cursorTextarea?.value ?? "";
+      const words = (t.trim().match(/\S+/g) || []).length;
+      count.setText(`${words} word${words === 1 ? "" : "s"} · ${t.length} char${t.length === 1 ? "" : "s"}`);
+    };
+    const caseBtn = tools.createEl("button", { cls: "stashpad-split-case-btn" });
+    setIcon(caseBtn.createSpan({ cls: "stashpad-split-btn-icon" }), "case-sensitive");
+    caseBtn.createSpan({ text: "Case" });
+    caseBtn.setAttr("aria-label", "Cycle case of the selection (or all text): lower → UPPER → Title → Sentence");
+    caseBtn.onmousedown = (e) => e.preventDefault();
+    caseBtn.onclick = () => this.cycleCase(updateCount);
+    this.cursorTextarea?.addEventListener("input", updateCount);
+    updateCount();
+
+    const help = this.host.createDiv({ cls: "stashpad-split-help" });
+    if (!Platform.isPhone) help.setText("Edit the note, then Save.  ·  ⌘/Ctrl+Enter or Save to write  ·  ⌘/Ctrl+S → Split  ·  Esc discards.");
+    const actions = this.host.createDiv({ cls: "stashpad-split-actions" });
+    const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn" });
+    setIcon(cancel.createSpan({ cls: "stashpad-split-btn-icon" }), "x");
+    cancel.createSpan({ text: "Cancel (Esc)" });
+    cancel.onmousedown = (e) => e.preventDefault();
+    cancel.onclick = () => this.cb.close();
+    this.renderPopOut(actions);
+    this.renderOpenExternal(actions);
+    const right = actions.createDiv({ cls: "stashpad-split-actions-right" });
+    const saveBtn = right.createEl("button", { cls: "stashpad-split-confirm-btn mod-cta" });
+    setIcon(saveBtn.createSpan({ cls: "stashpad-split-btn-icon" }), "save");
+    saveBtn.createSpan({ text: "Save" });
+    saveBtn.onmousedown = (e) => e.preventDefault();
+    saveBtn.onclick = () => void this.commit();
+  }
+
+  private caseCycleIndex = 0;
+  private cycleCase(after: () => void): void {
+    const ta = this.cursorTextarea;
+    if (!ta) return;
+    const hasSel = ta.selectionStart !== ta.selectionEnd;
+    const start = hasSel ? ta.selectionStart : 0;
+    const end = hasSel ? ta.selectionEnd : ta.value.length;
+    const seg = ta.value.slice(start, end);
+    const forms = ["lower", "upper", "title", "sentence"] as const;
+    const form = forms[this.caseCycleIndex % forms.length];
+    this.caseCycleIndex += 1;
+    const out = applyCase(seg, form);
+    ta.value = ta.value.slice(0, start) + out + ta.value.slice(end);
+    ta.setSelectionRange(start, start + out.length);
+    this.cursorText = ta.value;
+    ta.dispatchEvent(new Event("input")); // refresh diff + count
+    after();
+    ta.focus();
+  }
+
+  private renderSplitSurface(): void {
     // 0.168.3: mode selection — one segmented row across ALL split methods. Line /
     // Cursor place a single divider you position; the preset methods (Each line /
     // Paragraphs / Headings) auto-split into many. Every method now SELECTS a mode
@@ -588,17 +736,20 @@ export class SplitUI {
     // inconsistent quick-splits. A greyed preset shows no count (a count of 1 means
     // "can't split", which read as noise).
     const modeRow = this.host.createDiv({ cls: "stashpad-split-modes" });
-    const modeBtn = (label: string, active: boolean, onPick: () => void, disabled = false): void => {
-      const b = modeRow.createEl("button", { cls: "stashpad-split-mode-btn", text: label });
+    const modeBtn = (label: string, active: boolean, onPick: () => void, icon: string, disabled = false): void => {
+      const b = modeRow.createEl("button", { cls: "stashpad-split-mode-btn" });
+      setIcon(b.createSpan({ cls: "stashpad-split-btn-icon" }), icon);
+      b.createSpan({ text: label });
       b.toggleClass("is-active", active);
       b.disabled = disabled;
       b.onmousedown = (e) => e.preventDefault();
       if (!disabled) b.onclick = onPick;
     };
     if (this.lines.length >= 2) {
-      modeBtn("Line", this.mode === "line", () => { this.mode = "line"; this.render(); });
+      modeBtn("Line", this.mode === "line", () => { this.mode = "line"; this.render(); }, "separator-horizontal");
     }
-    modeBtn("Cursor", this.mode === "cursor", () => { this.mode = "cursor"; this.render(); });
+    modeBtn("Cursor", this.mode === "cursor", () => { this.mode = "cursor"; this.render(); }, "text-cursor-input");
+    const presetIcon: Record<SplitMode, string> = { lines: "list", paragraphs: "pilcrow", headings: "heading" };
     (["lines", "paragraphs", "headings"] as SplitMode[]).forEach((m) => {
       const n = splitIntoChunks(this.body, m).length;
       const disabled = n < 2;
@@ -607,12 +758,12 @@ export class SplitUI {
       const base = m === "paragraphs" ? "Blank line(s)" : SPLIT_MODE_LABELS[m];
       const label = disabled ? base : `${base} (${n})`;
       modeBtn(label, this.mode === "preset" && this.presetMode === m,
-        () => { this.mode = "preset"; this.presetMode = m; this.render(); }, disabled);
+        () => { this.mode = "preset"; this.presetMode = m; this.render(); }, presetIcon[m], disabled);
     });
 
     // Preview for the active mode.
     if (this.mode === "line") this.renderLineMode();
-    else if (this.mode === "cursor") this.renderCursorMode();
+    else if (this.mode === "cursor") this.renderEditorSections();
     else this.renderPresetMode();
 
     const help = this.host.createDiv({ cls: "stashpad-split-help" });
@@ -637,20 +788,13 @@ export class SplitUI {
     const actions = this.host.createDiv({ cls: "stashpad-split-actions" });
     // 0.168.5: Cancel IS the escape action, so it carries the Esc hint (the separate
     // corner chip was redundant with both Cancel and the ×).
-    const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn", text: "Cancel (Esc)" });
+    const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn" });
+    setIcon(cancel.createSpan({ cls: "stashpad-split-btn-icon" }), "x");
+    cancel.createSpan({ text: "Cancel (Esc)" });
     cancel.onmousedown = (e) => e.preventDefault();
     cancel.onclick = () => this.cb.close();
-
-    // 0.169.0: "Open in a tab" — hand the current state to a full leaf, great for
-    // long text / mobile. Only offered by the modal (the tab itself omits it).
-    if (this.cb.popOut) {
-      const pop = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
-      setIcon(pop.createSpan({ cls: "stashpad-split-popout-icon" }), "maximize-2");
-      pop.createSpan({ text: "Open in a tab" });
-      pop.setAttr("aria-label", "Open this split in a full tab");
-      pop.onmousedown = (e) => e.preventDefault();
-      pop.onclick = () => this.cb.popOut!(this.getState());
-    }
+    this.renderPopOut(actions);
+    this.renderOpenExternal(actions);
 
     const right = actions.createDiv({ cls: "stashpad-split-actions-right" });
     const nestWrap = right.createEl("label", { cls: "stashpad-split-nest" });
@@ -661,10 +805,9 @@ export class SplitUI {
     nestCb.onchange = () => { this.nest = nestCb.checked; setHelp(); };
 
     const splitCount = this.mode === "preset" ? splitIntoChunks(this.body, this.presetMode).length : 0;
-    const splitBtn = right.createEl("button", {
-      cls: "stashpad-split-confirm-btn mod-cta",
-      text: this.mode === "preset" && splitCount >= 2 ? `Split into ${splitCount}` : "Split",
-    });
+    const splitBtn = right.createEl("button", { cls: "stashpad-split-confirm-btn mod-cta" });
+    setIcon(splitBtn.createSpan({ cls: "stashpad-split-btn-icon" }), "split");
+    splitBtn.createSpan({ text: this.mode === "preset" && splitCount >= 2 ? `Split into ${splitCount}` : "Split" });
     splitBtn.onmousedown = (e) => e.preventDefault(); // don't blur the textarea
     splitBtn.onclick = () => this.commit();
   }
@@ -753,7 +896,7 @@ export class SplitUI {
     return btn;
   }
 
-  private renderCursorMode(): void {
+  private renderEditorSections(): void {
     // 0.168.1/0.168.2: when the text has been edited, a read-only ORIGINAL section
     // and a read-only word-level DIFF section appear above the editor. All three are
     // consistent collapsible framed sections (whole header = the toggle button).
@@ -766,7 +909,7 @@ export class SplitUI {
     const changes = this.buildSplitSection(this.host, "changes", "Changes");
     const diffBody = changes.body.createDiv({ cls: "stashpad-split-panel-body stashpad-split-diff-body" });
 
-    const edit = this.buildSplitSection(this.host, "edit", "Your edit — the split uses this");
+    const edit = this.buildSplitSection(this.host, "edit", this.surface === "edit" ? "Your edit" : "Your edit — the split uses this");
     const ta = edit.body.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
     // Seed from the persisted (possibly edited) text so toggling modes doesn't
     // discard edits; the split acts on exactly what's shown here.
@@ -791,7 +934,9 @@ export class SplitUI {
     // Auto-size the textarea to fit content. Cap at 3 lines on mobile,
     // 12 lines on desktop. Recomputed on input in case the user edits.
     const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 22;
-    const maxLines = Platform.isMobile ? 3 : 12;
+    // 0.170.3: the Edit surface is a real writing space — let the editor grow much
+    // taller than in Split mode (where it stays compact next to the split controls).
+    const maxLines = this.surface === "edit" ? (Platform.isMobile ? 14 : 40) : (Platform.isMobile ? 3 : 12);
     const minLines = 2;
     const fit = (): void => {
       ta.setCssStyles({ height: "auto" });
@@ -812,99 +957,156 @@ export class SplitUI {
   }
 }
 
-/** Callbacks a split host is handed (the host fills in `close`/`onDone`). */
-export type SplitCommandCallbacks = Omit<SplitUICallbacks, "close" | "onDone">;
+/** Callbacks a split host is handed (the host fills in `close`/`onDone`/`onTitle`). */
+export type WorkbenchCommandCallbacks = Omit<WorkbenchCallbacks, "close" | "onDone" | "onTitle">;
 
-export const SPLIT_VIEW_TYPE = "stashpad-split-view";
+export const WORKBENCH_VIEW_TYPE = "stashpad-split-view";
 
-/** 0.169.0: thin modal host around SplitUI. */
-export class SplitNoteModal extends Modal {
-  private ui: SplitUI | null = null;
-  constructor(app: App, private body: string, private cbs: SplitCommandCallbacks) {
+/** 0.169.0: thin modal host around NoteWorkbench. */
+export class NoteWorkbenchModal extends Modal {
+  private ui: NoteWorkbench | null = null;
+  /** 0.170.5: set when the close is intentional (Save/Split done, or pop-out) so the
+   *  unsaved-edits guard is skipped. */
+  private committing = false;
+  constructor(app: App, private body: string, private cbs: WorkbenchCommandCallbacks, private init: Partial<WorkbenchState> = {}) {
     super(app);
   }
   onOpen(): void {
-    this.titleEl.setText("Split note");
     this.modalEl.addClass("stashpad-split-modal");
-    this.ui = new SplitUI(this.app, this.contentEl, this.body, {}, {
+    this.ui = new NoteWorkbench(this.app, this.contentEl, this.body, this.init, {
       onSplitAtLine: this.cbs.onSplitAtLine,
       onSplitAtChar: this.cbs.onSplitAtChar,
       onSplitMany: this.cbs.onSplitMany,
+      onSave: this.cbs.onSave,
+      onOpenExternal: this.cbs.onOpenExternal,
       close: () => this.close(),
-      onDone: () => this.close(), // split ran → just dismiss the modal
-      // Popping out closes the modal first, then opens the tab with the live state.
-      popOut: this.cbs.popOut ? (state) => { this.close(); this.cbs.popOut!(state); } : undefined,
+      onDone: () => { this.committing = true; this.close(); }, // split/save ran → dismiss
+      onTitle: (t) => this.titleEl.setText(t),
+      // Popping out closes the modal first, then opens the tab with the live state
+      // (the edits go with it, so no discard guard).
+      popOut: this.cbs.popOut ? (state) => { this.committing = true; this.close(); this.cbs.popOut!(state); } : undefined,
     });
     // Mod+Enter commits in every mode (see 0.168.5). Arrows move the line divider.
     this.scope.register(["Mod"], "Enter", (e) => { e.preventDefault(); void this.ui?.commit(); });
     this.scope.register([], "ArrowUp", (e) => { if (this.ui?.moveDivider(-1)) e.preventDefault(); });
     this.scope.register([], "ArrowDown", (e) => { if (this.ui?.moveDivider(1)) e.preventDefault(); });
+    // 0.170.3: Mod+E / Mod+S toggle the Edit / Split surface while open.
+    this.scope.register(["Mod"], "e", (e) => { e.preventDefault(); this.ui?.setSurface("edit"); });
+    this.scope.register(["Mod"], "s", (e) => { e.preventDefault(); this.ui?.setSurface("split"); });
+  }
+  // 0.170.5: dirty guard — Esc / click-outside / × / Cancel all route through close();
+  // if there are unsaved edits (and this isn't a deliberate Save/Split/pop-out), confirm.
+  close(): void {
+    if (this.committing || !this.ui?.isDirty()) { super.close(); return; }
+    new ConfirmModal(
+      this.app,
+      "Discard unsaved edits?",
+      "You've edited this note but haven't saved. Close and discard your changes?",
+      "Discard",
+      (ok) => { if (ok) { this.committing = true; this.close(); } },
+      "Keep editing",
+      true,
+    ).open();
   }
   onClose(): void { this.ui = null; this.contentEl.empty(); }
 }
 
-/** Context injected into a popped-out SplitNoteView. `prevLeaf` is the tab to
+/** Context injected into a popped-out NoteWorkbenchView. `prevLeaf` is the tab to
  *  refocus once the split's done. */
-export interface SplitViewContext {
+export interface WorkbenchViewContext {
   body: string;
-  cbs: SplitCommandCallbacks;
-  init: Partial<SplitUIState>;
+  cbs: WorkbenchCommandCallbacks;
+  init: Partial<WorkbenchState>;
   prevLeaf?: WorkspaceLeaf | null;
 }
 
-/** 0.169.0: full-leaf host around SplitUI ("pop out"). Ephemeral — needs its
+/** 0.169.0: full-leaf host around NoteWorkbench ("pop out"). Ephemeral — needs its
  *  context injected via setContext right after creation; a restored-but-context-less
  *  view shows a "session ended" placeholder. 0.169.3: once the split commits, it
  *  runs a live countdown and then closes + refocuses the previous tab. */
-export class SplitNoteView extends ItemView {
-  private ui: SplitUI | null = null;
-  private ctx: SplitViewContext | null = null;
+export class NoteWorkbenchView extends ItemView {
+  private ui: NoteWorkbench | null = null;
+  private ctx: WorkbenchViewContext | null = null;
   private prevLeaf: WorkspaceLeaf | null = null;
   private autoCloseTimer: number | null = null;
+  private expiredGrace: number | null = null;
+  private title = "Note";
+  private viewIcon = "pencil-line";
   constructor(leaf: WorkspaceLeaf) { super(leaf); }
-  getViewType(): string { return SPLIT_VIEW_TYPE; }
-  getDisplayText(): string { return "Split note"; }
-  getIcon(): string { return "split"; }
+  getViewType(): string { return WORKBENCH_VIEW_TYPE; }
+  getDisplayText(): string { return this.title; }
+  getIcon(): string { return this.viewIcon; }
 
-  setContext(ctx: SplitViewContext): void {
+  private setHeader(title: string, icon: string): void {
+    this.title = title;
+    this.viewIcon = icon;
+    // Undocumented but real: refresh the tab header so the title/icon update live.
+    (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
+  }
+
+  setContext(ctx: WorkbenchViewContext): void {
+    if (this.expiredGrace != null) { window.clearTimeout(this.expiredGrace); this.expiredGrace = null; }
     this.ctx = ctx;
     this.prevLeaf = ctx.prevLeaf ?? null;
+    const isEdit = ctx.init.surface === "edit";
+    this.setHeader(isEdit ? "Edit note" : "Split note", isEdit ? "pencil-line" : "split");
     this.renderUI();
   }
-  async onOpen(): Promise<void> { this.renderUI(); }
+
+  async onOpen(): Promise<void> {
+    // Fresh pop-outs get their context via setContext within a tick. A RESTORED tab
+    // (workspace reload) never will — so if no context arrives shortly, it's an
+    // orphan: show the expired panel and auto-close it. The grace period avoids
+    // flashing/auto-closing the transient no-context state during a fresh open.
+    this.contentEl.addClass("stashpad-split-modal", "stashpad-split-view");
+    if (!this.ctx) {
+      this.expiredGrace = window.setTimeout(() => { this.expiredGrace = null; if (!this.ctx) this.renderExpired(); }, 800);
+    }
+  }
 
   private renderUI(): void {
     const c = this.contentEl;
     c.empty();
     c.addClass("stashpad-split-modal", "stashpad-split-view");
-    if (!this.ctx) {
-      c.createDiv({ cls: "stashpad-split-empty", text: "This split session has ended — close this tab and run “Split note” again." });
-      return;
-    }
-    this.ui = new SplitUI(this.app, c, this.ctx.body, this.ctx.init, {
+    if (!this.ctx) return;
+    this.ui = new NoteWorkbench(this.app, c, this.ctx.body, this.ctx.init, {
       onSplitAtLine: this.ctx.cbs.onSplitAtLine,
       onSplitAtChar: this.ctx.cbs.onSplitAtChar,
       onSplitMany: this.ctx.cbs.onSplitMany,
-      close: () => this.leaf.detach(),
-      onDone: () => this.finishAndClose(),
+      onSave: this.ctx.cbs.onSave,
+      onOpenExternal: this.ctx.cbs.onOpenExternal,
+      close: () => this.guardedDetach(),
+      onDone: () => this.startClosePanel("✓ Done.", null, true),
+      onTitle: (t) => this.setHeader(t, t.startsWith("Edit") ? "pencil-line" : "split"),
     });
     // Mod+Enter commits; arrows move the line divider (only acts in line mode, so
     // arrows in the cursor textarea fall through to the textarea).
     this.registerDomEvent(c, "keydown", (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); void this.ui?.commit(); }
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key === "Enter") { e.preventDefault(); void this.ui?.commit(); }
+      else if (mod && (e.key === "e" || e.key === "E")) { e.preventDefault(); this.ui?.setSurface("edit"); }
+      else if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); this.ui?.setSurface("split"); }
       else if (e.key === "ArrowUp") { if (this.ui?.moveDivider(-1)) e.preventDefault(); }
       else if (e.key === "ArrowDown") { if (this.ui?.moveDivider(1)) e.preventDefault(); }
     });
   }
 
-  /** After the split ran: swap the UI for a "done" panel with a live countdown,
-   *  then auto-close the tab and refocus the previously-active tab. */
-  private finishAndClose(): void {
+  /** Orphaned restored tab — can't be revived; auto-close it. */
+  private renderExpired(): void {
+    this.setHeader("Expired", "clock");
+    this.startClosePanel("This session has expired.", "It can't be restored — closing this tab…", false);
+  }
+
+  /** Shared close panel: a title + a live countdown that auto-closes, plus Close
+   *  now / Keep tab open. `refocus` returns to the previous tab (done) vs just
+   *  closing (expired orphan). */
+  private startClosePanel(titleText: string, subText: string | null, refocus: boolean): void {
     const c = this.contentEl;
     c.empty();
     this.ui = null;
     const box = c.createDiv({ cls: "stashpad-split-done" });
-    box.createDiv({ cls: "stashpad-split-done-title", text: "✓ Split complete." });
+    box.createDiv({ cls: "stashpad-split-done-title", text: titleText });
+    if (subText) box.createDiv({ cls: "stashpad-split-countdown", text: subText });
     const count = box.createDiv({ cls: "stashpad-split-countdown" });
     const btns = box.createDiv({ cls: "stashpad-split-done-btns" });
     const closeNow = btns.createEl("button", { cls: "mod-cta", text: "Close now" });
@@ -915,18 +1117,26 @@ export class SplitNoteView extends ItemView {
     const stop = (): void => {
       if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
     };
+    const close = (): void => { stop(); if (refocus) this.closeAndRefocus(); else this.leaf.detach(); };
     paint();
-    this.autoCloseTimer = window.setInterval(() => {
-      n -= 1;
-      if (n <= 0) { stop(); this.closeAndRefocus(); } else paint();
-    }, 1000);
-    closeNow.onclick = () => { stop(); this.closeAndRefocus(); };
-    keep.onclick = () => {
-      stop();
-      count.setText("Done — close this tab whenever you're ready.");
-      keep.remove();
-      closeNow.setText("Close tab");
-    };
+    this.autoCloseTimer = window.setInterval(() => { n -= 1; if (n <= 0) close(); else paint(); }, 1000);
+    closeNow.onclick = close;
+    keep.onclick = () => { stop(); count.setText("Close this tab whenever you're ready."); keep.remove(); closeNow.setText("Close tab"); };
+  }
+
+  /** 0.170.5: Cancel in the tab confirms if there are unsaved edits before detaching.
+   *  (A native tab close / Cmd+W can't be intercepted — that path isn't guarded.) */
+  private guardedDetach(): void {
+    if (!this.ui?.isDirty()) { this.leaf.detach(); return; }
+    new ConfirmModal(
+      this.app,
+      "Discard unsaved edits?",
+      "You've edited this note but haven't saved. Close this tab and discard your changes?",
+      "Discard",
+      (ok) => { if (ok) this.leaf.detach(); },
+      "Keep editing",
+      true,
+    ).open();
   }
 
   private leafStillOpen(leaf: WorkspaceLeaf): boolean {
@@ -938,13 +1148,12 @@ export class SplitNoteView extends ItemView {
   private closeAndRefocus(): void {
     const prev = this.prevLeaf;
     this.leaf.detach();
-    // Return the user to the tab they came from (falls back to Obsidian's default
-    // adjacent-tab focus if it's since been closed).
     if (prev && this.leafStillOpen(prev)) this.app.workspace.setActiveLeaf(prev, { focus: true });
   }
 
   async onClose(): Promise<void> {
     if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
+    if (this.expiredGrace != null) { window.clearTimeout(this.expiredGrace); this.expiredGrace = null; }
     this.ui = null;
     this.contentEl.empty();
   }

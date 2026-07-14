@@ -28,6 +28,8 @@ export interface ShortcutMap {
   openEditor: string;  // E  — open in regular Obsidian markdown tab
   openTab: string;     // T  — open in a new Stashpad tab
   split: string;       // (empty by default) — split selected note into two
+  edit: string;        // E — edit selected note in the in-app editor
+  editParent: string;  // Shift+E — edit the focused parent note in the in-app editor
   copyOutline: string; // (empty by default) — copy selection as nested embed outline
 }
 
@@ -51,7 +53,7 @@ export interface ModShortcuts {
  *  descriptions live in COMMAND_META below. */
 export type CommandId =
   | "move" | "pickMove" | "merge" | "copy" | "copyTree" | "copyLink" | "openEditor" | "openTab"
-  | "split" | "copyOutline"
+  | "split" | "edit" | "editParent" | "copyOutline"
   | "toggleSplit" | "pickDestination" | "search" | "searchInParent" | "delete" | "undo" | "redo"
   | "toggleComplete" | "moveUp" | "moveDown" | "moveToTop" | "moveToBottom"
   | "outdent" | "setColor"
@@ -101,9 +103,11 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "copy",            label: "Copy",                          desc: "Copy selected note bodies to clipboard.",                                                defaultPrimary: "C" },
   { id: "copyTree",        label: "Copy tree",                     desc: "Copy the focused note + all descendants, indented.",                                     defaultPrimary: "Y" },
   { id: "copyLink",        label: "Copy Stashpad link",            desc: "Copy an obsidian://stashpad deep link to the cursor row (or first selected note) — click it anywhere to jump back. No default chord.", defaultPrimary: "" },
-  { id: "openEditor",      label: "Open in editor",                desc: "Open the cursor row (or focused note) in a regular Obsidian markdown tab.",              defaultPrimary: "E" },
+  { id: "openEditor",      label: "Open in Obsidian editor",       desc: "Open the cursor row (or focused note) in a regular Obsidian markdown tab.",              defaultPrimary: "Mod+Shift+E" },
   { id: "openTab",         label: "Open in new Stashpad tab",      desc: "Open the cursor row (or focused note) in a new Stashpad tab focused on it.",             defaultPrimary: "T" },
   { id: "split",           label: "Split note",                    desc: "Split the cursor row (or focused note) into two notes at a chosen line.",                defaultPrimary: "S" },
+  { id: "edit",            label: "Edit note (in-app)",            desc: "Edit the cursor row (or focused note) in Stashpad's in-app editor (with a Split toggle) instead of a full Obsidian tab.", defaultPrimary: "E" },
+  { id: "editParent",      label: "Edit parent note (in-app)",     desc: "Edit the focused parent note in Stashpad's in-app editor.",                              defaultPrimary: "Shift+E" },
   { id: "copyOutline",     label: "Copy as outline",               desc: "Copy selection (or cursor row) as a nested ![[embed]] outline.",                         defaultPrimary: "L" },
   { id: "toggleSplit",     label: "Toggle split-on-newlines",      desc: "Default: Mod+/",                                                                          defaultPrimary: "Mod+/" },
   { id: "pickDestination", label: "Pick destination",              desc: "Default: Mod+D",                                                                          defaultPrimary: "Mod+D" },
@@ -650,7 +654,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   slugStopWords: [],  // empty → DEFAULT_STOPWORDS used at runtime
   searchIncludedFolders: [],
   searchExcludedFolders: [],
-  shortcuts: { move: "M", pickMove: "O", merge: "&", copy: "C", copyTree: "Y", openEditor: "E", openTab: "T", split: "S", copyOutline: "L" },
+  shortcuts: { move: "M", pickMove: "O", merge: "&", copy: "C", copyTree: "Y", openEditor: "Mod+Shift+E", openTab: "T", split: "S", edit: "E", editParent: "Shift+E", copyOutline: "L" },
   mod: {
     toggleSplit: "Mod+/", pickDestination: "Mod+D", search: "Mod+F",
     delete: "Mod+Backspace", undo: "Mod+Z", redo: "Mod+Shift+Z",

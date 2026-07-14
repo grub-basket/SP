@@ -26,7 +26,7 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, SplitNoteModal } from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, NoteWorkbenchModal } from "./modals";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, humanCombo } from "./view-keys";
 import { openAggregateView } from "./aggregate-view";
@@ -6577,6 +6577,11 @@ export class StashpadView extends ItemView {
       }
       if (matchBinding(e, sb.openTab)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdOpenInNewStashpadTab(); return; }
       if (matchBinding(e, sb.split)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdSplit(); return; }
+      // editParent (Shift+E) is checked BEFORE edit (E): a plain-letter binding also
+      // fires on its shifted form (matchKey ignores Shift), so Shift+E must consume
+      // the event first or "E" would swallow it. (The shifted-key trap.)
+      if (matchBinding(e, sb.editParent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdEditParent(); return; }
+      if (matchBinding(e, sb.edit)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdEdit(); return; }
       if (matchBinding(e, sb.clone)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdClone(); return; }
       if (matchBinding(e, sb.forkNote)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdForkNote(); return; }
       if (matchBinding(e, sb.insertTemplate)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInsertTemplate(); return; }
@@ -10759,16 +10764,63 @@ export class StashpadView extends ItemView {
   /** Split the cursor row (or focused/passed) note in two at a chosen line.
    *  First part keeps the original note's id, file, and children.
    *  Second part becomes a new sibling with no children. */
-  async cmdSplit(node?: TreeNode): Promise<void> {
+  /** 0.170.0: also the entry for the in-app EDIT surface — `surface: "edit"` opens
+   *  the same modal on the Edit tab (edits + Save), which can toggle to Split. */
+  cmdEdit(node?: TreeNode): Promise<void> { return this.cmdSplit(node, "edit"); }
+
+  /** 0.170.2: edit the focused parent note in the in-app editor (Shift+E). */
+  cmdEditParent(): Promise<void> {
+    const focused = this.tree.get(this.focusId);
+    if (!focused?.file) { new Notice("No focused parent to edit."); return Promise.resolve(); }
+    return this.cmdEdit(focused);
+  }
+
+  async cmdSplit(node?: TreeNode, surface: "edit" | "split" = "split"): Promise<void> {
     const target = node ?? this.resolveActionTarget();
-    if (!target?.file) { new Notice("Pick a note to split."); return; }
+    if (!target?.file) { new Notice(surface === "edit" ? "Pick a note to edit." : "Pick a note to split."); return; }
     const file = target.file;
     const md = await this.app.vault.read(file);
     const body = this.stripFrontmatter(md).replace(/\s+$/, "");
     const lines = body.split(/\r?\n/);
-    if (body.trim().length < 2) { new Notice("Note is too short to split."); return; }
+    // Split needs ≥2 chars to be meaningful; editing has no such floor.
+    if (surface === "split" && body.trim().length < 2) { new Notice("Note is too short to split."); return; }
     const originalContent = md;
     const originalPath = file.path;
+    // 0.170.0: Edit-surface Save — write the edited body back to the note (frontmatter
+    // preserved), as one undo entry.
+    const performEdit = async (newBody: string): Promise<void> => {
+      const nb = newBody.replace(/\s+$/, "");
+      if (!nb.trim()) { new Notice("Can't save an empty note."); return; }
+      const fm = md.startsWith("---") ? md.slice(0, md.indexOf("\n---", 3) + 4) : "";
+      const newContent = fm + (fm ? "\n" : "") + nb + "\n";
+      if (newContent === originalContent) return; // no change
+      await this.app.vault.modify(file, newContent);
+      // 0.170.2: re-slug the filename to match the new first line (user chose auto-rename).
+      const renamedTo = await this.reslugFile(file, nb);
+      const finalPath = renamedTo ?? originalPath;
+      this.tree.rebuild(this.noteFolder);
+      this.render();
+      this.plugin.notifications.show({
+        message: `Saved "${this.titleForNode(target)}"`, kind: "success", category: "split",
+        affectedIds: [target.id], folder: this.noteFolder,
+      });
+      const folder = this.noteFolder;
+      this.plugin.getUndoStack(folder).push({
+        label: "Edit note",
+        undo: async () => {
+          let f = this.app.vault.getAbstractFileByPath(finalPath) as TFile | null;
+          if (f && finalPath !== originalPath) { try { await this.app.fileManager.renameFile(f, originalPath); } catch { /* ignore */ } }
+          f = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
+          if (f) await this.app.vault.modify(f, originalContent);
+          this.tree.rebuild(folder); this.render();
+        },
+        redo: async () => {
+          const f = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
+          if (f) { await this.app.vault.modify(f, newContent); if (finalPath !== originalPath) { try { await this.app.fileManager.renameFile(f, finalPath); } catch { /* ignore */ } } }
+          this.tree.rebuild(folder); this.render();
+        },
+      });
+    };
     const performSplit = async (firstBody: string, secondBody: string, payload: Record<string, unknown>, nest = false) => {
       if (!firstBody.trim() || !secondBody.trim()) { new Notice("Split would leave one part empty."); return; }
       try {
@@ -10929,11 +10981,13 @@ export class StashpadView extends ItemView {
         await performSplit(firstBody, secondBody, { mode: "cursor", splitAtChar: charIdx, edited: text !== body, nest }, nest);
       },
       onSplitMany: async (parts: string[], nest: boolean) => { await performMultiSplit(parts, nest); },
+      onSave: performEdit,
+      onOpenExternal: () => { void this.openFileAtEnd(file); },
     };
-    new SplitNoteModal(this.app, body, {
+    new NoteWorkbenchModal(this.app, body, {
       ...splitCore,
-      popOut: (state) => { void this.plugin.openSplitView(body, splitCore, state); },
-    }).open();
+      popOut: (state) => { void this.plugin.openWorkbench(body, splitCore, state); },
+    }, { surface }).open();
   }
 
   cmdOpenInNewStashpadTab(node?: TreeNode): void {
@@ -11473,6 +11527,28 @@ export class StashpadView extends ItemView {
     this.slugDebouncers.set(file.path, d);
     d();
   }
+  /** 0.170.2: rename `file` so its slug matches `body`'s first line. Returns the new
+   *  path if it renamed, else null. Like maybeRenameForSlug but takes a known body
+   *  (used by the Edit-surface Save so it doesn't wait on the cache). */
+  private async reslugFile(file: TFile, body: string): Promise<string | null> {
+    const fmIdRaw = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+    const fmId = typeof fmIdRaw === "string" ? fmIdRaw : null;
+    const fnId = parseIdFromFilename(file.basename);
+    const id = fnId ?? (isNoteId(fmId ?? "") ? fmId : null);
+    if (!id || id === ROOT_ID) return null;
+    if (fmId !== id) return null;
+    const desired = buildFilename(bodyToSlug(body, this.activeStopwords()), id);
+    if (file.name === desired) return null;
+    const newPath = file.parent ? `${file.parent.path}/${desired}` : desired;
+    if (this.app.vault.getAbstractFileByPath(newPath)) return null;
+    const oldPath = file.path;
+    try {
+      await this.app.fileManager.renameFile(file, newPath);
+      await this.log.append({ type: "rename", id, payload: { from: oldPath, to: newPath } });
+      return newPath;
+    } catch { return null; }
+  }
+
   private async maybeRenameForSlug(file: TFile): Promise<void> {
     const fmIdRaw = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
     const fmId = typeof fmIdRaw === "string" ? fmIdRaw : null;
@@ -11707,6 +11783,7 @@ export class StashpadView extends ItemView {
     }));
     menu.addItem((it: any) => it.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => this.navigateTo(node.id)));
     menu.addSeparator();
+    menu.addItem((it: any) => it.setTitle("Edit (in-app)…").setIcon("pencil-line").onClick(() => void this.cmdEdit(node)));
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
     // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
     // normalises selection to the right-clicked row.
