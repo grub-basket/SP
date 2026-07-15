@@ -4786,8 +4786,9 @@ export class StashpadView extends ItemView {
     const node = this.tree.get(id);
     if (!node) return;
     const menu = new Menu();
-    menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => { onAction?.(); this.navigateTo(id); }));
+    // "Open in new tab" listed first (user preference, 2026-07-14).
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").onClick(() => { onAction?.(); this.cmdOpenInNewStashpadTab(node); }));
+    menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => { onAction?.(); this.navigateTo(id); }));
     if (node.file) {
       menu.addItem((it: any) => it.setTitle("Open in editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
     }
@@ -5338,10 +5339,40 @@ export class StashpadView extends ItemView {
       this.renderNoteBodyNow(container, node, opts);
       return;
     }
+    // 0.180.0: stale-by-mtime but we DO have a cached render (this row was already
+    // painted, then a write bumped the mtime). Pre-paint the cached body instantly
+    // so a frontmatter-only write (color / task / due) doesn't flash the filename
+    // placeholder — then recompute now; if the body actually changed it repaints.
+    const cached = this.bodyRenderer.peekCache(node.file);
+    if (cached) {
+      this.prepaintCachedBody(container, node, cached, opts);
+      this.renderNoteBodyNow(container, node, opts);
+      return;
+    }
     container.empty();
     const ph = container.createDiv({ cls: "stashpad-note-text is-plain is-lazy-placeholder" });
     ph.textContent = this.titleForNode(node);
     this.bodyRenderer.defer(container, () => this.renderNoteBodyNow(container, node, opts));
+  }
+
+  /** 0.180.0: synchronously paint a row's body from a (possibly stale) cache
+   *  entry — just the text, clamped to match the collapsed state — to bridge a
+   *  re-render without the filename-placeholder flash. renderNoteBodyNow's async
+   *  recompute replaces this a tick later (identical for a frontmatter-only write;
+   *  updated for a real body edit), and adds attachments / footer / the toggle. */
+  private prepaintCachedBody(
+    container: HTMLElement,
+    node: TreeNode,
+    entry: { text: string; html: string },
+    opts: { clamp?: boolean },
+  ): void {
+    container.empty();
+    const textEl = container.createDiv({ cls: "stashpad-note-text" });
+    const expanded = this.isNoteExpanded(node.id);
+    if (opts.clamp && !expanded) textEl.addClass("is-clamped");
+    container.toggleClass("is-body-expanded", opts.clamp === true && expanded);
+    if (this.compactMode || this.tinyMode) { textEl.addClass("is-plain"); textEl.textContent = entry.text; }
+    else { textEl.append(sanitizeHTMLToDom(entry.html)); }
   }
 
   private renderNoteBodyNow(
@@ -5587,6 +5618,16 @@ export class StashpadView extends ItemView {
       attr: { rows: "2", placeholder: this.composerPlaceholder(enterSubmits, splitMode) },
     });
     ta.value = this.composerDraft;
+
+    // 0.179.0: full-screen button (top-right of the composer) — opens the current
+    // composer text in the in-app editor; Save creates the note(s) and clears the
+    // composer.
+    const fsBtn = taWrap.createEl("button", { cls: "stashpad-composer-fullscreen" });
+    setIcon(fsBtn, "maximize");
+    fsBtn.title = "Open in the full editor";
+    fsBtn.setAttr("aria-label", "Open in the full editor");
+    fsBtn.onmousedown = (e) => e.preventDefault();
+    fsBtn.onclick = (e) => { e.preventDefault(); this.cmdComposerFullscreen(); };
 
     // Debounce non-empty saves so fast typing doesn't queue a disk write
     // per keystroke (a real issue on slow / network drives). Empty/clear
@@ -6559,6 +6600,12 @@ export class StashpadView extends ItemView {
     // below; paste used to be trapped there too, which is why pasting inside a
     // parent only worked when a child happened to be selected/under the cursor.)
     if (matchBinding(e, sb.pasteNotes) && this.plugin.noteClipboard) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
+    // openAllTasks (default Shift+T) is global — no selection/cursor needed — AND
+    // must be checked BEFORE openTab (plain "T"): a plain-letter binding also fires
+    // on its shifted form (matchKey ignores Shift, the shifted-key trap), so if
+    // "T" ran first it would swallow Shift+T. Checking here (above the gated block
+    // that holds openTab) fixes both.
+    if (matchBinding(e, sb.openAllTasks)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void openAggregateView(this.plugin, "tasks"); return; }
     if (this.selection.size > 0 || (this.cursorIdx >= 0 && this.currentChildren[this.cursorIdx])) {
       if (matchBinding(e, sb.move)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdMovePicker(); return; }
       if (matchBinding(e, sb.pickMove)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInListPicker(); return; }
@@ -6602,7 +6649,6 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.listPin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin(); return; }
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
-      if (matchBinding(e, sb.openAllTasks)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void openAggregateView(this.plugin, "tasks"); return; }
     }
     // Jump to top/bottom: no selection required — only a non-empty list.
     if (this.currentChildren.length > 0) {
@@ -7638,6 +7684,7 @@ export class StashpadView extends ItemView {
             const file = this.fileForNote(m.id, m.path);
             if (!file) continue;
             try {
+              this.markFmSelfWrite(file.path); // body unchanged → no placeholder flash
               await this.app.fileManager.processFrontMatter(file, (fm) => {
                 if (m.col) fm.color = m.col;
                 else delete fm.color;
@@ -9570,6 +9617,7 @@ export class StashpadView extends ItemView {
       priorStates.push(ps);
       if (was === newState) continue;
       let didRoll = false;
+      this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (fm) => {
         // 0.140.0: completing a REPEATING task rolls it forward (stays an active
         // task with a new due) instead of just going strikethrough.
@@ -9791,6 +9839,7 @@ export class StashpadView extends ItemView {
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
       const wasTagged = this.isTaskTagged(t);
       prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery });
+      this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
         else { m.due = iso; m.task = true; }
@@ -9941,6 +9990,7 @@ export class StashpadView extends ItemView {
       prior.push({ id: t.id, path: t.file.path, tags: fmNow?.tags, completed: fmNow?.completed, task: fmNow?.task, wasTagged });
       if (wasTagged === makeTask) continue;
       let nowCompleted = false;
+      this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (m: any) => {
         if (makeTask) {
           fmAddTag(m, "task");
@@ -10783,6 +10833,47 @@ export class StashpadView extends ItemView {
    *  the same modal on the Edit tab (edits + Save), which can toggle to Split. */
   cmdEdit(node?: TreeNode): Promise<void> { return this.cmdSplit(node, "edit"); }
 
+  /** 0.179.0: open the COMPOSER's current text in the full in-app editor. Save
+   *  creates the note(s) under the current focus (a split creates several) and
+   *  clears the composer — a roomier way to compose than the 2-row textarea. */
+  cmdComposerFullscreen(): void {
+    const seed = this.composerInputEl?.value ?? this.composerDraft ?? "";
+    const clearComposer = async (): Promise<void> => {
+      if (this.composerInputEl) this.composerInputEl.value = "";
+      this.composerDraft = "";
+      try { await this.saveDraft(""); } catch { /* ignore */ }
+    };
+    const createParts = async (parts: string[]): Promise<void> => {
+      const clean = parts.map((p) => p.trim()).filter((p) => p.length > 0);
+      if (clean.length === 0) { new Notice("Nothing to save."); return; }
+      const parent = this.focusId;
+      this.autoSelectNewest = true;
+      this.scrollToBottomOnNextRender = true;
+      if (clean.length === 1) await this.createNoteUnder(clean[0], parent);
+      else await this.createNotesBatch(clean, parent, undefined, clean.join("\n\n"), this.noteFolder);
+      await clearComposer();
+      this.render();
+    };
+    const splitCore = {
+      onSplitAtLine: async (idx: number): Promise<void> => {
+        const lines = seed.replace(/\r\n/g, "\n").split("\n");
+        await createParts([lines.slice(0, idx).join("\n"), lines.slice(idx).join("\n")]);
+      },
+      onSplitAtChar: async (text: string, ch: number): Promise<void> => {
+        await createParts([text.slice(0, ch), text.slice(ch)]);
+      },
+      onSplitMany: async (chunks: string[]): Promise<void> => { await createParts(chunks); },
+      onSave: async (body: string): Promise<void> => { await createParts([body]); },
+      onOpenExternal: undefined,
+    };
+    new NoteWorkbenchModal(
+      this.app,
+      seed,
+      { ...splitCore, popOut: (state) => void this.plugin.openWorkbench(seed, splitCore, state) },
+      { surface: "edit" },
+    ).open();
+  }
+
   /** 0.170.2: edit the focused parent note in the in-app editor (Shift+E). */
   cmdEditParent(): Promise<void> {
     const focused = this.tree.get(this.focusId);
@@ -11501,6 +11592,21 @@ export class StashpadView extends ItemView {
 
   // --- File events ---
 
+  /** 0.180.0: paths we just wrote frontmatter-ONLY to (color/task/complete/due),
+   *  with the write timestamp. onFileModify consults `wasRecentFmSelfWrite` so it
+   *  retags the render cache (no placeholder flash / re-read) instead of evicting.
+   *  One-shot per write; 2.5s grace (matches fmSync). */
+  private recentFmSelfWrites = new Map<string, number>();
+  /** Call right before a Stashpad frontmatter-only write so the resulting modify
+   *  event is recognized as ours. */
+  markFmSelfWrite(path: string): void { this.recentFmSelfWrites.set(path, Date.now()); }
+  private wasRecentFmSelfWrite(path: string): boolean {
+    const t = this.recentFmSelfWrites.get(path);
+    if (t == null) return false;
+    this.recentFmSelfWrites.delete(path); // one-shot
+    return Date.now() - t < 2500;
+  }
+
   private onFileModify = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
@@ -11514,6 +11620,17 @@ export class StashpadView extends ItemView {
     // later body edit is still handled below.
     if (this.fmSync.wasRecentSelfWrite(file.path)) {
       this.bodyRenderer.retagMtime(file.path, file.stat.mtime);
+      return;
+    }
+    // 0.180.0: our OWN frontmatter-only command write (color / task / complete /
+    // due). The body is unchanged, so RETAG the render cache (keeps it fresh → the
+    // re-render paints from cache with no filename-placeholder flash and no re-read)
+    // — but, unlike the fmSync recovery write above, we STILL re-render so the
+    // visible chip / checkbox / due badge updates.
+    if (this.wasRecentFmSelfWrite(file.path)) {
+      this.bodyRenderer.retagMtime(file.path, file.stat.mtime);
+      if (this.deferDuringSyncBurst()) return;
+      this.debouncedRender();
       return;
     }
     // 0.122.6 (#13): drop this file's (possibly stale-content-but-fresh-mtime)

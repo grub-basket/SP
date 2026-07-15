@@ -695,7 +695,8 @@ export class NoteWorkbench {
     const actions = this.host.createDiv({ cls: "stashpad-split-actions" });
     const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn" });
     setIcon(cancel.createSpan({ cls: "stashpad-split-btn-icon" }), "x");
-    cancel.createSpan({ text: "Cancel (Esc)" });
+    cancel.createSpan({ text: "Cancel" });
+    cancel.createSpan({ cls: "stashpad-split-esc-hint", text: " (Esc)" });
     cancel.onmousedown = (e) => e.preventDefault();
     cancel.onclick = () => this.cb.close();
     this.renderPopOut(actions);
@@ -790,7 +791,8 @@ export class NoteWorkbench {
     // corner chip was redundant with both Cancel and the ×).
     const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn" });
     setIcon(cancel.createSpan({ cls: "stashpad-split-btn-icon" }), "x");
-    cancel.createSpan({ text: "Cancel (Esc)" });
+    cancel.createSpan({ text: "Cancel" });
+    cancel.createSpan({ cls: "stashpad-split-esc-hint", text: " (Esc)" });
     cancel.onmousedown = (e) => e.preventDefault();
     cancel.onclick = () => this.cb.close();
     this.renderPopOut(actions);
@@ -897,6 +899,10 @@ export class NoteWorkbench {
   }
 
   private renderEditorSections(): void {
+    // 0.177.0: mobile gets a compact TABBED layout — the Original / Changes / edit
+    // panels share one space (one visible at a time) so they don't stack and blow
+    // the modal past the keyboard. Desktop keeps the stacked collapsible sections.
+    if (Platform.isMobile) { this.renderEditorTabbed(); return; }
     // 0.168.1/0.168.2: when the text has been edited, a read-only ORIGINAL section
     // and a read-only word-level DIFF section appear above the editor. All three are
     // consistent collapsible framed sections (whole header = the toggle button).
@@ -949,9 +955,96 @@ export class NoteWorkbench {
     syncEdited();
     requestAnimationFrame(() => {
       fit();
-      const mid = Math.floor(ta.value.length / 2);
       ta.focus();
-      ta.setSelectionRange(mid, mid);
+      // Edit surface: cursor at END (you're continuing the note). Split cursor
+      // mode: middle (you're picking a split point).
+      const pos = this.surface === "edit" ? ta.value.length : Math.floor(ta.value.length / 2);
+      ta.setSelectionRange(pos, pos);
+    });
+    ta.addEventListener("input", () => { this.cursorText = ta.value; fit(); syncEdited(); });
+  }
+
+  /** 0.177.0: mobile tabbed editor. One panel visible at a time — "Your edit"
+   *  (the textarea), plus "Original" and "Changes" tabs that appear once the text
+   *  differs. Keeps the modal short so it never grows past the on-screen keyboard;
+   *  the textarea is hard-capped and scrolls. */
+  private renderEditorTabbed(): void {
+    const wrap = this.host.createDiv({ cls: "stashpad-split-tabs" });
+    const tabBar = wrap.createDiv({ cls: "stashpad-split-tabbar" });
+    const bodyHost = wrap.createDiv({ cls: "stashpad-split-tabbody" });
+
+    // Edit panel (the live textarea).
+    const editPanel = bodyHost.createDiv({ cls: "stashpad-split-tabpanel stashpad-split-tabpanel-edit" });
+    const ta = editPanel.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
+    ta.value = this.cursorText;
+    ta.readOnly = false;
+    this.cursorTextarea = ta;
+
+    // Original (read-only) — copy button lives inside the panel (top-right).
+    const origPanel = bodyHost.createDiv({ cls: "stashpad-split-tabpanel" });
+    origPanel.createDiv({ cls: "stashpad-split-panel-body", text: this.body });
+    origPanel.appendChild(this.makeCopyButton(() => this.body, "Copy the original text", "stashpad-split-copy-btn stashpad-split-tab-copy"));
+
+    // Changes (word diff).
+    const changesPanel = bodyHost.createDiv({ cls: "stashpad-split-tabpanel" });
+    const diffBody = changesPanel.createDiv({ cls: "stashpad-split-panel-body stashpad-split-diff-body" });
+
+    const tabs = [
+      { key: "edit", label: this.surface === "edit" ? "Your edit" : "Edit", panel: editPanel },
+      { key: "orig", label: "Original", panel: origPanel },
+      { key: "changes", label: "Changes", panel: changesPanel },
+    ];
+    const btns: Record<string, HTMLElement> = {};
+    let active = "edit";
+    const showTab = (key: string): void => {
+      active = key;
+      for (const t of tabs) {
+        t.panel.toggleClass("is-active", t.key === key);
+        btns[t.key]?.toggleClass("is-active", t.key === key);
+      }
+      if (key === "edit") ta.focus();
+    };
+    for (const t of tabs) {
+      const b = tabBar.createEl("button", { cls: "stashpad-split-tab", text: t.label });
+      b.onmousedown = (e) => e.preventDefault();
+      b.onclick = () => showTab(t.key);
+      btns[t.key] = b;
+    }
+
+    const renderDiff = (): void => {
+      diffBody.empty();
+      for (const part of splitWordDiff(this.body, ta.value)) {
+        const cls = part.t === "ins" ? "stashpad-diff-ins" : part.t === "del" ? "stashpad-diff-del" : "stashpad-diff-eq";
+        diffBody.createSpan({ cls, text: part.s });
+      }
+    };
+    const syncEdited = (): void => {
+      const edited = ta.value !== this.body;
+      btns.orig.toggleClass("is-hidden", !edited);
+      btns.changes.toggleClass("is-hidden", !edited);
+      if (edited) renderDiff();
+      // If the visible tab just got hidden (text reverted to original), fall back.
+      if (!edited && (active === "orig" || active === "changes")) showTab("edit");
+    };
+
+    // Firm height cap so the editor scrolls instead of pushing the action bar
+    // past the keyboard (fewer lines than desktop — space is at a premium).
+    const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 22;
+    const maxLines = this.surface === "edit" ? 8 : 4;
+    ta.setCssStyles({ maxHeight: `${lineHeight * maxLines + 16}px`, overflowY: "auto" });
+    const fit = (): void => {
+      ta.setCssStyles({ height: "auto" });
+      const needed = Math.min(ta.scrollHeight, lineHeight * maxLines + 16);
+      ta.setCssStyles({ height: `${Math.max(needed, lineHeight * 2 + 16)}px` });
+    };
+
+    syncEdited();
+    showTab("edit");
+    requestAnimationFrame(() => {
+      fit();
+      ta.focus();
+      const pos = this.surface === "edit" ? ta.value.length : Math.floor(ta.value.length / 2);
+      ta.setSelectionRange(pos, pos);
     });
     ta.addEventListener("input", () => { this.cursorText = ta.value; fit(); syncEdited(); });
   }

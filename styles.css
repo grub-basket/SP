@@ -1160,11 +1160,20 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 .stashpad-focused-body {
   padding: 0;
-  /* 0.71.15: cap the focused-header body to a few lines + scroll. A
-     long home note (especially after the JD index Preview overwrites
-     it with a hierarchy) was eating ~half the viewport; users prefer
-     a stable header strip and scroll-on-demand. */
-  max-height: calc(var(--font-text-size, 16px) * 1.5 * 3);
+  /* 0.177.0 (#26): the collapsed focused-header is a fixed-height SCROLL window —
+     read more of the note without expanding it. Room for the ~8-line text window
+     below (plus any attachment rail / footer). Expanding (.is-body-expanded) drops
+     the cap for the full note. */
+  max-height: calc(var(--font-text-size, 16px) * 1.5 * 10);
+  overflow-y: auto;
+}
+/* The collapsed body's text is a scroll window, NOT a 2-line truncate+fade — so
+   you can scroll to read it in place. The Show more toggle still fully expands. */
+.stashpad-focused-body .stashpad-note-text.is-clamped {
+  display: block;
+  -webkit-line-clamp: unset;
+  text-overflow: clip;
+  max-height: calc(var(--font-text-size, 16px) * 1.5 * 8);
   overflow-y: auto;
 }
 /* 0.171.1: when the focused note is expanded via the Show more toggle, drop
@@ -1562,6 +1571,14 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   overflow: visible;
   text-overflow: clip;
 }
+/* 0.177.0 (#26): an EXPANDED list note is capped to a scroll window so a very long
+   note doesn't take over the list — scroll within it to read the rest. Only the
+   persistently-expanded rows (.is-body-expanded) are capped; the transient
+   cursor-expanded row above stays fully visible. */
+.stashpad-note-body-content.is-body-expanded .stashpad-note-text {
+  max-height: calc(var(--font-text-size, 16px) * 1.5 * 16);
+  overflow-y: auto;
+}
 .stashpad-expand-toggle {
   margin-top: 4px;
   padding: 2px 8px;
@@ -1715,6 +1732,29 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   color: var(--text-normal);
 }
 .stashpad-composer-clear .svg-icon { width: 14px; height: 14px; }
+/* 0.179.0: full-screen button — opens the composer text in the in-app editor. */
+.stashpad-composer-fullscreen {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  cursor: pointer;
+  z-index: 2;
+  opacity: 0.65;
+}
+.stashpad-composer-fullscreen:hover { background: var(--background-modifier-hover); color: var(--text-normal); opacity: 1; }
+.stashpad-composer-fullscreen .svg-icon { width: 14px; height: 14px; }
+/* Keep typed text clear of the button. */
+.stashpad-composer-input { padding-right: 32px; }
 
 .stashpad-composer {
   flex: 0 0 auto;
@@ -2284,6 +2324,52 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 .is-mobile .stashpad-split-list { max-height: 40vh; font-size: var(--font-ui-small); }
 .is-mobile .stashpad-split-line { padding: 6px 12px; }
+/* Mobile compact pass (0.177.0): tighten every control so nothing is chunky with
+   empty padding, and keep the whole modal short enough to sit above the keyboard. */
+.is-mobile .stashpad-split-modal .modal-content { gap: 5px; padding: 8px 10px; }
+/* Edit/Split toggle: compact, no ⌘ hints (no hardware keyboard on a phone). */
+.is-mobile .stashpad-split-surface { margin-bottom: 6px; padding-bottom: 6px; }
+.is-mobile .stashpad-split-surface-btn { padding: 4px 10px; font-size: var(--font-ui-smaller); }
+.is-mobile .stashpad-split-kbd-hint { display: none; }
+.is-mobile .stashpad-split-modes { gap: 4px; margin-bottom: 5px; }
+.is-mobile .stashpad-split-mode-btn { padding: 4px 8px; font-size: var(--font-ui-smaller); }
+.is-mobile .stashpad-split-edit-tools { margin-top: 4px; }
+.is-mobile .stashpad-split-case-btn { padding: 4px 9px; }
+.is-mobile .stashpad-split-count { font-size: var(--font-ui-smaller); }
+/* Mobile tabbed editor: Original / Changes / Your edit share one space. */
+.stashpad-split-tabbar { display: flex; gap: 4px; margin-bottom: 5px; }
+.stashpad-split-tab {
+  flex: 1;
+  padding: 5px 8px;
+  font-size: var(--font-ui-smaller);
+  font-weight: 500;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.stashpad-split-tab.is-active { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
+.stashpad-split-tab.is-hidden { display: none; }
+.stashpad-split-tabpanel { position: relative; }
+.stashpad-split-tabpanel:not(.is-active) { display: none; }
+/* Copy button sits in the Original panel (top-right), scaled small. */
+.stashpad-split-tab-copy { position: absolute; top: 4px; right: 4px; z-index: 2; padding: 4px; }
+.stashpad-split-tabpanel .stashpad-split-panel-body {
+  max-height: calc(1.5em * 7 + 12px);
+  overflow-y: auto;
+  padding: 8px 10px;
+  margin: 0;
+}
+/* Action bar: keep all buttons on ONE row, compact. Cancel drops its "(Esc)" hint,
+   and pop-out + Obsidian-editor go icon-only, so Cancel / ⤢ / ✎ / Save fit. */
+.is-mobile .stashpad-split-modal .stashpad-split-actions { flex-wrap: nowrap; gap: 6px; margin-top: 6px; }
+.is-mobile .stashpad-split-cancel-btn,
+.is-mobile .stashpad-split-confirm-btn,
+.is-mobile .stashpad-split-popout-btn { padding: 6px 10px; }
+.is-mobile .stashpad-split-esc-hint { display: none; }
+.is-mobile .stashpad-split-popout-btn span:not([class*="icon"]) { display: none; }
+.is-mobile .stashpad-split-actions-right { margin-left: auto; gap: 8px; }
 /* Tap-friendly line picker — make each line look interactable. */
 .stashpad-split-line { cursor: pointer; }
 .stashpad-split-line:hover { background: var(--background-modifier-hover); }

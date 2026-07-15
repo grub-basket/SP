@@ -125,6 +125,14 @@ export class NoteBodyRenderer {
     return !!c && c.mtime === file.stat.mtime;
   }
 
+  /** 0.180.0: the cached render entry REGARDLESS of mtime (may be stale). Used to
+   *  pre-paint a row's last-known body instantly on a re-render, so a
+   *  frontmatter-only write (color / task / due) doesn't flash the filename
+   *  placeholder while the (usually identical) body recomputes in the background. */
+  peekCache(file: TFile): RenderEntry | undefined {
+    return this.renderCache.get(file.path);
+  }
+
   /** 0.122.6 (#13): drop a file's cached render so the next render recomputes
    *  from fresh content. Wired to the modify event. The mtime-keyed cache can be
    *  poisoned: a render that runs while `cachedRead` is momentarily stale — seen

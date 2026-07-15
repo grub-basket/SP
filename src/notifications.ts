@@ -216,13 +216,28 @@ export class NotificationService {
       const noticeEl = (notice as unknown as { containerEl?: HTMLElement; noticeEl?: HTMLElement }).containerEl
         ?? (notice as unknown as { noticeEl?: HTMLElement }).noticeEl;
       if (noticeEl) {
+        // a11y: the whole card is an activatable control — make it keyboard
+        // focusable (Tab), labelled, and Enter/Space-activatable. The overlay
+        // (Snooze) is a real <button>, so it's already in the tab order after it.
         noticeEl.classList.add("stashpad-notice-clickable");
-        noticeEl.addEventListener("click", (e) => {
-          const t = e.target as HTMLElement;
-          if (t.closest(".stashpad-notice-action, .stashpad-notice-overlay")) return;
+        noticeEl.setAttribute("tabindex", "0");
+        noticeEl.setAttribute("role", "button");
+        noticeEl.setAttribute("aria-label", `${opts.message} — activate to open; use the button to snooze`);
+        const activate = (): void => {
           void Promise.resolve().then(() => onBodyClick())
             .catch((err) => console.warn("[Stashpad] notification body click failed", err));
           notice.hide();
+        };
+        noticeEl.addEventListener("click", (e) => {
+          const t = e.target as HTMLElement;
+          if (t.closest(".stashpad-notice-action, .stashpad-notice-overlay")) return;
+          activate();
+        });
+        noticeEl.addEventListener("keydown", (e) => {
+          // Only when the card itself is focused — not a child button (its own
+          // Enter/Space handling wins).
+          if (e.target !== noticeEl) return;
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); activate(); }
         });
       }
     }

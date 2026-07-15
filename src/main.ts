@@ -1631,9 +1631,13 @@ export default class StashpadPlugin extends Plugin {
           return true;
         }
         if (file.extension !== "md") {
-          const notes = this.findStashpadNotesEmbedding(file);
-          if (notes.length === 0) return false;
-          if (!checking) void this.revealAttachmentInStashpad(file, notes);
+          // 0.176.x PERF: never scan the vault in checkCallback — it runs for
+          // EVERY command each time the palette rebuilds (per keystroke), and the
+          // old findStashpadNotesEmbedding() full-vault scan here hung Mod+P for
+          // seconds when an attachment tab was active. Show the command cheaply
+          // for any attachment; the scan happens on execution (and Notices if
+          // nothing references the file).
+          if (!checking) void this.revealAttachmentInStashpad(file);
           return true;
         }
         return false;
@@ -5311,23 +5315,18 @@ export default class StashpadPlugin extends Plugin {
    *  Backs "Open in Stashpad" on a non-md attachment file. */
   findStashpadNotesEmbedding(attachment: TFile): TFile[] {
     const target = attachment.path;
+    // PERF: iterate metadataCache.resolvedLinks (only notes that link to
+    // ANYTHING, keyed lookups) instead of scanning every markdown file with a
+    // getFileCache + getFirstLinkpathDest per note. resolvedLinks captures body
+    // `![[attachment]]` embeds/links — how attachments are referenced — which is
+    // the case Stashpad notes use (an added attachment is body-embedded). This is
+    // O(linked notes) cheap lookups; the old scan hung on large vaults.
     const resolved = this.app.metadataCache.resolvedLinks || {};
-    const norm = (a: string): string =>
-      a.replace(/^!?\[\[/, "").replace(/\]\]$/, "").replace(/^\/+/, "").split("|")[0].split("#")[0].trim();
     const out: TFile[] = [];
-    for (const md of this.app.vault.getMarkdownFiles()) {
-      if (!this.isStashpadNoteFile(md)) continue;
-      let refs = !!resolved[md.path]?.[target]; // body ![[…]] / [[…]]
-      if (!refs) {
-        const fm = this.app.metadataCache.getFileCache(md)?.frontmatter as { attachments?: unknown } | undefined;
-        const atts = Array.isArray(fm?.attachments) ? (fm!.attachments as unknown[]) : [];
-        for (const a of atts) {
-          if (typeof a !== "string") continue;
-          const dest = this.app.metadataCache.getFirstLinkpathDest(norm(a), md.path);
-          if (dest && dest.path === target) { refs = true; break; }
-        }
-      }
-      if (refs) out.push(md);
+    for (const src of Object.keys(resolved)) {
+      if (!resolved[src][target]) continue;
+      const f = this.app.vault.getAbstractFileByPath(src);
+      if (f instanceof TFile && this.isStashpadNoteFile(f)) out.push(f);
     }
     return out;
   }
@@ -5396,16 +5395,18 @@ export default class StashpadPlugin extends Plugin {
   /** Handle an `obsidian://stashpad?…` deep link. Resolve → activate → reveal →
    *  run macro. Any unresolved target is a LOUD failure (Notice), never a silent
    *  no-op. See `docs/deep-links-plan.md`. */
-  async handleDeepLink(params: { folder?: string; note?: string; run?: string; action?: string; vault?: string }, opts: { forceNewTab?: boolean } = {}): Promise<boolean> {
+  async handleDeepLink(params: { folder?: string; note?: string; run?: string; action?: string; vault?: string }, opts: { forceNewTab?: boolean; silent?: boolean } = {}): Promise<boolean> {
     const folder = (params.folder || "").replace(/^\/+|\/+$/g, "");
     const noteId = (params.note || "").trim();
     const actions = parseRunActions(params);
+    const fail = (msg: string): boolean => { if (!opts.silent) new Notice(msg); return false; };
 
     // 1. Guard + resolve. Returns false (not thrown) on a bad link so a batch
-    // caller can tally how many actually opened.
-    if (!folder) { new Notice("Stashpad link: missing “folder”."); return false; }
+    // caller can tally how many actually opened. `silent` suppresses the Notice
+    // when the caller intends to hand off / report a tally instead.
+    if (!folder) return fail("Stashpad link: missing “folder”.");
     const dir = this.app.vault.getAbstractFileByPath(folder);
-    if (!(dir instanceof TFolder)) { new Notice(`Stashpad link: folder “${folder}” not found.`); return false; }
+    if (!(dir instanceof TFolder)) return fail(`Stashpad link: folder “${folder}” not found.`);
 
     // 2. Wait for the workspace to settle. On a cross-vault jump Obsidian may
     // still be laying out when the handler fires, so activate/reveal would find
@@ -5423,7 +5424,7 @@ export default class StashpadPlugin extends Plugin {
         file = this.resolveNoteFileInFolder(folder, noteId);
         if (!file) await new Promise((r) => window.setTimeout(r, 150));
       }
-      if (!file) { new Notice(`Stashpad link: note “${noteId}” not found in ${folder}.`); return false; }
+      if (!file) return fail(`Stashpad link: note “${noteId}” not found in ${folder}.`);
     }
 
     // 3. Open the target WITHOUT hijacking the current tab. A deep link should
@@ -5481,21 +5482,55 @@ export default class StashpadPlugin extends Plugin {
       // Stashpad link"). Links are whitespace/newline-separated and never
       // contain literal spaces (URLs are percent-encoded), so split on \s+.
       const candidates = raw.split(/\s+/).map((s) => s.trim()).filter(Boolean);
-      const parsed = candidates
-        .map((c) => parseStashpadLink(c))
-        .filter((p): p is NonNullable<typeof p> => !!p);
-      if (parsed.length === 0) { new Notice("That doesn't look like a Stashpad link."); return; }
-      if (parsed.length === 1) { void this.handleDeepLink(parsed[0]); return; }
-      // Multiple → open each in its OWN new tab, then report the tally.
-      void (async () => {
-        let opened = 0;
-        for (const p of parsed) { if (await this.handleDeepLink(p, { forceNewTab: true })) opened++; }
-        const failed = parsed.length - opened;
-        new Notice(failed === 0
-          ? `Opened ${opened} Stashpad links in new tabs.`
-          : `Opened ${opened} of ${parsed.length} Stashpad links (${failed} couldn't be found).`);
-      })();
+      const items = candidates
+        .map((c) => ({ raw: c, parsed: parseStashpadLink(c) }))
+        .filter((x): x is { raw: string; parsed: NonNullable<ReturnType<typeof parseStashpadLink>> } => !!x.parsed);
+      if (items.length === 0) { new Notice("That doesn't look like a Stashpad link."); return; }
+      void this.openDeepLinks(items);
     }).open();
+  }
+
+  /** 0.181.0: open a batch of parsed Stashpad links. A link that targets a
+   *  DIFFERENT vault (or can't be resolved locally) is handed off to Obsidian's
+   *  own protocol handler — which opens/switches to the right vault — instead of
+   *  failing. Hand-offs are staggered so Obsidian routes each cleanly rather than
+   *  clobbering one tab repeatedly; locally-opened links keep their own tabs. */
+  private async openDeepLinks(items: Array<{ raw: string; parsed: NonNullable<ReturnType<typeof parseStashpadLink>> }>): Promise<void> {
+    const myVault = this.app.vault.getName();
+    const multi = items.length > 1;
+    let opened = 0, handedOff = 0, notFound = 0;
+    for (const { raw, parsed } of items) {
+      // Cross-vault link → let Obsidian open it (it switches vaults). Don't try
+      // locally (the folder isn't in THIS vault).
+      if (parsed.vault && parsed.vault !== myVault) {
+        this.handOffToObsidian(raw);
+        handedOff++;
+        await new Promise((r) => window.setTimeout(r, 350)); // stagger so Obsidian routes each
+        continue;
+      }
+      const ok = await this.handleDeepLink(parsed, { forceNewTab: multi, silent: true });
+      if (ok) { opened++; continue; }
+      // Resolved to THIS vault but not found. If the link names a vault (this one)
+      // there's nothing more to try; if it names ANOTHER, we already handed off.
+      // A vault-less miss is a genuine not-found — report it.
+      notFound++;
+    }
+    const parts: string[] = [];
+    if (opened) parts.push(`opened ${opened}`);
+    if (handedOff) parts.push(`sent ${handedOff} to Obsidian (other vault)`);
+    if (notFound) parts.push(`${notFound} not found`);
+    new Notice(`Stashpad link${items.length === 1 ? "" : "s"}: ${parts.join(" · ") || "nothing to open"}.`);
+  }
+
+  /** Hand a raw `obsidian://…` URL to Obsidian's own protocol handling (via the
+   *  OS), so it opens/switches to the vault named in the link. Electron shell
+   *  first; window.open as a fallback. */
+  private handOffToObsidian(rawUrl: string): void {
+    try {
+      const shell = (window as unknown as { require?: (m: string) => { shell?: { openExternal?: (u: string) => Promise<void> } } }).require?.("electron")?.shell;
+      if (shell?.openExternal) { void shell.openExternal(rawUrl); return; }
+    } catch { /* fall through */ }
+    try { window.open(rawUrl); } catch { /* ignore */ }
   }
 
   /** Tidy Stashpad tabs: PRUNE orphans (focused on a note that no longer
