@@ -1459,6 +1459,13 @@ export default class StashpadPlugin extends Plugin {
         new Notice(notices.length ? `Dismissed ${notices.length} notification${notices.length === 1 ? "" : "s"}.` : "No notifications to dismiss.");
       },
     });
+    // 0.185.0: re-fire reminders for every incomplete, past-due task assigned to
+    // you — pops your task backlog up again on demand (ignores the once-only dedup).
+    this.addCommand({
+      id: "stashpad-resend-reminders",
+      name: "Resend reminders for incomplete due tasks (show my backlog)",
+      callback: () => void this.resendDueReminders(),
+    });
     this.addCommand({
       id: "stashpad-copy-link",
       name: "Copy Stashpad link (deep link / URL) to note",
@@ -5842,6 +5849,15 @@ export default class StashpadPlugin extends Plugin {
     // ring and evicted legit `id@due` keys (→ old past-due one-offs re-notify).
     this.settings.notifiedDueKeys = [...(this.settings.notifiedDueKeys ?? []), ...due.filter((d) => !d.key.endsWith("@persist")).map((d) => d.key)].slice(-2000);
     await this.saveSettings();
+    await this.showDueToasts(due);
+  }
+
+  /** 0.185.0: render the due-task toasts. Up to 3 due tasks each get their own
+   *  tappable card (whole card opens the task without hijacking the current tab;
+   *  the Snooze corner opens the scheduler); more than that collapses to one
+   *  summary toast. Shared by the automatic check and the manual resend command. */
+  private async showDueToasts(due: Array<{ id: string; folder: string; file: TFile; dueMs: number }>): Promise<void> {
+    if (due.length === 0) return;
     const titleOf = async (file: TFile): Promise<string> => {
       try {
         const body = splitFrontmatter(await this.app.vault.cachedRead(file)).body;
@@ -5858,7 +5874,10 @@ export default class StashpadPlugin extends Plugin {
           kind: "warning", category: "reminder", duration: 0, folder: d.folder, affectedIds: [d.id],
           // 0.171.0: whole card opens the task; the corner Snooze control opens
           // the scheduler/assigner modal instead (layered above, stopPropagation).
-          onBodyClick: () => void this.revealNoteByRef(d.folder, d.id),
+          // 0.185.0: open via openDeepLinkTarget so the reminder never hijacks the
+          // tab you're currently in — it focuses a background folder tab if one
+          // exists, otherwise opens a fresh tab.
+          onBodyClick: () => void this.openDeepLinkTarget(d.folder, d.id),
           overlayAction: {
             label: "Snooze", icon: "alarm-clock-check", title: "Snooze / reschedule…",
             onClick: () => void this.openSchedulerForRef(d.folder, d.id),
@@ -5871,6 +5890,31 @@ export default class StashpadPlugin extends Plugin {
         kind: "warning", category: "reminder", duration: 0, folder: "",
       });
     }
+  }
+
+  /** 0.185.0: manually re-fire reminders for every incomplete, past-due task
+   *  assigned to me (or unassigned) — the "pop my backlog up again" command.
+   *  Unlike checkDueReminders it ignores the once-per-(id@due) dedup, doesn't
+   *  auto-resolve tasks, and doesn't touch the persist log; a pure on-demand
+   *  re-notify. */
+  async resendDueReminders(): Promise<void> {
+    const now = Date.now();
+    const myId = (this.settings.authorId ?? "").trim();
+    const due: Array<{ id: string; folder: string; file: TFile; dueMs: number }> = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (f.path.includes("/_authors/")) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown; completed?: unknown } | undefined;
+      if (!fm || fm.due == null) continue;
+      const id = typeof fm.id === "string" ? fm.id : "";
+      if (!id || fm.completed === true) continue;
+      const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(String(fm.due));
+      if (!Number.isFinite(dueMs) || dueMs > now) continue; // not due yet
+      const assignees = parseAssignees(fm);
+      if (assignees.length > 0 && !(myId && assignees.some((a) => a.id === myId))) continue;
+      due.push({ id, folder: (f.parent?.path ?? "").replace(/\/+$/, ""), file: f, dueMs });
+    }
+    if (due.length === 0) { new Notice("No incomplete tasks are due — your backlog is clear. 🎉"); return; }
+    await this.showDueToasts(due);
   }
 
   /** 0.99.17 (#3): the "centralized sync" — rebuild the registry from the whole

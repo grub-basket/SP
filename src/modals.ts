@@ -4,6 +4,7 @@ import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
+import { ComposerAutocomplete } from "./composer-autocomplete";
 import type { ExportContent } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
 
@@ -483,6 +484,10 @@ export interface WorkbenchCallbacks {
   onTitle?: (title: string) => void;
   /** When present, an "Open in a tab" button appears; called with the live state. */
   popOut?: (state: WorkbenchState) => void;
+  /** 0.185.0: import a pasted/dropped file as an attachment and return its
+   *  `![[wikilink]]` (or null). Wired to the view's `importAttachment` so the
+   *  edit/split textarea gets the composer's paste-a-file-as-a-link behaviour. */
+  onImportFile?: (file: File) => Promise<string | null>;
 }
 
 /** 0.169.0: the split UI extracted from the modal so it can render into EITHER a
@@ -506,6 +511,10 @@ export class NoteWorkbench {
   private presetMode: SplitMode = "paragraphs";
   private nest = false;
   private cursorTextarea: HTMLTextAreaElement | null = null;
+  /** 0.185.0: composer-parity autocomplete bound to the live editor textarea.
+   *  Recreated on each render (surface/mode switch rebuilds the textarea); the
+   *  old instance is detached first so listeners don't leak. */
+  private autocomplete: ComposerAutocomplete | null = null;
   private cursorText: string;
   private collapsed: { orig: boolean; changes: boolean; edit: boolean };
 
@@ -556,6 +565,74 @@ export class NoteWorkbench {
       cursorText: this.cursorTextarea?.value ?? this.cursorText,
       lineCursorIdx: this.lineCursorIdx,
     };
+  }
+
+  /** 0.185.0: give the live editor textarea composer parity — `[[` / `#` / `@`
+   *  autocomplete plus paste/drop of files as `![[wikilink]]` attachments. Called
+   *  from each textarea-creation site; re-entrant (detaches any prior autocomplete
+   *  first, since render() rebuilds the textarea on surface/mode switches). */
+  private enhanceTextarea(ta: HTMLTextAreaElement): void {
+    this.autocomplete?.detach();
+    this.autocomplete = new ComposerAutocomplete(this.app, ta);
+    this.autocomplete.attach();
+
+    const imp = this.cb.onImportFile;
+    if (!imp) return; // no import hook (e.g. new-note composer path) → autocomplete only
+    // Insert imported attachment link(s) at the caret (not appended — this is an
+    // editor, the cursor is meaningful), then fire `input` so fit()/diff resync.
+    const insertLinks = async (files: File[]): Promise<void> => {
+      let chunk = "";
+      for (const f of files) {
+        const link = await imp(f);
+        if (link) chunk += (chunk ? "\n" : "") + link;
+      }
+      if (!chunk) return;
+      const start = ta.selectionStart, end = ta.selectionEnd;
+      const before = ta.value.slice(0, start), after = ta.value.slice(end);
+      const sep = before && !before.endsWith("\n") ? "\n" : "";
+      const inserted = sep + chunk + "\n";
+      ta.value = before + inserted + after;
+      this.cursorText = ta.value;
+      const caret = before.length + inserted.length;
+      ta.setSelectionRange(caret, caret);
+      ta.dispatchEvent(new Event("input"));
+      ta.focus();
+    };
+    ta.addEventListener("paste", (e) => {
+      const data = e.clipboardData;
+      if (!data) return;
+      const out: File[] = [];
+      for (const f of Array.from(data.files ?? [])) out.push(f);
+      if (out.length === 0) {
+        for (const it of Array.from(data.items ?? [])) {
+          if (it.kind === "file") { const f = it.getAsFile(); if (f) out.push(f); }
+        }
+      }
+      if (out.length === 0) return; // pure text paste — let it through natively
+      e.preventDefault();
+      e.stopPropagation();
+      void insertLinks(out);
+    });
+    ta.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      try { e.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
+    });
+    ta.addEventListener("drop", (e) => {
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      void insertLinks(files);
+    });
+  }
+
+  /** Detach the autocomplete + its document/vault listeners. Hosts call this on
+   *  close so the popup listeners don't outlive the modal/tab. */
+  destroy(): void {
+    this.autocomplete?.detach();
+    this.autocomplete = null;
   }
 
   /** 0.168.3: single dispatch for the Split button + Mod+Enter. 0.169.3: awaits the
@@ -620,6 +697,11 @@ export class NoteWorkbench {
   }
 
   private render(): void {
+    // The textarea (and its bound autocomplete) is discarded on every rebuild;
+    // detach first so listeners don't accumulate. enhanceTextarea re-attaches
+    // when the new render creates a cursor textarea.
+    this.autocomplete?.detach();
+    this.autocomplete = null;
     this.host.empty();
     this.host.toggleClass("stashpad-edit-surface", this.surface === "edit");
     this.cb.onTitle?.(this.surface === "edit" ? "Edit note" : "Split note");
@@ -922,6 +1004,7 @@ export class NoteWorkbench {
     ta.value = this.cursorText;
     ta.readOnly = false;
     this.cursorTextarea = ta;
+    this.enhanceTextarea(ta);
 
     const renderDiff = (): void => {
       diffBody.empty();
@@ -982,6 +1065,7 @@ export class NoteWorkbench {
     ta.value = this.cursorText;
     ta.readOnly = false;
     this.cursorTextarea = ta;
+    this.enhanceTextarea(ta);
 
     // Original (read-only). 0.183.3: copy button in a right-aligned bar ABOVE the
     // text (it used to overlay the text's right edge as a full-height strip).
@@ -1071,6 +1155,7 @@ export class NoteWorkbenchModal extends Modal {
       onSplitMany: this.cbs.onSplitMany,
       onSave: this.cbs.onSave,
       onOpenExternal: this.cbs.onOpenExternal,
+      onImportFile: this.cbs.onImportFile,
       close: () => this.close(),
       onDone: () => { this.committing = true; this.close(); }, // split/save ran → dismiss
       onTitle: (t) => this.titleEl.setText(t),
@@ -1103,7 +1188,7 @@ export class NoteWorkbenchModal extends Modal {
       true,
     ).open();
   }
-  onClose(): void { this.ui = null; this.contentEl.empty(); }
+  onClose(): void { this.ui?.destroy(); this.ui = null; this.contentEl.empty(); }
 }
 
 /** Context injected into a popped-out NoteWorkbenchView. `prevLeaf` is the tab to
@@ -1170,6 +1255,7 @@ export class NoteWorkbenchView extends ItemView {
       onSplitMany: this.ctx.cbs.onSplitMany,
       onSave: this.ctx.cbs.onSave,
       onOpenExternal: this.ctx.cbs.onOpenExternal,
+      onImportFile: this.ctx.cbs.onImportFile,
       close: () => this.guardedDetach(),
       onDone: () => this.startClosePanel("✓ Done.", null, true),
       onTitle: (t) => this.setHeader(t, t.startsWith("Edit") ? "pencil-line" : "split"),
@@ -1201,6 +1287,7 @@ export class NoteWorkbenchView extends ItemView {
   private startClosePanel(titleText: string, subText: string | null, refocus: boolean): void {
     const c = this.contentEl;
     c.empty();
+    this.ui?.destroy();
     this.ui = null;
     const box = c.createDiv({ cls: "stashpad-split-done" });
     box.createDiv({ cls: "stashpad-split-done-title", text: titleText });
@@ -1265,6 +1352,7 @@ export class NoteWorkbenchView extends ItemView {
     }
     if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
     if (this.expiredGrace != null) { window.clearTimeout(this.expiredGrace); this.expiredGrace = null; }
+    this.ui?.destroy();
     this.ui = null;
     this.contentEl.empty();
   }

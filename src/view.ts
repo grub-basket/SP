@@ -10907,6 +10907,7 @@ export class StashpadView extends ItemView {
       onSplitMany: async (chunks: string[]): Promise<void> => { await createParts(chunks); },
       onSave: async (body: string): Promise<void> => { await createParts([body]); },
       onOpenExternal: undefined,
+      onImportFile: (f: File): Promise<string | null> => this.importAttachment(f),
     };
     new NoteWorkbenchModal(
       this.app,
@@ -11131,6 +11132,7 @@ export class StashpadView extends ItemView {
       onSplitMany: async (parts: string[], nest: boolean) => { await performMultiSplit(parts, nest); },
       onSave: performEdit,
       onOpenExternal: () => { void this.openFileAtEnd(file); },
+      onImportFile: (f: File): Promise<string | null> => this.importAttachment(f),
     };
     new NoteWorkbenchModal(this.app, body, {
       ...splitCore,
