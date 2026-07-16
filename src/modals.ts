@@ -946,8 +946,11 @@ export class NoteWorkbench {
     const minLines = 2;
     const fit = (): void => {
       ta.setCssStyles({ height: "auto" });
-      const needed = Math.min(ta.scrollHeight, lineHeight * maxLines + 16);
-      ta.setCssStyles({ height: `${Math.max(needed, lineHeight * minLines + 16)}px` });
+      // 0.184.0: also cap at ~half the window height so hitting Enter can't grow
+      // the editor until it pushes the action bar off-screen; it scrolls past that.
+      const cap = Math.min(lineHeight * maxLines + 16, Math.round(window.innerHeight * 0.5));
+      const needed = Math.min(ta.scrollHeight, cap);
+      ta.setCssStyles({ height: `${Math.max(needed, lineHeight * minLines + 16)}px`, overflowY: "auto" });
     };
     // Set the initial edited-state synchronously (doesn't need layout) so the
     // panels are correctly hidden on a fresh/unedited cursor render — the rAF-only
@@ -1082,6 +1085,9 @@ export class NoteWorkbenchModal extends Modal {
     // 0.170.3: Mod+E / Mod+S toggle the Edit / Split surface while open.
     this.scope.register(["Mod"], "e", (e) => { e.preventDefault(); this.ui?.setSurface("edit"); });
     this.scope.register(["Mod"], "s", (e) => { e.preventDefault(); this.ui?.setSurface("split"); });
+    // 0.184.0: Mod+Shift+E → open the note in Obsidian's editor (no-op for a new
+    // note from the composer, which has no onOpenExternal).
+    this.scope.register(["Mod", "Shift"], "e", (e) => { e.preventDefault(); if (this.cbs.onOpenExternal) { this.cbs.onOpenExternal(); this.close(); } });
   }
   // 0.170.5: dirty guard — Esc / click-outside / × / Cancel all route through close();
   // if there are unsaved edits (and this isn't a deliberate Save/Split/pop-out), confirm.
@@ -1172,8 +1178,11 @@ export class NoteWorkbenchView extends ItemView {
     // arrows in the cursor textarea fall through to the textarea).
     this.registerDomEvent(c, "keydown", (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (mod && e.key === "Enter") { e.preventDefault(); void this.ui?.commit(); }
-      else if (mod && (e.key === "e" || e.key === "E")) { e.preventDefault(); this.ui?.setSurface("edit"); }
+      // Mod+Shift+E → open the note in Obsidian's editor. Checked BEFORE Mod+E
+      // (a plain-letter check also fires on its shifted form — the shifted-key trap).
+      if (mod && e.shiftKey && (e.key === "e" || e.key === "E")) { e.preventDefault(); this.ctx?.cbs.onOpenExternal?.(); void this.guardedDetach(); }
+      else if (mod && e.key === "Enter") { e.preventDefault(); void this.ui?.commit(); }
+      else if (mod && !e.shiftKey && (e.key === "e" || e.key === "E")) { e.preventDefault(); this.ui?.setSurface("edit"); }
       else if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); this.ui?.setSurface("split"); }
       else if (e.key === "ArrowUp") { if (this.ui?.moveDivider(-1)) e.preventDefault(); }
       else if (e.key === "ArrowDown") { if (this.ui?.moveDivider(1)) e.preventDefault(); }
@@ -1215,14 +1224,19 @@ export class NoteWorkbenchView extends ItemView {
 
   /** 0.170.5: Cancel in the tab confirms if there are unsaved edits before detaching.
    *  (A native tab close / Cmd+W can't be intercepted — that path isn't guarded.) */
+  /** Set before any deliberate detach so onClose's best-effort unsaved-warning
+   *  (which fires on a NATIVE tab close — Cmd+W / the tab × — that we can't
+   *  intercept) doesn't double up on a close the user already confirmed. */
+  private closingIntentionally = false;
+
   private guardedDetach(): void {
-    if (!this.ui?.isDirty()) { this.leaf.detach(); return; }
+    if (!this.ui?.isDirty()) { this.closingIntentionally = true; this.leaf.detach(); return; }
     new ConfirmModal(
       this.app,
       "Discard unsaved edits?",
       "You've edited this note but haven't saved. Close this tab and discard your changes?",
       "Discard",
-      (ok) => { if (ok) this.leaf.detach(); },
+      (ok) => { if (ok) { this.closingIntentionally = true; this.leaf.detach(); } },
       "Keep editing",
       true,
     ).open();
@@ -1236,11 +1250,19 @@ export class NoteWorkbenchView extends ItemView {
 
   private closeAndRefocus(): void {
     const prev = this.prevLeaf;
+    this.closingIntentionally = true;
     this.leaf.detach();
     if (prev && this.leafStillOpen(prev)) this.app.workspace.setActiveLeaf(prev, { focus: true });
   }
 
   async onClose(): Promise<void> {
+    // 0.184.0 (experimental): Obsidian gives ItemViews no blocking pre-close hook,
+    // so a NATIVE tab close (Cmd+W / the tab ×) with unsaved edits can't be
+    // confirmed — warn AFTER the fact instead. Guarded closes set the flag so this
+    // doesn't fire when the user already chose to discard / saved.
+    if (!this.closingIntentionally && this.ui?.isDirty()) {
+      new Notice("Closed the in-app editor with unsaved changes — they were discarded. Use Save (⌘/Ctrl+Enter) next time.", 7000);
+    }
     if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
     if (this.expiredGrace != null) { window.clearTimeout(this.expiredGrace); this.expiredGrace = null; }
     this.ui = null;

@@ -2195,7 +2195,18 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   align-items: center;
   gap: 10px;
   margin-top: 12px;
+  /* 0.184.0: pin to the bottom of the (scrollable) modal so a tall editor can't
+     push the buttons off-screen. Desktop only — mobile resets this below (sticky
+     distorted on iOS). */
+  position: sticky;
+  bottom: 0;
+  background: var(--modal-background, var(--background-primary));
+  padding-bottom: 10px;
+  z-index: 3;
 }
+/* Mobile: NOT sticky (see the .is-mobile action-bar rules for the margin-top:auto
+   / flow layout used there). */
+.is-mobile .stashpad-split-actions { position: static; background: transparent; padding-bottom: 0; }
 .stashpad-split-actions-right {
   display: flex;
   align-items: center;

@@ -1448,6 +1448,17 @@ export default class StashpadPlugin extends Plugin {
       name: "Copy focused subtree",
       callback: () => call("cmdCopyTree"),
     });
+    // 0.184.0: dismiss every visible notification toast at once (handy when a batch
+    // of due reminders / messages stacks up).
+    this.addCommand({
+      id: "stashpad-dismiss-notifications",
+      name: "Dismiss all notifications",
+      callback: () => {
+        const notices = Array.from(document.querySelectorAll(".notice"));
+        for (const n of notices) n.parentElement?.removeChild(n);
+        new Notice(notices.length ? `Dismissed ${notices.length} notification${notices.length === 1 ? "" : "s"}.` : "No notifications to dismiss.");
+      },
+    });
     this.addCommand({
       id: "stashpad-copy-link",
       name: "Copy Stashpad link (deep link / URL) to note",

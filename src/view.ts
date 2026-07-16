@@ -5565,6 +5565,45 @@ export class StashpadView extends ItemView {
         e.stopPropagation();
         if (file) void this.app.workspace.getLeaf("tab").openFile(file);
       };
+      // 0.184.0: right-click an attachment → copy it to the OS clipboard (images
+      // paste straight into chat / email / editors), open it, or reveal it.
+      box.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); this.openAttachmentMenu(e, p, file, ext); };
+    }
+  }
+
+  /** 0.184.0: context menu for an attachment in a note's rail. */
+  private openAttachmentMenu(evt: MouseEvent, path: string, file: TFile | null, ext: string): void {
+    const menu = new Menu();
+    if (file && IMG_EXT.has(ext)) {
+      menu.addItem((it: any) => it.setTitle("Copy image").setIcon("copy").onClick(() => void this.copyAttachmentImage(file)));
+    }
+    if (file) {
+      menu.addItem((it: any) => it.setTitle("Open in new tab").setIcon("external-link").onClick(() => void this.app.workspace.getLeaf("tab").openFile(file)));
+      for (const a of buildFileActions(this.app, file.path, Platform.isMobile)) {
+        menu.addItem((it: any) => it.setTitle(a.label).setIcon(a.label.startsWith("Reveal") ? "folder-open" : "arrow-up-right").onClick(() => void a.onClick()));
+      }
+    }
+    menu.addItem((it: any) => it.setTitle("Copy path").setIcon("link").onClick(() => void navigator.clipboard?.writeText(path).then(() => new Notice("Path copied."), () => {})));
+    menu.showAtMouseEvent(evt);
+  }
+
+  /** 0.184.0: copy an image attachment to the OS clipboard as a native image, so
+   *  it can be pasted into chat apps / email / editors. Desktop only (Electron). */
+  private async copyAttachmentImage(file: TFile): Promise<void> {
+    try {
+      const electron = (window as unknown as { require?: (m: string) => any }).require?.("electron");
+      if (!electron?.clipboard?.writeImage || !electron?.nativeImage) {
+        new Notice("Copying an image to the clipboard needs the desktop app.");
+        return;
+      }
+      const buf = await this.app.vault.readBinary(file);
+      const img = electron.nativeImage.createFromBuffer(Buffer.from(new Uint8Array(buf)));
+      if (img.isEmpty()) { new Notice("Couldn't read that image."); return; }
+      electron.clipboard.writeImage(img);
+      new Notice("Image copied to the clipboard.");
+    } catch (e) {
+      console.warn("[Stashpad] copy image failed", e);
+      new Notice("Couldn't copy the image.");
     }
   }
 
@@ -10405,14 +10444,17 @@ export class StashpadView extends ItemView {
         }
       };
       if (settings.confirmCrossParentDrag) {
-        const targetTitle = this.titleForNode(targetNode);
+        const rawTitle = this.titleForNode(targetNode);
+        // 0.184.0: cap the preview + put the target note on its OWN line (the line
+        // above and below stay separate) so a long note title doesn't sprawl.
+        const targetTitle = rawTitle.length > 120 ? rawTitle.slice(0, 120).trimEnd() + "…" : rawTitle;
         const n = sourceNodes.length;
         const verb = position === "into" ? "Nest" : "Move";
         const prep = position === "into" ? "as children of" : "under";
         new ConfirmModal(
           this.app,
           position === "into" ? "Nest under target?" : "Move under different parent?",
-          `${verb} ${n} note${n === 1 ? "" : "s"} ${prep} "${targetTitle}"? Their parent will change.`,
+          `${verb} ${n} note${n === 1 ? "" : "s"} ${prep}:\n"${targetTitle}"\nTheir parent will change.`,
           verb,
           (ok) => { if (ok) void doMove(); },
         ).open();
