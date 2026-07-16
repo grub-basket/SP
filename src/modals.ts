@@ -652,7 +652,7 @@ export class NoteWorkbench {
     if (!this.cb.popOut) return;
     const pop = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
     setIcon(pop.createSpan({ cls: "stashpad-split-popout-icon" }), "maximize-2");
-    pop.createSpan({ text: "Open in a tab" });
+    pop.createSpan({ text: Platform.isMobile ? "Pop-out" : "Open in a tab" });
     pop.setAttr("aria-label", "Open in a full tab");
     pop.onmousedown = (e) => e.preventDefault();
     pop.onclick = () => this.cb.popOut!(this.getState());
@@ -663,7 +663,7 @@ export class NoteWorkbench {
     if (!this.cb.onOpenExternal) return;
     const b = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
     setIcon(b.createSpan({ cls: "stashpad-split-popout-icon" }), "pencil");
-    b.createSpan({ text: "Obsidian editor" });
+    b.createSpan({ text: Platform.isMobile ? "Advanced" : "Obsidian editor" });
     b.setAttr("aria-label", "Open in a full Obsidian editor tab");
     b.onmousedown = (e) => e.preventDefault();
     b.onclick = () => { this.cb.onOpenExternal!(); this.cb.close(); };
@@ -980,10 +980,12 @@ export class NoteWorkbench {
     ta.readOnly = false;
     this.cursorTextarea = ta;
 
-    // Original (read-only) — copy button lives inside the panel (top-right).
+    // Original (read-only). 0.183.3: copy button in a right-aligned bar ABOVE the
+    // text (it used to overlay the text's right edge as a full-height strip).
     const origPanel = bodyHost.createDiv({ cls: "stashpad-split-tabpanel" });
+    const origCopyBar = origPanel.createDiv({ cls: "stashpad-split-tab-copybar" });
+    origCopyBar.appendChild(this.makeCopyButton(() => this.body, "Copy the original text", "stashpad-split-copy-btn stashpad-split-tab-copy"));
     origPanel.createDiv({ cls: "stashpad-split-panel-body", text: this.body });
-    origPanel.appendChild(this.makeCopyButton(() => this.body, "Copy the original text", "stashpad-split-copy-btn stashpad-split-tab-copy"));
 
     // Changes (word diff).
     const changesPanel = bodyHost.createDiv({ cls: "stashpad-split-tabpanel" });
@@ -1027,26 +1029,20 @@ export class NoteWorkbench {
       if (!edited && (active === "orig" || active === "changes")) showTab("edit");
     };
 
-    // Firm height cap so the editor scrolls instead of pushing the action bar
-    // past the keyboard (fewer lines than desktop — space is at a premium).
-    const lineHeight = parseFloat(getComputedStyle(ta).lineHeight) || 22;
-    const maxLines = this.surface === "edit" ? 8 : 4;
-    ta.setCssStyles({ maxHeight: `${lineHeight * maxLines + 16}px`, overflowY: "auto" });
-    const fit = (): void => {
-      ta.setCssStyles({ height: "auto" });
-      const needed = Math.min(ta.scrollHeight, lineHeight * maxLines + 16);
-      ta.setCssStyles({ height: `${Math.max(needed, lineHeight * 2 + 16)}px` });
-    };
+    // 0.183.0: the editor FILLS the fixed-height modal (flex, via CSS) and scrolls
+    // internally — no explicit line cap. With the modal at a fixed height it can't
+    // grow past the keyboard anyway, so filling looks better than a hard cap that
+    // leaves an empty gap under a short note.
+    ta.setCssStyles({ overflowY: "auto" });
 
     syncEdited();
     showTab("edit");
     requestAnimationFrame(() => {
-      fit();
       ta.focus();
       const pos = this.surface === "edit" ? ta.value.length : Math.floor(ta.value.length / 2);
       ta.setSelectionRange(pos, pos);
     });
-    ta.addEventListener("input", () => { this.cursorText = ta.value; fit(); syncEdited(); });
+    ta.addEventListener("input", () => { this.cursorText = ta.value; syncEdited(); });
   }
 }
 
