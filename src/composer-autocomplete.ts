@@ -16,6 +16,11 @@ import { getSettings } from "./settings";
  * Triggers (matched against the substring ending at the caret):
  *   #foo            → tag suggestions ("#foo", "#foobar", ...)
  *   [[foo           → file suggestions (basenames containing "foo")
+ *   @foo            → unified: natural-language dates (via the Natural
+ *                     Language Dates plugin's parseDate API, if installed)
+ *                     blended with note-link suggestions. `@today` inserts
+ *                     the resolved date; `@meeting` inserts [[Meeting]].
+ *                     Falls back to note-links only when NLD isn't present.
  *
  * Keyboard while popup is open:
  *   ↑/↓             move highlighted item
@@ -168,7 +173,53 @@ export class ComposerAutocomplete {
       };
     }
 
+    // @-mention: `@` (preceded by start-of-line/whitespace) then an optional
+    // query that MAY contain spaces (natural-language dates like "next friday").
+    // Bounded to a single line, ≤ 24 chars, and stops at `@`/`[`/`#` so those
+    // triggers take over. The 24-char cap matters: chrono (via NLD) will still
+    // extract "today" from a whole sentence, so without a tight bound the popup
+    // would linger and Enter would insert a date instead of a newline. 24 chars
+    // covers the longest real date phrases ("the day after tomorrow" = 22) while
+    // auto-closing the moment the query outgrows one. The bare `@` opens
+    // immediately (NLD-style); the popup self-closes once the query matches
+    // neither a date nor any note.
+    const atMatch = before.match(/(^|\s)@([^\n@[#]{0,24})$/);
+    if (atMatch) {
+      const query = atMatch[2];
+      return {
+        kind: "at",
+        query,
+        replaceStart: caret - query.length - 1, // include the `@`
+        replaceEnd: caret,
+      };
+    }
+
     return null;
+  }
+
+  /** Resolve a natural-language date via the Natural Language Dates plugin's
+   *  public `parseDate` API. Returns the plugin-formatted date string (which
+   *  already honours the user's NLD format + link settings), or null if NLD
+   *  isn't installed or the text doesn't parse as a date. Fully defensive —
+   *  a missing/changed API just disables date suggestions, never throws. */
+  private nldParse(input: string): string | null {
+    const text = input.trim();
+    if (!text) return null;
+    try {
+      const nld = (this.app as unknown as { plugins?: { plugins?: Record<string, unknown> } }).plugins?.plugins?.["nldates-obsidian"] as
+        | { parseDate?: (s: string) => { moment?: { isValid?: () => boolean }; formattedString?: string } | null }
+        | undefined;
+      if (!nld || typeof nld.parseDate !== "function") return null;
+      const res = nld.parseDate(text);
+      if (!res) return null;
+      const valid = res.moment && typeof res.moment.isValid === "function"
+        ? res.moment.isValid()
+        : !!res.formattedString && res.formattedString !== "Invalid date";
+      if (!valid) return null;
+      return res.formattedString || null;
+    } catch {
+      return null;
+    }
   }
 
   // ---------- Suggest generation ----------
@@ -185,36 +236,46 @@ export class ComposerAutocomplete {
       for (const t of tokens) if (!haystack.includes(t)) return false;
       return true;
     };
+    // Note-link candidates (used by both the `[[` and `@` triggers). Markdown
+    // notes insert as [[basename]]; non-md files keep their extension because
+    // Obsidian only resolves [[image.png]] WITH the ext.
+    const fileMatches = (limit: number): SuggestItem[] => this.fileIndex
+      .filter((f) => matchesAll(f.lower))
+      .slice(0, limit)
+      .map((f) => ({ label: f.label, insert: `[[${f.insertText}]]`, subtitle: f.file.path }));
+
     if (state.kind === "link") {
-      // 0.73.3: cap bumped 30 → 50 now that the index includes every
-      // file type — more candidates means fuzzy queries have more to
-      // narrow down.
-      const matches = this.fileIndex
-        .filter((f) => matchesAll(f.lower))
-        .slice(0, 50)
-        .map((f) => ({
-          label: f.label,
-          // replaceStart points BEFORE the opening "[[", so we re-emit
-          // them along with the link text + closing brackets. Markdown
-          // notes use the basename; non-md files keep their extension
-          // because Obsidian only resolves [[image.png]] WITH the ext.
-          insert: `[[${f.insertText}]]`,
-          subtitle: f.file.path,
-        }));
-      return matches;
-    } else {
-      // Tag autocomplete: same all-tokens rule, just against the
-      // pre-sorted (by usage count) tag list.
-      const matches = this.tagIndex
+      // 0.73.3: cap bumped 30 → 50 now that the index includes every file type.
+      return fileMatches(50);
+    }
+    if (state.kind === "tag") {
+      // Tag autocomplete: same all-tokens rule, against the pre-sorted (by
+      // usage count) tag list.
+      return this.tagIndex
         .filter((t) => matchesAll(t.toLowerCase()))
         .slice(0, 30)
-        .map((t) => ({
-          label: t,
-          insert: t,
-          subtitle: "",
-        }));
-      return matches;
+        .map((t) => ({ label: t, insert: t, subtitle: "" }));
     }
+    // 0.186.0: unified `@` — natural-language dates (via NLD) blended with
+    // note links. Dates rank first so Enter on `@today` inserts the date.
+    const dateItems: SuggestItem[] = [];
+    if (q === "") {
+      // Bare `@`: offer a few common relatives (NLD-style). Absent NLD, this
+      // yields nothing and we fall through to a short note list below.
+      for (const phrase of ["today", "tomorrow", "next week"]) {
+        const f = this.nldParse(phrase);
+        if (f) dateItems.push({ label: `📅 ${phrase}`, insert: f, subtitle: `→ ${f}` });
+      }
+    } else {
+      const f = this.nldParse(state.query);
+      if (f) dateItems.push({ label: `📅 ${state.query.trim()}`, insert: f, subtitle: `→ ${f}` });
+    }
+    // On a bare `@` with date suggestions present, keep the list tight (dates
+    // only); otherwise blend in note matches so `@name` still links a note.
+    const noteItems = q === ""
+      ? (dateItems.length ? [] : fileMatches(15))
+      : fileMatches(30);
+    return [...dateItems, ...noteItems];
   }
 
   // ---------- Event handlers ----------
@@ -387,7 +448,7 @@ interface SuggestItem {
 }
 
 interface AutocompleteState {
-  kind: "tag" | "link";
+  kind: "tag" | "link" | "at";
   query: string;
   /** Inclusive start index of the trigger (for replacement). For "[[foo"
    *  this points at the first `[`; for "#foo" at the `#`. */
