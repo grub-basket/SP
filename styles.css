@@ -3037,7 +3037,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 /* Composer autocomplete popup */
 .stashpad-composer-suggest {
   position: fixed;
-  z-index: var(--layer-popover, 30);
+  /* 0.185.1: use the MENU layer (above --layer-modal), not --layer-popover — the
+     edit/split editor renders this popup (appended to document.body) while a modal
+     is open, and --layer-popover (30) sits BEHIND --layer-modal (100), so the
+     suggestions were occluded by the modal. Menu layer is where dropdown/suggestion
+     UI belongs and is above modals; harmless in the composer (nothing above it). */
+  z-index: var(--layer-menu, 1000);
   background: var(--background-primary);
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
