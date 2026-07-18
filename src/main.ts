@@ -1488,18 +1488,18 @@ export default class StashpadPlugin extends Plugin {
     });
     this.addCommand({
       id: "stashpad-edit-note",
-      name: "Edit note in new tab (selection)",
+      name: "Open note in Obsidian editor (new tab)",
       callback: () => call("cmdOpenInEditor"),
     });
     this.addCommand({
-      // 0.170.0: the in-app editor (Edit ⇄ Split surface), not a full Obsidian tab.
+      // 0.170.0: Stashpad's own editor (Edit ⇄ Split surface), not a full Obsidian tab.
       id: "stashpad-edit-inapp",
-      name: "Edit note (in-app editor)…",
+      name: "Edit note in Stashpad…",
       callback: () => call("cmdEdit"),
     });
     this.addCommand({
       id: "stashpad-edit-parent-inapp",
-      name: "Edit parent note (in-app editor)…",
+      name: "Edit parent note in Stashpad…",
       callback: () => call("cmdEditParent"),
     });
     this.addCommand({

@@ -197,29 +197,35 @@ export class ComposerAutocomplete {
     return null;
   }
 
-  /** Resolve a natural-language date via the Natural Language Dates plugin's
-   *  public `parseDate` API. Returns the plugin-formatted date string (which
-   *  already honours the user's NLD format + link settings), or null if NLD
-   *  isn't installed or the text doesn't parse as a date. Fully defensive —
-   *  a missing/changed API just disables date suggestions, never throws. */
+  /** Resolve a natural-language date via a Natural Language Dates plugin's
+   *  public `parseDate` API. Supports both the original `nldates-obsidian` and
+   *  the modern `nldates-redux` fork — both expose the same
+   *  `parseDate(text) → { moment, formattedString }` shape, and formattedString
+   *  already honours that plugin's date format + link settings. Returns the
+   *  formatted string, or null if neither plugin is installed or the text
+   *  doesn't parse as a date. Fully defensive — a missing/changed API just
+   *  disables date suggestions, never throws. */
   private nldParse(input: string): string | null {
     const text = input.trim();
     if (!text) return null;
-    try {
-      const nld = (this.app as unknown as { plugins?: { plugins?: Record<string, unknown> } }).plugins?.plugins?.["nldates-obsidian"] as
+    const plugins = (this.app as unknown as { plugins?: { plugins?: Record<string, unknown> } }).plugins?.plugins ?? {};
+    for (const id of ["nldates-obsidian", "nldates-redux"]) {
+      const nld = plugins[id] as
         | { parseDate?: (s: string) => { moment?: { isValid?: () => boolean }; formattedString?: string } | null }
         | undefined;
-      if (!nld || typeof nld.parseDate !== "function") return null;
-      const res = nld.parseDate(text);
-      if (!res) return null;
-      const valid = res.moment && typeof res.moment.isValid === "function"
-        ? res.moment.isValid()
-        : !!res.formattedString && res.formattedString !== "Invalid date";
-      if (!valid) return null;
-      return res.formattedString || null;
-    } catch {
-      return null;
+      if (!nld || typeof nld.parseDate !== "function") continue;
+      try {
+        const res = nld.parseDate(text);
+        if (!res) continue;
+        const valid = res.moment && typeof res.moment.isValid === "function"
+          ? res.moment.isValid()
+          : !!res.formattedString && res.formattedString !== "Invalid date";
+        if (valid && res.formattedString) return res.formattedString;
+      } catch {
+        // try the next candidate plugin
+      }
     }
+    return null;
   }
 
   // ---------- Suggest generation ----------
@@ -315,6 +321,23 @@ export class ComposerAutocomplete {
       e.preventDefault();
       e.stopPropagation();
       this.commit();
+    } else if (e.key === " " && this.state.kind === "tag") {
+      // Space completes a tag (tags can't contain spaces, so the space that
+      // would end the tag doubles as "accept the highlighted suggestion").
+      // NOT for links / @ (those legitimately contain spaces). Guard: only
+      // complete when the highlighted tag actually STARTS WITH what's typed —
+      // otherwise a mere substring match would hijack a brand-new tag the user
+      // is typing (e.g. typing `#foo` when only `#barfoo` exists). The inserted
+      // tag keeps the space so typing flows on.
+      const active = this.items[this.activeIdx];
+      const typed = "#" + this.state.query.toLowerCase();
+      if (active && active.insert.toLowerCase().startsWith(typed)) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.commit(" ");
+      } else {
+        this.close(); // new tag the user is typing — let the space through
+      }
     } else if (e.key === "Escape") {
       // stopImmediatePropagation beats Obsidian's workspace-level
       // Escape handler (which would otherwise refocus another tab).
@@ -413,13 +436,13 @@ export class ComposerAutocomplete {
     this.popupEl.style.minWidth = `${Math.min(360, r.width)}px`;
   }
 
-  private commit(): void {
+  private commit(trailing = ""): void {
     if (!this.state || !this.items.length) return;
     const item = this.items[this.activeIdx];
     if (!item) return;
     const before = this.ta.value.slice(0, this.state.replaceStart);
     const after = this.ta.value.slice(this.state.replaceEnd);
-    const insert = item.insert;
+    const insert = item.insert + trailing;
     this.ta.value = before + insert + after;
     const caret = before.length + insert.length;
     this.ta.setSelectionRange(caret, caret);

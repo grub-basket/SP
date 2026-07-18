@@ -3314,7 +3314,8 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Collapse all").setIcon("fold-vertical").onClick(() => this.cmdCollapseAll()));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").setDisabled(!hasTargets).onClick(() => this.cmdOpenInNewStashpadTab()));
-    menu.addItem((it: any) => it.setTitle("Open in editor").setIcon("pencil").setDisabled(!hasTargets).onClick(() => this.cmdOpenInEditor()));
+    menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").setDisabled(!hasTargets).onClick(() => void this.cmdEdit()));
+    menu.addItem((it: any) => it.setTitle("Open in Obsidian editor").setIcon("pencil").setDisabled(!hasTargets).onClick(() => this.cmdOpenInEditor()));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Move…").setIcon("arrow-right-circle").setDisabled(!hasTargets).onClick(() => this.cmdMovePicker()));
     menu.addItem((it: any) => it.setTitle("Nest under… (in-list)").setIcon("indent").setDisabled(!hasTargets).onClick(() => this.cmdInListPicker()));
@@ -4790,7 +4791,8 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").onClick(() => { onAction?.(); this.cmdOpenInNewStashpadTab(node); }));
     menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => { onAction?.(); this.navigateTo(id); }));
     if (node.file) {
-      menu.addItem((it: any) => it.setTitle("Open in editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
+      menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => { onAction?.(); void this.cmdEdit(node); }));
+      menu.addItem((it: any) => it.setTitle("Open in Obsidian editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
     }
     if (evt && (evt.clientX > 0 || evt.clientY > 0)) {
       menu.showAtMouseEvent(evt);
@@ -4891,8 +4893,11 @@ export class StashpadView extends ItemView {
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-pencil" });
       setIcon(pencil, "pencil");
-      pencil.title = "Edit in new tab";
-      pencil.onclick = () => void this.openFileAtEnd(file);
+      // 0.187.0: the pencil now opens Stashpad's own editor (the default edit
+      // action), not a full Obsidian tab. The Obsidian editor stays available via
+      // the right-click menu ("Open in Obsidian editor") and Mod+Shift+E.
+      pencil.title = "Edit in Stashpad";
+      pencil.onclick = () => void this.cmdEdit(node);
 
       const dupBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-dup" });
       // "copy" — the lucide icon is two overlapping document shapes,
@@ -5224,8 +5229,9 @@ export class StashpadView extends ItemView {
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil" });
       setIcon(pencil, "pencil");
-      pencil.title = "Edit in new tab";
-      pencil.onclick = (e) => { e.stopPropagation(); void this.openFileAtEnd(file); };
+      // 0.187.0: pencil opens Stashpad's own editor (default edit action).
+      pencil.title = "Edit in Stashpad";
+      pencil.onclick = (e) => { e.stopPropagation(); void this.cmdEdit(node); };
       const enterBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-enter-btn" });
       setIcon(enterBtn, "arrow-right");
       enterBtn.title = "Open in Stashpad view";
@@ -8803,7 +8809,7 @@ export class StashpadView extends ItemView {
       // Clear the clipboard BEFORE the move so its re-render doesn't re-apply
       // the .is-cut-pending ghost to the just-moved rows (ids already captured).
       this.plugin.clearNoteClipboard();
-      await this.moveAcrossThenReorder(nodes.map((n) => n.id), parentId, anchor, "after");
+      await this.moveAcrossThenReorder(nodes.map((n) => n.id), parentId, anchor, "after", "Moved");
       return;
     }
 
@@ -10214,6 +10220,10 @@ export class StashpadView extends ItemView {
     targetParentId: StashpadId,
     targetId: StashpadId,
     position: "before" | "after",
+    // 0.187.0: the success-toast verb. "Nested" when dropping/picking INTO a
+    // target, "Moved" for a cross-parent before/after drop — clearer than the
+    // old generic "Reparented" and matches the confirm dialog's wording.
+    verb = "Reparented",
   ): Promise<void> {
     // Capture prior state for undo: each source's old parent + path.
     const priorParents: { id: StashpadId; path: string; oldParent: StashpadId | null }[] = [];
@@ -10315,7 +10325,7 @@ export class StashpadView extends ItemView {
     const targetTitle = targetNode ? this.titleForNode(targetNode) : "(root)";
     this.plugin.notifications.show({
       message: this.bulkActionMessage({
-        verb: "Reparented",
+        verb,
         nodes: movedNodes,
         destination: `→ "${targetTitle}"`,
       }),
@@ -10438,9 +10448,9 @@ export class StashpadView extends ItemView {
       const doMove = async () => {
         if (position === "into") {
           // Append to target's children at the end (no targetId-relative position).
-          await this.moveAcrossThenReorder(sourceNodes.map((n) => n.id), newParentId, /*targetId for ordering*/ "", "after");
+          await this.moveAcrossThenReorder(sourceNodes.map((n) => n.id), newParentId, /*targetId for ordering*/ "", "after", "Nested");
         } else {
-          await this.moveAcrossThenReorder(sourceNodes.map((n) => n.id), newParentId, targetId, position);
+          await this.moveAcrossThenReorder(sourceNodes.map((n) => n.id), newParentId, targetId, position, "Moved");
         }
       };
       if (settings.confirmCrossParentDrag) {
@@ -11969,12 +11979,12 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("layout-grid").onClick(() => {
       void this.openInNewStashpadTab(node.id);
     }));
-    menu.addItem((it: any) => it.setTitle("Open in editor").setIcon("file-text").onClick(() => {
+    menu.addItem((it: any) => it.setTitle("Open in Obsidian editor").setIcon("file-text").onClick(() => {
       void this.openFileAtEnd(file);
     }));
     menu.addItem((it: any) => it.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => this.navigateTo(node.id)));
     menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Edit (in-app)…").setIcon("pencil-line").onClick(() => void this.cmdEdit(node)));
+    menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => void this.cmdEdit(node)));
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
     // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
     // normalises selection to the right-clicked row.

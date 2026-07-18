@@ -162,7 +162,7 @@ export function populateLockedMenu(menu: Menu, cfg: LockedMenuConfig): void {
     // Folder-view locked row: full openNoteMenu parity. Actions that need the
     // decrypted note show an "unlock first" notice; the rest act on ciphertext.
     menu.addItem((i: any) => i.setTitle("Open in new Stashpad tab").setIcon("layout-grid").onClick(() => unlockFirst("open it in a tab")));
-    menu.addItem((i: any) => i.setTitle("Open in editor").setIcon("file-text").onClick(() => unlockFirst("open it in the editor")));
+    menu.addItem((i: any) => i.setTitle("Open in Obsidian editor").setIcon("file-text").onClick(() => unlockFirst("open it in the editor")));
     menu.addItem((i: any) => i.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => unlockFirst("focus it")));
     menu.addSeparator();
     menu.addItem((i: any) => i.setTitle("Split note…").setIcon("split").onClick(() => unlockFirst("split it")));

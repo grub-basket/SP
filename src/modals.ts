@@ -1348,7 +1348,7 @@ export class NoteWorkbenchView extends ItemView {
     // confirmed — warn AFTER the fact instead. Guarded closes set the flag so this
     // doesn't fire when the user already chose to discard / saved.
     if (!this.closingIntentionally && this.ui?.isDirty()) {
-      new Notice("Closed the in-app editor with unsaved changes — they were discarded. Use Save (⌘/Ctrl+Enter) next time.", 7000);
+      new Notice("Closed the Stashpad editor with unsaved changes — they were discarded. Use Save (⌘/Ctrl+Enter) next time.", 7000);
     }
     if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
     if (this.expiredGrace != null) { window.clearTimeout(this.expiredGrace); this.expiredGrace = null; }
