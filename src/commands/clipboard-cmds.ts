@@ -19,9 +19,24 @@ export async function cmdCopy(view: StashpadView): Promise<void> {
     if (!t.file) continue;
     const raw = await view.app.vault.cachedRead(t.file);
     const body = view.stripFrontmatter(raw).trim();
-    out.push(prefix ? `${view.formatTimeInline(t.created)} ${body}` : body);
+    // 0.188.0: task checkbox + color/alias metadata prefix. Plain-copy has no
+    // leading dash, so add one ("- ") ONLY for a task (a checkbox needs it to
+    // render); a colour-only prefix renders fine inline without a dash.
+    const { needsDash, checkbox, meta } = view.copyMetaPrefix(t);
+    const lead = `${needsDash ? "- " : ""}${checkbox}${meta}`;
+    const ts = prefix ? `${view.formatTimeInline(t.created)} ` : "";
+    out.push(`${lead}${ts}${body}`);
   }
-  await navigator.clipboard.writeText(out.join("\n\n"));
+  // 0.188.1: join consecutive SINGLE-LINE items (tasks / short notes) with a
+  // single newline so a copied task list stays a tight checklist — the old blank
+  // line between every item split the checkboxes into a loose list. The blank-line
+  // separator is kept only around a multi-line item, where prose wants the gap.
+  let joined = out[0] ?? "";
+  for (let i = 1; i < out.length; i++) {
+    const gap = out[i - 1].includes("\n") || out[i].includes("\n") ? "\n\n" : "\n";
+    joined += gap + out[i];
+  }
+  await navigator.clipboard.writeText(joined);
   view.plugin.notifications.show({
     message: `Copied ${view.titleList(targets)} to clipboard`,
     kind: "success",
@@ -122,7 +137,10 @@ export async function cmdCopyTree(view: StashpadView): Promise<void> {
       const raw = await view.app.vault.cachedRead(node.file);
       const body = view.stripFrontmatter(raw).trim().split(/\r?\n/).join(" ");
       const ts = prefix ? `${view.formatTimeInline(node.created)} ` : "";
-      lines.push(`${"  ".repeat(depth)}- ${ts}${body}`);
+      // 0.188.0: checkbox + colour metadata go AFTER the bullet dash this format
+      // already emits (needsDash ignored — the "- " is always present here).
+      const { checkbox, meta } = view.copyMetaPrefix(node);
+      lines.push(`${"  ".repeat(depth)}- ${checkbox}${meta}${ts}${body}`);
     }
     for (const c of view.tree.getChildren(node.id)) await walk(c, depth + 1);
   };
@@ -159,7 +177,9 @@ export async function cmdCopyOutline(view: StashpadView): Promise<void> {
   const walk = (node: TreeNode, depth: number) => {
     if (!node.file) return;
     const indent = "  ".repeat(depth);
-    lines.push(`${indent}- ![[${node.file.basename}]]`);
+    // 0.188.0: checkbox + colour metadata after the bullet dash, before the embed.
+    const { checkbox, meta } = view.copyMetaPrefix(node);
+    lines.push(`${indent}- ${checkbox}${meta}![[${node.file.basename}]]`);
     for (const c of view.tree.getChildren(node.id)) walk(c, depth + 1);
   };
   for (const r of roots) walk(r, 0);

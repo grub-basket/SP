@@ -8221,6 +8221,30 @@ export class StashpadView extends ItemView {
   cmdCopyTree(): Promise<void> { return clipboardCmds.cmdCopyTree(this); }
   cmdCopyOutline(): Promise<void> { return clipboardCmds.cmdCopyOutline(this); }
 
+  /** 0.188.0: inline task/color metadata prefix for a COPIED note, so a task
+   *  pastes as a real Obsidian checkbox and a note's color (+ its alias) survive
+   *  as inline metadata in a plain note. Public so the clipboard commands can
+   *  reuse the private task/color getters. Returns the pieces so each copy
+   *  format places them correctly relative to its own leading dash:
+   *    - `needsDash` — true when the note is a task (a checkbox needs a "- " to
+   *      render as a checkbox). Formats that ALREADY emit "- " ignore this.
+   *    - `checkbox`  — "[ ] " (incomplete) / "[x] " (completed), or "".
+   *    - `meta`      — "[color: #hex | alias: name] " (alias only when the color
+   *      has one), or "".
+   *  Compose as `<dash?><checkbox><meta><body>`; empty-checkbox keeps the space
+   *  between brackets so Obsidian renders it. */
+  copyMetaPrefix(node: TreeNode): { needsDash: boolean; checkbox: string; meta: string } {
+    const task = this.isTask(node);
+    const checkbox = task ? (this.isCompleted(node) ? "[x] " : "[ ] ") : "";
+    const color = this.colorForNode(node);
+    let meta = "";
+    if (color) {
+      const alias = this.plugin.getColorAlias(this.noteFolder, color);
+      meta = alias ? `[color: ${color} | alias: ${alias}] ` : `[color: ${color}] `;
+    }
+    return { needsDash: task, checkbox, meta };
+  }
+
   /** Toggle the "Show more / show less" clamp for the current target(s).
    *  Targets follow getActionTargets (selection > cursor row). Each
    *  target's id is added to or removed from this.expandedNotes; if any
