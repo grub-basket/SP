@@ -62,6 +62,21 @@ import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
 
+/** 0.190.0 — sync-storm detection for the render debounce.
+ *
+ *  More than RENDER_BURST_THRESHOLD change events inside RENDER_BURST_WINDOW_MS is
+ *  machine-driven, not human: Obsidian debounces its own metadataCache while you
+ *  type, so a person editing rarely exceeds ~2 change events a second. A sync
+ *  landing a few hundred files easily sustains 5–20/s.
+ *
+ *  Threshold tuned by measurement: a realistic storm arrives BURSTY, with gaps
+ *  larger than the old 80ms debounce (~150ms apart), so the old code rendered once
+ *  per event. At 4-per-second the detector engages a few events in and then
+ *  coalesces the rest into a single settle render. */
+const RENDER_CALM_MS = 900;
+const RENDER_BURST_THRESHOLD = 5;
+const RENDER_STORM_DELAY_MS = 700;
+
 
 const VIEW_MODE_LABELS: Record<ViewMode, string> = {
   nested: "Nested",
@@ -166,7 +181,18 @@ export class StashpadView extends ItemView {
   private slugDebouncers = new Map<string, ReturnType<typeof debounce>>();
   private attachmentDebouncers = new Map<string, ReturnType<typeof debounce>>();
   /** public: called by AuthorshipTracker (the host interface). */
-  debouncedRender: ReturnType<typeof debounce>;
+  debouncedRender: { (): void; cancel?: () => void };
+  /** 0.190.0: adaptive render coalescing. A fixed 80ms debounce re-fires every
+   *  ~80ms for the ENTIRE duration of a sync storm (hundreds of files landing over
+   *  many seconds), which is what made the list flicker and appear to render/stop/
+   *  render. We count change events in a rolling window and, once it looks like a
+   *  storm rather than typing, stretch the debounce so we render ONCE after things
+   *  go quiet instead of ~12x/second. */
+  private renderBurstCount = 0;
+  private renderBurstWindowAt = 0;
+  private renderTimer: number | null = null;
+  /** True while change events are arriving faster than a human could cause. */
+  private renderStorm = false;
   // Bulk-render suppression: while a bulk op runs (a long split paste,
   // rebootstrap), metadata-driven re-renders are dropped so the list doesn't
   // flicker per-note as files parse and fmSync writes recovery fields. One
@@ -379,7 +405,36 @@ export class StashpadView extends ItemView {
       const base = mode === "manual" ? this.order.getOrder(folder, parentId) : computeSortedIds(this, parentId, mode);
       return this.hoistListPinned(parentId, base);
     });
-    this.debouncedRender = debounce(() => { if (this.renderSuppressed()) return; this.render(); }, 80);
+    // 0.190.0: adaptive — 80ms when a human is driving, stretched to a quiet-period
+    // wait during a sync storm so the list settles once instead of thrashing.
+    const scheduleRender = (): void => {
+      const now = Date.now();
+      // Reset only after a genuine QUIET GAP. (A fixed rolling window was the first
+      // attempt and it silently defeated itself: the window boundary cleared the
+      // storm flag every second, dropping straight back to the snappy delay and
+      // re-rendering — measured as no improvement at all.)
+      if (now - this.renderBurstWindowAt > RENDER_CALM_MS) {
+        this.renderBurstCount = 0;
+        this.renderStorm = false;
+      }
+      this.renderBurstWindowAt = now;
+      this.renderBurstCount++;
+      if (this.renderBurstCount > RENDER_BURST_THRESHOLD) this.renderStorm = true;
+      const delay = this.renderStorm ? RENDER_STORM_DELAY_MS : 80;
+      if (this.renderTimer != null) window.clearTimeout(this.renderTimer);
+      this.renderTimer = window.setTimeout(() => {
+        this.renderTimer = null;
+        // NB: don't clear the storm flag here — the storm ends when events stop
+        // arriving (the calm check above), not when we happen to get a render in.
+        if (this.renderSuppressed()) return;
+        this.render();
+      }, delay);
+    };
+    this.debouncedRender = Object.assign(scheduleRender, {
+      cancel: () => {
+        if (this.renderTimer != null) { window.clearTimeout(this.renderTimer); this.renderTimer = null; }
+      },
+    });
     this.authorship = new AuthorshipTracker(this);
     this.dnd = new ViewDnD(this);
     // 0.83.2: back the body render cache with the plugin's persisted store
@@ -8045,6 +8100,10 @@ export class StashpadView extends ItemView {
       if (await this.changeParent(t, target.id, { silentSuccess: true })) movedTargets.push(t);
     }
     this.notifyBatchMove(movedTargets, target.id, childCounts);
+    // 0.191.0: surface the new home in a BACKGROUND tab (setting-gated, on by
+    // default). Skipped when autoNavOnMoveIn is on — that already drills you into
+    // the parent, so a tab would just duplicate where you already are.
+    if (!this.plugin.settings.autoNavOnMoveIn) void this.openParentInBackgroundTab(target.id);
     // 0.72.6: optional auto-navigate INTO the destination parent so
     // the user follows their moved note. Skips the select-in-place
     // flow below because navigateTo rebuilds the view for the new
@@ -9371,6 +9430,41 @@ export class StashpadView extends ItemView {
 
   // --- Open in new Stashpad tab ---
 
+  /** 0.191.0: open a Stashpad tab focused on `focusId` WITHOUT stealing focus —
+   *  used after nesting a note into another note so its new home is one click away
+   *  while you keep working. Gated by the openParentTabOnMoveIn setting.
+   *
+   *  No-ops when the destination is Home/root (nothing meaningful to open) or when a
+   *  Stashpad tab is already focused there (so repeated nesting into the same parent
+   *  doesn't pile up duplicate tabs). Focus is restored to whatever leaf was active
+   *  before, which is what makes it a genuine background tab. */
+  async openParentInBackgroundTab(focusId: StashpadId): Promise<void> {
+    if (!this.plugin.settings.openParentTabOnMoveIn) return;
+    if (!focusId || focusId === ROOT_ID) return;
+    const ws = this.app.workspace;
+    // Already open on that parent? Leave it alone.
+    let existing = false;
+    ws.iterateAllLeaves((l) => {
+      const v: any = l.view;
+      if (v?.getViewType?.() === STASHPAD_VIEW_TYPE && v?.focusId === focusId && v?.noteFolder === this.noteFolder) existing = true;
+    });
+    if (existing) return;
+    const active = ws.activeLeaf;
+    try {
+      const leaf = ws.getLeaf("tab");
+      await leaf.setViewState({
+        type: STASHPAD_VIEW_TYPE,
+        active: false,
+        state: { focusId, timeFilter: this.timeFilter, folderOverride: this.folderOverride },
+      });
+      // getLeaf("tab") fronts the new tab; hand focus straight back so the move
+      // never interrupts the user's place.
+      if (active) ws.setActiveLeaf(active, { focus: true });
+    } catch (e) {
+      console.warn("[Stashpad] background parent tab failed", e);
+    }
+  }
+
   private async openInNewStashpadTab(focusId: StashpadId): Promise<void> {
     const ws = this.app.workspace;
     const originLeaf = this.leaf;
@@ -10364,6 +10458,11 @@ export class StashpadView extends ItemView {
         onClick: () => this.navigateTo(targetParentId),
       }],
     });
+
+    // 0.191.0: open the destination parent in a BACKGROUND tab so the moved note's
+    // new home is one click away without stealing focus (setting-gated, on by
+    // default; no-ops for a move to Home or when that parent is already open).
+    void this.openParentInBackgroundTab(targetParentId);
 
     // Undo: revert each parent change AND restore the order snapshots for every affected parent.
     this.plugin.getUndoStack(folder).push({

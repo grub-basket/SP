@@ -519,6 +519,12 @@ export interface StashpadSettings {
    *  new parent; on, the view also drills into that parent so the user
    *  lands inside it. */
   autoNavOnMoveIn: boolean;
+  /** 0.191.0: after moving/nesting a note INTO another note, open that destination
+   *  parent in a BACKGROUND Stashpad tab — so the note's new home is one click away
+   *  without yanking you out of what you were doing. Distinct from autoNavOnMoveIn,
+   *  which drills the CURRENT view into the parent (and steals your place). On by
+   *  default; skipped when the destination is Home/root or already open in a tab. */
+  openParentTabOnMoveIn: boolean;
   /** 0.73.14: when on, the row under the keyboard cursor temporarily
    *  un-clamps its body — showing the full content as the user
    *  arrow-keys through the list. Moving the cursor away re-collapses
@@ -690,6 +696,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   notificationHistoryLimit: 5000,
   notifiedDueKeys: [],
   autoNavOnMoveIn: false,
+  openParentTabOnMoveIn: true,
   autoNavOnMoveOut: false,
   autoExpandCursorRow: false,
   expandBodiesByDefault: false,
@@ -1531,6 +1538,8 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.movingNotes.push(toggle("Navigate into parent after moving a note IN", "When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
+    cats.movingNotes.push(toggle("Open the new parent in a background tab after moving a note IN", "When you nest a note into another note, open that parent in a background Stashpad tab so its new home is one click away — without stealing focus from what you're doing. Skipped when the destination is Home or already open in a tab. On by default.",
+      () => this.plugin.settings.openParentTabOnMoveIn, (v) => { this.plugin.settings.openParentTabOnMoveIn = v; }, ["background", "tab", "move", "in", "parent"]));
     cats.movingNotes.push(toggle("Navigate to destination after moving a note OUT", "When you outdent a note, move it via the cross-parent picker, or send it to Home, automatically drill into the destination parent. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveOut, (v) => { this.plugin.settings.autoNavOnMoveOut = v; }, ["navigate", "move", "out"]));
     cats.listDisplay.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",

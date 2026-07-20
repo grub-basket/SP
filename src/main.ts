@@ -39,6 +39,7 @@ import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
 import { perf } from "./perf";
 import { RenderCacheStore } from "./render-cache-store";
+import { SettingsStore, MOVED_KEYS } from "./settings-store";
 
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
  *  the next load knows to un-ghost the deferred Stashpad tabs. */
@@ -1847,6 +1848,7 @@ export default class StashpadPlugin extends Plugin {
       { key: "prefixTimestampsOnCopy",    label: "Prefix timestamps when copying" },
       { key: "useTemplatesFormat",        label: "Use Templates plugin date/time formats" },
       { key: "autoNavOnMoveIn",           label: "Auto-navigate into parent on move IN" },
+      { key: "openParentTabOnMoveIn",     label: "Open new parent in a background tab on move IN" },
       { key: "autoNavOnMoveOut",          label: "Auto-navigate to destination on move OUT" },
       { key: "confirmCrossParentDrag",    label: "Confirm cross-parent drag-and-drop" },
       { key: "confirmBulkDelete",         label: "Confirm bulk deletes" },
@@ -2148,9 +2150,11 @@ export default class StashpadPlugin extends Plugin {
     // to our own data.json, then re-read + adopt the collision-protected keys and
     // refresh the folder panel. Our own writes are skipped via the settingsRev
     // guard in onExternalDataJsonChange.
-    const dataJsonPath = `${(this.manifest as any).dir.replace(/\/+$/, "")}/data.json`;
+    // 0.189.0: watch every file the settings store owns, not just data.json — the
+    // split files need the same "another window wrote this" adoption path.
+    const ownedPaths = new Set(this.store.watchPaths());
     this.registerEvent((this.app.vault as any).on("raw", (changedPath: string) => {
-      if (changedPath === dataJsonPath) this.scheduleExternalDataJsonReload();
+      if (ownedPaths.has(changedPath)) this.scheduleExternalDataJsonReload();
     }));
 
     // 0.79.1: auto-import — any file appearing directly in a Stashpad
@@ -2202,6 +2206,9 @@ export default class StashpadPlugin extends Plugin {
    *  the renderer on the cached old main.js, so the update "didn't take".
    *  Notifies once per detected on-disk version. */
   private notifiedBuildVersion: string | null = null;
+  /** On-disk version seen on the PREVIOUS check — must match the current one before
+   *  we announce it, so a mid-sync manifest churn doesn't spam the notice. */
+  private pendingBuildVersion: string | null = null;
   private async checkForSyncedBuild(): Promise<void> {
     try {
       const dir = (this.manifest as any).dir as string | undefined;
@@ -2219,6 +2226,15 @@ export default class StashpadPlugin extends Plugin {
       // focus forever. Silently ignore older/equal on-disk versions.
       if (!this.isSemverGreater(onDisk, loaded)) return;
       if (this.notifiedBuildVersion === onDisk) return;
+      // 0.190.0: require the on-disk version to hold STILL across two consecutive
+      // checks before nudging. Mid-sync, manifest.json can land, get rewritten, or
+      // flip versions repeatedly — announcing each transient state is what spammed
+      // the notice during a big sync. Waiting one interval means we only ever
+      // announce a build that actually settled.
+      if (this.pendingBuildVersion !== onDisk) {
+        this.pendingBuildVersion = onDisk;
+        return;
+      }
       this.notifiedBuildVersion = onDisk;
       this.notifications.show({
         message: `A newer Stashpad build synced in (\`${loaded}\` → \`${onDisk}\`). Reload the app to apply it.`,
@@ -6411,7 +6427,12 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const data = (await this.loadData()) ?? {};
+    // 0.189.0: merges data.json + history.json into the historic settings shape and
+    // performs the one-time split migration (backing data.json up first). Callers
+    // downstream see exactly the object they always did.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- same loose shape
+    // loadData() returned; the legacy-key migrations below index it dynamically.
+    const data = (((await this.store.loadAll()) ?? {}) as any);
     // 0.137.3: collision guard — remember the on-disk write generation we
     // loaded from, so a save can detect that another instance wrote since.
     this.lastSeenSettingsRev = typeof data?.settingsRev === "number" ? data.settingsRev : 0;
@@ -6736,6 +6757,10 @@ export default class StashpadPlugin extends Plugin {
   private static readonly COLLISION_PROTECTED_KEYS = ["encryption", "lockedSubtrees", "folderEncPrefs", "archiveFolders", "folderPanelPinned", "folderPanelDownranked", "folderPanelHidden", "folderPanelPinnedGrouping"] as const;
   private lastSeenSettingsRev = 0;
   private settingsBaseline: Record<string, string | undefined> = {};
+  /** 0.189.0: persistence layer. data.json keeps everything that must sync; the
+   *  per-device reminder/draft churn lives in history.json so a reminder firing no
+   *  longer rewrites the whole settings blob. See docs/data-split-plan.md. */
+  private store = new SettingsStore(this);
   private externalReloadDebounced = debounce(() => void this.onExternalDataJsonChange(), 600, false);
 
   /** Coalesce a burst of `raw` data.json events (a sync often writes in chunks). */
@@ -6747,21 +6772,33 @@ export default class StashpadPlugin extends Plugin {
    *  folder panel so synced pins/hides show without a reload. Skips our own writes
    *  via the settingsRev guard (our writes never raise diskRev above lastSeen). */
   private async onExternalDataJsonChange(): Promise<void> {
-    let disk: Record<string, unknown> | null = null;
-    try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { return; }
-    if (!disk) return;
-    const diskRev = typeof disk.settingsRev === "number" ? (disk.settingsRev as number) : 0;
-    if (diskRev <= this.lastSeenSettingsRev) return; // our own write (or nothing newer)
     const s = this.settings as unknown as Record<string, unknown>;
     let panelChanged = false, anyChanged = false;
-    for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
-      if (disk[k] === undefined) continue;
-      if (JSON.stringify(disk[k]) === JSON.stringify(s[k])) continue;
-      s[k] = disk[k];
-      anyChanged = true;
-      if (k.startsWith("folderPanel")) panelChanged = true;
+
+    // 0.189.0: adopt the SPLIT files first. They carry their own per-file revs, so a
+    // history.json write from another window must be picked up even when data.json
+    // is untouched — the old early-return on data.json's rev would have skipped it.
+    try {
+      const rep = await this.store.adoptExternal(s);
+      if (rep.any) anyChanged = true;
+    } catch { /* non-fatal: split files are device-local churn */ }
+
+    let disk: Record<string, unknown> | null = null;
+    try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { disk = null; }
+    const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
+    // Only walk data.json's protected keys when it actually moved on disk; our own
+    // writes never raise diskRev above lastSeen.
+    if (disk && diskRev > this.lastSeenSettingsRev) {
+      for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
+        if (disk[k] === undefined) continue;
+        if (JSON.stringify(disk[k]) === JSON.stringify(s[k])) continue;
+        s[k] = disk[k];
+        anyChanged = true;
+        if (k.startsWith("folderPanel")) panelChanged = true;
+      }
+      this.lastSeenSettingsRev = diskRev;
     }
-    this.lastSeenSettingsRev = diskRev;
+
     if (anyChanged) {
       setSettings(this.settings);
       this.snapshotSettingsBaseline();
@@ -6777,6 +6814,9 @@ export default class StashpadPlugin extends Plugin {
 
   private async guardedSave(): Promise<void> {
     let disk: Record<string, unknown> | null = null;
+    /** Set when the collision guard adopted a disk value — forces the data.json
+     *  write even if none of OUR core keys changed, so the merged result lands. */
+    let adoptedAny = false;
     try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { /* first write / unreadable */ }
     const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
     // 0.140.2: adopt on CONTENT change, not just a higher rev. Two instances
@@ -6796,6 +6836,7 @@ export default class StashpadPlugin extends Plugin {
         }
       }
       if (adopted.length) {
+        adoptedAny = true;
         console.warn(`[Stashpad] settings collision: on-disk protected keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
         new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${adopted.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
         setSettings(this.settings);
@@ -6804,10 +6845,31 @@ export default class StashpadPlugin extends Plugin {
       }
       if (diskRev > this.lastSeenSettingsRev) this.lastSeenSettingsRev = diskRev;
     }
+    const all0 = this.settings as unknown as Record<string, unknown>;
+    // Skip the data.json write entirely when only per-device churn changed — that's
+    // the other half of the split: a reminder firing must not rewrite your hotkeys.
+    const coreDirty = this.store.coreDirty(all0) || adoptedAny;
     const rev = Math.max(diskRev, this.lastSeenSettingsRev) + 1;
-    (this.settings as unknown as Record<string, unknown>).settingsRev = rev;
-    await this.saveData(this.settings);
-    this.lastSeenSettingsRev = rev;
+    if (coreDirty) (this.settings as unknown as Record<string, unknown>).settingsRev = rev;
+    // 0.189.0: the per-device churn keys go to history.json (written only when they
+    // actually changed), and data.json is written WITHOUT them. The guarded-merge
+    // logic above still governs data.json's collision-protected keys.
+    const all = this.settings as unknown as Record<string, unknown>;
+    // Isolated: history.json is per-device churn, so a failure there must never
+    // block the (more important) data.json write that follows.
+    try {
+      await this.store.saveSplit(all);
+    } catch (e) {
+      console.warn("[Stashpad] history.json write failed — continuing with data.json.", e);
+    }
+    if (coreDirty) {
+      const core: Record<string, unknown> = {};
+      const moved = new Set<string>(MOVED_KEYS);
+      for (const [k, v] of Object.entries(all)) if (!moved.has(k)) core[k] = v;
+      await this.saveData(core);
+      this.lastSeenSettingsRev = rev;
+      this.store.markCoreSaved(all);
+    }
     this.snapshotSettingsBaseline();
   }
 
