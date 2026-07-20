@@ -1,15 +1,21 @@
 # Stashpad
 
-A chat-style, nested-notes workspace for [Obsidian](https://obsidian.md). Type at
-the bottom, your notes stack and nest, and you drill in and out of the tree, with
-optional **Open Knowledge Format (OKF)** export so your notes can be shared with
-LLMs and agents.
+A capture-first, chat-style notes workspace for [Obsidian](https://obsidian.md).
+Type at the bottom and press Enter — your notes stack newest-first, nest under each
+other, and become an outline you can drill through. No filenames to invent, no folder
+to pick first: just jot it down and keep moving.
 
-> ⚠️ **Alpha software.** Stashpad does a lot and is usable daily, but it's young.
-> Keep backups of anything important.
+Think of it as a running conversation with yourself that quietly organizes into a
+tree — a scratchpad, an outliner, and a task list in one panel.
+
+> ⚠️ **Alpha software, honestly labeled.** Stashpad does a lot and is usable daily,
+> but it's young — keep backups of anything important.
 >
-> The project was designed and directed by its maintainer, but the **code was
-> written by an AI assistant** — it is not hand-authored or human-reviewed.
+> It's designed and directed by its maintainer, but the **code is written by an AI
+> assistant** rather than hand-authored or human-reviewed. The upside of that is
+> pace: Stashpad is **actively maintained and moves quickly**, and bug reports are
+> genuinely welcome and get acted on. If something breaks or feels off,
+> [open an issue](https://github.com/grub-basket/SP/issues) — it'll be looked at.
 
 ## Install
 
@@ -28,56 +34,95 @@ Stashpad is on the [Obsidian community store](https://community.obsidian.md/plug
    appears in the list above.
 3. **Click a note (or press →)** to drill into it; new notes you add now nest under
    it. Press **←** or the back arrow to come back out.
-4. Explore from there: search, move/clone, set colors, pin, make tasks, or turn on
-   OKF (below) to export.
+4. From there: search, move/clone, set colors, pin, or turn a note into a task with a
+   due date and reminder.
 
-## What it does
+---
 
-- **Chat-style capture** — type at the bottom, hit Enter; Shift+Enter for newlines,
-  with an optional split-on-newlines mode.
-- **Outliner** — notes nest under notes, arbitrarily deep; drill in/out, focus any
-  note as a temporary root.
-- **Search** — fast all-tokens/any-order "Sift" search across one folder or every
-  Stashpad in the vault.
-- **Organize** — move/merge/clone/outdent, drag-and-drop re-parenting, manual order,
-  per-note colors with friendly aliases, pinning, and cross-folder cut/copy/paste of
-  whole subtrees (attachments included, fully undoable).
-- **Tasks** — turn a note into a to-do, set due dates, get reminders.
-- **Tiny mode** — pop Stashpad into a small, pinnable, opacity-adjustable window for
-  quick capture while you work elsewhere.
-- **Folder panel** — sidebar of your Stashpad folders and pinned notes/folders.
+## Capture-first: type and go
+
+The heart of Stashpad is the composer pinned to the bottom of the panel. You type,
+you press Enter, and the note lands in the list above — no dialog, no filename to
+invent, no folder to choose. It's the messaging-app model applied to notes: the cost
+of writing something down drops to almost nothing, so you actually do it.
+
+Shift+Enter adds newlines for a longer thought, and an optional split-on-newlines mode
+turns one burst into several separate notes at once. Everything you capture is an
+ordinary Markdown file with frontmatter — nothing proprietary, readable by the rest of
+Obsidian and by you in ten years.
+
+## An outliner that nests as deep as you think
+
+Notes aren't a flat feed. Click a note (or press →) to drill into it, and anything you
+capture next nests underneath — arbitrarily deep. Press ← to climb back out. Any note
+can become a temporary root, so you can focus a single branch and work inside it
+without the rest of the tree in your way.
+
+The result is that structure *emerges* from fast capture instead of being planned up
+front. Dump thoughts in as they come; promote, demote, and rearrange them into an
+outline later — or never, if the newest-first stack is all you need.
+
+## Tasks & reminders
+
+Turn any note into a to-do with a keystroke: it gains a checkbox you can tick right in
+the list. Give it a due date and Stashpad will remind you when it's due — click the
+reminder to jump straight to the task, or snooze it. Tasks support recurrence and
+assignees, and a dedicated tasks panel gathers everything that's open so your notes and
+your to-dos live in the same place instead of a separate app.
+
+## Find anything fast
+
+Search uses **Sift** — all-tokens, any-order, case-insensitive matching — so "budget
+q3" finds "Q3 budget review" without you remembering the exact wording. Search a single
+Stashpad folder or every Stashpad in the vault at once, and narrow results with filters
+like color or completion state.
+
+## Organize without friction
+
+When you *do* want to tidy up, the moves are all there: move, merge, clone, and outdent;
+drag-and-drop re-parenting; manual ordering; and per-note **colors** you can give
+friendly aliases (so `#ffe243` becomes "boogers"). Pin the notes and folders you return
+to. You can even cut / copy / paste whole subtrees — attachments included — across
+folders, and every structural change is fully undoable, so reorganizing never feels
+risky.
+
+## Tiny mode
+
+Pop Stashpad out into a small, always-on-top, opacity-adjustable window and pin it to a
+corner of your screen. It's built for capturing a stray thought while you're working in
+another app — jot it, and get back to what you were doing without losing your place.
+
+## Attachments & clean copy-out
+
+Drop files onto the panel and they auto-import as attachments. When you want notes *out*
+of Stashpad, copy them as a checklist (tasks come across as real `- [ ]` / `- [x]`
+checkboxes, with color/alias carried along), as an indented outline, or as `![[embed]]`
+links you can transclude into any regular Obsidian note.
+
+---
+
+## Also includes
+
+Useful extras that aren't the point of Stashpad, but are there when you need them —
+and out of the way when you don't:
+
 - **Import / export** — `.stash` bundles (optionally encrypted) round-trip notes +
-  attachments; dropped files auto-import.
+  attachments between vaults.
+- **Encryption (beta)** — lock notes or folders into encrypted `.stashenc` files, with
+  archive folders, encrypted trash, and shared-key collaboration. *(Please read the
+  caveat below.)*
 - **Authorship / multiplayer** — stamp notes with your name; shared vaults track
-  contributors, with a vault-wide author registry.
+  contributors via a vault-wide author registry.
 - **Johnny.Decimal index** — build a JD-style hierarchy from dotted-prefix titles.
+- **Open Knowledge Format (OKF) export** — opt a folder in to export it as an
+  [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf) bundle
+  (`.zip` / `.tar.gz` / `.stash`) — Google's vendor-neutral Markdown format for handing
+  curated knowledge to LLMs and agents. See [`docs/okf-guide.md`](docs/okf-guide.md).
 
-## Open Knowledge Format (OKF)
-
-[OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf) is
-Google's open, vendor-neutral spec for packaging curated knowledge as Markdown that
-LLMs and agents can read. Stashpad already stores notes as Markdown with frontmatter
-and a real hierarchy, so it can produce OKF bundles for you:
-
-- Turn OKF on, then opt **per folder** by assigning the auto-created template.
-- Each OKF folder gets complementary `okf*` frontmatter and a generated `index.md`;
-  your own fields and links are never renamed or removed.
-- **Export as OKF** to `.zip` / `.tar.gz` (portable bundles) or `.stash`. On export,
-  the `okf*` fields are mapped to OKF's standard keys (`type` / `title` / etc.) and
-  the hierarchy becomes relative-Markdown links, so the bundle is spec-compliant while
-  the originals are kept for lossless re-import.
-
-See [`docs/okf-guide.md`](docs/okf-guide.md) for a from-scratch walkthrough.
-
-## Encryption (optional, beta)
-
-Stashpad can lock notes/folders into encrypted `.stashenc` files, with archive folders,
-encrypted trash, and shared-key collaboration.
-
-> 🔒 **Please read:** the encryption was written by an AI assistant and has **not**
-> been human-audited or security-tested. Treat it as a best-effort way to deter a
-> casual snoop, **not** a guarantee. Don't rely on it for anything sensitive, and keep
-> unencrypted backups. It's optional and off by default.
+> 🔒 **On encryption:** it was written by an AI assistant and has **not** been
+> human-audited or security-tested. Treat it as a way to deter a casual snoop, **not**
+> a guarantee — don't rely on it for anything sensitive, and keep unencrypted backups.
+> It's optional and off by default.
 
 ## Feedback
 
