@@ -1855,7 +1855,7 @@ export class EncryptionPasswordModal extends Modal {
     // the key is safe, so the risk + liability travel with every password dialog.
     const betaRow = this.contentEl.createDiv({ cls: "stashpad-beta-row" });
     betaRow.createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
-    betaRow.createEl("span", { cls: "stashpad-beta-note", text: "Beta encryption — data can be lost with or without your key. Keep unencrypted backups; Stashpad isn't liable for data loss." });
+    betaRow.createEl("span", { cls: "stashpad-beta-note", text: "Beta, unaudited encryption — not proven to protect anything, and data can be lost with or without your key. Keep unencrypted backups. Stashpad isn't liable for data loss or for a failure to keep your data private." });
 
     if (this.opts.intro) {
       this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: this.opts.intro });

@@ -1691,7 +1691,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         "Each device unlocks with its own password (it never leaves the device); collaborators get access by device approval, not a shared password. If everyone with access loses their password, the content is unrecoverable. While encrypting or decrypting, avoid having a sync/cloud service write the vault mid-operation — it can corrupt files.",
       );
       warn.createEl("p", { cls: "stashpad-enc-liability" }).setText(
-        "Stashpad cannot recover keys or passwords, and is not liable for the loss of keys, passwords, or any data — whether the cause is a lost key or a fault in this beta encryption itself. Keeping your own backups is yours to do.",
+        "No warranty of any kind. This encryption has never been audited, so it is not proven to protect anything. Stashpad cannot recover keys or passwords, and is not liable for the loss of keys, passwords or data, for a fault in this beta encryption, or for any harm that follows if it fails to keep your data private. Keeping your own backups — and deciding what is safe to trust it with — are yours to do.",
       );
 
       // 0.137.4: ONE collapsible, toggle-free "how it works" reference block, so

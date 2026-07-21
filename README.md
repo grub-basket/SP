@@ -137,9 +137,11 @@ and out of the way when you don't:
 > interrupted lock/unlock, or a sync writing the vault mid-operation can damage
 > encrypted files even when your password is perfectly safe. Keep unencrypted backups.
 >
-> *Stashpad cannot recover keys or passwords, and is not liable for the loss of keys,
-> passwords, or any data — whether the cause is a lost key or a fault in this beta
-> encryption itself.*
+> *No warranty of any kind. This encryption has never been audited, so it is not proven
+> to protect anything. Stashpad cannot recover keys or passwords, and is not liable for
+> the loss of keys, passwords or data, for a fault in this beta encryption, or for any
+> harm that follows if it fails to keep your data private. Keeping your own backups —
+> and deciding what is safe to trust it with — are yours to do.*
 
 ## Feedback
 
