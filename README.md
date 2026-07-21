@@ -119,10 +119,22 @@ and out of the way when you don't:
   (`.zip` / `.tar.gz` / `.stash`) — Google's vendor-neutral Markdown format for handing
   curated knowledge to LLMs and agents. See [`docs/okf-guide.md`](docs/okf-guide.md).
 
-> 🔒 **On encryption:** it was written by an AI assistant and has **not** been
-> human-audited or security-tested. Treat it as a way to deter a casual snoop, **not**
-> a guarantee — don't rely on it for anything sensitive, and keep unencrypted backups.
-> It's optional and off by default.
+> 🔒 **On encryption — read before you encrypt anything.**
+>
+> **Save your folder password in a password manager first.** "Remember on this device
+> (keychain)" is a convenience, **not a backup**. An OS or keychain reset, a
+> wiped/restored profile, a reinstall, a new machine, or an IT event can erase it at
+> any time, without warning. If that was the only copy of your password, everything
+> encrypted under it is permanently unreadable — by you, by us, by anyone. Setting a
+> **Recovery password** as a second way in is strongly recommended.
+>
+> The encryption was also written by an AI assistant and has **not** been human-audited
+> or security-tested. Treat it as a way to deter a casual snoop, **not** a guarantee —
+> don't rely on it for anything sensitive, and keep unencrypted backups. It's optional
+> and off by default.
+>
+> *Stashpad cannot recover keys or passwords, and is not liable for the loss of keys,
+> passwords, or any data encrypted with them.*
 
 ## Feedback
 

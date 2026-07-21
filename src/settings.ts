@@ -1108,7 +1108,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
   private promptSetFolderPassword(folder: string): void {
     new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: true, title: `Set password for “${folder.split("/").pop()}”`,
-      intro: "A separate password just for this folder. Share it with collaborators out-of-band (a password manager, Signal, in person). There is NO recovery if it's lost.",
+      intro: "A separate password just for this folder. Save it in a password manager BEFORE you continue — the device keychain is a convenience that can be wiped at any time, not a backup. There is NO recovery if it's lost: Stashpad cannot recover it, and everything encrypted under it becomes permanently unreadable.",
       onSubmit: async ({ next, remember }) => { if (!next) return "Enter a password."; try { await this.plugin.encryption.setupFolderKey(folder, next, this.folderKeyLabel(folder), remember); } catch (e) { return (e as Error).message; } new Notice("Folder password set — share it securely."); this.update?.(); this.pfeRerender?.(); return null; } }).open();
   }
   private promptChangeFolderPassword(folder: string): void {
@@ -1656,7 +1656,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     const enc = this.plugin.encryption;
     const items: SettingDefinitionItem[] = [];
 
-    items.push(this.sectionDef("Vault Encryption", "Set one password to encrypt content in this vault. Stored only on this device — there is no recovery if you lose it.", (host) => {
+    items.push(this.sectionDef("Vault Encryption", "Encrypt notes per folder with a password you choose. Keep that password in a password manager — there is no recovery if it is lost.", (host) => {
       host.addClass("stashpad-encryption-section");
       const betaRow = host.createDiv({ cls: "stashpad-beta-row" });
       betaRow.createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
@@ -1665,6 +1665,20 @@ export class StashpadSettingTab extends PluginSettingTab {
       // a ⚠️ description paragraph here, and a "no recovery" callout at the top
       // of the per-folder section). Same .stashpad-enc-warning callout style.
       const warn = host.createEl("div", { cls: "stashpad-enc-warning" });
+      // 0.194.0: keychain loss leads, because it's the failure that actually happens.
+      // (Real incident: a server/profile reset wiped the OS keychain and took the only
+      // copy of a folder password with it.) The key itself lives in the folder's
+      // `.stashkey`; the keychain only ever held a CONVENIENCE copy of the password —
+      // so if that copy was the only one, the content is gone.
+      warn.createEl("p", { cls: "stashpad-enc-lead" }).setText(
+        "⚠️ Write your password down somewhere outside this computer — a password manager — BEFORE you encrypt anything.",
+      );
+      warn.createEl("p").setText(
+        "“Remember on this device (keychain)” is a convenience, NOT a backup. An OS or keychain reset, a wiped/restored profile, a reinstall, a new machine, or an IT/server event can erase it at any time, without warning and without asking you. If the only copy of your password was in the keychain, everything encrypted under it is permanently unreadable — by you, by us, by anyone.",
+      );
+      warn.createEl("p").setText(
+        "Store the password in a password manager (1Password, Bitwarden, KeePass…), and set a Recovery password as a second way in. Both are stored outside the keychain, so they survive the events above.",
+      );
       warn.createEl("p").setText(
         "⚠️ AI-built, NOT human-audited. This encryption was written by an AI assistant — not reviewed or security-audited by a human. Treat it as best-effort protection against a casual snoop, not a guarantee — and always keep your own unencrypted backups of anything important.",
       );
@@ -1673,6 +1687,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       );
       warn.createEl("p").setText(
         "Each device unlocks with its own password (it never leaves the device); collaborators get access by device approval, not a shared password. If everyone with access loses their password, the content is unrecoverable. While encrypting or decrypting, avoid having a sync/cloud service write the vault mid-operation — it can corrupt files.",
+      );
+      warn.createEl("p", { cls: "stashpad-enc-liability" }).setText(
+        "Stashpad cannot recover keys or passwords, and is not liable for the loss of keys, passwords, or any data encrypted with them. Backing them up is yours to do.",
       );
 
       // 0.137.4: ONE collapsible, toggle-free "how it works" reference block, so

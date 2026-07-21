@@ -6090,11 +6090,30 @@ body.stashpad-folderpanel-resizing { cursor: row-resize; user-select: none; }
      Vault Encryption section (was three separate warnings) — inset 14px to
      line up with the section's setting rows. */
   margin: 4px 14px 18px;
-  font-size: 13px;
-  line-height: 1.5;
+  /* 0.194.0: bumped 13px -> 14px and the rule 3px -> 4px. A user lost an encryption
+     key to a keychain wipe; this callout is the last thing standing between someone
+     and permanent data loss, so it gets read-me-first weight. */
+  font-size: 14px;
+  line-height: 1.55;
 }
 .stashpad-enc-warning p { margin: 0; }
-.stashpad-enc-warning p + p { margin-top: 8px; }
+.stashpad-enc-warning p + p { margin-top: 9px; }
+/* The single most important sentence in the plugin — larger and bolder than the
+   paragraphs beneath it. */
+.stashpad-enc-warning .stashpad-enc-lead {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+.stashpad-enc-warning strong { color: var(--text-normal); font-weight: 700; }
+/* Liability line: quieter than the warnings, but unmissable. */
+.stashpad-enc-warning .stashpad-enc-liability {
+  margin-top: 11px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(var(--color-red-rgb, 224, 49, 49), 0.35);
+  font-size: 13px;
+  font-style: italic;
+}
 /* 0.137.4: collapsible "how encryption works" concepts block — one toggle-free
    reference so the individual setting rows can stay one-liners. Collapsed by
    default (details), neutral (not a warning). */
@@ -6229,3 +6248,15 @@ button.stashpad-btn-loading::after {
 .stashpad-import-view .stashpad-import-preview { max-height: none; }
 .stashpad-import-popicon { display: inline-flex; margin-left: 4px; vertical-align: -2px; }
 .stashpad-import-popicon svg { width: 14px; height: 14px; }
+
+/* 0.194.0 — the keychain opt-in note carries a real data-loss warning now, so it
+   gets warning colour instead of reading as neutral fine print. */
+.stashpad-keychain-note {
+  color: var(--text-normal);
+  border-left: 3px solid var(--color-red, #e03131);
+  background: rgba(var(--color-red-rgb, 224, 49, 49), 0.10);
+  padding: 8px 10px;
+  border-radius: 4px;
+  margin-top: 6px;
+  line-height: 1.5;
+}

@@ -1972,7 +1972,10 @@ export class EncryptionPasswordModal extends Modal {
       const lbl = row.createEl("label", { text: "Remember on this device (keychain) — auto-unlock here without re-typing." });
       lbl.htmlFor = rememberCb.id;
       const note = this.contentEl.createDiv({ cls: "stashpad-export-remember-note" });
-      note.setText("Stored only in this device's keychain — doesn't sync to your other devices. Anyone with access to this unlocked device + keychain could decrypt.");
+      // 0.194.0: this checkbox is where people accidentally make the keychain the
+      // ONLY copy of their password. Say so here, at the moment of the decision.
+      note.setText("Stored only in this device's keychain — it doesn't sync, and anyone with access to this unlocked device could decrypt. This is a convenience, NOT a backup: an OS/keychain reset, a restored profile, a reinstall or a new machine can erase it without warning. Keep the password in a password manager too, or you will lose access to everything encrypted under it.");
+      note.addClass("stashpad-keychain-note");
       note.setCssStyles({ display: rememberCb.checked ? "" : "none" });
       rememberCb.onchange = () => { note.setCssStyles({ display: rememberCb!.checked ? "" : "none" }); };
     }
