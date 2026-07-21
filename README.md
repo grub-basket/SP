@@ -125,8 +125,12 @@ and out of the way when you don't:
 > (keychain)" is a convenience, **not a backup**. An OS or keychain reset, a
 > wiped/restored profile, a reinstall, a new machine, or an IT event can erase it at
 > any time, without warning. If that was the only copy of your password, everything
-> encrypted under it is permanently unreadable — by you, by us, by anyone. Setting a
-> **Recovery password** as a second way in is strongly recommended.
+> encrypted under it is permanently unreadable — by you, by us, by anyone.
+>
+> A **Recovery password** adds a second way in, but only helps if you keep it somewhere
+> separate from the main one — two entries in the same password manager both vanish
+> with that manager. Do set one for **shared** folders: it survives a collaborator
+> changing the main password.
 >
 > The encryption was also written by an AI assistant and has **not** been human-audited
 > or security-tested. Treat it as a way to deter a casual snoop, **not** a guarantee —

@@ -1108,7 +1108,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
   private promptSetFolderPassword(folder: string): void {
     new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: true, title: `Set password for “${folder.split("/").pop()}”`,
-      intro: "A separate password just for this folder. Save it in a password manager BEFORE you continue — the device keychain is a convenience that can be wiped at any time, not a backup. There is NO recovery if it's lost: Stashpad cannot recover it, and everything encrypted under it becomes permanently unreadable.",
+      intro: "A separate password just for this folder. Save it in a password manager BEFORE you continue — the device keychain is a convenience that can be wiped at any time, not a backup. There is NO recovery if it's lost: Stashpad cannot recover it, and everything encrypted under it becomes permanently unreadable. If you plan to SHARE this folder, add a Recovery password afterwards and keep it somewhere separate — anyone you share the main password with can change it, and only a recovery password gets you back in.",
       onSubmit: async ({ next, remember }) => { if (!next) return "Enter a password."; try { await this.plugin.encryption.setupFolderKey(folder, next, this.folderKeyLabel(folder), remember); } catch (e) { return (e as Error).message; } new Notice("Folder password set — share it securely."); this.update?.(); this.pfeRerender?.(); return null; } }).open();
   }
   private promptChangeFolderPassword(folder: string): void {
@@ -1119,7 +1119,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   private promptSetFolderRecovery(folder: string): void {
     const name = folder.split("/").pop() || folder;
     new EncryptionPasswordModal(this.app, { mode: "setup", offerKeychain: false, title: `Recovery password for “${name}”`,
-      intro: "A SECOND password that also unlocks this folder — a backup in case the main password is lost. It wraps the same key, so it's exactly as sensitive: store it somewhere safe and separate. Setting it again replaces any existing recovery password.",
+      intro: "A SECOND password that also unlocks this folder. Either one works, so it is exactly as sensitive as the main password. It only buys you anything if you store it SOMEWHERE ELSE — a different password manager, printed and filed, or with someone you trust; two entries in the same manager both vanish with that manager. Its other job: it survives a change of the main password, so on a SHARED folder it's your way back in if a collaborator rotates the password, and it can't go stale the way a saved copy of a rotated password does. Setting it again replaces any existing recovery password.",
       onSubmit: async ({ next }) => { if (!next) return "Enter a password."; try { await this.plugin.encryption.setFolderRecoveryPassword(folder, next); } catch (e) { return (e as Error).message; } new Notice("Recovery password set — keep it somewhere safe."); this.update?.(); this.pfeRerender?.(); return null; } }).open();
   }
   private promptRemoveFolderRecovery(folder: string): void {
@@ -1225,8 +1225,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       const hasRec = this.plugin.encryption.folderHasRecovery(folder);
       const rec = new Setting(host).setName("Recovery password")
         .setDesc(hasRec
-          ? "A second password that also unlocks this folder. Keep it somewhere safe and separate."
-          : "Optional. Add a second password that also unlocks this folder, as a backup if the main one is lost.");
+          ? "A second password that also unlocks this folder. Keep it somewhere SEPARATE from the main password — a different password manager, printed, or with someone you trust."
+          : "Optional second password that also unlocks this folder. Only worth it if you store it somewhere SEPARATE from the main password — two entries in the same password manager don't protect you from losing that manager. Recommended for SHARED folders: it survives someone else changing the main password.");
       rec.addButton((b) => b.setButtonText(hasRec ? "Change recovery…" : "Add recovery…").onClick(() => this.promptSetFolderRecovery(folder)));
       if (hasRec) rec.addButton((b) => { b.setButtonText("Remove recovery").onClick(() => this.promptRemoveFolderRecovery(folder)); b.buttonEl.addClass("mod-warning"); });
     }
@@ -1679,7 +1679,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         "“Remember on this device (keychain)” is a convenience, NOT a backup. An OS or keychain reset, a wiped/restored profile, a reinstall, a new machine, or an IT/server event can erase it at any time, without warning and without asking you. If the only copy of your password was in the keychain, everything encrypted under it is permanently unreadable — by you, by us, by anyone.",
       );
       warn.createEl("p").setText(
-        "Store the password in a password manager (1Password, Bitwarden, KeePass…), and set a Recovery password as a second way in. Both are stored outside the keychain, so they survive the events above.",
+        "Store the password in a password manager (1Password, Bitwarden, KeePass…) — that alone is what saves you, and it lives outside the keychain so it survives the events above. A Recovery password is a SECOND way in, but only helps if you keep it somewhere separate from the main one (a different manager, printed, or with someone you trust); two entries in the same manager add little. Do set one for SHARED folders — it survives a collaborator changing the main password.",
       );
       warn.createEl("p").setText(
         "⚠️ AI-built, NOT human-audited. This encryption was written by an AI assistant — not reviewed or security-audited by a human. Treat it as best-effort protection against a casual snoop, not a guarantee — and always keep your own unencrypted backups of anything important.",
