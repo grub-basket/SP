@@ -27,6 +27,9 @@ import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
 import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, NoteWorkbenchModal } from "./modals";
+import { TextImportModal } from "./text-import-modal";
+import type { ImportNote } from "./text-importer";
+import { isAllCheckboxLines } from "./text-importer";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, humanCombo } from "./view-keys";
 import { openAggregateView } from "./aggregate-view";
@@ -6079,7 +6082,11 @@ export class StashpadView extends ItemView {
       // draft re-appear on reload if writes were still in flight.
       try { await this.saveDraft(""); } catch { /* ignore */ }
       try { await this.recordLastSubmitted(text); } catch { /* ignore */ }
-      const split = this.modeSplit ?? getSettings().splitOnLines;
+      // 0.193.0: a block where EVERY line is a checkbox is a task LIST — split it
+      // into one task per line even when split-on-newlines is off, since a single
+      // note full of checkbox text is almost never the intent (setting-gated).
+      const allChecks = getSettings().splitCheckboxLines && isAllCheckboxLines(text);
+      const split = (this.modeSplit ?? getSettings().splitOnLines) || allChecks;
       const dest = this.nextDestination;
       // 0.76.15: capture the cross-folder target (if any) before
       // resetting. A remote destination creates the note in that
@@ -8279,6 +8286,110 @@ export class StashpadView extends ItemView {
   cmdCopyCodeBlock(): Promise<void> { return clipboardCmds.cmdCopyCodeBlock(this); }
   cmdCopyTree(): Promise<void> { return clipboardCmds.cmdCopyTree(this); }
   cmdCopyOutline(): Promise<void> { return clipboardCmds.cmdCopyOutline(this); }
+
+  /** 0.193.0: reverse colour-alias lookup — friendly name → hex for THIS folder.
+   *  (settings.colorAliases stores hex → name, so this scans.) Case-insensitive. */
+  private hexForColorAlias(folder: string, name: string): string | null {
+    const map = this.plugin.settings.colorAliases?.[folder.replace(/\/+$/, "")] ?? {};
+    const want = name.trim().toLowerCase();
+    for (const [hex, alias] of Object.entries(map)) {
+      if (typeof alias === "string" && alias.trim().toLowerCase() === want) return hex;
+    }
+    return null;
+  }
+
+  /** 0.192.0: open the paste-text importer — the standalone Stashpad Importer web
+   *  app's job, done in-plugin (no `.stash` round-trip). Level-1 notes land under
+   *  whatever is currently focused, so you can import straight into a subtree. */
+  cmdImportText(): void {
+    const focus = this.focusId && this.focusId !== ROOT_ID ? this.tree.get(this.focusId) : null;
+    const dest = focus ? `“${this.titleForNode(focus)}”` : `“${this.noteFolder}” (home)`;
+    const run = (notes: ImportNote[]) => this.runTextImport(notes);
+    new TextImportModal(
+      this.app, dest, run,
+      // Pop out into a full tab, carrying the typed text + options across.
+      (state) => void this.plugin.openTextImporter({ state, destinationLabel: dest, onImport: run }),
+    ).open();
+  }
+
+  /** Create the parsed notes in order: each note's parent is resolved from the
+   *  already-created note at its parentIndex, colours are stamped after creation,
+   *  and the whole batch is ONE undo entry. */
+  private async runTextImport(notes: ImportNote[]): Promise<void> {
+    if (!notes.length) return;
+    const folder = this.noteFolder;
+    const rootParent: StashpadId = this.focusId ?? ROOT_ID;
+    const collected: Array<{ path: string; content: string }> = [];
+    const createdIds: Array<StashpadId | null> = [];
+    const base = Date.now();
+    let failed = 0;
+
+    this.beginBulkRender();
+    try {
+      for (let i = 0; i < notes.length; i++) {
+        const n = notes[i];
+        // A parent that failed to create falls back to the import root rather than
+        // orphaning the child.
+        const parentId = n.parentIndex == null ? rootParent : (createdIds[n.parentIndex] ?? rootParent);
+        const before = collected.length;
+        const id = await this.createNoteUnder(n.body, parentId, {
+          record: false,
+          // Ascending by 1ms so the imported order is preserved by created-time sort.
+          createdOverride: new Date(base + i).toISOString(),
+          deferRender: true,
+          collectInto: collected,
+        });
+        createdIds.push(id);
+        if (!id) { failed++; continue; }
+        // 0.193.0: an unresolved colour NAME ("[color: boogers]") is looked up in
+        // this folder's own colour aliases before giving up — built-in names like
+        // "amber" were already resolved by the parser.
+        let hex = n.color;
+        if (!hex && n.colorName) hex = this.hexForColorAlias(folder, n.colorName);
+        if (hex) {
+          const path = collected.length > before ? collected[collected.length - 1].path : null;
+          const f = path ? (this.app.vault.getAbstractFileByPath(path) as TFile | null) : null;
+          if (f) {
+            try {
+              await this.app.fileManager.processFrontMatter(f, (m: any) => { m.color = hex; });
+            } catch { /* colour is cosmetic — never fail the import over it */ }
+          }
+          // Carry the friendly colour name across as a folder colour alias, so a
+          // round-tripped copy keeps its palette names.
+          if (n.colorAlias) {
+            try { await this.plugin.setColorAlias(folder, hex, n.colorAlias); } catch { /* ignore */ }
+          }
+        }
+      }
+    } finally {
+      try { await this.fmSync.flush(); } catch { /* best effort */ }
+      this.endBulkRender();
+    }
+
+    this.tree.rebuild(folder);
+    this.render();
+    const made = collected.length;
+    this.plugin.notifications.show({
+      message: `Imported ${made} note${made === 1 ? "" : "s"}${failed ? ` (${failed} failed)` : ""}`,
+      kind: failed ? "warning" : "success",
+      category: "system",
+      affectedIds: createdIds.filter((x): x is StashpadId => !!x),
+      folder,
+    });
+
+    const created = collected.slice();
+    this.plugin.getUndoStack(folder).push({
+      label: `Import ${made} note${made === 1 ? "" : "s"}`,
+      undo: async () => {
+        for (const { path } of created) {
+          const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+          if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
 
   /** 0.188.0: inline task/color metadata prefix for a COPIED note, so a task
    *  pastes as a real Obsidian checkbox and a note's color (+ its alias) survive
@@ -11353,12 +11464,15 @@ export class StashpadView extends ItemView {
     }
 
     // 0.176.0: a leading checkbox prefix makes the note a task. "[]" / "[ ]" →
+    // 0.193.0: an optional "- "/"* "/"+ " list marker is allowed in front, because
+    // that's exactly what Copy emits ("- [x] text") — without it, pasting your own
+    // copied tasks back in produced plain notes that merely LOOKED like checkboxes.
     // open task; "[x]" / "[X]" → completed. The prefix (and any trailing space)
     // is stripped from the stored body, so the slug/title/first-line are clean.
     // Requires actual content after the bracket, so a bare "[]" isn't swallowed.
     let taskPrefix: { completed: boolean } | null = null;
     {
-      const m = body.match(/^\s*\[([ xX]?)\]\s*(?=\S)/);
+      const m = body.match(/^\s*(?:[-*+]\s+)?\[([ xX]?)\]\s*(?=\S)/);
       if (m) {
         taskPrefix = { completed: /[xX]/.test(m[1]) };
         body = body.slice(m[0].length);

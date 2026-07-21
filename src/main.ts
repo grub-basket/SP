@@ -40,6 +40,7 @@ import { ImportLog } from "./import-log";
 import { perf } from "./perf";
 import { RenderCacheStore } from "./render-cache-store";
 import { SettingsStore, MOVED_KEYS } from "./settings-store";
+import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
 
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
  *  the next load knows to un-ghost the deferred Stashpad tabs. */
@@ -1008,6 +1009,12 @@ export default class StashpadPlugin extends Plugin {
       WORKBENCH_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new NoteWorkbenchView(leaf),
     );
+    // 0.193.0: same idea for the paste-text importer — a long outline is cramped in
+    // a modal, so it can pop out into a full tab.
+    this.registerView(
+      TEXT_IMPORT_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new TextImportView(leaf),
+    );
     // Deep links: `obsidian://stashpad?folder=…&note=<id>&run=reveal[,open]`.
     // Routes into the Stashpad view, reveals a note, runs a small macro. See
     // `docs/deep-links-plan.md`. (Obsidian only allows an action under its own
@@ -1467,6 +1474,12 @@ export default class StashpadPlugin extends Plugin {
       name: "Resend reminders for incomplete due tasks (show my backlog)",
       callback: () => void this.resendDueReminders(),
     });
+    // 0.192.0: paste-text importer (replaces the standalone Stashpad Importer web app).
+    this.addCommand({
+      id: "stashpad-import-text",
+      name: "Import pasted text (paste → nested notes)…",
+      callback: () => call("cmdImportText"),
+    });
     this.addCommand({
       id: "stashpad-copy-link",
       name: "Copy Stashpad link (deep link / URL) to note",
@@ -1847,6 +1860,7 @@ export default class StashpadPlugin extends Plugin {
     const TOGGLES: Array<{ key: keyof StashpadSettings; label: string }> = [
       { key: "prefixTimestampsOnCopy",    label: "Prefix timestamps when copying" },
       { key: "useTemplatesFormat",        label: "Use Templates plugin date/time formats" },
+      { key: "splitCheckboxLines",        label: "Split a pasted checklist into tasks" },
       { key: "autoNavOnMoveIn",           label: "Auto-navigate into parent on move IN" },
       { key: "openParentTabOnMoveIn",     label: "Open new parent in a background tab on move IN" },
       { key: "autoNavOnMoveOut",          label: "Auto-navigate to destination on move OUT" },
@@ -4081,6 +4095,16 @@ export default class StashpadPlugin extends Plugin {
    *  injects the live context (the split handlers are closures bound to the source
    *  note, so the tab must be seeded right away; a restored context-less view shows
    *  a "session ended" placeholder). */
+  /** 0.193.0: pop the paste-text importer out into a full tab, carrying whatever was
+   *  already typed so nothing is lost on the way out of the modal. */
+  async openTextImporter(ctx: Omit<ImporterViewContext, "prevLeaf">): Promise<void> {
+    const prevLeaf = this.app.workspace.getMostRecentLeaf();
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: TEXT_IMPORT_VIEW_TYPE, active: true });
+    if (leaf.view instanceof TextImportView) leaf.view.setContext({ ...ctx, prevLeaf });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
   async openWorkbench(body: string, cbs: WorkbenchCommandCallbacks, init: Partial<WorkbenchState>): Promise<void> {
     // Remember the tab we came from so the split tab can hand focus back on close.
     const prevLeaf = this.app.workspace.getMostRecentLeaf();
@@ -6430,9 +6454,7 @@ export default class StashpadPlugin extends Plugin {
     // 0.189.0: merges data.json + history.json into the historic settings shape and
     // performs the one-time split migration (backing data.json up first). Callers
     // downstream see exactly the object they always did.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- same loose shape
-    // loadData() returned; the legacy-key migrations below index it dynamically.
-    const data = (((await this.store.loadAll()) ?? {}) as any);
+    const data = (await this.store.loadAll()) ?? {};
     // 0.137.3: collision guard — remember the on-disk write generation we
     // loaded from, so a save can detect that another instance wrote since.
     this.lastSeenSettingsRev = typeof data?.settingsRev === "number" ? data.settingsRev : 0;

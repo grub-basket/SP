@@ -6178,3 +6178,54 @@ button.stashpad-btn-loading::after {
 .stashpad-due-recur-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
 .stashpad-due-recur-row label { flex: 0 0 130px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
 .stashpad-due-recur-row input { flex: 1; }
+
+/* ---------------------------------------------------------------------------
+   0.192.0 — paste-text importer modal (TextImportModal)
+   --------------------------------------------------------------------------- */
+.stashpad-import-input {
+  width: 100%;
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  resize: vertical;
+}
+.stashpad-import-count { margin-top: 10px; }
+.stashpad-import-preview {
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 6px 0 4px;
+  padding: 6px 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-primary-alt);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-import-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-import-check { color: var(--text-muted); flex: 0 0 auto; }
+.stashpad-import-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-import-text { overflow: hidden; text-overflow: ellipsis; }
+.stashpad-import-more { color: var(--text-faint); flex: 0 0 auto; }
+
+/* 0.193.0 — importer as a pop-out tab: give the leaf the same padding a modal has. */
+.stashpad-import-view {
+  padding: 12px 16px 16px;
+  overflow-y: auto;
+}
+.stashpad-import-view .stashpad-import-preview { max-height: none; }
+.stashpad-import-popicon { display: inline-flex; margin-left: 4px; vertical-align: -2px; }
+.stashpad-import-popicon svg { width: 14px; height: 14px; }

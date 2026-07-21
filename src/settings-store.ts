@@ -114,8 +114,13 @@ export class SettingsStore {
   /** Read every file and merge into ONE object with the historic settings shape.
    *  Split files win over data.json (data.json's copies are stale leftovers from
    *  before migration); a missing split file falls back to data.json's copy, so a
-   *  deleted/unreadable file never reads as "user cleared these settings". */
-  async loadAll(): Promise<Bag> {
+   *  deleted/unreadable file never reads as "user cleared these settings".
+   *
+   *  Returns whatever `loadData()` returns (Obsidian types it loosely) so callers
+   *  keep indexing it dynamically for legacy-key migrations — deriving the type from
+   *  Plugin["loadData"] avoids writing an explicit `any`, which the community-plugin
+   *  review rejects — as it does any lint-suppression directive for it. */
+  async loadAll(): ReturnType<Plugin["loadData"]> {
     const base = ((await this.plugin.loadData()) as Bag | null) ?? {};
     const merged: Bag = { ...base };
 

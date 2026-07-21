@@ -518,6 +518,11 @@ export interface StashpadSettings {
    *  off (default), the picker just reparents in place and selects the
    *  new parent; on, the view also drills into that parent so the user
    *  lands inside it. */
+  /** 0.193.0: when a submission's every non-empty line is a checkbox ("- [ ] a" /
+   *  "[x] b"), treat it as a task LIST and split it into one task per line, even if
+   *  split-on-lines is off. Pasting a checklist is the common case and one giant note
+   *  full of checkbox text is almost never what's wanted. On by default. */
+  splitCheckboxLines: boolean;
   autoNavOnMoveIn: boolean;
   /** 0.191.0: after moving/nesting a note INTO another note, open that destination
    *  parent in a BACKGROUND Stashpad tab — so the note's new home is one click away
@@ -695,6 +700,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   mutedNotificationCategories: [],
   notificationHistoryLimit: 5000,
   notifiedDueKeys: [],
+  splitCheckboxLines: true,
   autoNavOnMoveIn: false,
   openParentTabOnMoveIn: true,
   autoNavOnMoveOut: false,
@@ -1538,6 +1544,8 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.movingNotes.push(toggle("Navigate into parent after moving a note IN", "When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
+    cats.composerCopy.push(toggle("Split a pasted checklist into separate tasks", 'When every line of what you submit is a checkbox — "- [ ] milk", "[x] eggs" — create one task per line instead of a single note. Applies even when "split on newlines" is off. On by default.',
+      () => this.plugin.settings.splitCheckboxLines, (v) => { this.plugin.settings.splitCheckboxLines = v; }, ["checkbox", "task", "split", "paste", "checklist"]));
     cats.movingNotes.push(toggle("Open the new parent in a background tab after moving a note IN", "When you nest a note into another note, open that parent in a background Stashpad tab so its new home is one click away — without stealing focus from what you're doing. Skipped when the destination is Home or already open in a tab. On by default.",
       () => this.plugin.settings.openParentTabOnMoveIn, (v) => { this.plugin.settings.openParentTabOnMoveIn = v; }, ["background", "tab", "move", "in", "parent"]));
     cats.movingNotes.push(toggle("Navigate to destination after moving a note OUT", "When you outdent a note, move it via the cross-parent picker, or send it to Home, automatically drill into the destination parent. Off = stay focused where you were.",
