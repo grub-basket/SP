@@ -6260,3 +6260,50 @@ button.stashpad-btn-loading::after {
   margin-top: 6px;
   line-height: 1.5;
 }
+
+/* 0.197.0 — recurrence mode picker help text under the dropdown. */
+.stashpad-due-recur-help {
+  margin: 2px 0 6px;
+  padding-left: 2px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+}
+
+/* 0.197.0 — a MISSED recurring occurrence. It's marked completed (so it drops out
+   of the active list) but it wasn't done, so it must not read as an accomplishment:
+   warning-tinted strike instead of the neutral completed grey, plus a marker. */
+.stashpad-note.is-missed .stashpad-note-body,
+.stashpad-note.is-missed .stashpad-note-time {
+  text-decoration-color: var(--color-orange, #e08a47);
+  color: var(--text-muted);
+}
+/* Marker sits in the row's own padding, next to the completed checkbox. */
+.stashpad-note.is-missed .stashpad-note-body::after {
+  content: " ✗ missed";
+  color: var(--color-orange, #e08a47);
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+/* 0.198.0 — recurrence anchor toggle (due-date vs completion) in the due picker. */
+.stashpad-anchor-seg { display: inline-flex; gap: 0; }
+.stashpad-anchor-seg button {
+  padding: 3px 10px;
+  font-size: var(--font-ui-smaller);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-muted);
+  border-radius: 0;
+  box-shadow: none;
+  cursor: pointer;
+}
+.stashpad-anchor-seg button:first-child { border-radius: 4px 0 0 4px; }
+.stashpad-anchor-seg button:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
+.stashpad-anchor-seg button.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}

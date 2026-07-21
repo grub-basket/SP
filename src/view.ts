@@ -11,7 +11,8 @@ import {
 import { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
 import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
-import { parseRecurrence, nextDueOnComplete } from "./recurrence";
+import { parseRecurrence, nextDueOnComplete, parseRepeatMode } from "./recurrence";
+import { spawnNextOccurrence, archiveOccurrenceSnapshot } from "./recurrence-spawn";
 import { OrderStore } from "./order-store";
 import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
@@ -2159,7 +2160,11 @@ export class StashpadView extends ItemView {
       // only when its subtree has no remaining work — so a category
       // checked off but still containing an unchecked task stays
       // visible until the last task is done.
-      if (hideCompleted && this.isCompleted(n) && !this.hasIncompleteDescendant(n)) return false;
+      // 0.197.0: a MISSED repeat is marked completed only so it drops out of the
+      // active cadence — it is not finished work. Hiding it with "hide completed"
+      // would make the miss invisible, which is the whole thing we're trying to
+      // surface, so missed occurrences stay visible.
+      if (hideCompleted && this.isCompleted(n) && !this.isMissed(n) && !this.hasIncompleteDescendant(n)) return false;
       // Attachments-only: keep a node if it (or any descendant) has an
       // attachment, so the attachment-bearing child stays reachable.
       if (attachmentsOnly && !this.hasAttachmentInSubtree(n)) return false;
@@ -5138,6 +5143,13 @@ export class StashpadView extends ItemView {
     if (isCursor && this.cursorHasMoved && this.plugin.settings.autoExpandCursorRow && !this.cursorExpandOverride.has(node.id)) row.addClass("is-cursor-expanded");
     if (isPickTarget) row.addClass("is-pick-target");
     if (this.isCompleted(node)) row.addClass("is-completed");
+    // 0.197.0: a repeating occurrence that ran out its interval unfinished is marked
+    // completed so it leaves the active list — but it was MISSED, not done. Without
+    // this it would be indistinguishable from work you actually finished.
+    if (this.isMissed(node)) {
+      row.addClass("is-missed");
+      row.title = "Missed — this repeat ran past its interval without being completed.";
+    }
     if (this.isListPinned(node.id)) row.addClass("is-list-pinned");
     // 0.99.5: ghost rows that are sitting on a pending CUT (note clipboard),
     // mirroring a file manager — they're about to move/be-extracted on paste.
@@ -8298,6 +8310,59 @@ export class StashpadView extends ItemView {
     return null;
   }
 
+  /** 0.198.0: push a repeating task to its NEXT occurrence without completing it —
+   *  "not this time". Completing would either mark work done you didn't do or spawn a
+   *  history entry claiming you did; skipping just advances the schedule. Honours the
+   *  rule's anchor, so a "when done" task counts from now and a due-anchored one keeps
+   *  its cadence. */
+  async cmdSkipOccurrence(node?: TreeNode): Promise<void> {
+    const targets = node ? [node] : this.getActionTargets();
+    const skipped: Array<{ title: string; when: number }> = [];
+    const prior: Array<{ path: string; due: unknown }> = [];
+    for (const t of targets) {
+      if (!t.file) continue;
+      const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter;
+      const rec = parseRecurrence(fm?.repeat as string | undefined);
+      if (!rec) continue;
+      const oldDue = fm?.due != null ? Date.parse(String(fm.due)) : NaN;
+      const next = nextDueOnComplete(rec, Number.isFinite(oldDue) ? oldDue : null, Date.now());
+      prior.push({ path: t.file.path, due: fm?.due });
+      this.markFmSelfWrite(t.file.path);
+      await this.app.fileManager.processFrontMatter(t.file, (m) => {
+        m.due = new Date(next).toISOString();
+        // Skipping is not completing, and not a miss — it's a deliberate pass.
+        delete m.completed;
+        delete m.missed;
+        delete m.missedAt;
+      });
+      skipped.push({ title: this.titleForNode(t), when: next });
+    }
+    if (!skipped.length) { new Notice("Nothing to skip — select a repeating task."); return; }
+    this.tree.rebuild(this.noteFolder);
+    this.render();
+    this.plugin.notifications.show({
+      message: skipped.length === 1
+        ? `⏭️ Skipped “${skipped[0].title}” → next on ${formatDateTime(skipped[0].when, this.plugin.settings)}.`
+        : `⏭️ Skipped ${skipped.length} repeating tasks to their next occurrence.`,
+      kind: "success", category: "system", folder: this.noteFolder,
+    });
+    const folder = this.noteFolder;
+    this.plugin.getUndoStack(folder).push({
+      label: `Skip occurrence (${skipped.length})`,
+      undo: async () => {
+        for (const p of prior) {
+          const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
+          if (!f) continue;
+          await this.app.fileManager.processFrontMatter(f, (m) => {
+            if (p.due === undefined) delete m.due; else m.due = p.due;
+          });
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
+
   /** 0.192.0: open the paste-text importer — the standalone Stashpad Importer web
    *  app's job, done in-plugin (no `.stash` round-trip). Level-1 notes land under
    *  whatever is currently focused, so you can import straight into a subtree. */
@@ -9882,6 +9947,10 @@ export class StashpadView extends ItemView {
 
     const changedIds: StashpadId[] = [];
     const rolled: Array<{ title: string; when: number }> = []; // recurring tasks rescheduled
+    // 0.197.0: occurrences spawned for the next interval, and notes whose completion
+    // should also be filed into archive/ (repeatMode "archive").
+    let spawned = 0;
+    const archivedSnapshots: Array<{ file: TFile; dueIso: string | null }> = [];
     for (const t of targets) {
       if (!t.file) continue;
       const was = this.isCompleted(t);
@@ -9891,29 +9960,53 @@ export class StashpadView extends ItemView {
       priorStates.push(ps);
       if (was === newState) continue;
       let didRoll = false;
+      // 0.197.0: what completing a repeating task does now depends on its repeat
+      // MODE. rollForward re-dates this note (historic behaviour, no history);
+      // complete/interval leave this occurrence done and spawn the next one;
+      // archive re-dates the live note but files a completed copy in archive/.
+      let spawnNextIso: string | null = null;
+      let archiveThis = false;
       this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (fm) => {
-        // 0.140.0: completing a REPEATING task rolls it forward (stays an active
-        // task with a new due) instead of just going strikethrough.
         const rec = newState ? parseRecurrence(fm.repeat as string | undefined) : null;
+        const mode = parseRepeatMode(fm.repeatMode);
         if (rec) {
           const oldDue = fm.due != null ? Date.parse(String(fm.due)) : NaN;
           const next = nextDueOnComplete(rec, Number.isFinite(oldDue) ? oldDue : null, Date.now());
-          fm.due = new Date(next).toISOString();
-          delete fm.completed;
-          ps.rolledTo = fm.due as string;
+          const nextIso = new Date(next).toISOString();
+          if (mode === "complete" || mode === "interval") {
+            // This occurrence is genuinely finished — it stays completed, and a
+            // fresh incomplete one is created for the next interval.
+            fm.completed = true;
+            delete fm.missed;
+            spawnNextIso = nextIso;
+          } else {
+            // rollForward / archive: the same note moves to the next date.
+            fm.due = nextIso;
+            delete fm.completed;
+            ps.rolledTo = nextIso;
+            didRoll = true;
+            if (mode === "archive") archiveThis = true;
+          }
           rolled.push({ title: (t.file!.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim()) || "task", when: next });
-          didRoll = true;
         } else if (newState) fm.completed = true;
         else delete fm.completed;
       });
+      if (spawnNextIso) {
+        const made = await spawnNextOccurrence(this.app, t.file, spawnNextIso);
+        if (made) spawned++;
+      }
+      if (archiveThis) archivedSnapshots.push({ file: t.file, dueIso: ps.dueBefore });
       // A rolled task is NOT completed — reflect its real (incomplete) state.
       this.completedState.set(t.file.path, didRoll ? false : newState);
       changedIds.push(t.id);
     }
+    // repeatMode "archive": file the completed snapshot after the live note rolled.
+    for (const a of archivedSnapshots) await archiveOccurrenceSnapshot(this.app, a.file, a.dueIso);
     this.render();
     for (const r of rolled) {
-      this.plugin.notifications.show({ message: `🔁 Rescheduled “${r.title}” → ${formatDateTime(r.when, this.plugin.settings)}.`, kind: "success", category: "system", folder: this.noteFolder });
+      const verb = spawned > 0 ? "Next up" : "Rescheduled";
+      this.plugin.notifications.show({ message: `🔁 ${verb}: “${r.title}” → ${formatDateTime(r.when, this.plugin.settings)}.`, kind: "success", category: "system", folder: this.noteFolder });
     }
     if (changedIds.length > 0) {
       await this.log.append({
@@ -10021,6 +10114,14 @@ export class StashpadView extends ItemView {
    *  there's no override. */
   private listPinnedState = new Map<string, { pinned: boolean; at: number }>();
 
+  /** 0.197.0: was this occurrence closed out as MISSED (interval elapsed unfinished)
+   *  rather than actually completed? Frontmatter-backed so it survives body edits. */
+  isMissed(node: TreeNode): boolean {
+    if (!node.file) return false;
+    const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter as { missed?: unknown } | undefined;
+    return fm?.missed === true;
+  }
+
   private isCompleted(node: TreeNode): boolean {
     if (!node.file) return false;
     const override = this.completedState.get(node.file.path);
@@ -10060,13 +10161,14 @@ export class StashpadView extends ItemView {
     const currentAssignees = parseAssignees(curFm ?? {});
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees, false, {
-        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery,
+        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode,
       });
     }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts,
       // 0.140.1: recurrence is a per-note concept — only show/write it for a
       // single target, else a multi-select would clobber 2..n's rules with #1's.
       showRecurrence: targets.length === 1,
       currentRepeat: typeof curFm?.repeat === "string" ? curFm.repeat : "",
+      currentRepeatMode: typeof curFm?.repeatMode === "string" ? curFm.repeatMode : "",
       currentAutoDoneAfter: typeof curFm?.autoDoneAfter === "string" ? curFm.autoDoneAfter : "",
       currentRemindEvery: typeof curFm?.remindEvery === "string" ? curFm.remindEvery : "",
     }).open();
@@ -10095,8 +10197,8 @@ export class StashpadView extends ItemView {
   /** Write the chosen due value (or clear it) across `targets`, with
    *  undo. Setting a date also flips `task: true`; clearing leaves the
    *  task flag intact (clearing a due ≠ "no longer a task"). */
-  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string }): Promise<void> {
-    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown }[] = [];
+  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string; repeatMode?: string }): Promise<void> {
+    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown; repeatMode: unknown }[] = [];
     const changedIds: StashpadId[] = [];
     // 0.78.1: who is doing the assigning (the local user) — stamped as
     // assignedBy so the "assigned by me" filter works. Null if the user
@@ -10112,7 +10214,7 @@ export class StashpadView extends ItemView {
       if (!t.file) continue;
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
       const wasTagged = this.isTaskTagged(t);
-      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery });
+      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery, repeatMode: fm?.repeatMode });
       this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
@@ -10120,11 +10222,13 @@ export class StashpadView extends ItemView {
         // 0.140.0: recurrence + reminder fields — an empty string clears the
         // field; a non-empty one sets it (and implies task-ness).
         if (recur) {
-          const set3 = (k: "repeat" | "autoDoneAfter" | "remindEvery", v?: string) => {
+          const set3 = (k: "repeat" | "autoDoneAfter" | "remindEvery" | "repeatMode", v?: string) => {
             const val = (v ?? "").trim();
             if (val) { m[k] = val; m.task = true; } else delete m[k];
           };
           set3("repeat", recur.repeat);
+          // Only meaningful with a repeat rule; clearing repeat clears the mode too.
+          set3("repeatMode", recur.repeat ? recur.repeatMode : "");
           set3("autoDoneAfter", recur.autoDoneAfter);
           set3("remindEvery", recur.remindEvery);
         }
@@ -10177,6 +10281,7 @@ export class StashpadView extends ItemView {
             if (p.assignedBy === undefined) delete m.assignedBy; else m.assignedBy = p.assignedBy;
             // 0.140.1: restore recurrence/reminder fields too (else undo left them).
             if (p.repeat === undefined) delete m.repeat; else m.repeat = p.repeat;
+            if (p.repeatMode === undefined) delete m.repeatMode; else m.repeatMode = p.repeatMode;
             if (p.autoDoneAfter === undefined) delete m.autoDoneAfter; else m.autoDoneAfter = p.autoDoneAfter;
             if (p.remindEvery === undefined) delete m.remindEvery; else m.remindEvery = p.remindEvery;
           });
@@ -10208,7 +10313,7 @@ export class StashpadView extends ItemView {
     const currentAssignees = parseAssignees(curFm ?? {});
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees, false, {
-        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery,
+        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode,
       });
     }, { knownAuthors, currentAssignees, title: "Assign / schedule task",
       // 0.155.0: Assign opens the SAME picker as "Set due date" with the full
@@ -10218,6 +10323,7 @@ export class StashpadView extends ItemView {
       quickAdjusts: this.plugin.settings.dueQuickAdjusts,
       showRecurrence: targets.length === 1,
       currentRepeat: typeof curFm?.repeat === "string" ? curFm.repeat : "",
+      currentRepeatMode: typeof curFm?.repeatMode === "string" ? curFm.repeatMode : "",
       currentAutoDoneAfter: typeof curFm?.autoDoneAfter === "string" ? curFm.autoDoneAfter : "",
       currentRemindEvery: typeof curFm?.remindEvery === "string" ? curFm.remindEvery : "",
     }).open();
@@ -12223,6 +12329,10 @@ export class StashpadView extends ItemView {
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => void this.cmdEdit(node)));
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
+    // Only meaningful on a repeating task; hidden otherwise so the menu stays short.
+    if (parseRecurrence(this.app.metadataCache.getFileCache(node.file!)?.frontmatter?.repeat as string | undefined)) {
+      menu.addItem((it: any) => it.setTitle("Skip to next occurrence").setIcon("skip-forward").onClick(() => void this.cmdSkipOccurrence(node)));
+    }
     // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
     // normalises selection to the right-clicked row.
     // 0.122.10: ordered above Clone so the plain "Copy text" reads first.

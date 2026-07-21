@@ -133,3 +133,25 @@ export function nextDueOnComplete(rec: Recurrence, oldDueMs: number | null, nowM
   if (next <= nowMs) { next = rec.next(nowMs); let g = 0; while (next <= nowMs && g++ < 5000) next = rec.next(next); }
   return next;
 }
+
+/** 0.197.0 — how a repeating task produces its next occurrence.
+ *
+ *  Until now there was exactly one behaviour: completing a repeating task re-dated
+ *  the SAME note and cleared `completed` ("roll forward"). That repeats fine but
+ *  leaves no trace — no record you did it last week, no sign you missed three. These
+ *  modes add per-occurrence history; `rollForward` stays the default so existing
+ *  repeating tasks don't silently change behaviour. */
+export type RepeatMode = "rollForward" | "complete" | "interval" | "archive";
+
+export const REPEAT_MODES: Array<{ id: RepeatMode; label: string; desc: string }> = [
+  { id: "rollForward", label: "Roll forward (no history)", desc: "One note whose due date moves. Nothing is kept for past occurrences." },
+  { id: "complete", label: "Keep each occurrence", desc: "Completing leaves that one done in the list and creates a fresh one for the next interval." },
+  { id: "interval", label: "One per interval (mark misses)", desc: "A new occurrence every interval whether or not you finished the last. An unfinished one is closed out and flagged as missed." },
+  { id: "archive", label: "Roll forward + archive", desc: "One live note as today, but each completion is archived so the history exists without cluttering the list." },
+];
+
+export function parseRepeatMode(v: unknown): RepeatMode {
+  const s = typeof v === "string" ? v.trim().toLowerCase() : "";
+  for (const m of REPEAT_MODES) if (m.id.toLowerCase() === s) return m.id;
+  return "rollForward"; // legacy / unset
+}

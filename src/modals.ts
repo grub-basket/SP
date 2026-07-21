@@ -4,6 +4,7 @@ import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
+import { REPEAT_MODES, parseRepeatMode } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import type { ExportContent } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
@@ -15,6 +16,7 @@ export interface DuePickResult {
   /** 0.140.0: recurrence + reminder rules (empty string = clear the field).
    *  Present only when the picker showed the "Repeat & reminders" section. */
   repeat?: string;
+  repeatMode?: string;
   autoDoneAfter?: string;
   remindEvery?: string;
 }
@@ -22,6 +24,7 @@ export interface DuePickerOptions {
   /** 0.140.0: show the "Repeat & reminders" section, pre-filled from these. */
   showRecurrence?: boolean;
   currentRepeat?: string;
+  currentRepeatMode?: string;
   currentAutoDoneAfter?: string;
   currentRemindEvery?: string;
   /** Known authors to offer in the assignee picker (from the registry). */
@@ -2766,6 +2769,7 @@ export class DueDatePickerModal extends Modal {
     let repeatIn: HTMLInputElement | null = null;
     let autoIn: HTMLInputElement | null = null;
     let remindIn: HTMLInputElement | null = null;
+    let modeSel: HTMLSelectElement | null = null;
     if (this.opts.showRecurrence) {
       const det = wrap.createEl("details", { cls: "stashpad-due-recur" });
       if (this.opts.currentRepeat || this.opts.currentAutoDoneAfter || this.opts.currentRemindEvery) det.open = true;
@@ -2780,10 +2784,49 @@ export class DueDatePickerModal extends Modal {
       repeatIn = mkRow("Repeat", 'e.g. "every weekday", "every 30 days when done"', this.opts.currentRepeat);
       autoIn = mkRow("Auto-complete after", 'e.g. "1d" — mark done once this overdue', this.opts.currentAutoDoneAfter);
       remindIn = mkRow("Remind every", 'e.g. "2h" — re-notify until done', this.opts.currentRemindEvery);
+
+      // 0.198.0: the anchor was only reachable by typing "when done" on the end of
+      // the rule. Same setting, now a visible toggle — it's the difference between
+      // "every Monday" and "30 days after I actually did it", and it's the control
+      // you want when rescheduling something you've let slip.
+      const ANCHOR_RE = /\s*(when done|after completion)\s*$/i;
+      const arow = det.createDiv({ cls: "stashpad-due-recur-row" });
+      arow.createEl("label", { text: "Count next from" });
+      const seg = arow.createDiv({ cls: "stashpad-anchor-seg" });
+      const bDue = seg.createEl("button", { text: "Due date", attr: { type: "button" } });
+      const bDone = seg.createEl("button", { text: "Completion", attr: { type: "button" } });
+      const anchorHelp = det.createDiv({ cls: "stashpad-due-recur-help" });
+      const isDone = (): boolean => ANCHOR_RE.test(repeatIn!.value);
+      const paintAnchor = (): void => {
+        const done = isDone();
+        bDue.toggleClass("is-active", !done);
+        bDone.toggleClass("is-active", done);
+        anchorHelp.setText(done
+          ? "Next occurrence counts from when you COMPLETE it — miss a few and the schedule shifts with you."
+          : "Next occurrence counts from the DUE date — the task keeps its original cadence no matter when you finish.");
+      };
+      bDue.onclick = () => { repeatIn!.value = repeatIn!.value.replace(ANCHOR_RE, "").trimEnd(); paintAnchor(); };
+      bDone.onclick = () => { if (!isDone()) repeatIn!.value = `${repeatIn!.value.trim()} when done`.trim(); paintAnchor(); };
+      repeatIn.addEventListener("input", paintAnchor);
+      paintAnchor();
+
+      // 0.197.0: what "repeat" actually DOES. Roll-forward (the historic behaviour)
+      // repeats but keeps no record; the other modes leave per-occurrence history.
+      const mrow = det.createDiv({ cls: "stashpad-due-recur-row" });
+      mrow.createEl("label", { text: "When repeating" });
+      modeSel = mrow.createEl("select");
+      for (const m of REPEAT_MODES) modeSel.createEl("option", { value: m.id, text: m.label });
+      modeSel.value = parseRepeatMode(this.opts.currentRepeatMode);
+      const modeHelp = det.createDiv({ cls: "stashpad-due-recur-help" });
+      const paintHelp = () => {
+        modeHelp.setText(REPEAT_MODES.find((m) => m.id === modeSel!.value)?.desc ?? "");
+      };
+      modeSel.onchange = paintHelp;
+      paintHelp();
     }
-    const recur = (): Pick<DuePickResult, "repeat" | "autoDoneAfter" | "remindEvery"> =>
+    const recur = (): Pick<DuePickResult, "repeat" | "autoDoneAfter" | "remindEvery" | "repeatMode"> =>
       this.opts.showRecurrence
-        ? { repeat: repeatIn!.value.trim(), autoDoneAfter: autoIn!.value.trim(), remindEvery: remindIn!.value.trim() }
+        ? { repeat: repeatIn!.value.trim(), autoDoneAfter: autoIn!.value.trim(), remindEvery: remindIn!.value.trim(), repeatMode: modeSel?.value ?? "" }
         : {};
 
     const cancel = grid.createEl("button", { cls: "stashpad-due-btn", text: "Cancel" });

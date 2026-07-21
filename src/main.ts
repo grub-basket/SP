@@ -29,7 +29,8 @@ import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
 import { ROOT_ID, parseAssignees } from "./types";
-import { parseRecurrence, nextDueOnComplete, parseDuration } from "./recurrence";
+import { parseRecurrence, nextDueOnComplete, parseDuration, parseRepeatMode } from "./recurrence";
+import { spawnNextOccurrence, markOccurrenceMissed } from "./recurrence-spawn";
 import { OrderStore } from "./order-store";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
@@ -1479,6 +1480,11 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-import-text",
       name: "Import pasted text (paste → nested notes)…",
       callback: () => call("cmdImportText"),
+    });
+    this.addCommand({
+      id: "stashpad-skip-occurrence",
+      name: "Skip repeating task to its next occurrence",
+      callback: () => call("cmdSkipOccurrence"),
     });
     this.addCommand({
       id: "stashpad-copy-link",
@@ -5834,6 +5840,7 @@ export default class StashpadPlugin extends Plugin {
     const persistLog = { ...(this.settings.persistReminderLog ?? {}) };
     let persistDirty = false;
     const activePersistIds = new Set<string>(); // 0.140.1: for pruning the log
+    let missedRolled = 0; // 0.197.0: interval-mode occurrences closed out as missed
     for (const f of this.app.vault.getMarkdownFiles()) {
       if (f.path.includes("/_authors/")) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown; completed?: unknown; repeat?: unknown; autoDoneAfter?: unknown; remindEvery?: unknown } | undefined;
@@ -5853,6 +5860,28 @@ export default class StashpadPlugin extends Plugin {
         if (grace != null && now >= dueMs + grace) {
           await this.autoResolveDueTask(f, dueMs, now);
           continue;
+        }
+      }
+      // 0.197.0: repeatMode "interval" — a new occurrence every interval whether or
+      // not the last was finished. Once THIS occurrence's window has elapsed, close
+      // it out flagged as missed and spawn the next, so the list shows what was
+      // skipped instead of one note quietly sliding forward.
+      if (fm.completed !== true) {
+        const mode = parseRepeatMode((fm as { repeatMode?: unknown }).repeatMode);
+        const recI = mode === "interval" ? parseRecurrence(fm.repeat as string | undefined) : null;
+        if (recI) {
+          const windowEnd = recI.next(dueMs);
+          if (now >= windowEnd) {
+            await markOccurrenceMissed(this.app, f, now);
+            // Anchor the next occurrence to the schedule, not to "now", so a task
+            // ignored for weeks lands back on its real cadence rather than drifting.
+            let nextMs = windowEnd;
+            let guard = 0;
+            while (nextMs <= now && guard++ < 500) nextMs = recI.next(nextMs);
+            await spawnNextOccurrence(this.app, f, new Date(nextMs).toISOString());
+            missedRolled++;
+            continue;
+          }
         }
       }
       if (fm.completed === true) continue; // completed one-offs: nothing to do
@@ -5890,6 +5919,12 @@ export default class StashpadPlugin extends Plugin {
     this.settings.notifiedDueKeys = [...(this.settings.notifiedDueKeys ?? []), ...due.filter((d) => !d.key.endsWith("@persist")).map((d) => d.key)].slice(-2000);
     await this.saveSettings();
     await this.showDueToasts(due);
+    if (missedRolled > 0) {
+      this.notifications.show({
+        message: `🔁 ${missedRolled} recurring task${missedRolled === 1 ? " was" : "s were"} missed and rolled to the next interval.`,
+        kind: "warning", category: "reminder", folder: "",
+      });
+    }
   }
 
   /** 0.185.0: render the due-task toasts. Up to 3 due tasks each get their own
