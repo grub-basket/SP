@@ -1851,7 +1851,11 @@ export class EncryptionPasswordModal extends Modal {
         : mode === "change" ? "Change encryption password"
           : "Unlock encryption"),
     );
-    this.contentEl.createDiv({ cls: "stashpad-beta-row" }).createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
+    // 0.195.0: the badge alone said nothing. Beta encryption can lose data even when
+    // the key is safe, so the risk + liability travel with every password dialog.
+    const betaRow = this.contentEl.createDiv({ cls: "stashpad-beta-row" });
+    betaRow.createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
+    betaRow.createEl("span", { cls: "stashpad-beta-note", text: "Beta encryption — data can be lost with or without your key. Keep unencrypted backups; Stashpad isn't liable for data loss." });
 
     if (this.opts.intro) {
       this.contentEl.createEl("p", { cls: "stashpad-export-desc", text: this.opts.intro });

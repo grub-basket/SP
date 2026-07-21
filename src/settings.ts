@@ -1660,7 +1660,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       host.addClass("stashpad-encryption-section");
       const betaRow = host.createDiv({ cls: "stashpad-beta-row" });
       betaRow.createEl("span", { cls: "stashpad-beta-badge", text: "BETA" });
-      betaRow.createEl("span", { cls: "stashpad-beta-note", text: "Encryption is in beta — keep your own backups of anything important." });
+      // 0.195.0: say the quiet part — beta code can lose data even when your key is
+      // perfectly safe (a bug, an interrupted lock/unlock, a sync writing mid-op).
+      betaRow.createEl("span", { cls: "stashpad-beta-note", text: "Encryption is in beta — data can be lost with or without your key. Keep your own unencrypted backups." });
       // 0.134.3: ONE merged warning callout (was three: the AI disclaimer box,
       // a ⚠️ description paragraph here, and a "no recovery" callout at the top
       // of the per-folder section). Same .stashpad-enc-warning callout style.
@@ -1689,7 +1691,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         "Each device unlocks with its own password (it never leaves the device); collaborators get access by device approval, not a shared password. If everyone with access loses their password, the content is unrecoverable. While encrypting or decrypting, avoid having a sync/cloud service write the vault mid-operation — it can corrupt files.",
       );
       warn.createEl("p", { cls: "stashpad-enc-liability" }).setText(
-        "Stashpad cannot recover keys or passwords, and is not liable for the loss of keys, passwords, or any data encrypted with them. Backing them up is yours to do.",
+        "Stashpad cannot recover keys or passwords, and is not liable for the loss of keys, passwords, or any data — whether the cause is a lost key or a fault in this beta encryption itself. Keeping your own backups is yours to do.",
       );
 
       // 0.137.4: ONE collapsible, toggle-free "how it works" reference block, so

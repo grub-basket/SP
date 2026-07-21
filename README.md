@@ -109,8 +109,8 @@ and out of the way when you don't:
 - **Import / export** — `.stash` bundles (optionally encrypted) round-trip notes +
   attachments between vaults.
 - **Encryption (beta)** — lock notes or folders into encrypted `.stashenc` files, with
-  archive folders, encrypted trash, and shared-key collaboration. *(Please read the
-  caveat below.)*
+  archive folders, encrypted trash, and shared-key collaboration. Beta: data can be
+  lost with or without your key. *(Please read the caveat below.)*
 - **Authorship / multiplayer** — stamp notes with your name; shared vaults track
   contributors via a vault-wide author registry.
 - **Johnny.Decimal index** — build a JD-style hierarchy from dotted-prefix titles.
@@ -133,8 +133,13 @@ and out of the way when you don't:
 > don't rely on it for anything sensitive, and keep unencrypted backups. It's optional
 > and off by default.
 >
+> Because it's beta, **data loss is possible with or without your key** — a bug, an
+> interrupted lock/unlock, or a sync writing the vault mid-operation can damage
+> encrypted files even when your password is perfectly safe. Keep unencrypted backups.
+>
 > *Stashpad cannot recover keys or passwords, and is not liable for the loss of keys,
-> passwords, or any data encrypted with them.*
+> passwords, or any data — whether the cause is a lost key or a fault in this beta
+> encryption itself.*
 
 ## Feedback
 
