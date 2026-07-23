@@ -2278,6 +2278,9 @@ export class ColorPickerModal extends Modal {
   /** Guard so re-rendering the grid (handleDelete → onOpen) doesn't stack a
    *  second copy of the keyboard handlers on the persistent scope. (0.140.6) */
   private scopeBound = false;
+  /** 0.199.4: DOM-level key handler used only when the modal lives in a
+   *  secondary window (the keymap scope doesn't receive keys there). */
+  private popoutKeyHandler: ((e: KeyboardEvent) => void) | null = null;
   /** Snapshot of selectable tiles in render order. The "+" tile is `kind:
    *  "add"` and opens CustomColorModal rather than committing directly. */
   private items: { kind: "none" | "preset" | "custom" | "add"; color: string | null; el: HTMLElement }[] = [];
@@ -2357,6 +2360,32 @@ export class ColorPickerModal extends Modal {
       this.scopeBound = true;
     }
 
+    // 0.199.4: in a SECONDARY window the keymap scope above never receives
+    // keys (verified with trusted CDP key events: arrows were completely dead
+    // in a pop-out — grid focus frozen, list guarded by isAnyModalOpen). Bind
+    // plain DOM handlers on the modal's own document as the pop-out path.
+    // Main-window modals keep the scope path only, so keys are never handled
+    // twice.
+    const doc = this.modalEl.ownerDocument;
+    if (doc !== document && !this.popoutKeyHandler) {
+      this.popoutKeyHandler = (e: KeyboardEvent): void => {
+        const step: Record<string, number> = {
+          ArrowRight: 1, ArrowLeft: -1, ArrowDown: this.columns(), ArrowUp: -this.columns(),
+        };
+        if (e.key in step) {
+          e.preventDefault(); e.stopPropagation();
+          this.moveFocus(step[e.key]);
+        } else if (e.key === "Enter") {
+          e.preventDefault(); e.stopPropagation();
+          this.activate(this.focusIdx);
+        } else if (e.key === "Escape") {
+          e.preventDefault(); e.stopPropagation();
+          this.close();
+        }
+      };
+      doc.addEventListener("keydown", this.popoutKeyHandler, true);
+    }
+
     // After paint, focus the modal so arrow keys land here, not in the
     // background view.
     requestAnimationFrame(() => (this.modalEl).focus());
@@ -2430,7 +2459,13 @@ export class ColorPickerModal extends Modal {
     }
   }
 
-  onClose(): void { this.contentEl.empty(); }
+  onClose(): void {
+    if (this.popoutKeyHandler) {
+      this.modalEl.ownerDocument.removeEventListener("keydown", this.popoutKeyHandler, true);
+      this.popoutKeyHandler = null;
+    }
+    this.contentEl.empty();
+  }
 }
 
 export class ConfirmModal extends Modal {
