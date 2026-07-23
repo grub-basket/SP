@@ -27,7 +27,7 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DueDatePickerModal, NoteWorkbenchModal } from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal } from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import type { ImportNote } from "./text-importer";
 import { isAllCheckboxLines } from "./text-importer";
@@ -61,7 +61,7 @@ import {
 } from "./sheets-versions";
 import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
-import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
+import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -5639,7 +5639,7 @@ export class StashpadView extends ItemView {
       }
       box.onclick = (e) => {
         e.stopPropagation();
-        if (file) void this.app.workspace.getLeaf("tab").openFile(file);
+        if (file) { const ws = this.app.workspace; const prev = ws.activeLeaf; void ws.getLeaf("tab").openFile(file).then(() => { settleNewTab(ws, prev); }); }
       };
       // 0.184.0: right-click an attachment → copy it to the OS clipboard (images
       // paste straight into chat / email / editors), open it, or reveal it.
@@ -5654,7 +5654,7 @@ export class StashpadView extends ItemView {
       menu.addItem((it: any) => it.setTitle("Copy image").setIcon("copy").onClick(() => void this.copyAttachmentImage(file)));
     }
     if (file) {
-      menu.addItem((it: any) => it.setTitle("Open in new tab").setIcon("external-link").onClick(() => void this.app.workspace.getLeaf("tab").openFile(file)));
+      menu.addItem((it: any) => it.setTitle("Open in new tab").setIcon("external-link").onClick(() => { const ws = this.app.workspace; const prev = ws.activeLeaf; void ws.getLeaf("tab").openFile(file).then(() => { settleNewTab(ws, prev); }); }));
       for (const a of buildFileActions(this.app, file.path, Platform.isMobile)) {
         menu.addItem((it: any) => it.setTitle(a.label).setIcon(a.label.startsWith("Reveal") ? "folder-open" : "arrow-up-right").onClick(() => void a.onClick()));
       }
@@ -5947,6 +5947,34 @@ export class StashpadView extends ItemView {
       });
       menu.showAtMouseEvent(e);
     };
+
+    // 0.199.3: dedicated file dropzone button — drag a file straight onto it
+    // (imports + appends the link, same as dropping on the composer), or click
+    // it to open a LARGE dropzone modal whose zone doubles as a file-picker
+    // button. Saves aiming a drag at the narrow composer or hunting the
+    // command palette for the picker.
+    const dropBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-drop" });
+    setIcon(dropBtn, "file-input");
+    dropBtn.title = "Add files — drop them here, or click for a bigger dropzone / file picker";
+    dropBtn.onmousedown = (e) => e.preventDefault();
+    dropBtn.onclick = (e) => {
+      e.preventDefault();
+      new DropzoneModal(this.app, (files) => void importAndAppend(files)).open();
+    };
+    dropBtn.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
+      e.preventDefault(); e.stopPropagation();
+      try { e.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
+      dropBtn.addClass("is-dropover");
+    });
+    dropBtn.addEventListener("dragleave", () => dropBtn.removeClass("is-dropover"));
+    dropBtn.addEventListener("drop", (e) => {
+      dropBtn.removeClass("is-dropover");
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
+      e.preventDefault(); e.stopPropagation();
+      void importAndAppend(files);
+    });
 
     const destBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-dest" });
     this.composerDestBtn = destBtn;
@@ -6889,7 +6917,24 @@ export class StashpadView extends ItemView {
   /** public: called by AuthorshipTracker (the host interface). */
   getActionTargets(): TreeNode[] {
     if (this.selection.size > 0) {
-      return [...this.selection].map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
+      const targets = [...this.selection].map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
+      // 0.199.1: return targets in LIST order, not click order. `selection` is
+      // a Set, so its iteration order is the order notes were selected — which
+      // made a multi-select copy paste out of chronological/visual order when
+      // the user clicked rows bottom-up or cherry-picked. Rank by a DFS over
+      // the current display list (covers nested expansions + sort modes);
+      // anything not currently displayed sinks to the end, keeping its
+      // selection order among peers (sort is stable).
+      const order = new Map<string, number>();
+      let i = 0;
+      const walk = (n: TreeNode): void => {
+        if (order.has(n.id)) return;
+        order.set(n.id, i++);
+        for (const c of this.tree.getChildren(n.id)) walk(c);
+      };
+      for (const top of this.currentChildren) walk(top);
+      const pos = (id: string): number => order.get(id) ?? Number.MAX_SAFE_INTEGER;
+      return targets.sort((a, b) => pos(a.id) - pos(b.id));
     }
     const cur = this.currentChildren[this.cursorIdx];
     return cur ? [cur] : [];
@@ -9656,6 +9701,7 @@ export class StashpadView extends ItemView {
     });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
+    settleNewTab(ws, originLeaf); // 0.199.0 background-tabs behavior
     // 0.57.5: when this spawned tab closes, the originating Stashpad tab
     // regains focus (see returnToOriginOnClose — shared by every opener).
     returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
@@ -9693,6 +9739,7 @@ export class StashpadView extends ItemView {
     });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
+    settleNewTab(ws, originLeaf); // 0.199.0 background-tabs behavior
     // 0.133.0: closing the search-opened tab returns to the tab you searched
     // from, not the tab to the right.
     returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
@@ -9717,6 +9764,7 @@ export class StashpadView extends ItemView {
     });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
+    settleNewTab(ws, originLeaf); // 0.199.0 background-tabs behavior
     // When the spawned leaf closes, restore focus to the originating tab.
     returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
   }

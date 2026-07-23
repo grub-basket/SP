@@ -530,6 +530,14 @@ export interface StashpadSettings {
    *  which drills the CURRENT view into the parent (and steals your place). On by
    *  default; skipped when the destination is Home/root or already open in a tab. */
   openParentTabOnMoveIn: boolean;
+  /** 0.199.0: route every "open in a new tab" Stashpad performs through a
+   *  BACKGROUND tab — the tab opens, but focus stays where you are. Covers
+   *  folder opens, note/attachment "open in new tab", reminder clicks,
+   *  aggregate/tasks/trash views, deep links. Off by default. */
+  newTabsInBackground: boolean;
+  /** 0.199.2: composer/edit textareas auto-close `[[` with `]]` and type-over
+   *  an existing closing bracket. On by default. */
+  autoPairBrackets: boolean;
   /** 0.73.14: when on, the row under the keyboard cursor temporarily
    *  un-clamps its body — showing the full content as the user
    *  arrow-keys through the list. Moving the cursor away re-collapses
@@ -703,6 +711,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   splitCheckboxLines: true,
   autoNavOnMoveIn: false,
   openParentTabOnMoveIn: true,
+  newTabsInBackground: false,
+  autoPairBrackets: true,
   autoNavOnMoveOut: false,
   autoExpandCursorRow: false,
   expandBodiesByDefault: false,
@@ -1643,6 +1653,10 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.searchOpensInNewTab, (v) => { this.plugin.settings.searchOpensInNewTab = v; }, ["search", "new tab", "results", "open"]));
     cats.windowsTabs.push(toggle("Folders always open in a new tab", "When you open a folder (folders panel, folder switcher, or the file-explorer “Open folder in Stashpad”), always open a NEW tab at the home note instead of reusing an already-open tab. The folder switcher also drops its “Reveal <folder> tab” option. Off by default (reuses an existing tab when there is one).",
       () => this.plugin.settings.foldersAlwaysNewTab, (v) => { this.plugin.settings.foldersAlwaysNewTab = v; }, ["folder", "new tab", "reveal", "open", "panel"]));
+    cats.windowsTabs.push(toggle("New tabs open in the background", "When Stashpad opens something in a new tab — a folder, a note, an attachment, a reminder's task, an aggregate/tasks/trash view — the tab opens WITHOUT stealing focus; you stay where you are and switch when ready. Off by default (new tabs come to the front).",
+      () => this.plugin.settings.newTabsInBackground, (v) => { this.plugin.settings.newTabsInBackground = v; }, ["background", "tab", "focus", "steal", "new"]));
+    cats.composerCopy.push(toggle("Auto-pair [[wikilink]] brackets", "Typing the second [ of a wikilink auto-inserts the closing ]] and keeps the caret between them; typing ] over an existing closing bracket steps over it instead of doubling up. Applies to the composer and the edit/split textareas. On by default.",
+      () => this.plugin.settings.autoPairBrackets, (v) => { this.plugin.settings.autoPairBrackets = v; }, ["bracket", "autopair", "wikilink", "close", "complete"]));
     cats.composerCopy.push(toggle("Prefix timestamps when copying", "Include each note's timestamp before its body when copying with C or Y.",
       () => this.plugin.settings.prefixTimestampsOnCopy, (v) => { this.plugin.settings.prefixTimestampsOnCopy = v; }, ["copy", "timestamp", "prefix"]));
 

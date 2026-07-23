@@ -42,6 +42,7 @@ import { perf } from "./perf";
 import { RenderCacheStore } from "./render-cache-store";
 import { SettingsStore, MOVED_KEYS } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
+import { settleNewTab } from "./view-helpers";
 
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
  *  the next load knows to un-ghost the deferred Stashpad tabs. */
@@ -1472,7 +1473,7 @@ export default class StashpadPlugin extends Plugin {
     // you — pops your task backlog up again on demand (ignores the once-only dedup).
     this.addCommand({
       id: "stashpad-resend-reminders",
-      name: "Resend reminders for incomplete due tasks (show my backlog)",
+      name: "Re-show pending notifications (resend / redisplay reminders for incomplete due tasks)",
       callback: () => void this.resendDueReminders(),
     });
     // 0.192.0: paste-text importer (replaces the standalone Stashpad Importer web app).
@@ -5293,6 +5294,7 @@ export default class StashpadPlugin extends Plugin {
   async activateViewForFolder(folder: string): Promise<WorkspaceLeaf | null> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
     if (!cleaned) return null;
+    const prev = this.app.workspace.activeLeaf;
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({
       type: STASHPAD_VIEW_TYPE,
@@ -5300,6 +5302,7 @@ export default class StashpadPlugin extends Plugin {
       state: { folderOverride: cleaned },
     });
     this.app.workspace.revealLeaf(leaf);
+    settleNewTab(this.app.workspace, prev); // 0.199.0 background-tabs behavior
     return leaf;
   }
 
@@ -5949,10 +5952,10 @@ export default class StashpadPlugin extends Plugin {
           kind: "warning", category: "reminder", duration: 0, folder: d.folder, affectedIds: [d.id],
           // 0.171.0: whole card opens the task; the corner Snooze control opens
           // the scheduler/assigner modal instead (layered above, stopPropagation).
-          // 0.185.0: open via openDeepLinkTarget so the reminder never hijacks the
-          // tab you're currently in — it focuses a background folder tab if one
-          // exists, otherwise opens a fresh tab.
-          onBodyClick: () => void this.openDeepLinkTarget(d.folder, d.id),
+          // 0.185.0 → 0.199.0: always a FRESH tab (focused). Reusing an existing
+          // folder tab navigated that tab to the task — which reads as "my tab
+          // got overwritten". forceNewTab skips the reuse path entirely.
+          onBodyClick: () => void this.openDeepLinkTarget(d.folder, d.id, { forceNewTab: true }),
           overlayAction: {
             label: "Snooze", icon: "alarm-clock-check", title: "Snooze / reschedule…",
             onClick: () => void this.openSchedulerForRef(d.folder, d.id),

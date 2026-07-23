@@ -8,6 +8,7 @@ type LockedEntry = { folder: string; blob: string; parentId?: string | null; tit
 import { renderTaskTriage, defaultTaskTriageState, type TaskTriageState } from "./task-render";
 import { renderAggModeBar, type AggMode } from "./agg-modes";
 import { returnToOriginOnClose } from "./leaf-return";
+import { settleNewTab } from "./view-helpers";
 
 // Obsidian types `moment` as a namespace (not callable); cast to a callable.
 const momentFn = moment as unknown as (...args: unknown[]) => { fromNow: () => string };
@@ -479,5 +480,6 @@ export async function openAggregateView(plugin: StashpadPlugin, mode: AggregateM
   const leaf = workspace.getLeaf("tab");
   await leaf.setViewState({ type: STASHPAD_AGGREGATE_VIEW_TYPE, active: true, state: { mode } });
   workspace.revealLeaf(leaf);
+  settleNewTab(workspace, originLeaf); // 0.199.0 background-tabs behavior
   returnToOriginOnClose(workspace, leaf, originLeaf, (ref) => plugin.registerEvent(ref));
 }

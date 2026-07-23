@@ -1,0 +1,3 @@
+#!/bin/zsh
+# sp — Stashpad CLI wrapper. See scripts/sp.mjs for docs.
+exec node "$(dirname "$0")/sp.mjs" "$@"

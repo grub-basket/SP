@@ -60,6 +60,7 @@ export class ComposerAutocomplete {
 
   attach(): void {
     this.ta.addEventListener("input", this.onInput);
+    this.ta.addEventListener("keydown", this.onAutoPair, true);
     this.ta.addEventListener("keydown", this.onKeyDown, true);
     this.ta.addEventListener("blur", this.onBlur);
     // Document-capture Escape interceptor — only acts while a popup is
@@ -94,6 +95,7 @@ export class ComposerAutocomplete {
   detach(): void {
     this.close();
     this.ta.removeEventListener("input", this.onInput);
+    this.ta.removeEventListener("keydown", this.onAutoPair, true);
     this.ta.removeEventListener("keydown", this.onKeyDown, true);
     this.ta.removeEventListener("blur", this.onBlur);
     for (const off of this.vaultListeners) off();
@@ -146,15 +148,33 @@ export class ComposerAutocomplete {
     if (caret == null) return null;
     const before = value.slice(0, caret);
 
-    // Wikilink: [[ followed by query (no closing ]] yet, no newline)
+    // Wikilink: [[ followed by query (no closing ]] before the caret, no newline).
     const linkMatch = before.match(/\[\[([^\]\[\n]*)$/);
     if (linkMatch) {
       const query = linkMatch[1];
+      // 0.199.2: when the caret sits INSIDE an existing link ("[[fo|o]]", or
+      // right before an auto-paired "]]"), extend the replacement over the
+      // remainder + its closing brackets. Without this, accepting a suggestion
+      // left the old tail behind: "[[Fixed]]o]]" — the four-brackets bug.
+      const rest = value.slice(caret).match(/^([^\]\[\n]*)\]\]/);
+      const replaceEnd = rest ? caret + rest[1].length + 2 : caret;
+      // 0.199.2: `[[@` hands over to the date trigger so a date can be
+      // inserted AS a link — the query after `@` resolves via NLD, and every
+      // insert (date or note) is a wikilink because the user is typing one.
+      if (query.startsWith("@")) {
+        return {
+          kind: "at",
+          query: query.slice(1),
+          replaceStart: caret - query.length - 2,
+          replaceEnd,
+          inLink: true,
+        };
+      }
       return {
         kind: "link",
         query,
         replaceStart: caret - query.length - 2,
-        replaceEnd: caret,
+        replaceEnd,
       };
     }
 
@@ -206,12 +226,23 @@ export class ComposerAutocomplete {
    *  doesn't parse as a date. Fully defensive — a missing/changed API just
    *  disables date suggestions, never throws. */
   private nldParse(input: string): string | null {
+    return this.nldResolve(input)?.formatted ?? null;
+  }
+
+  /** Like nldParse, but also reports whether the NLD plugin's own
+   *  "add dates as link" autosuggest setting is on — so `@today` in the
+   *  composer inserts the same thing NLD's editor suggest would
+   *  (0.199.2: inherit that setting instead of always inserting plain text). */
+  private nldResolve(input: string): { formatted: string; asLink: boolean } | null {
     const text = input.trim();
     if (!text) return null;
     const plugins = (this.app as unknown as { plugins?: { plugins?: Record<string, unknown> } }).plugins?.plugins ?? {};
     for (const id of ["nldates-obsidian", "nldates-redux"]) {
       const nld = plugins[id] as
-        | { parseDate?: (s: string) => { moment?: { isValid?: () => boolean }; formattedString?: string } | null }
+        | {
+            parseDate?: (s: string) => { moment?: { isValid?: () => boolean }; formattedString?: string } | null;
+            settings?: { autosuggestToggleLink?: unknown };
+          }
         | undefined;
       if (!nld || typeof nld.parseDate !== "function") continue;
       try {
@@ -220,7 +251,9 @@ export class ComposerAutocomplete {
         const valid = res.moment && typeof res.moment.isValid === "function"
           ? res.moment.isValid()
           : !!res.formattedString && res.formattedString !== "Invalid date";
-        if (valid && res.formattedString) return res.formattedString;
+        if (valid && res.formattedString) {
+          return { formatted: res.formattedString, asLink: nld.settings?.autosuggestToggleLink === true };
+        }
       } catch {
         // try the next candidate plugin
       }
@@ -265,16 +298,21 @@ export class ComposerAutocomplete {
     // 0.186.0: unified `@` — natural-language dates (via NLD) blended with
     // note links. Dates rank first so Enter on `@today` inserts the date.
     const dateItems: SuggestItem[] = [];
+    // 0.199.2: a date inserts as a wikilink when the trigger sits inside `[[`
+    // (the user is typing a link), or when NLD's own "add dates as link"
+    // setting is on — inherited so `@today` matches what NLD would insert.
+    const dateInsert = (r: { formatted: string; asLink: boolean }): string =>
+      state.inLink || r.asLink ? `[[${r.formatted}]]` : r.formatted;
     if (q === "") {
       // Bare `@`: offer a few common relatives (NLD-style). Absent NLD, this
       // yields nothing and we fall through to a short note list below.
       for (const phrase of ["today", "tomorrow", "next week"]) {
-        const f = this.nldParse(phrase);
-        if (f) dateItems.push({ label: `📅 ${phrase}`, insert: f, subtitle: `→ ${f}` });
+        const r = this.nldResolve(phrase);
+        if (r) dateItems.push({ label: `📅 ${phrase}`, insert: dateInsert(r), subtitle: `→ ${r.formatted}` });
       }
     } else {
-      const f = this.nldParse(state.query);
-      if (f) dateItems.push({ label: `📅 ${state.query.trim()}`, insert: f, subtitle: `→ ${f}` });
+      const r = this.nldResolve(state.query);
+      if (r) dateItems.push({ label: `📅 ${state.query.trim()}`, insert: dateInsert(r), subtitle: `→ ${r.formatted}` });
     }
     // On a bare `@` with date suggestions present, keep the list tight (dates
     // only); otherwise blend in note matches so `@name` still links a note.
@@ -305,6 +343,28 @@ export class ComposerAutocomplete {
     e.stopPropagation();
     e.stopImmediatePropagation();
     this.close();
+  };
+
+  /** 0.199.2: bracket autopairing. Typing the second `[` of a wikilink
+   *  auto-inserts the closing `]]` (caret stays between); typing `]` when the
+   *  next character already is `]` types over it instead of doubling up.
+   *  Together with the extended-replacement logic in detectTrigger, accepting
+   *  a suggestion never strands stray brackets. Toggleable in settings. */
+  private onAutoPair = (e: KeyboardEvent): void => {
+    if (!getSettings().autoPairBrackets) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const caret = this.ta.selectionStart;
+    if (caret == null || caret !== this.ta.selectionEnd) return;
+    const v = this.ta.value;
+    if (e.key === "[" && v[caret - 1] === "[") {
+      e.preventDefault();
+      this.ta.value = v.slice(0, caret) + "[]]" + v.slice(caret);
+      this.ta.setSelectionRange(caret + 1, caret + 1);
+      this.ta.dispatchEvent(new Event("input", { bubbles: true }));
+    } else if (e.key === "]" && v[caret] === "]") {
+      e.preventDefault();
+      this.ta.setSelectionRange(caret + 1, caret + 1);
+    }
   };
 
   private onKeyDown = (e: KeyboardEvent): void => {
@@ -472,6 +532,8 @@ interface SuggestItem {
 
 interface AutocompleteState {
   kind: "tag" | "link" | "at";
+  /** 0.199.2: the trigger sits inside `[[ ]]` — every insert must be a link. */
+  inLink?: boolean;
   query: string;
   /** Inclusive start index of the trigger (for replacement). For "[[foo"
    *  this points at the first `[`; for "#foo" at the `#`. */

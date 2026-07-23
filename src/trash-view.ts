@@ -5,6 +5,7 @@ import { ConfirmModal } from "./modals";
 import type { DeletedMeta } from "./encryption-ops";
 import { renderAggModeBar, type AggMode } from "./agg-modes";
 import { returnToOriginOnClose } from "./leaf-return";
+import { settleNewTab } from "./view-helpers";
 
 // Obsidian types `moment` as the namespace (not callable); cast to a callable.
 const momentFn = moment as unknown as (...args: unknown[]) => { fromNow: () => string };
@@ -326,5 +327,6 @@ export async function openTrashView(plugin: StashpadPlugin): Promise<void> {
   const leaf = workspace.getLeaf("tab");
   await leaf.setViewState({ type: STASHPAD_TRASH_VIEW_TYPE, active: true });
   workspace.revealLeaf(leaf);
+  settleNewTab(workspace, originLeaf); // 0.199.0 background-tabs behavior
   returnToOriginOnClose(workspace, leaf, originLeaf, (ref) => plugin.registerEvent(ref));
 }

@@ -1,4 +1,16 @@
-import { setIcon } from "obsidian";
+import { setIcon, type Workspace, type WorkspaceLeaf } from "obsidian";
+import { getSettings } from "./settings";
+
+/** 0.199.0: "New tabs open in the background" behavior. Call AFTER opening a
+ *  new tab, passing the leaf that was active BEFORE `getLeaf("tab")`: when the
+ *  setting is on, focus is handed straight back so the new tab loads behind
+ *  the user's current place. Returns true when it backgrounded. (settings.ts's
+ *  import of this module is type-only, so there's no runtime import cycle.) */
+export function settleNewTab(ws: Workspace, prev: WorkspaceLeaf | null | undefined): boolean {
+  if (!getSettings().newTabsInBackground) return false;
+  if (prev) ws.setActiveLeaf(prev, { focus: true });
+  return true;
+}
 
 /** How a block of text is broken into multiple notes — for the composer's
  *  split-on-submit and the per-note Split modal's "Split by…" presets. */

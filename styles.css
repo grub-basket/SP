@@ -3862,10 +3862,16 @@ body.is-mobile .stashpad-okf-cta {
 .stashpad-due-time::-webkit-calendar-picker-indicator {
   display: none;
 }
-.stashpad-due-date, .stashpad-due-time {
+/* 0.198.1: Obsidian's app.css reserves a picker-indicator gutter on date
+   inputs via `body:not(.is-ios):not(.is-android) input[type="date"]:not(…)`
+   { padding-left: var(--size-4-6) } — specificity (0,4,2), unbeatable with a
+   clean class selector. We hide that indicator (left icon is the picker), so
+   the gutter is just an empty gap before the value. !important on the padding
+   only, scoped to these two inputs. */
+input[type="date"].stashpad-due-date, input[type="time"].stashpad-due-time {
   flex: 1 1 auto;
   min-width: 0;
-  padding: 6px 8px;
+  padding: 6px 8px !important;
   border-radius: 6px;
   border: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
@@ -6307,3 +6313,32 @@ button.stashpad-btn-loading::after {
   color: var(--text-on-accent);
   border-color: var(--interactive-accent);
 }
+
+/* 0.199.3: composer dropzone button + the big dropzone modal. */
+.stashpad-composer-drop.is-dropover {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.stashpad-dropzone-modal { max-width: 480px; }
+.stashpad-dropzone {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 8px;
+  min-height: 220px;
+  margin: 8px 0 4px;
+  padding: 24px;
+  border: 2px dashed var(--background-modifier-border-hover);
+  border-radius: 12px;
+  cursor: pointer;
+  text-align: center;
+  color: var(--text-muted);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.stashpad-dropzone:hover { border-color: var(--interactive-accent); color: var(--text-normal); }
+.stashpad-dropzone.is-dropover {
+  border-color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-dropzone-icon svg { width: 42px; height: 42px; }
+.stashpad-dropzone-title { font-size: 1.1em; font-weight: 700; }
+.stashpad-dropzone-sub { font-size: 0.85em; max-width: 320px; }

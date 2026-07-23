@@ -2122,9 +2122,14 @@ export class OpenDeepLinkModal extends Modal {
     const input = row.createEl("textarea", { attr: { rows: "3" } });
     input.addClass("stashpad-export-name");
     input.placeholder = "obsidian://stashpad?folder=…&note=…";
+    // 0.199.3: use the MODAL's window's navigator, not the main window's.
+    // In a secondary (pop-out) window the main document isn't focused, so
+    // `navigator.clipboard.readText()` rejects ("document is not focused")
+    // and the auto-paste silently never happened there.
+    const nav = this.contentEl.ownerDocument?.defaultView?.navigator ?? navigator;
     pasteBtn.onclick = async () => {
       try {
-        const t = (await navigator.clipboard?.readText?.())?.trim();
+        const t = (await nav.clipboard?.readText?.())?.trim();
         if (t) { input.value = t; autoHint.hide(); }
         input.focus();
       } catch { new Notice("Couldn't read the clipboard — paste manually."); }
@@ -2159,7 +2164,7 @@ export class OpenDeepLinkModal extends Modal {
       // Prefill from the clipboard when it already holds a Stashpad link — the
       // whole point is pasting, so save the paste. Selected so the user can
       // overwrite with a real paste if it's the wrong link. Best-effort.
-      void navigator.clipboard?.readText?.().then((t) => {
+      void nav.clipboard?.readText?.().then((t) => {
         if (!input.value && t && /obsidian:\/\/stashpad\?/i.test(t.trim())) {
           input.value = t.trim();
           input.select();
@@ -3343,5 +3348,62 @@ export class ReEncryptReviewModal extends Modal {
     };
     btns.createEl("button", { text: "Cancel" }).onclick = () => this.close();
   }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.199.3: a big, explicit dropzone. Opened from the composer's dropzone
+ *  button: drag files onto the large dashed area (imports them like a drop on
+ *  the composer), or click the area to open the OS file picker. The zone is
+ *  deliberately huge — the whole point is not having to aim. */
+export class DropzoneModal extends Modal {
+  constructor(app: App, private onFiles: (files: File[]) => void) { super(app); }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.titleEl.setText("Add files");
+    this.modalEl.addClass("stashpad-dropzone-modal");
+
+    const zone = this.contentEl.createDiv({ cls: "stashpad-dropzone" });
+    setIcon(zone.createDiv({ cls: "stashpad-dropzone-icon" }), "file-input");
+    zone.createDiv({ cls: "stashpad-dropzone-title", text: "Drop files here" });
+    zone.createDiv({ cls: "stashpad-dropzone-sub", text: "…or click to browse. Files import as attachments and their links land in the composer." });
+
+    const take = (files: File[]): void => {
+      if (files.length === 0) return;
+      this.close();
+      this.onFiles(files);
+    };
+
+    zone.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
+      e.preventDefault(); e.stopPropagation();
+      try { e.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
+      zone.addClass("is-dropover");
+    });
+    zone.addEventListener("dragleave", () => zone.removeClass("is-dropover"));
+    zone.addEventListener("drop", (e) => {
+      zone.removeClass("is-dropover");
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
+      e.preventDefault(); e.stopPropagation();
+      take(files);
+    });
+    zone.onclick = () => {
+      // The modal's own document, so the picker works in pop-out windows too.
+      const doc = this.contentEl.ownerDocument ?? document;
+      const input = doc.createElement("input");
+      input.type = "file";
+      input.multiple = true;
+      input.setCssStyles({ display: "none" });
+      input.onchange = () => {
+        const picked = Array.from(input.files ?? []);
+        input.remove();
+        take(picked);
+      };
+      doc.body.appendChild(input);
+      input.click();
+    };
+  }
+
   onClose(): void { this.contentEl.empty(); }
 }

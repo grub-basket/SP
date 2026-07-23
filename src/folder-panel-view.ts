@@ -94,7 +94,10 @@ export class StashpadFolderPanelView extends ItemView {
     if (this.plugin.encryption?.isConfigured?.()) {
       const trashBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-trash" });
       setIcon(trashBtn, "trash-2");
-      trashBtn.setAttr("aria-label", "Open encrypted trash");
+      // 0.199.0: "Open trash" — encryption is an implementation detail of the
+      // trash store, and there's no separate plain-text trash view to
+      // disambiguate from.
+      trashBtn.setAttr("aria-label", "Open trash");
       trashBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); this.plugin.openEncryptedTrash(); } };
     }
     this.renderFolders(folderSection.createDiv({ cls: "stashpad-folderpanel-list" }));
@@ -761,6 +764,9 @@ export class StashpadFolderPanelView extends ItemView {
     // 0.98.37: reveal-in-file-explorer moved to the context menu only; keep the
     // open-in-new-tab quick button.
     const actions = row.createDiv({ cls: "stashpad-folderpanel-actions" });
+    // 0.199.0: when "Folders always open in a new tab" is on, a per-row
+    // new-tab button is redundant (the row click already opens a new tab).
+    if (!this.plugin.settings.foldersAlwaysNewTab) {
     const newTabBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
     setIcon(newTabBtn, "plus-square");
     newTabBtn.setAttr("aria-label", "Open in new tab");
@@ -773,6 +779,7 @@ export class StashpadFolderPanelView extends ItemView {
       e.preventDefault(); e.stopPropagation();
       this.onNavigateAway(); void this.plugin.activateViewForFolder(folder);
     };
+    }
 
     // 0.98.37: open on a SINGLE click. Use mousedown (not click) so it fires even
     // when the sidebar panel wasn't focused yet — Obsidian's "first click focuses
@@ -887,7 +894,7 @@ export class StashpadFolderPanelView extends ItemView {
       // the per-folder "Encrypt archived notes" setting.)
 
       // 0.98.31: open the encrypted-trash tab (recoverable secure-deleted notes).
-      menu.addItem((i) => i.setTitle("Open encrypted trash").setIcon("rotate-ccw")
+      menu.addItem((i) => i.setTitle("Open trash").setIcon("rotate-ccw")
         .onClick(() => this.plugin.openEncryptedTrash()));
     }
     menu.addSeparator();
