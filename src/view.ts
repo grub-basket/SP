@@ -5907,10 +5907,8 @@ export class StashpadView extends ItemView {
       void importAndAppend(out);
     });
 
-    const fileInput = composer.createEl("input", {
-      cls: "stashpad-composer-file-input", type: "file", attr: { multiple: "true" },
-    });
-    fileInput.setCssStyles({ display: "none" });
+    // (0.201.2: the hidden composer file input is gone — the paperclip opens
+    // the DropzoneModal, whose zone hosts its own picker.)
 
     const btnRail = composer.createDiv({ cls: "stashpad-composer-btn-rail" });
     // 0.119.0 (mobile-ui-changes-2): on mobile, the folder picker + search +
@@ -5950,33 +5948,7 @@ export class StashpadView extends ItemView {
       menu.showAtMouseEvent(e);
     };
 
-    // 0.199.3: dedicated file dropzone button — drag a file straight onto it
-    // (imports + appends the link, same as dropping on the composer), or click
-    // it to open a LARGE dropzone modal whose zone doubles as a file-picker
-    // button. Saves aiming a drag at the narrow composer or hunting the
-    // command palette for the picker.
-    const dropBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-drop" });
-    setIcon(dropBtn, "file-input");
-    dropBtn.title = "Add files — drop them here, or click for a bigger dropzone / file picker";
-    dropBtn.onmousedown = (e) => e.preventDefault();
-    dropBtn.onclick = (e) => {
-      e.preventDefault();
-      new DropzoneModal(this.app, (files) => void importAndAppend(files)).open();
-    };
-    dropBtn.addEventListener("dragover", (e) => {
-      if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
-      e.preventDefault(); e.stopPropagation();
-      try { e.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
-      dropBtn.addClass("is-dropover");
-    });
-    dropBtn.addEventListener("dragleave", () => dropBtn.removeClass("is-dropover"));
-    dropBtn.addEventListener("drop", (e) => {
-      dropBtn.removeClass("is-dropover");
-      const files = Array.from(e.dataTransfer?.files ?? []);
-      if (files.length === 0) return;
-      e.preventDefault(); e.stopPropagation();
-      void importAndAppend(files);
-    });
+    // (0.201.2: the 0.199.3 dropzone button merged into the paperclip below.)
 
     const destBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-dest" });
     this.composerDestBtn = destBtn;
@@ -6024,36 +5996,35 @@ export class StashpadView extends ItemView {
       this.composerDraft = ta.value;
     };
 
-    const clipBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn" });
+    // 0.201.2: the paperclip absorbed the 0.199.3 dropzone button's powers
+    // (the two were redundant): drop files straight ONTO it, or click for the
+    // large dropzone modal (whose zone doubles as the file picker). Same icon
+    // as always; the separate dropzone button is gone.
+    const clipBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-drop" });
     setIcon(clipBtn, "paperclip");
-    clipBtn.title = "Attach files";
+    clipBtn.title = "Attach files — drop them here, or click for a bigger dropzone / file picker";
     clipBtn.onmousedown = (e) => e.preventDefault();
     clipBtn.onclick = (e) => {
       e.preventDefault();
-      const wasFocused = document.activeElement === ta;
-      fileInput.click();
-      // The native file picker is a system overlay and will blur the
-      // textarea regardless of preventDefault. Re-focus once the user
-      // cancels or the change event lands.
-      if (wasFocused) {
-        const refocus = () => { ta.focus(); };
-        setTimeout(refocus, 100);
-        setTimeout(refocus, 500);
-      }
+      new DropzoneModal(this.app, (files) => void importAndAppend(files)).open();
     };
-    fileInput.addEventListener("change", async () => {
-      const files = Array.from(fileInput.files ?? []);
-      fileInput.value = "";
-      for (const f of files) {
-        const link = await this.importAttachment(f);
-        if (link) appendLink(link);
-      }
-      ta.focus();
+    clipBtn.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
+      e.preventDefault(); e.stopPropagation();
+      try { e.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
+      clipBtn.addClass("is-dropover");
     });
-
+    clipBtn.addEventListener("dragleave", () => clipBtn.removeClass("is-dropover"));
+    clipBtn.addEventListener("drop", (e) => {
+      clipBtn.removeClass("is-dropover");
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      if (files.length === 0) return;
+      e.preventDefault(); e.stopPropagation();
+      void importAndAppend(files);
+    });
     // Button order (per product decision): destination · attachment · send-mode ·
     // split. append() moves the already-created nodes into this order without
-    // disturbing their handlers or the appendLink/fileInput dependency above.
+    // disturbing their handlers or the appendLink dependency above.
     expandedGroup.append(destBtn, clipBtn, enterBtn, splitBtn);
 
     // 0.61.4: render the expand-toggle on BOTH mobile and desktop. CSS
@@ -11718,6 +11689,12 @@ export class StashpadView extends ItemView {
     // Jump action.
     const folder = (opts.targetFolder ?? this.noteFolder).replace(/\/+$/, "");
     const remote = folder !== this.noteFolder;
+    // 0.201.2: heal exactly-four consecutive brackets — the residue of the
+    // pre-0.199.2 four-brackets autocomplete bug and of hand-doubled closes —
+    // down to a proper pair. Anchored so [[[ / ]]]]] (3, 5+) are left alone;
+    // runs at CREATION only (the least disruptive point — never rewrites
+    // already-saved notes).
+    body = body.replace(/(?<!\[)\[{4}(?!\[)/g, "[[").replace(/(?<!\])\]{4}(?!\])/g, "]]");
     await this.ensureFolder(folder);
     const id = this.plugin.mintNoteId();
 

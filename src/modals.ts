@@ -743,15 +743,29 @@ export class NoteWorkbench {
     pop.onclick = () => this.cb.popOut!(this.getState());
   }
 
+  /** 0.201.2: leave for Obsidian's editor, SAVING first. The old flow opened
+   *  the tab immediately and only then hit the dirty guard — so the discard
+   *  prompt appeared over an already-opened (stale) tab. Now: unsaved edits
+   *  are written silently, then the up-to-date note opens; no prompt. */
+  async openExternalSaving(): Promise<void> {
+    if (!this.cb.onOpenExternal) return;
+    if (this.isDirty()) {
+      try { await this.cb.onSave(this.cursorTextarea?.value ?? this.cursorText); }
+      catch (e) { console.warn("[Stashpad] save-before-open failed", e); new Notice("Couldn't save the edits — not opening. See console."); return; }
+    }
+    this.cb.onOpenExternal();
+    this.cb.onDone(); // committing close — the dirty guard must not fire
+  }
+
   /** 0.170.1: leave for a full Obsidian markdown editor tab. */
   private renderOpenExternal(actions: HTMLElement): void {
     if (!this.cb.onOpenExternal) return;
     const b = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
     setIcon(b.createSpan({ cls: "stashpad-split-popout-icon" }), "pencil");
     b.createSpan({ text: Platform.isMobile ? "Advanced" : "Obsidian editor" });
-    b.setAttr("aria-label", "Open in a full Obsidian editor tab");
+    b.setAttr("aria-label", "Open in a full Obsidian editor tab (saves your edits first)");
     b.onmousedown = (e) => e.preventDefault();
-    b.onclick = () => { this.cb.onOpenExternal!(); this.cb.close(); };
+    b.onclick = () => { void this.openExternalSaving(); };
   }
 
   /** 0.170.0: plain editing — the shared Original/Changes/editor sections + a Save. */
@@ -1175,7 +1189,7 @@ export class NoteWorkbenchModal extends Modal {
     this.scope.register(["Mod"], "s", (e) => { e.preventDefault(); this.ui?.setSurface("split"); });
     // 0.184.0: Mod+Shift+E → open the note in Obsidian's editor (no-op for a new
     // note from the composer, which has no onOpenExternal).
-    this.scope.register(["Mod", "Shift"], "e", (e) => { e.preventDefault(); if (this.cbs.onOpenExternal) { this.cbs.onOpenExternal(); this.close(); } });
+    this.scope.register(["Mod", "Shift"], "e", (e) => { e.preventDefault(); void this.ui?.openExternalSaving(); }); // 0.201.2: saves first, no discard prompt
   }
   // 0.170.5: dirty guard — Esc / click-outside / × / Cancel all route through close();
   // if there are unsaved edits (and this isn't a deliberate Save/Split/pop-out), confirm.
