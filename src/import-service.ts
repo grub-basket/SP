@@ -286,6 +286,26 @@ export class ImportService {
 
   /** Markdown: archive the untouched original to `_archive/`, then create a
    *  Stashpad-shaped clone (frontmatter filled in) in the folder root. */
+  /** 0.199.5: preserve an imported markdown file's ORIGINAL FILENAME by
+   *  prepending it to the body as an H1 + blank line. Stashpad renames the
+   *  clone to a slug of its first line, so before this the filename was
+   *  simply lost. Skipped when the note already opens with an equivalent
+   *  line (compared as slugs, so "My Note" matches "my-note"), and callers
+   *  skip it for Stashpad-origin files (their filename is just slug+id, not
+   *  user information). */
+  private withTitleHeading(basename: string, body: string): string {
+    const name = basename.trim();
+    if (!name) return body;
+    const firstLine = (body.split(/\r?\n/).find((l) => l.trim()) ?? "").trim().replace(/^#+\s*/, "");
+    const same = (a: string, b: string): boolean => {
+      const sa = bodyToSlug(a) || a.toLowerCase();
+      const sb = bodyToSlug(b) || b.toLowerCase();
+      return !!sa && sa === sb;
+    };
+    if (same(firstLine, name)) return body;
+    return `# ${name}\n\n${body.replace(/^\n+/, "")}`;
+  }
+
   private async importMarkdown(file: TFile): Promise<ImportRecord | null> {
     const folder = file.parent!.path.replace(/\/+$/, "");
     const raw = await this.app.vault.read(file);
@@ -326,9 +346,12 @@ export class ImportService {
     if (fm.contributors !== undefined) cloneFm.contributors = fm.contributors;
     cloneFm.imported = true; // mark as imported (the "imported only" view filter)
 
-    const slug = bodyToSlug(body) || file.basename;
+    // 0.199.5: keep the filename as an H1 (unless Stashpad-origin — its
+    // filename is just slug+id — or the note already opens with it).
+    const finalBody = typeof fm.id === "string" && fm.id ? body : this.withTitleHeading(file.basename, body);
+    const slug = bodyToSlug(finalBody) || file.basename;
     const notePath = await this.uniquePath(folder, buildFilename(slug, cloneFm.id));
-    await this.createNote(notePath, serializeNote(cloneFm, body));
+    await this.createNote(notePath, serializeNote(cloneFm, finalBody));
     return { kind: "md", folder, archivePath, notePath, originalName: file.name };
   }
 
@@ -503,9 +526,12 @@ export class ImportService {
           cloneFm.created = t.created;
           if (t.modified) cloneFm.modified = t.modified;
           cloneFm.attachments = Array.isArray(fm.attachments) ? fm.attachments : [];
-          const slug = bodyToSlug(body) || child.basename;
+          // 0.199.5: same filename-preserving H1 as importMarkdown; skipped
+          // for Stashpad-origin notes (incomingId — filename is slug+id).
+          const finalBody = incomingId ? body : this.withTitleHeading(child.basename, body);
+          const slug = bodyToSlug(finalBody) || child.basename;
           const notePath = await this.uniquePath(root, buildFilename(slug, cloneFm.id));
-          await this.createNote(notePath, serializeNote(cloneFm, body));
+          await this.createNote(notePath, serializeNote(cloneFm, finalBody));
           notePaths.push(notePath);
         } else if (NON_NOTE_EXTENSIONS.has(child.extension)) {
           // 0.84.9: never turn a nested .edtz / .stash into a linking note —
