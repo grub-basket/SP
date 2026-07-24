@@ -221,8 +221,12 @@ function breadcrumb(nodes, n) {
 // Self-contained client for the obs-dev instance on :9222 (same protocol as
 // scripts/obs-dev.mjs, including the SAME safety interlock: refuse to drive
 // unless the target is the Claude Dev Vault, verified by name + sentinel).
-const PORT = 9222;
-const SENTINEL = "claude-dev-vault-7f3a9c2e-do-not-delete";
+// SP_PORT=9223 targets the slot-B instance (Claude Dev Vault B).
+const PORT = Number(process.env.SP_PORT) || 9222;
+const SENTINELS = new Map([
+  ["Claude Dev Vault", "claude-dev-vault-7f3a9c2e-do-not-delete"],
+  ["Claude Dev Vault B", "claude-dev-vault-b-4e8d1f6a-do-not-delete"],
+]);
 
 async function cdpEvalRaw(body) {
   let targets;
@@ -246,12 +250,15 @@ let vaultVerified = false;
 async function obsDevEval(js) {
   if (!vaultVerified) {
     const raw = await cdpEvalRaw(`
-      const f = app.vault.getAbstractFileByPath("CLAUDE-DEV-VAULT-SENTINEL.md");
-      let sentinel = false;
-      if (f) { try { sentinel = (await app.vault.cachedRead(f)).includes(${JSON.stringify(SENTINEL)}); } catch {} }
-      return { name: app.vault.getName(), sentinel };`);
+      const name = app.vault.getName();
+      const fname = name === "Claude Dev Vault B" ? "CLAUDE-DEV-VAULT-B-SENTINEL.md" : "CLAUDE-DEV-VAULT-SENTINEL.md";
+      const f = app.vault.getAbstractFileByPath(fname);
+      let body = "";
+      if (f) { try { body = await app.vault.cachedRead(f); } catch {} }
+      return { name, body };`);
     let v; try { v = JSON.parse(raw); } catch { v = null; }
-    if (!v || v.name !== "Claude Dev Vault" || !v.sentinel) {
+    const expected = v ? SENTINELS.get(v.name) : null;
+    if (!v || !expected || !(v.body || "").includes(expected)) {
       die(`SAFETY ABORT — instance on :${PORT} is NOT the Claude Dev Vault (${raw}). Refusing to drive.`);
     }
     vaultVerified = true;

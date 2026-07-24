@@ -53,10 +53,11 @@ Obsidian and by you in ten years.
 
 ## An outliner that nests as deep as you think
 
-Notes aren't a flat feed. Click a note (or press →) to drill into it, and anything you
-capture next nests underneath — arbitrarily deep. Press ← to climb back out. Any note
-can become a temporary root, so you can focus a single branch and work inside it
-without the rest of the tree in your way.
+Notes don't have to stay a flat feed. Click a note (or press →) to drill into it, and
+anything you capture next nests underneath — arbitrarily deep. Press ← to climb back
+out. Any note can become a temporary root, so you can focus a single branch and work
+inside it without the rest of the tree in your way. (Prefer everything in one stream?
+There's a flat view mode for that too.)
 
 The result is that structure *emerges* from fast capture instead of being planned up
 front. Dump thoughts in as they come; promote, demote, and rearrange them into an

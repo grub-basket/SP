@@ -6342,3 +6342,7 @@ button.stashpad-btn-loading::after {
 .stashpad-dropzone-icon svg { width: 42px; height: 42px; }
 .stashpad-dropzone-title { font-size: 1.1em; font-weight: 700; }
 .stashpad-dropzone-sub { font-size: 0.85em; max-width: 320px; }
+
+/* 0.201.0: multi-line notification messages (cut summary, cross-vault paste
+   receipt) — render \n as line breaks. Single-line messages unaffected. */
+.stashpad-notice-message { white-space: pre-line; }

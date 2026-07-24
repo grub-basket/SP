@@ -22,6 +22,7 @@ import {
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
+import { writeXvClipboard, readXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
 import { ensureOkfTemplate, okfFolders, rebuildOkfForFolder, OKF_DEFAULT_TEMPLATE_PATH } from "./okf";
 import { buildOkfBundleFiles, zipBundle, tarGzBundle } from "./okf-export";
 import { formatDateTime } from "./format";
@@ -182,6 +183,9 @@ export default class StashpadPlugin extends Plugin {
   /** The persistent "cut pending" notice, kept so it can be dismissed when the
    *  cut resolves (paste) or is cancelled (Escape / replaced by a new copy). */
   noteClipboardNotice: Notice | null = null;
+  /** 0.201.1: a cross-vault CUT waiting for its destination ACK. Set when a
+   *  cut payload is stamped; resolved by checkXvCutAck() on window focus. */
+  pendingXvCut: { token: string; folder: string; ids: StashpadId[] } | null = null;
 
   /** Clear the note clipboard + dismiss its notice. Callers re-render to drop
    *  the .is-cut-pending / .is-copy-pending row styling. */
@@ -189,6 +193,7 @@ export default class StashpadPlugin extends Plugin {
     try { this.noteClipboardNotice?.hide(); } catch { /* already gone */ }
     this.noteClipboardNotice = null;
     this.noteClipboard = null;
+    this.pendingXvCut = null;
   }
 
   private _renderCacheStore: RenderCacheStore | null = null;
@@ -2208,6 +2213,9 @@ export default class StashpadPlugin extends Plugin {
     // foregrounds. Nudges the user to reload so they're not stuck on
     // stale code (the "old UI after opening the app" report).
     this.registerDomEvent(window, "focus", () => void this.checkForSyncedBuild());
+    // 0.201.1: cross-vault cut handshake — returning to this vault after
+    // pasting the cut elsewhere surfaces the "delete the originals?" modal.
+    this.registerDomEvent(window, "focus", () => void this.checkXvCutAck());
     setTimeout(() => void this.checkForSyncedBuild(), 5000);
     // 0.92.2: also poll periodically. Focus + one-shot-at-5s missed the case
     // where a newer build lands WHILE the window stays focused (a fresh deploy,
@@ -4959,6 +4967,91 @@ export default class StashpadPlugin extends Plugin {
       try { const id = splitFrontmatter(await this.app.vault.read(f)).fm.id; if (typeof id === "string") out.add(id); } catch { /* skip unreadable */ }
     }
     return out;
+  }
+
+  /** 0.201.0: stamp the OS clipboard with the cross-vault payload for a
+   *  copy/cut selection — plain text stays as-is, plus a hidden `.stash`-zip
+   *  flavor any OTHER vault's Stashpad can paste (see cross-vault-clipboard.ts).
+   *  Oversized selections are refused with a modal offering the .stash-file
+   *  export instead (clipboards aren't for hundreds of MB of attachments).
+   *  Best-effort: any failure just leaves the plain-text clipboard behavior. */
+  async stampCrossVaultClipboard(folder: string, rootIds: StashpadId[], mode: "cut" | "copy", plainText: string): Promise<{ status: "ok" | "too-big" | "failed" | "empty"; mb?: string }> {
+    try {
+      const cleaned = folder.replace(/\/+$/, "");
+      const rootNotes: { id: StashpadId; file: TFile }[] = [];
+      const allDescendants: { id: StashpadId; file: TFile }[] = [];
+      for (const rid of rootIds) {
+        const sub = await collectSubtree(this.app, cleaned, rid);
+        if (!sub) continue;
+        rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
+        for (const d of sub.descendants) allDescendants.push({ id: d.id, file: d.file });
+      }
+      if (!rootNotes.length) return { status: "empty" };
+      const zip = await buildStashZip(this.app, { rootNotes, allDescendants, sourceFolder: cleaned });
+      if (zip.length > XV_MAX_BYTES) {
+        // 0.201.1: the caller (view) shows the modal and routes to the FULL
+        // export modal, so encryption etc. are on the table for big payloads.
+        return { status: "too-big", mb: (zip.length / (1024 * 1024)).toFixed(1) };
+      }
+      const cutToken = mode === "cut" ? this.mintNoteId() + this.mintNoteId() : undefined;
+      await writeXvClipboard(plainText, {
+        v: 1, mode, sourceVault: this.app.vault.getName(), sourceFolder: cleaned,
+        parents: rootNotes.length, children: allDescendants.length,
+        ...(cutToken ? { cutToken } : {}),
+      }, zip);
+      if (cutToken) this.pendingXvCut = { token: cutToken, folder: cleaned, ids: rootIds.slice() };
+      return { status: "ok" };
+    } catch (e) {
+      console.warn("[Stashpad] cross-vault clipboard stamp failed (plain text still copied)", e);
+      return { status: "failed" };
+    }
+  }
+
+  /** 0.201.1: source side of the cross-vault cut handshake. Runs on window
+   *  focus: if our pending cut's token is ACKed on the clipboard (the other
+   *  vault pasted it), offer — via modal, NOTHING is deleted before the user
+   *  confirms — to delete the originals here. Confirm → snapshot-backed,
+   *  undoable trash of the cut subtrees. Cancel → the cut resolves as a copy. */
+  async checkXvCutAck(): Promise<void> {
+    const pending = this.pendingXvCut;
+    if (!pending) return;
+    const ack = readXvAck();
+    if (!ack || ack.token !== pending.token) return;
+    // Consume the pending state FIRST so a second focus event can't stack a
+    // second modal for the same cut.
+    this.pendingXvCut = null;
+    const n = pending.ids.length;
+    new ConfirmModal(
+      this.app,
+      "Cut notes pasted in another vault",
+      `Vault "${ack.destVault}" received the ${n} cut note${n === 1 ? "" : "s"} (with their subtrees).\nDelete the originals from THIS vault now to finish the move?\nDeleting is undoable here (Undo in the list). Cancel keeps them — the cut becomes a copy.`,
+      "Delete the originals",
+      (confirmed) => { void (async () => {
+        if (!confirmed) { this.clearNoteClipboard(); this.refreshOpenViewsForFolder(pending.folder); return; }
+        try {
+          const snapPaths = await this.subtreeFilePaths(pending.folder, pending.ids);
+          const snap = await this.snapshotPaths(snapPaths);
+          const trashed = await this.trashSubtrees(pending.folder, pending.ids);
+          this.clearNoteClipboard();
+          this.refreshOpenViewsForFolder(pending.folder);
+          const noteN = trashed.filter((f) => f.extension === "md").length;
+          this.getUndoStack(pending.folder).push({
+            label: `Finish cross-vault cut (${noteN} note${noteN === 1 ? "" : "s"})`,
+            undo: async () => { await this.restoreSnapshot(snap); this.refreshOpenViewsForFolder(pending.folder); },
+            redo: async () => { await this.trashSubtrees(pending.folder, pending.ids); this.refreshOpenViewsForFolder(pending.folder); },
+          });
+          this.notifications.show({
+            message: `Finished the cross-vault cut: removed ${noteN} note${noteN === 1 ? "" : "s"} — they now live in "${ack.destVault}". Undo restores them here.`,
+            kind: "warning", category: "delete", affectedIds: pending.ids, folder: pending.folder, duration: 0,
+          });
+        } catch (e) {
+          console.warn("[Stashpad] cross-vault cut cleanup failed — nothing deleted", e);
+          new Notice("Couldn't delete the cut originals — they're untouched. See console.");
+        }
+      })(); },
+      "Keep them (copy)",
+      true,
+    ).open();
   }
 
   /** Cross-folder note paste engine (cut = move, copy = clone). Routes the source

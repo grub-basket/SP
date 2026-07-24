@@ -61,6 +61,8 @@ import {
 } from "./sheets-versions";
 import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
+import { readXvPayload, hasXvPayload, writeXvAck, type XvMeta } from "./cross-vault-clipboard";
+import { importStashZip } from "./stash-package";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
@@ -6746,7 +6748,7 @@ export class StashpadView extends ItemView {
     // and cut need a target, so they stay in the selection/cursor-gated block
     // below; paste used to be trapped there too, which is why pasting inside a
     // parent only worked when a child happened to be selected/under the cursor.)
-    if (matchBinding(e, sb.pasteNotes) && this.plugin.noteClipboard) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
+    if (matchBinding(e, sb.pasteNotes) && (this.plugin.noteClipboard || hasXvPayload())) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
     // openAllTasks (default Shift+T) is global — no selection/cursor needed — AND
     // must be checked BEFORE openTab (plain "T"): a plain-letter binding also fires
     // on its shifted form (matchKey ignores Shift, the shifted-key trap), so if
@@ -8995,6 +8997,15 @@ export class StashpadView extends ItemView {
     this.plugin.clearNoteClipboard(); // drop any prior cut/copy (+ its notice)
     this.plugin.noteClipboard = { mode: "copy", folder: this.noteFolder, ids: targets.map((t) => t.id) };
     this.render(); // paint the .is-copy-pending tint
+    // 0.201.0: add the hidden cross-vault payload alongside the plain text
+    // cmdCopy just wrote. Read that text back so both flavors carry the same
+    // string (best-effort; failure leaves the plain-text-only clipboard).
+    try {
+      const req = (window as unknown as { require?: (m: string) => { clipboard?: { readText?: () => string } } }).require;
+      const plain = req?.("electron")?.clipboard?.readText?.() ?? "";
+      if (plain) void this.plugin.stampCrossVaultClipboard(this.noteFolder, targets.map((t) => t.id), "copy", plain)
+        .then((r) => { if (r.status === "too-big") this.offerExportForOversize(r.mb ?? "?"); });
+    } catch { /* plain text copy already succeeded */ }
   }
 
   /** True when `id` is on a pending CUT in THIS folder — drives the ghosted
@@ -9052,15 +9063,141 @@ export class StashpadView extends ItemView {
     this.render(); // paint the ghosted .is-cut-pending rows immediately
     // Persistent: a pending cut is a MODE — the user should see it until they
     // paste or cancel (Escape). Stored so it can be dismissed on resolve.
+    void this.plugin.stampCrossVaultClipboard(this.noteFolder, targets.map((t) => t.id), "cut", cutText) // 0.201.0
+      .then((r) => { if (r.status === "too-big") this.offerExportForOversize(r.mb ?? "?"); });
+    // 0.199.x tidy-up: structured, line-per-part message — count of parents
+    // (+ their children), a short bulleted list, then the how-to lines.
+    const childCount = targets.reduce((n, t) => n + this.countDescendants(t.id), 0);
+    const bullets = targets.slice(0, 10).map((t) => {
+      const title = (this.titleForNode(t).trim() || "(untitled)");
+      return `• ${title.length > 36 ? title.slice(0, 36) + "…" : title}`;
+    });
+    if (targets.length > 10) bullets.push(`• …+${targets.length - 10} more`);
     this.plugin.noteClipboardNotice = this.plugin.notifications.show({
-      message: `Cut ${this.titleList(targets)} — paste in the LIST to move it there as a note; paste in a note's COMPOSER to drop its text in and delete the original (undoable). Esc cancels. Nothing happens until you paste.`,
+      message: [
+        `✂️ Cut ${targets.length} note${targets.length === 1 ? "" : "s"}${childCount ? ` (with ${childCount} child${childCount === 1 ? "" : "ren"})` : ""}`,
+        ...bullets,
+        "Paste in a LIST to move them there; paste in a COMPOSER to insert the text and delete the originals (undoable).",
+        "Esc cancels — nothing happens until you paste.",
+      ].join("\n"),
       kind: "info", category: "system", affectedIds: targets.map((t) => t.id), folder: this.noteFolder, duration: 0,
     });
   }
 
+  /** 0.201.1: the selection was too big for the clipboard payload — offer the
+   *  FULL export modal (so encryption etc. are available) instead. The plain
+   *  text copy/cut already happened; only the cross-vault flavor was skipped. */
+  private offerExportForOversize(mb: string): void {
+    new ConfirmModal(
+      this.app,
+      "Selection too large for the clipboard",
+      `This selection is ${mb} MB with attachments — too big to carry on the clipboard for cross-vault paste.\nThe normal text copy still worked; only the cross-vault payload was skipped.\nTo move this much between vaults, export it as a .stash file (optionally encrypted) and import it in the other vault.`,
+      "Open the export modal",
+      (confirmed) => { if (confirmed) void this.cmdExportStash(); },
+    ).open();
+  }
+
+  /** Number of descendants under `id` (children, grandchildren, …). */
+  private countDescendants(id: StashpadId): number {
+    let n = 0;
+    const stack = [...(this.tree.get(id)?.children ?? [])];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      n++;
+      const node = this.tree.get(cur);
+      if (node) stack.push(...node.children);
+    }
+    return n;
+  }
+
+  /** 0.201.0: paste a cross-vault clipboard payload (a .stash zip written by
+   *  another vault's copy/cut) as real notes under the paste target. Uses the
+   *  same import engine as .stash files — id remap on collision (cut keeps
+   *  ids: it's a move in spirit; copy mints fresh ones), attachments deduped
+   *  by content, reserved frontmatter stripped (the clipboard is external
+   *  transport — same trust level as a .stash from disk, 0.140.6 invariant).
+   *  NEVER touches the source vault: a cross-vault cut cannot transactionally
+   *  delete over there, so the originals stay and the receipt notice says so. */
+  private async pasteCrossVault(xv: { meta: XvMeta; zip: Uint8Array }): Promise<void> {
+    const folder = this.noteFolder;
+    const cursor = this.currentChildren[this.cursorIdx] ?? null;
+    const destParent = ((cursor?.parent ?? this.focusId) ?? ROOT_ID);
+    const total = xv.meta.parents + xv.meta.children;
+    const progress = new Notice(`⇄ Receiving ${total} note${total === 1 ? "" : "s"} from vault "${xv.meta.sourceVault}"…`, 0);
+    try {
+      const existingIds = await this.plugin.idsInFolder(folder);
+      const summary = await importStashZip(this.app, xv.zip, folder, existingIds, {
+        forceNewIds: xv.meta.mode === "copy",
+        reparentRootsTo: destParent === ROOT_ID ? null : destParent,
+        stripReserved: true,
+        dedupeExisting: true,
+      });
+      if (summary.colorAliases) {
+        for (const [hex, name] of Object.entries(summary.colorAliases)) {
+          try { await this.plugin.setColorAlias(folder, hex, name); } catch { /* non-fatal */ }
+        }
+      }
+      const newIds = Object.values(summary.idRemap);
+      this.tree.rebuild(folder);
+      this.pendingFocusIds = newIds.slice();
+      this.render();
+      // Undo/redo: snapshot the created files (same pattern as same-vault
+      // copy-paste) — undo trashes them, redo restores from the snapshot.
+      // Paths come from the import summary, NOT the tree — the metadata cache
+      // lags fresh creates, so tree-derived paths can silently miss files
+      // (caught live: undo stranded a grandchild whose cache entry wasn't in yet).
+      const createdPaths = summary.notePaths.slice();
+      const snapNodes: TreeNode[] = createdPaths
+        .map((p) => this.app.vault.getAbstractFileByPath(p))
+        .filter((f): f is TFile => !!f && (f as TFile).extension === "md")
+        .map((file) => ({ id: parseIdFromFilename(file.basename) ?? file.basename, parent: null, children: [], file, created: new Date().toISOString() }));
+      const snap = await this.snapshotNotes(snapNodes, false);
+      this.plugin.getUndoStack(folder).push({
+        label: `Paste ${xv.meta.parents} note${xv.meta.parents === 1 ? "" : "s"} from vault ${xv.meta.sourceVault}`,
+        undo: async () => {
+          for (const p of [...createdPaths].reverse()) {
+            const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
+            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          }
+          this.tree.rebuild(folder);
+          this.render();
+        },
+        redo: async () => { await this.restoreSnapshots(snap, newIds); },
+      });
+      const lines = [
+        `⇄ Pasted ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"} from vault "${xv.meta.sourceVault}"${summary.attachmentsWritten ? ` (+${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"})` : ""}.`,
+      ];
+      if (xv.meta.mode === "cut") {
+        // 0.201.1: ACK the cut on the clipboard — when the user switches back
+        // to the source vault, ITS Stashpad offers to delete the originals.
+        const acked = xv.meta.cutToken ? writeXvAck(xv.meta.cutToken, this.app.vault.getName()) : false;
+        lines.push(acked
+          ? `The originals are still in "${xv.meta.sourceVault}" — switch back there and Stashpad will offer to delete them.`
+          : `Cross-vault cut can't remove the originals — they still exist in "${xv.meta.sourceVault}". Delete them there if you meant to move.`);
+      }
+      if (summary.warnings.length) lines.push(`${summary.warnings.length} entr${summary.warnings.length === 1 ? "y was" : "ies were"} skipped (see console).`);
+      this.plugin.notifications.show({
+        message: lines.join("\n"),
+        kind: "success", category: "clone", affectedIds: newIds, folder, duration: 0,
+      });
+    } catch (e) {
+      console.warn("[Stashpad] cross-vault paste failed", e);
+      new Notice("Cross-vault paste failed — nothing was changed. See console for details.");
+    } finally {
+      progress.hide();
+    }
+  }
+
   async cmdPasteNotes(): Promise<void> {
     const clip = this.plugin.noteClipboard;
-    if (!clip) { new Notice("The note clipboard is empty — copy or cut notes first."); return; }
+    if (!clip) {
+      // 0.201.0: no local note clipboard — check the OS clipboard for a
+      // cross-vault payload written by ANOTHER vault's Stashpad.
+      const xv = await readXvPayload();
+      if (xv && xv.meta.sourceVault !== this.app.vault.getName()) { await this.pasteCrossVault(xv); return; }
+      new Notice("The note clipboard is empty — copy or cut notes first.");
+      return;
+    }
     // Cross-folder paste: the source notes live in another Stashpad folder, so
     // route through the plugin's bundle-based engine — it carries ATTACHMENTS
     // into this folder's _attachments, mints fresh ids for a copy (keeps them for

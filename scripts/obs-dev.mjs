@@ -24,12 +24,17 @@ import { execSync } from "node:child_process";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..");
-const PORT = 9222;
+// 0.201.x: SLOT support — `OBS_DEV_SLOT=b obs-dev …` drives a SECOND isolated
+// instance (own port + user-data-dir) pinned to "Claude Dev Vault B", for
+// cross-vault feature testing. Default slot is the original Claude Dev Vault.
+const SLOT_B = process.env.OBS_DEV_SLOT === "b";
+const PORT = SLOT_B ? 9223 : 9222;
 const OBSIDIAN_BIN = "/Applications/Obsidian.app/Contents/MacOS/Obsidian";
-const VAULT = resolve(REPO, "..", "Claude Dev Vault");
-const VAULT_NAME = "Claude Dev Vault";
-const SENTINEL = "claude-dev-vault-7f3a9c2e-do-not-delete";
-const USER_DATA_DIR = join(process.env.HOME, "Library", "Application Support", "obsidian-claude-dev");
+const VAULT_NAME = SLOT_B ? "Claude Dev Vault B" : "Claude Dev Vault";
+const VAULT = resolve(REPO, "..", VAULT_NAME);
+const SENTINEL_FILE = SLOT_B ? "CLAUDE-DEV-VAULT-B-SENTINEL.md" : "CLAUDE-DEV-VAULT-SENTINEL.md";
+const SENTINEL = SLOT_B ? "claude-dev-vault-b-4e8d1f6a-do-not-delete" : "claude-dev-vault-7f3a9c2e-do-not-delete";
+const USER_DATA_DIR = join(process.env.HOME, "Library", "Application Support", SLOT_B ? "obsidian-claude-dev-b" : "obsidian-claude-dev");
 
 const cmd = process.argv[2];
 const arg = process.argv[3];
@@ -103,7 +108,7 @@ async function evalExpr(code) {
 // ---- vault verification (name + sentinel) ---------------------------------
 async function verifyVault() {
   const raw = await evalExpr(`
-    const f = app.vault.getAbstractFileByPath("CLAUDE-DEV-VAULT-SENTINEL.md");
+    const f = app.vault.getAbstractFileByPath("${SENTINEL_FILE}");
     let sentinel = false;
     if (f) { try { sentinel = (await app.vault.cachedRead(f)).includes("${SENTINEL}"); } catch {} }
     return { name: app.vault.getName(), sentinel };
@@ -195,7 +200,8 @@ async function ensureStashpad() {
 
 function stop() {
   try {
-    execSync(`pkill -f "obsidian-claude-dev"`);
+    // user-data-dir is the LAST spawn arg, so $-anchoring distinguishes slot A from B.
+    execSync(SLOT_B ? `pkill -f "obsidian-claude-dev-b$"` : `pkill -f "obsidian-claude-dev$"`);
     console.log("stopped the dev instance.");
   } catch { console.log("no dev instance was running."); }
 }

@@ -56,6 +56,10 @@ export interface ImportSummary {
   /** Old id → new id mapping applied on import (identity for kept ids). Lets a
    *  caller (e.g. cross-folder paste) locate the written roots by their source id. */
   idRemap: Record<string, string>;
+  /** 0.201.0: vault paths of every note file this import wrote, in write
+   *  order. The authoritative list for undo — the tree/metadata cache lags
+   *  fresh creates, so deriving paths from it can silently miss files. */
+  notePaths: string[];
 }
 
 interface ParsedNote {
@@ -270,6 +274,7 @@ export async function importStashZip(
 
   // Write notes with remapped ids/parents and import_date.
   let notesWritten = 0;
+  const notePathsWritten: string[] = [];
   for (const p of parsed) {
     const oldId = p.fm.id as string | undefined;
     if (!oldId) { warnings.push(`Skipped ${p.originalName} — no id in frontmatter`); continue; }
@@ -341,6 +346,7 @@ export async function importStashZip(
       outPath = `${destFolder}/${outName}`;
     }
     await app.vault.create(outPath, finalContent);
+    notePathsWritten.push(outPath);
     notesWritten++;
   }
 
@@ -357,7 +363,7 @@ export async function importStashZip(
     if (Object.keys(clean).length) colorAliases = clean;
   }
 
-  return { notesWritten, attachmentsWritten, collisionsRenamed, warnings, colorAliases, idRemap: Object.fromEntries(idRemap) };
+  return { notesWritten, notePaths: notePathsWritten, attachmentsWritten, collisionsRenamed, warnings, colorAliases, idRemap: Object.fromEntries(idRemap) };
 }
 
 // ---------------- Helpers ----------------
