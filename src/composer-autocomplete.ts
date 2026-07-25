@@ -345,25 +345,75 @@ export class ComposerAutocomplete {
     this.close();
   };
 
-  /** 0.199.2: bracket autopairing. Typing the second `[` of a wikilink
-   *  auto-inserts the closing `]]` (caret stays between); typing `]` when the
-   *  next character already is `]` types over it instead of doubling up.
-   *  Together with the extended-replacement logic in detectTrigger, accepting
-   *  a suggestion never strands stray brackets. Toggleable in settings. */
+  /** 0.199.2 → 0.201.3: Markdown autopairing for the plain textarea.
+   *
+   *  - Openers pair: `[` → `]`, `(` → `)`, and a second `*` / `~` / `=` (bold,
+   *    strikethrough, highlight) or `\`` inserts its closer with the caret
+   *    between. `[[` pairing fires ONLY on the second bracket (a third `[`
+   *    used to re-fire and leave 3 opens / 4 closes).
+   *  - Type-over: typing a closer when that exact character is already at the
+   *    caret steps over it instead of doubling up.
+   *  - Backspace: deleting an opener whose closer sits right after the caret
+   *    removes BOTH (`[[|]]` → Backspace → `[|]` → Backspace → empty).
+   *
+   *  Single `*` and `~` never pair (list bullets / italics stay typable).
+   *  Toggleable in settings ("Auto-pair Markdown syntax"). */
   private onAutoPair = (e: KeyboardEvent): void => {
     if (!getSettings().autoPairBrackets) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     const caret = this.ta.selectionStart;
     if (caret == null || caret !== this.ta.selectionEnd) return;
     const v = this.ta.value;
-    if (e.key === "[" && v[caret - 1] === "[") {
+    const prev = v[caret - 1];
+    const next = v[caret];
+    const insertPair = (open: string, close: string): void => {
       e.preventDefault();
-      this.ta.value = v.slice(0, caret) + "[]]" + v.slice(caret);
-      this.ta.setSelectionRange(caret + 1, caret + 1);
+      this.ta.value = v.slice(0, caret) + open + close + v.slice(caret);
+      this.ta.setSelectionRange(caret + open.length, caret + open.length);
       this.ta.dispatchEvent(new Event("input", { bubbles: true }));
-    } else if (e.key === "]" && v[caret] === "]") {
+    };
+    const stepOver = (): void => {
       e.preventDefault();
       this.ta.setSelectionRange(caret + 1, caret + 1);
+    };
+    // Simple opener/closer pairs.
+    const SIMPLE: Record<string, string> = { "[": "]", "(": ")", "`": "`" };
+    // Doubled emphasis markers: the SECOND keypress pairs (never the first).
+    const DOUBLED = new Set(["*", "~", "="]);
+    const CLOSERS = new Set(["]", ")", "`", "*", "~", "="]);
+
+    if (e.key === "Backspace") {
+      // Pair deletion: opener before caret + its closer right after.
+      const pairClose = prev !== undefined ? SIMPLE[prev] : undefined;
+      const symmetric = prev !== undefined && DOUBLED.has(prev) && next === prev;
+      if ((pairClose && next === pairClose) || symmetric) {
+        e.preventDefault();
+        this.ta.value = v.slice(0, caret - 1) + v.slice(caret + 1);
+        this.ta.setSelectionRange(caret - 1, caret - 1);
+        this.ta.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      return;
+    }
+    if (e.key.length !== 1) return;
+
+    // Type-over an existing closer (covers ] ) ` and the symmetric markers).
+    if (CLOSERS.has(e.key) && next === e.key) { stepOver(); return; }
+
+    if (e.key in SIMPLE) {
+      // `[` pairs progressively: `[|]` then `[[|]]`. A THIRD `[` inserts
+      // plain (nothing beyond a double is intentional — and it used to leave
+      // 3 opens / 4 closes). Repeated backticks insert plain too, so typing
+      // a ``` fence doesn't breed extra closers.
+      if (e.key === "[" && prev === "[" && v[caret - 2] === "[") return;
+      if (e.key === "`" && prev === "`") return;
+      insertPair(e.key, SIMPLE[e.key]);
+      return;
+    }
+    if (DOUBLED.has(e.key)) {
+      // Pair ONLY on the second consecutive marker (`**|**`), and never on a
+      // third (`***` stays typable): prev must be the marker, prev-prev not.
+      if (prev === e.key && v[caret - 2] !== e.key) insertPair(e.key, e.key + e.key);
+      return;
     }
   };
 

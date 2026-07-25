@@ -5051,6 +5051,7 @@ export default class StashpadPlugin extends Plugin {
       })(); },
       "Keep them (copy)",
       true,
+      true, // persistent - a stray focus-click must not dismiss the offer (0.201.3)
     ).open();
   }
 

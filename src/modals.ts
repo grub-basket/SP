@@ -2498,7 +2498,17 @@ export class ConfirmModal extends Modal {
     /** When true (destructive confirms like "Clear log"), focus Cancel instead
      *  of Confirm so a stray Enter doesn't fire the irreversible action. */
     private dangerous: boolean = false,
+    /** 0.201.3: when true, ONLY the two buttons close the modal — Escape and
+     *  clicking outside are ignored. For prompts that must not be lost to a
+     *  stray click (the cross-vault "delete the cut originals?" offer arrives
+     *  exactly as the user clicks the window to focus it). */
+    private persistent: boolean = false,
   ) { super(app); }
+
+  close(): void {
+    if (this.persistent && !this.didChoose) return; // buttons only
+    super.close();
+  }
   onOpen(): void {
     this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
     this.contentEl.empty();

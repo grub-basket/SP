@@ -6006,6 +6006,24 @@ export class StashpadView extends ItemView {
     clipBtn.onmousedown = (e) => e.preventDefault();
     clipBtn.onclick = (e) => {
       e.preventDefault();
+      // 0.201.3: on MOBILE go straight to the native attachment sheet — a
+      // dropzone is pointless without drag-and-drop, and the extra tap read
+      // as a downgrade. Desktop keeps the big dropzone modal.
+      if (Platform.isMobile) {
+        const doc = this.containerEl.ownerDocument ?? document;
+        const input = doc.createElement("input");
+        input.type = "file";
+        input.multiple = true;
+        input.setCssStyles({ display: "none" });
+        input.onchange = () => {
+          const picked = Array.from(input.files ?? []);
+          input.remove();
+          if (picked.length) void importAndAppend(picked);
+        };
+        doc.body.appendChild(input);
+        input.click();
+        return;
+      }
       new DropzoneModal(this.app, (files) => void importAndAppend(files)).open();
     };
     clipBtn.addEventListener("dragover", (e) => {
@@ -11689,12 +11707,10 @@ export class StashpadView extends ItemView {
     // Jump action.
     const folder = (opts.targetFolder ?? this.noteFolder).replace(/\/+$/, "");
     const remote = folder !== this.noteFolder;
-    // 0.201.2: heal exactly-four consecutive brackets — the residue of the
-    // pre-0.199.2 four-brackets autocomplete bug and of hand-doubled closes —
-    // down to a proper pair. Anchored so [[[ / ]]]]] (3, 5+) are left alone;
-    // runs at CREATION only (the least disruptive point — never rewrites
-    // already-saved notes).
-    body = body.replace(/(?<!\[)\[{4}(?!\[)/g, "[[").replace(/(?<!\])\]{4}(?!\])/g, "]]");
+    // 0.201.2 → 0.201.3: heal ANY run of 3+ consecutive brackets down to a
+    // pair (per user: nothing beyond [[ ]] is ever intentional). Creation-time
+    // only — never rewrites already-saved notes.
+    body = body.replace(/\[{3,}/g, "[[").replace(/\]{3,}/g, "]]");
     await this.ensureFolder(folder);
     const id = this.plugin.mintNoteId();
 
