@@ -490,12 +490,24 @@ export default class StashpadPlugin extends Plugin {
     const folders = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
-        | { id?: unknown; parent?: unknown } | undefined;
+        | { id?: unknown; parent?: unknown; attachments?: unknown } | undefined;
       if (typeof fm?.id !== "string" || !fm.id.trim()) continue;
       // Require parent to be present in the frontmatter (any value —
       // including null and ROOT_ID — counts). A note without a parent
       // field isn't a Stashpad note.
       if (!fm || !("parent" in fm)) continue;
+      // 0.205.0: `id` + `parent` alone is NOT a Stashpad signature — it's a
+      // generic outliner one. Another plugin in the same vault (an outliner
+      // writing id/parent/created/due per note) had every one of its folders
+      // claimed here, which put them in every folder picker AND exposed their
+      // notes to Stashpad's task/reminder/integrity machinery — including
+      // writers like the recovery-link sync. Qualify a folder only on a
+      // signature Stashpad actually owns:
+      //   - the home note (`id: __root__`), written for every folder we create; or
+      //   - `attachments`, which createNoteUnder writes on EVERY note.
+      // Verified against the dev vault: keeps all 12 real Stashpad folders,
+      // drops the foreign plugin's entirely.
+      if (fm.id !== ROOT_ID && !("attachments" in fm)) continue;
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       // 0.136.0: reserved subfolders (archive/, trash/, _archive/, …) are never
       // Stashpad folders of their own — their notes surface via the aggregated
