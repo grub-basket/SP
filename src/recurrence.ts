@@ -99,6 +99,87 @@ function nextInWeekdays(from: number, days: number[]): number {
   return from + UNIT_MS.week; // unreachable while `days` is non-empty
 }
 
+/** 0.204.0: parse "1st and 15th", "every 15th of the month", "1st, last".
+ *  `-1` means the LAST day of the month. Returns null unless every token is a
+ *  month day AND the rule is unambiguously monthly — an ordinal suffix ("15th")
+ *  or an explicit "of the month" / "monthly" — so "every 3 days" never lands
+ *  here. */
+export function parseMonthDayList(s: string | null | undefined): number[] | null {
+  let raw = String(s ?? "").trim().toLowerCase().replace(/^every\s+/, "");
+  if (!raw) return null;
+  const monthPhrase = /\bof\s+(the\s+)?month\b|\bmonthly\b/.test(raw);
+  raw = raw.replace(/\bof\s+(the\s+)?month\b/g, "").replace(/\bmonthly\b/g, "")
+    .replace(/\bon\s+the\b/g, " ").replace(/\bthe\b/g, " ").trim();
+  if (!raw) return null;
+  const tokens = raw.split(/\s*(?:,|\/|&|\+|\band\b)\s*/).map((t) => t.trim()).filter(Boolean);
+  if (!tokens.length) return null;
+  const days = new Set<number>();
+  let ordinal = false;
+  for (const t of tokens) {
+    if (t === "last" || t === "last day" || t === "eom") { days.add(-1); ordinal = true; continue; }
+    if (t === "first") { days.add(1); ordinal = true; continue; }
+    const m = t.match(/^(\d{1,2})(st|nd|rd|th)?$/);
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    if (n < 1 || n > 31) return null;
+    if (m[2]) ordinal = true;
+    days.add(n);
+  }
+  if (!ordinal && !monthPhrase) return null;
+  return sortMonthDays([...days]);
+}
+
+/** Month days ascending, with "last" (-1) at the end where it reads naturally. */
+function sortMonthDays(days: number[]): number[] {
+  return [...new Set(days)].sort((a, b) => (a === -1 ? 99 : a) - (b === -1 ? 99 : b));
+}
+
+/** "1st" / "22nd" / "last day". For labels + the picker's help line. */
+export function monthDayLabel(d: number): string {
+  if (d === -1) return "last day";
+  const rem100 = d % 100, rem10 = d % 10;
+  const suffix = rem100 >= 11 && rem100 <= 13 ? "th" : rem10 === 1 ? "st" : rem10 === 2 ? "nd" : rem10 === 3 ? "rd" : "th";
+  return `${d}${suffix}`;
+}
+
+/** The next timestamp after `from` landing on one of `days` (day-of-month;
+ *  -1 = last day), keeping the time-of-day. A day that doesn't exist in a
+ *  given month (the 31st of February) is skipped for that month rather than
+ *  clamped — "the 31st" means the 31st. */
+function nextInMonthDays(from: number, days: number[]): number {
+  const base = new Date(from);
+  for (let off = 0; off <= 48; off++) {
+    const year = base.getFullYear();
+    const month = base.getMonth() + off;
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const candidates = sortMonthDays(days)
+      .map((d) => (d === -1 ? daysInMonth : d))
+      .filter((d) => d >= 1 && d <= daysInMonth)
+      .sort((a, b) => a - b);
+    for (const day of candidates) {
+      const c = new Date(from);           // carries the time-of-day
+      c.setFullYear(year, month, day);
+      if (c.getTime() > from) return c.getTime();
+    }
+  }
+  return addMonths(from, 1);
+}
+
+/** Rewrite `rule` so it repeats on exactly the month days `days` (-1 = last),
+ *  preserving a trailing "when done" anchor. Empty clears a month-day rule and
+ *  leaves other rules alone. Mirror of `withWeekdays`; because both rewrite the
+ *  whole rule body, picking weekdays and month days are naturally exclusive. */
+export function withMonthDays(rule: string | null | undefined, days: number[]): string {
+  const raw = String(rule ?? "");
+  const anchorM = raw.match(/\s*(when done|after completion|on completion|from completion)\s*$/i);
+  const body = (anchorM ? raw.slice(0, anchorM.index) : raw).trim();
+  const anchor = anchorM ? anchorM[1].trim() : "";
+  const sorted = sortMonthDays(days.filter((d) => d === -1 || (d >= 1 && d <= 31)));
+  if (!sorted.length) return parseMonthDayList(body) ? "" : raw;
+  const next = `every ${sorted.map(monthDayLabel).join(", ")} of the month`;
+  return anchor ? `${next} ${anchor}` : next;
+}
+
 /** Rewrite `rule` so it repeats on exactly `days`, preserving a trailing
  *  "when done" anchor. Empty `days` clears a weekday rule (and leaves any
  *  other kind of rule alone). Backs the day-picker in the due modal — the rule
@@ -123,7 +204,7 @@ function nextBusinessDay(from: number): number {
 
 /** Parse a recurrence rule. Understood forms (case-insensitive, "every"
  *  optional): "daily" / "every day" / "every 3 days"; "weekly" / "every week" /
- *  "every 2 weeks"; "every weekday"; "every monday"; "every mon, wed & fri"; "monthly" / "every month" /
+ *  "every 2 weeks"; "every weekday"; "every monday"; "every mon, wed & fri"; "monthly" / "every month" / "every 1st, 15th of the month" /
  *  "every 2 months" / "first of the month"; "yearly" / "every year"; "every N
  *  hours" / "every N minutes". A trailing "when done" / "after completion" sets
  *  the completion anchor. Returns null if nothing matched. */
@@ -154,6 +235,12 @@ export function parseRecurrence(rule: string | null | undefined): Recurrence | n
   }
   if (s === "weekday" || s === "weekdays" || s === "business day" || s === "business days")
     return mk(nextBusinessDay, "every weekday");
+
+  // month day(s) — "every 1st, 15th of the month", "every last day"
+  const mdays = parseMonthDayList(s);
+  if (mdays && mdays.length) {
+    return mk((from) => nextInMonthDays(from, mdays), `every ${mdays.map(monthDayLabel).join(", ")} of the month`);
+  }
 
   // bare keywords
   if (s === "daily" || s === "day") return mk((f) => f + UNIT_MS.day, "every day");

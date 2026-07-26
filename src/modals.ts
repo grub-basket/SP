@@ -4,7 +4,7 @@ import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
-import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, WEEKDAY_SHORT, WEEKDAY_INITIAL } from "./recurrence";
+import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import type { ExportContent } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
@@ -2868,6 +2868,13 @@ export class DueDatePickerModal extends Modal {
       const chipWrap = wrow.createDiv({ cls: "stashpad-weekday-chips" });
       const daysHelp = det.createDiv({ cls: "stashpad-due-recur-help" });
 
+      // 0.204.0: days of the MONTH — the "verify my hours on the 1st and the
+      // 15th" case, one task instead of two.
+      const mdrow = det.createDiv({ cls: "stashpad-due-recur-row" });
+      mdrow.createEl("label", { text: "Days of the month" });
+      const mdWrap = mdrow.createDiv({ cls: "stashpad-monthday-chips" });
+      const mdHelp = det.createDiv({ cls: "stashpad-due-recur-help" });
+
       // 0.198.0: the anchor was only reachable by typing "when done" on the end of
       // the rule. Same setting, now a visible toggle — it's the difference between
       // "every Monday" and "30 days after I actually did it", and it's the control
@@ -2912,15 +2919,43 @@ export class DueDatePickerModal extends Modal {
           const cur = new Set(parseWeekdayList(repeatIn!.value.replace(/\s*(when done|after completion)\s*$/i, "")) ?? []);
           if (cur.has(i)) cur.delete(i); else cur.add(i);
           repeatIn!.value = withWeekdays(repeatIn!.value, [...cur]);
-          paintDays();
-          paintAnchor();
+          repaint();
         };
         chipEls.push(b);
       }
 
-      repeatIn.addEventListener("input", () => { paintAnchor(); paintDays(); });
-      paintAnchor();
-      paintDays();
+      // Month-day chips: 1–31 plus "Last". Same rule-string-is-truth contract.
+      // Because withMonthDays/withWeekdays each rewrite the whole rule body,
+      // picking month days clears any weekday selection and vice versa — the
+      // two are different kinds of schedule, not combinable.
+      const mdEls: HTMLElement[] = [];
+      const mdValues = [...Array.from({ length: 31 }, (_, i) => i + 1), -1];
+      const strip = (v: string): string => v.replace(/\s*(when done|after completion)\s*$/i, "");
+      const paintMonthDays = (): void => {
+        const on = new Set(parseMonthDayList(strip(repeatIn!.value)) ?? []);
+        mdEls.forEach((el, i) => el.toggleClass("is-active", on.has(mdValues[i])));
+        mdHelp.setText(on.size
+          ? `Repeats on the ${[...on].sort((a, b) => (a === -1 ? 99 : a) - (b === -1 ? 99 : b)).map(monthDayLabel).join(", ")} of each month.`
+          : "Optional. Pick dates in the month (e.g. 1st + 15th for a twice-monthly task). A date a month doesn't have is skipped that month.");
+      };
+      for (const val of mdValues) {
+        const b = mdWrap.createEl("button", {
+          text: val === -1 ? "Last" : String(val),
+          attr: { type: "button", "aria-label": val === -1 ? "Last day of the month" : monthDayLabel(val), title: val === -1 ? "Last day of the month" : monthDayLabel(val) },
+        });
+        if (val === -1) b.addClass("is-last");
+        b.onclick = () => {
+          const cur = new Set(parseMonthDayList(strip(repeatIn!.value)) ?? []);
+          if (cur.has(val)) cur.delete(val); else cur.add(val);
+          repeatIn!.value = withMonthDays(repeatIn!.value, [...cur]);
+          repaint();
+        };
+        mdEls.push(b);
+      }
+
+      const repaint = (): void => { paintAnchor(); paintDays(); paintMonthDays(); };
+      repeatIn.addEventListener("input", repaint);
+      repaint();
 
       // 0.197.0: what "repeat" actually DOES. Roll-forward (the historic behaviour)
       // repeats but keeps no record; the other modes leave per-occurrence history.

@@ -6368,3 +6368,27 @@ button.stashpad-btn-loading::after {
   border-color: var(--interactive-accent);
   color: var(--text-on-accent);
 }
+
+/* 0.204.0: day-of-month picker in the due/repeat modal. */
+.stashpad-monthday-chips {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 3px;
+  max-width: 300px;
+}
+.stashpad-monthday-chips button {
+  height: 26px; padding: 0;
+  border-radius: 5px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal);
+  color: var(--text-muted);
+  font-size: 0.78em; font-weight: 600;
+  cursor: pointer;
+}
+.stashpad-monthday-chips button.is-last { grid-column: span 2; font-size: 0.72em; }
+.stashpad-monthday-chips button:hover { background: var(--interactive-hover); color: var(--text-normal); }
+.stashpad-monthday-chips button.is-active {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
