@@ -4878,6 +4878,7 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     const mini = parent.createDiv({ cls: "stashpad-focused-mini" });
     mini.dataset.id = node.id;
+    if (this.isTask(node)) this.addTaskCheckbox(mini, node); // 0.201.4: task state in the sticky header too
     const text = mini.createDiv({ cls: "stashpad-focused-mini-text" });
     text.setText(this.titleForNode(node).trim());
     // 0.123.0: match the full focused header — the sticky preview's lone edit
@@ -4928,6 +4929,10 @@ export class StashpadView extends ItemView {
     const metaTop = meta.createDiv({ cls: "stashpad-focused-meta-top" });
     metaTop.createSpan({ cls: "stashpad-focused-time stashpad-note-time", text: this.formatTime(node.created) });
     metaTop.createDiv({ cls: "stashpad-focused-grip-spacer" });
+    // 0.201.4: when the FOCUSED note is a task, show its completion checkbox in
+    // the header too — the drilled-in parent's task state was invisible (and
+    // untoggleable) unless you climbed back out to its list row.
+    if (this.isTask(node)) this.addTaskCheckbox(metaTop, node);
 
     const body = wrap.createDiv({ cls: "stashpad-focused-body" });
     // Markdown rendered inside the focused header includes #tags and

@@ -6346,3 +6346,7 @@ button.stashpad-btn-loading::after {
 /* 0.201.0: multi-line notification messages (cut summary, cross-vault paste
    receipt) — render \n as line breaks. Single-line messages unaffected. */
 .stashpad-notice-message { white-space: pre-line; }
+
+/* 0.201.4: task checkbox in the focused headers (full + sticky mini). */
+.stashpad-focused-meta-top .stashpad-note-task-checkbox { cursor: pointer; display: inline-flex; align-items: center; }
+.stashpad-focused-mini .stashpad-note-task-checkbox { cursor: pointer; display: inline-flex; align-items: center; flex: 0 0 auto; margin-right: 6px; }
