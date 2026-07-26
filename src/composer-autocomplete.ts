@@ -376,11 +376,13 @@ export class ComposerAutocomplete {
       e.preventDefault();
       this.ta.setSelectionRange(caret + 1, caret + 1);
     };
-    // Simple opener/closer pairs.
-    const SIMPLE: Record<string, string> = { "[": "]", "(": ")", "`": "`" };
+    // Simple opener/closer pairs. Quotes are symmetric (0.201.5) — see the
+    // prose-guard below so apostrophes ("don't") and closing quotes after a
+    // word never spawn a pair.
+    const SIMPLE: Record<string, string> = { "[": "]", "(": ")", "`": "`", '"': '"', "'": "'" };
     // Doubled emphasis markers: the SECOND keypress pairs (never the first).
     const DOUBLED = new Set(["*", "~", "="]);
-    const CLOSERS = new Set(["]", ")", "`", "*", "~", "="]);
+    const CLOSERS = new Set(["]", ")", "`", "*", "~", "=", '"', "'"]);
 
     if (e.key === "Backspace") {
       // Pair deletion: opener before caret + its closer right after.
@@ -406,6 +408,13 @@ export class ComposerAutocomplete {
       // a ``` fence doesn't breed extra closers.
       if (e.key === "[" && prev === "[" && v[caret - 2] === "[") return;
       if (e.key === "`" && prev === "`") return;
+      // 0.201.5: quotes pair only at a WORD START — after whitespace, line
+      // start, or an opener. After a letter/digit they insert plainly, so
+      // apostrophes (don't, it's) and a hand-typed closing quote stay sane.
+      if (e.key === '"' || e.key === "'") {
+        const wordStart = prev === undefined || /[\s([{"'\u2018\u201C]/.test(prev);
+        if (!wordStart) return;
+      }
       insertPair(e.key, SIMPLE[e.key]);
       return;
     }
