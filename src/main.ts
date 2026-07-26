@@ -33,6 +33,7 @@ import { ROOT_ID, parseAssignees } from "./types";
 import { parseRecurrence, nextDueOnComplete, parseDuration, parseRepeatMode } from "./recurrence";
 import { spawnNextOccurrence, markOccurrenceMissed } from "./recurrence-spawn";
 import { OrderStore } from "./order-store";
+import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./structure-snapshot";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { NotificationService, buildFileActions } from "./notifications";
@@ -505,9 +506,90 @@ export default class StashpadPlugin extends Plugin {
     return out;
   }
 
+  /** 0.206.0: per-folder structure snapshot store (recovery sidecar). */
+  private _structureStore: StructureSnapshotStore | null = null;
+  get structureStore(): StructureSnapshotStore {
+    if (!this._structureStore) this._structureStore = new StructureSnapshotStore(this.app);
+    return this._structureStore;
+  }
+
+  /** 0.206.0: rebuild lost frontmatter from the folder's structure snapshot.
+   *
+   *  The case this exists for: a note's frontmatter gets wiped (bad merge, an
+   *  overzealous find-and-replace, a sync conflict) and it drops out of the
+   *  tree — anonymous, unparented, invisible. Its own recovery fields went with
+   *  it, so the only thing left to identify it by is its PATH, which is exactly
+   *  what the snapshot is keyed on.
+   *
+   *  Only ever ADDS what's missing: a note that still has an `id` is left
+   *  completely alone, so running this on a healthy folder is a no-op. Bodies
+   *  are never touched. Snapshot-backed and undoable. */
+  async repairFolderFromSnapshot(folder: string): Promise<{ repaired: number; scanned: number; skipped: number; undo: () => Promise<void> } | null> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const snap = await this.structureStore.load(cleaned);
+    if (!snap) { new Notice(`No structure snapshot for "${cleaned}" yet — nothing to repair from.`); return null; }
+    const byPath = indexByPath(snap);
+
+    const candidates: TFile[] = [];
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (dir !== cleaned) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      // Healthy note → leave it entirely alone.
+      if (typeof fm?.id === "string" && fm.id.trim()) continue;
+      if (byPath.has(f.path)) candidates.push(f);
+    }
+    const scanned = byPath.size;
+    if (!candidates.length) {
+      new Notice(`"${cleaned}": nothing to repair — every note still has its Stashpad frontmatter.`);
+      return { repaired: 0, scanned, skipped: 0, undo: async () => { /* nothing changed */ } };
+    }
+
+    const paths = candidates.map((f) => f.path);
+    const before = await this.snapshotPaths(paths);
+    let repaired = 0, skipped = 0;
+    for (const file of candidates) {
+      const hit = byPath.get(file.path);
+      if (!hit) { skipped++; continue; }
+      try {
+        await this.app.fileManager.processFrontMatter(file, (fm) => {
+          fm.id = hit.id;
+          fm.parent = parentForFrontmatter(hit.entry.parent);
+          if (hit.entry.created && typeof fm.created !== "string") fm.created = hit.entry.created;
+          if (!Array.isArray(fm.attachments)) fm.attachments = [];
+        });
+        repaired++;
+      } catch (e) {
+        console.warn("[Stashpad] snapshot repair failed for", file.path, e);
+        skipped++;
+      }
+    }
+    return {
+      repaired, scanned, skipped,
+      undo: async () => { await this.restoreSnapshot(before); },
+    };
+  }
+
   discoverStashpadFolders(): string[] {
     const folders = new Set<string>();
     const foreign = this.foreignClaimedFolders();
+    // 0.206.1: the claim covers the folder AND everything under it. Trynalist's
+    // conversion BACKUPS carry a `backup.trynalist` marker at
+    // `_conversion-backups/<folder>-<stamp>/` precisely so a backup of a
+    // Stashpad folder is never adopted as live data — but a backed-up folder
+    // can contain note-bearing subfolders of its own, and a folder-only test
+    // left those claimable. (They're also covered by the `_` prefix rule, but
+    // that's a user setting — the marker is the unconditional guard, so it has
+    // to protect the whole subtree to mean anything.)
+    const isForeign = (dir: string): boolean => {
+      let cur = dir;
+      for (;;) {
+        if (foreign.has(cur)) return true;
+        const cut = cur.lastIndexOf("/");
+        if (cut < 0) return false;
+        cur = cur.slice(0, cut);
+      }
+    };
     for (const f of this.app.vault.getMarkdownFiles()) {
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
         | { id?: unknown; parent?: unknown; attachments?: unknown } | undefined;
@@ -532,7 +614,7 @@ export default class StashpadPlugin extends Plugin {
       // 0.136.0: reserved subfolders (archive/, trash/, _archive/, …) are never
       // Stashpad folders of their own — their notes surface via the aggregated
       // views instead of the folder pickers.
-      if (foreign.has(dir)) continue; // another plugin's document folder (0.205.1)
+      if (isForeign(dir)) continue; // another plugin's document folder (0.205.1)
       if (dir && !this.pathHasExcludedSegment(dir) && !isInReservedSubfolder(dir)) folders.add(dir);
     }
     // 0.165.0: sort alphabetically, case-INSENSITIVELY, so the Folders lists in
@@ -1804,6 +1886,35 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-fix-orphans",
       name: "Set missing parents to Home (orphan fix)",
       callback: () => void this.fixOrphanParents(),
+    });
+    // 0.206.0: rebuild wiped frontmatter from the folder's structure snapshot.
+    this.addCommand({
+      id: "stashpad-repair-from-snapshot",
+      name: "Repair lost note frontmatter from the folder's structure snapshot (recover id / parent)",
+      callback: () => void (async () => {
+        // The folder of the Stashpad tab you were last in; otherwise the
+        // configured default. Repair is per-folder because the snapshot is.
+        const active = (this.lastActiveStashpadLeaf?.view as { noteFolder?: string } | undefined)?.noteFolder;
+        const folder = (active || this.settings.folder || "Stashpad").replace(/\/+$/, "");
+        const res = await this.repairFolderFromSnapshot(folder);
+        if (!res || res.repaired === 0) return;
+        this.refreshOpenViewsForFolder(folder);
+        this.getUndoStack(folder).push({
+          label: `Repair ${res.repaired} note${res.repaired === 1 ? "" : "s"} from snapshot`,
+          undo: async () => { await res.undo(); this.refreshOpenViewsForFolder(folder); },
+          redo: async () => { await this.repairFolderFromSnapshot(folder); this.refreshOpenViewsForFolder(folder); },
+        });
+        const lines = [
+          `🩹 Repaired ${res.repaired} note${res.repaired === 1 ? "" : "s"} in "${folder.split("/").pop()}" from the structure snapshot.`,
+          "Their id, parent and created date were restored from the folder's recovery sidecar; bodies were untouched.",
+        ];
+        if (res.skipped) lines.push(`${res.skipped} could not be matched and were left alone.`);
+        lines.push("Undo (in the list) reverses it.");
+        this.notifications.show({
+          message: lines.join("\n"),
+          kind: "success", category: "system", folder, duration: 0,
+        });
+      })(),
     });
     // 0.77.2: rebuild the author registry from a full vault scan.
     this.addCommand({

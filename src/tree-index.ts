@@ -206,6 +206,12 @@ export class TreeIndex {
     return this.nodes.get(ROOT_ID)!;
   }
 
+  /** 0.206.0: every node in the index (ROOT included). Used by the structure
+   *  snapshot, which needs `created` + the file — more than `snapshot()` gives. */
+  allNodes(): TreeNode[] {
+    return [...this.nodes.values()];
+  }
+
   getChildren(id: StashpadId): TreeNode[] {
     const node = this.nodes.get(id);
     if (!node) return [];

@@ -586,7 +586,10 @@ export class StashpadView extends ItemView {
     // Pop on view teardown.
     this.register(() => popViewScope());
 
-    this.detachTreeHook = this.tree.hookMetadataCache(() => this.debouncedRender());
+    this.detachTreeHook = this.tree.hookMetadataCache(() => {
+      this.debouncedRender();
+      this.scheduleStructureSnapshot(); // 0.206.0 recovery sidecar (debounced)
+    });
     // 0.76.30: self-heal stale trees after a sync burst / cold start.
     // The per-file create/changed hooks above can miss files that
     // sync in before the view's listeners attach (mobile cold start)
@@ -935,6 +938,32 @@ export class StashpadView extends ItemView {
     setTimeout(tryFocus, 200);
   }
 
+  /** 0.206.0: hand the current shape to the per-folder structure snapshot —
+   *  the sidecar that lets a note whose frontmatter got wiped be put back
+   *  (see structure-snapshot.ts + `repairFolderFromSnapshot`). Cheap and
+   *  debounced inside the store, so calling it on every tree change is fine.
+   *  Never throws into the render path: a recovery aid must not be able to
+   *  break the thing it's protecting. */
+  private scheduleStructureSnapshot(): void {
+    try {
+      const folder = this.noteFolder;
+      if (!folder) return;
+      const notes: Record<string, { parent: string | null; path: string; created?: string; title?: string }> = {};
+      for (const node of this.tree.allNodes()) {
+        if (node.id === ROOT_ID || !node.file) continue;
+        notes[node.id] = {
+          parent: node.parent && node.parent !== ROOT_ID ? node.parent : null,
+          path: node.file.path,
+          created: node.created || undefined,
+          title: this.titleForNode(node).trim().slice(0, 80) || undefined,
+        };
+      }
+      this.plugin.structureStore.schedule(folder, notes);
+    } catch (e) {
+      console.warn("[Stashpad] structure snapshot schedule failed", e);
+    }
+  }
+
   async onClose(): Promise<void> {
     clearActiveView(this);
     // Cancel any pending debounced render so it can't fire post-close (the
@@ -979,6 +1008,7 @@ export class StashpadView extends ItemView {
     // reorder/sort-mode change. Both flushes are idempotent + safe to
     // call when nothing's pending.
     try { await this.order.flush(this.noteFolder); } catch { /* ignore */ }
+    try { await this.plugin.structureStore.flush(this.noteFolder); } catch { /* ignore */ }
     try { await this.sortStore.flush(this.noteFolder); } catch { /* ignore */ }
     // Drain any pending frontmatter sync writes so the recovery fields
     // (parentLink / children) don't lag behind tree state across a
