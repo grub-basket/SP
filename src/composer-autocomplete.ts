@@ -1,6 +1,7 @@
 import { App, Scope, TFile } from "obsidian";
 import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore } from "./types";
 import { getSettings } from "./settings";
+import { MarkdownInput, type MarkdownInputOptions } from "./markdown-input";
 
 /**
  * Composer autocomplete: a lightweight popup attached to a plain
@@ -55,12 +56,24 @@ export class ComposerAutocomplete {
    *  belt-and-suspenders) so the workspace's "Escape returns to last
    *  leaf" handler doesn't fire and yank focus to a previous tab. */
   private scope: Scope | null = null;
+  /** 0.202.0: shared Markdown editing behaviors (see markdown-input.ts). */
+  private input: MarkdownInput | null = null;
 
-  constructor(private app: App, private ta: HTMLTextAreaElement) {}
+  constructor(
+    private app: App,
+    private ta: HTMLTextAreaElement,
+    /** Passed through to MarkdownInput — chiefly `insertsNewline`, which tells
+     *  list continuation whether THIS Enter makes a newline or submits. */
+    private inputOpts: MarkdownInputOptions = {},
+  ) {}
 
   attach(): void {
     this.ta.addEventListener("input", this.onInput);
-    this.ta.addEventListener("keydown", this.onAutoPair, true);
+    // 0.202.0: the Markdown editing behaviors (autopair, wrap, list
+    // continuation, Tab indent, double-click trim) live in their own layer —
+    // attached here so EVERY surface that gets suggestions also gets them.
+    this.input = new MarkdownInput(this.app, this.ta, this.inputOpts);
+    this.input.attach();
     this.ta.addEventListener("keydown", this.onKeyDown, true);
     this.ta.addEventListener("blur", this.onBlur);
     // Document-capture Escape interceptor — only acts while a popup is
@@ -95,7 +108,8 @@ export class ComposerAutocomplete {
   detach(): void {
     this.close();
     this.ta.removeEventListener("input", this.onInput);
-    this.ta.removeEventListener("keydown", this.onAutoPair, true);
+    this.input?.detach();
+    this.input = null;
     this.ta.removeEventListener("keydown", this.onKeyDown, true);
     this.ta.removeEventListener("blur", this.onBlur);
     for (const off of this.vaultListeners) off();
@@ -343,87 +357,6 @@ export class ComposerAutocomplete {
     e.stopPropagation();
     e.stopImmediatePropagation();
     this.close();
-  };
-
-  /** 0.199.2 → 0.201.3: Markdown autopairing for the plain textarea.
-   *
-   *  - Openers pair: `[` → `]`, `(` → `)`, and a second `*` / `~` / `=` (bold,
-   *    strikethrough, highlight) or `\`` inserts its closer with the caret
-   *    between. `[[` pairing fires ONLY on the second bracket (a third `[`
-   *    used to re-fire and leave 3 opens / 4 closes).
-   *  - Type-over: typing a closer when that exact character is already at the
-   *    caret steps over it instead of doubling up.
-   *  - Backspace: deleting an opener whose closer sits right after the caret
-   *    removes BOTH (`[[|]]` → Backspace → `[|]` → Backspace → empty).
-   *
-   *  Single `*` and `~` never pair (list bullets / italics stay typable).
-   *  Toggleable in settings ("Auto-pair Markdown syntax"). */
-  private onAutoPair = (e: KeyboardEvent): void => {
-    if (!getSettings().autoPairBrackets) return;
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
-    const caret = this.ta.selectionStart;
-    if (caret == null || caret !== this.ta.selectionEnd) return;
-    const v = this.ta.value;
-    const prev = v[caret - 1];
-    const next = v[caret];
-    const insertPair = (open: string, close: string): void => {
-      e.preventDefault();
-      this.ta.value = v.slice(0, caret) + open + close + v.slice(caret);
-      this.ta.setSelectionRange(caret + open.length, caret + open.length);
-      this.ta.dispatchEvent(new Event("input", { bubbles: true }));
-    };
-    const stepOver = (): void => {
-      e.preventDefault();
-      this.ta.setSelectionRange(caret + 1, caret + 1);
-    };
-    // Simple opener/closer pairs. Quotes are symmetric (0.201.5) — see the
-    // prose-guard below so apostrophes ("don't") and closing quotes after a
-    // word never spawn a pair.
-    const SIMPLE: Record<string, string> = { "[": "]", "(": ")", "`": "`", '"': '"', "'": "'" };
-    // Doubled emphasis markers: the SECOND keypress pairs (never the first).
-    const DOUBLED = new Set(["*", "~", "="]);
-    const CLOSERS = new Set(["]", ")", "`", "*", "~", "=", '"', "'"]);
-
-    if (e.key === "Backspace") {
-      // Pair deletion: opener before caret + its closer right after.
-      const pairClose = prev !== undefined ? SIMPLE[prev] : undefined;
-      const symmetric = prev !== undefined && DOUBLED.has(prev) && next === prev;
-      if ((pairClose && next === pairClose) || symmetric) {
-        e.preventDefault();
-        this.ta.value = v.slice(0, caret - 1) + v.slice(caret + 1);
-        this.ta.setSelectionRange(caret - 1, caret - 1);
-        this.ta.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      return;
-    }
-    if (e.key.length !== 1) return;
-
-    // Type-over an existing closer (covers ] ) ` and the symmetric markers).
-    if (CLOSERS.has(e.key) && next === e.key) { stepOver(); return; }
-
-    if (e.key in SIMPLE) {
-      // `[` pairs progressively: `[|]` then `[[|]]`. A THIRD `[` inserts
-      // plain (nothing beyond a double is intentional — and it used to leave
-      // 3 opens / 4 closes). Repeated backticks insert plain too, so typing
-      // a ``` fence doesn't breed extra closers.
-      if (e.key === "[" && prev === "[" && v[caret - 2] === "[") return;
-      if (e.key === "`" && prev === "`") return;
-      // 0.201.5: quotes pair only at a WORD START — after whitespace, line
-      // start, or an opener. After a letter/digit they insert plainly, so
-      // apostrophes (don't, it's) and a hand-typed closing quote stay sane.
-      if (e.key === '"' || e.key === "'") {
-        const wordStart = prev === undefined || /[\s([{"'\u2018\u201C]/.test(prev);
-        if (!wordStart) return;
-      }
-      insertPair(e.key, SIMPLE[e.key]);
-      return;
-    }
-    if (DOUBLED.has(e.key)) {
-      // Pair ONLY on the second consecutive marker (`**|**`), and never on a
-      // third (`***` stays typable): prev must be the marker, prev-prev not.
-      if (prev === e.key && v[caret - 2] !== e.key) insertPair(e.key, e.key + e.key);
-      return;
-    }
   };
 
   private onKeyDown = (e: KeyboardEvent): void => {

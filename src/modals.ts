@@ -576,7 +576,9 @@ export class NoteWorkbench {
    *  first, since render() rebuilds the textarea on surface/mode switches). */
   private enhanceTextarea(ta: HTMLTextAreaElement): void {
     this.autocomplete?.detach();
-    this.autocomplete = new ComposerAutocomplete(this.app, ta);
+    // 0.202.0: in the workbench, Mod+Enter commits — every other Enter is a
+    // newline, so list continuation always applies.
+    this.autocomplete = new ComposerAutocomplete(this.app, ta, { insertsNewline: () => true });
     this.autocomplete.attach();
 
     const imp = this.cb.onImportFile;

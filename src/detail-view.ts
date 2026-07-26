@@ -318,7 +318,8 @@ export class StashpadDetailView extends ItemView {
     sendBtn.onclick = () => void this.submitComposer(sel);
 
     // Attach the shared composer autocomplete (# tags, [[ links, @…).
-    this.composerAutocomplete = new ComposerAutocomplete(this.app, ta);
+    // 0.202.0: Enter submits here, Shift+Enter inserts a newline.
+    this.composerAutocomplete = new ComposerAutocomplete(this.app, ta, { insertsNewline: (e) => e.shiftKey });
     this.composerAutocomplete.attach();
   }
 

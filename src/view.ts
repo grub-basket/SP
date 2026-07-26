@@ -5827,7 +5827,13 @@ export class StashpadView extends ItemView {
     // Tear down any previous autocomplete (the textarea was just rebuilt
     // by render) and attach a fresh one to the new node.
     if (this.composerAutocomplete) this.composerAutocomplete.detach();
-    this.composerAutocomplete = new ComposerAutocomplete(this.app, ta);
+    // 0.202.0: tell the shared input layer when Enter makes a NEWLINE rather
+    // than sending — list continuation must never pre-empt a submit. Mirrors
+    // the send rule in the keydown handler below (read live, so toggling the
+    // Enter mode takes effect without a rebuild).
+    this.composerAutocomplete = new ComposerAutocomplete(this.app, ta, {
+      insertsNewline: (e) => !(this.modeEnterSubmits ? !e.shiftKey : e.shiftKey),
+    });
     this.composerAutocomplete.attach();
 
     // Drag-and-drop + paste of files into the composer. Both flows
