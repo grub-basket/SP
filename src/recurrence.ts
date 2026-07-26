@@ -53,10 +53,67 @@ function addMonths(ms: number, n: number): number {
 function addYears(ms: number, n: number): number {
   const d = new Date(ms); d.setFullYear(d.getFullYear() + n); return d.getTime();
 }
-function nextWeekday(from: number, targetDow: number): number {
-  const d = new Date(from);
-  do { d.setDate(d.getDate() + 1); } while (d.getDay() !== targetDow);
-  return d.getTime();
+/** 0.203.0: short + initial forms, for the day-picker UI and rule labels. */
+export const WEEKDAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+export const WEEKDAY_INITIAL = ["S", "M", "T", "W", "T", "F", "S"];
+
+/** Every spelling of a weekday we accept in a rule → its index. */
+const WEEKDAY_ALIASES: Record<string, number> = {
+  sun: 0, su: 0, sunday: 0,
+  mon: 1, mo: 1, monday: 1,
+  tue: 2, tues: 2, tu: 2, tuesday: 2,
+  wed: 3, weds: 3, we: 3, wednesday: 3,
+  thu: 4, thur: 4, thurs: 4, th: 4, thursday: 4,
+  fri: 5, fr: 5, friday: 5,
+  sat: 6, sa: 6, saturday: 6,
+};
+
+/** Parse "monday" / "mon, wed & fri" / "tue/thu" into sorted day indices.
+ *  Returns null unless EVERY token is a weekday — so "weekday", "3 days" and
+ *  other rules fall through to their own branches untouched. */
+export function parseWeekdayList(s: string | null | undefined): number[] | null {
+  const raw = String(s ?? "").trim().toLowerCase().replace(/^every\s+/, "");
+  if (!raw) return null;
+  const tokens = raw.split(/\s*(?:,|\/|&|\+|\band\b)\s*/).map((t) => t.trim()).filter(Boolean);
+  if (!tokens.length) return null;
+  const days = new Set<number>();
+  for (const t of tokens) {
+    const key = t.replace(/s$/, ""); // mondays → monday, weds → wed
+    const d = WEEKDAY_ALIASES[t] ?? WEEKDAY_ALIASES[key];
+    if (d === undefined) return null;
+    days.add(d);
+  }
+  return [...days].sort((a, b) => a - b);
+}
+
+/** The next timestamp after `from` landing on one of `days`, keeping the
+ *  time-of-day. Works for one day or many (a Mon/Wed/Fri chore hits whichever
+ *  comes next). */
+function nextInWeekdays(from: number, days: number[]): number {
+  const set = new Set(days);
+  for (let i = 1; i <= 7; i++) {
+    const d = new Date(from);
+    d.setDate(d.getDate() + i);
+    if (set.has(d.getDay())) return d.getTime();
+  }
+  return from + UNIT_MS.week; // unreachable while `days` is non-empty
+}
+
+/** Rewrite `rule` so it repeats on exactly `days`, preserving a trailing
+ *  "when done" anchor. Empty `days` clears a weekday rule (and leaves any
+ *  other kind of rule alone). Backs the day-picker in the due modal — the rule
+ *  STRING stays the single source of truth, as with the anchor toggle. */
+export function withWeekdays(rule: string | null | undefined, days: number[]): string {
+  const raw = String(rule ?? "");
+  const anchorM = raw.match(/\s*(when done|after completion|on completion|from completion)\s*$/i);
+  const body = (anchorM ? raw.slice(0, anchorM.index) : raw).trim();
+  const anchor = anchorM ? anchorM[1].trim() : "";
+  const sorted = [...new Set(days)].filter((d) => d >= 0 && d <= 6).sort((a, b) => a - b);
+  if (!sorted.length) return parseWeekdayList(body) ? "" : raw;
+  const list = sorted.length === 1
+    ? WEEKDAYS[sorted[0]]
+    : sorted.map((d) => WEEKDAY_SHORT[d].toLowerCase()).join(", ");
+  return anchor ? `every ${list} ${anchor}` : `every ${list}`;
 }
 function nextBusinessDay(from: number): number {
   const d = new Date(from);
@@ -66,7 +123,7 @@ function nextBusinessDay(from: number): number {
 
 /** Parse a recurrence rule. Understood forms (case-insensitive, "every"
  *  optional): "daily" / "every day" / "every 3 days"; "weekly" / "every week" /
- *  "every 2 weeks"; "every weekday"; "every monday"; "monthly" / "every month" /
+ *  "every 2 weeks"; "every weekday"; "every monday"; "every mon, wed & fri"; "monthly" / "every month" /
  *  "every 2 months" / "first of the month"; "yearly" / "every year"; "every N
  *  hours" / "every N minutes". A trailing "when done" / "after completion" sets
  *  the completion anchor. Returns null if nothing matched. */
@@ -87,9 +144,14 @@ export function parseRecurrence(rule: string | null | undefined): Recurrence | n
   if (/^(first|1st) of (the )?month$/.test(s)) {
     return mk((from) => { const d = new Date(from); d.setMonth(d.getMonth() + 1, 1); return d.getTime(); }, "first of the month");
   }
-  // weekday name(s) — single weekday only for v1
-  const dow = WEEKDAYS.indexOf(s.replace(/s$/, ""));
-  if (dow >= 0) return mk((from) => nextWeekday(from, dow), `every ${WEEKDAYS[dow]}`);
+  // weekday name(s) — one or many ("every monday", "every mon, wed & fri")
+  const days = parseWeekdayList(s);
+  if (days && days.length) {
+    const label = days.length === 1
+      ? `every ${WEEKDAYS[days[0]]}`
+      : `every ${days.map((d) => WEEKDAY_SHORT[d].toLowerCase()).join(", ")}`;
+    return mk((from) => nextInWeekdays(from, days), label);
+  }
   if (s === "weekday" || s === "weekdays" || s === "business day" || s === "business days")
     return mk(nextBusinessDay, "every weekday");
 

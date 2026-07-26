@@ -4,7 +4,7 @@ import { buildTimePickerInto } from "./time-picker";
 import { siftMatch } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
-import { REPEAT_MODES, parseRepeatMode } from "./recurrence";
+import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, WEEKDAY_SHORT, WEEKDAY_INITIAL } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import type { ExportContent } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
@@ -668,8 +668,18 @@ export class NoteWorkbench {
     this.render();
   }
 
-  /** Move the line-mode divider by ±1. Returns true if it applied (line mode). */
+  /** Move the line-mode divider by ±1. Returns true if it applied (split
+   *  surface, line mode). Returning false lets the key through untouched.
+   *
+   *  0.202.1: the SURFACE guard is the important one. `mode` defaults to
+   *  "line" and is independent of `surface`, so on the EDIT surface ArrowUp/
+   *  ArrowDown still reached here, moved an invisible divider, and called
+   *  render() — which rebuilds the editor and re-seeds the caret to the END of
+   *  the text (edit-surface default). Net effect: pressing ↑ while editing
+   *  teleported the cursor to the end instead of moving up a line. The divider
+   *  only exists on the split surface; never touch arrows anywhere else. */
   moveDivider(delta: number): boolean {
+    if (this.surface !== "split") return false;
     if (this.mode !== "line") return false;
     this.lineCursorIdx = Math.max(1, Math.min(this.lines.length - 1, this.lineCursorIdx + delta));
     this.render();
@@ -2851,6 +2861,13 @@ export class DueDatePickerModal extends Modal {
       autoIn = mkRow("Auto-complete after", 'e.g. "1d" — mark done once this overdue', this.opts.currentAutoDoneAfter);
       remindIn = mkRow("Remind every", 'e.g. "2h" — re-notify until done', this.opts.currentRemindEvery);
 
+      // 0.203.0: pick the DAYS a weekly repeat lands on. Created here so it sits
+      // directly under the Repeat field; wired further down (needs paintAnchor).
+      const wrow = det.createDiv({ cls: "stashpad-due-recur-row" });
+      wrow.createEl("label", { text: "On these days" });
+      const chipWrap = wrow.createDiv({ cls: "stashpad-weekday-chips" });
+      const daysHelp = det.createDiv({ cls: "stashpad-due-recur-help" });
+
       // 0.198.0: the anchor was only reachable by typing "when done" on the end of
       // the rule. Same setting, now a visible toggle — it's the difference between
       // "every Monday" and "30 days after I actually did it", and it's the control
@@ -2873,8 +2890,37 @@ export class DueDatePickerModal extends Modal {
       };
       bDue.onclick = () => { repeatIn!.value = repeatIn!.value.replace(ANCHOR_RE, "").trimEnd(); paintAnchor(); };
       bDone.onclick = () => { if (!isDone()) repeatIn!.value = `${repeatIn!.value.trim()} when done`.trim(); paintAnchor(); };
-      repeatIn.addEventListener("input", paintAnchor);
+      // Day chips. Same contract as the anchor toggle: the rule STRING is the
+      // source of truth, so typing "every mon, fri" lights the chips and the
+      // chips rewrite the rule. Clicking a day on a non-weekday rule (e.g.
+      // "every 3 days") converts it to a weekly one, which is what picking
+      // days means; clearing every chip clears the rule.
+      const chipEls: HTMLElement[] = [];
+      const paintDays = (): void => {
+        const on = new Set(parseWeekdayList(repeatIn!.value.replace(/\s*(when done|after completion)\s*$/i, "")) ?? []);
+        chipEls.forEach((el, i) => el.toggleClass("is-active", on.has(i)));
+        daysHelp.setText(on.size
+          ? `Repeats on ${[...on].sort((a, b) => a - b).map((d) => WEEKDAY_SHORT[d]).join(", ")} — whichever comes next.`
+          : "Optional. Pick the days a weekly task lands on (e.g. Mon/Wed/Fri); leave blank to use the rule above.");
+      };
+      for (let i = 0; i < 7; i++) {
+        const b = chipWrap.createEl("button", {
+          text: WEEKDAY_INITIAL[i],
+          attr: { type: "button", "aria-label": WEEKDAY_SHORT[i], title: WEEKDAY_SHORT[i] },
+        });
+        b.onclick = () => {
+          const cur = new Set(parseWeekdayList(repeatIn!.value.replace(/\s*(when done|after completion)\s*$/i, "")) ?? []);
+          if (cur.has(i)) cur.delete(i); else cur.add(i);
+          repeatIn!.value = withWeekdays(repeatIn!.value, [...cur]);
+          paintDays();
+          paintAnchor();
+        };
+        chipEls.push(b);
+      }
+
+      repeatIn.addEventListener("input", () => { paintAnchor(); paintDays(); });
       paintAnchor();
+      paintDays();
 
       // 0.197.0: what "repeat" actually DOES. Roll-forward (the historic behaviour)
       // repeats but keeps no record; the other modes leave per-occurrence history.

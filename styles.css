@@ -6350,3 +6350,21 @@ button.stashpad-btn-loading::after {
 /* 0.201.4: task checkbox in the focused headers (full + sticky mini). */
 .stashpad-focused-meta-top .stashpad-note-task-checkbox { cursor: pointer; display: inline-flex; align-items: center; }
 .stashpad-focused-mini .stashpad-note-task-checkbox { cursor: pointer; display: inline-flex; align-items: center; flex: 0 0 auto; margin-right: 6px; }
+
+/* 0.203.0: weekday picker in the due/repeat modal. */
+.stashpad-weekday-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.stashpad-weekday-chips button {
+  width: 30px; height: 30px; padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal);
+  color: var(--text-muted);
+  font-size: 0.85em; font-weight: 700;
+  cursor: pointer;
+}
+.stashpad-weekday-chips button:hover { background: var(--interactive-hover); color: var(--text-normal); }
+.stashpad-weekday-chips button.is-active {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
