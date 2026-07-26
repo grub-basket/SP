@@ -486,8 +486,28 @@ export default class StashpadPlugin extends Plugin {
     return path.replace(/\/+$/, "").split("/").some((seg) => prefixes.some((p) => seg.startsWith(p)));
   }
 
+  /** 0.205.1: file extensions that mark a folder as ANOTHER outliner plugin's.
+   *  Part of the cross-plugin agreement with Trynalist (its
+   *  `dev-docs/interop.md`): each plugin's discovery must key off an artifact
+   *  it OWNS, never generic frontmatter. Trynalist claims a folder only via its
+   *  `<doc>.trynalist` manifest — so it can never claim ours — and we skip any
+   *  folder holding one. Unlike the `attachments` check below, this stays
+   *  correct no matter which frontmatter fields either plugin adds later. */
+  private static FOREIGN_MANIFEST_EXTS: ReadonlySet<string> = new Set(["trynalist"]);
+
+  /** Folders another outliner plugin has claimed with its own manifest file. */
+  private foreignClaimedFolders(): Set<string> {
+    const out = new Set<string>();
+    for (const f of this.app.vault.getFiles()) {
+      if (!StashpadPlugin.FOREIGN_MANIFEST_EXTS.has(f.extension)) continue;
+      out.add(f.parent?.path?.replace(/\/+$/, "") ?? "");
+    }
+    return out;
+  }
+
   discoverStashpadFolders(): string[] {
     const folders = new Set<string>();
+    const foreign = this.foreignClaimedFolders();
     for (const f of this.app.vault.getMarkdownFiles()) {
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
         | { id?: unknown; parent?: unknown; attachments?: unknown } | undefined;
@@ -512,6 +532,7 @@ export default class StashpadPlugin extends Plugin {
       // 0.136.0: reserved subfolders (archive/, trash/, _archive/, …) are never
       // Stashpad folders of their own — their notes surface via the aggregated
       // views instead of the folder pickers.
+      if (foreign.has(dir)) continue; // another plugin's document folder (0.205.1)
       if (dir && !this.pathHasExcludedSegment(dir) && !isInReservedSubfolder(dir)) folders.add(dir);
     }
     // 0.165.0: sort alphabetically, case-INSENSITIVELY, so the Folders lists in
