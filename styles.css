@@ -6392,3 +6392,117 @@ button.stashpad-btn-loading::after {
   border-color: var(--interactive-accent);
   color: var(--text-on-accent);
 }
+
+/* 0.207.0: line-number gutter for the edit/split editor. The gutter scrolls in
+   lockstep with the textarea; each number's height is measured from a hidden
+   mirror so soft-wrapped lines stay aligned. */
+.stashpad-edit-wrap { display: flex; align-items: flex-start; gap: 0; width: 100%; }
+.stashpad-edit-wrap .stashpad-split-cursor-ta { flex: 1 1 auto; min-width: 0; }
+.stashpad-edit-gutter {
+  flex: 0 0 auto;
+  overflow: hidden;
+  box-sizing: border-box;
+  min-width: 2.4em;
+  padding-right: 6px;
+  text-align: right;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  border-right: 1px solid var(--background-modifier-border);
+  margin-right: 6px;
+}
+.stashpad-edit-lineno { overflow: hidden; }
+.stashpad-edit-mirror {
+  position: absolute;
+  top: 0;
+  left: -99999px;
+  visibility: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+/* ── Onboarding: first-run welcome modal + root zero-state ──────────────────
+   Theme variables only (no literal colors) so both light and dark are legible
+   without per-theme overrides. */
+
+.stashpad-welcome .stashpad-welcome-lede {
+  font-size: var(--font-ui-medium);
+  color: var(--text-normal);
+  margin: 0 0 8px;
+}
+
+.stashpad-welcome .stashpad-welcome-detail,
+.stashpad-welcome .stashpad-welcome-footnote {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin: 0 0 12px;
+}
+
+.stashpad-welcome .stashpad-welcome-footnote {
+  margin: 12px 0 0;
+  line-height: 1.5;
+}
+
+.stashpad-welcome .stashpad-welcome-input {
+  width: 100%;
+}
+
+.stashpad-welcome .stashpad-welcome-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.stashpad-zerostate {
+  max-width: 460px;
+  margin: 0 auto;
+  padding: 40px 16px 24px;
+  text-align: center;
+}
+
+.stashpad-zerostate-title {
+  font-size: var(--font-ui-large);
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+  margin-bottom: 8px;
+}
+
+.stashpad-zerostate-body {
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.stashpad-zerostate-hints {
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 0;
+  text-align: left;
+  display: inline-block;
+}
+
+.stashpad-zerostate-hints li {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  padding: 3px 0 3px 16px;
+  position: relative;
+}
+
+.stashpad-zerostate-hints li::before {
+  content: "•";
+  position: absolute;
+  left: 2px;
+}
+
+.stashpad-zerostate-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 20px;
+}

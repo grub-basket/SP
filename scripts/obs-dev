@@ -8,6 +8,7 @@
 #   scripts/obs-dev eval '<js>'            run JS (app in scope) against the dev instance
 #   scripts/obs-dev eval-file <path>       run a JS file
 #   scripts/obs-dev reload                 reload renderer after a deploy
+#   scripts/obs-dev focus                  bring the window to the front (un-throttle timers)
 #   scripts/obs-dev screenshot /tmp/x.png  screenshot the dev instance
 #   scripts/obs-dev stop                   quit the dev instance
 exec node "$(dirname "$0")/obs-dev.mjs" "$@"

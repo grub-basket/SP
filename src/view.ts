@@ -18,7 +18,8 @@ import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { buildFileActions } from "./notifications";
 import { newId } from "./id-service";
-import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, DEFAULT_STOPWORDS } from "./slug-service";
+import { seedDemoContent } from "./demo-content";
+import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, stripInlineMarkdown, DEFAULT_STOPWORDS } from "./slug-service";
 import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
 import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
@@ -672,14 +673,41 @@ export class StashpadView extends ItemView {
     this.keydownWindow = (this.containerEl?.ownerDocument?.defaultView ?? window) as Window;
     this.keydownWindow.addEventListener("keydown", this.onDocKeyDown, true);
     this.loadConfig();
-    // 0.71.36: bootstrap can throw "Folder already exists" when the
-    // vault state races our cache check on tab open/close. Swallow
-    // that specific case so the wrap doesn't surface as Obsidian's
-    // "Failed to open view" — bootstrap is idempotent on next mount.
-    try { await this.bootstrapFolder(); } catch (e) {
-      const msg = (e as Error)?.message ?? "";
-      if (!/already exists/i.test(msg)) console.warn("[Stashpad] bootstrapFolder failed:", e);
-    }
+    // 0.208.3: DEFER the bootstrap by one task. Do not make it eager again.
+    //
+    // Obsidian delivers view state through setState(), which runs AFTER onOpen.
+    // A tab opened on a NON-default folder therefore spends onOpen believing it
+    // is the default folder — loadConfig() resolves noteFolder from
+    // settings.folder — and an eager bootstrapFolder() CREATED that folder
+    // (+ Home + _exports) before setState arrived and switched to the real one.
+    // Net effect: opening any other Stashpad silently conjured a stray default
+    // "Stashpad" folder in the vault. Long-standing, and newly VISIBLE because
+    // 0.208.0 announces folder creation — so it also fired a notice naming a
+    // folder the user never asked for.
+    //
+    // Reading leaf.getViewState() here does not help: the leaf has not stored
+    // the new state yet at onOpen time (verified — the read comes back empty).
+    // Deferring does, because setState lands first and its own
+    // loadConfig/bootstrapFolder/rebuild handles the real folder. When no state
+    // is coming (a plain default-folder open) this still bootstraps, just a tick
+    // later, and bootstrappedFolders keeps the two paths from duplicating work.
+    window.setTimeout(() => {
+      void (async () => {
+        // 0.71.36: bootstrap can throw "Folder already exists" when the vault
+        // state races our cache check on tab open/close. Swallow that specific
+        // case — bootstrap is idempotent on next mount.
+        try { await this.bootstrapFolder(); } catch (e) {
+          const msg = (e as Error)?.message ?? "";
+          if (!/already exists/i.test(msg)) console.warn("[Stashpad] bootstrapFolder failed:", e);
+          return;
+        }
+        // The first paint happened against a not-yet-bootstrapped folder, so
+        // pick up the Home note this just created.
+        if (!this.viewRoot?.isConnected) return;
+        this.tree.rebuild(this.noteFolder);
+        this.render();
+      })();
+    }, 0);
     this.tree.rebuild(this.noteFolder);
     // Subscribe the persistent "updating recovery metadata…" notice
     // to the fmSync queue's activity events. Done BEFORE the backfill
@@ -1890,7 +1918,13 @@ export class StashpadView extends ItemView {
     const manual = mode === "nested" && this.sortStore.getMode(this.noteFolder, focused.id) === "manual";
 
     if (this.currentChildren.length === 0 && fileItems.length === 0 && lockItems.length === 0) {
-      list.createDiv({ cls: "stashpad-empty", text: "No notes here yet. Type below to add one." });
+      // Two very different "empty"s. Drilling into a childless note is a normal,
+      // frequent state and wants one quiet line. Sitting at the ROOT of a
+      // Stashpad with nothing in it means the user has just arrived and has no
+      // idea what to do — that one earns a real zero-state. Same branch used to
+      // serve both, which is why first-run guidance was a single sentence.
+      if (focused.id === ROOT_ID) this.renderRootZeroState(list);
+      else list.createDiv({ cls: "stashpad-empty", text: "No notes here yet. Type below to add one." });
     } else if (manual && lockItems.length > 0) {
       // Build the full sibling sequence (unlocked notes + locked placeholders),
       // inserting each placeholder after its `prevSibling`. CHAIN-RESOLVING: a
@@ -5114,7 +5148,12 @@ export class StashpadView extends ItemView {
     if (!node.file) return "Untitled";
     const cache = this.app.metadataCache.getFileCache(node.file);
     const firstHeading = cache?.headings?.[0]?.heading;
-    if (firstHeading) return firstHeading.trim();
+    // 0.208.4: titles are raw Markdown (a heading or the first body line), and
+    // every consumer is plain text — breadcrumb, focused header, tooltips, tab
+    // title — so the syntax characters showed through verbatim
+    // ("**Atomic Habits**"). Strip at this single choke point rather than at each
+    // call site; the tooltip/tab-title consumers can't render HTML anyway.
+    if (firstHeading) return stripInlineMarkdown(firstHeading);
     // Prefer the note's first body line (what the row / focused header shows)
     // over the filename: a filename can be a short slug that doesn't match its
     // content (e.g. `grand.md` whose body is "Grandchild under child A of
@@ -5123,7 +5162,9 @@ export class StashpadView extends ItemView {
     // any crumb not cached yet. Falls back to the filename slug on a miss.
     const bodyText = this.plugin.renderCacheStore.get(node.file.path)?.text;
     const firstLine = bodyText?.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
-    if (firstLine) return firstLine;
+    // Strip AFTER picking the line: a line that is only syntax (e.g. "**") would
+    // otherwise strip to empty and silently win over the filename fallback.
+    if (firstLine) return stripInlineMarkdown(firstLine) || node.file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
     return node.file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
   }
 
@@ -9666,10 +9707,58 @@ export class StashpadView extends ItemView {
     menu.showAtMouseEvent(new MouseEvent("click", { clientX: 200, clientY: 400 }));
   }
 
+  /** The first thing a new user actually looks at: an empty Stashpad root.
+   *  Says what this pane is, what the composer does, and offers the two ways
+   *  out (example content, or the welcome walkthrough). Only rendered at the
+   *  root — see the call site for why. */
+  private renderRootZeroState(list: HTMLElement): void {
+    const zero = list.createDiv({ cls: "stashpad-zerostate" });
+    zero.createDiv({ cls: "stashpad-zerostate-title", text: "This Stashpad is empty" });
+    zero.createDiv({
+      cls: "stashpad-zerostate-body",
+      text: "Type in the box below and press Enter — each line becomes a note. Click a note to drill into it and add notes underneath, building a tree you can navigate.",
+    });
+
+    const hints = zero.createEl("ul", { cls: "stashpad-zerostate-hints" });
+    hints.createEl("li", { text: "Enter adds a note here. Click one to go deeper." });
+    hints.createEl("li", { text: "Start a line with [] to make it a task." });
+    hints.createEl("li", { text: "Everything is plain markdown in your vault — nothing is locked away." });
+
+    const actions = zero.createDiv({ cls: "stashpad-zerostate-actions" });
+    const demoBtn = actions.createEl("button", { text: "Load example content", cls: "mod-cta" });
+    // Seed into THIS folder, not a new one. The command-palette version creates a
+    // separate "Stashpad demo" so it can't mix examples into someone's real
+    // notes — but that reasoning doesn't apply here: this folder is provably
+    // empty (it's why the zero-state is on screen), and jumping the user to a
+    // different folder after they clicked a button labelled "load example
+    // content" would be a surprise.
+    demoBtn.addEventListener("click", () => {
+      void (async () => {
+        demoBtn.disabled = true; // seeding ~35 notes isn't instant
+        try {
+          const { created } = await seedDemoContent(this.app, this.plugin, this.noteFolder);
+          new Notice(`Stashpad: added ${created} example note${created === 1 ? "" : "s"}.`, 6000);
+          this.tree.rebuild(this.noteFolder);
+          this.render();
+        } catch (e) {
+          demoBtn.disabled = false;
+          new Notice(`Stashpad: couldn't add the example notes — ${e instanceof Error ? e.message : String(e)}`, 0);
+        }
+      })();
+    });
+    const helpBtn = actions.createEl("button", { text: "Getting started" });
+    helpBtn.addEventListener("click", () => this.plugin.showWelcome());
+  }
+
   // --- Bootstrap ---
 
   private async bootstrapFolder(): Promise<void> {
     if (this.bootstrappedFolders.has(this.noteFolder)) return;
+    // Opening the view CREATES the folder, a Home note and two subfolders if
+    // they don't exist. That used to happen with no prompt and no notice — a
+    // plugin writing four things into someone's vault while they were still
+    // working out what it does. Check first so we can say so afterwards.
+    const preexisting = await this.app.vault.adapter.exists(this.noteFolder);
     await this.ensureFolder(this.noteFolder);
     await this.ensureHomeNote();
     await this.migrateNullParents();
@@ -9685,6 +9774,14 @@ export class StashpadView extends ItemView {
     // user's saved preference on the very first render.
     await this.sortStore.load(this.noteFolder);
     this.bootstrappedFolders.add(this.noteFolder);
+    // Tell the user what just appeared in their vault. Only when we actually
+    // created the folder — reopening an existing Stashpad must stay silent.
+    if (!preexisting) {
+      const n = new Notice("", 10000);
+      n.noticeEl.createSpan({
+        text: `Stashpad created the folder "${this.noteFolder}" with a Home note. It's ordinary markdown — move or delete it whenever.`,
+      });
+    }
   }
 
   /** First-time-per-session backfill of the redundant parentLink +

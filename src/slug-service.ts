@@ -6,6 +6,53 @@ export const DEFAULT_STOPWORDS = [
   "your","our","their","do","does","did","so","just","very","really","im",
 ];
 
+/** Strip inline Markdown syntax, leaving the visible text.
+ *
+ *  Titles in Stashpad come from a note's first body line, which is raw Markdown —
+ *  so a breadcrumb read `📕 **Atomic Habits** — James Clear` complete with
+ *  asterisks. Every consumer of a title is a PLAIN-TEXT context (the breadcrumb,
+ *  the focused header, `title=` tooltips, the Obsidian tab title), and several of
+ *  them cannot render HTML at all, so stripping is the fix that works everywhere
+ *  — rendering Markdown would only have been possible in some of them.
+ *
+ *  Conservative on purpose: emphasis is only unwrapped when the delimiters look
+ *  like real emphasis, so `snake_case_name` and `2 * 3` survive intact. Anything
+ *  it doesn't recognise is left alone rather than mangled.
+ */
+export function stripInlineMarkdown(input: string): string {
+  // Escapes are PROTECTED first, not stripped last. `\*not bold\*` otherwise
+  // reaches the emphasis rules looking exactly like emphasis, and comes out as
+  // `\not bold\` — asterisks eaten, backslashes kept, precisely backwards.
+  // Placeholders use NUL, which can't occur in a note title.
+  const escaped: string[] = [];
+  let out = input.replace(/\\([\\`*_{}[\]()#+\-.!~=>])/g, (_m, ch: string) => {
+    escaped.push(ch);
+    return `\u0000${escaped.length - 1}\u0000`;
+  });
+  // Images before links, so alt text survives rather than the whole tag going.
+  out = out.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
+  out = out.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  // Wikilinks: [[Target|Alias]] shows the alias; [[Target]] shows the target.
+  out = out.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2");
+  out = out.replace(/\[\[([^\]]+)\]\]/g, "$1");
+  // Leading block markers (heading hashes, quote, bullet, ordered marker).
+  out = out.replace(/^\s{0,3}(?:#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/, "");
+  // Inline code — keep the code text, drop the backticks.
+  out = out.replace(/`{1,3}([^`]+)`{1,3}/g, "$1");
+  // Emphasis, longest delimiter first so *** isn't half-eaten by **.
+  out = out.replace(/(\*\*\*|___)(\S(?:[\s\S]*?\S)?)\1/g, "$2");
+  out = out.replace(/(\*\*|__)(\S(?:[\s\S]*?\S)?)\1/g, "$2");
+  // Single-delimiter emphasis: require a non-word char outside and no space
+  // just inside, which is what keeps `snake_case` and `a * b` untouched.
+  out = out.replace(/(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])/g, "$1");
+  out = out.replace(/(?<![\w_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\w_])/g, "$1");
+  out = out.replace(/~~([^~]+)~~/g, "$1");
+  out = out.replace(/==([^=]+)==/g, "$1");
+  // Restore what the author escaped, as the bare character.
+  out = out.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => escaped[Number(i)] ?? "");
+  return out.replace(/\s+/g, " ").trim();
+}
+
 const MAX_LEN = 50;
 
 export function bodyToSlug(body: string, stopwords: string[] = DEFAULT_STOPWORDS): string {

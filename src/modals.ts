@@ -6,6 +6,8 @@ import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
+import { readClipboardText } from "./cross-vault-clipboard";
+import { getSettings } from "./settings";
 import type { ExportContent } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
 
@@ -635,9 +637,89 @@ export class NoteWorkbench {
 
   /** Detach the autocomplete + its document/vault listeners. Hosts call this on
    *  close so the popup listeners don't outlive the modal/tab. */
+  /** 0.207.0: line-number gutter for the editor.
+   *
+   *  A `<textarea>` has no gutter and no way to ask where a line was drawn, so
+   *  the numbers are positioned by MEASUREMENT: a hidden mirror with the
+   *  textarea's exact width, font and padding renders each logical line, and
+   *  each number is given that line's real height. That's what makes the
+   *  numbers stay aligned when a long line SOFT-WRAPS across several rows —
+   *  the naive one-row-per-line gutter drifts out of alignment the moment any
+   *  line wraps, which in a note editor is immediately.
+   *
+   *  Desktop only: on a phone the gutter costs width the editor needs more. */
+  private attachLineNumbers(wrap: HTMLElement, ta: HTMLTextAreaElement): void {
+    if (Platform.isMobile) return;
+    if (!getSettings().showEditorLineNumbers) return;
+    const doc = wrap.ownerDocument ?? document;
+    const gutter = doc.createElement("div");
+    gutter.className = "stashpad-edit-gutter";
+    gutter.setAttribute("aria-hidden", "true"); // decorative; the text is the content
+    wrap.insertBefore(gutter, ta);
+
+    const mirror = doc.createElement("div");
+    mirror.className = "stashpad-edit-mirror";
+    doc.body.appendChild(mirror);
+
+    const paint = (): void => {
+      const cs = getComputedStyle(ta);
+      // Match every property that affects where a line breaks.
+      mirror.style.font = cs.font;
+      mirror.style.letterSpacing = cs.letterSpacing;
+      mirror.style.lineHeight = cs.lineHeight;
+      mirror.style.paddingLeft = cs.paddingLeft;
+      mirror.style.paddingRight = cs.paddingRight;
+      mirror.style.width = `${ta.clientWidth}px`;
+      mirror.style.tabSize = cs.tabSize;
+      gutter.style.paddingTop = cs.paddingTop;
+      gutter.style.lineHeight = cs.lineHeight;
+      gutter.style.fontSize = cs.fontSize;
+      // A DEFINITE height is what makes the gutter scrollable in lockstep: left
+      // to stretch, it grows to fit all its numbers, so it never overflows
+      // (scrollTop pins at 0 and the numbers desync from a scrolling textarea)
+      // AND it drags the whole modal taller on a long note.
+      gutter.style.height = `${ta.clientHeight}px`;
+
+      const lines = ta.value.split("\n");
+      mirror.empty();
+      const rows: HTMLElement[] = [];
+      for (const line of lines) {
+        const row = mirror.createDiv();
+        // A zero-width space keeps an empty line one row tall instead of zero.
+        row.textContent = line.length ? line : "\u200b";
+        rows.push(row);
+      }
+      gutter.empty();
+      for (let i = 0; i < lines.length; i++) {
+        const n = gutter.createDiv({ cls: "stashpad-edit-lineno", text: String(i + 1) });
+        n.style.height = `${rows[i].offsetHeight}px`;
+      }
+    };
+
+    const syncScroll = (): void => { gutter.scrollTop = ta.scrollTop; };
+    const onInput = (): void => { paint(); syncScroll(); };
+    ta.addEventListener("input", onInput);
+    ta.addEventListener("scroll", syncScroll);
+    // Width changes rewrap every line, so the heights must be remeasured.
+    const ro = new ResizeObserver(() => { paint(); syncScroll(); });
+    ro.observe(ta);
+    requestAnimationFrame(paint);
+
+    this.lineNumberCleanups.push(() => {
+      ta.removeEventListener("input", onInput);
+      ta.removeEventListener("scroll", syncScroll);
+      ro.disconnect();
+      mirror.remove();
+    });
+  }
+
+  private lineNumberCleanups: Array<() => void> = [];
+
   destroy(): void {
     this.autocomplete?.detach();
     this.autocomplete = null;
+    for (const off of this.lineNumberCleanups) { try { off(); } catch { /* ignore */ } }
+    this.lineNumberCleanups = [];
   }
 
   /** 0.168.3: single dispatch for the Split button + Mod+Enter. 0.169.3: awaits the
@@ -790,7 +872,10 @@ export class NoteWorkbench {
     const updateCount = (): void => {
       const t = this.cursorTextarea?.value ?? "";
       const words = (t.trim().match(/\S+/g) || []).length;
-      count.setText(`${words} word${words === 1 ? "" : "s"} · ${t.length} char${t.length === 1 ? "" : "s"}`);
+      // 0.207.0: lines alongside words/chars. Counted as LOGICAL lines (what
+      // you typed), not wrapped rows — matching the gutter beside the editor.
+      const lines = t === "" ? 0 : t.split("\n").length;
+      count.setText(`${lines} line${lines === 1 ? "" : "s"} · ${words} word${words === 1 ? "" : "s"} · ${t.length} char${t.length === 1 ? "" : "s"}`);
     };
     const caseBtn = tools.createEl("button", { cls: "stashpad-split-case-btn" });
     setIcon(caseBtn.createSpan({ cls: "stashpad-split-btn-icon" }), "case-sensitive");
@@ -1027,13 +1112,15 @@ export class NoteWorkbench {
     const diffBody = changes.body.createDiv({ cls: "stashpad-split-panel-body stashpad-split-diff-body" });
 
     const edit = this.buildSplitSection(this.host, "edit", this.surface === "edit" ? "Your edit" : "Your edit — the split uses this");
-    const ta = edit.body.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
+    const editWrap = edit.body.createDiv({ cls: "stashpad-edit-wrap" });
+    const ta = editWrap.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
     // Seed from the persisted (possibly edited) text so toggling modes doesn't
     // discard edits; the split acts on exactly what's shown here.
     ta.value = this.cursorText;
     ta.readOnly = false;
     this.cursorTextarea = ta;
     this.enhanceTextarea(ta);
+    this.attachLineNumbers(editWrap, ta);
 
     const renderDiff = (): void => {
       diffBody.empty();
@@ -2148,17 +2235,20 @@ export class OpenDeepLinkModal extends Modal {
     const input = row.createEl("textarea", { attr: { rows: "3" } });
     input.addClass("stashpad-export-name");
     input.placeholder = "obsidian://stashpad?folder=…&note=…";
-    // 0.199.3: use the MODAL's window's navigator, not the main window's.
-    // In a secondary (pop-out) window the main document isn't focused, so
-    // `navigator.clipboard.readText()` rejects ("document is not focused")
-    // and the auto-paste silently never happened there.
-    const nav = this.contentEl.ownerDocument?.defaultView?.navigator ?? navigator;
+    // 0.208.5: read through readClipboardText(), which prefers ELECTRON's
+    // clipboard. 0.199.3 switched this to the modal's own window's navigator,
+    // which only helps when that window happens to be the OS-focused one —
+    // `navigator.clipboard.readText()` rejects with "document is not focused"
+    // otherwise. That is why auto-paste worked in some vaults' secondary windows
+    // and never in another: it depended on which window had focus at that
+    // instant, not on the vault. Electron's clipboard has no focus dependency.
+    // The window is still passed for the navigator fallback (mobile).
+    const modalWin = this.contentEl.ownerDocument?.defaultView ?? null;
     pasteBtn.onclick = async () => {
-      try {
-        const t = (await nav.clipboard?.readText?.())?.trim();
-        if (t) { input.value = t; autoHint.hide(); }
-        input.focus();
-      } catch { new Notice("Couldn't read the clipboard — paste manually."); }
+      const t = (await readClipboardText(modalWin)).trim();
+      if (t) { input.value = t; autoHint.hide(); }
+      else new Notice("Couldn't read the clipboard — paste manually.");
+      input.focus();
     };
     // A manual paste or edit means the field is no longer the auto-pasted link —
     // drop the green confirmation so it isn't misleading.
@@ -2190,13 +2280,13 @@ export class OpenDeepLinkModal extends Modal {
       // Prefill from the clipboard when it already holds a Stashpad link — the
       // whole point is pasting, so save the paste. Selected so the user can
       // overwrite with a real paste if it's the wrong link. Best-effort.
-      void nav.clipboard?.readText?.().then((t) => {
+      void readClipboardText(modalWin).then((t) => {
         if (!input.value && t && /obsidian:\/\/stashpad\?/i.test(t.trim())) {
           input.value = t.trim();
           input.select();
           autoHint.show(); // green "auto-pasted" confirmation
         }
-      }).catch(() => { /* clipboard blocked — user pastes manually */ });
+      });
     });
   }
   onClose(): void { this.contentEl.empty(); }

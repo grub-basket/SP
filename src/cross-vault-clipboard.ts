@@ -75,6 +75,29 @@ function electronClipboard(): { writeText?: (t: string) => void; write?: (d: { t
   } catch { return null; }
 }
 
+/** Read plain text from the OS clipboard, focus-independently where possible.
+ *
+ *  Prefers Electron's clipboard: it is synchronous and does NOT require the
+ *  document to be focused. `navigator.clipboard.readText()` rejects outright with
+ *  "document is not focused", which is why clipboard auto-prefill worked in some
+ *  windows and silently never fired in others — including pop-outs and any window
+ *  that wasn't the OS-focused one at that instant. Passing the window only
+ *  affects the navigator fallback (mobile, where Electron isn't there).
+ *
+ *  Returns "" rather than throwing; callers treat empty as "nothing to paste".
+ */
+export async function readClipboardText(win?: Window | null): Promise<string> {
+  const ec = electronClipboard();
+  if (ec?.readText) {
+    try {
+      const t = ec.readText();
+      if (typeof t === "string") return t;
+    } catch { /* fall through to the navigator path */ }
+  }
+  const nav = win?.navigator ?? navigator;
+  try { return (await nav.clipboard?.readText?.()) ?? ""; } catch { return ""; }
+}
+
 /** Write plain text + the hidden cross-vault payload to the OS clipboard.
  *  Returns false when neither clipboard API could take the dual payload
  *  (callers then fall back to their plain-text-only write). */

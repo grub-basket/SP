@@ -1,7 +1,9 @@
 import type { App } from "obsidian";
-import type { StashpadId } from "./types";
+import { STASHPAD_SIDECAR_FILES, type StashpadId } from "./types";
 
-const ORDER_FILE = ".stashpad-order.json";
+// Canonical name lives in types.ts (STASHPAD_SIDECAR_FILES) so the list a
+// sibling plugin mirrors can never drift from what we actually write.
+const ORDER_FILE = STASHPAD_SIDECAR_FILES[0];
 
 /** Per-folder ordering store. Maintains a `{ parentId: [childId, ...] }` map
  *  in `<folder>/.stashpad-order.json`. Children present in the map sort by

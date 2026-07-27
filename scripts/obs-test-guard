@@ -42,9 +42,24 @@
 # The banner Notice is persistent (duration 0) and tracked on
 # window.__claudeTestBanner so `end` can dismiss it. `start` does the wait in the
 # SHELL (not inside eval — obs eval has a ~1s ceiling).
+#
+# ENVIRONMENT:
+#   OBS_GUARD_DRIVER=dev|cli  force the driver (default: auto — "dev" when an
+#                             Obsidian debug port is live, else "cli")
+#   OBS_GUARD_TIMEOUT=<secs>  per-call ceiling, default 25. Nothing can hang
+#                             longer than this; a trip aborts with exit 4.
+#   OBS_DEV_SLOT=b            target the slot-B dev instance (Vault B, :9223)
+#   OBS_GUARD_TTL=<secs>      lock TTL, default 300
+#
+# EXIT CODES: 0 ok · 1 wrong/unreachable vault · 3 another chat holds the lock
+#             · 4 driver timed out (nothing claimed, no banner up)
+#
+# CAVEAT: the watchdog kills the driver process, but a cold-launching official
+# CLI may already have spawned an Obsidian app that outlives it. That's why the
+# no-debug-port case refuses the cli driver up front instead of relying on the
+# timeout — prevention beats cleanup here.
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-OBS="$DIR/obs"
 
 # Owner identity: the chat's session id (stable across this script's separate
 # start/ensure/end invocations, distinct from any other chat). Fall back to a
@@ -53,14 +68,152 @@ OBS="$DIR/obs"
 OWNER="${CLAUDE_CODE_SESSION_ID:-nosession-$$}"
 LOCK_TTL="${OBS_GUARD_TTL:-300}"
 
+# ---- driver selection (the 2026-07-23 "start hangs forever" fix) -----------
+# The guard used to hardcode scripts/obs (the OFFICIAL Obsidian CLI). That CLI is
+# a remote control for the user's NORMAL running Obsidian — and if none is
+# running, its first command COLD-LAUNCHES Obsidian and then blocks forever. Our
+# dev instance doesn't count: obs-dev runs with its own --user-data-dir, so the
+# CLI can't see it. Net effect: on a machine where only obs-dev was up (the
+# common case now), `obs-test-guard start` hung at verify() with no output and
+# the lock stayed FREE — exactly the reported symptom.
+#
+# So the driver is now CHOSEN, not assumed, and EVERY call is time-boxed:
+#   * driver "dev" → scripts/obs-dev eval (CDP straight at the debug port; this
+#     is the instance we actually test against)
+#   * driver "cli" → scripts/obs eval code=… (official CLI; only sane when the
+#     user's own Obsidian is the target)
+# Auto-detect prefers a live debug port. Override with OBS_GUARD_DRIVER=dev|cli.
+# Slot-aware: OBS_DEV_SLOT=b (or "only 9223 is up") → Vault B on port 9223.
+GUARD_TIMEOUT="${OBS_GUARD_TIMEOUT:-25}"
+
+port_up() { curl -s -m 2 "http://localhost:$1/json/version" >/dev/null 2>&1; }
+
+# GUARD_PORT is "" when nothing is listening — that's what triggers the crisp
+# "start scripts/obs-dev first" abort instead of a confusing downstream failure.
+# WANT_PORTS is only for the message, so it names the port(s) actually checked.
+# Slot-parametrized expectations, mirroring the SLOTS table in
+# scripts/obs-dev.mjs. Keep the two in sync — the guard does its OWN verify
+# (belt and braces: obs-dev verifies too) so the cli driver is covered as well.
+# Slot c is the FIRST-RUN vault: deliberately empty of Stashpad folders, which
+# is the only way to exercise the welcome-modal gate.
+slot_cfg() {
+  case "$1" in
+    b) SLOT_PORT=9223; EXPECT_VAULT="Claude Dev Vault B"
+       SENTINEL_FILE="CLAUDE-DEV-VAULT-B-SENTINEL.md"
+       SENTINEL_TOKEN="claude-dev-vault-b-4e8d1f6a-do-not-delete" ;;
+    c) SLOT_PORT=9224; EXPECT_VAULT="Claude Dev Vault C"
+       SENTINEL_FILE="CLAUDE-DEV-VAULT-C-SENTINEL.md"
+       SENTINEL_TOKEN="claude-dev-vault-c-9b2e5d31-do-not-delete" ;;
+    *) SLOT_PORT=9222; EXPECT_VAULT="Claude Dev Vault"
+       SENTINEL_FILE="CLAUDE-DEV-VAULT-SENTINEL.md"
+       SENTINEL_TOKEN="claude-dev-vault-7f3a9c2e-do-not-delete" ;;
+  esac
+}
+
+if [ -n "${OBS_DEV_SLOT:-}" ]; then
+  # Explicit slot: only that slot's port counts. Never silently fall back to a
+  # different vault than the one asked for.
+  slot_cfg "$OBS_DEV_SLOT"
+  WANT_PORTS=":$SLOT_PORT (slot $OBS_DEV_SLOT)"
+  if port_up "$SLOT_PORT"; then GUARD_PORT="$SLOT_PORT"; else GUARD_PORT=""; fi
+else
+  # Auto-detect: first live port wins, and the expectations follow it.
+  WANT_PORTS=":9222, :9223 and :9224"
+  GUARD_PORT=""
+  for _s in a b c; do
+    slot_cfg "$_s"
+    if port_up "$SLOT_PORT"; then
+      GUARD_PORT="$SLOT_PORT"
+      [ "$_s" = a ] || { OBS_DEV_SLOT="$_s"; export OBS_DEV_SLOT; }
+      break
+    fi
+  done
+  # No port up: fall back to slot a's expectations for the error message.
+  [ -n "$GUARD_PORT" ] || slot_cfg a
+fi
+
+DRIVER="${OBS_GUARD_DRIVER:-}"
+if [ -z "$DRIVER" ]; then
+  if [ -n "$GUARD_PORT" ]; then DRIVER=dev; else DRIVER=cli; fi
+fi
+
+# run_to <secs> <cmd…> — run a command with a hard wall-clock ceiling. macOS has
+# no coreutils `timeout`, hence the watchdog. Exit 124 on timeout (timeout(1)'s
+# convention) so callers can distinguish "hung" from "answered with an error".
+run_to() {
+  _secs="$1"; shift
+  _out="$(mktemp -t obsguard)"
+  "$@" >"$_out" 2>/dev/null &
+  _cpid=$!
+  ( sleep "$_secs"; kill -9 "$_cpid" 2>/dev/null ) >/dev/null 2>&1 &
+  _wpid=$!
+  wait "$_cpid" 2>/dev/null; _rc=$?
+  # Reap the watchdog quietly — without the `wait`, some shells print a stray
+  # "Terminated: 15" job notice for it on every successful call.
+  { kill "$_wpid" 2>/dev/null; wait "$_wpid" 2>/dev/null; } 2>/dev/null
+  cat "$_out"; rm -f "$_out"
+  # 137 = SIGKILL from our watchdog (the process was still running at the ceiling).
+  [ "$_rc" -eq 137 ] && return 124
+  return "$_rc"
+}
+
+# drive <js-expression> — evaluate JS in the target renderer via the chosen
+# driver, time-boxed, output normalized. Normalization matters: obs-dev
+# JSON-stringifies the returned value, so a helper that returns a JSON *string*
+# comes back double-encoded (`"{\"ok\":true}"`). Stripping backslashes lets the
+# existing `*'"ok":true'*` matching work identically under both drivers.
+#
+# NOTE: normalize WITHOUT a pipeline. A trailing `| tr …` would make drive's exit
+# status `tr`'s (always 0), silently killing every 124/timeout check downstream.
+drive() {
+  if [ "$DRIVER" = dev ]; then
+    _raw="$(run_to "$GUARD_TIMEOUT" env OBS_DEV_SLOT="${OBS_DEV_SLOT:-a}" "$DIR/obs-dev" eval "$1")"; _drc=$?
+  else
+    _raw="$(run_to "$GUARD_TIMEOUT" "$DIR/obs" eval code="$1")"; _drc=$?
+  fi
+  printf '%s' "$_raw" | tr -d '\\'
+  return "$_drc"
+}
+
 show() {
-  # show <js-string-literal-message> — (re)uses the single tracked banner Notice.
-  "$OBS" eval code="(() => {
+  # show <js-string-literal-message> — (re)uses the single tracked banner Notice,
+  # and (re)attaches a reposition toggle button (top<->bottom, persisted). The
+  # button lives INSIDE the notice element as a sibling of the message, so
+  # setMessage (which only rewrites the message) never wipes it. Mirrors the
+  # Bases Toolbox obs-dev.mjs banner. NOTE: bottom:40px is a first pass — tune
+  # visually when testing. Kept as string-concat (no backticks) on purpose:
+  # this whole block is a bash double-quoted string, and a backtick would trigger
+  # command substitution.
+  drive "(() => {
     const msg = $1;
     if (window.__claudeTestBanner && typeof window.__claudeTestBanner.setMessage === 'function') {
       window.__claudeTestBanner.setMessage(msg);
     } else {
       window.__claudeTestBanner = new Notice(msg, 0);
+    }
+    const CSS = '.bt-test-banner{border-left:3px solid var(--color-red, #e05252) !important}'
+      + '.bt-test-banner .bt-banner-toggle{display:inline-block;margin-top:6px;padding:3px 10px;font-size:11px;line-height:1.3;border-radius:5px;border:1px solid var(--background-modifier-border);background:var(--interactive-accent);color:#fff;text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000;cursor:pointer;font-family:var(--font-interface);white-space:nowrap}'
+      + '.bt-test-banner .bt-banner-toggle:hover{filter:brightness(1.1)}'
+      + 'body.bt-banner-bottom .bt-test-banner{position:fixed !important;top:auto !important;bottom:40px !important;right:14px !important}';
+    if (!document.getElementById('bt-banner-style')) {
+      const st = document.createElement('style'); st.id = 'bt-banner-style'; st.textContent = CSS; document.head.appendChild(st);
+    }
+    const POS = 'bt-banner-pos';
+    if (localStorage.getItem(POS) === 'bottom') document.body.classList.add('bt-banner-bottom');
+    else document.body.classList.remove('bt-banner-bottom');
+    const el = window.__claudeTestBanner.containerEl || window.__claudeTestBanner.noticeEl;
+    if (el) {
+      el.classList.add('bt-test-banner');
+      const cont = el.parentElement;
+      if (cont && !cont.dataset.btNoDismiss) {
+        cont.addEventListener('click', (e) => { if (e.target.closest('.bt-test-banner') && !e.target.closest('.bt-banner-toggle')) e.stopPropagation(); }, true);
+        cont.dataset.btNoDismiss = '1';
+      }
+      let btn = el.querySelector('.bt-banner-toggle');
+      if (!btn) { btn = document.createElement('button'); btn.className = 'bt-banner-toggle'; el.appendChild(btn); }
+      const relabel = () => { btn.textContent = document.body.classList.contains('bt-banner-bottom') ? '↑ Move banner to top' : '↓ Move banner to bottom'; };
+      btn.onclick = (e) => { e.stopPropagation(); const b = document.body.classList.toggle('bt-banner-bottom'); localStorage.setItem(POS, b ? 'bottom' : 'top'); relabel(); };
+      relabel();
     }
     return 'shown';
   })()" >/dev/null 2>&1
@@ -71,7 +224,7 @@ show() {
 #   {"ok":false,"owner":..,"label":..,     held by a DIFFERENT live session — caller must abort
 #    "heldForSec":N,"expiresInSec":N}
 claim() {
-  "$OBS" eval code="(() => {
+  drive "(() => {
     const now = Date.now();
     const mine = '$OWNER';
     const ttl = ${LOCK_TTL} * 1000;
@@ -89,9 +242,18 @@ claim() {
   })()" 2>/dev/null
 }
 
+# claim_tagged <label> — claim, but tag a HUNG driver in the OUTPUT rather than
+# exiting here. It's called as `out="$(claim_tagged …)"`, i.e. in a subshell, so an
+# `exit` would only leave the substitution and the script would sail on. The tag
+# travels back to abort_if_held, which exits in the MAIN shell where it counts.
+claim_tagged() {
+  out="$(claim "$1")"; rc=$?
+  if [ "$rc" -eq 124 ]; then printf '%s' '{"__timeout":true}'; else printf '%s' "$out"; fi
+}
+
 # release — clear the lock, but only if it's mine (never clobber another session).
 release() {
-  "$OBS" eval code="(() => {
+  drive "(() => {
     const mine = '$OWNER';
     const cur = window.__claudeVaultLock;
     if (cur && cur.owner && cur.owner !== mine) {
@@ -111,6 +273,11 @@ jsonnum() { sed -n "s/.*\"$1\":\([0-9-]*\).*/\1/p"; }
 abort_if_held() {
   case "$1" in
     *'"ok":true'*) return 0 ;;
+    *'"__timeout":true'*)
+      echo "✋ GUARD ABORT: the $DRIVER driver TIMED OUT (${GUARD_TIMEOUT}s) claiming the lock." >&2
+      echo "   Nothing was claimed and no banner is up — do NOT drive." >&2
+      echo "   Raise the ceiling with OBS_GUARD_TIMEOUT=<secs> if the instance is merely slow." >&2
+      exit 4 ;;
     *)
       own=$(printf '%s' "$1" | jsonstr owner)
       lbl=$(printf '%s' "$1" | jsonstr label)
@@ -137,18 +304,33 @@ abort_if_held() {
 # The sentinel makes this robust even if the vault is renamed again — a real
 # vault would have to deliberately contain the token to be mistaken for this one.
 # Prints "verify: OK" + exits 0 on match; LOUD error + exits 1 otherwise.
-EXPECT_VAULT="Claude Dev Vault"
-SENTINEL_TOKEN="claude-dev-vault-7f3a9c2e-do-not-delete"
+# (EXPECT_VAULT / SENTINEL_FILE / SENTINEL_TOKEN are set slot-aware above.)
 verify() {
-  out="$("$OBS" eval code="(async () => {
+  if [ "$DRIVER" = cli ] && [ -z "$GUARD_PORT" ]; then
+    echo "✋ GUARD ABORT: no Obsidian debug port is listening (checked $WANT_PORTS)." >&2
+    echo "   Refusing to fall back to the official CLI — with no running instance it" >&2
+    echo "   cold-launches Obsidian and BLOCKS FOREVER (the 2026-07-23 hang)." >&2
+    echo "   Start the test instance first:  scripts/obs-dev start" >&2
+    echo "   (Slot B:  OBS_DEV_SLOT=b scripts/obs-dev start)" >&2
+    echo "   To drive the user's own Obsidian anyway:  OBS_GUARD_DRIVER=cli scripts/obs-test-guard …" >&2
+    return 1
+  fi
+  out="$(drive "(async () => {
     const name = app.vault.getName();
     let token = '';
-    try { token = await app.vault.adapter.read('CLAUDE-DEV-VAULT-SENTINEL.md'); } catch (e) {}
+    try { token = await app.vault.adapter.read('$SENTINEL_FILE'); } catch (e) {}
     const ok = name === '$EXPECT_VAULT' && token.indexOf('$SENTINEL_TOKEN') !== -1;
     return JSON.stringify({ ok, name, sentinel: token.indexOf('$SENTINEL_TOKEN') !== -1 });
   })()" 2>/dev/null)"
+  if [ $? -eq 124 ]; then
+    echo "✋ GUARD ABORT: the $DRIVER driver TIMED OUT after ${GUARD_TIMEOUT}s during verify." >&2
+    echo "   Nothing was claimed and no banner is up — do NOT drive." >&2
+    [ "$DRIVER" = cli ] && echo "   The official CLI blocks when no normal Obsidian is running; use scripts/obs-dev start." >&2
+    echo "   Raise the ceiling with OBS_GUARD_TIMEOUT=<secs> if the instance is merely slow." >&2
+    return 1
+  fi
   case "$out" in
-    *'"ok":true'*) echo "verify: OK — $EXPECT_VAULT (name + sentinel confirmed)"; return 0 ;;
+    *'"ok":true'*) echo "verify: OK — $EXPECT_VAULT via $DRIVER driver${GUARD_PORT:+ (:$GUARD_PORT)} (name + sentinel confirmed)"; return 0 ;;
     *)
       echo "✋ GUARD ABORT: the running Obsidian is NOT the throwaway dev vault." >&2
       echo "   Expected \"$EXPECT_VAULT\" + sentinel note; got: ${out:-<no response from CLI>}" >&2
@@ -164,7 +346,11 @@ case "$1" in
   status)
     # Read-only: report the current lock holder without touching it. Safe to run
     # from any chat BEFORE deciding to start, so you can see if someone's testing.
-    out="$("$OBS" eval code="(() => {
+    if [ -z "$GUARD_PORT" ] && [ "${OBS_GUARD_DRIVER:-}" != cli ]; then
+      echo "lock: UNKNOWN — no Obsidian debug port on $WANT_PORTS (nothing to ask; start scripts/obs-dev)." >&2
+      exit 1
+    fi
+    out="$(drive "(() => {
       const now = Date.now();
       const cur = window.__claudeVaultLock;
       if (!cur || !cur.owner || cur.expiresAt <= now) return JSON.stringify({ held: false });
@@ -193,7 +379,7 @@ case "$1" in
     ;;
   start)
     verify || exit 1
-    out="$(claim 'start')"
+    out="$(claim_tagged 'start')"
     abort_if_held "$out"
     secs="${2:-5}"
     show "'🤖 Claude is about to run an automated Stashpad test.\n✋ Please STOP interacting — starting in about ${secs} seconds…'"
@@ -212,7 +398,7 @@ case "$1" in
     # initial `start`, so no grace period is needed. Re-verifies the vault AND
     # re-claims/refreshes the lock (aborts if another chat grabbed it meanwhile).
     verify || exit 1
-    out="$(claim 'ensure')"
+    out="$(claim_tagged 'ensure')"
     abort_if_held "$out"
     show "'🤖 Claude is TESTING Stashpad now.\n✋ Please don\\'t touch until you see the all-clear.'"
     echo "guard: lock refreshed, banner ensured (instant)"
@@ -221,7 +407,7 @@ case "$1" in
     # Force-claim a lock you're CERTAIN is stale (the holding chat crashed or was
     # abandoned and you don't want to wait out the TTL). Overwrites ownership.
     verify || exit 1
-    "$OBS" eval code="(() => {
+    drive "(() => {
       const now = Date.now();
       window.__claudeVaultLock = { owner: '$OWNER', label: 'steal', startedAt: now, expiresAt: now + ${LOCK_TTL} * 1000 };
       return 'stolen';
@@ -231,11 +417,15 @@ case "$1" in
     ;;
   end)
     rel="$(release)"
+    # Report accurately: a foreign lock is deliberately left in place, so don't
+    # then claim it was "released".
+    released=yes
     case "$rel" in
       *'"cleared":false'*)
-        echo "guard: NOTE — the lock is held by another session; left it alone (only cleared the banner)." >&2 ;;
+        released=no
+        echo "guard: NOTE — the lock is held by another session; left it alone (only clearing the banner)." >&2 ;;
     esac
-    "$OBS" eval code="(() => {
+    drive "(() => {
       if (window.__claudeTestBanner && typeof window.__claudeTestBanner.hide === 'function') {
         try { window.__claudeTestBanner.hide(); } catch (e) {}
       }
@@ -243,7 +433,11 @@ case "$1" in
       new Notice('✅ Safe to use Stashpad again — Claude has finished testing.', 0);
       return 'cleared';
     })()" >/dev/null 2>&1
-    echo "guard: lock released, banner cleared, all-clear shown"
+    if [ "$released" = yes ]; then
+      echo "guard: lock released, banner cleared, all-clear shown"
+    else
+      echo "guard: banner cleared + all-clear shown; another session's lock left intact"
+    fi
     ;;
   note)
     [ -n "$2" ] || { echo "usage: obs-test-guard note 'message'" >&2; exit 1; }

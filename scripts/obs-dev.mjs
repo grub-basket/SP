@@ -27,14 +27,25 @@ const REPO = resolve(HERE, "..");
 // 0.201.x: SLOT support — `OBS_DEV_SLOT=b obs-dev …` drives a SECOND isolated
 // instance (own port + user-data-dir) pinned to "Claude Dev Vault B", for
 // cross-vault feature testing. Default slot is the original Claude Dev Vault.
-const SLOT_B = process.env.OBS_DEV_SLOT === "b";
-const PORT = SLOT_B ? 9223 : 9222;
+// 0.208.2: slots are a TABLE, not a chain of ternaries. Slot C exists to test
+// the FIRST-RUN experience, which needs a vault with zero Stashpad folders —
+// A and B both have content, so neither can ever exercise the welcome gate.
+// Keep C empty of Stashpad folders or it stops being useful for that.
+const SLOTS = {
+  a: { port: 9222, vault: "Claude Dev Vault",   sentinelFile: "CLAUDE-DEV-VAULT-SENTINEL.md",   sentinel: "claude-dev-vault-7f3a9c2e-do-not-delete",   userDataDir: "obsidian-claude-dev" },
+  b: { port: 9223, vault: "Claude Dev Vault B", sentinelFile: "CLAUDE-DEV-VAULT-B-SENTINEL.md", sentinel: "claude-dev-vault-b-4e8d1f6a-do-not-delete", userDataDir: "obsidian-claude-dev-b" },
+  c: { port: 9224, vault: "Claude Dev Vault C", sentinelFile: "CLAUDE-DEV-VAULT-C-SENTINEL.md", sentinel: "claude-dev-vault-c-9b2e5d31-do-not-delete", userDataDir: "obsidian-claude-dev-c" },
+};
+const SLOT = (process.env.OBS_DEV_SLOT || "a").toLowerCase();
+const CFG = SLOTS[SLOT];
+if (!CFG) { console.error(`unknown OBS_DEV_SLOT="${SLOT}" (expected one of: ${Object.keys(SLOTS).join(", ")})`); process.exit(1); }
+const PORT = CFG.port;
 const OBSIDIAN_BIN = "/Applications/Obsidian.app/Contents/MacOS/Obsidian";
-const VAULT_NAME = SLOT_B ? "Claude Dev Vault B" : "Claude Dev Vault";
+const VAULT_NAME = CFG.vault;
 const VAULT = resolve(REPO, "..", VAULT_NAME);
-const SENTINEL_FILE = SLOT_B ? "CLAUDE-DEV-VAULT-B-SENTINEL.md" : "CLAUDE-DEV-VAULT-SENTINEL.md";
-const SENTINEL = SLOT_B ? "claude-dev-vault-b-4e8d1f6a-do-not-delete" : "claude-dev-vault-7f3a9c2e-do-not-delete";
-const USER_DATA_DIR = join(process.env.HOME, "Library", "Application Support", SLOT_B ? "obsidian-claude-dev-b" : "obsidian-claude-dev");
+const SENTINEL_FILE = CFG.sentinelFile;
+const SENTINEL = CFG.sentinel;
+const USER_DATA_DIR = join(process.env.HOME, "Library", "Application Support", CFG.userDataDir);
 
 const cmd = process.argv[2];
 const arg = process.argv[3];
@@ -201,9 +212,23 @@ async function ensureStashpad() {
 function stop() {
   try {
     // user-data-dir is the LAST spawn arg, so $-anchoring distinguishes slot A from B.
-    execSync(SLOT_B ? `pkill -f "obsidian-claude-dev-b$"` : `pkill -f "obsidian-claude-dev$"`);
+    execSync(`pkill -f "${CFG.userDataDir}$"`);
     console.log("stopped the dev instance.");
   } catch { console.log("no dev instance was running."); }
+}
+
+/** Bring the instance's window to the front and un-hide its renderer.
+ *  Matters for more than convenience: an occluded Obsidian window reports
+ *  document.visibilityState === "hidden", and Chromium then THROTTLES timers in
+ *  that renderer. Anything under test that depends on a setTimeout (e.g. the
+ *  first-run welcome's settle delay) fires late or not at all while hidden, which
+ *  reads as a plugin bug when it is really a background-tab artifact. Call this
+ *  before timing-sensitive checks. */
+async function focus() {
+  await verifyVault();
+  await cdp("Page.bringToFront", {});
+  const state = await evalExpr('document.visibilityState');
+  console.log(`focused — visibilityState now ${state}`);
 }
 
 async function screenshot(path) {
@@ -252,6 +277,7 @@ try {
     case "eval": { await verifyVault(); console.log(await evalExpr(arg ?? "")); break; }
     case "eval-file": { await verifyVault(); console.log(await evalExpr(readFileSync(arg, "utf8"))); break; }
     case "reload": await reload(); break;
+    case "focus": await focus(); break;
     case "screenshot": await screenshot(arg); break;
     case "stop": stop(); break;
     default:

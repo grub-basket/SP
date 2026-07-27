@@ -1,5 +1,5 @@
 import type { App } from "obsidian";
-import { ROOT_ID } from "./types";
+import { ROOT_ID, STASHPAD_SIDECAR_FILES } from "./types";
 
 /** 0.206.0: per-folder structure snapshot — a recovery sidecar.
  *
@@ -47,9 +47,9 @@ import { ROOT_ID } from "./types";
  *  Dotfile (like `.stashpad-order.json`) so it stays out of the note list and
  *  out of Obsidian's file index; read/written through `vault.adapter`. */
 
-const SNAPSHOT_FILE = ".stashpad-structure.json";
+const SNAPSHOT_FILE = STASHPAD_SIDECAR_FILES[2]; // see types.ts
 /** One rotated generation, in case a bug ever defeats the retention rule. */
-const PREV_FILE = ".stashpad-structure.prev.json";
+const PREV_FILE = STASHPAD_SIDECAR_FILES[3];
 /** Bump when the shape changes incompatibly; a mismatch is discarded. */
 const SCHEMA = 1;
 

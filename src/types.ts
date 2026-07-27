@@ -126,6 +126,34 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
 
 /** Reserved Stashpad subfolder names (machine-managed; not user notes).
  *  Centralised so search/link/folder surfaces filter them consistently. */
+/** 0.207.1: every PER-FOLDER sidecar file Stashpad writes beside a folder's
+ *  notes. All are dotfiles, which means Obsidian's vault index cannot see them
+ *  (`getAbstractFileByPath` returns null, and they never appear in
+ *  `folder.children`) — they're read and written through `vault.adapter`.
+ *
+ *  This list is the CANONICAL one, and it exists because that invisibility has
+ *  already cost a sibling plugin three separate investigations: its folder
+ *  converter couldn't see the order file, then couldn't see the structure file.
+ *  Anything that walks, copies, backs up or converts a Stashpad folder needs
+ *  this set, and reverse-engineering it from scattered string literals is how
+ *  you miss one. (`.stashpad-sort.json` is exactly the one you'd miss.)
+ *
+ *  ADDING A NEW SIDECAR? Add it here, and say so in
+ *  `docs/interop-trynalist.md` — a sibling plugin mirrors this list, and a
+ *  missed entry surfaces as silent data weirdness, not an error. */
+export const STASHPAD_SIDECAR_FILES: readonly string[] = [
+  ".stashpad-order.json",        // manual sibling order        (order-store.ts)
+  ".stashpad-sort.json",         // per-parent sort mode        (sort-store.ts)
+  ".stashpad-structure.json",    // recovery snapshot           (structure-snapshot.ts)
+  ".stashpad-structure.prev.json", // rotated previous generation
+] as const;
+
+/** True when `path` names one of Stashpad's per-folder sidecars. */
+export function isStashpadSidecar(path: string): boolean {
+  const name = path.split("/").pop() ?? path;
+  return STASHPAD_SIDECAR_FILES.includes(name);
+}
+
 export const RESERVED_SUBFOLDER_NAMES: ReadonlySet<string> = new Set([
   "_attachments", "_authors", "_exports", "_imports", "_processed",
   "_archive", ".archive", // .archive is legacy (pre-0.79.10)

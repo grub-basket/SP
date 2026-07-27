@@ -15,6 +15,8 @@ import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-vie
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT } from "./encryption-ops";
 import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState } from "./modals";
+import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
+import { seedDemoContent } from "./demo-content";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
@@ -321,6 +323,13 @@ export default class StashpadPlugin extends Plugin {
   async createNewStashpad(folder: string): Promise<void> {
     const cleaned = folder.trim().replace(/^\/+|\/+$/g, "");
     if (!cleaned) throw new Error("Folder name is empty");
+    // Reject "." / ".." segments before any mkdir. Paths here are joined against
+    // the vault root, and 0.208.0 wired this to a free-text field in the
+    // first-run welcome, so the traversal invariant now has a user-facing entry
+    // point. Fail loud instead of sanitizing (same rule as the .stash importer).
+    if (cleaned.split("/").some((p) => p === "." || p === "..")) {
+      throw new Error(`Folder name can't contain "." or ".." path segments`);
+    }
     const adapter = this.app.vault.adapter;
     // mkdir intermediates.
     const parts = cleaned.split("/").filter(Boolean);
@@ -935,6 +944,49 @@ export default class StashpadPlugin extends Plugin {
    *  Use this for EVERY note-creation site instead of bare newId(). Amortized
    *  O(1) — the used-id set is built once (lazily) and maintained by the
    *  metadataCache handler in onload. */
+  /** Record that the user has seen (and answered) the first-run welcome, so it
+   *  never asks twice. "later" counts as an answer — see WelcomeModal.onClose.
+   *  Reopenable any time from Settings → Help & Getting started. */
+  async markOnboardingAnswered(choice: OnboardingChoice): Promise<void> {
+    this.settings.onboardingAnswered = true;
+    this.settings.onboardingChoice = choice;
+    await this.saveSettings();
+  }
+
+  /** Remember the folder the user is currently working in. Cheap and idempotent:
+   *  returns immediately when nothing changed, so the active-leaf-change firehose
+   *  doesn't write settings on every tab switch. */
+  recordFolderUsed(folder: string): void {
+    const cleaned = (folder || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!cleaned || this.settings.lastUsedFolder === cleaned) return;
+    this.settings.lastUsedFolder = cleaned;
+    void this.saveSettings();
+  }
+
+  /** Open the first-run welcome on demand (command palette / settings button),
+   *  regardless of whether it has already been answered. */
+  showWelcome(): void {
+    new WelcomeModal(this.app, this).open();
+  }
+
+  /** Seed the example content into a fresh folder and open it. Used by the
+   *  command palette and the empty-state button. Picks a free folder name
+   *  rather than merging into an existing Stashpad — the demo is meant to be
+   *  explored and thrown away, not mixed into someone's real notes. */
+  async createDemoStashpad(): Promise<void> {
+    const base = `${DEFAULT_STASHPAD_FOLDER} demo`;
+    let folder = base;
+    for (let i = 2; await this.app.vault.adapter.exists(folder); i++) folder = `${base} ${i}`;
+    try {
+      const { created } = await seedDemoContent(this.app, this, folder);
+      new Notice(`Stashpad: created "${folder}" with ${created} example notes.`, 8000);
+      await this.openFolderInStashpad(folder);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      new Notice(`Stashpad: couldn't create the demo — ${msg}`, 0);
+    }
+  }
+
   mintNoteId(): string {
     if (this.usedNoteIds === null) this.rebuildUsedNoteIds();
     const set = this.usedNoteIds!;
@@ -1046,6 +1098,15 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (f) => { if (f.path.endsWith(".stashenc")) this.pendingEncBlobs.delete(f.path); }));
     this.registerEvent(this.app.vault.on("delete", (f) => { if (f.path.endsWith(".stashenc")) this.pendingEncBlobs.delete(f.path); }));
     this.app.workspace.onLayoutReady(() => {
+      // First-run welcome. MUST wait for layout-ready + a settle delay: the
+      // gate counts existing Stashpad folders, and discoverStashpadFolders()
+      // reads frontmatter from the metadata cache, which isn't populated yet
+      // during onload. Asking too early would report zero folders for an
+      // existing user and greet them as if they were new.
+      window.setTimeout(() => {
+        if (!shouldShowWelcome(this)) return;
+        new WelcomeModal(this.app, this).open();
+      }, 2500);
       // Vault is fully indexed now — safe to reconcile locked placeholders
       // (drop entries whose blob is truly gone, add cross-device blobs).
       void this.reconcileLockedRegistry();
@@ -1151,6 +1212,16 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
       if (leaf && leaf.view.getViewType() === STASHPAD_VIEW_TYPE) {
         this.lastActiveStashpadLeaf = leaf;
+        // 0.208.2: remember the folder you were last actually looking at, so the
+        // folder switcher can rank it first. Hooked here rather than at the
+        // open() call sites because this fires for EVERY way a folder becomes
+        // current — picker, ribbon, deep link, or a tab restored at startup.
+        //
+        // Deferred a tick on purpose: for a NEWLY opened view this event fires
+        // before the view's own onOpen/loadConfig has established noteFolder, so
+        // reading it synchronously yields "" and the folder is never recorded.
+        // (Caught in testing — lastUsedFolder stayed empty with a view open.)
+        setTimeout(() => this.recordFolderUsed(((leaf.view as any)?.noteFolder ?? "").trim()), 0);
         // 0.74.1: auto-open the right-sidebar detail panel when the
         // user enters a Stashpad view, if the setting is on AND the
         // panel isn't already open. Defer one tick so the leaf is
@@ -1327,21 +1398,27 @@ export default class StashpadPlugin extends Plugin {
     setTimeout(refreshGeometry, 250);
     setTimeout(refreshGeometry, 1000);
 
-    // 0.62.0: ribbon click ALWAYS shows the folder/leaf menu. Earlier
-    // behaviour (0 or 1 leaves → silently open/reveal; 2+ → menu) was
-    // confusing — users with multiple Stashpad folders couldn't reach
-    // the picker without right-clicking, and the leaves-count heuristic
-    // wasn't discoverable. Now: click → menu listing every Stashpad
-    // folder; picking one reveals its tab if open, else opens a new
-    // tab on it. Empty case (no folders discovered yet) falls through
-    // to creating the default Stashpad.
-    const ribbon = this.addRibbonIcon("list-tree", "Open Stashpad", () => {
+    // 0.208.2: ONE folder-count rule, shared by the ribbon and the open command.
+    // They used to disagree — the ribbon showed the picker at >=1 folder while
+    // the command only showed it at >=2 — so at exactly one folder the ribbon
+    // popped a picker containing a single entry (a modal to choose between one
+    // option) while the command just opened it. The fresh-install click was also
+    // the only ribbon click that behaved differently from every later one.
+    //
+    // The rule now, everywhere: 0 → welcome (never silently create), 1 → open it,
+    // 2+ → picker. The picker is deliberately kept for 2+ rather than auto-opening
+    // the last-used folder, so nothing is opened or converted without being asked;
+    // last-used is merely ranked first inside it.
+    const openStashpadEntryPoint = (): void => {
       const folders = this.discoverStashpadFolders();
-      if (folders.length === 0) {
-        void this.activateView({ reveal: true });
-        return;
-      }
+      if (folders.length === 0) { this.showWelcome(); return; }
+      if (folders.length === 1) { void this.openFolderInStashpad(folders[0]); return; }
       this.openFolderPicker();
+    };
+    // Icon: stacked rectangles, reading as a pile of notes. "list-tree" implied a
+    // file-tree, which is the one thing Stashpad's view is not.
+    const ribbon = this.addRibbonIcon("square-stack", "Open Stashpad", () => {
+      openStashpadEntryPoint();
     });
     ribbon.addEventListener("contextmenu", (evt) => {
       evt.preventDefault();
@@ -1365,21 +1442,25 @@ export default class StashpadPlugin extends Plugin {
       void openStashpadDetailView(this.app);
     });
 
-    // 0.62.3: same smarts as the ribbon icon — if there's more than one
-    // Stashpad folder, show the picker instead of silently defaulting
-    // to the plugin's configured folder. Single-folder vaults still
-    // get the direct "open" behaviour they had before.
+    // Shares openStashpadEntryPoint with the ribbon (0.208.2) so the two can't
+    // drift apart again.
     this.addCommand({
       id: "stashpad-open",
       name: "Open Stashpad in new tab",
-      callback: () => {
-        const folders = this.discoverStashpadFolders();
-        if (folders.length >= 2) {
-          this.openFolderPicker();
-          return;
-        }
-        void this.activateView({ reveal: false });
-      },
+      callback: () => { openStashpadEntryPoint(); },
+    });
+    // Onboarding, reachable forever — not just on first run. Named with the
+    // words someone actually types when they're lost ("getting started",
+    // "welcome", "setup") so fuzzy search finds it.
+    this.addCommand({
+      id: "stashpad-welcome",
+      name: "Getting started (welcome / setup)",
+      callback: () => this.showWelcome(),
+    });
+    this.addCommand({
+      id: "stashpad-create-demo",
+      name: "Create example (demo) content in a new Stashpad",
+      callback: () => { void this.createDemoStashpad(); },
     });
     this.addCommand({
       id: "stashpad-reveal",
@@ -3383,7 +3464,14 @@ export default class StashpadPlugin extends Plugin {
     };
 
     const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
-    const stashpadFolders = this.discoverStashpadFolders();
+    // 0.208.2: rank the folder you were last in FIRST. Discovery returns
+    // alphabetical order, which is stable but means the folder you actually
+    // work in sits wherever its name happens to fall. Only the ordering
+    // changes — every folder is still listed, and typing still filters.
+    const lastUsed = (this.settings.lastUsedFolder || "").trim();
+    const stashpadFolders = this.discoverStashpadFolders()
+      .slice()
+      .sort((a, b) => (a === lastUsed ? -1 : b === lastUsed ? 1 : 0));
     const activeView = getActiveView();
     const activeFolder = activeView ? ((activeView).noteFolder ?? "").trim().replace(/^\/+|\/+$/g, "") : "";
 
@@ -3444,6 +3532,20 @@ export default class StashpadPlugin extends Plugin {
     for (const folder of stashpadFolders.filter((f) => !seenOpen.has(f))) {
       const label = folder.split("/").pop() || folder;
       baseItems.push({ kind: "open", folder, label: `Open "${label}" in new tab`, icon: this.isArchiveFolder(folder) ? "archive" : "layout-template" });
+    }
+
+    // 0.208.2: float EVERY entry for the last-used folder to the top. Sorting the
+    // discovered-folder list alone wasn't enough: folders with an open tab enter
+    // the list as "reveal" items built from workspace order, so a last-used
+    // folder that happened to be open still sank below an alphabetically-earlier
+    // one. Sorting here catches both kinds. Array.prototype.sort is stable, so
+    // the relative order of everything else is untouched.
+    if (lastUsed) {
+      baseItems.sort((a, b) => {
+        const av = (a as { folder?: string }).folder === lastUsed ? 0 : 1;
+        const bv = (b as { folder?: string }).folder === lastUsed ? 0 : 1;
+        return av - bv;
+      });
     }
 
     // 0.118.3: optionally surface pinned notes so the switcher can jump

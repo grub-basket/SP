@@ -3,3 +3,8 @@ node_modules/
 data.json
 .deploy-target
 *.log
+
+# Dev-harness state — never belongs in the public mirror. Previously this was
+# only kept out by the global gitignore, which does not travel with the repo.
+.claude/
+CLAUDE.md

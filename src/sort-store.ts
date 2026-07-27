@@ -1,5 +1,5 @@
 import type { App } from "obsidian";
-import type { StashpadId } from "./types";
+import { STASHPAD_SIDECAR_FILES, type StashpadId } from "./types";
 
 /** Per-folder sort-mode store. Mirrors the OrderStore pattern: maintains a
  *  `{ parentId: SortMode }` map in `<folder>/.stashpad-sort.json`, loaded
@@ -41,7 +41,7 @@ export const SORT_MODES_ORDER: SortMode[] = [
 
 const VALID_MODES = new Set<string>(SORT_MODES_ORDER);
 
-const SORT_FILE = ".stashpad-sort.json";
+const SORT_FILE = STASHPAD_SIDECAR_FILES[1]; // see types.ts
 
 export class SortStore {
   /** folder -> { parentId -> SortMode } (excluding "manual" entries) */

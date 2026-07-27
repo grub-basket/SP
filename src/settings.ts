@@ -221,6 +221,15 @@ export interface FolderEncPrefs {
 
 export interface StashpadSettings {
   folder: string;
+  /** True once the first-run welcome has been answered (including "Set up
+   *  later" and dismissing it). Gates the modal so it asks exactly once —
+   *  the other gate is "you have zero Stashpad folders". */
+  onboardingAnswered: boolean;
+  /** What they picked, for diagnostics only — nothing branches on it. */
+  onboardingChoice: "later" | "fresh" | "demo" | null;
+  /** The Stashpad folder most recently viewed. Ranked first in the folder
+   *  switcher so the common "back to what I was doing" case is one keystroke. */
+  lastUsedFolder: string;
   importDropFolder: string;
   exportFolder: string;
   /** 0.79.1: auto-import files dropped directly into a Stashpad folder
@@ -538,6 +547,8 @@ export interface StashpadSettings {
   /** 0.199.2: composer/edit textareas auto-close `[[` with `]]` and type-over
    *  an existing closing bracket. On by default. */
   autoPairBrackets: boolean;
+  /** 0.207.0: line-number gutter beside the edit/split editor (desktop). */
+  showEditorLineNumbers: boolean;
   /** 0.73.14: when on, the row under the keyboard cursor temporarily
    *  un-clamps its body — showing the full content as the user
    *  arrow-keys through the list. Moving the cursor away re-collapses
@@ -632,6 +643,9 @@ export interface StashpadSettings {
 
 export const DEFAULT_SETTINGS: StashpadSettings = {
   folder: "Stashpad",
+  onboardingAnswered: false,
+  onboardingChoice: null,
+  lastUsedFolder: "",
   importDropFolder: "",
   exportFolder: "_exports",
   autoImport: false,
@@ -713,6 +727,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   openParentTabOnMoveIn: true,
   newTabsInBackground: false,
   autoPairBrackets: true,
+  showEditorLineNumbers: true,
   autoNavOnMoveOut: false,
   autoExpandCursorRow: false,
   expandBodiesByDefault: false,
@@ -766,9 +781,14 @@ export function getTemplatesFormats(app: App): { dateFormat: string; timeFormat:
 export type SettingsTabId =
   | "foldersStorage" | "importExport" | "datesTime" | "behaviors"
   | "notifications" | "encryption" | "authorship" | "templates"
-  | "organizationSystems" | "maintenance" | "diagnostics" | "hotkeys";
+  | "organizationSystems" | "maintenance" | "diagnostics" | "hotkeys"
+  | "help";
 export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = ([
   { id: "foldersStorage", label: "📁 Folders & Storage" },
+  // Every plugin should answer "what does this do and how do I use it" without
+  // the user leaving Obsidian. Stashpad had no such section at all until
+  // 0.208.0 — no feature list, no command list, no version, no links.
+  { id: "help",           label: "❓ Help & Getting started" },
   { id: "importExport",   label: "🔄 Import & Export" },
   { id: "datesTime",      label: "🕒 Dates & Time" },
   // 0.121.9: the six toggle-only sections (List & Display, Moving Notes,
@@ -896,6 +916,7 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  decomposed (those still render imperatively). */
   private itemsForTab(tab: SettingsTabId): SettingDefinitionItem[] | null {
     switch (tab) {
+      case "help": return this.helpItems();
       case "hotkeys": return this.hotkeyItems();
       case "diagnostics": return this.diagnosticsItems();
       case "notifications": return this.notificationsItems();
@@ -945,6 +966,102 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
 
   // ---------- Tabs ----------
+
+  /** Help & Getting started (0.208.0).
+   *
+   *  Answers "what is this / how do I start / what can it do" in-app. Derived
+   *  from source wherever possible — the command list comes from COMMAND_META
+   *  and the version from manifest.json — so it can't silently drift as
+   *  features land. When you add a command or a known issue elsewhere, it
+   *  shows up (or should be added) here in the same change. */
+  private helpItems(): SettingDefinitionItem[] {
+    const items: SettingDefinitionItem[] = [];
+
+    items.push(this.sectionDef("What Stashpad is", "", (host) => {
+      host.createEl("p", {
+        text:
+          "Stashpad turns a folder in your vault into a chat-style outliner: type a line, it becomes " +
+          "a note; nest notes under each other to build a tree you can drill into.",
+      });
+      // This definition used to exist ONLY inside the Cross-Stashpad Search
+      // Scope section, and only while you had zero Stashpads — i.e. it vanished
+      // exactly when someone might come looking for it. It belongs here.
+      host.createEl("p", {
+        text:
+          "A \"Stashpad\" is just a folder that contains a Stashpad-shaped note — one whose frontmatter " +
+          "has both an `id` and a `parent`. There's no database and no registry: the notes are ordinary " +
+          "markdown, and a folder stops being a Stashpad when those notes are gone. You can have as many " +
+          "as you like.",
+      });
+    }, ["what", "intro", "getting started", "concept", "explain"]));
+
+    items.push(this.renderDef(
+      "Getting started",
+      "Reopen the welcome walkthrough — name a folder, start fresh, or load example content.",
+      (s) => s.addButton((b) => b.setButtonText("Open welcome").onClick(() => this.plugin.showWelcome())),
+      ["welcome", "onboarding", "tutorial", "start", "help"],
+    ));
+
+    items.push(this.renderDef(
+      "Example content",
+      "Create a new folder of realistic example notes (a trip, a reading list, a few tasks) to see how nesting works. They're normal notes — delete them whenever.",
+      (s) => s.addButton((b) => b.setButtonText("Create demo Stashpad").onClick(() => { void this.plugin.createDemoStashpad(); })),
+      ["demo", "example", "sample", "try"],
+    ));
+
+    items.push(this.headingDef("✨ Features"));
+    items.push(this.sectionDef("", "", (host) => {
+      const ul = host.createEl("ul");
+      for (const line of [
+        "Chat-style composer — type a line, press Enter, it's a note.",
+        "Nesting without limits: drill into any note and add notes under it.",
+        "Tasks with due dates and reminders (start a line with []).",
+        "Move, merge, clone, and reorder notes from the keyboard.",
+        "Per-folder colors, filters, and saved sort orders.",
+        "Import from and export to plain markdown, plus a portable .stash bundle.",
+        "Optional per-folder encryption for notes you'd rather not leave in plaintext.",
+        "Sidebar panels: folders, a detail pane, and aggregate archive/trash views.",
+      ]) ul.createEl("li", { text: line });
+    }, ["features", "what can it do"]));
+
+    items.push(this.headingDef("⌨️ Commands"));
+    items.push(this.sectionDef("", "", (host) => {
+      host.createEl("p", {
+        cls: "setting-item-description",
+        text:
+          "Every command below is in the command palette (search \"Stashpad\") and can be given a hotkey " +
+          "in the Hotkeys tab. The chord shown is Stashpad's own in-view default.",
+      });
+      const ul = host.createEl("ul");
+      for (const m of COMMAND_META) {
+        const li = ul.createEl("li");
+        li.createSpan({ text: m.label });
+        if (m.defaultPrimary) li.createEl("code", { text: ` ${m.defaultPrimary}` });
+        li.createSpan({ cls: "stashpad-help-cmd-desc", text: ` — ${m.desc}` });
+      }
+    }, ["commands", "hotkeys", "shortcuts", "keyboard"]));
+
+    items.push(this.headingDef("⚠️ Known limitations"));
+    items.push(this.sectionDef("", "", (host) => {
+      const ul = host.createEl("ul");
+      for (const line of [
+        "Requires Obsidian 1.13.0 or newer.",
+        "Very large folders (many thousands of notes in one Stashpad) can be slow to first paint; the render cache warms after the first visit.",
+        "Encryption protects note contents at rest in your vault — it is not a substitute for full-disk encryption or a password manager.",
+        "Mobile supports the core outliner, but some desktop-only affordances (drag-to-reorder, pop-out windows) differ or are unavailable.",
+      ]) ul.createEl("li", { text: line });
+    }, ["limitations", "known issues", "bugs", "caveats"]));
+
+    items.push(this.headingDef("ℹ️ About"));
+    items.push(this.sectionDef("", "", (host) => {
+      const version = this.plugin.manifest?.version ?? "unknown";
+      host.createEl("p", { text: `Stashpad v${version}` });
+      const p = host.createEl("p");
+      p.createEl("a", { text: "Source, issues & changelog on GitHub", href: "https://github.com/grub-basket/SP" });
+    }, ["about", "version", "github", "issues", "support", "changelog"]));
+
+    return items;
+  }
 
   /** Diagnostics tab: log + notification controls. Lifted verbatim
    *  from the pre-0.73.1 Log section. Inventory items A1–A4. */
@@ -1583,8 +1700,13 @@ export class StashpadSettingTab extends PluginSettingTab {
         .setName("Cross-Stashpad Search Scope")
         .setDesc("Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations — their notes just don't appear in search results from elsewhere.");
       if (folders.length === 0) {
+        // The full "what is a Stashpad" explanation now lives in the Help &
+        // Getting started tab, where someone looking for it can actually find
+        // it — it used to exist ONLY here, in a section about search scope, and
+        // disappeared the moment the user had one folder. Keep this short and
+        // point at the real thing.
         host.createEl("p", { cls: "setting-item-description" }).setText(
-          "No Stashpads found in this vault yet. A Stashpad is just a folder that contains a Stashpad-shaped note (frontmatter has both `id` and `parent`). Easiest way: open Stashpad (ribbon icon or command \"Reveal or open Stashpad\") — it auto-creates the default folder on first use. Or create one below.",
+          "No Stashpads found in this vault yet. See the “Help & Getting started” tab for what a Stashpad is and how to make your first one — or create one below.",
         );
       } else {
         const list = host.createDiv({ cls: "stashpad-folder-list" });
@@ -1655,6 +1777,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.foldersAlwaysNewTab, (v) => { this.plugin.settings.foldersAlwaysNewTab = v; }, ["folder", "new tab", "reveal", "open", "panel"]));
     cats.windowsTabs.push(toggle("New tabs open in the background", "When Stashpad opens something in a new tab — a folder, a note, an attachment, a reminder's task, an aggregate/tasks/trash view — the tab opens WITHOUT stealing focus; you stay where you are and switch when ready. Off by default (new tabs come to the front).",
       () => this.plugin.settings.newTabsInBackground, (v) => { this.plugin.settings.newTabsInBackground = v; }, ["background", "tab", "focus", "steal", "new"]));
+    cats.composerCopy.push(toggle("Line numbers in the editor", "Show a line-number gutter beside the edit/split editor, and a line count alongside the word and character counts. Desktop only — on a phone the gutter costs width the editor needs more. On by default.",
+      () => this.plugin.settings.showEditorLineNumbers, (v) => { this.plugin.settings.showEditorLineNumbers = v; }, ["line", "number", "gutter", "editor", "count"]));
     cats.composerCopy.push(toggle("Auto-pair Markdown syntax", "Brackets, parentheses, quotes (double + single, at word starts only — apostrophes are safe), inline code, **bold**, ~~strikethrough~~ and ==highlight== markers auto-close with the caret between them. Select text first and the character WRAPS it instead of replacing it (press again to nest: [note] → [[note]], *word* → **word**). Typing the closing character steps over an existing one, and Backspace on an empty pair removes both. Applies to the composer and the edit/split textareas. On by default.",
       () => this.plugin.settings.autoPairBrackets, (v) => { this.plugin.settings.autoPairBrackets = v; }, ["bracket", "autopair", "wikilink", "close", "complete"]));
     cats.composerCopy.push(toggle("Prefix timestamps when copying", "Include each note's timestamp before its body when copying with C or Y.",
