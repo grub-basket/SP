@@ -1,4 +1,5 @@
-import type { App, TFile } from "obsidian";
+import { TFile } from "obsidian";
+import type { App } from "obsidian";
 import { splitFrontmatter } from "./stash-package";
 import { okfTitleFromFile, buildOkfIndex, OKF_LEGEND } from "./okf";
 
@@ -55,7 +56,13 @@ export async function buildOkfBundleFiles(
     // Collect referenced attachments (resolved against this note's path).
     for (const ref of raw.match(/!\[\[([^\]]+?)\]\]/g) ?? []) {
       const inner = ref.slice(3, -2).split("|")[0].split("#")[0].trim();
-      const af = app.metadataCache.getFirstLinkpathDest(inner, f.path);
+      // 0.209.0: same defensive fallback as the .stash exporter — see the longer
+      // note there. Measured, getFirstLinkpathDest already handles full paths;
+      // this only covers a not-yet-indexed file.
+      // Narrow: getAbstractFileByPath can return a folder.
+      const byPath = app.vault.getAbstractFileByPath(inner);
+      const af = app.metadataCache.getFirstLinkpathDest(inner, f.path)
+        ?? (byPath instanceof TFile ? byPath : null);
       if (af && !attachments.has(af.name)) attachments.set(af.name, af);
     }
   }

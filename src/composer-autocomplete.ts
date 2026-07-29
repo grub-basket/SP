@@ -33,6 +33,39 @@ import { MarkdownInput, type MarkdownInputOptions } from "./markdown-input";
  * require a hidden mirror element); textarea-bottom anchoring is good
  * enough for a small composer.
  */
+/** Obsidian's frontmatter aliases for a note, normalized.
+ *
+ *  Accepts both `aliases` and the legacy singular `alias`, and both a bare string
+ *  and a list — all four shapes appear in real vaults. Returns de-duplicated,
+ *  trimmed, non-empty strings; anything else (numbers, nested objects) is ignored
+ *  rather than coerced, since a junk alias would pollute the link autocomplete.
+ */
+/** One row of the link-autocomplete index: either a file (by name) or one of its
+ *  frontmatter aliases. `alias` set = this row matched by alias, which changes
+ *  what gets inserted. */
+interface FileIndexEntry {
+  label: string;
+  lower: string;
+  insertText: string;
+  file: TFile;
+  alias?: string;
+}
+
+function frontmatterAliases(app: App, file: TFile): string[] {
+  const fm = app.metadataCache.getFileCache(file)?.frontmatter as Record<string, unknown> | undefined;
+  if (!fm) return [];
+  const out: string[] = [];
+  for (const key of ["aliases", "alias"]) {
+    const raw = fm[key];
+    if (typeof raw === "string") out.push(raw);
+    else if (Array.isArray(raw)) for (const v of raw) if (typeof v === "string") out.push(v);
+  }
+  const seen = new Set<string>();
+  return out
+    .map((a) => a.trim())
+    .filter((a) => a && !seen.has(a.toLowerCase()) && seen.add(a.toLowerCase()));
+}
+
 export class ComposerAutocomplete {
   private popupEl: HTMLDivElement | null = null;
   private items: SuggestItem[] = [];
@@ -47,7 +80,7 @@ export class ComposerAutocomplete {
    *  link autocomplete surfaces images, PDFs, attachments, etc. — not
    *  just markdown. `.edtz` files (Encrypted Templater) stay excluded
    *  because they're internal-tooling files users never link to. */
-  private fileIndex: { label: string; lower: string; insertText: string; file: TFile }[] = [];
+  private fileIndex: FileIndexEntry[] = [];
   private tagIndex: string[] = [];
   private indexBuilt = false;
   private vaultListeners: Array<() => void> = [];
@@ -139,11 +172,23 @@ export class ComposerAutocomplete {
       .filter((f) => !isArchivedPath(f.path)
         && !isIgnoredFileExtension(f.path)
         && !(inherit && matchesObsidianIgnore(f.path, ignoreFilters)))
-      .map((f) => {
+      .flatMap((f) => {
         const isMd = f.extension === "md";
         const label = isMd ? f.basename : f.name;
         const insertText = isMd ? f.basename : f.name;
-        return { label, lower: label.toLowerCase(), insertText, file: f };
+        const entries: FileIndexEntry[] = [{ label, lower: label.toLowerCase(), insertText, file: f }];
+        // 0.209.0: index Obsidian's frontmatter aliases too, so a note filed as
+        // "Architecture Decision 7" is reachable by typing "ADR-7". Each alias is
+        // its OWN suggestion (same as Obsidian's own link autocomplete) rather
+        // than being folded into the note's haystack, so the list shows which
+        // name actually matched. Accepting one inserts [[Real Name|Alias]] — the
+        // link resolves by the real name while reading as the alias.
+        if (isMd) {
+          for (const a of frontmatterAliases(this.app, f)) {
+            entries.push({ label: a, lower: a.toLowerCase(), insertText, file: f, alias: a });
+          }
+        }
+        return entries;
       });
     const tagsRecord = (this.app.metadataCache as any).getTags?.() ?? {};
     this.tagIndex = Object.keys(tagsRecord).sort((a, b) =>
@@ -184,9 +229,17 @@ export class ComposerAutocomplete {
           inLink: true,
         };
       }
+      // 0.209.0: split on the FIRST pipe so `[[target|alias` searches on the
+      // target and keeps the alias. Without this the whole string went into the
+      // matcher, no note contains a "|", and typing an alias link killed the
+      // suggestions at the moment you pressed `|`.
+      const pipeIdx = query.indexOf("|");
       return {
         kind: "link",
-        query,
+        query: pipeIdx >= 0 ? query.slice(0, pipeIdx) : query,
+        // null = user never typed a pipe; "" = typed it but hasn't typed the
+        // alias yet. The two insert differently, so they can't be collapsed.
+        aliasPart: pipeIdx >= 0 ? query.slice(pipeIdx + 1) : null,
         replaceStart: caret - query.length - 2,
         replaceEnd,
       };
@@ -292,10 +345,29 @@ export class ComposerAutocomplete {
     // Note-link candidates (used by both the `[[` and `@` triggers). Markdown
     // notes insert as [[basename]]; non-md files keep their extension because
     // Obsidian only resolves [[image.png]] WITH the ext.
+    const typedAlias = state.kind === "link" ? state.aliasPart ?? null : null;
     const fileMatches = (limit: number): SuggestItem[] => this.fileIndex
       .filter((f) => matchesAll(f.lower))
       .slice(0, limit)
-      .map((f) => ({ label: f.label, insert: `[[${f.insertText}]]`, subtitle: f.file.path }));
+      .map((f) => {
+        // What the user typed after `|` wins; otherwise an alias ROW carries its
+        // own alias, so picking "ADR-7" writes [[Architecture Decision 7|ADR-7]]
+        // — resolves by real name, reads as the alias.
+        const alias = typedAlias !== null ? typedAlias : f.alias ?? null;
+        if (alias === null) {
+          return { label: f.label, insert: `[[${f.insertText}]]`, subtitle: f.file.path };
+        }
+        if (alias === "") {
+          // Pipe typed but no alias yet: leave the caret between | and ]] so the
+          // user just keeps typing, instead of landing after the brackets.
+          return { label: f.label, insert: `[[${f.insertText}|]]`, subtitle: f.file.path, caretBack: 2 };
+        }
+        return {
+          label: f.alias ? f.label : `${f.label} | ${alias}`,
+          insert: `[[${f.insertText}|${alias}]]`,
+          subtitle: f.alias ? `${f.insertText} · ${f.file.path}` : f.file.path,
+        };
+      });
 
     if (state.kind === "link") {
       // 0.73.3: cap bumped 30 → 50 now that the index includes every file type.
@@ -496,7 +568,7 @@ export class ComposerAutocomplete {
     const after = this.ta.value.slice(this.state.replaceEnd);
     const insert = item.insert + trailing;
     this.ta.value = before + insert + after;
-    const caret = before.length + insert.length;
+    const caret = before.length + insert.length - (trailing ? 0 : item.caretBack ?? 0);
     this.ta.setSelectionRange(caret, caret);
     // Fire input so the composer's draft-save and any other listeners catch up.
     this.ta.dispatchEvent(new Event("input", { bubbles: true }));
@@ -517,6 +589,9 @@ export class ComposerAutocomplete {
 }
 
 interface SuggestItem {
+  /** Characters to walk the caret BACK from the end of the inserted text.
+   *  Used for the alias slot, so `[[Note|]]` leaves you inside the pipe. */
+  caretBack?: number;
   label: string;
   insert: string;
   subtitle: string;
@@ -529,6 +604,7 @@ interface AutocompleteState {
   query: string;
   /** Inclusive start index of the trigger (for replacement). For "[[foo"
    *  this points at the first `[`; for "#foo" at the `#`. */
+  aliasPart?: string | null;
   replaceStart: number;
   /** Exclusive end index (the caret). */
   replaceEnd: number;

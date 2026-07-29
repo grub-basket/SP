@@ -81,7 +81,22 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
     let rewritten = md;
     const refs = extractAttachmentRefs(md);
     for (const ref of refs) {
-      const af = app.metadataCache.getFirstLinkpathDest(ref, n.file.path);
+      // 0.209.0: defensive path fallback, NOT a fix for a demonstrated bug.
+      // Trynalist's rendering notes report that getFirstLinkpathDest misses a
+      // full path with a non-markdown extension; measured against Obsidian
+      // 1.13.2 that is NOT true — it resolved "Alpha/Assets/diagram.png",
+      // "/Alpha/...", mismatched case and embedded spaces, and the shapes it did
+      // miss ("./x.png", "%20"-encoded) miss the path lookup too, so the fallback
+      // never changed an outcome in testing. Kept because it costs nothing and
+      // does cover the one case linkpath resolution genuinely can't: a file the
+      // metadata cache has not indexed yet. Do not read this as "there was a
+      // bug here".
+      // getAbstractFileByPath can hand back a FOLDER, so narrow before using it
+      // as an attachment (the compiler caught this — a folder would otherwise
+      // have been zipped as if it were a file).
+      const byPath = app.vault.getAbstractFileByPath(ref);
+      const af = app.metadataCache.getFirstLinkpathDest(ref, n.file.path)
+        ?? (byPath instanceof TFile ? byPath : null);
       if (!af) {
         warnings.push(`Missing attachment "${ref}" in ${n.file.path}`);
         continue;
