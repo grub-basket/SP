@@ -165,7 +165,10 @@ export class NoteBodyRenderer {
 
   private splitAttachments(body: string): { text: string; attachments: string[] } {
     const attachments: string[] = [];
-    const text = body.replace(/!\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (_m, p1) => {
+    // 0.209.1: require a non-space char in the target. `![[   ]]` used to match,
+    // which pushed "   " as an attachment AND deleted that text from the body —
+    // so a stray pair of brackets made visible text disappear.
+    const text = body.replace(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (_m, p1) => {
       attachments.push(p1);
       return "";
     }).replace(/\n{3,}/g, "\n\n").trim();

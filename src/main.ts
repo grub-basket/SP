@@ -17,6 +17,7 @@ import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncry
 import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState } from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
+import { writeClipboardText } from "./cross-vault-clipboard";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap,
@@ -1452,6 +1453,41 @@ export default class StashpadPlugin extends Plugin {
     // Onboarding, reachable forever — not just on first run. Named with the
     // words someone actually types when they're lost ("getting started",
     // "welcome", "setup") so fuzzy search finds it.
+    // 0.209.2: capture the selection pipeline right after a bad Mod+A. Reports
+    // through THREE channels on purpose: a Notice (readable immediately, no
+    // setup), the clipboard (pasteable into a bug report), and the debug trace
+    // (so it lands in the existing Diagnostics copy-out when tracing is on).
+    // It mutates nothing, so running it does not disturb the state being
+    // diagnosed.
+    this.addCommand({
+      id: "stashpad-selection-diagnostics",
+      name: "Diagnose selection (select-all mismatch)",
+      callback: () => {
+        const view = getActiveView();
+        if (!view) { new Notice("Open a Stashpad view first, then run this right after the bad selection."); return; }
+        const snap = view.selectionDiagnostics();
+        const report = JSON.stringify(snap, null, 2);
+        this.trace("selection-diagnostics", snap);
+        const shortfall = (snap.currentChildren as number) - (snap.actionTargets as number);
+        const headline = shortfall > 0
+          ? `⚠️ ${snap.actionTargets} of ${snap.currentChildren} listed notes would be acted on (${shortfall} short).`
+          : `✅ All ${snap.currentChildren} listed notes are selected and actionable.`;
+        const n = new Notice("", 0);
+        n.noticeEl.createDiv({ text: headline });
+        n.noticeEl.createDiv({ text: `tree ${snap.treeChildrenOfFocus} · list ${snap.currentChildren} · selected ${snap.selectionSize} · targets ${snap.actionTargets}` });
+        if ((snap.selectedWithoutFile as number) > 0) {
+          n.noticeEl.createDiv({ text: `${snap.selectedWithoutFile} selected note(s) have no file yet — those are dropped by actions.` });
+        }
+        if ((snap.selectedNotInTree as number) > 0) {
+          n.noticeEl.createDiv({ text: `${snap.selectedNotInTree} selected id(s) are no longer in the tree.` });
+        }
+        const copy = n.noticeEl.createEl("button", { text: "Copy full report", cls: "mod-cta" });
+        copy.style.marginTop = "8px";
+        copy.addEventListener("click", () => {
+          void writeClipboardText(report).then(() => new Notice("Selection report copied.", 3000));
+        });
+      },
+    });
     this.addCommand({
       id: "stashpad-welcome",
       name: "Getting started (welcome / setup)",

@@ -22,7 +22,10 @@ export function safeZipEntryName(name: string): string {
   if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("..")) return "";
   return trimmed;
 }
-const ATTACHMENT_LINK_RE = /!\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]/g;
+// 0.209.1: the lookahead requires a non-space target, so `![[  ]]` is not
+// collected as an attachment named "  " (which then failed to resolve and
+// emitted a spurious "Missing attachment" warning on every export).
+const ATTACHMENT_LINK_RE = /!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g;
 
 export interface StashManifest {
   stashSchema: number;

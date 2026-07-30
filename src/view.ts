@@ -10118,6 +10118,57 @@ export class StashpadView extends ItemView {
   /** T key. Opens the cursor row (or focused note) in a new Stashpad tab focused on it. */
   /** Mod+Enter: toggle the "completed" frontmatter flag on selected/cursor/focused notes.
    *  When true, the row body renders with a strikethrough. */
+  /** 0.209.2: read-only snapshot of the selection pipeline, for diagnosing
+   *  "select-all missed some notes" reports.
+   *
+   *  Deliberately mutates NOTHING — the whole point is to run it immediately
+   *  after a bad Mod+A and see the state that produced it. It reports each
+   *  stage separately so the shortfall can be attributed instead of guessed:
+   *
+   *    files on disk -> tree -> currentChildren -> selection -> action targets
+   *
+   *  The two counts that matter most are `selectedNotInTree` and
+   *  `selectedWithoutFile`: getActionTargets() drops any selected id whose node
+   *  is missing or has no `.file` (a synthetic row whose metadata-cache entry
+   *  has not landed yet), which is exactly how a note can look selected and
+   *  still not be acted on. A gap at `currentChildren` instead points at a
+   *  filter or the view mode; a gap at `tree` points at indexing. */
+  selectionDiagnostics(): Record<string, unknown> {
+    const focused = this.tree.get(this.focusId);
+    const ids = [...this.selection];
+    const nodes = ids.map((id) => this.tree.get(id));
+    const folderPrefix = this.noteFolder.replace(/\/+$/, "") + "/";
+    const onDisk = this.app.vault.getMarkdownFiles()
+      .filter((f) => f.path.startsWith(folderPrefix)).length;
+    return {
+      folder: this.noteFolder,
+      focusId: this.focusId,
+      viewMode: this.currentViewMode(),
+      // A filter runs BEFORE selection, so an active one legitimately shrinks
+      // the set — worth seeing before calling anything a bug.
+      filtersActive: {
+        tag: this.tagFilter ?? null,
+        color: this.colorFilter ?? null,
+        time: this.timeFilter ?? null,
+        hideCompleted: this.currentHideCompleted(),
+        hideChildless: this.currentHideChildless(),
+        attachmentsOnly: this.currentAttachmentsOnly(),
+        importedOnly: this.importedOnly,
+        author: this.authorFilter ?? null,
+      },
+      mdFilesUnderFolder: onDisk,
+      treeChildrenOfFocus: focused ? this.tree.getChildren(this.focusId).length : null,
+      currentChildren: this.currentChildren.length,
+      selectionSize: this.selection.size,
+      actionTargets: this.getActionTargets().length,
+      selectedNotInTree: nodes.filter((n) => !n).length,
+      selectedWithoutFile: nodes.filter((n) => !!n && !n.file).length,
+      domRows: this.listEl?.querySelectorAll(".stashpad-note").length ?? 0,
+      domSelected: this.listEl?.querySelectorAll(".stashpad-note.is-selected").length ?? 0,
+      pluginVersion: this.plugin.manifest.version,
+    };
+  }
+
   /** Add every visible note to the selection. Default Mod+A. 0.59.0. */
   cmdSelectAll(): void {
     if (this.currentChildren.length === 0) return;

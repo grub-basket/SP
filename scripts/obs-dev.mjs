@@ -49,6 +49,11 @@ const USER_DATA_DIR = join(process.env.HOME, "Library", "Application Support", C
 
 const cmd = process.argv[2];
 const arg = process.argv[3];
+// Upper bound for `eval`/`eval-file` so a body that awaits something that never
+// resolves (a canvas view load that stalls under CDP, a leaf.openFile on a
+// .canvas that never settles) fails fast with a clear message instead of hanging.
+// Generous enough for legitimately slow evals (indexing); override if needed.
+const EVAL_TIMEOUT = Number(process.env.OBS_DEV_EVAL_TIMEOUT) || 30000;
 
 // ---- CDP helpers ----------------------------------------------------------
 async function portReady() {
@@ -65,32 +70,46 @@ async function pickPage() {
     || targets[0];
 }
 
-async function cdp(method, params) {
+// Every CDP call is TIME-BOXED. Without a bound, a `Runtime.evaluate` whose
+// awaited promise never resolves — a wedged renderer mid-reload, or a canvas
+// view whose load stalls under CDP — hangs the socket forever. That unbounded
+// await is what defeated the poll-with-deadline loops below: the `while
+// (Date.now() < deadline)` guard is only re-checked at the TOP of the loop, so a
+// single hung cdp() inside the body means the deadline is never reached. On
+// timeout we close the socket and reject with an actionable message.
+async function cdp(method, params, timeoutMs = 15000) {
   const page = await pickPage();
   if (!page) throw new Error("no CDP page target on port " + PORT);
   const ws = new WebSocket(page.webSocketDebuggerUrl);
-  let id = 0;
-  const pending = new Map();
-  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error("ws error")); });
-  ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
-    if (msg.id && pending.has(msg.id)) {
-      const { res, rej } = pending.get(msg.id);
-      pending.delete(msg.id);
-      msg.error ? rej(new Error(JSON.stringify(msg.error))) : res(msg.result);
-    }
-  };
-  const out = await new Promise((res, rej) => {
-    const mid = ++id;
-    pending.set(mid, { res, rej });
-    ws.send(JSON.stringify({ id: mid, method, params }));
+  const id = 1;
+  return await new Promise((resolve, reject) => {
+    let done = false;
+    const finish = (fn, val) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      fn(val);
+    };
+    const timer = setTimeout(
+      () => finish(reject, new Error(`CDP ${method} timed out after ${timeoutMs}ms — renderer unresponsive (still booting, wedged mid-reload, or a canvas/await that never resolves).`)),
+      timeoutMs,
+    );
+    ws.onerror = () => finish(reject, new Error("ws error"));
+    ws.onopen = () => {
+      ws.onmessage = (m) => {
+        let msg; try { msg = JSON.parse(m.data); } catch { return; }
+        if (msg.id !== id) return;
+        if (msg.error) finish(reject, new Error(JSON.stringify(msg.error)));
+        else finish(resolve, msg.result);
+      };
+      ws.send(JSON.stringify({ id, method, params }));
+    };
   });
-  ws.close();
-  return out;
 }
 
-async function rawEval(wrapped) {
-  return cdp("Runtime.evaluate", { expression: wrapped, awaitPromise: true, returnByValue: true });
+async function rawEval(wrapped, timeoutMs) {
+  return cdp("Runtime.evaluate", { expression: wrapped, awaitPromise: true, returnByValue: true }, timeoutMs);
 }
 
 // Run `body` as an async-function body, JSON-stringifying its return value.
@@ -98,17 +117,18 @@ async function rawEval(wrapped) {
 const wrapBody = (body) =>
   `(async () => { try { const __r = await (async () => { ${body} })(); return JSON.stringify(__r) ?? "undefined"; } catch (e) { return JSON.stringify({ __error: String(e && e.stack || e) }); } })()`;
 
-async function evalExpr(code) {
+async function evalExpr(code, timeoutMs) {
   // Ergonomics: accept BOTH a bare expression (`String(2+2)` → auto-returned,
   // like a REPL) and statement code that uses its own `return` (the form
   // verify/eval-file rely on). Try expression-mode first; if it's a *syntax*
   // error (i.e. the code is multiple statements / already has `return`), fall
   // back to statement-mode. Only SyntaxErrors fall back, so a runtime-throwing
-  // expression isn't executed twice.
-  let r = await rawEval(wrapBody(`return (${code})`));
+  // expression isn't executed twice. (A cdp timeout THROWS out of here — a
+  // hanging body doesn't produce a SyntaxError, so it won't be retried twice.)
+  let r = await rawEval(wrapBody(`return (${code})`), timeoutMs);
   const syntaxErr = r.exceptionDetails &&
     /SyntaxError/.test(r.exceptionDetails.exception?.description || r.exceptionDetails.text || "");
-  if (syntaxErr) r = await rawEval(wrapBody(code));
+  if (syntaxErr) r = await rawEval(wrapBody(code), timeoutMs);
   if (r.exceptionDetails && !r.result?.value) {
     const d = r.exceptionDetails;
     return JSON.stringify({ __error: d.exception?.description || d.text });
@@ -116,19 +136,57 @@ async function evalExpr(code) {
   return r.result?.value;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // ---- vault verification (name + sentinel) ---------------------------------
-async function verifyVault() {
+// Short default timeout so the poll loops iterate promptly if the renderer is
+// mid-boot; a real safety check against a live instance answers in well under 8s.
+async function verifyVault(timeoutMs = 8000) {
   const raw = await evalExpr(`
     const f = app.vault.getAbstractFileByPath("${SENTINEL_FILE}");
     let sentinel = false;
     if (f) { try { sentinel = (await app.vault.cachedRead(f)).includes("${SENTINEL}"); } catch {} }
     return { name: app.vault.getName(), sentinel };
-  `);
+  `, timeoutMs);
   let v; try { v = JSON.parse(raw); } catch { v = null; }
   if (!v || v.name !== VAULT_NAME || !v.sentinel) {
     throw new Error(`SAFETY ABORT — debug-port instance is NOT the Claude Dev Vault (got ${raw}). Refusing to drive.`);
   }
   return v;
+}
+
+// ---- readiness (name + sentinel + workspace.layoutReady) -------------------
+// `layoutReady` is the signal the app has finished booting. Gating start()/
+// reload() on it is what makes a reload immediately after start safe: we never
+// fire app:reload while the workspace is still assembling.
+async function probeReady(timeoutMs = 4000) {
+  const raw = await evalExpr(`
+    const f = app.vault.getAbstractFileByPath("${SENTINEL_FILE}");
+    let sentinel = false;
+    if (f) { try { sentinel = (await app.vault.cachedRead(f)).includes("${SENTINEL}"); } catch {} }
+    return { name: app.vault.getName(), sentinel, layoutReady: !!(app.workspace && app.workspace.layoutReady) };
+  `, timeoutMs);
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+// Poll until the RIGHT vault is up AND fully booted, or throw a clear, actionable
+// error at the deadline (never hangs — each probe is time-boxed by cdp()). Reads
+// only; it never mutates or drives, so it's safe to run against a wrong vault
+// (it just keeps waiting, then reports what it saw).
+async function waitReady(ms, phase) {
+  const deadline = Date.now() + ms;
+  let last = "no response yet";
+  while (Date.now() < deadline) {
+    await sleep(700);
+    if (!(await portReady())) { last = "debug port down"; continue; }
+    let v = null;
+    try { v = await probeReady(); } catch (e) { last = e.message; continue; }
+    if (!v) { last = "probe unparseable"; continue; }
+    if (v.name !== VAULT_NAME || !v.sentinel) { last = `wrong/unverified vault (name=${v.name}, sentinel=${v.sentinel})`; continue; }
+    if (!v.layoutReady) { last = "vault up but workspace.layoutReady still false (booting)"; continue; }
+    return v;
+  }
+  throw new Error(`dev instance not ready (${phase}) within ${Math.round(ms / 1000)}s — last state: ${last}. Try 'obs-dev stop' then 'obs-dev start'.`);
 }
 
 // ---- launch ---------------------------------------------------------------
@@ -191,12 +249,12 @@ async function start() {
     if (await portReady()) break;
   }
   if (!(await portReady())) throw new Error("dev instance did not expose the debug port within 30s");
-  // Give the renderer a moment to load the vault + plugin, then verify.
-  for (let i = 0; i < 20; i++) {
-    await new Promise((r) => setTimeout(r, 700));
-    try { const v = await verifyVault(); await ensureStashpad(); console.log(`started: ${v.name} on :${PORT} (sentinel ok, Stashpad enabled)`); return; } catch { /* keep waiting */ }
-  }
-  await verifyVault(); // final attempt — throws with detail if still wrong
+  // Wait for the renderer to finish BOOTING (workspace.layoutReady), not merely
+  // for the sentinel to be readable — so an eval or reload fired right after
+  // start() returns lands on a settled app, not one still assembling its layout.
+  const v = await waitReady(30000, "startup");
+  await ensureStashpad();
+  console.log(`started: ${v.name} on :${PORT} (sentinel ok, layout ready, Stashpad enabled)`);
 }
 
 // A fresh user-data-dir opens the vault in restricted mode (community plugins
@@ -240,12 +298,18 @@ async function screenshot(path) {
 }
 
 async function reload() {
-  await verifyVault();
-  // Reload from inside the page (Obsidian's own "app:reload", falling back to
+  // SERIALIZE: never fire app:reload while the app is still booting — reloading a
+  // half-initialized renderer is exactly what wedges it ("reload right after
+  // start hangs"). Wait until fully ready first. waitReady also safety-verifies
+  // the vault (name + sentinel) before we drive anything.
+  await waitReady(30000, "before reload");
+  // Reload from INSIDE the page (Obsidian's own "app:reload", falling back to
   // location.reload) rather than a raw CDP Page.reload. Page.reload tears the
-  // target down while we're still awaiting its response, which wedges the
-  // socket and has coincided with the dev instance dying outright. Fire it on a
-  // short timer so this eval returns before the navigation starts.
+  // target down while we're still awaiting its response, which wedges the socket
+  // and has coincided with the dev instance dying outright. Fire on a short timer
+  // so this eval returns before the navigation starts (a 5s cap so a boot-time
+  // wedge can't hang even this fire-and-forget), and swallow the expected socket
+  // drop as the page navigates.
   try {
     await rawEval(wrapBody(`
       const reloadNow = () => {
@@ -254,19 +318,14 @@ async function reload() {
       };
       setTimeout(reloadNow, 50);
       return "reloading";
-    `));
+    `), 5000);
   } catch { /* the socket may drop as the page navigates; that's expected */ }
   console.log("reloading dev instance renderer (picks up the latest deploy)…");
-  // Poll the port + re-verify like start(), so reload only returns once the
-  // instance is actually back — instead of leaving the next command to trip
-  // over a renderer that's still mid-reload (or gone).
-  const deadline = Date.now() + 30000;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 700));
-    if (!(await portReady())) continue;
-    try { await verifyVault(); console.log("reload complete — instance healthy."); return; } catch { /* still booting */ }
-  }
-  throw new Error("dev instance did not come back after reload within 30s — run `obs-dev start` to relaunch.");
+  // Wait for it to come back FULLY (layoutReady). Each probe is time-boxed by
+  // cdp(), so a renderer still mid-reload can't hang the loop — the deadline is
+  // now actually honored, and we fail fast with a clear message instead of 120s.
+  await waitReady(30000, "after reload");
+  console.log("reload complete — instance healthy.");
 }
 
 // ---- dispatch -------------------------------------------------------------
@@ -274,8 +333,8 @@ try {
   switch (cmd) {
     case "start": await start(); break;
     case "verify": { const v = await verifyVault(); console.log(`OK — ${v.name} on :${PORT} (sentinel ok)`); break; }
-    case "eval": { await verifyVault(); console.log(await evalExpr(arg ?? "")); break; }
-    case "eval-file": { await verifyVault(); console.log(await evalExpr(readFileSync(arg, "utf8"))); break; }
+    case "eval": { await verifyVault(); console.log(await evalExpr(arg ?? "", EVAL_TIMEOUT)); break; }
+    case "eval-file": { await verifyVault(); console.log(await evalExpr(readFileSync(arg, "utf8"), EVAL_TIMEOUT)); break; }
     case "reload": await reload(); break;
     case "focus": await focus(); break;
     case "screenshot": await screenshot(arg); break;

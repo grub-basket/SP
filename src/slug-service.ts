@@ -33,8 +33,19 @@ export function stripInlineMarkdown(input: string): string {
   out = out.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1");
   out = out.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
   // Wikilinks: [[Target|Alias]] shows the alias; [[Target]] shows the target.
-  out = out.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "$2");
-  out = out.replace(/\[\[([^\]]+)\]\]/g, "$1");
+  // The lookaheads require at least one character that is neither whitespace
+  // NOR a delimiter in
+  // part being kept. Without them `[^\]]+` happily matches pure whitespace, so
+  // `[[   ]]` stripped to `   ` — the brackets silently vanished from the title
+  // and the user saw an empty gap where they had typed something. An empty or
+  // whitespace-only target is not a link to Obsidian either; it renders as
+  // literal text, so leaving it alone is also the truthful thing to show.
+  // The no-alias fallback excludes `|` as well, so a blank ALIAS (`[[Target| ]]`)
+  // stays literal rather than falling through and rendering as `Target| `.
+  // NB: `\S` alone is NOT enough — it matches `]`, so the closing bracket itself
+  // satisfied the lookahead and `[[   ]]` still stripped. Caught by a unit pass.
+  out = out.replace(/\[\[(?=[^\]|]*[^\s\]|])([^\]|]+)\|(?=[^\]]*[^\s\]])([^\]]+)\]\]/g, "$2");
+  out = out.replace(/\[\[(?=[^\]|]*[^\s\]|])([^\]|]+)\]\]/g, "$1");
   // Leading block markers (heading hashes, quote, bullet, ordered marker).
   out = out.replace(/^\s{0,3}(?:#{1,6}\s+|>\s?|[-*+]\s+|\d+[.)]\s+)/, "");
   // Inline code — keep the code text, drop the backticks.

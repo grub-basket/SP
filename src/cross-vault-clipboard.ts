@@ -98,6 +98,19 @@ export async function readClipboardText(win?: Window | null): Promise<string> {
   try { return (await nav.clipboard?.readText?.()) ?? ""; } catch { return ""; }
 }
 
+/** Write plain text to the OS clipboard, focus-independently where possible.
+ *  Electron first for the same reason readClipboardText prefers it: the browser
+ *  API refuses when its document is not focused, which is unpredictable across
+ *  windows. Resolves false when neither route worked, so callers can say so
+ *  instead of claiming a copy that did not happen. */
+export async function writeClipboardText(text: string): Promise<boolean> {
+  const ec = electronClipboard();
+  if (ec?.writeText) {
+    try { ec.writeText(text); return true; } catch { /* fall through */ }
+  }
+  try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+}
+
 /** Write plain text + the hidden cross-vault payload to the OS clipboard.
  *  Returns false when neither clipboard API could take the dual payload
  *  (callers then fall back to their plain-text-only write). */
