@@ -116,6 +116,8 @@ export class ComposerAutocomplete {
     const doc = this.ta.ownerDocument ?? document;
     doc.addEventListener("keydown", this.onDocEscape, true);
     this.vaultListeners.push(() => doc.removeEventListener("keydown", this.onDocEscape, true));
+    doc.addEventListener("keydown", this.onDocSelectAll, true);
+    this.vaultListeners.push(() => doc.removeEventListener("keydown", this.onDocSelectAll, true));
     this.buildIndex();
     // Refresh index on vault structure changes. Coalesce by just
     // invalidating; next openFor call rebuilds lazily.
@@ -429,6 +431,35 @@ export class ComposerAutocomplete {
     e.stopPropagation();
     e.stopImmediatePropagation();
     this.close();
+  };
+
+  /** 0.209.8: claim Mod+A for this text field at DOCUMENT CAPTURE.
+   *
+   *  Another plugin registering a document-level select-all listener was
+   *  swallowing Mod+A while typing in Stashpad, so the user got that plugin's
+   *  behaviour instead of selecting their own text. Selecting all NOTES in the
+   *  list was unaffected, which is the tell: the list path is Stashpad's own
+   *  keybinding, while in a text field the keystroke was going to whoever got
+   *  there first.
+   *
+   *  0.209.7 tried an Obsidian Scope. That was not enough on its own: this class
+   *  pushes its OWN Scope (parented to app.scope, not to the view's), so while
+   *  the suggestion popup is up the view's scope is not in the chain at all.
+   *  Capture phase is the pattern this file already proves works — see
+   *  onDocEscape, added for exactly this class of race against Obsidian's own
+   *  workspace handler.
+   *
+   *  Only acts when the event targets OUR textarea, so it cannot affect typing
+   *  anywhere else in Obsidian. stopImmediatePropagation is what actually denies
+   *  a competing document listener, capture or bubble. */
+  private onDocSelectAll = (e: KeyboardEvent): void => {
+    if (e.key?.toLowerCase() !== "a") return;
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+    if (e.target !== this.ta) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    try { this.ta.select(); } catch { /* detached */ }
   };
 
   private onKeyDown = (e: KeyboardEvent): void => {

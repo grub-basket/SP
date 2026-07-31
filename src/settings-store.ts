@@ -1,4 +1,5 @@
 import type { Plugin } from "obsidian";
+import { Notice } from "obsidian";
 
 /** 0.189.0 — persistence layer for plugin settings, split across several files.
  *
@@ -120,7 +121,51 @@ export class SettingsStore {
    *  keep indexing it dynamically for legacy-key migrations — deriving the type from
    *  Plugin["loadData"] avoids writing an explicit `any`, which the community-plugin
    *  review rejects — as it does any lint-suppression directive for it. */
+  /** 0.209.5: set when data.json existed but could not be parsed. The plugin must
+   *  NOT save while this is true — a save would write defaults over a file the user
+   *  can still recover by hand. Read via `loadFailed()`. */
+  private corruptDataJson = false;
+  loadFailed(): boolean { return this.corruptDataJson; }
+
   async loadAll(): ReturnType<Plugin["loadData"]> {
+    // 0.209.5 DATA LOSS FIX: distinguish "absent" from "unparseable".
+    //
+    // This used to be `(await loadData()) ?? {}`. Obsidian's loadData() returns null
+    // for BOTH cases, so a truncated data.json (crash or sync mid-write — the writes
+    // here are not atomic) silently became `{}`, spread over DEFAULT_SETTINGS, and
+    // was baselined as empty. Every key then read dirty and the next save wrote
+    // defaults OVER the still-recoverable file: hotkeys, templates, colour aliases,
+    // folder pins, and settings.encryption (the key-derivation identity) all gone,
+    // with the evidence destroyed. Every OTHER store in this file already guards
+    // exactly this (see readSplit: "NEVER to empty"); data.json, the most valuable
+    // file, was the only one that did not.
+    //
+    // So: read it ourselves first. If it parses, or is genuinely absent, carry on as
+    // before. If it is present but corrupt, preserve a copy, refuse to save for the
+    // rest of the session, and tell the user rather than quietly resetting them.
+    const dataPath = this.pathFor("data.json");
+    const adapter = this.plugin.app.vault.adapter;
+    try {
+      if (await adapter.exists(dataPath)) {
+        const raw = await adapter.read(dataPath);
+        try {
+          JSON.parse(raw);
+        } catch {
+          this.corruptDataJson = true;
+          const backup = `${dataPath}.corrupt-${Date.now()}`;
+          try { if (!(await adapter.exists(backup))) await adapter.write(backup, raw); } catch { /* best effort */ }
+          new Notice(
+            "Stashpad: your settings file (data.json) is damaged and could not be read.\n"
+            + `A copy was saved as ${backup.split("/").pop()}.\n`
+            + "Settings are showing defaults for now and Stashpad will NOT save over the "
+            + "damaged file this session, so it stays recoverable. Restart after restoring "
+            + "a backup, or reconfigure and restart to start saving again.",
+            0,
+          );
+        }
+      }
+    } catch { /* adapter unavailable — fall through to the original behaviour */ }
+
     const base = ((await this.plugin.loadData()) as Bag | null) ?? {};
     const merged: Bag = { ...base };
 

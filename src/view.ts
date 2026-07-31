@@ -62,7 +62,7 @@ import {
 } from "./sheets-versions";
 import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
-import { readXvPayload, hasXvPayload, writeXvAck, type XvMeta } from "./cross-vault-clipboard";
+import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMeta } from "./cross-vault-clipboard";
 import { importStashZip } from "./stash-package";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
@@ -567,6 +567,35 @@ export class StashpadView extends ItemView {
           this.revealCursorRow();
         }
         return false;
+      });
+      // 0.209.7: claim Mod+A while focus is inside a Stashpad text field.
+      //
+      // Another plugin registering a DOCUMENT-level keydown listener for select-all
+      // can swallow Mod+A before the composer ever sees it, so the user gets that
+      // plugin's behaviour while typing here. Obsidian routes keys through the
+      // keymap BEFORE bubble-phase document listeners (the same reason Escape needs
+      // a Scope rather than stopPropagation), so registering here preempts it
+      // regardless of what any other plugin does at the document level.
+      //
+      // Only text fields are claimed. With focus in the LIST, we return true so the
+      // event continues to the existing selectAll binding — that path already works
+      // and must keep working.
+      viewScope.register(["Mod"], "a", (evt: KeyboardEvent) => {
+        const el = (this.containerEl?.ownerDocument?.activeElement ?? null) as HTMLElement | null;
+        const isTextField = !!el && (el.tagName === "TEXTAREA" || el.tagName === "INPUT" || el.isContentEditable);
+        if (!isTextField) return true; // list focus — let the note select-all binding run
+        evt.preventDefault();
+        const field = el as HTMLTextAreaElement & { select?: () => void };
+        try { field.select?.(); } catch { /* contenteditable — fall through */ }
+        if (el.isContentEditable) {
+          const doc = el.ownerDocument;
+          const range = doc.createRange();
+          range.selectNodeContents(el);
+          const sel = doc.defaultView?.getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(range);
+        }
+        return false; // consumed — a document-level listener elsewhere never runs
       });
       (this.app as any).keymap?.pushScope(viewScope);
     };
@@ -7039,7 +7068,12 @@ export class StashpadView extends ItemView {
     const roots = targets.filter((t) => {
       if (alreadyLocked.has(t.id)) return false;
       let p = t.parent;
-      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      // 0.210.1: visited-set guarded. A parent cycle in the index (see
+      // TreeIndex.wouldCycle) used to make this spin forever and hang Obsidian on
+      // the next delete / lock / copy / clone. Bail out treating it as "not a
+      // root" rather than looping.
+      const seenAnc = new Set<StashpadId>();
+      while (p) { if (ids.has(p)) return false; if (seenAnc.has(p)) return false; seenAnc.add(p); p = this.tree.get(p)?.parent ?? null; }
       return true;
     });
     if (roots.length === 0) { new Notice("Nothing to lock (already locked)."); return; }
@@ -7143,7 +7177,12 @@ export class StashpadView extends ItemView {
     const ids = new Set(sources.map((t) => t.id));
     const roots = sources.filter((t) => {
       let p = t.parent;
-      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      // 0.210.1: visited-set guarded. A parent cycle in the index (see
+      // TreeIndex.wouldCycle) used to make this spin forever and hang Obsidian on
+      // the next delete / lock / copy / clone. Bail out treating it as "not a
+      // root" rather than looping.
+      const seenAnc = new Set<StashpadId>();
+      while (p) { if (ids.has(p)) return false; if (seenAnc.has(p)) return false; seenAnc.add(p); p = this.tree.get(p)?.parent ?? null; }
       return true;
     });
     if (roots.length === 0) return;
@@ -7196,7 +7235,12 @@ export class StashpadView extends ItemView {
     const ids = new Set(targets.map((t) => t.id));
     const roots = targets.filter((t) => {
       let p = t.parent;
-      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      // 0.210.1: visited-set guarded. A parent cycle in the index (see
+      // TreeIndex.wouldCycle) used to make this spin forever and hang Obsidian on
+      // the next delete / lock / copy / clone. Bail out treating it as "not a
+      // root" rather than looping.
+      const seenAnc = new Set<StashpadId>();
+      while (p) { if (ids.has(p)) return false; if (seenAnc.has(p)) return false; seenAnc.add(p); p = this.tree.get(p)?.parent ?? null; }
       return true;
     });
     if (roots.length === 0) return;
@@ -7233,7 +7277,12 @@ export class StashpadView extends ItemView {
     const ids = new Set(sources.map((t) => t.id));
     const roots = sources.filter((t) => {
       let p = t.parent;
-      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      // 0.210.1: visited-set guarded. A parent cycle in the index (see
+      // TreeIndex.wouldCycle) used to make this spin forever and hang Obsidian on
+      // the next delete / lock / copy / clone. Bail out treating it as "not a
+      // root" rather than looping.
+      const seenAnc = new Set<StashpadId>();
+      while (p) { if (ids.has(p)) return false; if (seenAnc.has(p)) return false; seenAnc.add(p); p = this.tree.get(p)?.parent ?? null; }
       return true;
     });
     if (roots.length === 0) return;
@@ -7274,7 +7323,12 @@ export class StashpadView extends ItemView {
     const ids = new Set(sources.map((t) => t.id));
     const roots = sources.filter((t) => {
       let p = t.parent;
-      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      // 0.210.1: visited-set guarded. A parent cycle in the index (see
+      // TreeIndex.wouldCycle) used to make this spin forever and hang Obsidian on
+      // the next delete / lock / copy / clone. Bail out treating it as "not a
+      // root" rather than looping.
+      const seenAnc = new Set<StashpadId>();
+      while (p) { if (ids.has(p)) return false; if (seenAnc.has(p)) return false; seenAnc.add(p); p = this.tree.get(p)?.parent ?? null; }
       return true;
     });
     if (roots.length === 0) return;
@@ -8552,12 +8606,44 @@ export class StashpadView extends ItemView {
     this.tree.rebuild(folder);
     this.render();
     const made = collected.length;
+    const importedIds = createdIds.filter((x): x is StashpadId => !!x);
+    // 0.210.0: the importer no longer closes itself on Import, so the receipt has
+    // to be the thing that takes you to the result — otherwise you import and are
+    // left staring at the importer with no idea where the notes went. The action
+    // focuses the Stashpad tab for this folder and reveals the first import.
     this.plugin.notifications.show({
-      message: `Imported ${made} note${made === 1 ? "" : "s"}${failed ? ` (${failed} failed)` : ""}`,
+      message: `Imported ${made} note${made === 1 ? "" : "s"} into **${folder}**${failed ? ` (${failed} failed)` : ""}`,
       kind: failed ? "warning" : "success",
       category: "system",
-      affectedIds: createdIds.filter((x): x is StashpadId => !!x),
+      affectedIds: importedIds,
       folder,
+      duration: 0,
+      actions: importedIds.length
+        ? [{
+            label: "Show imported notes",
+            onClick: () => {
+              void (async () => {
+                await this.plugin.openFolderInStashpad(folder);
+                const target = importedIds[0];
+                // Prefer THIS view when it is still showing that folder; otherwise
+                // find any open Stashpad view on it (openFolderInStashpad above has
+                // already opened one if none existed).
+                const v = (this.noteFolder === folder && this.viewRoot?.isConnected)
+                  ? this
+                  : (this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+                      .map((l) => l.view as StashpadView | undefined)
+                      .find((x) => x?.noteFolder === folder));
+                if (!v) return;
+                v.selection.clear();
+                for (const id of importedIds) v.selection.add(id);
+                const idx = v.currentChildren.findIndex((n) => n.id === target);
+                if (idx >= 0) v.cursorIdx = idx;
+                v.render();
+                v.revealCursorRow();
+              })();
+            },
+          }]
+        : undefined,
     });
 
     const created = collected.slice();
@@ -8761,7 +8847,12 @@ export class StashpadView extends ItemView {
     const ids = new Set(targets.map((t) => t.id));
     const roots = targets.filter((t) => {
       let p = t.parent;
-      while (p) { if (ids.has(p)) return false; p = this.tree.get(p)?.parent ?? null; }
+      // 0.210.1: visited-set guarded. A parent cycle in the index (see
+      // TreeIndex.wouldCycle) used to make this spin forever and hang Obsidian on
+      // the next delete / lock / copy / clone. Bail out treating it as "not a
+      // root" rather than looping.
+      const seenAnc = new Set<StashpadId>();
+      while (p) { if (ids.has(p)) return false; if (seenAnc.has(p)) return false; seenAnc.add(p); p = this.tree.get(p)?.parent ?? null; }
       return true;
     });
     const folder = this.noteFolder;
@@ -9061,6 +9152,34 @@ export class StashpadView extends ItemView {
   // on the system clipboard as text (so pasting in the composer or any app
   // works normally); paste IN THE LIST operates on the notes themselves.
 
+  /** 0.209.3: user-facing outcome of the cross-vault clipboard stamp.
+   *
+   *  The stamp is deliberately async (it reads every file in the selection and
+   *  zips them — seconds on a big selection or a network drive), and while it
+   *  runs the OS clipboard holds ONLY plain text. In the destination vault the
+   *  paste keybinding gates on hasXvPayload(), so pasting during that window
+   *  does nothing at all — which users experienced as "mash paste until it
+   *  kicks in". The fix is not to make the stamp faster (disk speed is disk
+   *  speed) but to make its STATE visible: say when the payload is ready, and
+   *  say when it failed instead of leaving a console.warn nobody sees. */
+  private reportXvStamp(r: { status: "ok" | "too-big" | "failed" | "empty"; mb?: string }, verb: "copy" | "cut"): void {
+    if (r.status === "ok") {
+      this.plugin.notifications.show({
+        message: `📋 Ready to paste in another vault — ${verb === "cut" ? "cut" : "copied"} from **${this.app.vault.getName()}**.`,
+        kind: "success", category: "system", folder: this.noteFolder, duration: 5000,
+      });
+      return;
+    }
+    if (r.status === "too-big") { this.offerExportForOversize(r.mb ?? "?"); return; }
+    // failed / empty: the plain-text copy still happened; only cross-vault won't work.
+    new Notice(
+      `Couldn't prepare the cross-vault ${verb} — pasting into ANOTHER vault won't work this time. ` +
+      `The plain text is on the clipboard, and pasting within this vault still works. ` +
+      `(Use Share/Export → .stash file as the reliable route for this selection.)`,
+      0,
+    );
+  }
+
   async cmdCopyNotes(): Promise<void> {
     const targets = this.getActionTargets();
     if (!targets.length) { new Notice("Nothing to copy."); return; }
@@ -9075,7 +9194,7 @@ export class StashpadView extends ItemView {
       const req = (window as unknown as { require?: (m: string) => { clipboard?: { readText?: () => string } } }).require;
       const plain = req?.("electron")?.clipboard?.readText?.() ?? "";
       if (plain) void this.plugin.stampCrossVaultClipboard(this.noteFolder, targets.map((t) => t.id), "copy", plain)
-        .then((r) => { if (r.status === "too-big") this.offerExportForOversize(r.mb ?? "?"); });
+        .then((r) => this.reportXvStamp(r, "copy"));
     } catch { /* plain text copy already succeeded */ }
   }
 
@@ -9128,25 +9247,27 @@ export class StashpadView extends ItemView {
       out.push(this.stripFrontmatter(await this.app.vault.cachedRead(t.file)).trim());
     }
     const cutText = out.join("\n\n");
-    await navigator.clipboard.writeText(cutText);
+    // 0.209.3: Electron-first write (navigator.clipboard rejects when the
+    // document is not focused — same lesson as the deep-link auto-paste).
+    if (!(await writeClipboardText(cutText))) new Notice("Couldn't write to the clipboard — the cut was not started.", 6000);
     this.plugin.clearNoteClipboard(); // drop any prior cut/copy (+ its notice)
     this.plugin.noteClipboard = { mode: "cut", folder: this.noteFolder, ids: targets.map((t) => t.id), text: cutText };
     this.render(); // paint the ghosted .is-cut-pending rows immediately
     // Persistent: a pending cut is a MODE — the user should see it until they
     // paste or cancel (Escape). Stored so it can be dismissed on resolve.
     void this.plugin.stampCrossVaultClipboard(this.noteFolder, targets.map((t) => t.id), "cut", cutText) // 0.201.0
-      .then((r) => { if (r.status === "too-big") this.offerExportForOversize(r.mb ?? "?"); });
+      .then((r) => this.reportXvStamp(r, "cut"));
     // 0.199.x tidy-up: structured, line-per-part message — count of parents
     // (+ their children), a short bulleted list, then the how-to lines.
     const childCount = targets.reduce((n, t) => n + this.countDescendants(t.id), 0);
     const bullets = targets.slice(0, 10).map((t) => {
       const title = (this.titleForNode(t).trim() || "(untitled)");
-      return `• ${title.length > 36 ? title.slice(0, 36) + "…" : title}`;
+      return `• **${title.length > 36 ? title.slice(0, 36) + "…" : title}**`;
     });
     if (targets.length > 10) bullets.push(`• …+${targets.length - 10} more`);
     this.plugin.noteClipboardNotice = this.plugin.notifications.show({
       message: [
-        `✂️ Cut ${targets.length} note${targets.length === 1 ? "" : "s"}${childCount ? ` (with ${childCount} child${childCount === 1 ? "" : "ren"})` : ""}`,
+        `✂️ Cut ${targets.length} note${targets.length === 1 ? "" : "s"}${childCount ? ` (with ${childCount} child${childCount === 1 ? "" : "ren"})` : ""} from **${this.app.vault.getName()}**`,
         ...bullets,
         "Paste in a LIST to move them there; paste in a COMPOSER to insert the text and delete the originals (undoable).",
         "Esc cancels — nothing happens until you paste.",
@@ -9194,7 +9315,7 @@ export class StashpadView extends ItemView {
     const cursor = this.currentChildren[this.cursorIdx] ?? null;
     const destParent = ((cursor?.parent ?? this.focusId) ?? ROOT_ID);
     const total = xv.meta.parents + xv.meta.children;
-    const progress = new Notice(`⇄ Receiving ${total} note${total === 1 ? "" : "s"} from vault "${xv.meta.sourceVault}"…`, 0);
+    const progress = new Notice(`⇄ Receiving ${total} note${total === 1 ? "" : "s"} from "${xv.meta.sourceVault}" into "${this.app.vault.getName()}"…`, 0);
     try {
       const existingIds = await this.plugin.idsInFolder(folder);
       const summary = await importStashZip(this.app, xv.zip, folder, existingIds, {
@@ -9236,14 +9357,14 @@ export class StashpadView extends ItemView {
         redo: async () => { await this.restoreSnapshots(snap, newIds); },
       });
       const lines = [
-        `⇄ Pasted ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"} from vault "${xv.meta.sourceVault}"${summary.attachmentsWritten ? ` (+${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"})` : ""}.`,
+        `⇄ Pasted ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"} from **${xv.meta.sourceVault}** into **${this.app.vault.getName()}**${summary.attachmentsWritten ? ` (+${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"})` : ""}.`,
       ];
       if (xv.meta.mode === "cut") {
         // 0.201.1: ACK the cut on the clipboard — when the user switches back
         // to the source vault, ITS Stashpad offers to delete the originals.
         const acked = xv.meta.cutToken ? writeXvAck(xv.meta.cutToken, this.app.vault.getName()) : false;
         lines.push(acked
-          ? `The originals are still in "${xv.meta.sourceVault}" — switch back there and Stashpad will offer to delete them.`
+          ? `The originals are still in **${xv.meta.sourceVault}**. Switch back there and Stashpad will offer to delete them.`
           : `Cross-vault cut can't remove the originals — they still exist in "${xv.meta.sourceVault}". Delete them there if you meant to move.`);
       }
       if (summary.warnings.length) lines.push(`${summary.warnings.length} entr${summary.warnings.length === 1 ? "y was" : "ies were"} skipped (see console).`);
@@ -10118,6 +10239,83 @@ export class StashpadView extends ItemView {
   /** T key. Opens the cursor row (or focused note) in a new Stashpad tab focused on it. */
   /** Mod+Enter: toggle the "completed" frontmatter flag on selected/cursor/focused notes.
    *  When true, the row body renders with a strikethrough. */
+  /** 0.210.2: split a note's raw text into (frontmatter, body), REFUSING when the
+   *  frontmatter block is unterminated.
+   *
+   *  `md.slice(0, md.indexOf("\n---", 3) + 4)` returns `"---"` when there is no
+   *  closing fence, because indexOf gives -1 and -1 + 4 = 3. Writing that back
+   *  produced `---\n<body>` — an unterminated block — so the note lost `id`,
+   *  `parent`, `created` and `attachments`, dropped out of the tree, and became an
+   *  unparented orphan. The merge path already guards this (the 0.140.9 fix); the
+   *  edit and split paths did not.
+   *
+   *  Reachable whenever a read catches a partially-written file (network share,
+   *  sync mid-write) or a note whose frontmatter was already truncated. Returns
+   *  null to mean "do not write". */
+  private splitFrontmatterForWrite(md: string, path: string): { fm: string; body: string } | null {
+    if (!md.startsWith("---")) return { fm: "", body: md };
+    const close = md.indexOf("\n---", 3);
+    if (close < 0) {
+      new Notice(
+        `Can't save “${path}” — its frontmatter block is missing a closing "---".\n`
+        + "Saving would strip the note's id and parent and detach it from the tree. "
+        + "Nothing was written; fix the frontmatter in the Obsidian editor first.",
+        0,
+      );
+      return null;
+    }
+    return { fm: md.slice(0, close + 4), body: md.slice(close + 4) };
+  }
+
+  /** 0.209.9: reveal the selected notes in the OS file manager.
+   *
+   *  Desktop only — `shell.showItemInFolder` is an Electron API and there is no
+   *  mobile equivalent, so the command hides itself there rather than failing.
+   *
+   *  One window per DISTINCT PARENT FOLDER, not one per note. Revealing 12 notes
+   *  from the same folder should not open 12 identical Finder windows; the OS
+   *  selects the item within a folder it already has open, so per-note calls to
+   *  the same directory just fight each other. Notes spread across folders DO get
+   *  a window each, which is the case the user asked for.
+   *
+   *  Capped, and the cap is REPORTED rather than silently applied — opening 40
+   *  windows because someone hit Select All is not a feature. */
+  async cmdRevealInFileManager(): Promise<void> {
+    if (Platform.isMobile) { new Notice("Revealing files needs a desktop app."); return; }
+    const targets = this.getActionTargets().filter((t) => !!t.file);
+    if (!targets.length) { new Notice("Select one or more notes first."); return; }
+    const shell = (window as unknown as { require?: (m: string) => { shell?: { showItemInFolder?: (p: string) => void } } })
+      .require?.("electron")?.shell;
+    if (!shell?.showItemInFolder) { new Notice("Couldn't reach the file manager on this platform."); return; }
+    const adapter = this.app.vault.adapter as unknown as { getFullPath?: (p: string) => string };
+
+    // One representative note per parent folder, preserving list order.
+    const byFolder = new Map<string, string>();
+    for (const t of targets) {
+      const path = t.file!.path;
+      const dir = path.slice(0, Math.max(0, path.lastIndexOf("/")));
+      if (!byFolder.has(dir)) byFolder.set(dir, path);
+    }
+    const MAX_WINDOWS = 8;
+    const picks = [...byFolder.values()];
+    const opening = picks.slice(0, MAX_WINDOWS);
+    let opened = 0;
+    for (const rel of opening) {
+      try {
+        const full = adapter?.getFullPath?.(rel);
+        if (full) { shell.showItemInFolder(full); opened++; }
+      } catch (e) { console.warn("[Stashpad] showItemInFolder failed", e); }
+    }
+    const noteWord = `${targets.length} note${targets.length === 1 ? "" : "s"}`;
+    if (opened === 0) { new Notice("Couldn't reveal those notes — see the console."); return; }
+    const skipped = picks.length - opening.length;
+    new Notice(
+      `Revealed ${noteWord} in ${opened} folder${opened === 1 ? "" : "s"}.`
+      + (skipped > 0 ? ` ${skipped} more folder${skipped === 1 ? "" : "s"} not opened (limit ${MAX_WINDOWS}).` : ""),
+      skipped > 0 ? 8000 : 4000,
+    );
+  }
+
   /** 0.209.2: read-only snapshot of the selection pipeline, for diagnosing
    *  "select-all missed some notes" reports.
    *
@@ -10356,7 +10554,7 @@ export class StashpadView extends ItemView {
         else delete fm.completed;
       });
       if (spawnNextIso) {
-        const made = await spawnNextOccurrence(this.app, t.file, spawnNextIso);
+        const made = await spawnNextOccurrence(this.app, t.file, spawnNextIso, () => this.plugin.mintNoteId());
         if (made) spawned++;
       }
       if (archiveThis) archivedSnapshots.push({ file: t.file, dueIso: ps.dueBefore });
@@ -10365,7 +10563,7 @@ export class StashpadView extends ItemView {
       changedIds.push(t.id);
     }
     // repeatMode "archive": file the completed snapshot after the live note rolled.
-    for (const a of archivedSnapshots) await archiveOccurrenceSnapshot(this.app, a.file, a.dueIso);
+    for (const a of archivedSnapshots) await archiveOccurrenceSnapshot(this.app, a.file, a.dueIso, () => this.plugin.mintNoteId());
     this.render();
     for (const r of rolled) {
       const verb = spawned > 0 ? "Next up" : "Rescheduled";
@@ -11653,9 +11851,47 @@ export class StashpadView extends ItemView {
     const performEdit = async (newBody: string): Promise<void> => {
       const nb = newBody.replace(/\s+$/, "");
       if (!nb.trim()) { new Notice("Can't save an empty note."); return; }
-      const fm = md.startsWith("---") ? md.slice(0, md.indexOf("\n---", 3) + 4) : "";
+
+      // 0.210.6: take the frontmatter from a FRESH read, never from the snapshot
+      // taken when the surface opened.
+      //
+      // The old code spliced `md` (read at open time) back together with the new
+      // body and overwrote the whole file. Anything that touched the note's
+      // frontmatter while the editor sat open was therefore silently reverted on
+      // Save — and the most frequent writer is Stashpad ITSELF: FrontmatterSyncQueue
+      // writing parentLink/children, a colour change, a completed toggle, a drag
+      // that rewrites `parent`, an author contribution stamp. Reverting `parent`
+      // moves the note back under its old parent on disk.
+      //
+      // Re-reading fixes the whole self-write class outright, because we only ever
+      // write OUR body onto THEIR frontmatter. A concurrent BODY edit is the one
+      // case that cannot be merged, so it asks instead of picking a winner.
+      const current = await this.app.vault.read(file);
+      const fresh = this.splitFrontmatterForWrite(current, originalPath);
+      if (!fresh) return;   // truncated frontmatter — refuse rather than orphan the note
+      const openSplit = this.splitFrontmatterForWrite(md, originalPath);
+      const freshBody = fresh.body.replace(/\s+$/, "");
+      const openBody = (openSplit?.body ?? "").replace(/\s+$/, "");
+      if (freshBody !== openBody && freshBody !== nb) {
+        const proceed = await new Promise<boolean>((resolve) => {
+          new ConfirmModal(
+            this.app,
+            "This note changed while you were editing",
+            `"${this.titleForNode(target)}" was modified somewhere else (another window, a synced device, or a collaborator) after you opened it here.\n\n`
+            + "Saving now replaces their version of the text with yours. Their edit is not merged.\n\n"
+            + "Cancel keeps both: nothing is written, and your text stays in the editor so you can copy it out.",
+            "Overwrite with my version",
+            // Single callback taking the choice; ConfirmModal reports Escape and
+            // overlay-clicks as Cancel, so this always resolves.
+            (confirmed: boolean) => resolve(confirmed),
+            "Cancel (keep both)",
+          ).open();
+        });
+        if (!proceed) return;
+      }
+      const fm = fresh.fm;
       const newContent = fm + (fm ? "\n" : "") + nb + "\n";
-      if (newContent === originalContent) return; // no change
+      if (newContent === current) return; // no change
       await this.app.vault.modify(file, newContent);
       // 0.170.2: re-slug the filename to match the new first line (user chose auto-rename).
       const renamedTo = await this.reslugFile(file, nb);
@@ -11686,7 +11922,9 @@ export class StashpadView extends ItemView {
     const performSplit = async (firstBody: string, secondBody: string, payload: Record<string, unknown>, nest = false) => {
       if (!firstBody.trim() || !secondBody.trim()) { new Notice("Split would leave one part empty."); return; }
       try {
-        const fm = md.startsWith("---") ? md.slice(0, md.indexOf("\n---", 3) + 4) : "";
+        const split = this.splitFrontmatterForWrite(md, originalPath);
+      if (!split) return;   // truncated frontmatter — refuse rather than orphan the note
+      const fm = split.fm;
         const newOriginal = fm + (fm ? "\n" : "") + firstBody + "\n";
         await this.app.vault.modify(file, newOriginal);
         // 0.168.3: nest → the new part becomes a CHILD of the original; otherwise a sibling.
@@ -11767,7 +12005,9 @@ export class StashpadView extends ItemView {
     const performMultiSplit = async (parts: string[], nest = false): Promise<void> => {
       if (parts.length < 2) return;
       try {
-        const fm = md.startsWith("---") ? md.slice(0, md.indexOf("\n---", 3) + 4) : "";
+        const split = this.splitFrontmatterForWrite(md, originalPath);
+      if (!split) return;   // truncated frontmatter — refuse rather than orphan the note
+      const fm = split.fm;
         const firstBody = parts[0].replace(/\s+$/, "");
         if (!firstBody.trim()) { new Notice("Split would leave the first part empty."); return; }
         const newOriginal = fm + (fm ? "\n" : "") + firstBody + "\n";
@@ -12673,6 +12913,14 @@ export class StashpadView extends ItemView {
       // 0.167.0: one unified "Export…" entry — the modal now picks .stash / OKF /
       // plain .zip + content scope, so the two old items collapsed into one.
       target.addItem((it: any) => it.setTitle("Export…").setIcon("package").onClick(() => { norm(); void this.cmdExportStash(); }));
+      // 0.209.9: desktop-only reveal. Hidden on mobile rather than shown-and-broken,
+      // since showItemInFolder is an Electron API with no mobile equivalent.
+      if (!Platform.isMobile) {
+        target.addItem((it: any) => it
+          .setTitle("Reveal in Finder / file manager")
+          .setIcon("folder-open")
+          .onClick(() => { norm(); void this.cmdRevealInFileManager(); }));
+      }
     };
     menu.addItem((it: any) => {
       it.setTitle("Share & export").setIcon("share-2");

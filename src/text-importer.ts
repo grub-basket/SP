@@ -29,6 +29,23 @@ export interface ImportOptions {
   paragraphMode: boolean;
   /** Parse `[x]` task prefixes and `[color: …]` metadata (round-trip support). */
   parseMeta: boolean;
+  /** 0.211.0: "Pasted from the old Stashpad desktop app".
+   *
+   *  That app exports a shape indentation alone cannot describe: the top-level
+   *  parent gets NO marker and NO indent, its children get a marker but STILL no
+   *  indent, and indentation only starts at the third level.
+   *
+   *      Parent 1
+   *      - Child 1
+   *       - Grandchild 1
+   *
+   *  By indent the first two lines are identical, so they import as siblings and
+   *  the whole tree flattens by one. The marker is the only thing separating them,
+   *  so under this option a list marker adds a level on top of the indent rank.
+   *  OFF by default: in ordinary markdown a bare line followed by "- item" is a
+   *  paragraph followed by a list at the SAME level, and treating that as nesting
+   *  would be wrong for everyone else. */
+  markerAddsLevel: boolean;
 }
 
 export const DEFAULT_IMPORT_OPTIONS: ImportOptions = {
@@ -37,6 +54,7 @@ export const DEFAULT_IMPORT_OPTIONS: ImportOptions = {
   keepCodeBlocks: true,
   paragraphMode: false,
   parseMeta: true,
+  markerAddsLevel: false,
 };
 
 export interface ImportNote {
@@ -119,12 +137,62 @@ export function isAllCheckboxLines(text: string): boolean {
   return lines.every((l) => /^\s*(?:[-*+]\s+)?\[[ xX]?\]\s*\S/.test(l));
 }
 
+/** Visual width of a line's leading whitespace, tabs expanded. Used only to
+ *  COMPARE indents, so the exact tab size matters little — 4 matches every editor
+ *  people paste from. */
+function indentWidth(lead: string): number {
+  return lead.replace(/\t/g, "    ").length;
+}
+
+/** Map the distinct indent widths present in the text to 1-based levels.
+ *
+ *  0.210.0: replaces `1 + tabs + Math.floor(spaces / 2)`, which hardcoded "two
+ *  spaces per level" and therefore mis-read every document that indents by ONE.
+ *  The old Stashpad desktop app exports exactly that shape:
+ *
+ *      Parent 1
+ *       - Child 1
+ *        - Grandchild 1
+ *
+ *  Widths 0/1/2 came out as levels 1/1/2, so the parent and its child collapsed
+ *  into siblings and the grandchild became the child — silently wrong nesting on
+ *  every import from the app this importer exists to migrate off.
+ *
+ *  Ordinal mapping instead: sort the distinct widths and use each one's rank. That
+ *  reads 0/1/2 and 0/2/4 and 0/4/8 and tab-indented text identically, without
+ *  guessing a unit. Inconsistent indentation degrades gracefully — an odd width
+ *  becomes its own level rather than being rounded into a neighbour — and the
+ *  caller still clamps a jump deeper than +1. */
+function buildIndentLevels(widths: number[]): Map<number, number> {
+  const distinct = [...new Set(widths)].sort((a, b) => a - b);
+  const out = new Map<number, number>();
+  distinct.forEach((w, i) => out.set(w, i + 1));
+  return out;
+}
+
 /** Split pasted text into notes: one per line, nested by indent / list depth,
  *  with fenced code, blank lines and metadata handled per `opts`. */
 export function parseImport(text: string, opts: ImportOptions): ImportNote[] {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   // Trailing blanks are noise; interior ones may be meaningful body spacing.
   while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+
+  // Pre-scan indents so levels can be assigned by RANK rather than by a fixed
+  // spaces-per-level guess. Only lines that will actually become notes count:
+  // blanks carry no indent, and fenced-code lines keep their own indentation
+  // verbatim as body text, so letting either vote would invent phantom levels.
+  const indentWidths: number[] = [];
+  {
+    let fence = false;
+    for (const raw of lines) {
+      const isFence = /^\s*```/.test(raw);
+      if (opts.keepCodeBlocks && fence) { if (isFence) fence = false; continue; }
+      if (opts.keepCodeBlocks && isFence) { fence = true; continue; }
+      if (raw.trim() === "") continue;
+      indentWidths.push(indentWidth((raw.match(/^([\t ]*)/) ?? ["", ""])[1]));
+    }
+  }
+  const levelForWidth = buildIndentLevels(indentWidths);
 
   const rows: Row[] = [];
   let inFence = false;
@@ -158,10 +226,11 @@ export function parseImport(text: string, opts: ImportOptions): ImportNote[] {
     let body = raw;
     const lead = (raw.match(/^([\t ]*)/) ?? ["", ""])[1];
     if (opts.detectIndent) {
-      const tabs = (lead.match(/\t/g) ?? []).length;
-      const spaces = lead.length - tabs;
-      level = 1 + tabs + Math.floor(spaces / 2);
+      level = levelForWidth.get(indentWidth(lead)) ?? 1;
     }
+    // Old-Stashpad shape: a marker means "one level deeper than a bare line at the
+    // same indent". Computed BEFORE the marker is stripped below.
+    if (opts.markerAddsLevel && LIST_MARKER.test(raw.slice(lead.length))) level += 1;
     body = raw.slice(lead.length);
 
     // List markers: strip so "- foo" imports as "foo", not "- foo".

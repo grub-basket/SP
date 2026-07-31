@@ -327,16 +327,24 @@ export class NotificationService {
     wrap.className = `stashpad-notice stashpad-notice-${kind}`;
     const msg = document.createElement("div");
     msg.className = "stashpad-notice-message";
-    // Inline-code via backticks. `path/to/file.md` renders as
-    // monospace + slightly tinted background. Plain text outside
-    // backticks uses textNodes (no XSS exposure — never set
-    // innerHTML to message content).
-    const parts = opts.message.split(/(`[^`\n]+`)/);
+    // Inline-code via backticks and **bold** via double asterisks. `path/to/file.md`
+    // renders monospace + tinted; **name** renders bold. 0.210.5 added bold so
+    // note and vault NAMES can stand out instead of being wrapped in quotes, which
+    // is hard to scan when a message names several of them.
+    //
+    // Everything still goes through textContent / createTextNode — the message is
+    // never assigned to innerHTML, so a note title containing markup is inert. An
+    // unmatched marker just renders literally, which is the right failure.
+    const parts = opts.message.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/);
     for (const part of parts) {
       if (part.length > 1 && part.startsWith("`") && part.endsWith("`")) {
         const code = document.createElement("code");
         code.textContent = part.slice(1, -1);
         msg.appendChild(code);
+      } else if (part.length > 4 && part.startsWith("**") && part.endsWith("**")) {
+        const strong = document.createElement("strong");
+        strong.textContent = part.slice(2, -2);
+        msg.appendChild(strong);
       } else if (part.length > 0) {
         msg.appendChild(document.createTextNode(part));
       }

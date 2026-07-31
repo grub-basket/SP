@@ -1,4 +1,5 @@
 import { App, TFile } from "obsidian";
+import { FolderKeystore, KEYFILE_NAME } from "./folder-keystore";
 import { buildStashZip, importStashZip, splitFrontmatter, resolveNoteAttachmentFiles } from "./stash-package";
 import { encryptWithKey, decryptWithKey, isEncryptedStash } from "./stash-crypto";
 import { type StashpadId } from "./types";
@@ -704,7 +705,20 @@ export async function restoreRawTrash(app: App, blobPath: string, dek: Uint8Arra
  *  under (stamped in the sidecar so decrypt resolves the right key). */
 export async function lockRawFolder(app: App, folder: string, dek: Uint8Array, keyId: string | undefined, stamp: string): Promise<{ blobPath: string; fileCount: number; unpurged: string[] }> {
   const cleaned = folder.replace(/\/+$/, "");
-  const files = (await listFilesRecursive(app, cleaned)).filter((f) => !f.endsWith(`.${STASHENC_EXT}`) && !f.endsWith(`.${STASHMETA_EXT}`));
+  // 0.209.4 CRITICAL FIX: NEVER bundle (and therefore never purge) the folder's own
+  // `.stashkey`. It lives INSIDE the folder, and listFilesRecursive walks
+  // `adapter.list()` — the adapter, which returns dotfiles even though
+  // `vault.getAbstractFileByPath()` does not (verified live). Before this filter,
+  // encrypting a raw folder zipped the only wrap of the DEK into the blob and then
+  // deleted it. Decrypt kept working for the rest of the session because the DEK is
+  // cached in `folderSessionKeys`, so the failure only appeared after a restart —
+  // at which point the content was permanently undecryptable. Any new sidecar that
+  // holds key material must be added here too.
+  const files = (await listFilesRecursive(app, cleaned)).filter((f) =>
+    !f.endsWith(`.${STASHENC_EXT}`)
+    && !f.endsWith(`.${STASHMETA_EXT}`)
+    && !f.endsWith(`/${KEYFILE_NAME}`)
+    && !f.endsWith(`/${KEYFILE_NAME}.tmp`));
   if (files.length === 0) throw new Error("This folder has no files to encrypt.");
   const entries: { name: string; data: ArrayBuffer }[] = [];
   const mtimes = new Map<string, number>();
@@ -723,6 +737,16 @@ export async function lockRawFolder(app: App, folder: string, dek: Uint8Array, k
   await writeBlobVerified(app, blobPath, blob);
   const meta: DeletedMeta = { v: 1, kind: "rawfolder", originalFolder: cleaned, parentId: null, title: cleaned.split("/").pop() || "", count: files.length, created: stamp, rootId: "", deletedAt: stamp, ...(keyId ? { keyId } : {}) };
   try { await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta)); } catch (e) { console.warn("[Stashpad] couldn't write rawfolder sidecar", e); }
+  // Second guard, independent of the filter above: if the folder key is not still
+  // readable at this point, something removed or swallowed it and deleting the
+  // originals would strand the blob forever. Fail loudly with the plaintext intact
+  // rather than completing a lock nobody can undo.
+  if (!(await new FolderKeystore(app).hasFile(cleaned))) {
+    throw new Error(
+      "Refusing to finish encrypting: this folder's key file (.stashkey) is missing, "
+      + "so the encrypted bundle could never be opened. Nothing was deleted.",
+    );
+  }
   const unpurged: string[] = [];
   for (const p of files) {
     const baseline = mtimes.get(p);

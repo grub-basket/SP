@@ -1459,6 +1459,19 @@ export default class StashpadPlugin extends Plugin {
     // (so it lands in the existing Diagnostics copy-out when tracing is on).
     // It mutates nothing, so running it does not disturb the state being
     // diagnosed.
+    // Desktop only — checkCallback so it does not appear in the palette on mobile,
+    // where showItemInFolder does not exist.
+    this.addCommand({
+      id: "stashpad-reveal-in-file-manager",
+      name: "Reveal selected notes in Finder / file manager",
+      checkCallback: (checking: boolean) => {
+        if (Platform.isMobile) return false;
+        const view = getActiveView();
+        if (!view) return false;
+        if (!checking) void view.cmdRevealInFileManager();
+        return true;
+      },
+    });
     this.addCommand({
       id: "stashpad-selection-diagnostics",
       name: "Diagnose selection (select-all mismatch)",
@@ -1481,8 +1494,11 @@ export default class StashpadPlugin extends Plugin {
         if ((snap.selectedNotInTree as number) > 0) {
           n.noticeEl.createDiv({ text: `${snap.selectedNotInTree} selected id(s) are no longer in the tree.` });
         }
-        const copy = n.noticeEl.createEl("button", { text: "Copy full report", cls: "mod-cta" });
-        copy.style.marginTop = "8px";
+        // Class, not an inline style: the community-store lint
+        // (obsidianmd/no-static-styles-assignment) rejects assigning a literal to
+        // element.style, and it is the only such assignment in the codebase — the
+        // rest compute their values, which the rule allows.
+        const copy = n.noticeEl.createEl("button", { text: "Copy full report", cls: "mod-cta stashpad-diag-copy-btn" });
         copy.addEventListener("click", () => {
           void writeClipboardText(report).then(() => new Notice("Selection report copied.", 3000));
         });
@@ -2477,6 +2493,17 @@ export default class StashpadPlugin extends Plugin {
     // 0.201.1: cross-vault cut handshake — returning to this vault after
     // pasting the cut elsewhere surfaces the "delete the originals?" modal.
     this.registerDomEvent(window, "focus", () => void this.checkXvCutAck());
+    // 0.209.3: ALSO poll for the ack while a cut is pending. Focus-only meant the
+    // "delete the originals?" modal never appeared until the user clicked back
+    // into the source window — with two vaults side by side, the natural flow is
+    // to paste in vault B and watch vault A ask, without a click. readXvAck is a
+    // cheap synchronous electron read, and the poll body is a no-op unless a cut
+    // is actually pending. Caveat: Chromium throttles timers in OCCLUDED
+    // windows, so a fully covered source vault may still wait for focus — but
+    // side-by-side (the workflow this exists for) is not occluded.
+    this.registerInterval(window.setInterval(() => {
+      if (this.pendingXvCut) void this.checkXvCutAck();
+    }, 3000));
     setTimeout(() => void this.checkForSyncedBuild(), 5000);
     // 0.92.2: also poll periodically. Focus + one-shot-at-5s missed the case
     // where a newer build lands WHILE the window stays focused (a fresh deploy,
@@ -5306,7 +5333,9 @@ export default class StashpadPlugin extends Plugin {
     new ConfirmModal(
       this.app,
       "Cut notes pasted in another vault",
-      `Vault "${ack.destVault}" received the ${n} cut note${n === 1 ? "" : "s"} (with their subtrees).\nDelete the originals from THIS vault now to finish the move?\nDeleting is undoable here (Undo in the list). Cancel keeps them — the cut becomes a copy.`,
+      `Vault "${ack.destVault}" received the ${n} cut note${n === 1 ? "" : "s"} (with their subtrees) from "${this.app.vault.getName()}".\n\n`
+      + `Delete the originals from "${this.app.vault.getName()}" now to finish the move?\n`
+      + `Deleting is undoable here (Undo in the list). Cancel keeps them and the cut becomes a copy.`,
       "Delete the originals",
       (confirmed) => { void (async () => {
         if (!confirmed) { this.clearNoteClipboard(); this.refreshOpenViewsForFolder(pending.folder); return; }
@@ -6257,7 +6286,7 @@ export default class StashpadPlugin extends Plugin {
             let nextMs = windowEnd;
             let guard = 0;
             while (nextMs <= now && guard++ < 500) nextMs = recI.next(nextMs);
-            await spawnNextOccurrence(this.app, f, new Date(nextMs).toISOString());
+            await spawnNextOccurrence(this.app, f, new Date(nextMs).toISOString(), () => this.mintNoteId());
             missedRolled++;
             continue;
           }
@@ -7225,9 +7254,20 @@ export default class StashpadPlugin extends Plugin {
     // Only walk data.json's protected keys when it actually moved on disk; our own
     // writes never raise diskRev above lastSeen.
     if (disk && diskRev > this.lastSeenSettingsRev) {
-      for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
+      // 0.211.1: pick up EVERY key a synced write changed, not just the protected
+      // eight. This is the live watcher; if it ignores a key, our in-memory copy
+      // stays stale and the next save writes that staleness back — which is how the
+      // laptop's rebinds died on the desktop. Only adopt keys we have NOT changed
+      // ourselves this session: an unsaved local edit must not be silently reverted
+      // by an incoming file.
+      const churn = new Set(MOVED_KEYS);
+      const candidates = new Set([...Object.keys(s), ...Object.keys(disk)]);
+      for (const k of candidates) {
+        if (k === "settingsRev" || churn.has(k)) continue;
         if (disk[k] === undefined) continue;
         if (JSON.stringify(disk[k]) === JSON.stringify(s[k])) continue;
+        const baseline = this.settingsBaseline[k];
+        if (baseline !== undefined && JSON.stringify(s[k]) !== baseline) continue; // ours is dirty — keep it
         s[k] = disk[k];
         anyChanged = true;
         if (k.startsWith("folderPanel")) panelChanged = true;
@@ -7242,13 +7282,35 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** 0.211.1: baseline EVERY settings key, not just the collision-protected eight.
+   *  The adoption rule in guardedSave is "ours unchanged + disk changed => take
+   *  disk's", and it can only be applied to a key we have a baseline for. Limiting
+   *  the baseline to 8 keys is what limited the protection to 8 keys. */
   private snapshotSettingsBaseline(): void {
-    for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
-      this.settingsBaseline[k] = JSON.stringify((this.settings as unknown as Record<string, unknown>)[k]);
+    const all = this.settings as unknown as Record<string, unknown>;
+    this.settingsBaseline = {};
+    for (const k of Object.keys(all)) {
+      if (k === "settingsRev") continue; // bookkeeping, never adopted
+      this.settingsBaseline[k] = JSON.stringify(all[k]);
     }
   }
 
+  /** Map-like settings where two machines editing DIFFERENT entries should keep
+   *  both, rather than one whole-value write winning. `drafts` is user-typed text
+   *  and `noteTemplates`/`colorAliases` are per-folder maps — losing the other
+   *  machine's entries there is real data loss, and a key-level union is exactly
+   *  right because the entries are independent. Anything not listed keeps
+   *  whole-value semantics, which is correct for scalars and ordered arrays. */
+  private static UNION_MERGE_KEYS: readonly string[] = [
+    "drafts", "lastSubmitted", "noteTemplates", "colorAliases", "viewModes",
+  ];
+
   private async guardedSave(): Promise<void> {
+    // 0.209.5: never write over a data.json we could not parse at load. Doing so
+    // replaces a recoverable file with defaults — the exact loss the load-time
+    // guard exists to prevent. One Notice already told the user; stay silent here
+    // so a busy session doesn't spam them on every autosave.
+    if (this.store.loadFailed()) return;
     let disk: Record<string, unknown> | null = null;
     /** Set when the collision guard adopted a disk value — forces the data.json
      *  write even if none of OUR core keys changed, so the merged result lands. */
@@ -7263,18 +7325,55 @@ export default class StashpadPlugin extends Plugin {
     // landed — regardless of rev — which is the common "minutes apart" case.
     if (disk) {
       const adopted: string[] = [];
-      for (const k of StashpadPlugin.COLLISION_PROTECTED_KEYS) {
-        const oursChanged = JSON.stringify((this.settings as unknown as Record<string, unknown>)[k]) !== this.settingsBaseline[k];
-        const diskChanged = JSON.stringify(disk[k]) !== this.settingsBaseline[k];
-        if (!oursChanged && diskChanged && disk[k] !== undefined) {
-          (this.settings as unknown as Record<string, unknown>)[k] = disk[k];
+      // 0.211.1: apply the rule to EVERY key, not just the protected eight.
+      //
+      // The rule itself was always right — "we didn't touch it, they did, so take
+      // theirs" — but it only ran over 8 of ~94 keys, so bindings, shortcuts,
+      // noteTemplates, colorAliases, folder pins and the rest stayed last-write-wins.
+      // Rebind hotkeys on the laptop, and the next save on the desktop (a task tick,
+      // a reminder) wrote its stale copy back over them.
+      //
+      // Two refinements make widening this safe rather than noisy:
+      //  - UNION for map-like keys: two machines editing DIFFERENT drafts or
+      //    templates keep both entries instead of one whole-value write winning.
+      //  - The loud Notice stays scoped to the SECURITY-critical keys. Widening the
+      //    protection should not mean interrupting the user because the other
+      //    machine pinned a folder.
+      const churn = new Set(MOVED_KEYS);
+      const ours = this.settings as unknown as Record<string, unknown>;
+      const candidates = new Set([...Object.keys(ours), ...Object.keys(disk)]);
+      for (const k of candidates) {
+        if (k === "settingsRev" || churn.has(k)) continue;   // bookkeeping / per-device
+        if (disk[k] === undefined) continue;
+        const baseline = this.settingsBaseline[k];
+        if (baseline === undefined) continue;                // never seen it — don't guess
+        const oursChanged = JSON.stringify(ours[k]) !== baseline;
+        const diskChanged = JSON.stringify(disk[k]) !== baseline;
+        if (!diskChanged) continue;
+        if (!oursChanged) {
+          ours[k] = disk[k];
           adopted.push(k);
+          continue;
+        }
+        // BOTH changed. For a map, keep both sides' entries (ours wins a genuine
+        // per-entry conflict, since we are the active editor). For anything else
+        // ours wins wholesale, as before.
+        if (StashpadPlugin.UNION_MERGE_KEYS.includes(k)
+          && disk[k] && ours[k] && typeof disk[k] === "object" && typeof ours[k] === "object"
+          && !Array.isArray(disk[k]) && !Array.isArray(ours[k])) {
+          const merged = { ...(disk[k] as Record<string, unknown>), ...(ours[k] as Record<string, unknown>) };
+          if (JSON.stringify(merged) !== JSON.stringify(ours[k])) {
+            ours[k] = merged;
+            adopted.push(`${k} (merged)`);
+          }
         }
       }
+      const protectedSet = new Set<string>(StashpadPlugin.COLLISION_PROTECTED_KEYS as readonly string[]);
+      const critical = adopted.filter((k) => protectedSet.has(k.replace(" (merged)", "")));
       if (adopted.length) {
         adoptedAny = true;
-        console.warn(`[Stashpad] settings collision: on-disk protected keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
-        new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${adopted.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
+        console.warn(`[Stashpad] settings collision: on-disk keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
+        if (critical.length) new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${critical.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
         setSettings(this.settings);
         // Reflect adopted folder-panel placement immediately — no reload needed.
         if (adopted.some((k) => k.startsWith("folderPanel"))) this.refreshFolderPanels();

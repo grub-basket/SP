@@ -1,5 +1,6 @@
 import { App, ItemView, Modal, Setting, WorkspaceLeaf, setIcon } from "obsidian";
 import { parseImport, DEFAULT_IMPORT_OPTIONS, type ImportOptions, type ImportNote } from "./text-importer";
+import { ColorPickerModal } from "./modals";
 
 export const TEXT_IMPORT_VIEW_TYPE = "stashpad-text-import";
 
@@ -25,6 +26,14 @@ export class TextImporterUI {
   private notes: ImportNote[] = [];
   private previewEl: HTMLElement | null = null;
   private countEl: HTMLElement | null = null;
+  /** Shown after an import, since the surface no longer closes to signal success. */
+  private importedEl: HTMLElement | null = null;
+  private lastImported = 0;
+  /** 0.211.0: per-row user overrides, by row index. Kept SEPARATE from the parsed
+   *  notes so re-parsing (an option change, an edit to the text) does not wipe
+   *  them — they are re-applied after every parse. */
+  private levelDelta = new Map<number, number>();
+  private colorOverride = new Map<number, string>();
   private importBtn: HTMLButtonElement | null = null;
 
   constructor(private app: App, private host: HTMLElement, init: Partial<ImporterState>, private cbs: ImporterCallbacks) {
@@ -60,8 +69,15 @@ export class TextImporterUI {
     opt("Keep code blocks whole", "A ``` fenced block stays in one note instead of splitting line by line.", "keepCodeBlocks");
     opt("Paragraph mode", "Consecutive lines form ONE note and a blank line starts the next — for pasting prose. Off = one note per line.", "paragraphMode");
     opt("Read tasks and colours", 'Understand "[x] done" checkboxes and "[color: red]" / "[color: #hex | alias: name]" tags — so text copied out of Stashpad pastes back with its tasks and colours intact.', "parseMeta");
+    opt(
+      "Pasted from the old Stashpad desktop app",
+      "That app exports the top parent with no bullet and no indent, its children with a bullet but STILL no indent, and only starts indenting at the third level — so by indent alone the first two levels look identical and the tree flattens. Turn this on and a bullet counts as one level deeper. Leave it OFF for ordinary markdown, where a paragraph followed by a list is not nesting.",
+      "markerAddsLevel",
+    );
 
     this.countEl = c.createDiv({ cls: "setting-item-description stashpad-import-count" });
+    this.importedEl = c.createDiv({ cls: "setting-item-description stashpad-import-done" });
+    this.importedEl.hide();
     this.previewEl = c.createDiv({ cls: "stashpad-import-preview" });
 
     const btns = c.createDiv({ cls: "stashpad-split-actions" });
@@ -75,8 +91,15 @@ export class TextImporterUI {
     this.importBtn.onclick = () => {
       if (!this.notes.length) return;
       const notes = this.notes;
-      this.cbs.close();
+      // 0.210.0: do NOT close on import. Closing threw away the pasted text and the
+      // options along with it, so importing a second batch — or fixing the indent
+      // settings and re-importing — meant pasting everything again. The receipt
+      // notification carries a "Show imported notes" button, so the way to the
+      // result no longer depends on this surface closing itself. Cancel still
+      // closes, and the popped-out tab is closed the normal way.
       void this.cbs.onImport(notes);
+      this.lastImported = notes.length;
+      this.refresh();
     };
 
     this.refresh();
@@ -86,11 +109,41 @@ export class TextImporterUI {
   /** Re-parse and repaint the preview — cheap enough for every keystroke. */
   private refresh(): void {
     this.notes = this.text.trim() ? parseImport(this.text, this.opts) : [];
+    // Re-apply the per-row overrides on top of the fresh parse. Level is clamped to
+    // >= 1 and to at most one deeper than the previous row, which is the same rule
+    // the parser enforces — otherwise a nested row could claim a level with no
+    // parent above it and the tree builder would silently reattach it elsewhere.
+    if (this.levelDelta.size || this.colorOverride.size) {
+      this.notes = this.notes.map((n, i) => {
+        const delta = this.levelDelta.get(i) ?? 0;
+        const color = this.colorOverride.get(i);
+        if (!delta && !color) return n;
+        return { ...n, level: Math.max(1, n.level + delta), ...(color ? { color } : {}) };
+      });
+      for (let i = 0; i < this.notes.length; i++) {
+        const maxAllowed = i === 0 ? 1 : this.notes[i - 1].level + 1;
+        if (this.notes[i].level > maxAllowed) this.notes[i] = { ...this.notes[i], level: maxAllowed };
+      }
+    }
     const n = this.notes.length;
     this.countEl?.setText(n === 0 ? "Nothing to import yet." : `${n} note${n === 1 ? "" : "s"} will be created:`);
     if (this.importBtn) {
       this.importBtn.disabled = n === 0;
       this.importBtn.setText(n === 0 ? "Import" : `Import ${n} note${n === 1 ? "" : "s"}`);
+    }
+    // The surface stays open after importing now, so it has to say so itself —
+    // otherwise a successful import looks like nothing happened.
+    if (this.importedEl) {
+      if (this.lastImported > 0) {
+        this.importedEl.setText(
+          `✅ Imported ${this.lastImported} note${this.lastImported === 1 ? "" : "s"}. `
+          + "Use “Show imported notes” on the notification to jump to them. "
+          + "Your text and options are still here — edit and import again, or Cancel to close.",
+        );
+        this.importedEl.show();
+      } else {
+        this.importedEl.hide();
+      }
     }
     const p = this.previewEl;
     if (!p) return;
@@ -113,6 +166,41 @@ export class TextImporterUI {
       row.createSpan({ cls: "stashpad-import-text", text: first || "(empty)" });
       const extra = note.body.split("\n").length - 1;
       if (extra > 0) row.createSpan({ cls: "stashpad-import-more", text: ` +${extra} line${extra === 1 ? "" : "s"}` });
+
+      // 0.211.0: per-row controls, the "neat features" the web app had.
+      //
+      // These are OVERRIDES layered on top of the parse, keyed by row index and
+      // re-applied on every refresh — so changing an option or editing the text
+      // does not silently discard them, and a row that disappears simply stops
+      // having its override applied.
+      const ctrls = row.createDiv({ cls: "stashpad-import-rowctl" });
+
+      // Nest under the line above / outdent. Solves any shape the parser cannot
+      // infer, including exports this toggle set does not anticipate.
+      const idx = this.notes.indexOf(note);
+      const nestBtn = ctrls.createEl("button", { cls: "stashpad-import-ctlbtn", text: "→" });
+      nestBtn.title = "Nest under the line above";
+      nestBtn.disabled = idx === 0 || note.level > (this.notes[idx - 1]?.level ?? 0);
+      nestBtn.onclick = () => { this.levelDelta.set(idx, (this.levelDelta.get(idx) ?? 0) + 1); this.refresh(); };
+      const outBtn = ctrls.createEl("button", { cls: "stashpad-import-ctlbtn", text: "←" });
+      outBtn.title = "Move out one level";
+      outBtn.disabled = note.level <= 1;
+      outBtn.onclick = () => { this.levelDelta.set(idx, (this.levelDelta.get(idx) ?? 0) - 1); this.refresh(); };
+
+      // Colour, from Stashpad's own palette.
+      const sel = ctrls.createEl("select", { cls: "stashpad-import-color" });
+      const none = sel.createEl("option", { text: "(no colour)" });
+      none.value = "";
+      for (const hex of ColorPickerModal.DEFAULT_PALETTE) {
+        const o = sel.createEl("option", { text: hex });
+        o.value = hex;
+      }
+      sel.value = this.colorOverride.get(idx) ?? note.color ?? "";
+      sel.onchange = () => {
+        if (sel.value) this.colorOverride.set(idx, sel.value);
+        else this.colorOverride.delete(idx);
+        this.refresh();
+      };
     }
   }
 }

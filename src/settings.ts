@@ -1816,6 +1816,17 @@ export class StashpadSettingTab extends PluginSettingTab {
       warn.createEl("p").setText(
         "“Remember on this device (keychain)” is a convenience, NOT a backup. An OS or keychain reset, a wiped/restored profile, a reinstall, a new machine, or an IT/server event can erase it at any time, without warning and without asking you. If the only copy of your password was in the keychain, everything encrypted under it is permanently unreadable — by you, by us, by anyone.",
       );
+      // 0.209.7: name the concrete triggers, because "can be erased" reads as
+      // hypothetical until you have seen it happen. Verified where these actually
+      // live: Obsidian keeps saved secrets in the APP's local data (a
+      // `…-secrets-encrypted` localStorage entry, encrypted via the OS), NOT inside
+      // your vault — so a vault backup or sync does NOT carry them, and anything
+      // that resets the app's local data takes them with it. Stashpad's own
+      // IndexedDB use is the render cache only, which is rebuildable and holds no
+      // key material.
+      warn.createEl("p").setText(
+        "Where it lives, and what wipes it: saved passwords are kept in Obsidian's local app data on this computer, not in your vault — so backing up or syncing your vault does NOT back them up. Downgrading or reinstalling Obsidian, clearing the app's local storage, a new profile, or a machine/server event at work can zero them out. The folder's key file (.stashkey) DOES live in your vault and survives all of that — but it can only be opened with the password. That is the whole reason to keep the password somewhere else.",
+      );
       warn.createEl("p").setText(
         "Store the password in a password manager (1Password, Bitwarden, KeePass…) — that alone is what saves you, and it lives outside the keychain so it survives the events above. A Recovery password is a SECOND way in, but only helps if you keep it somewhere separate from the main one (a different manager, printed, or with someone you trust); two entries in the same manager add little. Do set one for SHARED folders — it survives a collaborator changing the main password.",
       );

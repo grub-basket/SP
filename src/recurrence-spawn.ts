@@ -8,14 +8,24 @@ import { newId } from "./id-service";
  *
  *  Implemented as vault.copy + processFrontMatter rather than rebuilding the note
  *  by hand — Obsidian then owns the YAML, so nested values (assignees, arrays)
- *  survive a round trip that hand-written frontmatter would mangle. */
+ *  survive a round trip that hand-written frontmatter would mangle.
+ *
+ *  0.210.3: ids come from an injected `mintId`, which callers pass as
+ *  `plugin.mintNoteId`. Raw `newId()` (the old behaviour, still the default so this
+ *  module stays view-free and testable) checks NOTHING: it neither avoids ids already
+ *  in the vault nor records the one it hands out, so a later mint in the same session
+ *  could reissue it. Duplicate ids are silently destructive — TreeIndex.rebuild keys
+ *  nodes by id, so the second file wins and the FIRST note disappears from the list
+ *  while still existing on disk. */
 export async function spawnNextOccurrence(
   app: App,
   src: TFile,
   nextDueIso: string,
+  /** 0.210.3: MUST be plugin.mintNoteId. See the note in this file's mintId use. */
+  mintId: () => string = newId,
 ): Promise<TFile | null> {
   try {
-    const id = newId();
+    const id = mintId();
     // Keep the human part of the filename, swap the trailing -<id>.
     const stem = src.basename.replace(/-[a-z0-9]{4,12}$/, "") || "task";
     const dir = src.parent?.path ? `${src.parent.path}/` : "";
@@ -61,11 +71,12 @@ export async function archiveOccurrenceSnapshot(
   app: App,
   src: TFile,
   dueIso: string | null,
+  mintId: () => string = newId,
 ): Promise<TFile | null> {
   try {
     const dir = `${src.parent?.path ? `${src.parent.path}/` : ""}archive`;
     if (!(await app.vault.adapter.exists(dir))) await app.vault.createFolder(dir);
-    const id = newId();
+    const id = mintId();
     const stem = src.basename.replace(/-[a-z0-9]{4,12}$/, "") || "task";
     let path = `${dir}/${stem}-${id}.md`;
     for (let i = 2; await app.vault.adapter.exists(path); i++) path = `${dir}/${stem}-${id}-${i}.md`;

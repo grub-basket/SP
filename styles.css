@@ -6506,3 +6506,59 @@ button.stashpad-btn-loading::after {
   gap: 8px;
   margin-top: 20px;
 }
+
+/* Copy button on the selection-diagnostics notice. A class rather than an inline
+   style so the store lint's no-static-styles-assignment rule stays satisfied. */
+.stashpad-diag-copy-btn {
+  margin-top: 8px;
+}
+
+/* Experimental-feature caution inside the due/repeat modal. Theme vars only, so it
+   stays legible in light and dark. */
+.stashpad-due-recur-warning {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background: var(--background-modifier-border);
+  border-left: 3px solid var(--text-warning);
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin: 6px 0 10px;
+  line-height: 1.45;
+}
+
+/* Importer per-row controls (0.211.0): nest/outdent + colour, aligned right so the
+   text column stays scannable. Theme variables only. */
+.stashpad-import-rowctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  padding-left: 8px;
+  flex: 0 0 auto;
+}
+.stashpad-import-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.stashpad-import-ctlbtn {
+  padding: 0 6px;
+  min-width: 22px;
+  height: 20px;
+  line-height: 1;
+  font-size: var(--font-ui-smaller);
+  background: var(--background-modifier-border);
+  color: var(--text-normal);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.stashpad-import-ctlbtn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.stashpad-import-color {
+  font-size: var(--font-ui-smaller);
+  max-width: 110px;
+  height: 20px;
+  padding: 0 4px;
+}

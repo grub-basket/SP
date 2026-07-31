@@ -2939,7 +2939,18 @@ export class DueDatePickerModal extends Modal {
     if (this.opts.showRecurrence) {
       const det = wrap.createEl("details", { cls: "stashpad-due-recur" });
       if (this.opts.currentRepeat || this.opts.currentAutoDoneAfter || this.opts.currentRemindEvery) det.open = true;
-      det.createEl("summary", { text: "🔁 Repeat & reminders" });
+      det.createEl("summary", { text: "🔁 Repeat & reminders (experimental)" });
+      // 0.210.4: label recurrence EXPERIMENTAL in the place someone is actually
+      // about to depend on it. Repeat rules work, but they are not thoroughly
+      // tested across time zones, missed occurrences and multi-device sync, and a
+      // missed reminder for something that mattered is exactly the failure a user
+      // would (reasonably) blame the plugin for. Say so before they rely on it.
+      det.createEl("div", { cls: "stashpad-due-recur-warning" }).setText(
+        "Recurring tasks are experimental — not thoroughly tested across time zones, "
+        + "missed occurrences, or syncing between devices. Please don't rely on a "
+        + "repeat for anything with real consequences; keep a reminder you trust for "
+        + "deadlines that matter. A one-off due date and reminder is the well-tested path.",
+      );
       const mkRow = (label: string, ph: string, val?: string): HTMLInputElement => {
         const r = det.createDiv({ cls: "stashpad-due-recur-row" });
         r.createEl("label", { text: label });

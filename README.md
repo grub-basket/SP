@@ -32,8 +32,9 @@ Stashpad is on the [Obsidian community store](https://community.obsidian.md/plug
    ribbon icon). The first run creates a `Stashpad` folder.
 2. **Type in the composer at the bottom and press Enter** to capture a note. It
    appears in the list above.
-3. **Click a note (or press →)** to drill into it; new notes you add now nest under
-   it. Press **←** or the back arrow to come back out.
+3. **Double-click a note (or press →)** to drill into it; new notes you add now nest
+   under it. A single click just selects, so you can act on notes without moving.
+   Press **←** or the back arrow to come back out.
 4. From there: search, move/clone, set colors, pin, or turn a note into a task with a
    due date and reminder.
 
@@ -67,9 +68,15 @@ outline later — or never, if the newest-first stack is all you need.
 
 Turn any note into a to-do with a keystroke: it gains a checkbox you can tick right in
 the list. Give it a due date and Stashpad will remind you when it's due — click the
-reminder to jump straight to the task, or snooze it. Tasks support recurrence and
-assignees, and a dedicated tasks panel gathers everything that's open so your notes and
-your to-dos live in the same place instead of a separate app.
+reminder to jump straight to the task, or snooze it. Tasks support assignees, and a
+dedicated tasks panel gathers everything that's open so your notes and your to-dos live
+in the same place instead of a separate app.
+
+> **Recurring tasks are experimental.** Repeat rules (daily, chosen days of the week or
+> month, repeat-on-completion) work, but they are not thoroughly tested across time
+> zones, missed occurrences, and multi-device sync. **Don't rely on them for anything
+> with real consequences** — keep a reminder you trust for deadlines that matter. A
+> one-off due date and reminder is the well-trodden path.
 
 ## Find anything fast
 

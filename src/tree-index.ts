@@ -158,7 +158,16 @@ export class TreeIndex {
       node.children.sort((a, b) => {
         const na = this.nodes.get(a)!;
         const nb = this.nodes.get(b)!;
-        return (na.created || "").localeCompare(nb.created || "");
+        // 0.209.6: tie-break on id. `created` is millisecond-resolution, so any
+        // BULK creation path — import, a multi-note paste, the demo seeder — stamps
+        // a whole batch identically and every one of those notes ties. Returning 0
+        // is not a crash (Array.sort is stable, so ties keep their input order and
+        // the list does not thrash), but that input order comes from the vault's
+        // file iteration, which is not content-determined: the same folder can
+        // order tied notes differently on another device or after a re-index, and
+        // manual reordering then starts from a different baseline. Ids are unique
+        // and identical everywhere, so this makes sibling order deterministic.
+        return (na.created || "").localeCompare(nb.created || "") || a.localeCompare(b);
       });
       // If an explicit order is provided for this parent, apply it: ids in the
       // order array come first (in the array's order); ids not in it stay where
@@ -405,6 +414,21 @@ export class TreeIndex {
     // incremental `changed` event would attach as its OWN child, hanging every
     // recursive child-walk. Pin it to ROOT here too.
     if (parentId === id) parentId = ROOT_ID;
+    // 0.210.1: the self-parent pin above only catches a 1-node cycle. A MULTI-node
+    // one (A.parent=B while B.parent=A — two devices moving notes in opposite
+    // directions, or a hand-edited/synced frontmatter write) still installed
+    // cleanly here, because the escapes below don't fire when the new parent is a
+    // known node and the path<->id map is consistent. rebuild() sweeps these
+    // (see the loop above); the incremental path did not, so a cycle could live
+    // in the index until the next full rebuild.
+    //
+    // That is not cosmetic: seven parent-chain walks in view.ts (the "which of
+    // these are roots" filter used by delete / lock / copy / clone, plus the
+    // cut-paste cycle guard) have no visited-set and would spin forever, hanging
+    // Obsidian on the next delete or paste. Refuse the cycle at the source: if the
+    // proposed parent is a DESCENDANT of this node, pin to ROOT rather than
+    // linking it, matching what rebuild() would do anyway.
+    if (parentId !== ROOT_ID && this.wouldCycle(id, parentId)) parentId = ROOT_ID;
     const created = (fm?.created as string) ?? "";
 
     // Safety net: if the declared parent isn't ROOT and isn't in the
@@ -538,13 +562,33 @@ export class TreeIndex {
   /** Re-sort a single parent's children using the same default + orderProvider
    *  pipeline as rebuild(). Pulled out so incremental updates can re-sort
    *  exactly one parent instead of every parent in the tree. */
+  /** Would making `parentId` the parent of `id` create a cycle? True when
+   *  `parentId` is `id` itself or sits inside `id`'s subtree. Visited-set guarded so
+   *  it terminates even if the index ALREADY contains a cycle (which is exactly when
+   *  it gets called). */
+  private wouldCycle(id: StashpadId, parentId: StashpadId): boolean {
+    if (parentId === id) return true;
+    const seen = new Set<StashpadId>([parentId]);
+    let p: StashpadId | null = this.nodes.get(parentId)?.parent ?? null;
+    while (p && p !== ROOT_ID) {
+      if (p === id) return true;      // walking up from the proposed parent reaches us
+      if (seen.has(p)) return true;   // pre-existing cycle — treat as unsafe
+      seen.add(p);
+      p = this.nodes.get(p)?.parent ?? null;
+    }
+    return false;
+  }
+
   private resortChildrenOf(parentId: StashpadId): void {
     const p = this.nodes.get(parentId);
     if (!p) return;
     p.children.sort((a, b) => {
       const na = this.nodes.get(a)!;
       const nb = this.nodes.get(b)!;
-      return (na.created || "").localeCompare(nb.created || "");
+      // Same id tie-break as rebuild() — see the note there. Both comparators must
+      // agree or the incremental path would order a tie group differently from a
+      // full rebuild, and rows would jump on the next metadata-cache event.
+      return (na.created || "").localeCompare(nb.created || "") || a.localeCompare(b);
     });
     if (this.orderProvider) {
       const explicit = this.orderProvider(parentId);

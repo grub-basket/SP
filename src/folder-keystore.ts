@@ -14,7 +14,10 @@ import { newId } from "./id-service";
  *  Everything stored is either public or DEK-wrapped-under-a-password (Argon2id),
  *  so it's safe to sync. The DEK never leaves memory unwrapped. */
 
-const KEYFILE_NAME = ".stashkey";
+/** Exported so every path that BUNDLES or PURGES a folder can exclude it by the
+ *  same constant the writer uses. Hardcoding ".stashkey" in a filter is how
+ *  0.209.4's data-loss bug happened. */
+export const KEYFILE_NAME = ".stashkey";
 const DEK_LEN = 32; // 256-bit folder key (matches EncryptionService.DEK_LEN)
 
 export interface StashKeySlot {
