@@ -25,7 +25,16 @@ export function safeZipEntryName(name: string): string {
 // 0.209.1: the lookahead requires a non-space target, so `![[  ]]` is not
 // collected as an attachment named "  " (which then failed to resolve and
 // emitted a spurious "Missing attachment" warning on every export).
-const ATTACHMENT_LINK_RE = /!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g;
+// 0.211.4 (F1): `[` is excluded from every class so a run of unterminated `![[`
+// can't be rescanned quadratically. Previously each `![[` position scanned forward
+// to the next `]`, so a note full of `![[` cost O(n²): measured 754ms at 60KB,
+// 12.1s at 240KB, a clean 4x per doubling — an outright freeze on the main thread
+// during export/import, reachable from any note body. Excluding `[` bounds each
+// attempt at the next bracket, which makes it linear (960KB: 3ms). This is also
+// strictly more correct, since an Obsidian link target cannot contain `[` or `]`;
+// verified behaviour-identical to the old pattern across the alias, space, path,
+// empty-target and adjacent-link cases.
+const ATTACHMENT_LINK_RE = /!\[\[(?=[^[\]|]*[^\s[\]|])([^[\]|]+)(?:\|[^[\]]+)?\]\]/g;
 
 export interface StashManifest {
   stashSchema: number;
@@ -76,8 +85,27 @@ interface ParsedNote {
 export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8Array> {
   const entries: ZipEntry[] = [];
   const allNotes = dedupeById([...input.rootNotes, ...input.allDescendants]);
-  const collectedAtts = new Map<string, ArrayBuffer>(); // basename -> binary
+  const collectedAtts = new Map<string, ArrayBuffer>(); // BUNDLE name -> binary
+  // 0.211.4 (F2): identity is the vault PATH, not the basename. Two distinct
+  // attachments can share a name in different folders (Assets/A/diagram.png and
+  // Assets/B/diagram.png); keying the bundle by basename dropped the second and
+  // rewrote BOTH notes' links to the one name, so the second note silently
+  // rendered the first note's image and the real file never left the vault.
+  // Distinct paths now get distinct bundle names, disambiguated on collision, and
+  // each note's link is rewritten to the name its own file actually got.
+  const attBundleName = new Map<string, string>(); // vault path -> bundle name
+  const takenAttNames = new Set<string>();
+  const bundleNameFor = (af: TFile): string => {
+    const existing = attBundleName.get(af.path);
+    if (existing) return existing;
+    let name = af.name;
+    for (let i = 2; takenAttNames.has(name); i++) name = uniqueAttachmentName(af.name, i);
+    takenAttNames.add(name);
+    attBundleName.set(af.path, name);
+    return name;
+  };
   const warnings: string[] = [];
+  const usedNoteNames = new Set<string>();
 
   for (const n of allNotes) {
     const md = await app.vault.read(n.file);
@@ -104,16 +132,26 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
         warnings.push(`Missing attachment "${ref}" in ${n.file.path}`);
         continue;
       }
-      const basename = af.name;
+      const basename = bundleNameFor(af);
       if (!collectedAtts.has(basename)) {
         collectedAtts.set(basename, await app.vault.readBinary(af));
       }
-      // Rewrite: ![[some/path/foo.png]] -> ![[foo.png]]
+      // Rewrite: ![[some/path/foo.png]] -> ![[foo.png]] (or foo-2.png if another
+      // file already claimed that name in this bundle).
       rewritten = rewriteAttachmentRef(rewritten, ref, basename);
     }
     // Also normalize attachments: list in frontmatter to bare basenames.
-    rewritten = rewriteFrontmatterAttachmentList(rewritten, app, n.file.path);
-    entries.push({ name: `notes/${n.file.name}`, data: rewritten });
+    rewritten = rewriteFrontmatterAttachmentList(rewritten, app, n.file.path, bundleNameFor);
+    // 0.211.8: flat, collision-free entry names — the same guard buildFilteredZip has.
+    // A subtree can span nested folders, so two notes CAN share a filename; without
+    // this, the second entry overwrites the first in the zip and that note is simply
+    // absent from the bundle. Not reachable today (Stashpad's own filenames carry a
+    // unique id suffix), but the export accepts whatever is on disk and the cost of
+    // being wrong here is a silently missing note.
+    let entryName = n.file.name;
+    while (usedNoteNames.has(entryName)) entryName = `${n.file.basename}-${newId(4)}.md`;
+    usedNoteNames.add(entryName);
+    entries.push({ name: `notes/${entryName}`, data: rewritten });
   }
 
   for (const [name, buf] of collectedAtts) {
@@ -150,6 +188,20 @@ export async function buildFilteredZip(
   const collectedAtts = new Map<string, ArrayBuffer>();
   const warnings: string[] = [];
   const usedNames = new Set<string>();
+  // 0.211.4 (F2): same path-vs-basename identity fix as buildStashZip above —
+  // two attachments sharing a name in different folders must not collapse into one
+  // bundle entry, silently giving the second note the first note's file.
+  const attBundleName = new Map<string, string>();
+  const takenAttNames = new Set<string>();
+  const bundleNameFor = (af: TFile): string => {
+    const existing = attBundleName.get(af.path);
+    if (existing) return existing;
+    let name = af.name;
+    for (let i = 2; takenAttNames.has(name); i++) name = uniqueAttachmentName(af.name, i);
+    takenAttNames.add(name);
+    attBundleName.set(af.path, name);
+    return name;
+  };
 
   for (const n of notes) {
     let md = await app.vault.read(n.file);
@@ -159,11 +211,11 @@ export async function buildFilteredZip(
       for (const ref of extractAttachmentRefs(md)) {
         const af = app.metadataCache.getFirstLinkpathDest(ref, n.file.path);
         if (!af) { warnings.push(`Missing attachment "${ref}" in ${n.file.path}`); continue; }
-        const basename = af.name;
+        const basename = bundleNameFor(af);
         if (!collectedAtts.has(basename)) collectedAtts.set(basename, await app.vault.readBinary(af));
         md = rewriteAttachmentRef(md, ref, basename);
       }
-      md = rewriteFrontmatterAttachmentList(md, app, n.file.path);
+      md = rewriteFrontmatterAttachmentList(md, app, n.file.path, bundleNameFor);
     }
     const data = filterNoteContent(md, content);
     // Flat, collision-free filenames (the subtree may span nested folders).
@@ -220,18 +272,41 @@ export async function importStashZip(
 
   // Build id remap (collision-aware).
   const idRemap = new Map<StashpadId, StashpadId>();
+  // 0.211.4 (F3): the assignment must be per NOTE, not per old id. A bundle can
+  // legitimately contain two notes carrying the same `id` (hand-edited frontmatter, a
+  // bundle concatenated from two exports, a duplicated file). Keyed only by old id,
+  // the second note OVERWROTE the first's entry, so both were then written with the
+  // SAME new id — an id collision in the destination folder, where the tree keys by
+  // id and one of the two notes becomes unreachable. Each parsed note now gets its
+  // own identity, checked against ids already taken on disk AND ids handed out
+  // earlier in this same import.
+  const assigned = new Map<ParsedNote, StashpadId>();
+  const takenIds = new Set<StashpadId>(existingIds);
+  const claim = (candidate: StashpadId, oldId: StashpadId): StashpadId => {
+    let id = candidate;
+    while (takenIds.has(id)) id = `${oldId}-${newId(4)}-Imported`;
+    takenIds.add(id);
+    return id;
+  };
   let collisionsRenamed = 0;
   for (const p of parsed) {
     const oldId = p.fm.id as string | undefined;
     if (!oldId) continue;
+    let newIdVal: StashpadId;
     if (opts.forceNewIds) {
-      idRemap.set(oldId, newId(6)); // cross-folder COPY → a fresh identity (not a same-id twin)
-    } else if (existingIds.has(oldId) || idRemap.has(oldId) /* dup within zip */) {
-      idRemap.set(oldId, `${oldId}-${newId(4)}-Imported`);
+      newIdVal = claim(newId(6), oldId); // cross-folder COPY → a fresh identity (not a same-id twin)
+    } else if (takenIds.has(oldId)) {
+      newIdVal = claim(`${oldId}-${newId(4)}-Imported`, oldId);
       collisionsRenamed++;
     } else {
-      idRemap.set(oldId, oldId);
+      newIdVal = claim(oldId, oldId);
     }
+    assigned.set(p, newIdVal);
+    // The returned map stays old→new for the caller's root lookup and for parent
+    // remapping below. With a duplicated old id the parent link is ambiguous by
+    // construction, so first-wins: don't let a later duplicate silently reparent the
+    // children of the earlier note.
+    if (!idRemap.has(oldId)) idRemap.set(oldId, newIdVal);
   }
 
   const importDate = new Date().toISOString();
@@ -296,7 +371,7 @@ export async function importStashZip(
   for (const p of parsed) {
     const oldId = p.fm.id as string | undefined;
     if (!oldId) { warnings.push(`Skipped ${p.originalName} — no id in frontmatter`); continue; }
-    const newIdVal = idRemap.get(oldId)!;
+    const newIdVal = assigned.get(p)!; // per-note (F3), not idRemap.get(oldId)
 
     const oldParent = (p.fm.parent ?? null) as string | null;
     let newParent: string | null = oldParent;
@@ -358,14 +433,28 @@ export async function importStashZip(
     // Filename: prefer original; if id changed, replace short id suffix; if collision on disk, suffix.
     let outName = newIdVal === oldId ? p.originalName : remixFilename(p.originalName, oldId, newIdVal);
     let outPath = `${destFolder}/${outName}`;
-    if (await app.vault.adapter.exists(outPath)) {
-      const stem = outName.replace(/\.md$/, "");
-      outName = `${stem}-${newId(4)}.md`;
-      outPath = `${destFolder}/${outName}`;
+    // 0.211.4 (F6): one unwritable note must not abort the whole import. Previously a
+    // throw here (a name the filesystem rejects, a permissions error, a full disk)
+    // escaped importStashZip with notes already on disk, while the cross-vault paste
+    // handler reported "nothing was changed" — untrue, and for a CUT the source vault
+    // was then asked to delete originals for an import that had actually stopped
+    // halfway. Record the failure as a warning and carry on: the remaining notes still
+    // land, the summary reports what didn't, and because the cut ACK is gated on an
+    // empty warnings list (F4) a partial import can no longer license deleting the
+    // originals. Not a rollback — deleting the notes that DID import would be its own
+    // data loss — but an accurate, non-silent partial result.
+    try {
+      if (await app.vault.adapter.exists(outPath)) {
+        const stem = outName.replace(/\.md$/, "");
+        outName = `${stem}-${newId(4)}.md`;
+        outPath = `${destFolder}/${outName}`;
+      }
+      await app.vault.create(outPath, finalContent);
+      notePathsWritten.push(outPath);
+      notesWritten++;
+    } catch (e) {
+      warnings.push(`Couldn't write ${p.originalName} — ${(e as Error).message}`);
     }
-    await app.vault.create(outPath, finalContent);
-    notePathsWritten.push(outPath);
-    notesWritten++;
   }
 
   // Surface sanitized hex→name aliases (lowercase #rrggbb keys) for the caller
@@ -443,12 +532,16 @@ function rewriteImportedAttachmentLinks(body: string, attRoute: Map<string, stri
   });
 }
 
-function rewriteFrontmatterAttachmentList(md: string, app: App, notePath: string): string {
+/** `nameFor` (0.211.4, F2) must be the SAME resolver the body rewrite used, or the
+ *  frontmatter list and the body disagree: the body would point at `diagram-2.png`
+ *  while `attachments:` still claimed `diagram.png`. Falls back to the bare basename
+ *  when no resolver is supplied. */
+function rewriteFrontmatterAttachmentList(md: string, app: App, notePath: string, nameFor?: (af: TFile) => string): string {
   const split = splitFrontmatter(md);
   if (!split.fm.attachments || !Array.isArray(split.fm.attachments)) return md;
   const remapped = (split.fm.attachments as string[]).map((a) => {
     const af = app.metadataCache.getFirstLinkpathDest(a, notePath);
-    return af ? af.name : baseFileName(a);
+    return af ? (nameFor ? nameFor(af) : af.name) : baseFileName(a);
   });
   const newFm = { ...split.fm, attachments: remapped };
   return serializeNote(newFm, split.body);

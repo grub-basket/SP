@@ -34,7 +34,7 @@ import { StashpadLog } from "./log";
 import { parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
 import { ROOT_ID, parseAssignees } from "./types";
 import { parseRecurrence, nextDueOnComplete, parseDuration, parseRepeatMode } from "./recurrence";
-import { spawnNextOccurrence, markOccurrenceMissed } from "./recurrence-spawn";
+import { spawnNextOccurrence, claimOccurrenceMissed } from "./recurrence-spawn";
 import { OrderStore } from "./order-store";
 import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./structure-snapshot";
 import { UndoStack } from "./undo-stack";
@@ -1732,7 +1732,7 @@ export default class StashpadPlugin extends Plugin {
     // 0.192.0: paste-text importer (replaces the standalone Stashpad Importer web app).
     this.addCommand({
       id: "stashpad-import-text",
-      name: "Import pasted text (paste → nested notes)…",
+      name: "Import pasted text into Stashpad (paste → nested notes)…",
       callback: () => call("cmdImportText"),
     });
     this.addCommand({
@@ -4202,8 +4202,31 @@ export default class StashpadPlugin extends Plugin {
       const fp = (this.settings.folderEncPrefs ?? {})[keyFolder] ?? {};
       // A per-note override (the "hide filename" command) wins over the folder pref.
       const hideTitle = opts.hideTitle ?? ((isArchiveLock ? fp.archiveEncryptFilenames : fp.encryptFilenames) ?? false); // 0.137.1: per-folder only
+      // 0.211.6 (L1): drain queued parentLink/children writes BEFORE lockSubtree
+      // baselines mtimes. FrontmatterSyncQueue writes 100ms apart in the background,
+      // so one landing after the baseline makes the purge (correctly) keep the note
+      // while the bundle has already been written — leaving plaintext and ciphertext
+      // side by side, and a later restore producing a duplicate subtree.
+      for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+        const v = leaf.view as { flushFrontmatterSync?: () => Promise<void> };
+        if (typeof v.flushFrontmatterSync === "function") await v.flushFrontmatterSync();
+      }
       const r = await lockSubtree(this.app, folder, rootId, dek, prevSibling, hideTitle, opts.blobFolder);
       this.pendingEncBlobs.add(r.blobPath); // fast-state index: cover the pre-vault-index window
+      // 0.211.6 (L7): a hide-title lock removes the plaintext file, but a structure
+      // snapshot written moments earlier still holds that note's title — and the
+      // rotated .prev.json keeps it indefinitely and syncs it everywhere. Scrub the
+      // titles of notes whose files are now gone, or filename-hiding is defeated by a
+      // recovery sidecar sitting next to the blob.
+      if (hideTitle) {
+        try {
+          // Drain first: a snapshot scheduled BEFORE the lock is still sitting in the
+          // debounce holding the plaintext title, and would land after the scrub and
+          // put it straight back.
+          await this.structureStore.flush(folder);
+          await this.structureStore.purgeTitlesForMissingNotes(folder);
+        } catch (e) { console.warn("[Stashpad] snapshot title scrub failed", e); }
+      }
       // Record a placeholder registry entry so the list shows a 🔒 stub where
       // the note was. The blob may live in a different folder than the note's
       // source (archive) — register it under the blob's actual folder.
@@ -4655,7 +4678,17 @@ export default class StashpadPlugin extends Plugin {
         const r = await restorePlaintextDeleted(this.app, blobPath, existing);
         this.pendingEncBlobs.delete(blobPath);
         try { await this.newLog().append({ type: "restore", id: meta?.rootId || ROOT_ID, payload: { to: r.restoredTo, from: "trash", encrypted: false } }); } catch { /* log best-effort */ }
-        if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo, actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(r.restoredTo) }] });
+        // 0.211.6 (L3): an incomplete restore KEEPS the bundle, so say so — the user
+        // needs to know the trash item is still there and why, rather than reading a
+        // plain success toast and assuming everything came back.
+        if (!opts.silent) this.notifications.show({
+          message: r.bundleKept
+            ? `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”, but ${r.warnings.length || "some"} couldn't be restored — the trash item was KEPT so you can try again.`
+            : `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`,
+          kind: r.bundleKept ? "warning" : "success",
+          category: "system", folder: r.restoredTo,
+          actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(r.restoredTo) }],
+        });
         return true;
       } catch (e) {
         console.warn("[Stashpad] restore plaintext trash failed", e);
@@ -6280,7 +6313,10 @@ export default class StashpadPlugin extends Plugin {
         if (recI) {
           const windowEnd = recI.next(dueMs);
           if (now >= windowEnd) {
-            await markOccurrenceMissed(this.app, f, now);
+            // 0.211.6 (L10): claim the roll atomically against the FILE, not the
+            // lagging cache — otherwise two sweeps in the cache-lag window both spawn
+            // a successor and the user gets duplicate tasks.
+            if (!(await claimOccurrenceMissed(this.app, f, now))) continue;
             // Anchor the next occurrence to the schedule, not to "now", so a task
             // ignored for weeks lands back on its real cadence rather than drifting.
             let nextMs = windowEnd;

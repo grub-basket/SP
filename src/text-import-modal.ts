@@ -1,6 +1,23 @@
 import { App, ItemView, Modal, Setting, WorkspaceLeaf, setIcon } from "obsidian";
 import { parseImport, DEFAULT_IMPORT_OPTIONS, type ImportOptions, type ImportNote } from "./text-importer";
 import { ColorPickerModal } from "./modals";
+import { BUILTIN_COLOR_NAMES } from "./text-importer";
+
+/** hex (lower-case) -> human name, inverted from BUILTIN_COLOR_NAMES.
+ *
+ *  0.211.2: the per-row colour control is a native <select>, and on macOS that
+ *  renders as a NATIVE menu — no swatches, no styling, just the option text. A list
+ *  of raw hex codes there is unreadable. The names already exist for parsing
+ *  "[color: Amber]", so reuse them rather than inventing a second vocabulary.
+ *  Built once; the first name wins, so the canonical nine beat their synonyms. */
+const HEX_TO_NAME: Record<string, string> = (() => {
+  const out: Record<string, string> = {};
+  for (const [name, hex] of Object.entries(BUILTIN_COLOR_NAMES)) {
+    const key = hex.toLowerCase();
+    if (!out[key]) out[key] = name.charAt(0).toUpperCase() + name.slice(1);
+  }
+  return out;
+})();
 
 export const TEXT_IMPORT_VIEW_TYPE = "stashpad-text-import";
 
@@ -192,7 +209,8 @@ export class TextImporterUI {
       const none = sel.createEl("option", { text: "(no colour)" });
       none.value = "";
       for (const hex of ColorPickerModal.DEFAULT_PALETTE) {
-        const o = sel.createEl("option", { text: hex });
+        // Name when we know it, hex only as a fallback for a custom colour.
+        const o = sel.createEl("option", { text: HEX_TO_NAME[hex.toLowerCase()] ?? hex });
         o.value = hex;
       }
       sel.value = this.colorOverride.get(idx) ?? note.color ?? "";

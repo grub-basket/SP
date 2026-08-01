@@ -59,6 +59,31 @@ export class OrderStore {
     await this.writeNow(folder);
   }
 
+  /** 0.211.6 (L8): re-key this store when its FOLDER is renamed.
+   *
+   *  Everything here is keyed by folder path. Without this, a rename left a debounced
+   *  write pointing at the OLD path, so the timer fired ~150ms later and wrote the
+   *  sidecar back into a folder the user had just renamed away — recreating the old
+   *  folder on disk — while the reorder/sort the user actually made was never written
+   *  to the new one. The stale `cache` entry was also still live under the old key, so
+   *  a NEW folder later created at that same path inherited the previous folder's
+   *  state. Cancel the pending timer, move the cached value across, and re-arm the
+   *  write against the new path. */
+  handleFolderRename(oldFolder: string, newFolder: string): void {
+    const from = oldFolder.replace(/\/+$/, "");
+    const to = newFolder.replace(/\/+$/, "");
+    if (from === to) return;
+    const t = this.pendingTimers.get(from);
+    if (t != null) { window.clearTimeout(t); this.pendingTimers.delete(from); }
+    this.writeInFlight.delete(from);
+    if (this.cache.has(from)) {
+      this.cache.set(to, this.cache.get(from)!);
+      this.cache.delete(from);
+      // Only re-arm if a write was actually pending; otherwise this is just a cache move.
+      if (t != null) this.scheduleWrite(to);
+    }
+  }
+
   private pendingTimers = new Map<string, number>();
   private writeInFlight = new Map<string, Promise<void>>();
 
@@ -92,6 +117,7 @@ export class OrderStore {
     // so writing it verbatim would clobber every other parent's saved order.
     // Merge in any on-disk parents we DIDN'T touch this session (cache wins per
     // key) so untouched orders survive.
+    let existedButUnreadable = false;
     try {
       if (await adapter.exists(path)) {
         const parsed = JSON.parse(await adapter.read(path));
@@ -101,12 +127,24 @@ export class OrderStore {
           }
         }
       }
-    } catch { /* unreadable / absent — write what we have */ }
+    } catch {
+      // 0.211.8: an EXISTING file we couldn't read must not be deleted below. The
+      // read is inside this try, so a JSON parse error or an I/O failure landed here
+      // with `map` holding only whatever this session touched — which for an
+      // untouched folder is nothing. The empty-map branch would then remove() the
+      // sidecar, destroying every ordering/sort on disk purely because we failed to
+      // parse it. Treat unreadable as "leave it exactly as it is".
+      try { existedButUnreadable = await adapter.exists(path); } catch { existedButUnreadable = true; }
+    }
     const trimmed: Record<string, string[]> = {};
     for (const [k, v] of Object.entries(map)) if (v.length > 0) trimmed[k] = v;
     this.cache.set(folder, trimmed);
     try {
       if (Object.keys(trimmed).length === 0) {
+        if (existedButUnreadable) {
+          console.warn("Stashpad: order sidecar unreadable — keeping it rather than deleting", path);
+          return;
+        }
         // Skip the exists() probe — remove() throws "file not found" if
         // it's missing, which we swallow. One round-trip instead of two
         // on a network drive.

@@ -105,6 +105,46 @@ export class StructureSnapshotStore {
     }
   }
 
+  /** 0.211.6 (L7): strip stored `title`s for notes whose file is no longer on disk,
+   *  from BOTH the live snapshot and the rotated `.prev.json`.
+   *
+   *  The snapshot records each note's title so a repair can show something meaningful.
+   *  When a note is locked with filename-hiding on, its plaintext file is removed and
+   *  the title is supposed to become unreadable — but a snapshot written moments
+   *  earlier still held it, and `.prev.json` kept that generation indefinitely and
+   *  synced it to every device. Filename-hiding was therefore defeated by a recovery
+   *  sidecar sitting next to the encrypted blob.
+   *
+   *  Keyed on "the file is gone" rather than on a list of locked ids, because the lock
+   *  result doesn't carry per-note ids and the purged files are exactly the ones whose
+   *  titles must not survive. Structural recovery is unaffected: `parent`, `path` and
+   *  `created` all stay, and only the cosmetic title is dropped. Called after a
+   *  hide-title lock; safe to call at any time. */
+  async purgeTitlesForMissingNotes(folder: string): Promise<void> {
+    const cleaned = folder.replace(/\/+$/, "");
+    if (!cleaned) return;
+    const adapter = this.app.vault.adapter;
+    const scrub = async (path: string): Promise<void> => {
+      try {
+        if (!(await adapter.exists(path))) return;
+        const snap = JSON.parse(await adapter.read(path)) as StructureSnapshot;
+        if (!snap?.notes) return;
+        let changed = false;
+        for (const entry of Object.values(snap.notes)) {
+          if (entry.title === undefined) continue;
+          if (await adapter.exists(entry.path)) continue; // still a live plaintext note
+          delete entry.title;
+          changed = true;
+        }
+        if (changed) await adapter.write(path, JSON.stringify(snap, null, 1));
+      } catch (e) {
+        console.warn("[Stashpad] couldn't scrub snapshot titles", path, e);
+      }
+    };
+    await scrub(this.pathFor(cleaned));
+    await scrub(this.prevPathFor(cleaned));
+  }
+
   /** Queue a write of `notes` for `folder` (debounced + coalesced). */
   schedule(folder: string, notes: Record<string, StructureEntry>): void {
     const cleaned = folder.replace(/\/+$/, "");
@@ -144,7 +184,18 @@ export class StructureSnapshotStore {
           const path = this.pathFor(key);
           // Rotate before overwriting: one intact generation behind us.
           try {
-            if (await adapter.exists(path)) await adapter.write(this.prevPathFor(key), await adapter.read(path));
+            if (await adapter.exists(path)) {
+              const current = await adapter.read(path);
+              // 0.211.8: only rotate a snapshot that actually PARSES. Rotating an
+              // unreadable one overwrites the last good generation with garbage, so a
+              // single corrupt write would cost both copies — and `.prev.json` is the
+              // fallback mergeWithPrevious now relies on precisely when the live file
+              // is unreadable. A corrupt current file is simply replaced below.
+              let ok = false;
+              try { const p = JSON.parse(current) as StructureSnapshot; ok = !!p && p.schema === SCHEMA && !!p.notes; } catch { ok = false; }
+              if (ok) await adapter.write(this.prevPathFor(key), current);
+              else console.warn("[Stashpad] not rotating an unreadable structure snapshot — keeping the previous generation", path);
+            }
           } catch { /* rotation is best-effort; never block the write */ }
           await adapter.write(path, JSON.stringify(merged, null, 1));
         } catch (e) {
@@ -153,6 +204,20 @@ export class StructureSnapshotStore {
       });
     }
     await this.writeChain;
+  }
+
+  /** 0.211.8: read the ROTATED generation (`.prev.json`). Used only as the fallback
+   *  when the live snapshot is unreadable, so a corrupt file doesn't cost us the
+   *  retention set. Same "null for anything wrong" contract as `load`. */
+  private async loadPrevGeneration(folder: string): Promise<StructureSnapshot | null> {
+    try {
+      const path = this.prevPathFor(folder);
+      const adapter = this.app.vault.adapter;
+      if (!(await adapter.exists(path))) return null;
+      const parsed = JSON.parse(await adapter.read(path)) as StructureSnapshot;
+      if (!parsed || parsed.schema !== SCHEMA || !parsed.notes) return null;
+      return parsed;
+    } catch { return null; }
   }
 
   private prevPathFor(folder: string): string {
@@ -164,7 +229,15 @@ export class StructureSnapshotStore {
    *  disk (damaged, not deleted) and pruned once it's gone. This is what stops
    *  a frontmatter wipe from erasing its own recovery record. */
   private async mergeWithPrevious(folder: string, next: StructureSnapshot): Promise<StructureSnapshot> {
-    const prev = await this.load(folder);
+    // 0.211.8: `load()` returns null for "absent" AND for "unreadable/wrong schema"
+    // alike, and returning `next` on null threw away the RETENTION set — the entries
+    // for notes whose file still exists but which have dropped out of the tree, i.e.
+    // exactly the frontmatter-damage records this sidecar exists to hold. Worse, the
+    // caller then wrote `next` over the file, so a single unparseable snapshot
+    // permanently discarded the recovery data. Fall back to the rotated generation:
+    // it's one write behind, and its retention entries are re-validated against disk
+    // below anyway, so a stale one costs nothing.
+    const prev = await this.load(folder) ?? await this.loadPrevGeneration(folder);
     if (!prev) return next;
     const adapter = this.app.vault.adapter;
     const now = new Date().toISOString();

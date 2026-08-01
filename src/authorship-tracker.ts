@@ -51,6 +51,27 @@ export class AuthorshipTracker {
    *  them; we keep the contribution parked and retry. */
   private lastExternalModify = new Map<string, number>();
 
+  /** 0.211.6 (L9): re-key every path-keyed map when a note's file is renamed.
+   *
+   *  All four maps below are keyed by vault path, and Stashpad renames a note itself
+   *  whenever its first line changes (the auto-reslug). Without this, the rename left
+   *  the entries stranded under the OLD path: the next body edit found
+   *  `knownBodies.get(newPath) === undefined`, took the "first sighting" early return,
+   *  and silently skipped the contribution stamp — so an edit made right after a
+   *  retitle never recorded its author. The stale entries were then quietly dropped by
+   *  pruneContribMaps, which is why it never surfaced as an error.
+   *
+   *  Wired from the view's existing vault "rename" listener, alongside the same
+   *  re-keying it already does for completedState/taskTaggedState. */
+  handleRename(oldPath: string, newPath: string): void {
+    if (oldPath === newPath) return;
+    const t = this.contribTimers.get(oldPath);
+    if (t !== undefined) { this.contribTimers.set(newPath, t); this.contribTimers.delete(oldPath); }
+    for (const map of [this.knownBodies, this.recentSelfWrites, this.lastExternalModify] as Map<string, unknown>[]) {
+      if (map.has(oldPath)) { map.set(newPath, map.get(oldPath)!); map.delete(oldPath); }
+    }
+  }
+
   private static CONTRIB_DEBOUNCE_MS = 4000;
   private static CONTRIB_ACTIVE_EDITOR_BONUS_MS = 2000;
   /** 0.72.4: how long after a self-initiated processFrontMatter we

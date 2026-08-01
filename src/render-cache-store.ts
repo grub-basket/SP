@@ -161,9 +161,34 @@ export class RenderCacheStore implements RenderCacheLike {
    *  cache row is leftover plaintext — for encryption's lock / secure-delete
    *  (which permanently remove the readable note) it would silently defeat
    *  "the encrypted blob is the only surviving copy". */
+  /** 0.211.5 (M9): evicting must TOMBSTONE the path, not just delete it.
+   *
+   *  The old body returned early when the path wasn't in the map — which is exactly
+   *  the dangerous case. A lazy render started before the lock resolves afterwards and
+   *  calls set() with the full plaintext body and rendered HTML, the debounce persists
+   *  it, and the note's plaintext is back on disk in the cache after encryption
+   *  claimed the blob was the only surviving copy. Evict now always records the path,
+   *  and set() refuses to re-admit a tombstoned one.
+   *
+   *  The tombstone expires so a note that is later unlocked or recreated can cache
+   *  again without anyone having to clear it by hand. The window only needs to outlast
+   *  an in-flight render; during it the note still renders normally, it just isn't
+   *  cached. */
+  private tombstones = new Map<string, number>(); // path -> expiry (epoch ms)
+  private static readonly TOMBSTONE_MS = 60_000;
+
+  private tombstoned(path: string): boolean {
+    const until = this.tombstones.get(path);
+    if (until === undefined) return false;
+    if (Date.now() >= until) { this.tombstones.delete(path); return false; }
+    return true;
+  }
+
   evict(path: string): void {
-    if (!this.map.delete(path)) return;
+    this.tombstones.set(path, Date.now() + RenderCacheStore.TOMBSTONE_MS);
+    const had = this.map.delete(path);
     this.used.delete(path);
+    if (!had) return; // nothing persisted to rewrite, but the tombstone above stands
     this.dirty = true;
     void this.save();
   }
@@ -175,6 +200,10 @@ export class RenderCacheStore implements RenderCacheLike {
   }
   has(path: string): boolean { return this.map.has(path); }
   set(path: string, entry: RenderEntry): void {
+    // 0.211.5 (M9): refuse a tombstoned path. This is the half of the fix that
+    // actually stops the plaintext coming back — a render started before the lock
+    // resolves afterwards and lands here with the full body.
+    if (this.tombstoned(path)) return;
     this.map.set(path, entry);
     this.used.set(path, Date.now());
     this.dirty = true;

@@ -52,16 +52,35 @@ export async function spawnNextOccurrence(
   }
 }
 
-/** Close out an occurrence that ran past its interval without being done: keep it
- *  in place but mark it complete AND flagged, so it leaves the active list while
- *  staying visible as a miss. Frontmatter rather than a body prefix — it survives
- *  the user editing the text, and it can be filtered on. */
-export async function markOccurrenceMissed(app: App, file: TFile, whenMs: number): Promise<void> {
+/** Close out an occurrence that ran past its interval without being done: keep it in
+ *  place but mark it complete AND flagged, so it leaves the active list while staying
+ *  visible as a miss. Frontmatter rather than a body prefix — it survives the user
+ *  editing the text, and it can be filtered on.
+ *
+ *  0.211.6 (L10) — this is a CLAIM: it returns false when the occurrence was already
+ *  closed by the time the write ran, so the caller knows not to spawn a successor. The
+ *  previous `markOccurrenceMissed` returned void and was deliberately REPLACED rather
+ *  than kept alongside this — leaving the unconditional version exported invites a
+ *  future caller to reintroduce the duplicate-spawn race below.
+ *
+ *  The interval sweep decides whether to roll an occurrence from the metadataCache,
+ *  which lags the vault. Two sweeps in the lag window — or this device and another
+ *  one syncing — could each see the same un-completed occurrence and each spawn a
+ *  next one, leaving the user with duplicate tasks that no longer share an id.
+ *  `processFrontMatter` reads the file itself rather than the cache, so the first
+ *  writer wins and any later one observes `completed === true` and backs off. This is
+ *  the same reason `autoResolveDueTask` re-reads `due` inside its callback; the
+ *  interval branch simply never got the equivalent. */
+export async function claimOccurrenceMissed(app: App, file: TFile, whenMs: number): Promise<boolean> {
+  let claimed = false;
   await app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
+    if (fm.completed === true) return; // already closed out — don't spawn again
+    claimed = true;
     fm.completed = true;
     fm.missed = true;
     fm.missedAt = new Date(whenMs).toISOString();
   });
+  return claimed;
 }
 
 /** 0.197.0 — `repeatMode: "archive"`: the live note rolls forward as before, but a

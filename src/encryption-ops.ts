@@ -540,16 +540,28 @@ export async function deletePlaintextSubtree(
  *  minus the crypto. */
 export async function restorePlaintextDeleted(
   app: App, blobPath: string, existingIds: Set<StashpadId>,
-): Promise<{ notesWritten: number; restoredTo: string }> {
+): Promise<{ notesWritten: number; restoredTo: string; bundleKept: boolean; warnings: string[] }> {
   const zip = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
   const meta = await readDeletedMeta(app, blobPath);
   // No dek: plaintext bundles never hide their origin, so `originalFolder` (or the
   // blob's own trash-parent fallback) is always the source of truth.
   const dest = await deletedRestoreDest(app, blobPath, meta);
   const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true });
-  await app.vault.adapter.remove(blobPath);
-  try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* may not exist */ }
-  return { notesWritten: summary.notesWritten, restoredTo: dest };
+  // 0.211.6 (L3): the bundle is the ONLY copy of these notes — it was previously
+  // removed unconditionally, so an import that wrote nothing, or skipped entries,
+  // destroyed the notes it failed to restore. Since 0.211.4 a per-note write failure
+  // is a warning rather than a throw, which makes an incomplete-but-not-thrown restore
+  // a real shape. Keep the bundle unless the restore was clean and actually produced
+  // notes; a leftover bundle is a visible, retryable item in the trash view, whereas a
+  // deleted one is gone.
+  const clean = summary.notesWritten > 0 && summary.warnings.length === 0;
+  if (clean) {
+    await app.vault.adapter.remove(blobPath);
+    try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* may not exist */ }
+  } else {
+    console.warn("[Stashpad] keeping the trash bundle — restore was incomplete", blobPath, summary.warnings);
+  }
+  return { notesWritten: summary.notesWritten, restoredTo: dest, bundleKept: !clean, warnings: summary.warnings };
 }
 
 /** List plaintext trash bundles (`.stashpack`) across the given per-folder trash
@@ -718,7 +730,11 @@ export async function lockRawFolder(app: App, folder: string, dek: Uint8Array, k
     !f.endsWith(`.${STASHENC_EXT}`)
     && !f.endsWith(`.${STASHMETA_EXT}`)
     && !f.endsWith(`/${KEYFILE_NAME}`)
-    && !f.endsWith(`/${KEYFILE_NAME}.tmp`));
+    // .tmp/.bak are FolderKeystore.write's staging + rollback copies of the key file.
+    // Encrypting either would wrap the key under itself and make the folder
+    // unrecoverable, exactly as encrypting `.stashkey` would.
+    && !f.endsWith(`/${KEYFILE_NAME}.tmp`)
+    && !f.endsWith(`/${KEYFILE_NAME}.bak`));
   if (files.length === 0) throw new Error("This folder has no files to encrypt.");
   const entries: { name: string; data: ArrayBuffer }[] = [];
   const mtimes = new Map<string, number>();

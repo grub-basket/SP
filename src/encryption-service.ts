@@ -354,6 +354,13 @@ export class EncryptionService {
     for (const slot of this.folderActiveSlots(entry)) {
       try {
         const dek = await decryptStash(fromB64(slot.wrapped), password);
+        // 0.211.8: reject a wrong-length unwrap rather than caching garbage as an AES
+        // key. FolderKeystore.unlock has carried this guard since it was written, but
+        // nothing calls it — THIS is the live unlock path, and it had none. A corrupt
+        // or tampered `.stashkey` slot that happens to authenticate to the wrong number
+        // of bytes would otherwise be installed as the session key, and every
+        // subsequent encrypt in that folder would use it.
+        if (dek.length !== DEK_LEN) { dek.fill(0); continue; }
         this.folderSessionKeys.set(entry.folderPath, dek); // key the session by the OWNING folder
         const kcId = this.folderKcIdFor(entry);
         if (remember || this.isFolderRemembered(kcId)) await this.rememberFolder(kcId, password);
@@ -666,6 +673,17 @@ export class EncryptionService {
    *  "Remove all encryption" for those.) Caller MUST hard-confirm first. Returns the
    *  number of paths removed. (0.144.1) */
   async wipeLegacyKeyMaterial(): Promise<number> {
+    // REFUSE on unmigrated folders, exactly as retireLegacyKeyfile() does (0.211.3).
+    // The reversible park had this guard and the IRREVERSIBLE wipe did not, which is
+    // backwards: if a folder's key still lives only in the keyfile, parking it can be
+    // undone by moving the files back, whereas wiping destroys the only copy of that
+    // key and the folder's encrypted notes become permanently unreadable. refresh()
+    // first so the check runs against what is on disk, not a stale cache.
+    await this.refresh();
+    const unmigrated = this.unmigratedKeyfileFolders();
+    if (unmigrated.length) {
+      throw new Error(`Can't wipe the old key material — these folders' keys still live ONLY in it, and wiping cannot be undone: ${unmigrated.map((f) => f || "(vault root)").join(", ")}. Open each folder once (or change its password) to migrate it to a per-folder key, then try again.`);
+    }
     const a = this.app.vault.adapter;
     let removed = 0;
     const rm = async (p: string, dir: boolean): Promise<void> => {

@@ -649,6 +649,19 @@ export class StashpadView extends ItemView {
       for (const map of [this.completedState, this.taskTaggedState]) {
         if (map.has(oldPath)) { map.set(file.path, map.get(oldPath)!); map.delete(oldPath); }
       }
+      // 0.211.6 (L9): the authorship tracker's four path-keyed maps need the same
+      // re-key, or a body edit made straight after an auto-reslug is treated as a
+      // first sighting and its contribution stamp is silently skipped.
+      this.authorship.handleRename(oldPath, file.path);
+      // 0.211.6 (L8): the order/sort sidecar stores are keyed by FOLDER path. On a
+      // folder rename their debounced write would otherwise fire against the old
+      // path — recreating the folder the user just renamed away, and losing the
+      // reorder — and the stale cache entry could later seed a new folder created at
+      // that same path.
+      if (file instanceof TFolder) {
+        this.order.handleFolderRename(oldPath, file.path);
+        this.sortStore.handleFolderRename(oldPath, file.path);
+      }
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       this.completedState.delete(file.path);
@@ -1497,6 +1510,52 @@ export class StashpadView extends ItemView {
       }
     }
     return { notes: noteSnaps, attachments: attSnaps };
+  }
+
+  /** 0.211.6 (L1): drain any queued `parentLink`/`children` recovery writes.
+   *
+   *  `FrontmatterSyncQueue` drains in the background with a 100ms gap between writes,
+   *  so a queued write can land AFTER the encryption lock has baselined a note's
+   *  mtime. The purge then sees a newer mtime, correctly refuses to delete the note —
+   *  but the bundle has already been written, so the vault ends up holding both the
+   *  plaintext note and its encrypted copy, and restoring later produces a duplicate
+   *  subtree. Flushing before the baseline closes that window. Public so the plugin
+   *  (which owns the lock path but not the queue) can drain every open view first. */
+  async flushFrontmatterSync(): Promise<void> {
+    try { await this.fmSync.flush(); } catch { /* best effort — the mtime guard still protects the note */ }
+  }
+
+  /** 0.211.5 (M7 + M8): resolve the attachment refs a delete is about to remove into
+   *  real TFiles, dropping any that a note OUTSIDE the delete set still references.
+   *
+   *  M7: the delete paths trashed every referenced attachment with no shared-use
+   *  check, unlike the lock path and cross-folder paste which both compute
+   *  exclusivity. An image embedded in two notes was deleted with the first, silently
+   *  breaking the second.
+   *
+   *  M8: the delete loops trash the union of body embeds AND the frontmatter
+   *  `attachments:` list, but `snapshotNotes` only collects body embeds — so a
+   *  frontmatter-only attachment was trashed and never captured, and undo could not
+   *  bring it back. Returning TFiles lets the caller snapshot and trash exactly the
+   *  same set, which is the only way to keep those two in step.
+   *
+   *  Known limit: `resolvedLinks` indexes body links only, so a surviving note that
+   *  references an attachment ONLY from its frontmatter list won't register as a
+   *  sharer. Strictly better than the previous no-check behaviour; noted rather than
+   *  papered over. */
+  private async attachmentsSafeToDelete(refs: string[], deletingNotePaths: Set<string>): Promise<{ files: TFile[]; sharedSkipped: number }> {
+    const byPath = new Map<string, TFile>();
+    for (const ref of refs) {
+      const f = this.app.metadataCache.getFirstLinkpathDest(ref, "");
+      if (f) byPath.set(f.path, f);
+    }
+    const total = byPath.size;
+    const resolved = this.app.metadataCache.resolvedLinks ?? {};
+    for (const notePath of Object.keys(resolved)) {
+      if (deletingNotePaths.has(notePath)) continue; // a note being deleted isn't a sharer
+      for (const target of Object.keys(resolved[notePath] ?? {})) byPath.delete(target);
+    }
+    return { files: [...byPath.values()], sharedSkipped: total - byPath.size };
   }
 
   /** Resolve a note's TFile id-first, falling back to a captured path. Undo/redo
@@ -8370,58 +8429,14 @@ export class StashpadView extends ItemView {
     const newOldestContent = `${fmBlock}\n${newBody}\n`;
     await this.app.vault.modify(oldest.file, newOldestContent);
 
-    for (let i = 1; i < targets.length; i++) {
-      const t = targets[i];
-      if (!t.file) continue;
-      for (const c of this.tree.getChildren(t.id)) {
-        const oldParent = c.parent;
-        // If the KEPT note is itself a child of this merged-away target, it can't
-        // be re-parented to itself (changeParent refuses) — move it up to the
-        // merged-away note's own parent instead. Record ONLY moves that actually
-        // happened, else redo would replay a refused move as parent:<self>. 0.140.9
-        const dest = c.id === oldest.id ? (t.parent ?? ROOT_ID) : oldest.id;
-        const moved = await this.changeParent(c, dest, { record: false });
-        if (moved && c.file) reassignments.push({ childId: c.id, childPath: c.file.path, oldParent, newParent: dest });
-      }
-      await this.app.fileManager.trashFile(t.file);
-      await this.log.append({ type: "delete", id: t.id, payload: { mergedInto: oldest.id } });
-    }
-    // 0.56.9: focus the kept (merged) note so the user can see what was
-    // consolidated. Previously cleared selection left the user in the
-    // dark about where the data ended up.
-    this.selection.clear();
-    this.cursorIdx = -1;
-    this.pendingFocusIds = [oldest.id];
-    const keptTitle = this.titleForNode(oldest);
-    this.plugin.notifications.show({
-      message: this.bulkActionMessage({
-        verb: "Merged",
-        nodes: targets,
-        destination: `→ kept "${keptTitle}"`,
-      }),
-      kind: "success",
-      category: "merge",
-      affectedIds: targets.map((t) => t.id),
-      folder: this.noteFolder,
-    });
-    this.tree.rebuild(this.noteFolder);
-    this.render({ kind: "follow-cursor" });
-    {
-      const keptId = oldest.id;
-      const guardKey = this.selectionGuardKey;
-      const tryReselect = () => {
-        if (this.selectionGuardKey !== guardKey) return;
-        if (this.selection.has(keptId)) return;
-        const idx = this.currentChildren.findIndex((n) => n.id === keptId);
-        if (idx < 0) return;
-        this.selection.add(keptId);
-        this.cursorIdx = idx;
-        this.render({ kind: "follow-cursor" });
-      };
-      setTimeout(tryReselect, 120);
-      setTimeout(tryReselect, 400);
-    }
-
+    // 0.211.6 (L2): register undo BEFORE the destructive loop. It used to be pushed
+    // only after every sibling had been reparented and trashed, so a throw mid-loop
+    // (a failed reparent, a trash the OS refuses, a log write) left the kept note
+    // rewritten and some siblings already in the trash with NO undo entry at all —
+    // nothing in the UI could put it back. Both closures read `reassignments` and
+    // `deletedSnap` when they RUN rather than now, and restoreSnapshots skips files
+    // that still exist, so one entry is correct whether the loop finishes or stops
+    // halfway.
     const folder = this.noteFolder;
     this.plugin.getUndoStack(folder).push({
       label: `Merge ${targets.length} notes`,
@@ -8461,6 +8476,71 @@ export class StashpadView extends ItemView {
         this.render();
       },
     });
+
+    try {
+    for (let i = 1; i < targets.length; i++) {
+      const t = targets[i];
+      if (!t.file) continue;
+      for (const c of this.tree.getChildren(t.id)) {
+        const oldParent = c.parent;
+        // If the KEPT note is itself a child of this merged-away target, it can't
+        // be re-parented to itself (changeParent refuses) — move it up to the
+        // merged-away note's own parent instead. Record ONLY moves that actually
+        // happened, else redo would replay a refused move as parent:<self>. 0.140.9
+        const dest = c.id === oldest.id ? (t.parent ?? ROOT_ID) : oldest.id;
+        const moved = await this.changeParent(c, dest, { record: false });
+        if (moved && c.file) reassignments.push({ childId: c.id, childPath: c.file.path, oldParent, newParent: dest });
+      }
+      await this.app.fileManager.trashFile(t.file);
+      await this.log.append({ type: "delete", id: t.id, payload: { mergedInto: oldest.id } });
+    }
+    } catch (e) {
+      // The undo entry is already on the stack, so the user can back this out.
+      console.warn("[Stashpad] merge stopped partway", e);
+      this.tree.rebuild(folder);
+      this.render();
+      this.plugin.notifications.show({
+        message: `Merge stopped partway — ${(e as Error).message}. Press Cmd+Z to undo what did happen.`,
+        kind: "warning", category: "merge", folder,
+      });
+      return;
+    }
+    // 0.56.9: focus the kept (merged) note so the user can see what was
+    // consolidated. Previously cleared selection left the user in the
+    // dark about where the data ended up.
+    this.selection.clear();
+    this.cursorIdx = -1;
+    this.pendingFocusIds = [oldest.id];
+    const keptTitle = this.titleForNode(oldest);
+    this.plugin.notifications.show({
+      message: this.bulkActionMessage({
+        verb: "Merged",
+        nodes: targets,
+        destination: `→ kept "${keptTitle}"`,
+      }),
+      kind: "success",
+      category: "merge",
+      affectedIds: targets.map((t) => t.id),
+      folder: this.noteFolder,
+    });
+    this.tree.rebuild(this.noteFolder);
+    this.render({ kind: "follow-cursor" });
+    {
+      const keptId = oldest.id;
+      const guardKey = this.selectionGuardKey;
+      const tryReselect = () => {
+        if (this.selectionGuardKey !== guardKey) return;
+        if (this.selection.has(keptId)) return;
+        const idx = this.currentChildren.findIndex((n) => n.id === keptId);
+        if (idx < 0) return;
+        this.selection.add(keptId);
+        this.cursorIdx = idx;
+        this.render({ kind: "follow-cursor" });
+      };
+      setTimeout(tryReselect, 120);
+      setTimeout(tryReselect, 400);
+    }
+
   }
 
   // Clipboard commands — implementations live in commands/clipboard-cmds.ts.
@@ -9311,6 +9391,32 @@ export class StashpadView extends ItemView {
    *  NEVER touches the source vault: a cross-vault cut cannot transactionally
    *  delete over there, so the originals stay and the receipt notice says so. */
   private async pasteCrossVault(xv: { meta: XvMeta; zip: Uint8Array }): Promise<void> {
+    // 0.211.6 (L6): the payload is ordinary HTML on the system clipboard, so ANY web
+    // page the user copies from can craft one — and `sourceVault` is attacker-chosen
+    // text that Stashpad otherwise reports verbatim, so a page can name itself after
+    // the user's own vault and have the paste look routine. The writes themselves are
+    // already contained (safeZipEntryName blocks zip-slip, stripReserved drops
+    // Stashpad-owned frontmatter), so this is about consent, not containment: confirm
+    // the FIRST paste from a given source name, then remember it.
+    const srcName = (xv.meta.sourceVault ?? "").slice(0, 80);
+    const trusted = getSettings().trustedXvSources ?? [];
+    if (!trusted.includes(srcName)) {
+      const total0 = xv.meta.parents + xv.meta.children;
+      const ok = await new Promise<boolean>((resolve) => {
+        new ConfirmModal(
+          this.app,
+          "Paste notes from another vault?",
+          `The clipboard holds ${total0} note${total0 === 1 ? "" : "s"} claiming to come from the vault “${srcName || "(unnamed)"}”.\n\nStashpad can't verify that name — anything that can write to your clipboard, including a web page you copied from, can set it. Only continue if you just copied these notes from that vault yourself.`,
+          "Paste notes",
+          resolve,
+        ).open();
+      });
+      if (!ok) { new Notice("Paste cancelled."); return; }
+      const list = [...(this.plugin.settings.trustedXvSources ?? [])];
+      if (!list.includes(srcName)) list.push(srcName);
+      this.plugin.settings.trustedXvSources = list.slice(-20); // bounded; oldest age out
+      await this.plugin.saveSettings();
+    }
     const folder = this.noteFolder;
     const cursor = this.currentChildren[this.cursorIdx] ?? null;
     const destParent = ((cursor?.parent ?? this.focusId) ?? ROOT_ID);
@@ -9362,10 +9468,29 @@ export class StashpadView extends ItemView {
       if (xv.meta.mode === "cut") {
         // 0.201.1: ACK the cut on the clipboard — when the user switches back
         // to the source vault, ITS Stashpad offers to delete the originals.
-        const acked = xv.meta.cutToken ? writeXvAck(xv.meta.cutToken, this.app.vault.getName()) : false;
-        lines.push(acked
-          ? `The originals are still in **${xv.meta.sourceVault}**. Switch back there and Stashpad will offer to delete them.`
-          : `Cross-vault cut can't remove the originals — they still exist in "${xv.meta.sourceVault}". Delete them there if you meant to move.`);
+        //
+        // 0.211.3 — ONLY ack a COMPLETE paste. The ACK is what licenses the source
+        // vault to delete the originals, so acking a partial import destroys the only
+        // remaining copy of whatever didn't arrive. importStashZip resolves normally
+        // when it skips entries (a note with no id in its frontmatter, a missing
+        // attachment); previously any non-throwing import acked, so a paste that
+        // dropped notes still offered to delete all of them at the source.
+        //
+        // Deliberately conservative: any warning at all, or fewer notes written than
+        // the payload advertised, blocks the ACK. A false "incomplete" costs the user
+        // one manual delete in the source vault; a false "complete" costs them notes.
+        const expected = xv.meta.parents + xv.meta.children;
+        const complete = !summary.warnings.length && summary.notesWritten >= expected;
+        const acked = complete && xv.meta.cutToken
+          ? writeXvAck(xv.meta.cutToken, this.app.vault.getName())
+          : false;
+        if (acked) {
+          lines.push(`The originals are still in **${xv.meta.sourceVault}**. Switch back there and Stashpad will offer to delete them.`);
+        } else if (!complete) {
+          lines.push(`⚠️ Only ${summary.notesWritten} of ${expected} notes arrived, so Stashpad will **not** offer to delete the originals in **${xv.meta.sourceVault}** — they're your only copy of what's missing. Check what landed here before removing anything there.`);
+        } else {
+          lines.push(`Cross-vault cut can't remove the originals — they still exist in "${xv.meta.sourceVault}". Delete them there if you meant to move.`);
+        }
       }
       if (summary.warnings.length) lines.push(`${summary.warnings.length} entr${summary.warnings.length === 1 ? "y was" : "ies were"} skipped (see console).`);
       this.plugin.notifications.show({
@@ -9373,8 +9498,13 @@ export class StashpadView extends ItemView {
         kind: "success", category: "clone", affectedIds: newIds, folder, duration: 0,
       });
     } catch (e) {
+      // 0.211.4 (F6): don't claim "nothing was changed" — an import can fail after it
+      // has already written notes, and telling the user their vault is untouched when
+      // it isn't is worse than admitting uncertainty. Per-note write failures are
+      // warnings now rather than throws, so reaching here means the failure was
+      // earlier/structural, but a partial write is still possible.
       console.warn("[Stashpad] cross-vault paste failed", e);
-      new Notice("Cross-vault paste failed — nothing was changed. See console for details.");
+      new Notice("Cross-vault paste failed. Some notes may already have been written — check this folder before pasting again, and don't delete the originals in the source vault yet. See console for details.", 12000);
     } finally {
       progress.hide();
     }
@@ -11648,9 +11778,21 @@ export class StashpadView extends ItemView {
         const snap = await this.snapshotNotes(allNotes, alsoAtts);
         let attsRemoved = 0;
         if (alsoAtts) {
-          for (const p of uniqueAtts) {
-            const f = this.app.metadataCache.getFirstLinkpathDest(p, "");
-            if (f) {
+          // 0.211.5 (M7/M8): trash only attachments no surviving note references, and
+          // make sure every file we trash is in the snapshot undo restores from.
+          const deletingPaths = new Set(allNotes.map((n) => n.file?.path).filter((p): p is string => !!p));
+          const { files: attFiles, sharedSkipped } = await this.attachmentsSafeToDelete(uniqueAtts, deletingPaths);
+          const inSnap = new Set(snap.attachments.map((a) => a.path));
+          for (const f of attFiles) {
+            if (inSnap.has(f.path)) continue;
+            try { snap.attachments.push({ path: f.path, data: await this.app.vault.readBinary(f) }); inSnap.add(f.path); }
+            catch { /* unreadable — trashing it below would be unrecoverable, so skip it */ }
+          }
+          if (sharedSkipped > 0) {
+            new Notice(`Kept ${sharedSkipped} attachment${sharedSkipped === 1 ? "" : "s"} — still used by ${sharedSkipped === 1 ? "another note" : "other notes"}.`, 7000);
+          }
+          for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
+            {
               try {
                 await this.app.fileManager.trashFile(f);
                 await this.log.append({ type: "attachment_remove", id: ROOT_ID, payload: { path: f.path } });
@@ -11724,6 +11866,16 @@ export class StashpadView extends ItemView {
         // Shared restore — used by both the notification's Undo button and
         // the undo stack; guarded so a double-fire is a no-op.
         let restored = false;
+        // 0.211.4 (M1): the toast's Undo and the undo-stack entry are two independent
+        // controllers of one restore, and they only shared a boolean. Pressing the
+        // toast's Undo left the stack entry in place, so a later Ctrl+Z silently
+        // no-opped (the flag was set) while the stack still advanced, and the matching
+        // Ctrl+Shift+Z reset the flag and re-trashed the note — by then live and
+        // possibly edited. A further Ctrl+Z then restored the stale pre-delete
+        // snapshot, losing every edit made since. Once the toast restores, the entry is
+        // neutralised: its undo and redo both become no-ops, because the toast has
+        // taken the operation out of the stack's hands and the pairing no longer holds.
+        let handledOutOfBand = false;
         const doRestore = async () => {
           if (restored) return; restored = true;
           this.selection.clear();
@@ -11743,12 +11895,26 @@ export class StashpadView extends ItemView {
           affectedIds: targets.map((t) => t.id),
           affectedAuthorIds: deletedAuthorIds,
           folder: this.noteFolder,
-          actions: [{ label: "Undo delete", onClick: () => void doRestore() }],
+          actions: [{ label: "Undo delete", onClick: () => { handledOutOfBand = true; void doRestore(); } }],
         });
         this.plugin.getUndoStack(folder).push({
           label: `Delete ${targets.length} note${targets.length === 1 ? "" : "s"}`,
-          undo: async () => { await doRestore(); },
+          undo: async () => { if (handledOutOfBand) return; await doRestore(); },
           redo: async () => {
+            if (handledOutOfBand) return;
+            // Defence in depth alongside the handledOutOfBand guard: never re-trash a
+            // note whose content has diverged from the snapshot this redo would undo.
+            // Trashing it would discard edits the snapshot cannot restore.
+            for (const n of snap.notes) {
+              const f = this.app.vault.getAbstractFileByPath(n.path) as TFile | null;
+              if (!f) continue;
+              let cur: string | null = null;
+              try { cur = await this.app.vault.read(f); } catch { cur = null; }
+              if (cur !== null && cur !== n.content) {
+                new Notice("Didn't redo the delete — one of those notes has been edited since. Delete it again if you meant to.", 8000);
+                return;
+              }
+            }
             this.selection.clear();
             this.cursorIdx = -1;
             restored = false;
@@ -11846,6 +12012,12 @@ export class StashpadView extends ItemView {
     if (surface === "split" && body.trim().length < 2) { new Notice("Note is too short to split."); return; }
     const originalContent = md;
     const originalPath = file.path;
+    // 0.211.4 (H6): undo/redo closures below run long after this point, and Stashpad
+    // auto-renames a note ~30s after its first line changes. Capture the stable id so
+    // those closures can resolve the note via fileForNote() instead of the stale path
+    // — a path-only lookup returns null after the reslug, and the undo then trashed
+    // the split-off half while never restoring the original's pre-split body.
+    const originalId = target.id;
     // 0.170.0: Edit-surface Save — write the edited body back to the note (frontmatter
     // preserved), as one undo entry.
     const performEdit = async (newBody: string): Promise<void> => {
@@ -11905,16 +12077,20 @@ export class StashpadView extends ItemView {
       const folder = this.noteFolder;
       this.plugin.getUndoStack(folder).push({
         label: "Edit note",
+        // 0.211.4: same stale-path class as H6. A save can trigger an auto-reslug, so
+        // by the time undo runs the note may sit at neither finalPath nor originalPath;
+        // a path-only lookup then silently no-ops while the undo stack advances, and
+        // the user's edit is unrecoverable through undo. Resolve id-first.
         undo: async () => {
-          let f = this.app.vault.getAbstractFileByPath(finalPath) as TFile | null;
-          if (f && finalPath !== originalPath) { try { await this.app.fileManager.renameFile(f, originalPath); } catch { /* ignore */ } }
-          f = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
-          if (f) await this.app.vault.modify(f, originalContent);
+          const f = this.fileForNote(target.id, finalPath) ?? this.fileForNote(target.id, originalPath);
+          if (!f) { new Notice("Can't undo the edit — that note was moved or deleted."); return; }
+          if (f.path !== originalPath) { try { await this.app.fileManager.renameFile(f, originalPath); } catch { /* ignore */ } }
+          await this.app.vault.modify(f, originalContent);
           this.tree.rebuild(folder); this.render();
         },
         redo: async () => {
-          const f = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
-          if (f) { await this.app.vault.modify(f, newContent); if (finalPath !== originalPath) { try { await this.app.fileManager.renameFile(f, finalPath); } catch { /* ignore */ } } }
+          const f = this.fileForNote(target.id, originalPath);
+          if (f) { await this.app.vault.modify(f, newContent); if (f.path !== finalPath) { try { await this.app.fileManager.renameFile(f, finalPath); } catch { /* ignore */ } } }
           this.tree.rebuild(folder); this.render();
         },
       });
@@ -11974,19 +12150,31 @@ export class StashpadView extends ItemView {
           label: "Split note",
           undo: async () => {
             // Trash the new note, restore the original's full body.
+            // 0.211.4 (H6): resolve the original FIRST and bail if it's gone. Undo is
+            // only safe as a pair — trashing the split-off half without restoring the
+            // original's full body destroys part two outright. Both lookups go through
+            // fileForNote so an auto-reslug rename since the split doesn't strand them.
+            const of = this.fileForNote(originalId, originalPath);
+            if (!of) { new Notice("Can't undo the split — the original note was moved or deleted. The split-off note was left in place."); return; }
             if (newPath) {
-              const nf = this.app.vault.getAbstractFileByPath(newPath) as TFile | null;
+              const nf = this.fileForNote(newId, newPath);
               if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
             }
-            const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
-            if (of) await this.app.vault.modify(of, originalContent);
+            await this.app.vault.modify(of, originalContent);
             this.tree.rebuild(folder);
             this.render();
           },
           redo: async () => {
-            const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
+            const of = this.fileForNote(originalId, originalPath);
             if (of) await this.app.vault.modify(of, newOriginal);
-            if (newPath && newContentForRedo && !(await this.app.vault.adapter.exists(newPath))) {
+            // 0.211.6 (L4): a path check alone isn't enough. The split-off note
+            // reslugs when its first line changes, so it can be alive at a DIFFERENT
+            // path — the path lookup then misses and redo creates a second file
+            // carrying the same id. restoreSnapshots already guards this way; match
+            // it. Recreate only when the id is genuinely absent from the tree.
+            if (newPath && newContentForRedo
+              && !(newId && this.tree.get(newId))
+              && !(await this.app.vault.adapter.exists(newPath))) {
               await this.app.vault.create(newPath, newContentForRedo);
             }
             this.tree.rebuild(folder);
@@ -12043,19 +12231,29 @@ export class StashpadView extends ItemView {
         this.plugin.getUndoStack(folder).push({
           label: `Split note into ${parts.length}`,
           undo: async () => {
+            // 0.211.4 (H6): fail closed — resolve the original before trashing any of
+            // the parts, or an undo after the original was renamed/removed would delete
+            // every split-off part while restoring nothing. Parts resolve id-first too
+            // (id parsed from the filename), since they reslug on their own first line.
+            const of = this.fileForNote(originalId, originalPath);
+            if (!of) { new Notice("Can't undo the split — the original note was moved or deleted. The split-off notes were left in place."); return; }
             for (const { path } of created) {
-              const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+              const nf = this.fileForNote(parseIdFromFilename(path.split("/").pop()!.replace(/\.md$/, "")), path);
               if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
             }
-            const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
-            if (of) await this.app.vault.modify(of, originalContent);
+            await this.app.vault.modify(of, originalContent);
             this.tree.rebuild(folder);
             this.render();
           },
           redo: async () => {
-            const of = this.app.vault.getAbstractFileByPath(originalPath) as TFile | null;
+            const of = this.fileForNote(originalId, originalPath);
             if (of) await this.app.vault.modify(of, newOriginal);
+            // 0.211.6 (L4): id-first check, same reasoning as the single-split redo —
+            // a part that reslugged is alive at a different path, and a path-only test
+            // would mint a duplicate carrying the same id.
             for (const { path, content } of created) {
+              const partId = parseIdFromFilename(path.split("/").pop()!.replace(/\.md$/, ""));
+              if (partId && this.tree.get(partId)) continue;
               if (!(await this.app.vault.adapter.exists(path))) await this.app.vault.create(path, content);
             }
             this.tree.rebuild(folder);
@@ -13109,9 +13307,22 @@ export class StashpadView extends ItemView {
       const snap = await this.snapshotNotes(all, alsoAtts);
       let attsRemoved = 0;
       if (alsoAtts) {
-        for (const p of uniqueAtts) {
-          const f = this.app.metadataCache.getFirstLinkpathDest(p, "");
-          if (f) {
+        // 0.211.5 (M7/M8): same exclusivity + snapshot-parity fix as the bulk delete —
+        // see attachmentsSafeToDelete. Don't trash an attachment a surviving note still
+        // uses, and never trash one the undo snapshot doesn't hold.
+        const deletingPaths = new Set(all.map((n) => n.file?.path).filter((p): p is string => !!p));
+        const { files: attFiles, sharedSkipped } = await this.attachmentsSafeToDelete(uniqueAtts, deletingPaths);
+        const inSnap = new Set(snap.attachments.map((a) => a.path));
+        for (const f of attFiles) {
+          if (inSnap.has(f.path)) continue;
+          try { snap.attachments.push({ path: f.path, data: await this.app.vault.readBinary(f) }); inSnap.add(f.path); }
+          catch { /* unreadable — skip rather than trash something undo can't restore */ }
+        }
+        if (sharedSkipped > 0) {
+          new Notice(`Kept ${sharedSkipped} attachment${sharedSkipped === 1 ? "" : "s"} — still used by ${sharedSkipped === 1 ? "another note" : "other notes"}.`, 7000);
+        }
+        for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
+          {
             try {
               await this.app.fileManager.trashFile(f);
               await this.log.append({ type: "attachment_remove", id: ROOT_ID, payload: { path: f.path } });
@@ -13183,7 +13394,11 @@ export class StashpadView extends ItemView {
         : "";
       // 0.79.11: persistent delete toast with a shared Undo (button +
       // undo stack), single-fire guarded.
+      // 0.211.4 (M1): same two-controllers-one-boolean defect as the bulk delete above
+      // — see the comment there. Restoring via the toast neutralises the stack entry,
+      // and redo additionally refuses to re-trash a note edited since the snapshot.
       let restored = false;
+      let handledOutOfBand = false;
       const doRestore = async () => {
         if (restored) return; restored = true;
         this.selection.clear();
@@ -13198,12 +13413,23 @@ export class StashpadView extends ItemView {
         affectedIds: [node.id],
         affectedAuthorIds: deletedAuthorIds,
         folder: this.noteFolder,
-        actions: [{ label: "Undo delete", onClick: () => void doRestore() }],
+        actions: [{ label: "Undo delete", onClick: () => { handledOutOfBand = true; void doRestore(); } }],
       });
       this.plugin.getUndoStack(folder).push({
         label,
-        undo: async () => { await doRestore(); },
+        undo: async () => { if (handledOutOfBand) return; await doRestore(); },
         redo: async () => {
+          if (handledOutOfBand) return;
+          for (const n of snap.notes) {
+            const f = this.app.vault.getAbstractFileByPath(n.path) as TFile | null;
+            if (!f) continue;
+            let cur: string | null = null;
+            try { cur = await this.app.vault.read(f); } catch { cur = null; }
+            if (cur !== null && cur !== n.content) {
+              new Notice("Didn't redo the delete — that note has been edited since. Delete it again if you meant to.", 8000);
+              return;
+            }
+          }
           this.selection.clear();
           this.cursorIdx = -1;
           restored = false;

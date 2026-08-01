@@ -89,27 +89,70 @@ export class FolderKeystore {
     try { return await this.a.exists(this.keyPath(folder)); } catch { return false; }
   }
 
-  /** Atomic write: temp file then rename over the target (safe on network drives /
-   *  a crash mid-write corrupts only the temp). Falls back to a direct write if the
-   *  adapter has no rename. Mirrors KeyfileStore.save (0.140.18). */
+  /** Atomic write: temp file, READ-BACK VERIFY, then rename over the target (safe on
+   *  network drives / a crash mid-write corrupts only the temp). Mirrors
+   *  KeyfileStore.save (0.140.18). Throws if the key could not be persisted intact —
+   *  callers must not treat a failure here as success, because the caller's next act
+   *  is usually to encrypt content against this key.
+   *
+   *  0.211.3 — this file is the ONLY copy of a folder's wrapped key. Losing it makes
+   *  every encrypted note in the folder permanently unreadable, so the ordering rules
+   *  are strict:
+   *
+   *  1. NEVER remove the existing key file before a replacement is confirmed on disk.
+   *     The old fallback did `remove(path)` then `rename(tmp, path)`; a crash, a
+   *     network-drive stall or a permissions error in that window left the folder with
+   *     NO key file at all. Where rename-over-existing isn't supported we now write
+   *     straight over the path instead — `adapter.write` truncates and writes in one
+   *     step, so there is no moment when the key is simply absent.
+   *  2. Keep a `.stashkey.bak` of the previous good key across the overwrite, and
+   *     restore from it if the final read-back doesn't match. That covers the case
+   *     rule 1 can't: a write that starts, truncates, and then fails.
+   *  3. Verify by reading back and comparing bytes, both for the temp and for the
+   *     final file. A silently truncated write is the failure mode that matters here,
+   *     and only a compare catches it. */
   async write(folder: string, sk: StashKey): Promise<void> {
     const path = this.keyPath(folder);
     const body = JSON.stringify(sk, null, 2);
     const tmp = `${path}.tmp`;
-    let wrote = false;
+    const bak = `${path}.bak`;
+
+    // Stage into the temp file and prove it landed intact BEFORE touching the target.
     try {
       await this.a.write(tmp, body);
-      try {
-        await this.a.rename(tmp, path);
-      } catch {
-        try { await this.a.remove(path); } catch { /* may not exist */ }
-        await this.a.rename(tmp, path);
+      if ((await this.a.read(tmp)) !== body) throw new Error("verify failed");
+    } catch (e) {
+      try { if (await this.a.exists(tmp)) await this.a.remove(tmp); } catch { /* best-effort */ }
+      throw new Error(`Couldn't stage the folder key file (${path}): ${(e as Error).message}. Nothing was changed.`);
+    }
+
+    // Preserve the previous good key so a failed overwrite is recoverable.
+    let hadPrev = false;
+    try {
+      if (await this.a.exists(path)) {
+        const prev = await this.a.read(path);
+        if (prev) { await this.a.write(bak, prev); hadPrev = true; }
       }
-      wrote = true;
-    } catch {
+    } catch { /* best-effort — a missing backup must not block the write */ }
+
+    let placed = false;
+    try { await this.a.rename(tmp, path); placed = true; }
+    catch {
+      // rename-over-existing is unsupported by some adapters. Write over the target
+      // directly rather than removing it first — see rule 1 above.
+      try { await this.a.write(path, body); placed = true; } catch { /* verified below */ }
       try { if (await this.a.exists(tmp)) await this.a.remove(tmp); } catch { /* best-effort */ }
     }
-    if (!wrote) await this.a.write(path, body);
+
+    // Final read-back. If the target is wrong, put the old key back rather than
+    // leaving the folder with a truncated or absent key file.
+    let ok = false;
+    try { ok = placed && (await this.a.read(path)) === body; } catch { ok = false; }
+    if (!ok) {
+      if (hadPrev) { try { await this.a.write(path, await this.a.read(bak)); } catch { /* nothing more we can do */ } }
+      throw new Error(`Couldn't write the folder key file (${path}). ${hadPrev ? "The previous key was restored." : "No key file was created."} Don't encrypt this folder until this is resolved.`);
+    }
+    try { if (await this.a.exists(bak)) await this.a.remove(bak); } catch { /* harmless leftover */ }
   }
 
   /** Delete a folder's key file (used by remove-encryption). Swallows "not found". */

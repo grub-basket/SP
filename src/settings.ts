@@ -595,6 +595,11 @@ export interface StashpadSettings {
   /** Keys (`<id>@<dueRaw>`) of task due-reminders already fired, so they don't
    *  re-fire on every launch. Bounded; pruned when it grows. */
   notifiedDueKeys: string[];
+  /** 0.211.6 (L6): vault names the user has accepted a cross-vault clipboard payload
+   *  from. The payload is just HTML on the system clipboard, so ANY web page can craft
+   *  one and set `sourceVault` to whatever it likes — including the user's own vault
+   *  name. The first paste from a given name asks for confirmation; later ones don't. */
+  trustedXvSources: string[];
   /** 0.140.0: last-fired ms per task id for PERSISTENT reminders (`remindEvery`)
    *  — so a persistent task re-notifies on its interval, not once. */
   persistReminderLog?: Record<string, number>;
@@ -722,6 +727,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   mutedNotificationCategories: [],
   notificationHistoryLimit: 5000,
   notifiedDueKeys: [],
+  trustedXvSources: [],
   splitCheckboxLines: true,
   autoNavOnMoveIn: false,
   openParentTabOnMoveIn: true,
@@ -2017,9 +2023,15 @@ export class StashpadSettingTab extends PluginSettingTab {
           phrase: "DELETE KEY MATERIAL",
           confirmText: "Permanently delete",
           onConfirm: async () => {
-            const n = await enc.wipeLegacyKeyMaterial();
-            new Notice(n > 0 ? `Permanently deleted the old key material (${n} item${n === 1 ? "" : "s"}). Not recoverable.` : "No old key material found to delete.", 9000);
-            this.update?.();
+            // 0.211.3: the wipe now REFUSES when a folder's key still lives only in
+            // the old keyfile. Surface that refusal — without the catch it would be an
+            // unhandled rejection and the user would see nothing happen at all, having
+            // just typed a confirmation phrase.
+            try {
+              const n = await enc.wipeLegacyKeyMaterial();
+              new Notice(n > 0 ? `Permanently deleted the old key material (${n} item${n === 1 ? "" : "s"}). Not recoverable.` : "No old key material found to delete.", 9000);
+              this.update?.();
+            } catch (e) { new Notice((e as Error).message, 12000); }
           },
         }).open();
       };
