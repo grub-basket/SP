@@ -16,7 +16,7 @@ import { spawnNextOccurrence, archiveOccurrenceSnapshot } from "./recurrence-spa
 import { OrderStore } from "./order-store";
 import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
-import { buildFileActions } from "./notifications";
+import { buildFileActions, boldFragment } from "./notifications";
 import { newId } from "./id-service";
 import { seedDemoContent } from "./demo-content";
 import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, stripInlineMarkdown, DEFAULT_STOPWORDS } from "./slug-service";
@@ -351,6 +351,11 @@ export class StashpadView extends ItemView {
    *  final pick / first-by-order when unset. */
   private activeVersionByGroup = new Map<string, StashpadId>();
   private focusComposerOnNextRender = false;
+  /** 0.213.0: vault paths of attachments THIS composer wrote during the current
+   *  compose (drop / paste / paperclip). Lets a send to another folder tell
+   *  "staged for this note" apart from "a link the user pasted", which decides
+   *  whether the file may be carried along. Cleared on every submit. */
+  private composerCreatedAttachments = new Set<string>();
   /** 0.76.21: timestamp until which the activation auto-focus
    *  (focusComposer) is suppressed. Set after actions that close a
    *  modal and re-activate the leaf (e.g. Split) — the leaf
@@ -911,7 +916,14 @@ export class StashpadView extends ItemView {
     while (this.syncBurstTimes.length && this.syncBurstTimes[0] < cutoff) this.syncBurstTimes.shift();
     if (!this.autoSyncDeferActive && this.syncBurstTimes.length >= 6) {
       this.autoSyncDeferActive = true;
-      this.autoSyncNotice = new Notice("Stashpad: syncing — list updates paused until it settles…", 0);
+      // 0.214.1: this said "syncing", but all deferDuringSyncBurst actually
+      // knows is that >= 6 file-change events landed inside 2 seconds. Obsidian
+      // Sync produces that, and so does an import, a bulk paste, a folder move,
+      // another plugin writing, a re-index, or a local deploy with Obsidian
+      // open. Claiming Sync sent people looking at their Sync settings for a
+      // problem that wasn't there. Describe the observation, not a guess at the
+      // cause.
+      this.autoSyncNotice = new Notice("Stashpad: lots of files are changing — list updates paused until it settles…", 0);
     }
     if (!this.autoSyncDeferActive) return false;
     if (this.autoSyncSettleTimer != null) window.clearTimeout(this.autoSyncSettleTimer);
@@ -3545,6 +3557,11 @@ export class StashpadView extends ItemView {
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Copy").setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopy()));
     menu.addItem((it: any) => it.setTitle("Copy tree").setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
+    // 0.214.0: plain Copy/Cut no longer build the cross-vault payload, so these
+    // are the way notes travel between vaults — they need to be findable here,
+    // not only in the command palette.
+    menu.addItem((it: any) => it.setTitle("Copy for another vault").setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopyForOtherVault()));
+    menu.addItem((it: any) => it.setTitle("Cut for another vault").setIcon("scissors").setDisabled(!hasTargets).onClick(() => void this.cmdCutForOtherVault()));
     menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").setDisabled(!hasTargets).onClick(() => void this.cmdClone()));
     // 0.155.1: Share & export ▸ — same submenu as the desktop context menu (the
     // ⚡ menu previously had no copy-link/export). Copy-link targets the primary
@@ -6013,8 +6030,24 @@ export class StashpadView extends ItemView {
         ta.value = ta.value + appended;
         this.composerDraft = ta.value;
         void this.saveDraft(ta.value);
+        const caret = ta.value.length;
         ta.focus();
-        ta.setSelectionRange(ta.value.length, ta.value.length);
+        ta.setSelectionRange(caret, caret);
+        // 0.212.2: the focus above is not enough on its own. importAttachment
+        // writes the file into <stashpad>/_attachments, and that vault create
+        // event drives a re-render which REBUILDS the composer textarea — so
+        // `ta` becomes a detached node and the focus lands on nothing. The text
+        // survived (the new textarea seeds from composerDraft, saved above),
+        // which is exactly why this read as "the image attaches but I still
+        // have to click into the composer".
+        //
+        // Claim the cross-render focus restore as well, so whichever order the
+        // render lands in, the LIVE textarea ends up focused with the caret at
+        // the end. Deliberately NOT focusComposer() — that self-gates on the
+        // focusComposerOnOpen setting, and a drop is a direct user action in
+        // the composer, not the on-open autofocus that setting governs.
+        this.focusComposerOnNextRender = true;
+        this.pendingComposerCaret = caret;
       }
     };
 
@@ -6302,6 +6335,21 @@ export class StashpadView extends ItemView {
       this.autoSelectNewest = !remote;
       this.scrollToBottomOnNextRender = !remote;
       const createOpts = remote ? { targetFolder: destFolder } : undefined;
+      // 0.213.0: an attachment added from THIS folder's composer was already
+      // written to <this.noteFolder>/_attachments by importAttachment — that
+      // happens at drop/paste time, before the destination is known. If the
+      // send then goes somewhere else, the note lands in destFolder while its
+      // attachment stays behind, and deleting this folder breaks the note.
+      //
+      // Fix it HERE, at creation, because this is the one moment where the
+      // ownership question has an unambiguous answer: the attachment was just
+      // created for a note that does not exist yet, so it has exactly ONE
+      // referent and there is no competing claim to weigh. (The general
+      // shared-attachment case is genuinely unresolvable by rule and is
+      // handled by reporting, not moving — see rehomeStrayAttachments.)
+      const sendText = remote && destFolder
+        ? await this.rehomeComposerAttachments(text, destFolder)
+        : text;
       // Bind the parent ONCE, here at submit time. A split otherwise reads
       // this.focusId on each per-note await, so navigating mid-paste reparents
       // the remaining notes into whatever level you moved to (the "looks
@@ -6309,15 +6357,20 @@ export class StashpadView extends ItemView {
       // the level we're submitting from.
       const parent = dest ?? this.focusId;
       if (split) {
-        const lines = splitIntoChunks(text, getSettings().splitMode);
+        const lines = splitIntoChunks(sendText, getSettings().splitMode);
         if (lines.length === 1) {
           await this.createNoteUnder(lines[0], parent, createOpts);
         } else if (lines.length > 1) {
-          await this.createNotesBatch(lines, parent, createOpts, text, remote ? destFolder : this.noteFolder);
+          await this.createNotesBatch(lines, parent, createOpts, sendText, remote ? destFolder : this.noteFolder);
         }
       } else {
-        await this.createNoteUnder(text, parent, createOpts);
+        await this.createNoteUnder(sendText, parent, createOpts);
       }
+      // 0.213.0: this compose is over — whatever it staged now belongs to the
+      // note that was just created. Not clearing would let a stale path be
+      // treated as "staged by this composer" on a later send and get moved out
+      // from under the note now using it.
+      this.composerCreatedAttachments.clear();
       // Keep focus in the composer so the user can keep typing without
       // re-clicking — unless the user disabled this in settings.
       if (getSettings().autofocusComposerAfterSend) {
@@ -6925,6 +6978,10 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.copyNotes) && !window.getSelection()?.toString()) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyNotes(); return; }
       if (matchBinding(e, sb.cutNotes) && !window.getSelection()?.toString()) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCutNotes(); return; }
       // (pasteNotes is handled above the block — it doesn't need a target.)
+      // 0.214.0: explicit cross-vault copy/cut. No default chord (both are
+      // deliberate, occasional actions) — bindable in settings if wanted.
+      if (matchBinding(e, sb.copyForOtherVault)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyForOtherVault(); return; }
+      if (matchBinding(e, sb.cutForOtherVault)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCutForOtherVault(); return; }
       if (matchBinding(e, sb.copyTree)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyTree(); return; }
       if (matchBinding(e, sb.copyLink)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyStashpadLink(); return; }
       if (matchBinding(e, sb.copyOutline)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyOutline(); return; }
@@ -9252,12 +9309,15 @@ export class StashpadView extends ItemView {
     }
     if (r.status === "too-big") { this.offerExportForOversize(r.mb ?? "?"); return; }
     // failed / empty: the plain-text copy still happened; only cross-vault won't work.
-    new Notice(
-      `Couldn't prepare the cross-vault ${verb} — pasting into ANOTHER vault won't work this time. ` +
-      `The plain text is on the clipboard, and pasting within this vault still works. ` +
-      `(Use Share/Export → .stash file as the reliable route for this selection.)`,
-      0,
-    );
+    // 0.214.1: through the service, not a plain Notice — a FAILED cross-vault
+    // prepare is exactly the kind of event the notification history exists for,
+    // and a plain Notice never reaches it.
+    this.plugin.notifications.show({
+      message: `Couldn't prepare the cross-vault ${verb} from **${this.app.vault.getName()}** — pasting into ANOTHER vault won't work this time. `
+        + `The plain text is on the clipboard, and pasting within **${this.app.vault.getName()}** still works. `
+        + `(Use Share/Export → .stash file as the reliable route for this selection.)`,
+      kind: "error", category: "system", folder: this.noteFolder, duration: 0,
+    });
   }
 
   async cmdCopyNotes(): Promise<void> {
@@ -9267,15 +9327,61 @@ export class StashpadView extends ItemView {
     this.plugin.clearNoteClipboard(); // drop any prior cut/copy (+ its notice)
     this.plugin.noteClipboard = { mode: "copy", folder: this.noteFolder, ids: targets.map((t) => t.id) };
     this.render(); // paint the .is-copy-pending tint
-    // 0.201.0: add the hidden cross-vault payload alongside the plain text
-    // cmdCopy just wrote. Read that text back so both flavors carry the same
-    // string (best-effort; failure leaves the plain-text-only clipboard).
+    // 0.214.0: the cross-vault payload is NO LONGER stamped here. Building it
+    // reads every note and attachment in the selection (stash-package
+    // buildStashZip) and that cost was paid on EVERY copy, for a feature used
+    // occasionally — punishing on a large selection or a network drive. It is
+    // now an explicit action: cmdCopyForOtherVault. Same-vault copy/paste is
+    // unaffected and is what this command is for.
+    //
+    // 0.214.2: unless the user opts back in. On a fast machine the read cost is
+    // unnoticeable and always-on is more convenient than remembering a second
+    // command, so the old behaviour is available as a setting.
+    if (getSettings().alwaysStampCrossVault) await this.stampForOtherVault(targets.map((t) => t.id), "copy");
+  }
+
+  /** 0.214.0: copy AND stamp the cross-vault clipboard payload — the deliberate
+   *  version of what plain copy used to do implicitly on every invocation.
+   *
+   *  The payload is a .stash zip of the whole selected subtree, built by reading
+   *  every note and attachment in it, so it is the expensive part of a copy. Now
+   *  you only pay it when you actually intend to paste into another vault. */
+  async cmdCopyForOtherVault(): Promise<void> {
+    const targets = this.getActionTargets();
+    if (!targets.length) { new Notice("Nothing to copy."); return; }
+    await this.cmdCopyNotes();
+    // cmdCopyNotes already stamped if the always-on setting is enabled.
+    if (!getSettings().alwaysStampCrossVault) await this.stampForOtherVault(targets.map((t) => t.id), "copy");
+  }
+
+  /** 0.214.0: cut AND stamp for another vault. The cut half also arms the ACK
+   *  handshake (pendingXvCut), which is what later offers to delete the
+   *  originals here once the other vault confirms the paste — so a cross-vault
+   *  MOVE has to go through this command, not plain cut. */
+  async cmdCutForOtherVault(): Promise<void> {
+    const targets = this.getActionTargets();
+    if (!targets.length) { new Notice("Nothing to cut."); return; }
+    await this.cmdCutNotes();
+    if (!getSettings().alwaysStampCrossVault) await this.stampForOtherVault(targets.map((t) => t.id), "cut");
+  }
+
+  /** Shared tail of the two "for another vault" commands: re-read the plain text
+   *  the copy/cut just put on the clipboard so both flavors carry the same
+   *  string, then attach the hidden payload alongside it. */
+  private async stampForOtherVault(ids: StashpadId[], mode: "copy" | "cut"): Promise<void> {
+    let plain = "";
     try {
       const req = (window as unknown as { require?: (m: string) => { clipboard?: { readText?: () => string } } }).require;
-      const plain = req?.("electron")?.clipboard?.readText?.() ?? "";
-      if (plain) void this.plugin.stampCrossVaultClipboard(this.noteFolder, targets.map((t) => t.id), "copy", plain)
-        .then((r) => this.reportXvStamp(r, "copy"));
-    } catch { /* plain text copy already succeeded */ }
+      plain = req?.("electron")?.clipboard?.readText?.() ?? "";
+    } catch { /* fall through — reported below */ }
+    if (!plain) { this.reportXvStamp({ status: "failed" }, mode); return; }
+    const notice = new Notice(`Preparing ${ids.length} note${ids.length === 1 ? "" : "s"} for another vault…`, 0);
+    try {
+      const r = await this.plugin.stampCrossVaultClipboard(this.noteFolder, ids, mode, plain);
+      this.reportXvStamp(r, mode);
+    } finally {
+      notice.hide();
+    }
   }
 
   /** True when `id` is on a pending CUT in THIS folder — drives the ghosted
@@ -9333,10 +9439,13 @@ export class StashpadView extends ItemView {
     this.plugin.clearNoteClipboard(); // drop any prior cut/copy (+ its notice)
     this.plugin.noteClipboard = { mode: "cut", folder: this.noteFolder, ids: targets.map((t) => t.id), text: cutText };
     this.render(); // paint the ghosted .is-cut-pending rows immediately
+    // 0.214.0: no cross-vault stamp here either — see cmdCopyNotes. A
+    // cross-vault MOVE goes through cmdCutForOtherVault, which also arms the
+    // ACK handshake that later offers to delete the originals. 0.214.2: honoured
+    // here too when the user has opted into always stamping.
+    if (getSettings().alwaysStampCrossVault) void this.stampForOtherVault(targets.map((t) => t.id), "cut");
     // Persistent: a pending cut is a MODE — the user should see it until they
     // paste or cancel (Escape). Stored so it can be dismissed on resolve.
-    void this.plugin.stampCrossVaultClipboard(this.noteFolder, targets.map((t) => t.id), "cut", cutText) // 0.201.0
-      .then((r) => this.reportXvStamp(r, "cut"));
     // 0.199.x tidy-up: structured, line-per-part message — count of parents
     // (+ their children), a short bulleted list, then the how-to lines.
     const childCount = targets.reduce((n, t) => n + this.countDescendants(t.id), 0);
@@ -9363,7 +9472,7 @@ export class StashpadView extends ItemView {
     new ConfirmModal(
       this.app,
       "Selection too large for the clipboard",
-      `This selection is ${mb} MB with attachments — too big to carry on the clipboard for cross-vault paste.\nThe normal text copy still worked; only the cross-vault payload was skipped.\nTo move this much between vaults, export it as a .stash file (optionally encrypted) and import it in the other vault.`,
+      `This selection is ${mb} MB with attachments — too big to carry on the clipboard for cross-vault paste.\nThe normal text copy still worked; only the cross-vault payload was skipped.\nTo move this much out of **${this.app.vault.getName()}**, export it as a .stash file (optionally encrypted) and import it in the destination vault.`,
       "Open the export modal",
       (confirmed) => { if (confirmed) void this.cmdExportStash(); },
     ).open();
@@ -9406,7 +9515,7 @@ export class StashpadView extends ItemView {
         new ConfirmModal(
           this.app,
           "Paste notes from another vault?",
-          `The clipboard holds ${total0} note${total0 === 1 ? "" : "s"} claiming to come from the vault “${srcName || "(unnamed)"}”.\n\nStashpad can't verify that name — anything that can write to your clipboard, including a web page you copied from, can set it. Only continue if you just copied these notes from that vault yourself.`,
+          `The clipboard holds ${total0} note${total0 === 1 ? "" : "s"} claiming to come from the vault **${srcName || "(unnamed)"}**, to be pasted into **${this.app.vault.getName()}**.\n\nStashpad can't verify that name — anything that can write to your clipboard, including a web page you copied from, can set it. Only continue if you just copied these notes from **${srcName || "(unnamed)"}** yourself.`,
           "Paste notes",
           resolve,
         ).open();
@@ -9421,7 +9530,13 @@ export class StashpadView extends ItemView {
     const cursor = this.currentChildren[this.cursorIdx] ?? null;
     const destParent = ((cursor?.parent ?? this.focusId) ?? ROOT_ID);
     const total = xv.meta.parents + xv.meta.children;
-    const progress = new Notice(`⇄ Receiving ${total} note${total === 1 ? "" : "s"} from "${xv.meta.sourceVault}" into "${this.app.vault.getName()}"…`, 0);
+    // 0.212.0: a plain Notice renders a string verbatim, so build a fragment and
+    // run the shared tokenizer over it — otherwise the **bold** markers used
+    // everywhere else in the cross-vault wording would show as literal asterisks.
+    const progress = new Notice(
+      boldFragment(`⇄ Receiving ${total} note${total === 1 ? "" : "s"} from **${xv.meta.sourceVault}** into **${this.app.vault.getName()}**…`),
+      0,
+    );
     try {
       const existingIds = await this.plugin.idsInFolder(folder);
       const summary = await importStashZip(this.app, xv.zip, folder, existingIds, {
@@ -9489,7 +9604,7 @@ export class StashpadView extends ItemView {
         } else if (!complete) {
           lines.push(`⚠️ Only ${summary.notesWritten} of ${expected} notes arrived, so Stashpad will **not** offer to delete the originals in **${xv.meta.sourceVault}** — they're your only copy of what's missing. Check what landed here before removing anything there.`);
         } else {
-          lines.push(`Cross-vault cut can't remove the originals — they still exist in "${xv.meta.sourceVault}". Delete them there if you meant to move.`);
+          lines.push(`Cross-vault cut can't remove the originals — they still exist in **${xv.meta.sourceVault}**, as well as here in **${this.app.vault.getName()}**. Delete them in **${xv.meta.sourceVault}** if you meant to move.`);
         }
       }
       if (summary.warnings.length) lines.push(`${summary.warnings.length} entr${summary.warnings.length === 1 ? "y was" : "ies were"} skipped (see console).`);
@@ -9504,7 +9619,12 @@ export class StashpadView extends ItemView {
       // warnings now rather than throws, so reaching here means the failure was
       // earlier/structural, but a partial write is still possible.
       console.warn("[Stashpad] cross-vault paste failed", e);
-      new Notice("Cross-vault paste failed. Some notes may already have been written — check this folder before pasting again, and don't delete the originals in the source vault yet. See console for details.", 12000);
+      this.plugin.notifications.show({
+        message: `Cross-vault paste from **${xv.meta.sourceVault}** into **${this.app.vault.getName()}** failed. `
+          + `Some notes may already have been written — check this folder in **${this.app.vault.getName()}** before pasting again, `
+          + `and don't delete the originals in **${xv.meta.sourceVault}** yet. See console for details.`,
+        kind: "error", category: "import", folder: this.noteFolder, duration: 0,
+      });
     } finally {
       progress.hide();
     }
@@ -11789,7 +11909,10 @@ export class StashpadView extends ItemView {
             catch { /* unreadable — trashing it below would be unrecoverable, so skip it */ }
           }
           if (sharedSkipped > 0) {
-            new Notice(`Kept ${sharedSkipped} attachment${sharedSkipped === 1 ? "" : "s"} — still used by ${sharedSkipped === 1 ? "another note" : "other notes"}.`, 7000);
+            this.plugin.notifications.show({
+              message: `Kept ${sharedSkipped} attachment${sharedSkipped === 1 ? "" : "s"} — still used by ${sharedSkipped === 1 ? "another note" : "other notes"}.`,
+              kind: "info", category: "delete", folder: this.noteFolder, duration: 7000,
+            });
           }
           for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
             {
@@ -12683,6 +12806,113 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** 0.213.0: move attachments that this composer wrote into THIS folder over to
+   *  `destFolder` when the note is being sent elsewhere, and rewrite the body's
+   *  links to match. Returns the rewritten body.
+   *
+   *  Only touches files under `<this.noteFolder>/_attachments` — a link pointing
+   *  anywhere else (a vault attachment, another Stashpad's folder, an absolute
+   *  path the user typed) is left exactly as-is; it isn't ours to relocate.
+   *
+   *  Reference-aware even though the common case can't be ambiguous. The note
+   *  being created doesn't exist yet, so normally the only referent is this
+   *  body — but the user can paste an existing `![[…]]` link into the composer,
+   *  and then the file IS referenced by a note that stays behind. Moving it
+   *  would break that note to fix this one. So: if any OTHER note references
+   *  the file, leave it in place and keep the absolute link (which still
+   *  resolves from the destination folder) rather than moving it.
+   *
+   *  Never throws — an attachment that can't be moved falls back to its
+   *  original link, which is exactly today's behaviour. */
+  private async rehomeComposerAttachments(body: string, destFolder: string): Promise<string> {
+    const srcDir = `${this.noteFolder.replace(/\/+$/, "")}/_attachments`;
+    const destDir = `${destFolder.replace(/\/+$/, "")}/_attachments`;
+    if (srcDir === destDir) return body;
+    // Only the embeds that point into THIS folder's _attachments are candidates.
+    const refs = new Set<string>();
+    for (const m of body.matchAll(/!\[\[([^\]|]+?)(?:\|[^\]]*)?\]\]/g)) {
+      const p = m[1].trim();
+      if (p.startsWith(`${srcDir}/`)) refs.add(p);
+    }
+    if (!refs.size) return body;
+
+    let out = body;
+    let moved = 0;
+    let sharedLeftBehind = 0;
+    for (const ref of refs) {
+      try {
+        const af = this.app.vault.getAbstractFileByPath(ref);
+        if (!(af instanceof TFile)) continue;               // already gone / never written
+        // Two conditions, and BOTH must hold. Only relocate a file this composer
+        // created during this compose (so we know it was staged for this note,
+        // not linked from somewhere), and only when nothing already references
+        // it. A pasted link to an existing attachment fails the first test; a
+        // file some other note embeds fails the second. Anything we don't move
+        // keeps its absolute link, which still resolves from the destination.
+        if (!this.composerCreatedAttachments.has(ref) || this.attachmentReferencedElsewhere(ref)) {
+          sharedLeftBehind++;
+          continue;
+        }
+        await this.ensureFolder(destDir);
+        // Collision-safe: the destination may already hold a same-named file.
+        let target = `${destDir}/${af.name}`;
+        for (let i = 1; i < 1000 && this.app.vault.getAbstractFileByPath(target); i++) {
+          target = `${destDir}/${buildAttachmentName(af.name, `${i}`)}`;
+        }
+        await this.app.fileManager.renameFile(af, target);
+        // Replace the link precisely. A bare split/join on the path would also
+        // rewrite a LONGER path that merely starts with it (x.png vs x.png.bak),
+        // silently repointing a different attachment.
+        out = out.split(`[[${ref}]]`).join(`[[${target}]]`).split(`[[${ref}|`).join(`[[${target}|`);
+        this.composerCreatedAttachments.delete(ref);
+        moved++;
+        await this.log.append({ type: "attachment_add", id: ROOT_ID, payload: { path: target, name: af.name, size: 0 } });
+      } catch (e) {
+        // Leave the link pointing at the original path — it still resolves.
+        console.warn("[Stashpad] couldn't re-home composer attachment", ref, e);
+      }
+    }
+    if (moved || sharedLeftBehind) {
+      const bits: string[] = [];
+      if (moved) bits.push(`Moved ${moved} attachment${moved === 1 ? "" : "s"} to **${destFolder}** with the note.`);
+      if (sharedLeftBehind) {
+        // Covers both reasons a file stays put: another note references it, or
+        // it wasn't staged by this composer (a pasted link). Either way the
+        // user-visible fact is the same — it lives in the other folder now, and
+        // the link still works — so say that rather than guess which applied.
+        bits.push(
+          `${sharedLeftBehind} attachment${sharedLeftBehind === 1 ? "" : "s"} stayed in **${this.noteFolder}** because ${sharedLeftBehind === 1 ? "it is" : "they are"} used elsewhere or ${sharedLeftBehind === 1 ? "was" : "were"} not added here. `
+          + `The note links to ${sharedLeftBehind === 1 ? "it" : "them"} across folders, so deleting **${this.noteFolder}** would break ${sharedLeftBehind === 1 ? "that link" : "those links"}.`,
+        );
+      }
+      this.plugin.notifications.show({
+        message: bits.join("\n"),
+        kind: sharedLeftBehind ? "warning" : "success",
+        category: "attachment",
+        folder: destFolder,
+        duration: sharedLeftBehind ? 0 : 5000,
+      });
+    }
+    return out;
+  }
+
+  /** True when any note already embeds `path` — i.e. moving it would break an
+   *  existing note.
+   *
+   *  Deliberately NOT a full-vault body scan. The obvious implementation
+   *  (getMarkdownFiles + cachedRead each) is O(vault) on every send that carries
+   *  an attachment, and cachedRead hits the disk for anything not already
+   *  loaded — which on a large vault on a network drive is exactly the cost
+   *  profile we are trying to avoid elsewhere. resolvedLinks is an in-memory
+   *  index Obsidian already maintains, and it includes embeds. */
+  private attachmentReferencedElsewhere(path: string): boolean {
+    const links = this.app.metadataCache.resolvedLinks ?? {};
+    for (const targets of Object.values(links)) {
+      if (targets && Object.prototype.hasOwnProperty.call(targets, path)) return true;
+    }
+    return false;
+  }
+
   private async importAttachment(file: File): Promise<string | null> {
     try {
       const buf = await file.arrayBuffer();
@@ -12692,6 +12922,10 @@ export class StashpadView extends ItemView {
       const stamp = Date.now().toString(36);
       const path = `${folder}/${buildAttachmentName(safeName, stamp)}`;
       await this.app.vault.createBinary(path, buf);
+      // 0.213.0: remember that THIS composer staged this file, so a later send
+      // to another folder knows it is safe to carry along (see
+      // rehomeComposerAttachments). Cleared on submit.
+      this.composerCreatedAttachments.add(path);
       await this.log.append({ type: "attachment_add", id: ROOT_ID, payload: { path, name: file.name, size: file.size } });
       this.plugin.notifications.show({
         message: `Attached ${file.name}`,
@@ -13319,7 +13553,10 @@ export class StashpadView extends ItemView {
           catch { /* unreadable — skip rather than trash something undo can't restore */ }
         }
         if (sharedSkipped > 0) {
-          new Notice(`Kept ${sharedSkipped} attachment${sharedSkipped === 1 ? "" : "s"} — still used by ${sharedSkipped === 1 ? "another note" : "other notes"}.`, 7000);
+          this.plugin.notifications.show({
+              message: `Kept ${sharedSkipped} attachment${sharedSkipped === 1 ? "" : "s"} — still used by ${sharedSkipped === 1 ? "another note" : "other notes"}.`,
+              kind: "info", category: "delete", folder: this.noteFolder, duration: 7000,
+            });
         }
         for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
           {

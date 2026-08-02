@@ -61,6 +61,7 @@ export function parseAdjustMinutes(raw: string): number | null {
   const unit = { m: 1, h: 60, d: 1440, w: 10080 }[m[2].toLowerCase()] ?? 1;
   return n * unit;
 }
+import { renderInlineMarkup } from "./notifications";
 import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
 const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
@@ -2607,6 +2608,18 @@ export class ConfirmModal extends Modal {
     private persistent: boolean = false,
   ) { super(app); }
 
+  /** 0.214.2: optional list of vault files rendered BELOW the message as
+   *  clickable rows, in their own scroll region.
+   *
+   *  Two reasons this isn't just more message lines. (1) A confirm that names
+   *  files is asking the user to make a decision ABOUT those files, and they
+   *  can't do that without looking at them — so each row opens the file.
+   *  (2) The count is unbounded (a folder can hold hundreds of shared
+   *  attachments), and an unbounded list grows the modal past the screen and
+   *  pushes the buttons out of reach. The region caps and scrolls instead. */
+  private fileList: string[] = [];
+  setFileList(paths: string[]): this { this.fileList = paths; return this; }
+
   close(): void {
     if (this.persistent && !this.didChoose) return; // buttons only
     super.close();
@@ -2620,8 +2633,26 @@ export class ConfirmModal extends Modal {
     // collapsed newlines into single spaces — callers passing
     // multi-sentence prose lost the formatting.
     const block = this.contentEl.createDiv({ cls: "stashpad-confirm-body" });
+    // 0.212.0: render **bold** / `code` per line, via the same safe tokenizer the
+    // toasts use (textContent only, never innerHTML). The cross-vault confirms
+    // bold the note and vault NAMES rather than quoting them.
     for (const line of this.message.split("\n")) {
-      block.createDiv({ cls: "stashpad-confirm-line", text: line });
+      renderInlineMarkup(block.createDiv({ cls: "stashpad-confirm-line" }), line);
+    }
+    if (this.fileList.length) {
+      const list = this.contentEl.createDiv({ cls: "stashpad-confirm-files" });
+      for (const path of this.fileList) {
+        const row = list.createEl("button", { cls: "stashpad-confirm-file" });
+        row.createSpan({ cls: "stashpad-confirm-file-name", text: path.split("/").pop() || path });
+        row.createSpan({ cls: "stashpad-confirm-file-path", text: path });
+        row.title = `Open ${path}`;
+        row.onclick = (e) => {
+          e.preventDefault();
+          // Open in a new tab and leave the confirm up — the user is inspecting
+          // in order to answer it, so dismissing here would lose their place.
+          this.app.workspace.openLinkText(path, "", true);
+        };
+      }
     }
     const row = this.contentEl.createDiv({ cls: "stashpad-modal-btns" });
     const cancel = row.createEl("button", { text: this.cancelText });

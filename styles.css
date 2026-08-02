@@ -4431,8 +4431,40 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 .stashpad-ribbon-suggest-body { flex: 1 1 auto; min-width: 0; }
 
 /* 0.63.2: ConfirmModal body — one sentence per line, no big gaps. */
-.stashpad-confirm-body { margin: 0 0 12px; }
+/* 0.214.2: cap the prose too. A confirm whose message enumerates things (the
+   folder-delete warning, a long import summary) could otherwise grow the modal
+   past the viewport and push the buttons off-screen — the one part the user
+   must be able to reach. */
+.stashpad-confirm-body { margin: 0 0 12px; max-height: 40vh; overflow-y: auto; }
 .stashpad-confirm-line { margin: 0; padding: 1px 0; }
+
+/* Clickable file rows under a confirm's message. Own scroll region so an
+   unbounded list (hundreds of shared attachments) never grows the modal. */
+.stashpad-confirm-files {
+  max-height: 30vh;
+  overflow-y: auto;
+  margin: 0 0 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+}
+.stashpad-confirm-file {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  padding: 5px 10px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-confirm-file:hover { background: var(--background-modifier-hover); }
+.stashpad-confirm-file + .stashpad-confirm-file { border-top: 1px solid var(--background-modifier-border); }
+.stashpad-confirm-file-name { color: var(--text-normal); font-size: var(--font-ui-small); }
+.stashpad-confirm-file-path { color: var(--text-muted); font-size: var(--font-ui-smaller); word-break: break-all; }
 
 /* 0.64.0: advanced search filter chips. */
 .stashpad-search-filter-row {
@@ -6555,6 +6587,21 @@ button.stashpad-btn-loading::after {
 .stashpad-import-ctlbtn:disabled {
   opacity: 0.35;
   cursor: default;
+}
+/* Merge toggle in the ON state (0.212.1) — accent fill, so a folded row is
+   obvious at a glance in both themes. --text-on-accent is the paired foreground. */
+.stashpad-import-ctlbtn.is-on {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+/* A merged row is body text of the row above, not a note of its own: muted, with
+   a left rule tying it to its target. */
+.stashpad-import-row.is-merged {
+  opacity: 0.72;
+  border-left: 2px solid var(--background-modifier-border);
+}
+.stashpad-import-row.is-merged .stashpad-import-text {
+  font-style: italic;
 }
 .stashpad-import-color {
   font-size: var(--font-ui-smaller);

@@ -249,6 +249,29 @@ export function parseImport(text: string, opts: ImportOptions): ImportNote[] {
   return assemble(rows, opts);
 }
 
+/** 0.212.1: re-derive level normalisation + `parentIndex` for a note list that was
+ *  modified AFTER parsing — the importer's per-row nest / outdent / merge overrides.
+ *
+ *  `assemble` bakes `parentIndex` in at parse time and the import consumer
+ *  (view.ts `createdIds[n.parentIndex]`) uses that field, NOT `level`. So anything
+ *  that changes a level afterwards must re-link, or the note lands somewhere other
+ *  than where the preview drew it. Same ancestor-by-level walk as `assemble`, kept
+ *  next to it so the two cannot drift. */
+export function relinkParents(notes: ImportNote[]): ImportNote[] {
+  const out: ImportNote[] = [];
+  const ancestors: Record<number, number> = {};
+  let prevEff = 0;
+  notes.forEach((n, idx) => {
+    const eff = idx === 0 ? 1 : Math.min(Math.max(1, n.level), prevEff + 1);
+    const parentIndex = eff === 1 ? null : (ancestors[eff - 1] ?? null);
+    out.push({ ...n, level: eff, parentIndex });
+    ancestors[eff] = out.length - 1;
+    for (const k of Object.keys(ancestors)) if (Number(k) > eff) delete ancestors[Number(k)];
+    prevEff = eff;
+  });
+  return out;
+}
+
 /** Fold merged rows into their preceding note, normalise depth, resolve parents. */
 function assemble(rows: Row[], opts: ImportOptions): ImportNote[] {
   interface Draft { rawLevel: number; bodyLines: string[] }

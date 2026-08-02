@@ -1,5 +1,5 @@
 import { App, ItemView, Modal, Setting, WorkspaceLeaf, setIcon } from "obsidian";
-import { parseImport, DEFAULT_IMPORT_OPTIONS, type ImportOptions, type ImportNote } from "./text-importer";
+import { parseImport, relinkParents, DEFAULT_IMPORT_OPTIONS, type ImportOptions, type ImportNote } from "./text-importer";
 import { ColorPickerModal } from "./modals";
 import { BUILTIN_COLOR_NAMES } from "./text-importer";
 
@@ -51,6 +51,15 @@ export class TextImporterUI {
    *  them — they are re-applied after every parse. */
   private levelDelta = new Map<number, number>();
   private colorOverride = new Map<number, string>();
+  /** 0.212.1: rows the user folded into the row above (the web app's per-row merge
+   *  button — the last parity gap). Keyed by the same parsed-row index as the other
+   *  overrides, so all three survive a re-parse together. */
+  private mergeInto = new Set<number>();
+  /** The DISPLAY list: one entry per parsed row, indices stable and equal to the
+   *  parse indices the override maps are keyed by. `notes` is what actually gets
+   *  imported — rows folded into their target and parents re-linked — so the two
+   *  differ exactly by the merges. */
+  private rows: ImportNote[] = [];
   private importBtn: HTMLButtonElement | null = null;
 
   constructor(private app: App, private host: HTMLElement, init: Partial<ImporterState>, private cbs: ImporterCallbacks) {
@@ -125,23 +134,34 @@ export class TextImporterUI {
 
   /** Re-parse and repaint the preview — cheap enough for every keystroke. */
   private refresh(): void {
-    this.notes = this.text.trim() ? parseImport(this.text, this.opts) : [];
-    // Re-apply the per-row overrides on top of the fresh parse. Level is clamped to
-    // >= 1 and to at most one deeper than the previous row, which is the same rule
-    // the parser enforces — otherwise a nested row could claim a level with no
-    // parent above it and the tree builder would silently reattach it elsewhere.
-    if (this.levelDelta.size || this.colorOverride.size) {
-      this.notes = this.notes.map((n, i) => {
-        const delta = this.levelDelta.get(i) ?? 0;
-        const color = this.colorOverride.get(i);
-        if (!delta && !color) return n;
-        return { ...n, level: Math.max(1, n.level + delta), ...(color ? { color } : {}) };
-      });
-      for (let i = 0; i < this.notes.length; i++) {
-        const maxAllowed = i === 0 ? 1 : this.notes[i - 1].level + 1;
-        if (this.notes[i].level > maxAllowed) this.notes[i] = { ...this.notes[i], level: maxAllowed };
+    const parsed = this.text.trim() ? parseImport(this.text, this.opts) : [];
+    // Re-apply the per-row overrides on top of the fresh parse, keyed by parse index
+    // so an option change or a text edit doesn't silently discard them.
+    const overridden = parsed.map((row, i) => {
+      const delta = this.levelDelta.get(i) ?? 0;
+      const color = this.colorOverride.get(i);
+      if (!delta && !color) return row;
+      return { ...row, level: Math.max(1, row.level + delta), ...(color ? { color } : {}) };
+    });
+    // relinkParents clamps each level to at most one deeper than the row above AND
+    // re-derives parentIndex from those levels. The re-derive is the load-bearing
+    // half: the import reads parentIndex, so before 0.212.1 the nest/outdent buttons
+    // moved the preview's indent while the note itself still landed under whatever
+    // parent the parser chose.
+    this.rows = relinkParents(overridden);
+    // Fold merged rows into the row above, then re-link again — a merge removes a
+    // note, so every parentIndex after it shifts.
+    const folded: ImportNote[] = [];
+    for (let i = 0; i < this.rows.length; i++) {
+      const row = this.rows[i];
+      if (i > 0 && this.mergeInto.has(i) && folded.length) {
+        const prev = folded[folded.length - 1];
+        folded[folded.length - 1] = { ...prev, body: `${prev.body}\n${row.body}`.replace(/\s+$/, "") };
+      } else {
+        folded.push(row);
       }
     }
+    this.notes = relinkParents(folded);
     const n = this.notes.length;
     this.countEl?.setText(n === 0 ? "Nothing to import yet." : `${n} note${n === 1 ? "" : "s"} will be created:`);
     if (this.importBtn) {
@@ -165,9 +185,20 @@ export class TextImporterUI {
     const p = this.previewEl;
     if (!p) return;
     p.empty();
-    for (const note of this.notes) {
-      const row = p.createDiv({ cls: "stashpad-import-row" });
-      row.style.paddingLeft = `${(note.level - 1) * 18}px`;
+    for (let idx = 0; idx < this.rows.length; idx++) {
+      const note = this.rows[idx];
+      const merged = idx > 0 && this.mergeInto.has(idx);
+      const row = p.createDiv({ cls: merged ? "stashpad-import-row is-merged" : "stashpad-import-row" });
+      // A merged row is body text of its target, so it lines up with that target
+      // rather than claiming a depth of its own. Walk back past any run of merged
+      // rows — consecutive merges all belong to the same unmerged note.
+      let depth = note.level;
+      if (merged) {
+        let t = idx - 1;
+        while (t > 0 && this.mergeInto.has(t)) t--;
+        depth = this.rows[t]?.level ?? 1;
+      }
+      row.style.paddingLeft = `${(depth - 1) * 18}px`;
       if (note.task !== "none") {
         row.createSpan({ cls: "stashpad-import-check", text: note.task === "done" ? "☑" : "☐" });
       }
@@ -192,16 +223,30 @@ export class TextImporterUI {
       // having its override applied.
       const ctrls = row.createDiv({ cls: "stashpad-import-rowctl" });
 
+      // 0.212.1: merge into the row above — the web app's last unported control.
+      // A merged row stops being a note and becomes body text of its target, which
+      // is how you keep a code block, a wrapped paragraph, or a stray list item in
+      // one note when the parser split it.
+      const mergeBtn = ctrls.createEl("button", { cls: merged ? "stashpad-import-ctlbtn is-on" : "stashpad-import-ctlbtn", text: "⤴" });
+      mergeBtn.title = merged
+        ? "Merged into the note above — click to make it its own note again"
+        : "Merge into the note above (keeps code and lists in one note)";
+      mergeBtn.disabled = idx === 0;
+      mergeBtn.onclick = () => {
+        if (merged) this.mergeInto.delete(idx); else this.mergeInto.add(idx);
+        this.refresh();
+      };
+
       // Nest under the line above / outdent. Solves any shape the parser cannot
-      // infer, including exports this toggle set does not anticipate.
-      const idx = this.notes.indexOf(note);
+      // infer, including exports this toggle set does not anticipate. Meaningless
+      // on a merged row — it has no level or colour of its own any more.
       const nestBtn = ctrls.createEl("button", { cls: "stashpad-import-ctlbtn", text: "→" });
       nestBtn.title = "Nest under the line above";
-      nestBtn.disabled = idx === 0 || note.level > (this.notes[idx - 1]?.level ?? 0);
+      nestBtn.disabled = merged || idx === 0 || note.level > (this.rows[idx - 1]?.level ?? 0);
       nestBtn.onclick = () => { this.levelDelta.set(idx, (this.levelDelta.get(idx) ?? 0) + 1); this.refresh(); };
       const outBtn = ctrls.createEl("button", { cls: "stashpad-import-ctlbtn", text: "←" });
       outBtn.title = "Move out one level";
-      outBtn.disabled = note.level <= 1;
+      outBtn.disabled = merged || note.level <= 1;
       outBtn.onclick = () => { this.levelDelta.set(idx, (this.levelDelta.get(idx) ?? 0) - 1); this.refresh(); };
 
       // Colour, from Stashpad's own palette.
@@ -214,6 +259,7 @@ export class TextImporterUI {
         o.value = hex;
       }
       sel.value = this.colorOverride.get(idx) ?? note.color ?? "";
+      sel.disabled = merged;
       sel.onchange = () => {
         if (sel.value) this.colorOverride.set(idx, sel.value);
         else this.colorOverride.delete(idx);

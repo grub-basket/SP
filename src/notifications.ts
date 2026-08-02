@@ -6,6 +6,50 @@ import type { StashpadId } from "./types";
  *  red; "info" is the neutral default. */
 export type NotificationKind = "info" | "success" | "warning" | "error";
 
+/** Render a message's inline markup into `host`: inline-code via backticks and
+ *  **bold** via double asterisks. `path/to/file.md` renders monospace + tinted;
+ *  **name** renders bold. 0.210.5 added bold so note and vault NAMES can stand
+ *  out instead of being wrapped in quotes, which is hard to scan when a message
+ *  names several of them. 0.212.0 lifted it out of the toast builder so modals
+ *  (the cross-vault confirms) can use the same renderer — the wording sweep
+ *  needs bold in both surfaces, and two tokenizers would drift.
+ *
+ *  Everything goes through textContent / createTextNode — the message is never
+ *  assigned to innerHTML, so a note title containing markup is inert. An
+ *  unmatched marker just renders literally, which is the right failure.
+ *
+ *  Elements are created in the HOST's ownerDocument, so this is safe in a
+ *  popout window (the documented cross-document trap). */
+export function renderInlineMarkup(host: HTMLElement, message: string): void {
+  const doc = host.ownerDocument;
+  const parts = message.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/);
+  for (const part of parts) {
+    if (part.length > 2 && part.startsWith("`") && part.endsWith("`")) {
+      const code = doc.createElement("code");
+      code.textContent = part.slice(1, -1);
+      host.appendChild(code);
+    } else if (part.length > 4 && part.startsWith("**") && part.endsWith("**")) {
+      const strong = doc.createElement("strong");
+      strong.textContent = part.slice(2, -2);
+      host.appendChild(strong);
+    } else if (part.length > 0) {
+      host.appendChild(doc.createTextNode(part));
+    }
+  }
+}
+
+/** 0.212.0: wrap `renderInlineMarkup` output in a DocumentFragment, for the
+ *  places that use Obsidian's plain `Notice` rather than the notification
+ *  service. `new Notice(string)` renders verbatim, so a message carrying the
+ *  **bold** markers used everywhere else would show literal asterisks. */
+export function boldFragment(message: string): DocumentFragment {
+  const frag = document.createDocumentFragment();
+  const span = document.createElement("span");
+  renderInlineMarkup(span, message);
+  frag.appendChild(span);
+  return frag;
+}
+
 /** What kind of operation produced this notification. Used by:
  *  - The history panel for filtering.
  *  - The per-category mute settings (e.g. "stop telling me when I delete").
@@ -327,28 +371,7 @@ export class NotificationService {
     wrap.className = `stashpad-notice stashpad-notice-${kind}`;
     const msg = document.createElement("div");
     msg.className = "stashpad-notice-message";
-    // Inline-code via backticks and **bold** via double asterisks. `path/to/file.md`
-    // renders monospace + tinted; **name** renders bold. 0.210.5 added bold so
-    // note and vault NAMES can stand out instead of being wrapped in quotes, which
-    // is hard to scan when a message names several of them.
-    //
-    // Everything still goes through textContent / createTextNode — the message is
-    // never assigned to innerHTML, so a note title containing markup is inert. An
-    // unmatched marker just renders literally, which is the right failure.
-    const parts = opts.message.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*)/);
-    for (const part of parts) {
-      if (part.length > 1 && part.startsWith("`") && part.endsWith("`")) {
-        const code = document.createElement("code");
-        code.textContent = part.slice(1, -1);
-        msg.appendChild(code);
-      } else if (part.length > 4 && part.startsWith("**") && part.endsWith("**")) {
-        const strong = document.createElement("strong");
-        strong.textContent = part.slice(2, -2);
-        msg.appendChild(strong);
-      } else if (part.length > 0) {
-        msg.appendChild(document.createTextNode(part));
-      }
-    }
+    renderInlineMarkup(msg, opts.message);
     wrap.appendChild(msg);
     if (opts.actions && opts.actions.length > 0) {
       const row = document.createElement("div");

@@ -67,6 +67,7 @@ export type CommandId =
   | "jumpToTop" | "jumpToBottom"
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
   | "copyNotes" | "cutNotes" | "pasteNotes"
+  | "copyForOtherVault" | "cutForOtherVault"
   | "commandPalette";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
@@ -150,6 +151,8 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "encryptDelete",   label: "Encrypt & delete selection",     desc: "Send the selected note(s) to the encrypted trash (recoverable with your password, Ctrl/Cmd+Z undoable). No default chord.", defaultPrimary: "" },
   { id: "copyNotes",       label: "Copy notes (note clipboard)",    desc: "Copy the selected note(s) as NOTES: paste in the list to duplicate them (new ids), or anywhere else to paste their text. Skipped when text is highlighted (normal copy wins).", defaultPrimary: "Mod+C" },
   { id: "cutNotes",        label: "Cut notes",                      desc: "Cut the selected note(s): paste in the list to MOVE them, or in the composer to extract their text and delete the originals (undoable).", defaultPrimary: "Mod+X" },
+  { id: "copyForOtherVault", label: "Copy for another vault",         desc: "Copy the selected note(s) AND prepare the cross-vault payload, so they can be pasted into a DIFFERENT vault. Slower than plain copy — it reads every note and attachment in the selection — which is why it is its own command.", defaultPrimary: "" },
+  { id: "cutForOtherVault",  label: "Cut for another vault",          desc: "Cut the selected note(s) for a DIFFERENT vault. After the other vault confirms the paste, Stashpad offers to delete the originals here. Nothing is deleted until then.", defaultPrimary: "" },
   { id: "pasteNotes",      label: "Paste notes",                    desc: "Paste previously copied/cut notes at the cursor row (after it, same parent). Does nothing if the note clipboard is empty.", defaultPrimary: "Mod+V" },
 ];
 
@@ -304,6 +307,12 @@ export interface StashpadSettings {
    *  in the body AND the frontmatter `attachments:` list (union) so a
    *  malformed body never silently undercounts. */
   confirmAttachmentDelete: boolean;
+  /** 0.214.2: stamp the cross-vault payload on EVERY cut/copy again (pre-0.214.0
+   *  behaviour). Off by default because building it reads every note and
+   *  attachment in the selection, which is slow on a big selection or a network
+   *  drive. On a fast machine that cost is unnoticeable and always-on is more
+   *  convenient than remembering the explicit command. */
+  alwaysStampCrossVault: boolean;
   /** When true (default), the composer textarea is re-focused after each
    *  Enter-submit so you can keep typing the next note. Off = focus stays
    *  in the list so arrow-keys keep working without an extra click. */
@@ -672,6 +681,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   confirmCrossParentDrag: true,
   confirmBulkDelete: true,
   confirmAttachmentDelete: true,
+  alwaysStampCrossVault: false,
   autofocusComposerAfterSend: true,
   focusComposerOnOpen: false,
   searchOpensInContext: true,
@@ -1021,7 +1031,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       for (const line of [
         "Chat-style composer — type a line, press Enter, it's a note.",
         "Nesting without limits: drill into any note and add notes under it.",
-        "Tasks with due dates and reminders (start a line with []).",
+        "Tasks with due dates and reminders (start a line with []). Recurring tasks are experimental — see Known limitations.",
         "Move, merge, clone, and reorder notes from the keyboard.",
         "Per-folder colors, filters, and saved sort orders.",
         "Import from and export to plain markdown, plus a portable .stash bundle.",
@@ -1052,6 +1062,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       const ul = host.createEl("ul");
       for (const line of [
         "Requires Obsidian 1.13.0 or newer.",
+        "Recurring tasks are EXPERIMENTAL. Repeat rules work, but they are not thoroughly tested across time zones, missed occurrences, or multi-device sync. Don't rely on them for anything with real consequences — keep a reminder you trust for deadlines that matter. A one-off due date and reminder is the well-trodden path.",
         "Very large folders (many thousands of notes in one Stashpad) can be slow to first paint; the render cache warms after the first visit.",
         "Encryption protects note contents at rest in your vault — it is not a substitute for full-disk encryption or a password manager.",
         "Mobile supports the core outliner, but some desktop-only affordances (drag-to-reorder, pop-out windows) differ or are unavailable.",
@@ -1699,6 +1710,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.confirmBulkDelete, (v) => { this.plugin.settings.confirmBulkDelete = v; }, ["confirm", "delete", "bulk"]));
     cats.deleting.push(toggle("Offer to delete attachments with note", "When a note references attachments, the delete modal includes an \"Also delete attachments\" checkbox so orphaned files don't pile up in your vault. Attachments are detected from both ![[…]] embeds in the body and the frontmatter attachments: list. Off = attachments are always preserved on delete (no checkbox shown), and a single childless note with attachments deletes silently.",
       () => this.plugin.settings.confirmAttachmentDelete, (v) => { this.plugin.settings.confirmAttachmentDelete = v; }, ["delete", "attachment", "orphan"]));
+
+    cats.movingNotes.push(toggle("Always prepare cut/copy for another vault", "Cross-vault copy/cut builds a bundle of the whole selection — every note and every attachment is read — so it is the slow part of a copy, especially on a network drive or a big selection. By default that only happens when you run “Copy/Cut for another vault”, keeping ordinary cut/copy instant. Turn this ON to prepare it on EVERY cut and copy, so plain Mod+C in one vault can be pasted into another. Fine on a fast machine; noticeable on a slow disk.",
+      () => this.plugin.settings.alwaysStampCrossVault, (v) => { this.plugin.settings.alwaysStampCrossVault = v; }, ["cross-vault", "clipboard", "copy", "cut", "paste", "slow", "zip", "performance"]));
 
     cats.foldersStorage.push(this.sectionDef("Cross-Stashpad Search Scope", "Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations. Also: create a new Stashpad.", (host) => {
       const folders = this.plugin.discoverStashpadFolders();

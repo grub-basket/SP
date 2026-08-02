@@ -940,10 +940,33 @@ export class StashpadFolderPanelView extends ItemView {
       .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned
         || (f.path.startsWith(cleaned + "/"))).length;
     const name = tf.name;
-    new ConfirmModal(
+    // 0.213.2: deleting a folder takes its _attachments with it, so notes in
+    // OTHER folders that embed those files lose their images with no warning
+    // and no obvious cause. Say so before the delete, not after — this is the
+    // one moment the user can still act on it.
+    const outside = this.plugin.outsideReferencesToFolderAttachments(cleaned);
+    const lines = [
+      `This moves the entire folder — about ${noteCount} note${noteCount === 1 ? "" : "s"} plus its attachments and exports — to the trash.`,
+      "You can restore it from your system/Obsidian trash.",
+    ];
+    if (outside.paths.length) {
+      lines.push(
+        "",
+        `⚠️ ${outside.paths.length} attachment${outside.paths.length === 1 ? "" : "s"} in **${name}** ${outside.paths.length === 1 ? "is" : "are"} used by notes in ${outside.folders.length} other folder${outside.folders.length === 1 ? "" : "s"}: ${outside.folders.map((f) => `**${f}**`).join(", ")}.`,
+        `Deleting **${name}** breaks ${outside.paths.length === 1 ? "that embed" : "those embeds"} — the notes stay, but the ${outside.paths.length === 1 ? "image" : "images"} stop resolving.`,
+        // 0.214.2: the files themselves are rendered below as CLICKABLE rows
+        // (setFileList) rather than inlined here as text. The user is being
+        // asked to decide about these specific files, which they cannot do
+        // without looking at them — and the list is unbounded, so it needs its
+        // own capped scroll region rather than growing the modal.
+        `Click any of them to open it${outside.paths.length > 1 ? "" : ""}:`,
+        `To keep ${outside.paths.length === 1 ? "it" : "them"}, move ${outside.paths.length === 1 ? "the file" : "those files"} out of **${name}** first, or restore the folder from the trash afterwards.`,
+      );
+    }
+    const modal = new ConfirmModal(
       this.app,
       `Delete "${name}"?`,
-      `This moves the entire folder — about ${noteCount} note${noteCount === 1 ? "" : "s"} plus its attachments and exports — to the trash.\nYou can restore it from your system/Obsidian trash.`,
+      lines.join("\n"),
       "Delete folder",
       async (confirmed) => {
         if (!confirmed) return;
@@ -952,7 +975,15 @@ export class StashpadFolderPanelView extends ItemView {
         // listener is suppressed for this path so it won't double-notify.
         await this.plugin.deleteStashpadFolderWithUndo(tf);
       },
-    ).open();
+      "Cancel",
+      // Focus Cancel when this delete would break notes elsewhere, so a stray
+      // Enter can't confirm it.
+      outside.paths.length > 0,
+    );
+    // Every affected file, not a truncated sample — the scroll region makes a
+    // long list safe, so there is no reason to hide any of them.
+    if (outside.paths.length) modal.setFileList(outside.paths);
+    modal.open();
   }
 
   /** 0.140.3 (review): run any in-flight divider-drag cleanup on view close so

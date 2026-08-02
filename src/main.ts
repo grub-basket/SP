@@ -39,7 +39,7 @@ import { OrderStore } from "./order-store";
 import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./structure-snapshot";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
-import { NotificationService, buildFileActions } from "./notifications";
+import { NotificationService, buildFileActions, boldFragment } from "./notifications";
 import { AuthorRegistry } from "./author-registry";
 import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
@@ -819,6 +819,36 @@ export default class StashpadPlugin extends Plugin {
       category: "delete",
       folder: cleaned,
     });
+    // 0.213.2 (part 3, post-hoc half): this path is a delete through Obsidian's
+    // OWN UI — the file explorer, or a sync from another device. There is no
+    // prompt to hook (Stashpad's own delete gets the pre-flight warning in the
+    // folder panel), so the best available answer is to name the damage right
+    // after it happens instead of leaving the user to find broken images later.
+    //
+    // The folder is already gone, so its attachments have dropped out of
+    // resolvedLinks; the notes that embedded them now carry UNRESOLVED links.
+    // Waits for the metadata cache to catch up before looking.
+    window.setTimeout(() => {
+      try {
+        const prefix = `${cleaned}/_attachments/`;
+        const broken = new Set<string>();
+        const unresolved = this.app.metadataCache.unresolvedLinks ?? {};
+        for (const [src, targets] of Object.entries(unresolved)) {
+          for (const target of Object.keys(targets ?? {})) {
+            if (target.startsWith(prefix)) { broken.add(src); break; }
+          }
+        }
+        if (!broken.size) return;
+        this.notifications.show({
+          message: `${broken.size} note${broken.size === 1 ? "" : "s"} outside “${name}” embedded ${broken.size === 1 ? "an attachment" : "attachments"} that lived in it, so ${broken.size === 1 ? "that image" : "those images"} no longer resolve${broken.size === 1 ? "s" : ""}. Restoring the folder from the trash fixes ${broken.size === 1 ? "it" : "them"}.\n`
+            + [...broken].slice(0, 8).map((p) => `• \`${p}\``).join("\n"),
+          kind: "warning",
+          category: "delete",
+          duration: 0,
+        });
+        if (broken.size > 8) console.warn("[Stashpad] notes with broken attachment embeds:", [...broken]);
+      } catch (e) { console.warn("[Stashpad] broken-embed check failed", e); }
+    }, 2000);
   }
 
   /** The folders eligible for cross-Stashpad search results, derived from
@@ -1555,6 +1585,21 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-mark-version-final",
       name: "Mark version as final (sheet)",
       callback: () => call("cmdMarkVersionFinal"),
+    });
+    // 0.214.0: the deliberate cross-vault copy/cut. Plain copy/cut no longer
+    // builds the payload, so these are how notes travel between vaults. Paste
+    // deliberately has NO counterpart command — cmdPasteNotes already detects a
+    // cross-vault payload on the clipboard and routes to it, so Mod+V covers
+    // both cases and a second command would just be a redundant door.
+    this.addCommand({
+      id: "stashpad-copy-for-other-vault",
+      name: "Copy for another vault (cross-vault copy)",
+      callback: () => call("cmdCopyForOtherVault"),
+    });
+    this.addCommand({
+      id: "stashpad-cut-for-other-vault",
+      name: "Cut for another vault (cross-vault move)",
+      callback: () => call("cmdCutForOtherVault"),
     });
     this.addCommand({
       id: "stashpad-command-palette",
@@ -2554,7 +2599,13 @@ export default class StashpadPlugin extends Plugin {
       }
       this.notifiedBuildVersion = onDisk;
       this.notifications.show({
-        message: `A newer Stashpad build synced in (\`${loaded}\` → \`${onDisk}\`). Reload the app to apply it.`,
+        // 0.214.1: say what is actually known. checkForSyncedBuild only compares
+        // the version loaded at launch against the one now on disk — it never
+        // checks whether Obsidian Sync is even enabled, and a newer build lands
+        // on disk from BRAT, a manual install, the community-store updater, or a
+        // local `pnpm run deploy` with Obsidian open. "Synced in" was wrong for
+        // every one of those.
+        message: `A newer Stashpad build is installed (\`${loaded}\` → \`${onDisk}\`). Reload the app to apply it.`,
         kind: "info",
         category: "system",
         duration: 0,
@@ -3195,6 +3246,32 @@ export default class StashpadPlugin extends Plugin {
     let attachmentsLinked = 0;
     try { attachmentsLinked = await this.convertAttachmentsToLinks(); }
     catch (e) { console.warn("Stashpad: attachment-link conversion failed", e); }
+    // 0.213.1: re-home attachments stranded in the wrong folder, and report the
+    // shared ones. Runs AFTER convertAttachmentsToLinks so plain-text
+    // attachment frontmatter has already become real links — otherwise those
+    // references wouldn't be in resolvedLinks and their files would look
+    // unreferenced.
+    let strays = { moved: 0, shared: 0, unreferenced: 0, sharedPaths: [] as string[] };
+    try { strays = await this.rehomeStrayAttachments(touched); }
+    catch (e) { console.warn("Stashpad: stray-attachment re-home failed", e); }
+    if (strays.moved || strays.shared) {
+      const lines: string[] = [];
+      if (strays.moved) lines.push(`Moved ${strays.moved} attachment${strays.moved === 1 ? "" : "s"} into the folder whose notes actually use ${strays.moved === 1 ? "it" : "them"}.`);
+      if (strays.shared) {
+        lines.push(
+          `${strays.shared} attachment${strays.shared === 1 ? " is" : "s are"} shared across SEVERAL folders, so ${strays.shared === 1 ? "it was" : "they were"} left where ${strays.shared === 1 ? "it is" : "they are"} — there is no single correct home, and moving ${strays.shared === 1 ? "it" : "them"} would break the other folders' notes. Deleting a folder that holds one of these breaks the notes elsewhere that link to it.`,
+        );
+        for (const p of strays.sharedPaths.slice(0, 10)) lines.push(`• \`${p}\``);
+        if (strays.sharedPaths.length > 10) lines.push(`• …+${strays.sharedPaths.length - 10} more (see console)`);
+        if (strays.sharedPaths.length > 10) console.warn("[Stashpad] shared attachments:", strays.sharedPaths);
+      }
+      this.notifications.show({
+        message: lines.join("\n"),
+        kind: strays.shared ? "warning" : "success",
+        category: "attachment",
+        duration: strays.shared ? 0 : 6000,
+      });
+    }
     return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped };
   }
 
@@ -3277,6 +3354,135 @@ export default class StashpadPlugin extends Plugin {
       }
     }
     return { renamed, skipped };
+  }
+
+  /** 0.213.1 (part 2 of the attachment-ownership work): re-home attachments that
+   *  are stranded in the wrong Stashpad folder, and REPORT the ones that can't
+   *  be re-homed rather than guessing.
+   *
+   *  These are the pre-existing strays — mostly from the composer bug fixed in
+   *  0.213.0, where a file attached in folder A stayed in A/_attachments after
+   *  the note was sent to B. Part 1 stops new ones being made; this cleans up
+   *  what is already on disk.
+   *
+   *  The rule is deliberately conservative, and it is the whole design:
+   *  - referenced by notes in exactly ONE folder, and that folder is not the one
+   *    holding the file → move it there. Unambiguous, so act.
+   *  - referenced from SEVERAL folders → leave it and report it. A file used by
+   *    three folders has no correct single home; picking one would break the
+   *    other two. This is the case the user asked about, and reporting is the
+   *    honest answer.
+   *  - referenced by nothing → leave it alone. It may be deliberate, and
+   *    deleting or moving unreferenced files is not this pass's job.
+   *
+   *  Reads the reverse index from metadataCache.resolvedLinks (in-memory, and it
+   *  includes embeds) rather than scanning bodies, so this stays cheap on a big
+   *  vault. */
+  private async rehomeStrayAttachments(
+    folders: string[],
+  ): Promise<{ moved: number; shared: number; unreferenced: number; sharedPaths: string[] }> {
+    // attachment vault path -> the folders AND the individual notes referencing it.
+    // The note paths matter: we rewrite their links ourselves (see below).
+    const refFolders = new Map<string, Set<string>>();
+    const refNotes = new Map<string, Set<string>>();
+    const links = this.app.metadataCache.resolvedLinks ?? {};
+    for (const [src, targets] of Object.entries(links)) {
+      const srcDir = src.includes("/") ? src.slice(0, src.lastIndexOf("/")) : "";
+      for (const target of Object.keys(targets ?? {})) {
+        if (!target.includes("/_attachments/")) continue;
+        let set = refFolders.get(target);
+        if (!set) { set = new Set(); refFolders.set(target, set); }
+        set.add(srcDir);
+        let notes = refNotes.get(target);
+        if (!notes) { notes = new Set(); refNotes.set(target, notes); }
+        notes.add(src);
+      }
+    }
+
+    let moved = 0, shared = 0, unreferenced = 0;
+    const sharedPaths: string[] = [];
+    for (const folder of folders) {
+      const dir = `${folder.replace(/\/+$/, "")}/_attachments`;
+      const af = this.app.vault.getAbstractFileByPath(dir);
+      if (!(af instanceof TFolder)) continue;
+      // Snapshot — renaming mutates the live children listing mid-loop.
+      const files = af.children.filter((c): c is TFile => c instanceof TFile);
+      for (const file of files) {
+        const refs = refFolders.get(file.path);
+        if (!refs || refs.size === 0) { unreferenced += 1; continue; }
+        if (refs.size > 1) { shared += 1; sharedPaths.push(file.path); continue; }
+        const [only] = [...refs];
+        const home = only.replace(/\/+$/, "");
+        // Already where it belongs, or referenced from a non-Stashpad location
+        // we shouldn't be moving things into.
+        if (!home || home === dir.replace(/\/_attachments$/, "") || !folders.includes(home)) continue;
+        const destDir = `${home}/_attachments`;
+        const from = file.path;
+        try {
+          await this.ensureFolderPath(destDir);
+          let target = `${destDir}/${file.name}`;
+          for (let i = 1; i < 1000 && this.app.vault.getAbstractFileByPath(target); i++) {
+            target = `${destDir}/${buildAttachmentName(file.name, `${i}`)}`;
+          }
+          // vault.rename, NOT fileManager.renameFile — and we rewrite the links
+          // ourselves afterwards. fileManager's automatic link updating obeys the
+          // user's "New link format" setting, which on the default "shortest"
+          // rewrites Stashpad's ABSOLUTE `![[Folder/_attachments/x.png]]` down to
+          // a bare `![[x.png]]`. That still resolves today, but it reintroduces
+          // exactly the basename ambiguity the 0.211.4 (F2) fix eliminated —
+          // attachment identity is the vault PATH, never the basename — and this
+          // pass moves files BETWEEN folders, which is where same-name collisions
+          // actually happen. Doing it by hand keeps links absolute and also drops
+          // the dependency on the user's automatic-link-update setting.
+          await this.app.vault.rename(file, target);
+          for (const notePath of refNotes.get(from) ?? []) {
+            const nf = this.app.vault.getAbstractFileByPath(notePath);
+            if (!(nf instanceof TFile)) continue;
+            try {
+              const body = await this.app.vault.read(nf);
+              const next = body
+                .split(`[[${from}]]`).join(`[[${target}]]`)
+                .split(`[[${from}|`).join(`[[${target}|`);
+              if (next !== body) await this.app.vault.modify(nf, next);
+            } catch (e) {
+              console.warn(`Stashpad: couldn't repoint ${notePath} after re-homing ${from}`, e);
+            }
+          }
+          moved += 1;
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        } catch (e) {
+          console.warn(`Stashpad: couldn't re-home stray attachment ${from}`, e);
+        }
+      }
+    }
+    return { moved, shared, unreferenced, sharedPaths };
+  }
+
+  /** 0.213.2 (part 3): which attachments inside `folder` are embedded by notes
+   *  OUTSIDE it — i.e. what deleting this folder would break elsewhere.
+   *
+   *  Deleting a Stashpad folder takes its `_attachments` with it, so any note in
+   *  another folder that embeds one of those files loses its image with no
+   *  warning and no obvious cause. This is the pre-flight for that.
+   *
+   *  Returns the attachment paths plus the set of outside folders affected, so
+   *  the caller can say what breaks and where. */
+  outsideReferencesToFolderAttachments(folder: string): { paths: string[]; folders: string[] } {
+    const dir = `${folder.replace(/\/+$/, "")}/_attachments/`;
+    const paths = new Set<string>();
+    const folders = new Set<string>();
+    const links = this.app.metadataCache.resolvedLinks ?? {};
+    for (const [src, targets] of Object.entries(links)) {
+      // A note inside the folder being deleted is going away too — only notes
+      // that SURVIVE the delete can be broken by it.
+      if (src.startsWith(`${folder.replace(/\/+$/, "")}/`)) continue;
+      for (const target of Object.keys(targets ?? {})) {
+        if (!target.startsWith(dir)) continue;
+        paths.add(target);
+        folders.add(src.includes("/") ? src.slice(0, src.lastIndexOf("/")) : "(vault root)");
+      }
+    }
+    return { paths: [...paths], folders: [...folders] };
   }
 
   // ---------- Sidebar panels (0.68.0) ----------
@@ -5366,8 +5572,8 @@ export default class StashpadPlugin extends Plugin {
     new ConfirmModal(
       this.app,
       "Cut notes pasted in another vault",
-      `Vault "${ack.destVault}" received the ${n} cut note${n === 1 ? "" : "s"} (with their subtrees) from "${this.app.vault.getName()}".\n\n`
-      + `Delete the originals from "${this.app.vault.getName()}" now to finish the move?\n`
+      `Vault **${ack.destVault}** received the ${n} cut note${n === 1 ? "" : "s"} (with their subtrees) from **${this.app.vault.getName()}**.\n\n`
+      + `Delete the originals from **${this.app.vault.getName()}** now to finish the move into **${ack.destVault}**?\n`
       + `Deleting is undoable here (Undo in the list). Cancel keeps them and the cut becomes a copy.`,
       "Delete the originals",
       (confirmed) => { void (async () => {
@@ -5385,12 +5591,12 @@ export default class StashpadPlugin extends Plugin {
             redo: async () => { await this.trashSubtrees(pending.folder, pending.ids); this.refreshOpenViewsForFolder(pending.folder); },
           });
           this.notifications.show({
-            message: `Finished the cross-vault cut: removed ${noteN} note${noteN === 1 ? "" : "s"} — they now live in "${ack.destVault}". Undo restores them here.`,
+            message: `Finished the cross-vault cut: removed ${noteN} note${noteN === 1 ? "" : "s"} from **${this.app.vault.getName()}** — they now live in **${ack.destVault}**. Undo restores them here.`,
             kind: "warning", category: "delete", affectedIds: pending.ids, folder: pending.folder, duration: 0,
           });
         } catch (e) {
           console.warn("[Stashpad] cross-vault cut cleanup failed — nothing deleted", e);
-          new Notice("Couldn't delete the cut originals — they're untouched. See console.");
+          new Notice(boldFragment(`Couldn't delete the cut originals in **${this.app.vault.getName()}** — they're untouched, and the copies in **${ack.destVault}** are unaffected. See console.`));
         }
       })(); },
       "Keep them (copy)",
