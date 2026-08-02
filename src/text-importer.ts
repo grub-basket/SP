@@ -96,6 +96,15 @@ export const BUILTIN_COLOR_NAMES: Record<string, string> = {
   // Friendly synonyms people actually type.
   yellow: "#e0a744", gold: "#e0a744", teal: "#5ba9ce", cyan: "#5ba9ce",
   violet: "#9b82c9", grey: "#9b82c9", gray: "#9b82c9",
+  // The desktop app's palette named this slot "Fuchsia" (its colorCode 8) and
+  // called the NEXT one "Pink", where ours calls them pink/magenta. The names
+  // slide by one at the top of the list, so `fuchsia` had no entry at all.
+  // Added as an alias for the existing hex rather than renaming `pink` — notes
+  // already carry baked hexes, and renaming would resolve `[color: pink]` to a
+  // different colour than the ones already in the vault. Anything importing
+  // from the old app must map by colorCode, never by name; see
+  // docs/stashpad-app-import-plan.md.
+  fuchsia: "#c57ab5",
 };
 
 /** Leading list marker: `- `, `* `, `+ `, `1. `, `1) `. */

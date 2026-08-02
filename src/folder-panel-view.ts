@@ -3,6 +3,7 @@ import type StashpadPlugin from "./main";
 import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type StashpadId } from "./types";
 import { renderCountBadge } from "./panels-view";
 import { ConfirmModal } from "./modals";
+import { canRevealInOs, osFileManagerName, revealInOsFileManager } from "./os-reveal";
 
 /** 0.164.0: a pinned item in the folder panel's shared pin order — either a
  *  pinned FOLDER or a pinned NOTE. `at` is the shared numeric order key. */
@@ -458,6 +459,10 @@ export class StashpadFolderPanelView extends ItemView {
       const menu = new Menu();
       menu.addItem((it) => it.setTitle("Unpin from sidebar").setIcon("pin-off")
         .onClick(() => void this.plugin.unpinNote({ folder, id })));
+      if (canRevealInOs()) {
+        menu.addItem((it) => it.setTitle(`Open in ${osFileManagerName()}`).setIcon("app-window")
+          .onClick(() => revealInOsFileManager(this.app, file.path)));
+      }
       menu.showAtMouseEvent(e);
     };
 
@@ -865,6 +870,14 @@ export class StashpadFolderPanelView extends ItemView {
       .onClick(() => void this.plugin.activateViewForFolder(folder)));
     menu.addItem((i) => i.setTitle("Reveal in file explorer").setIcon("folder-search")
       .onClick(() => this.revealFolder(folder)));
+    // 0.215.0: hand off to the OS file manager. Desktop only — mobile has no
+    // file manager to reveal into, so the entry is hidden rather than shown
+    // and failing. Distinct from the entry above, which reveals in Obsidian's
+    // OWN file explorer view.
+    if (canRevealInOs()) {
+      menu.addItem((i) => i.setTitle(`Open in ${osFileManagerName()}`).setIcon("app-window")
+        .onClick(() => revealInOsFileManager(this.app, folder)));
+    }
     menu.addSeparator();
     // Placement (pin / downrank / hide). Each is a toggle; setFolderState clears
     // the other two so a folder is in at most one state.

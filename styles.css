@@ -32,6 +32,14 @@
 .workspace-leaf:has(> .workspace-leaf-content[data-type="stashpad-view"]) .view-header-nav-buttons {
   display: none !important;
 }
+/* 0.216.0: wrapper for everything rendered ABOVE the composer. render()
+   empties THIS instead of the view root when the composer is being reused, so
+   the focused textarea is never detached (detaching it dismisses the mobile
+   keyboard). display:contents keeps its children direct participants in the
+   root's flex column — layout and gap are byte-identical to the unwrapped
+   structure, and no selector in this file targets root children directly. */
+.stashpad-chrome { display: contents; }
+
 .stashpad-view {
   position: absolute;
   inset: 0;
@@ -83,9 +91,28 @@
   min-width: 0;
 }
 .stashpad-folder-btn:hover { background: var(--background-modifier-hover); }
+/* 0.215.0: the override state used the raw accent as TEXT on the neutral grey
+   button background. That is only legible when the theme's accent happens to be
+   dark; with a bright accent (yellow, lime, cyan) it washes out completely.
+
+   Fixed by pairing, not by picking a colour: fill with the accent and use
+   --text-on-accent for the text. Obsidian guarantees that pair contrasts, and
+   it is the variable that exists precisely for "text sitting on the accent" —
+   so this self-corrects for every theme and every accent, light or dark,
+   instead of hardcoding black (which would then fail on a dark accent) or
+   lightening the grey (which only moves the problem). The icon inherits
+   currentColor, so it comes along. */
 .stashpad-folder-btn.is-override {
+  background: var(--interactive-accent);
   border-color: var(--interactive-accent);
-  color: var(--interactive-accent);
+  /* --sp-on-accent is chosen at runtime from the accent's luminance (see
+     applyOnAccentText in view.ts) — white on a dark accent, black on a bright
+     one. The fallback covers the frame before that lands. */
+  color: var(--sp-on-accent, var(--text-on-accent));
+}
+.stashpad-folder-btn.is-override:hover {
+  background: var(--interactive-accent-hover, var(--interactive-accent));
+  color: var(--sp-on-accent, var(--text-on-accent));
 }
 .stashpad-time-filter-btns {
   display: flex;
@@ -1067,6 +1094,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   border-radius: 14px 14px 0 0;
   max-height: 75vh;
   animation: stashpad-sheet-up 0.18s ease;
+  /* 0.216.2: lift the CONTENT off the very bottom of the screen (home
+     indicator / thumb-reach dead zone) while the sheet surface itself still
+     runs to the edge — padding, not margin, so there is no blank gap under
+     the sheet. env() adds the device safe-area on real phones; the 18px base
+     provides the lift everywhere else. */
+  padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
 }
 @keyframes stashpad-sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
 .stashpad-breadcrumb-modal .stashpad-bc-levels { display: flex; flex-direction: column; gap: 2px; }
@@ -3212,11 +3245,54 @@ body.is-mobile .stashpad-binding-slot-btns { flex-direction: column; gap: 3px; }
 }
 /* 0.143.0: the per-folder "Folder" picker reads as a heading-sized selector — the
    selected folder is the subject of every option below it. */
+/* The folder IS the subject of everything below it, so this dropdown is
+   deliberately heading-sized (0.143.0).
+
+   0.214.3: it used `padding: 4px 8px`, and that shorthand overwrote the
+   RIGHT padding Obsidian reserves for the chevron it paints as a background
+   image. At this font size a long folder name then ran straight under the
+   chevron. Keep the large type; give the arrow its room back explicitly, and
+   let an over-long name ellipsize instead of colliding. Chromium (so Electron,
+   so Obsidian) honours text-overflow on a <select>. */
 .stashpad-folderenc-picker {
   font-size: var(--font-ui-large, 1.1em);
   font-weight: var(--font-semibold, 600);
   height: auto;
-  padding: 4px 8px;
+  /* 0.215.1: the chevron sits inside a CIRCULAR button, which is wider than the
+     bare glyph — 34px cleared the arrow but left the name almost touching the
+     circle. 46px gives the text real separation from it. */
+  padding: 4px 46px 4px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 0.214.4: size to the content instead of Obsidian's fixed settings-dropdown
+   width, so the control grows LEFTWARD from the right edge for as long as the
+   name needs — capped at the row so it can never overflow. Ellipsis stays as
+   the backstop for a name longer than the whole row.
+
+   The extra `.setting-item-control` in the selector is load-bearing, not
+   decoration: Obsidian styles this as `.setting-item-control .dropdown`
+   (specificity 0,2,0) with a fixed width and max-width: 400px, which beats a
+   lone `.stashpad-folderenc-picker` (0,1,0). A single-class rule here silently
+   loses and the picker stays pinned narrow — which is exactly what happened on
+   the first attempt at this fix. */
+.stashpad-folderenc-row .setting-item-control .stashpad-folderenc-picker {
+  width: auto;
+  max-width: 100%;
+}
+/* The control column defaults to `flex: 0 0 auto`, which is what kept the
+   picker narrow. Let it claim the space it needs (min-width:0 so it may still
+   shrink on a narrow pane) while staying right-aligned. */
+.stashpad-folderenc-row .setting-item-control {
+  flex: 1 1 auto;
+  min-width: 0;
+  justify-content: flex-end;
+}
+/* Paired with the above: the name/description column must be allowed to shrink,
+   or the two fight and the row overflows instead of the text wrapping. */
+.stashpad-folderenc-row .setting-item-info {
+  min-width: 0;
 }
 /* 0.121.13: the FIRST sub-heading of a folded tab (top of Behavior / Org
    Systems) gets extra top room so it doesn't crowd the page title. */

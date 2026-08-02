@@ -313,6 +313,17 @@ export interface StashpadSettings {
    *  drive. On a fast machine that cost is unnoticeable and always-on is more
    *  convenient than remembering the explicit command. */
   alwaysStampCrossVault: boolean;
+  /** 0.215.0: set once the one-shot "automatic link updating is off" notice has
+   *  been shown, so it never nags. The settings warning stays regardless. */
+  linkUpdateWarningShown: boolean;
+  /** 0.215.0: where NEW attachments are written.
+   *  - "per-folder" (default): `<stashpadFolder>/_attachments` — today's behaviour.
+   *  - "universal": one folder for every Stashpad, `attachmentUniversalFolder`.
+   *  - "obsidian": wherever Obsidian's own attachment setting points.
+   *  Only affects attachments added from now on; existing files stay put. */
+  attachmentLocation: "per-folder" | "universal" | "obsidian";
+  /** Destination for attachmentLocation === "universal". */
+  attachmentUniversalFolder: string;
   /** When true (default), the composer textarea is re-focused after each
    *  Enter-submit so you can keep typing the next note. Off = focus stays
    *  in the list so arrow-keys keep working without an extra click. */
@@ -682,6 +693,9 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   confirmBulkDelete: true,
   confirmAttachmentDelete: true,
   alwaysStampCrossVault: false,
+  linkUpdateWarningShown: false,
+  attachmentLocation: "per-folder",
+  attachmentUniversalFolder: "Attachments",
   autofocusComposerAfterSend: true,
   focusComposerOnOpen: false,
   searchOpensInContext: true,
@@ -1316,7 +1330,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     this.pfeRerender = () => { panel.empty(); this.renderFolderEncPanel(panel, this.pfeSelected!); };
     // 0.143.0: "Folder" is a heading, and the folder picker is enlarged to read as
     // a heading-sized selector (the folder IS the subject of everything below).
-    new Setting(host).setName("Folder")
+    const folderRow = new Setting(host).setName("Folder")
       .setDesc("Pick a folder to configure its password, archive, and trash options. Everything below applies to the selected folder only.")
       .setHeading()
       .addDropdown((d) => {
@@ -1325,6 +1339,11 @@ export class StashpadSettingTab extends PluginSettingTab {
         d.selectEl.addClass("stashpad-folderenc-picker");
         d.onChange((v) => { this.pfeSelected = v; this.pfeRerender?.(); });
       });
+    // 0.214.4: mark the ROW too. The control column is `flex: 0 0 auto` by
+    // default, which is what pinned the picker to a narrow intrinsic width and
+    // truncated a folder name far earlier than it needed to. CSS can't reach a
+    // parent, so the row gets its own class to widen the control column.
+    folderRow.settingEl.addClass("stashpad-folderenc-row");
     // (createDiv above put the panel before the dropdown in the DOM — move it
     // back below so the layout reads Folder → panel.)
     host.appendChild(panel);
@@ -1604,6 +1623,28 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.plugin.settings.importExcludePrefixes = v; await set();
       })), ["import", "exclude", "prefix", "subfolder", "underscore", "ignore"]));
 
+    // 0.215.0: a standing warning while Obsidian's automatic link updating is
+    // off. The startup toast fires once; this stays for as long as the problem
+    // does, so the explanation is findable after that toast is dismissed.
+    if (this.plugin.linkUpdatesDisabled()) {
+      cats.maintenance.push(this.sectionDef(
+        "⚠️ Automatic link updating is OFF",
+        "",
+        (host) => {
+          host.createEl("p", { text:
+            "Obsidian's “Automatically update internal links” setting is turned off for this vault. " +
+            "Stashpad renames a note's file when its first line changes, and with that setting off Obsidian " +
+            "will not repoint [[wikilinks]] to the renamed note — so links to your Stashpad notes break " +
+            "silently as you edit them." });
+          host.createEl("p", { cls: "setting-item-description", text:
+            "Fix it in Obsidian's Settings → Files and links → “Automatically update internal links”. " +
+            "Stashpad deliberately does not change this for you: it is a vault-wide Obsidian preference, " +
+            "and you may have turned it off on purpose. This warning disappears once it is on." });
+        },
+        ["links", "wikilinks", "rename", "broken", "update", "automatically"],
+      ));
+    }
+
     cats.maintenance.push(this.renderDef("Rebootstrap existing Stashpad folders", "Walk every folder that has a home note: ensure infrastructure (_imports, _exports, drafts file), backfill the redundant parentLink + children frontmatter fields, rename any note whose filename slug no longer matches its body's first line, AND migrate legacy attachment filenames to the new name-first format (`photo-<id>.png`). Safe to run anytime; skip-if-equal means already-synced notes are no-op writes.", (s) =>
       s.addButton((b) =>
         b.setButtonText("Rebootstrap now").onClick(async () => {
@@ -1713,6 +1754,48 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.movingNotes.push(toggle("Always prepare cut/copy for another vault", "Cross-vault copy/cut builds a bundle of the whole selection — every note and every attachment is read — so it is the slow part of a copy, especially on a network drive or a big selection. By default that only happens when you run “Copy/Cut for another vault”, keeping ordinary cut/copy instant. Turn this ON to prepare it on EVERY cut and copy, so plain Mod+C in one vault can be pasted into another. Fine on a fast machine; noticeable on a slow disk.",
       () => this.plugin.settings.alwaysStampCrossVault, (v) => { this.plugin.settings.alwaysStampCrossVault = v; }, ["cross-vault", "clipboard", "copy", "cut", "paste", "slow", "zip", "performance"]));
+
+    // 0.215.0: where new attachments go. Default stays per-folder so existing
+    // vaults are unchanged; the description names the trade-off honestly,
+    // because the stranding risk is the whole reason the other modes exist.
+    cats.foldersStorage.push(this.renderDef(
+      "Where new attachments are stored",
+      "Per-Stashpad keeps each folder's files inside it (<folder>/_attachments), which makes a Stashpad "
+      + "self-contained and portable — but it is also what causes STRANDED ATTACHMENTS: attach a file, then "
+      + "send or move that note to a different folder, and the file stays behind in the folder it was "
+      + "dropped in. Stashpad now carries staged attachments across on send and can re-home strays during "
+      + "Rebootstrap, but a file used by SEVERAL folders has no single correct home, so it is reported "
+      + "rather than moved — and deleting the folder holding it breaks the other folders' notes. "
+      + "One shared folder, or Obsidian's own attachment location, avoids the whole problem by never "
+      + "putting attachments inside a Stashpad. Changing this only affects attachments added from now on; "
+      + "existing files stay exactly where they are.",
+      (s) => s.addDropdown((d) => {
+        d.addOption("per-folder", "Per-Stashpad (<folder>/_attachments)");
+        d.addOption("universal", "One shared folder (set below)");
+        d.addOption("obsidian", "Follow Obsidian's attachment setting");
+        d.setValue(this.plugin.settings.attachmentLocation ?? "per-folder");
+        d.onChange(async (v) => {
+          this.plugin.settings.attachmentLocation = v as "per-folder" | "universal" | "obsidian";
+          await this.plugin.saveSettings();
+        });
+      }),
+      ["attachment", "attachments", "storage", "location", "stranded", "images", "files"],
+    ));
+    cats.foldersStorage.push(this.renderDef(
+      "Shared attachments folder",
+      "Used when the setting above is “One shared folder”. Created on first use if it does not exist.",
+      (s) => s.addText((t) => {
+        new FolderSuggest(this.app, t.inputEl);
+        t.setPlaceholder("Attachments");
+        t.setValue(this.plugin.settings.attachmentUniversalFolder ?? "");
+        t.inputEl.addEventListener("blur", async () => {
+          const v = t.getValue().trim().replace(/^\/+|\/+$/g, "");
+          this.plugin.settings.attachmentUniversalFolder = v || "Attachments";
+          await this.plugin.saveSettings();
+        });
+      }),
+      ["attachment", "attachments", "shared", "universal", "folder"],
+    ));
 
     cats.foldersStorage.push(this.sectionDef("Cross-Stashpad Search Scope", "Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations. Also: create a new Stashpad.", (host) => {
       const folders = this.plugin.discoverStashpadFolders();

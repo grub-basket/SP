@@ -2550,6 +2550,10 @@ export default class StashpadPlugin extends Plugin {
       if (this.pendingXvCut) void this.checkXvCutAck();
     }, 3000));
     setTimeout(() => void this.checkForSyncedBuild(), 5000);
+    // 0.215.0: one-shot nudge if Obsidian's automatic link updating is off.
+    // Late enough not to compete with startup, and it self-suppresses after the
+    // user has seen it once (see maybeWarnLinkUpdatesOff).
+    setTimeout(() => this.maybeWarnLinkUpdatesOff(), 9000);
     // 0.92.2: also poll periodically. Focus + one-shot-at-5s missed the case
     // where a newer build lands WHILE the window stays focused (a fresh deploy,
     // or Sync pushing a build mid-session) — without a refocus nothing
@@ -2557,6 +2561,57 @@ export default class StashpadPlugin extends Plugin {
     // (checkForSyncedBuild dedupes on version, so a quiet vault costs one cheap
     // manifest read per tick and shows the toast at most once per new version.)
     this.registerInterval(window.setInterval(() => void this.checkForSyncedBuild(), 45_000));
+  }
+
+
+  /** 0.215.0: Obsidian's "Automatically update internal links" is a global
+   *  preference Stashpad quietly DEPENDS on, and it is off for a fair number of
+   *  people who have never had a reason to think about it.
+   *
+   *  Why it matters here more than for most plugins: Stashpad re-slugs a note's
+   *  FILENAME roughly 30 seconds after its first line changes, via
+   *  fileManager.renameFile. With that setting on, Obsidian repoints every
+   *  `[[wikilink]]` to the renamed note. With it OFF, each of those renames
+   *  silently breaks every link pointing at that note — and re-slugging is
+   *  routine, not an edge case, so the damage accumulates quietly.
+   *
+   *  Deliberately NOT auto-enabled. It is a vault-wide Obsidian preference and
+   *  flipping someone's global config from a plugin is not ours to do; the user
+   *  may have turned it off on purpose. Explain the consequence, point at the
+   *  setting, and let them decide.
+   *
+   *  Shown at most once per install. The Settings tab keeps a permanent warning
+   *  (see the Maintenance section) so the information stays findable after this
+   *  toast is dismissed. */
+  maybeWarnLinkUpdatesOff(): void {
+    try {
+      if (this.settings.linkUpdateWarningShown) return;
+      if (!this.linkUpdatesDisabled()) return;
+      this.settings.linkUpdateWarningShown = true;
+      void this.saveSettings();
+      this.notifications.show({
+        message:
+          "Obsidian's **Automatically update internal links** is OFF.\n"
+          + "Stashpad renames a note's file when its first line changes, and with that setting off "
+          + "Obsidian won't repoint `[[links]]` to the renamed note — so those links break silently.\n"
+          + "Turn it on in Obsidian's **Settings → Files and links**. This notice won't appear again; "
+          + "Stashpad's own settings keep a reminder while it stays off.",
+        kind: "warning",
+        category: "system",
+        duration: 0,
+      });
+    } catch (e) {
+      console.warn("[Stashpad] link-update check failed", e);
+    }
+  }
+
+  /** True when Obsidian's automatic internal-link updating is definitively OFF.
+   *  `alwaysUpdateLinks` is undefined on a vault that has never touched the
+   *  setting, and Obsidian's own default is ON — so treat only an explicit
+   *  false as disabled, and never warn on "unknown". */
+  linkUpdatesDisabled(): boolean {
+    const cfg = (this.app.vault as { getConfig?: (k: string) => unknown }).getConfig?.("alwaysUpdateLinks");
+    return cfg === false;
   }
 
   /** 0.76.31: compare the version Obsidian LOADED (this.manifest, read

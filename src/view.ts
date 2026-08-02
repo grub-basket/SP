@@ -200,6 +200,17 @@ export class StashpadView extends ItemView {
   private renderTimer: number | null = null;
   /** True while change events are arriving faster than a human could cause. */
   private renderStorm = false;
+  /** 0.216.1: until this timestamp, debounced renders use a LONGER trailing
+   *  delay so the burst of self-inflicted events after our own note creation
+   *  (vault create, metadata resolve, metadata changed, fmSync parentLink
+   *  write) coalesces into one settle render instead of firing one full
+   *  rebuild each. Those events arrive ~140ms apart — past the 80ms debounce,
+   *  so before this every send produced FIVE full renders in ~1.4s, and each
+   *  one recreated every row. On a large vault that recreation churn is
+   *  visible as the just-created row appearing to select/deselect repeatedly.
+   *  External edits landing inside this window still render — at worst 400ms
+   *  later than usual, and only for the 2s after a create. */
+  private postCreateSettleUntil = 0;
   // Bulk-render suppression: while a bulk op runs (a long split paste,
   // rebootstrap), metadata-driven re-renders are dropped so the list doesn't
   // flicker per-note as files parse and fmSync writes recovery fields. One
@@ -256,6 +267,25 @@ export class StashpadView extends ItemView {
   private composerSplitBtn: HTMLElement | null = null;
   private composerEnterBtn: HTMLElement | null = null;
   private composerHelperEl: HTMLElement | null = null;
+  /** 0.216.0 — persistent-composer machinery. On mobile, rebuilding the
+   *  composer <textarea> detaches the focused element, which dismisses the
+   *  on-screen keyboard; the post-render refocus then re-summons it — a
+   *  visible flicker on every send. iOS offers no reliable way to keep the
+   *  keyboard up across a detach (even a same-task detach+refocus bounces the
+   *  native input session), so the only real fix is to never detach it: the
+   *  composer element persists across renders and only the chrome around it
+   *  (filter bar, breadcrumb, header, list) is rebuilt.
+   *  - chromeEl: display:contents wrapper for everything ABOVE the composer;
+   *    render() empties THIS, not the view root, when the composer is reused.
+   *  - composerRootEl: the persistent .stashpad-composer div.
+   *  - composerSignature: the state the composer build bakes in structurally.
+   *    When it changes (folder switch, tiny/compact toggle) the composer IS
+   *    rebuilt — everything else is updated in place (syncComposerModeUI /
+   *    refreshDestButton). */
+  private chromeEl: HTMLElement | null = null;
+  private composerRootEl: HTMLElement | null = null;
+  private mobileNavEl: HTMLElement | null = null;
+  private composerSignature = "";
   private composerDestBtn: HTMLElement | null = null;
   private composerDraft = "";
   private draftsLoadedFor: string | null = null;
@@ -432,7 +462,9 @@ export class StashpadView extends ItemView {
       this.renderBurstWindowAt = now;
       this.renderBurstCount++;
       if (this.renderBurstCount > RENDER_BURST_THRESHOLD) this.renderStorm = true;
-      const delay = this.renderStorm ? RENDER_STORM_DELAY_MS : 80;
+      const delay = this.renderStorm
+        ? RENDER_STORM_DELAY_MS
+        : (now < this.postCreateSettleUntil ? 400 : 80);
       if (this.renderTimer != null) window.clearTimeout(this.renderTimer);
       this.renderTimer = window.setTimeout(() => {
         this.renderTimer = null;
@@ -2665,7 +2697,34 @@ export class StashpadView extends ItemView {
     const prevAtBottom = !!this.listEl
       && (this.stickToListBottom
         || this.listEl.scrollTop + this.listEl.clientHeight >= this.listEl.scrollHeight - 2);
-    root.empty();
+    // 0.216.0: reuse the composer whenever its baked-in inputs are unchanged —
+    // which includes every render a SEND triggers (the file-create render, the
+    // settings-broadcast render, the metadata-cache render). The focused
+    // textarea is never detached, so the mobile keyboard has no reason to
+    // move. Rebuild only when the signature changed (folder switch,
+    // tiny/compact transition) or the persistent elements are gone.
+    const composerSigNow = this.composerSig();
+    const reuseComposer = !!this.composerRootEl
+      && this.composerRootEl.parentElement === root
+      && this.chromeEl?.parentElement === root
+      && !!this.composerInputEl?.isConnected
+      && this.composerSignature === composerSigNow;
+    if (reuseComposer) {
+      this.chromeEl!.empty();
+      // The mobile nav sits AFTER the composer and carries no focus, so it is
+      // cheap to rebuild; re-appending below lands it back in the right slot.
+      this.mobileNavEl?.remove();
+      this.mobileNavEl = null;
+    } else {
+      root.empty();
+      this.chromeEl = root.createDiv({ cls: "stashpad-chrome" });
+      this.composerRootEl = null;
+      this.mobileNavEl = null;
+    }
+    // Everything that used to build into `root` above the composer builds into
+    // this wrapper instead. display:contents makes it invisible to the root's
+    // flex column, so layout (and the gap between sections) is unchanged.
+    const chrome = this.chromeEl!;
     root.toggleClass("is-mobile", Platform.isMobile);
     // 0.61.1: tiny-mode shell — skip the filter bar, breadcrumb, and
     // focused-header. Render a slim strip with the folder name +
@@ -2688,7 +2747,7 @@ export class StashpadView extends ItemView {
       tabsEl.classList.toggle("stashpad-has-tiny", this.tinyMode);
     }
     if (this.tinyMode) {
-      this.renderTinyHeader(root);
+      this.renderTinyHeader(chrome);
     } else {
       // 0.61.2: compact mode skips the time-filter row on DESKTOP (folder
       // switcher, tag/color/sort/view dropdowns, time-window buttons, the three
@@ -2701,8 +2760,8 @@ export class StashpadView extends ItemView {
       // desktop compact, behavior is unchanged (toolbar hidden, breadcrumb +
       // its exit button shown).
       const mobileCompact = this.compactMode && Platform.isMobile;
-      if (!this.compactMode || Platform.isMobile) this.renderTimeFilterBar(root);
-      if (!mobileCompact) this.renderBreadcrumb(root);
+      if (!this.compactMode || Platform.isMobile) this.renderTimeFilterBar(chrome);
+      if (!mobileCompact) this.renderBreadcrumb(chrome);
     }
 
     const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
@@ -2712,7 +2771,7 @@ export class StashpadView extends ItemView {
     // appears at the top of the list when the full header scrolls out.
     // 0.61.1: tiny mode hides the focused-header too. 0.61.2: compact
     // mode also hides it.
-    if (focused.file && !Platform.isMobile && !this.tinyMode && !this.compactMode) this.renderFocusedHeader(root, focused);
+    if (focused.file && !Platform.isMobile && !this.tinyMode && !this.compactMode) this.renderFocusedHeader(chrome, focused);
 
     this.currentChildren = this.filterChildren(this.collectViewItems(focused.id));
     let selectionMovedByRender = false;
@@ -2745,7 +2804,7 @@ export class StashpadView extends ItemView {
       this.cursorIdx = this.currentChildren.length - 1;
     }
 
-    const list = root.createDiv({ cls: "stashpad-list" });
+    const list = chrome.createDiv({ cls: "stashpad-list" });
     this.listEl = list;
     // List-level dragover: handles the case where the cursor is in the *gap* between
     // rows (no row's dragover fires there). Picks the nearest row + position.
@@ -2763,7 +2822,23 @@ export class StashpadView extends ItemView {
     this.dnd.attachListDnD(list);
     this.populateListBody(list, focused);
 
-    this.renderComposer(root);
+    if (reuseComposer) {
+      // In-place refresh of everything the rebuild used to provide. These two
+      // already exist for the mode toggles (0.142.5) and the destination chip;
+      // between them they cover placeholder, split/enter buttons, helper text
+      // and the destination state.
+      this.refreshDestButton();
+      // Draft reconciliation: when the textarea is NOT focused, adopt an
+      // externally-changed draft (another window / sync via
+      // onExternalSettingsChange). When it IS focused, the live value is the
+      // source of truth — never stomp in-flight typing or IME composition.
+      const taLive = this.composerInputEl;
+      if (taLive && taLive.ownerDocument.activeElement !== taLive && taLive.value !== this.composerDraft) {
+        taLive.value = this.composerDraft;
+      }
+    } else {
+      this.renderComposer(root);
+    }
     if (Platform.isMobile) this.renderMobileNav(root);
     // 0.74.6: a full render is a CONTENT change, not a selection
     // change. Firing selection-changed here made the detail panel
@@ -2998,6 +3073,43 @@ export class StashpadView extends ItemView {
     if (span) { span.empty(); setIcon(span, this.plugin.getFolderIcon(this.noteFolder) ?? "folder"); }
   }
 
+  /** 0.215.0: pick a readable text colour for an accent-filled control.
+   *
+   *  Obsidian ships BOTH `--text-on-accent` (white) and
+   *  `--text-on-accent-inverted` (black) precisely because a theme's accent can
+   *  be light or dark, and it does NOT pick between them for you. Using
+   *  `--text-on-accent` unconditionally is fine on the default purple (3.4:1)
+   *  but unreadable on a bright accent — yellow, lime, cyan — which is exactly
+   *  the case this was reported for.
+   *
+   *  CSS can't branch on a colour's luminance, so measure the accent as the
+   *  browser actually resolved it and choose. Deferred a frame because the
+   *  element has no computed background until it is in the document. The value
+   *  written is computed, not a literal, so it doesn't trip the store lint's
+   *  no-static-styles-assignment rule. */
+  private applyOnAccentText(el: HTMLElement): void {
+    requestAnimationFrame(() => {
+      if (!el.isConnected) return;
+      const bg = getComputedStyle(el).backgroundColor;
+      const parts = (bg.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
+      if (parts.length < 3) return;   // unresolvable (e.g. transparent) — leave the CSS default
+      const lin = parts.map((v) => {
+        const c = v / 255;
+        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+      });
+      const luminance = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
+      // Pick whichever of white/black actually contrasts better on this fill.
+      // The crossover is where the two WCAG ratios are equal:
+      //   white: 1.05 / (L + 0.05)      black: (L + 0.05) / 0.05
+      //   equal when (L + 0.05)^2 = 1.05 * 0.05  ->  L = sqrt(0.0525) - 0.05
+      // which is ~0.179, NOT the ~0.36 this first used. That error mattered:
+      // it left the default purple accent on white text at 3.43:1 (below the
+      // 4.5:1 needed for text this size) when black would have given 6.6:1.
+      const CROSSOVER = Math.sqrt(0.0525) - 0.05;
+      el.style.setProperty("--sp-on-accent", luminance > CROSSOVER ? "var(--text-on-accent-inverted, black)" : "var(--text-on-accent, white)");
+    });
+  }
+
   private renderTimeFilterBar(parent: HTMLElement): void {
     const bar = parent.createDiv({ cls: "stashpad-time-filter-bar" });
 
@@ -3016,7 +3128,7 @@ export class StashpadView extends ItemView {
       folderBtn.title = isOverride
         ? `Folder (override): ${this.noteFolder}\nClick to change or revert to default.`
         : `Folder: ${this.noteFolder}\nClick to override for this tab.`;
-      if (isOverride) folderBtn.addClass("is-override");
+      if (isOverride) { folderBtn.addClass("is-override"); this.applyOnAccentText(folderBtn); }
       folderBtn.onclick = (e) => { e.preventDefault(); this.openFolderPicker(); };
 
       // 0.68.4: icon-only Search button between the folder switcher and
@@ -3469,6 +3581,15 @@ export class StashpadView extends ItemView {
     if (inSelect) selectBtn.addClass("is-active");
     selectBtn.onclick = (e) => {
       e.preventDefault();
+      // 0.216.3: toggling select mode is a MODE change, not navigation — the
+      // list must not move. The render's anchor-based scroll restore drifts
+      // here (select mode changes row chrome, so the anchor row lands at a
+      // slightly different offset — measured ~-140px on the first toggle), so
+      // restore the exact pixel position instead. NOTE: render() recreates
+      // this.listEl, so the restore must read the FRESH element after render —
+      // restoring onto the pre-render node is a silent no-op on a detached
+      // element.
+      const restoreScroll = this.holdListScroll();
       if (this.mobileSelectMode) {
         const first = this.firstSelectedId ?? this.selection.values().next().value;
         this.selection.clear();
@@ -3481,6 +3602,7 @@ export class StashpadView extends ItemView {
         this.firstSelectedId = null;
         this.mobileSelectMode = false;
         this.render();
+        restoreScroll();
       } else {
         const node = this.currentChildren[Math.max(0, this.cursorIdx)];
         this.mobileSelectMode = true;
@@ -3491,6 +3613,7 @@ export class StashpadView extends ItemView {
           this.firstSelectedId = node.id;
         }
         this.render();
+        restoreScroll();
         // Unicode bolt ⚡ matches the lightning-bolt icon on the
         // actions button (Obsidian's Notice doesn't render Lucide icons
         // inline, so the emoji is the next-best visual match).
@@ -5894,6 +6017,22 @@ export class StashpadView extends ItemView {
     // folder + search.
   }
 
+  /** The composer-chrome inputs that are baked in at BUILD time rather than
+   *  synced in place. If any of these change, reuse would show stale chrome, so
+   *  render() rebuilds the composer (accepting one keyboard flicker for these
+   *  rare, deliberate transitions). Everything not listed here is either static
+   *  or refreshed in place on the reuse path. */
+  private composerSig(): string {
+    return [
+      this.noteFolder,
+      this.tinyMode,
+      this.compactMode,
+      Platform.isMobile,
+      this.folderOverride ?? "",
+      this.plugin.getFolderIcon(this.noteFolder) ?? "",
+    ].join("\u0000");
+  }
+
   private renderComposer(parent: HTMLElement): void {
     const settings = getSettings();
     const enterSubmits = this.modeEnterSubmits;
@@ -5908,6 +6047,8 @@ export class StashpadView extends ItemView {
     // post-restore "clear-X" button went with it — 0.97.x removed the dead code.)
 
     const composer = parent.createDiv({ cls: "stashpad-composer" });
+    this.composerRootEl = composer;
+    this.composerSignature = this.composerSig();
 
     // Wrap the textarea so we can absolutely-position the clear-X over it.
     const taWrap = composer.createDiv({ cls: "stashpad-composer-input-wrap" });
@@ -5996,7 +6137,19 @@ export class StashpadView extends ItemView {
         // 0.89.0: tapping the list to dismiss the composer should leave the
         // selected note visible (it may have been hidden behind the composer).
         // Re-reveal after the keyboard's close animation settles the layout.
-        if (Platform.isMobile && this.cursorIdx >= 0) setTimeout(() => this.revealCursorRow(), 350);
+        // 0.216.2: only when the cursor row is already NEAR the viewport. This
+        // reveal exists to counter the keyboard-dismiss reflow (~336px of row
+        // slide as the leaf regrows) — it is a "keep what you were looking at
+        // visible" fix, not navigation. Deciding unconditionally meant that
+        // after a send (cursor on the newest note, which sits at the TOP of
+        // the stack), tapping ANY toolbar button while the composer was
+        // focused blurred it and, 350ms later, yanked the whole list to the
+        // top. Measured live: scrollTop 4495 -> 129 from one select-mode tap.
+        // A row within 1.5 list-heights comfortably covers the genuine reflow
+        // case; anything farther means the user deliberately scrolled away.
+        if (Platform.isMobile && this.cursorIdx >= 0 && this.cursorRowNearViewport()) {
+          setTimeout(() => this.revealCursorRow(), 350);
+        }
       });
     }
     this.composerInputEl = ta;
@@ -6303,6 +6456,11 @@ export class StashpadView extends ItemView {
     this.composerNarrowObserver = ro;
 
     const sendBtn = btnRail.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-send" });
+    // 0.216.0: every sibling button already guards mousedown (destBtn's comment
+    // documents why: stealing focus dismisses the mobile keyboard). Send was
+    // the ONE button without it, so a tap on Send blurred the textarea at
+    // gesture time — dismissing the keyboard before submit even ran.
+    sendBtn.onmousedown = (e) => e.preventDefault();
     sendBtn.title = "Send (Enter)";
     setIcon(sendBtn, "arrow-up");
     const submit = async () => {
@@ -6469,6 +6627,7 @@ export class StashpadView extends ItemView {
 
   private renderMobileNav(parent: HTMLElement): void {
     const nav = parent.createDiv({ cls: "stashpad-mobile-nav" });
+    this.mobileNavEl = nav;
     nav.createEl("button", { text: "Home" }).onclick = () => this.navigateTo(ROOT_ID);
     nav.createEl("button", { text: "Back" }).onclick = () => this.navigateUp();
     nav.createEl("button", { text: "Bookmarks" }).onclick = () => this.openBookmarks();
@@ -6637,6 +6796,62 @@ export class StashpadView extends ItemView {
     this.revealCursorRow();
     this.stampSelectedCursor();
     this.plugin.notifyStashpadSelectionChanged();
+  }
+
+  /** True when the cursor row sits within ~1.5 list-heights of the visible
+   *  list area. Used at composer-blur time to decide whether the post-dismiss
+   *  reveal is a reflow correction (row nearby — do it) or an unwanted jump to
+   *  wherever the cursor happens to live (row far away — skip). 0.216.2. */
+  private cursorRowNearViewport(): boolean {
+    const list = this.listEl;
+    if (!list || this.cursorIdx < 0) return false;
+    const row = list.querySelector(`[data-idx="${this.cursorIdx}"]`) as HTMLElement | null;
+    if (!row) return false;
+    const lr = list.getBoundingClientRect();
+    const rr = row.getBoundingClientRect();
+    const margin = lr.height * 1.5;
+    return rr.bottom > lr.top - margin && rr.top < lr.bottom + margin;
+  }
+
+  /** 0.216.4: hold the list exactly where it is across a render.
+   *
+   *  render()'s default policy is ANCHOR-based (re-scroll so the same row sits
+   *  at the same visual offset), which is right when CONTENT changed. It is
+   *  wrong for an in-place ATTRIBUTE change — select mode, a colour, a task
+   *  checkbox — because those alter row chrome, so the anchor row lands at a
+   *  slightly different offset and the list creeps. Measured: ~130px UP per
+   *  colour change / task toggle, and the same on the select toggle.
+   *
+   *  Call BEFORE the mutation, invoke the returned function right after
+   *  this.render().
+   *
+   *  Two things this gets right that a naive scrollTop save/restore does not:
+   *  - render() RECREATES this.listEl, so the restore reads the element FRESH
+   *    each time. Capturing the node up front writes to a detached element and
+   *    silently no-ops.
+   *  - AT THE BOTTOM, restoring a fixed pixel is wrong: lazy note bodies keep
+   *    growing scrollHeight for a few hundred ms afterwards, so the saved
+   *    offset stops being the bottom and the list visibly settles backwards
+   *    (the "jiggle"). When we started at the bottom we re-pin to the bottom
+   *    instead, which absorbs that growth smoothly. */
+  private holdListScroll(): () => void {
+    const list = this.listEl;
+    const top = list?.scrollTop ?? 0;
+    const atBottom = !!list && (list.scrollTop + list.clientHeight >= list.scrollHeight - 2);
+    return () => {
+      const apply = (): void => {
+        const el = this.listEl;
+        if (!el) return;
+        el.scrollTop = atBottom ? el.scrollHeight - el.clientHeight : top;
+      };
+      apply();
+      requestAnimationFrame(apply);
+      window.setTimeout(apply, 60);
+      // Lazy bodies can still resize rows for a while; a late pass keeps both
+      // the pinned-bottom and the fixed-offset cases stable through it.
+      window.setTimeout(apply, 220);
+      window.setTimeout(apply, 500);
+    };
   }
 
   private revealCursorRow(): void {
@@ -8080,7 +8295,11 @@ export class StashpadView extends ItemView {
             await this.log.append({ type: "palette_color_add", id: ROOT_ID, payload: { color } });
           }
         }
+        // 0.216.4: a colour is an in-place attribute change — the list must not
+        // move. (Anchor restore drifted it ~130px up.)
+        const restoreColorScroll = this.holdListScroll();
         this.render();
+        restoreColorScroll();
         // 0.59.0: push an undo entry so the user can reverse a color
         // change with Cmd+Z. Restores each target's prior color (or
         // removes the color frontmatter entirely if there was none).
@@ -8099,7 +8318,9 @@ export class StashpadView extends ItemView {
             } catch { /* ignore */ }
           }
           this.tree.rebuild(undoFolder);
+          const restore = this.holdListScroll();
           this.render();
+          restore();
         };
         this.plugin.getUndoStack(undoFolder).push({
           label: priors.length === 1 ? "Color change" : `Color change (${priors.length})`,
@@ -11199,7 +11420,11 @@ export class StashpadView extends ItemView {
       this.taskTaggedState.set(t.file.path, makeTask);           // 0.85.1
       changedIds.push(t.id);
     }
+    // 0.216.4: adding/removing a checkbox changes row chrome, so the anchor
+    // restore drifts (measured -130px). Hold the exact position instead.
+    const restoreTaskScroll = this.holdListScroll();
     this.render();
+    restoreTaskScroll();
     if (changedIds.length > 0) {
       // 0.76.3: title-first wording — '"Foo" marked as task'.
       const verb = makeTask ? "marked as task" : "unmarked as task";
@@ -12556,6 +12781,12 @@ export class StashpadView extends ItemView {
       // importer's create event fires, so its disk id-check would miss the
       // id and "import" the note into Home. Long TTL covers a laggy create.
       this.plugin.importService.suppress(path, 60000);
+      // 0.216.1: everything this write sets in motion (create event, metadata
+      // resolve/changed, the fmSync parentLink write ~100ms out) lands as a
+      // trickle of debounced renders. Stretch the debounce for the next 2s so
+      // they coalesce into one settle render — stamped BEFORE the write,
+      // because the create event fires inside it.
+      this.postCreateSettleUntil = Date.now() + 2000;
       await perf.timeAsync("write.createNote.file", () => this.app.vault.create(path, fullContent));
       opts.collectInto?.push({ path, content: fullContent });
       try {
@@ -12913,14 +13144,52 @@ export class StashpadView extends ItemView {
     return false;
   }
 
+  /** 0.215.0: where a NEW attachment is written, per the attachment-location
+   *  setting. Existing files are never relocated by changing this — only the
+   *  destination for what comes next changes, so switching modes can't strand
+   *  or break anything already on disk.
+   *
+   *  "per-folder" keeps every attachment inside the Stashpad that uses it,
+   *  which is what makes a folder self-contained and portable — and also what
+   *  creates the stranding problem the 0.213.x work manages, since a note sent
+   *  to another folder leaves its files behind. The other two modes put
+   *  attachments outside any single Stashpad, so that problem does not arise.
+   *
+   *  Falls back to per-folder whenever the configured destination is unusable,
+   *  rather than failing the attach. */
+  private attachmentDirFor(): string {
+    const perFolder = `${this.noteFolder}/_attachments`;
+    const s = getSettings();
+    if (s.attachmentLocation === "universal") {
+      const dir = (s.attachmentUniversalFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
+      return dir || perFolder;
+    }
+    if (s.attachmentLocation === "obsidian") {
+      // Obsidian's own setting. "" means the vault root; a leading "./" means
+      // "next to the note", which has no single answer for a Stashpad note
+      // being composed, so that case falls back to per-folder.
+      const raw = (this.app.vault as { getConfig?: (k: string) => unknown }).getConfig?.("attachmentFolderPath");
+      if (typeof raw !== "string") return perFolder;
+      const dir = raw.trim();
+      if (dir === "" || dir === "/") return "";           // vault root
+      if (dir.startsWith("./")) return perFolder;          // note-relative — not resolvable here
+      return dir.replace(/^\/+|\/+$/g, "");
+    }
+    return perFolder;
+  }
+
   private async importAttachment(file: File): Promise<string | null> {
     try {
       const buf = await file.arrayBuffer();
-      const folder = `${this.noteFolder}/_attachments`;
-      await this.ensureFolder(folder);
+      const folder = this.attachmentDirFor();
+      // "" is the vault ROOT (Obsidian's attachment setting allows it). Don't
+      // ensureFolder it, and don't join with a slash — `/name.png` is not a
+      // valid vault path.
+      if (folder) await this.ensureFolder(folder);
       const safeName = file.name.replace(/[^\w.\-]+/g, "_");
       const stamp = Date.now().toString(36);
-      const path = `${folder}/${buildAttachmentName(safeName, stamp)}`;
+      const leaf = buildAttachmentName(safeName, stamp);
+      const path = folder ? `${folder}/${leaf}` : leaf;
       await this.app.vault.createBinary(path, buf);
       // 0.213.0: remember that THIS composer staged this file, so a later send
       // to another folder knows it is safe to carry along (see
