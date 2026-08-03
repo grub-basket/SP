@@ -1052,28 +1052,23 @@ export default class StashpadPlugin extends Plugin {
       new Notice("No duplicate note ids found in any Stashpad folder.");
       return;
     }
-    const totalHidden = perFolder.reduce((n, f) =>
-      n + f.groups.reduce((m, g) => m + g.files.filter((x) => !x.isShown).length, 0), 0);
-    const open = (i: number): void => {
-      const { folder, groups } = perFolder[i];
-      new DuplicateIdsModal(this.app, folder, groups, {
-        onRepair: async () => {
-          const n = await this.repairDuplicateIds(folder, groups);
-          new Notice(n ? `Gave ${n} hidden note${n === 1 ? "" : "s"} a fresh id — they're visible now. Undo in the list reverses it.`
-                       : "Nothing to repair here.");
-        },
-        onNext: i + 1 < perFolder.length ? () => open(i + 1) : undefined,
-        remaining: perFolder.length - i - 1,
-      }).open();
-    };
-    if (perFolder.length > 1) {
-      this.notifications.show({
-        message: `Duplicate ids in ${perFolder.length} folders — ${totalHidden} note${totalHidden === 1 ? " is" : "s are"} hidden in total: `
-          + perFolder.map((f) => `**${f.folder}**`).join(", "),
-        kind: "warning", category: "system", duration: 0,
-      });
-    }
-    open(0);
+    this.openDuplicatesModal(perFolder);
+  }
+
+  /** 0.220.1: one modal for the whole vault. Repair spans every folder listed,
+   *  so the single button matches the single view. */
+  openDuplicatesModal(perFolder: { folder: string; groups: DuplicateIdGroup[] }[]): void {
+    new DuplicateIdsModal(this.app, perFolder, {
+      onRepair: async () => {
+        let total = 0;
+        for (const { folder, groups } of perFolder) {
+          total += await this.repairDuplicateIds(folder, groups);
+        }
+        new Notice(total
+          ? `Gave ${total} hidden note${total === 1 ? "" : "s"} a fresh id — they're visible now. Undo (in the list) reverses it per folder.`
+          : "Nothing to repair — the remaining duplicates are home-note ids, which need a different fix.");
+      },
+    }).open();
   }
 
   async runIntegrityCheckOnFolder(folder: string): Promise<void> {
@@ -3507,7 +3502,7 @@ export default class StashpadPlugin extends Plugin {
           message: `Rebootstrap also found duplicate note ids: ${hidden} note${hidden === 1 ? " is" : "s are"} hidden `
             + `in ${dupes.length === 1 ? `**${dupes[0].folder}**` : `${dupes.length} folders`}. Nothing was changed.`,
           kind: "warning", category: "system", duration: 0,
-          actions: [{ label: "Review duplicates", onClick: () => { void this.findDuplicateNoteIds(); } }],
+          actions: [{ label: "Review duplicates", onClick: () => { this.openDuplicatesModal(dupes); } }],
         });
       }
     } catch (e) { console.warn("Stashpad: duplicate-id scan during rebootstrap failed", e); }
