@@ -74,6 +74,13 @@ export class StashpadDetailView extends ItemView {
   getDisplayText(): string { return "Stashpad detail"; }
   getIcon(): string { return "panel-right"; }
 
+  /** 0.220.0: the last note the panel actually displayed, kept so closing the
+   *  Stashpad tab leaves a readable copy of what you were last looking at
+   *  instead of an empty panel. Marked as retained in the UI so it is never
+   *  mistaken for a live selection. */
+  private lastShown: { folder: string; id: StashpadId; path: string } | null = null;
+  private showingRetained = false;
+
   async onOpen(): Promise<void> {
     this.render();
     // Genuine selection change → unlock so the panel re-locks to the
@@ -97,6 +104,12 @@ export class StashpadDetailView extends ItemView {
       if (leaf.view?.getViewType?.() !== STASHPAD_VIEW_TYPE) return;
       this.scheduleRender();
     }));
+    // 0.220.0: tabs opening/closing/moving. Without this, closing the Stashpad
+    // tab the panel was following left it showing that tab's last selection
+    // forever — the leaf reference outlives the tab, so nothing invalidated it.
+    // Debounced through scheduleRender, and re-rendering is cheap, so reacting
+    // to every layout change is fine.
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.scheduleRender()));
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (this.displayedPath && file.path === this.displayedPath) this.scheduleRender();
     }));
@@ -159,10 +172,23 @@ export class StashpadDetailView extends ItemView {
     // the panel previews the current level instead of "no note selected". Not
     // pinned (no displayedId): re-derived each render, so selecting a child
     // immediately takes over. Home (ROOT, no file) falls through to empty.
-    const view = this.plugin.lastActiveStashpadLeaf?.view as any;
+    // Only a leaf that is STILL OPEN — a closed tab keeps its view object alive
+    // with its last focus intact, which is exactly the stale panel this fixes.
+    const view = this.plugin.activeStashpadLeafIfOpen()?.view as any;
     if (view?.getViewType?.() === STASHPAD_VIEW_TYPE && view.tree?.get && view.focusId) {
       const node = view.tree.get(view.focusId);
       if (node?.file) return { folder: view.noteFolder as string, id: view.focusId as StashpadId, file: node.file as TFile };
+    }
+    // 0.220.0: nothing live. Rather than blanking, fall back to a COPY of what
+    // was last previewed — provided the file still exists, so a deleted note
+    // still clears properly. Flagged as retained so the UI can say so.
+    if (this.lastShown) {
+      const f = this.app.vault.getAbstractFileByPath(this.lastShown.path);
+      if (f instanceof TFile) {
+        this.showingRetained = true;
+        return { folder: this.lastShown.folder, id: this.lastShown.id, file: f };
+      }
+      this.lastShown = null;   // the note is gone — don't keep pointing at it
     }
     return null;
   }
@@ -182,9 +208,11 @@ export class StashpadDetailView extends ItemView {
     root.empty();
     root.addClass("stashpad-detail-root");
 
+    this.showingRetained = false;
     const sel = this.resolveDisplayed();
     if (!sel) {
       this.displayedPath = null;
+      this.lastShown = null;
       const empty = root.createDiv({ cls: "stashpad-detail-empty" });
       setIcon(empty.createSpan({ cls: "stashpad-detail-empty-icon" }), "panel-right");
       empty.createSpan({ cls: "stashpad-detail-empty-text",
@@ -194,6 +222,16 @@ export class StashpadDetailView extends ItemView {
 
     const file = sel.file;
     this.displayedPath = file.path;
+    // Remember it for the retained fallback — but only when it is a LIVE
+    // selection, or the retained copy would keep refreshing its own timestamp.
+    if (!this.showingRetained) this.lastShown = { folder: sel.folder, id: sel.id, path: file.path };
+    if (this.showingRetained) {
+      const note = root.createDiv({ cls: "stashpad-detail-retained" });
+      setIcon(note.createSpan({ cls: "stashpad-detail-retained-icon" }), "history");
+      note.createSpan({
+        text: "Last viewed — the Stashpad tab this came from is closed. Open a Stashpad list to resume live updates.",
+      });
+    }
     const fm = (this.app.metadataCache.getFileCache(file)?.frontmatter ?? {}) as any;
 
     // 0.74.7: scrollable content area. Header / body / footer /

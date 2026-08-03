@@ -3784,8 +3784,26 @@ export default class StashpadPlugin extends Plugin {
   /** 0.74.1: snapshot of "which Stashpad note is currently selected"
    *  for the detail panel. Returns null when no Stashpad view is
    *  active or when no row is selected/cursored. */
-  getActiveStashpadSelection(): { folder: string; id: StashpadId; file: TFile } | null {
+  /** 0.220.0: the last-active Stashpad leaf, but ONLY if it is still open.
+   *
+   *  `lastActiveStashpadLeaf` is assigned on activation and never cleared when
+   *  the tab closes, so a detached leaf keeps its view object alive with its
+   *  last `currentChildren` / `cursorIdx` intact. Anything reading it after the
+   *  close — the detail panel especially — kept reporting a selection from a
+   *  tab that no longer exists. Verifying against the live workspace is the
+   *  only reliable test; the reference itself looks perfectly valid. Clears the
+   *  stale reference as a side effect so the check is paid once. */
+  activeStashpadLeafIfOpen(): WorkspaceLeaf | null {
     const leaf = this.lastActiveStashpadLeaf;
+    if (!leaf) return null;
+    let alive = false;
+    this.app.workspace.iterateAllLeaves((l) => { if (l === leaf) alive = true; });
+    if (!alive) { this.lastActiveStashpadLeaf = null; return null; }
+    return leaf;
+  }
+
+  getActiveStashpadSelection(): { folder: string; id: StashpadId; file: TFile } | null {
+    const leaf = this.activeStashpadLeafIfOpen();
     const view = leaf?.view as any;
     if (!view || view.getViewType?.() !== STASHPAD_VIEW_TYPE) return null;
     const folder = (view.noteFolder as string | undefined) ?? "";

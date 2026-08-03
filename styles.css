@@ -6876,3 +6876,20 @@ button.stashpad-btn-loading::after {
   color: var(--text-success);
   font-weight: var(--font-semibold, 600);
 }
+
+/* Detail panel: "last viewed" banner shown when the Stashpad tab the preview
+   came from has been closed (0.220.0). Theme variables only. */
+.stashpad-detail-retained {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+}
+.stashpad-detail-retained-icon { flex: 0 0 auto; color: var(--text-muted); }
