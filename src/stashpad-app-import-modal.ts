@@ -89,7 +89,9 @@ export class AppImporterUI {
     const picker = drop.createEl("input", { type: "file" });
     picker.multiple = true;
     picker.accept = ".json,.md";
-    picker.style.display = "none";
+    // 0.219.6: a CSS class, not a literal style assignment — the community-store
+    // lint's no-static-styles-assignment rule is a CONFIRMED review blocker.
+    picker.addClass("stashpad-visually-hidden");
     picker.addEventListener("change", () => {
       if (picker.files) void this.accept(Array.from(picker.files));
       picker.value = "";

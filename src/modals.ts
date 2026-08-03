@@ -3681,3 +3681,65 @@ export class DropzoneModal extends Modal {
 
   onClose(): void { this.contentEl.empty(); }
 }
+
+/** 0.219.6: a real view of duplicate note ids, replacing the wall-of-text
+ *  notice that listed them inline.
+ *
+ *  Read-only on purpose (see docs/duplicate-ids-plan.md): it makes the
+ *  INVISIBLE notes visible and lets the user open any of them, but changes
+ *  nothing. Repair — re-minting the copies — comes next, once the report shows
+ *  what the real cases look like.
+ *
+ *  Why this matters: TreeIndex keys notes by frontmatter `id`, so files sharing
+ *  an id collapse into ONE row. Every file listed here that isn't the "shown"
+ *  one is currently invisible in Stashpad while still existing on disk. */
+export interface DuplicateIdGroup {
+  id: string;
+  files: { path: string; isShown: boolean }[];
+}
+
+export class DuplicateIdsModal extends Modal {
+  constructor(app: App, private folder: string, private groups: DuplicateIdGroup[]) { super(app); }
+
+  onOpen(): void {
+    this.modalEl.addClass("stashpad-dupes-modal");
+    this.titleEl.setText(`Duplicate note ids in “${this.folder}”`);
+    const c = this.contentEl;
+    c.empty();
+
+    const hiddenCount = this.groups.reduce((n, g) => n + g.files.filter((f) => !f.isShown).length, 0);
+    c.createEl("p", {
+      cls: "setting-item-description",
+      text: `${this.groups.length} id${this.groups.length === 1 ? "" : "s"} ${this.groups.length === 1 ? "is" : "are"} used by more than one note. `
+        + `Notes sharing an id collapse into a single row, so ${hiddenCount} note${hiddenCount === 1 ? " is" : "s are"} currently `
+        + `hidden from the list even though the file still exists. Nothing here changes your notes.`,
+    });
+    c.createEl("p", {
+      cls: "setting-item-description",
+      text: "Most duplicates come from copies that kept their frontmatter — a re-import, a restored backup, or a sync conflict copy. "
+        + "To un-hide one now, open it and give it a different id in its frontmatter. A repair command is planned.",
+    });
+
+    const list = c.createDiv({ cls: "stashpad-dupes-list" });
+    for (const g of this.groups) {
+      const box = list.createDiv({ cls: "stashpad-dupes-group" });
+      const head = box.createDiv({ cls: "stashpad-dupes-group-head" });
+      head.createEl("code", { text: g.id });
+      head.createSpan({ cls: "stashpad-dupes-count", text: `${g.files.length} files` });
+      for (const f of g.files) {
+        const row = box.createEl("button", { cls: "stashpad-dupes-file" });
+        if (f.isShown) row.addClass("is-shown");
+        row.createSpan({
+          cls: "stashpad-dupes-badge",
+          text: f.isShown ? "shown" : "hidden",
+        });
+        row.createSpan({ cls: "stashpad-dupes-path", text: f.path });
+        row.title = f.isShown
+          ? "This is the note Stashpad currently shows for this id — click to open"
+          : "Hidden from the list because another note has the same id — click to open";
+        row.onclick = () => { this.app.workspace.openLinkText(f.path, "", true); };
+      }
+    }
+  }
+  onClose(): void { this.contentEl.empty(); }
+}

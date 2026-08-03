@@ -29,7 +29,7 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal } from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal , DuplicateIdsModal, type DuplicateIdGroup} from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import { AppImportModal } from "./stashpad-app-import-modal";
 import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
@@ -1087,44 +1087,47 @@ export class StashpadView extends ItemView {
    *  Surfaced once per session, and only when the gap is real. */
   private warnDuplicateIds(folder: string, gap: number): void {
     if (this.reportedDuplicateIds || gap <= 0) return;
-    this.reportedDuplicateIds = true;
-    const seen = new Map<string, number>();
+    // Group by id, scoped to THIS folder exactly the way the tree enumerates it.
     const prefix = folder + "/";
+    const byId = new Map<string, string[]>();
     for (const f of this.app.vault.getMarkdownFiles()) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
       const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
       if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
       const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
-      if (typeof id === "string" && id) seen.set(id, (seen.get(id) ?? 0) + 1);
+      if (typeof id !== "string" || !id) continue;
+      const arr = byId.get(id);
+      if (arr) arr.push(f.path); else byId.set(id, [f.path]);
     }
-    const dupes = [...seen.values()].filter((n) => n > 1).length;
-    if (!dupes) return;   // gap has some other cause — don't guess at it
-    // Deliberately does NOT point at "Check folder integrity": that sweep builds
-    // an id-keyed record too, so it collapses duplicates exactly like the tree
-    // does and cannot see this. Name the affected files here instead, so the
-    // notice is actionable on its own until the dedicated scan lands
-    // (docs/duplicate-ids-plan.md).
-    const examples: string[] = [];
-    for (const [id, n] of seen) {
-      if (n < 2) continue;
-      const paths = [...this.app.vault.getMarkdownFiles()]
-        .filter((f) => this.app.metadataCache.getFileCache(f)?.frontmatter?.id === id)
-        .map((f) => f.path);
-      examples.push(`\`${id}\` — ${paths.length} files: ${paths.slice(0, 3).join(", ")}${paths.length > 3 ? ", …" : ""}`);
-      if (examples.length >= 3) break;
+    const groups: DuplicateIdGroup[] = [];
+    for (const [id, paths] of byId) {
+      if (paths.length < 2) continue;
+      // Which one does the tree actually show? That is the file the id resolves
+      // to right now; every other file in the group is invisible in the list.
+      const shownPath = this.tree.get(id as StashpadId)?.file?.path ?? null;
+      groups.push({ id, files: paths.map((p) => ({ path: p, isShown: p === shownPath })) });
     }
+    if (!groups.length) return;   // gap has some other cause — don't guess at it
+    this.reportedDuplicateIds = true;
+    const hidden = groups.reduce((n, g) => n + g.files.filter((f) => !f.isShown).length, 0);
+    // 0.219.6: ONE short line + a button. The previous version inlined every id
+    // and path, which produced a wall of text per folder — and its path lookup
+    // was not folder-scoped, so it listed unrelated notes from other folders
+    // (every folder's home note shares the id `__root__`, so that alone pulled
+    // in a file per Stashpad). Both fixed: scoped above, detail moved into the
+    // modal.
     this.plugin.notifications.show({
-      message: [
-        `**${folder}** has ${dupes} duplicate note id${dupes === 1 ? "" : "s"} (${gap} note${gap === 1 ? "" : "s"} share an id with another).`,
-        `Notes sharing an id collapse into ONE row, so some of these are invisible in the list even though the files still exist.`,
-        ...examples.map((e) => `• ${e}`),
-        dupes > examples.length ? `• …and ${dupes - examples.length} more (see console)` : "",
-        `Nothing has been changed. A repair command is planned; until then, giving one copy a different \`id\` in its frontmatter makes it visible again.`,
-      ].filter(Boolean).join("\n"),
-      kind: "warning", category: "system", folder, duration: 0,
+      message: `**${folder}**: ${groups.length} duplicate note id${groups.length === 1 ? "" : "s"} — ${hidden} note${hidden === 1 ? " is" : "s are"} hidden from the list.`,
+      kind: "warning",
+      category: "system",
+      folder,
+      duration: 0,
+      actions: [{
+        label: "Review duplicates",
+        onClick: () => { new DuplicateIdsModal(this.app, folder, groups).open(); },
+      }],
     });
-    console.warn("[Stashpad] duplicate note ids in", folder, [...seen].filter(([, n]) => n > 1).map(([id]) => id));
   }
 
   private focusView(): void {

@@ -2435,6 +2435,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 .stashpad-split-tab.is-active { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
 .stashpad-split-tab.is-hidden { display: none; }
+
+/* 0.219.6: shared "not rendered" helper. Exists so code never assigns
+   element.style.display directly — that literal assignment is a confirmed
+   Obsidian community-store review blocker (no-static-styles-assignment). */
+.stashpad-visually-hidden { display: none; }
 .stashpad-split-tabpanel { position: relative; }
 .stashpad-split-tabpanel:not(.is-active) { display: none; }
 /* 0.183.0: the editor FILLS the fixed-height modal (no empty gap under short
@@ -6755,3 +6760,40 @@ button.stashpad-btn-loading::after {
   padding: 3px 0 3px 9px;
   margin: 4px 0;
 }
+
+/* Duplicate-id review modal (0.219.6). Theme variables only, legible in light
+   and dark; the list scrolls so a folder with dozens of groups can't grow the
+   modal past the viewport. */
+.stashpad-dupes-list { max-height: 46vh; overflow-y: auto; margin-top: 8px; }
+.stashpad-dupes-group {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+}
+.stashpad-dupes-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.stashpad-dupes-count { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.stashpad-dupes-file {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-dupes-file:hover { background: var(--background-modifier-hover); }
+.stashpad-dupes-badge {
+  flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+  padding: 0 6px;
+  border-radius: 10px;
+  background: var(--background-modifier-error);
+  color: var(--text-normal);
+}
+.stashpad-dupes-file.is-shown .stashpad-dupes-badge { background: var(--background-modifier-success); }
+.stashpad-dupes-path { color: var(--text-muted); font-size: var(--font-ui-smaller); word-break: break-all; }
