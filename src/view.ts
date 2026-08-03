@@ -1087,45 +1087,25 @@ export class StashpadView extends ItemView {
    *  Surfaced once per session, and only when the gap is real. */
   private warnDuplicateIds(folder: string, gap: number): void {
     if (this.reportedDuplicateIds || gap <= 0) return;
-    // Group by id, scoped to THIS folder exactly the way the tree enumerates it.
-    const prefix = folder + "/";
-    const byId = new Map<string, string[]>();
-    for (const f of this.app.vault.getMarkdownFiles()) {
-      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-      if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
-      const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
-      if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
-      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
-      if (typeof id !== "string" || !id) continue;
-      const arr = byId.get(id);
-      if (arr) arr.push(f.path); else byId.set(id, [f.path]);
-    }
-    const groups: DuplicateIdGroup[] = [];
-    for (const [id, paths] of byId) {
-      if (paths.length < 2) continue;
-      // Which one does the tree actually show? That is the file the id resolves
-      // to right now; every other file in the group is invisible in the list.
-      const shownPath = this.tree.get(id as StashpadId)?.file?.path ?? null;
-      groups.push({ id, files: paths.map((p) => ({ path: p, isShown: p === shownPath })) });
-    }
-    if (!groups.length) return;   // gap has some other cause — don't guess at it
+    // 0.219.8: check EVERY folder, not just this one. The reconcile that calls
+    // us only ever runs for a folder with an open view, so scoping the warning
+    // to `folder` under-reported — a vault with duplicates in three folders
+    // reported whichever tab happened to be in front.
+    const perFolder = this.plugin.duplicateGroupsEverywhere();
+    if (!perFolder.length) return;   // gap has some other cause — don't guess
     this.reportedDuplicateIds = true;
-    const hidden = groups.reduce((n, g) => n + g.files.filter((f) => !f.isShown).length, 0);
-    // 0.219.6: ONE short line + a button. The previous version inlined every id
-    // and path, which produced a wall of text per folder — and its path lookup
-    // was not folder-scoped, so it listed unrelated notes from other folders
-    // (every folder's home note shares the id `__root__`, so that alone pulled
-    // in a file per Stashpad). Both fixed: scoped above, detail moved into the
-    // modal.
+    const hidden = perFolder.reduce((n, f) =>
+      n + f.groups.reduce((m, g) => m + g.files.filter((x) => !x.isShown).length, 0), 0);
+    const where = perFolder.length === 1 ? `**${perFolder[0].folder}**` : `${perFolder.length} folders`;
     this.plugin.notifications.show({
-      message: `**${folder}**: ${groups.length} duplicate note id${groups.length === 1 ? "" : "s"} — ${hidden} note${hidden === 1 ? " is" : "s are"} hidden from the list.`,
+      message: `${hidden} note${hidden === 1 ? " is" : "s are"} hidden by duplicate ids in ${where}.`,
       kind: "warning",
       category: "system",
       folder,
       duration: 0,
       actions: [{
         label: "Review duplicates",
-        onClick: () => { new DuplicateIdsModal(this.app, folder, groups).open(); },
+        onClick: () => { void this.plugin.findDuplicateNoteIds(); },
       }],
     });
   }

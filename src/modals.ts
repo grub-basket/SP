@@ -1,7 +1,7 @@
-import { App, Modal, ItemView, WorkspaceLeaf, Platform, moment, Notice, setIcon, type SecretStorage } from "obsidian";
+import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, moment, Notice, setIcon, type SecretStorage } from "obsidian";
 import { splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
 import { buildTimePickerInto } from "./time-picker";
-import { siftMatch } from "./types";
+import { siftMatch, ROOT_ID } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL } from "./recurrence";
@@ -3698,26 +3698,42 @@ export interface DuplicateIdGroup {
   files: { path: string; isShown: boolean }[];
 }
 
+export interface DuplicateIdsModalOpts {
+  /** Give every hidden copy a fresh id so it becomes its own visible note. */
+  onRepair?: () => void | Promise<void>;
+  /** Move on to the next affected folder, when several have duplicates. */
+  onNext?: () => void;
+  remaining?: number;
+}
+
 export class DuplicateIdsModal extends Modal {
-  constructor(app: App, private folder: string, private groups: DuplicateIdGroup[]) { super(app); }
+  constructor(
+    app: App,
+    private folder: string,
+    private groups: DuplicateIdGroup[],
+    private opts: DuplicateIdsModalOpts = {},
+  ) { super(app); }
 
   onOpen(): void {
     this.modalEl.addClass("stashpad-dupes-modal");
     this.titleEl.setText(`Duplicate note ids in “${this.folder}”`);
+    this.render();
+  }
+
+  private render(): void {
     const c = this.contentEl;
     c.empty();
-
     const hiddenCount = this.groups.reduce((n, g) => n + g.files.filter((f) => !f.isShown).length, 0);
     c.createEl("p", {
       cls: "setting-item-description",
       text: `${this.groups.length} id${this.groups.length === 1 ? "" : "s"} ${this.groups.length === 1 ? "is" : "are"} used by more than one note. `
         + `Notes sharing an id collapse into a single row, so ${hiddenCount} note${hiddenCount === 1 ? " is" : "s are"} currently `
-        + `hidden from the list even though the file still exists. Nothing here changes your notes.`,
+        + `hidden from the list even though the file still exists.`,
     });
     c.createEl("p", {
       cls: "setting-item-description",
-      text: "Most duplicates come from copies that kept their frontmatter — a re-import, a restored backup, or a sync conflict copy. "
-        + "To un-hide one now, open it and give it a different id in its frontmatter. A repair command is planned.",
+      text: "Most of these are copies that kept their frontmatter — a sync conflict copy, a re-import, or a restored backup. "
+        + "Compare a hidden copy against the one being shown before deciding: a conflict copy can hold edits the shown note doesn't.",
     });
 
     const list = c.createDiv({ cls: "stashpad-dupes-list" });
@@ -3726,20 +3742,67 @@ export class DuplicateIdsModal extends Modal {
       const head = box.createDiv({ cls: "stashpad-dupes-group-head" });
       head.createEl("code", { text: g.id });
       head.createSpan({ cls: "stashpad-dupes-count", text: `${g.files.length} files` });
+      const shown = g.files.find((f) => f.isShown);
       for (const f of g.files) {
-        const row = box.createEl("button", { cls: "stashpad-dupes-file" });
-        if (f.isShown) row.addClass("is-shown");
-        row.createSpan({
-          cls: "stashpad-dupes-badge",
-          text: f.isShown ? "shown" : "hidden",
-        });
-        row.createSpan({ cls: "stashpad-dupes-path", text: f.path });
-        row.title = f.isShown
-          ? "This is the note Stashpad currently shows for this id — click to open"
-          : "Hidden from the list because another note has the same id — click to open";
-        row.onclick = () => { this.app.workspace.openLinkText(f.path, "", true); };
+        const row = box.createDiv({ cls: f.isShown ? "stashpad-dupes-file is-shown" : "stashpad-dupes-file" });
+        row.createSpan({ cls: "stashpad-dupes-badge", text: f.isShown ? "shown" : "hidden" });
+        const path = row.createSpan({ cls: "stashpad-dupes-path", text: f.path });
+        path.title = f.path;
+        const acts = row.createDiv({ cls: "stashpad-dupes-actions" });
+        const openBtn = acts.createEl("button", { cls: "stashpad-dupes-act", text: "Open" });
+        openBtn.onclick = () => { this.app.workspace.openLinkText(f.path, "", true); };
+        if (!f.isShown && shown) {
+          const cmp = acts.createEl("button", { cls: "stashpad-dupes-act", text: "Compare" });
+          cmp.title = `Diff this copy against ${shown.path}`;
+          cmp.onclick = () => { void this.showDiff(shown.path, f.path); };
+        }
       }
     }
+
+    const row = c.createDiv({ cls: "stashpad-modal-btns" });
+    row.createEl("button", { text: this.opts.onNext ? `Skip (${this.opts.remaining} more)` : "Close" }).onclick = () => {
+      const next = this.opts.onNext;
+      this.close();
+      next?.();
+    };
+    if (this.opts.onRepair && this.groups.some((g) => g.id !== ROOT_ID)) {
+      const fix = row.createEl("button", { cls: "mod-cta", text: "Give hidden copies new ids" });
+      fix.title = "Nothing is deleted — each hidden copy becomes its own visible note, and Undo reverses it.";
+      fix.onclick = () => { const f = this.opts.onRepair!; this.close(); void f(); };
+    }
   }
+
+  /** 0.219.8: side-by-side word diff of a hidden copy against the shown note,
+   *  reusing the split modal's differ. Read-only — this is for DECIDING, not
+   *  merging: a sync conflict copy often differs by a sentence, and that is the
+   *  thing you need to see before choosing what to keep. */
+  private async showDiff(shownPath: string, hiddenPath: string): Promise<void> {
+    const read = async (p: string): Promise<string> => {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) return "";
+      const raw = await this.app.vault.cachedRead(f);
+      return raw.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();   // body only; frontmatter is the thing that differs by design
+    };
+    const [a, b] = [await read(shownPath), await read(hiddenPath)];
+    const c = this.contentEl;
+    c.empty();
+    c.createEl("p", { cls: "setting-item-description", text: `Comparing note bodies. Frontmatter is excluded — the ids differ by definition.` });
+    const meta = c.createDiv({ cls: "stashpad-dupes-diff-meta" });
+    meta.createDiv({ text: `shown: ${shownPath}` });
+    meta.createDiv({ text: `hidden: ${hiddenPath}` });
+    if (a === b) {
+      c.createEl("p", { cls: "stashpad-dupes-identical", text: "These two bodies are IDENTICAL — the copy carries nothing the shown note doesn't." });
+    } else {
+      const pane = c.createDiv({ cls: "stashpad-dupes-diff" });
+      for (const part of splitWordDiff(a, b)) {
+        pane.createSpan({ cls: part.t === "eq" ? "stashpad-diff-eq" : part.t === "ins" ? "stashpad-diff-ins" : "stashpad-diff-del", text: part.s });
+      }
+      c.createEl("p", { cls: "setting-item-description", text: "Green is only in the hidden copy; red is only in the shown note." });
+    }
+    const row = c.createDiv({ cls: "stashpad-modal-btns" });
+    row.createEl("button", { text: "Back" }).onclick = () => this.render();
+    row.createEl("button", { text: "Open hidden copy" }).onclick = () => { this.app.workspace.openLinkText(hiddenPath, "", true); };
+  }
+
   onClose(): void { this.contentEl.empty(); }
 }

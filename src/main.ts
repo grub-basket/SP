@@ -926,58 +926,154 @@ export default class StashpadPlugin extends Plugin {
    *  Read-only. Groups by id the way TreeIndex does NOT (it keys by id, so
    *  duplicates collapse and become invisible), scoped per folder and skipping
    *  reserved subfolders so archived copies aren't false positives. */
-  async findDuplicateNoteIds(): Promise<void> {
-    const folders = this.discoverStashpadFolders();
-    const perFolder: { folder: string; groups: DuplicateIdGroup[] }[] = [];
-    for (const folder of folders) {
-      const prefix = folder + "/";
-      const byId = new Map<string, string[]>();
-      for (const f of this.app.vault.getMarkdownFiles()) {
-        const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-        if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
-        const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
-        if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
-        const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
-        if (typeof id !== "string" || !id) continue;
-        const arr = byId.get(id);
-        if (arr) arr.push(f.path); else byId.set(id, [f.path]);
-      }
-      const groups: DuplicateIdGroup[] = [];
-      for (const [id, paths] of byId) {
-        if (paths.length < 2) continue;
-        // The tree shows whichever file it indexed last for this id. Ask the
-        // open view when there is one; otherwise mark the first as shown so the
-        // list still communicates "one of these wins".
-        const view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-          .map((l) => l.view as unknown as { noteFolder?: string; tree?: { get(i: string): { file?: { path: string } | null } | undefined } })
-          .find((v) => v.noteFolder === folder);
-        const shown = view?.tree?.get(id)?.file?.path ?? paths[0];
-        groups.push({ id, files: paths.map((p) => ({ path: p, isShown: p === shown })) });
-      }
-      if (groups.length) perFolder.push({ folder, groups });
+  /** 0.219.8: duplicate-id groups for ONE folder. Scoped exactly the way
+   *  TreeIndex enumerates (reserved subfolders skipped), so archived copies are
+   *  not false positives. `isShown` marks the file the tree currently resolves
+   *  the id to — every other file in the group is invisible in the list. */
+  duplicateGroupsForFolder(folder: string): DuplicateIdGroup[] {
+    const prefix = folder + "/";
+    const byId = new Map<string, string[]>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
+      const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
+      if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id !== "string" || !id) continue;
+      const arr = byId.get(id);
+      if (arr) arr.push(f.path); else byId.set(id, [f.path]);
     }
+    const view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+      .map((l) => l.view as unknown as { noteFolder?: string; tree?: { get(i: string): { file?: { path: string } | null } | undefined } })
+      .find((v) => v.noteFolder === folder);
+    const groups: DuplicateIdGroup[] = [];
+    for (const [id, paths] of byId) {
+      if (paths.length < 2) continue;
+      const shown = view?.tree?.get(id)?.file?.path ?? paths[0];
+      groups.push({ id, files: paths.map((p) => ({ path: p, isShown: p === shown })) });
+    }
+    return groups;
+  }
+
+  /** Every folder with duplicates. The automatic warning used to see only the
+   *  folder that happened to have an open view, which under-reported. */
+  duplicateGroupsEverywhere(): { folder: string; groups: DuplicateIdGroup[] }[] {
+    const out: { folder: string; groups: DuplicateIdGroup[] }[] = [];
+    for (const folder of this.discoverStashpadFolders()) {
+      const groups = this.duplicateGroupsForFolder(folder);
+      if (groups.length) out.push({ folder, groups });
+    }
+    return out;
+  }
+
+  /** 0.219.8: REPAIR — give every hidden copy a fresh id so it becomes its own
+   *  visible note. Nothing is deleted and no body is touched; only the `id`
+   *  frontmatter of the copies changes.
+   *
+   *  Why re-mint rather than delete: the copies are usually real content (a sync
+   *  conflict copy can hold edits the winner does not), and deleting is the one
+   *  choice the user cannot undo by hand. Re-minting is reversible — the undo
+   *  entry restores the original ids — and it makes the hidden notes reachable
+   *  so the user can compare them and decide.
+   *
+   *  The note the tree currently SHOWS keeps its id, so existing deep links,
+   *  `parent` references and children continue to resolve to the same note. */
+  /** Find a file in `folder` whose frontmatter id is `id`. Used by the
+   *  duplicate-repair undo, because changing an id re-slugs the filename and
+   *  makes any captured path stale. */
+  private fileByFrontmatterId(folder: string, id: string): TFile | null {
+    const prefix = folder + "/";
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
+      if (this.app.metadataCache.getFileCache(f)?.frontmatter?.id === id) return f;
+    }
+    return null;
+  }
+
+  async repairDuplicateIds(folder: string, groups: DuplicateIdGroup[]): Promise<number> {
+    const used = new Set<string>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id === "string" && id) used.add(id);
+    }
+    // Record the NEW id too, not just the path. Changing a note's id makes
+    // Stashpad re-slug its FILENAME, so the captured path goes stale within
+    // seconds — resolving undo by path alone silently no-ops, which is the
+    // stale-path bug class this repo has hit repeatedly (0.140.10, H6,
+    // 0.211.4). Verified here: the first version of this undo did nothing.
+    const changed: { path: string; from: string; to: string }[] = [];
+    for (const g of groups) {
+      for (const file of g.files) {
+        if (file.isShown) continue;                  // the winner keeps its id
+        const af = this.app.vault.getAbstractFileByPath(file.path);
+        if (!(af instanceof TFile)) continue;
+        // ROOT_ID is structural (a folder's home note), not a normal note id —
+        // re-minting it would orphan the folder. Those need a different remedy,
+        // so leave them and report them as skipped.
+        if (g.id === ROOT_ID) continue;
+        const fresh = freshId((c) => used.has(c));
+        used.add(fresh);
+        try {
+          await this.app.fileManager.processFrontMatter(af, (fm) => { fm.id = fresh; });
+          changed.push({ path: file.path, from: g.id, to: fresh });
+        } catch (e) {
+          console.warn("[Stashpad] couldn't re-mint id for", file.path, e);
+        }
+      }
+    }
+    if (changed.length) {
+      this.getUndoStack(folder).push({
+        label: `Repair ${changed.length} duplicate id${changed.length === 1 ? "" : "s"}`,
+        undo: async () => {
+          for (const c of changed) {
+            // id-FIRST: the file has almost certainly been renamed by the
+            // re-slug that our own id change triggered, so the captured path is
+            // stale. Find it by the id we just wrote; fall back to the path.
+            const af = this.fileByFrontmatterId(folder, c.to)
+              ?? (this.app.vault.getAbstractFileByPath(c.path) as TFile | null);
+            if (af instanceof TFile) {
+              try { await this.app.fileManager.processFrontMatter(af, (fm) => { fm.id = c.from; }); }
+              catch (e) { console.warn("[Stashpad] couldn't restore id for", c.to, e); }
+            }
+          }
+          this.refreshOpenViewsForFolder(folder);
+        },
+        redo: async () => { await this.repairDuplicateIds(folder, this.duplicateGroupsForFolder(folder)); },
+      });
+      this.refreshOpenViewsForFolder(folder);
+    }
+    return changed.length;
+  }
+
+  async findDuplicateNoteIds(): Promise<void> {
+    const perFolder = this.duplicateGroupsEverywhere();
     if (!perFolder.length) {
       new Notice("No duplicate note ids found in any Stashpad folder.");
       return;
     }
     const totalHidden = perFolder.reduce((n, f) =>
       n + f.groups.reduce((m, g) => m + g.files.filter((x) => !x.isShown).length, 0), 0);
-    // One modal per affected folder would be a pile of dialogs; show the first
-    // and name the rest, so nothing is silently dropped.
-    const [first, ...rest] = perFolder;
-    if (rest.length) {
+    const open = (i: number): void => {
+      const { folder, groups } = perFolder[i];
+      new DuplicateIdsModal(this.app, folder, groups, {
+        onRepair: async () => {
+          const n = await this.repairDuplicateIds(folder, groups);
+          new Notice(n ? `Gave ${n} hidden note${n === 1 ? "" : "s"} a fresh id — they're visible now. Undo in the list reverses it.`
+                       : "Nothing to repair here.");
+        },
+        onNext: i + 1 < perFolder.length ? () => open(i + 1) : undefined,
+        remaining: perFolder.length - i - 1,
+      }).open();
+    };
+    if (perFolder.length > 1) {
       this.notifications.show({
-        message: `Duplicate ids found in ${perFolder.length} folders — ${totalHidden} notes hidden in total. `
-          + `Showing **${first.folder}**; the others are: ${rest.map((r) => `**${r.folder}**`).join(", ")}.`,
+        message: `Duplicate ids in ${perFolder.length} folders — ${totalHidden} note${totalHidden === 1 ? " is" : "s are"} hidden in total: `
+          + perFolder.map((f) => `**${f.folder}**`).join(", "),
         kind: "warning", category: "system", duration: 0,
-        actions: rest.map((r) => ({
-          label: r.folder,
-          onClick: () => { new DuplicateIdsModal(this.app, r.folder, r.groups).open(); },
-          keepOpen: true,
-        })).slice(0, 4),
       });
     }
-    new DuplicateIdsModal(this.app, first.folder, first.groups).open();
+    open(0);
   }
 
   async runIntegrityCheckOnFolder(folder: string): Promise<void> {
@@ -3398,6 +3494,23 @@ export default class StashpadPlugin extends Plugin {
     let strays = { moved: 0, shared: 0, unreferenced: 0, sharedPaths: [] as string[] };
     try { strays = await this.rehomeStrayAttachments(touched); }
     catch (e) { console.warn("Stashpad: stray-attachment re-home failed", e); }
+    // 0.219.8: duplicate ids are exactly the kind of thing a maintenance sweep
+    // should surface — but NOT silently repair. Re-minting changes note
+    // identity, and a sync conflict copy may hold edits worth reading first, so
+    // rebootstrap reports and offers; it never rewrites ids on its own.
+    try {
+      const dupes = this.duplicateGroupsEverywhere();
+      if (dupes.length) {
+        const hidden = dupes.reduce((n, f) =>
+          n + f.groups.reduce((m, g) => m + g.files.filter((x) => !x.isShown).length, 0), 0);
+        this.notifications.show({
+          message: `Rebootstrap also found duplicate note ids: ${hidden} note${hidden === 1 ? " is" : "s are"} hidden `
+            + `in ${dupes.length === 1 ? `**${dupes[0].folder}**` : `${dupes.length} folders`}. Nothing was changed.`,
+          kind: "warning", category: "system", duration: 0,
+          actions: [{ label: "Review duplicates", onClick: () => { void this.findDuplicateNoteIds(); } }],
+        });
+      }
+    } catch (e) { console.warn("Stashpad: duplicate-id scan during rebootstrap failed", e); }
     if (strays.moved || strays.shared) {
       const lines: string[] = [];
       if (strays.moved) lines.push(`Moved ${strays.moved} attachment${strays.moved === 1 ? "" : "s"} into the folder whose notes actually use ${strays.moved === 1 ? "it" : "them"}.`);

@@ -6825,10 +6825,54 @@ button.stashpad-btn-loading::after {
    anomaly, and only it needs to carry colour. --text-muted and --text-error are
    both defined against the normal background, so this holds in either theme. */
 .stashpad-dupes-file.is-shown .stashpad-dupes-badge { color: var(--text-muted); }
+/* 0.219.8: one scrollbar PER ROW rather than wrapping. Wrapping kept long paths
+   inside the row but made each row several lines tall, so a folder with sync
+   conflict copies (long names) became a wall. Each path now stays on one line
+   and scrolls horizontally within its own row: rows stay uniform height, the
+   start of every path lines up, and the tail is still reachable. */
 .stashpad-dupes-path {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   line-height: 1.5;
-  overflow-wrap: anywhere;   /* wrap long paths INSIDE the row, never overflow it */
   min-width: 0;
+  white-space: nowrap;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;   /* don't chain to the modal's own scroll */
+  scrollbar-width: thin;
+  padding-bottom: 2px;              /* room for the scrollbar so it can't clip text */
+}
+
+/* Duplicate modal: per-row actions + the compare view (0.219.8). */
+.stashpad-dupes-file { grid-template-columns: 62px minmax(0, 1fr) auto; }
+.stashpad-dupes-actions { display: flex; gap: 4px; align-items: center; }
+.stashpad-dupes-act {
+  padding: 1px 8px;
+  font-size: var(--font-ui-smaller);
+  background: var(--background-modifier-border);
+  color: var(--text-normal);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.stashpad-dupes-act:hover { background: var(--background-modifier-hover); }
+.stashpad-dupes-diff-meta {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+.stashpad-dupes-diff {
+  max-height: 44vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-size: var(--font-ui-small);
+  line-height: 1.55;
+  padding: 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary-alt);
+}
+.stashpad-dupes-identical {
+  color: var(--text-success);
+  font-weight: var(--font-semibold, 600);
 }
