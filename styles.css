@@ -6761,39 +6761,74 @@ button.stashpad-btn-loading::after {
   margin: 4px 0;
 }
 
-/* Duplicate-id review modal (0.219.6). Theme variables only, legible in light
-   and dark; the list scrolls so a folder with dozens of groups can't grow the
-   modal past the viewport. */
-.stashpad-dupes-list { max-height: 46vh; overflow-y: auto; margin-top: 8px; }
+/* Duplicate-id review modal. Theme variables only; light + dark safe.
+   0.219.7: rebuilt as a GRID. The first pass used flex with a shrinkable badge
+   and an unconstrained path, so the path could not shrink (no min-width: 0),
+   every row overflowed its box, and the badges staggered because each row sized
+   itself to its own path. A two-column grid with a fixed badge column keeps the
+   badges aligned and lets the path wrap inside the row. */
+.stashpad-dupes-modal { max-width: min(720px, 94vw); }
+.stashpad-dupes-list { max-height: 46vh; overflow-y: auto; margin-top: 10px; }
 .stashpad-dupes-group {
   border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  padding: 6px 8px;
-  margin-bottom: 8px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
 }
-.stashpad-dupes-group-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
-.stashpad-dupes-count { color: var(--text-muted); font-size: var(--font-ui-smaller); }
-.stashpad-dupes-file {
+.stashpad-dupes-group-head {
   display: flex;
   align-items: baseline;
   gap: 8px;
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-dupes-group-head code {
+  font-size: var(--font-ui-small);
+  word-break: break-all;
+}
+.stashpad-dupes-count { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-left: auto; }
+.stashpad-dupes-file {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);   /* minmax(0,1fr) is what lets the path wrap */
+  align-items: start;
+  gap: 10px;
   width: 100%;
-  padding: 4px 6px;
+  padding: 6px;
+  margin: 0;
   background: transparent;
   border: none;
-  border-radius: 4px;
+  border-radius: 6px;
   text-align: left;
   cursor: pointer;
   box-shadow: none;
 }
 .stashpad-dupes-file:hover { background: var(--background-modifier-hover); }
+.stashpad-dupes-file + .stashpad-dupes-file { border-top: 1px solid var(--background-modifier-border); }
+/* 0.219.7b: semantic TEXT colours, not filled pills. A filled pill needs a
+   foreground that contrasts with the fill, and --text-normal on
+   --background-modifier-success measured 1.44:1 in dark mode — illegible.
+   --text-success / --text-error are defined to be readable on the normal
+   background in BOTH themes, so colouring the text instead is correct by
+   construction rather than by tuning. */
 .stashpad-dupes-badge {
-  flex: 0 0 auto;
+  justify-self: start;
   font-size: var(--font-ui-smaller);
-  padding: 0 6px;
-  border-radius: 10px;
-  background: var(--background-modifier-error);
-  color: var(--text-normal);
+  font-weight: var(--font-semibold, 600);
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  color: var(--text-error);
+  white-space: nowrap;
 }
-.stashpad-dupes-file.is-shown .stashpad-dupes-badge { background: var(--background-modifier-success); }
-.stashpad-dupes-path { color: var(--text-muted); font-size: var(--font-ui-smaller); word-break: break-all; }
+/* "shown" is the BASELINE state, so it stays neutral — --text-success is a pale
+   green that measured 2.61:1 on a light background. Only "hidden" is an
+   anomaly, and only it needs to carry colour. --text-muted and --text-error are
+   both defined against the normal background, so this holds in either theme. */
+.stashpad-dupes-file.is-shown .stashpad-dupes-badge { color: var(--text-muted); }
+.stashpad-dupes-path {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+  overflow-wrap: anywhere;   /* wrap long paths INSIDE the row, never overflow it */
+  min-width: 0;
+}

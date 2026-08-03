@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon, debounce, type App } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId } from "./id-service";
-import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId } from "./types";
+import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
 import { StashpadTrashView, openTrashView } from "./trash-view";
@@ -14,7 +14,7 @@ import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState } from "./modals";
+import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
 import { writeClipboardText } from "./cross-vault-clipboard";
@@ -916,6 +916,70 @@ export default class StashpadPlugin extends Plugin {
   /** Manual integrity check — writes log entries for every delta between
    *  state.json and the current vault snapshot. Triggered from the
    *  command palette, not on view mount. */
+  /** 0.219.7: scan EVERY Stashpad folder for duplicate note ids.
+   *
+   *  The automatic warning only fires from a view's tree reconcile, so it can
+   *  only ever notice the folder you happen to have open — which is why a vault
+   *  with duplicates in three folders reported one. This command checks them
+   *  all, so the answer doesn't depend on which tab is in front.
+   *
+   *  Read-only. Groups by id the way TreeIndex does NOT (it keys by id, so
+   *  duplicates collapse and become invisible), scoped per folder and skipping
+   *  reserved subfolders so archived copies aren't false positives. */
+  async findDuplicateNoteIds(): Promise<void> {
+    const folders = this.discoverStashpadFolders();
+    const perFolder: { folder: string; groups: DuplicateIdGroup[] }[] = [];
+    for (const folder of folders) {
+      const prefix = folder + "/";
+      const byId = new Map<string, string[]>();
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+        if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
+        const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
+        if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
+        const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+        if (typeof id !== "string" || !id) continue;
+        const arr = byId.get(id);
+        if (arr) arr.push(f.path); else byId.set(id, [f.path]);
+      }
+      const groups: DuplicateIdGroup[] = [];
+      for (const [id, paths] of byId) {
+        if (paths.length < 2) continue;
+        // The tree shows whichever file it indexed last for this id. Ask the
+        // open view when there is one; otherwise mark the first as shown so the
+        // list still communicates "one of these wins".
+        const view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+          .map((l) => l.view as unknown as { noteFolder?: string; tree?: { get(i: string): { file?: { path: string } | null } | undefined } })
+          .find((v) => v.noteFolder === folder);
+        const shown = view?.tree?.get(id)?.file?.path ?? paths[0];
+        groups.push({ id, files: paths.map((p) => ({ path: p, isShown: p === shown })) });
+      }
+      if (groups.length) perFolder.push({ folder, groups });
+    }
+    if (!perFolder.length) {
+      new Notice("No duplicate note ids found in any Stashpad folder.");
+      return;
+    }
+    const totalHidden = perFolder.reduce((n, f) =>
+      n + f.groups.reduce((m, g) => m + g.files.filter((x) => !x.isShown).length, 0), 0);
+    // One modal per affected folder would be a pile of dialogs; show the first
+    // and name the rest, so nothing is silently dropped.
+    const [first, ...rest] = perFolder;
+    if (rest.length) {
+      this.notifications.show({
+        message: `Duplicate ids found in ${perFolder.length} folders — ${totalHidden} notes hidden in total. `
+          + `Showing **${first.folder}**; the others are: ${rest.map((r) => `**${r.folder}**`).join(", ")}.`,
+        kind: "warning", category: "system", duration: 0,
+        actions: rest.map((r) => ({
+          label: r.folder,
+          onClick: () => { new DuplicateIdsModal(this.app, r.folder, r.groups).open(); },
+          keepOpen: true,
+        })).slice(0, 4),
+      });
+    }
+    new DuplicateIdsModal(this.app, first.folder, first.groups).open();
+  }
+
   async runIntegrityCheckOnFolder(folder: string): Promise<void> {
     const f = (folder || "").trim().replace(/\/+$/, "");
     if (!f) return;
@@ -2079,6 +2143,11 @@ export default class StashpadPlugin extends Plugin {
         });
         return true;
       },
+    });
+    this.addCommand({
+      id: "stashpad-find-duplicate-ids",
+      name: "Find duplicate note ids (hidden / colliding notes)",
+      callback: () => void this.findDuplicateNoteIds(),
     });
     this.addCommand({
       id: "stashpad-fix-orphans",
