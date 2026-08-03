@@ -1501,8 +1501,8 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    leading checkbox grid column — frees width so the single action button
    doesn't wrap. */
 .is-mobile .stashpad-note.is-task { grid-template-columns: auto 1fr auto; }
-.is-mobile .stashpad-note-meta-bottom .stashpad-note-task-checkbox { margin: 0; padding: 2px; }
-.is-mobile .stashpad-note-meta-bottom .stashpad-note-task-checkbox svg { width: 18px; height: 18px; }
+.is-mobile .stashpad-note-meta-top .stashpad-note-task-checkbox { margin: 0; padding: 2px; }
+.is-mobile .stashpad-note-meta-top .stashpad-note-task-checkbox svg { width: 18px; height: 18px; }
 
 .stashpad-note-body { min-width: 0; word-wrap: break-word; }
 .stashpad-note-body > :first-child { margin-top: 0; }
@@ -6956,4 +6956,18 @@ button.stashpad-btn-loading::after {
   cursor: pointer;
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
+}
+
+/* Append-target chip (0.222.0) — the composer's visible signal that the next
+   send goes INTO an existing note rather than making a new one. Styled like
+   the destination chip on purpose: same grammar, same clear affordance. */
+.stashpad-composer-append.is-hidden { display: none; }
+.stashpad-composer-append.is-active {
+  color: var(--text-accent);
+  max-width: 14em;
+}
+.stashpad-composer-append .stashpad-btn-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

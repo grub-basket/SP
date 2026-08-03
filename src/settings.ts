@@ -233,6 +233,10 @@ export interface StashpadSettings {
   /** The Stashpad folder most recently viewed. Ranked first in the folder
    *  switcher so the common "back to what I was doing" case is one keystroke. */
   lastUsedFolder: string;
+  /** 0.221.0: most-recently-used Stashpad folders, newest first, capped. Backs
+   *  the composer's quick-destination menu so the common "send this somewhere
+   *  else" case is one tap instead of a full picker. */
+  recentFolders: string[];
   importDropFolder: string;
   exportFolder: string;
   /** 0.79.1: auto-import files dropped directly into a Stashpad folder
@@ -552,6 +556,10 @@ export interface StashpadSettings {
    *  split-on-lines is off. Pasting a checklist is the common case and one giant note
    *  full of checkbox text is almost never what's wanted. On by default. */
   splitCheckboxLines: boolean;
+  /** 0.222.0: typing `+` alone into an empty composer opens the note picker and
+   *  binds an append target. Off = `+` is just a character (markdown `+ ` list
+   *  bullets keep working with no dismiss step). */
+  composerAppendTrigger: boolean;
   autoNavOnMoveIn: boolean;
   /** 0.191.0: after moving/nesting a note INTO another note, open that destination
    *  parent in a BACKGROUND Stashpad tab — so the note's new home is one click away
@@ -661,6 +669,10 @@ export interface StashpadSettings {
   okfTemplatePath: string;
   /** Per-folder composer draft text. Stored in the plugin's data.json. */
   drafts: Record<string, string>;
+  /** 0.223.0: per-folder append target (frontmatter id) that rides along with
+   *  the draft, so binding a target then reloading doesn't silently turn the
+   *  append into a new note. Cleared whenever the target is cleared. */
+  draftAppendTargets: Record<string, { id: string; label?: string; path: string; folder: string; mode: "append" | "prepend" }>;
   /** Per-folder: the text most recently sent via Enter, used to suppress
    *  the "restore draft" suggestion if the saved draft happens to match. */
   lastSubmitted: Record<string, string>;
@@ -671,6 +683,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   onboardingAnswered: false,
   onboardingChoice: null,
   lastUsedFolder: "",
+  recentFolders: [],
   importDropFolder: "",
   exportFolder: "_exports",
   autoImport: false,
@@ -753,6 +766,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   notifiedDueKeys: [],
   trustedXvSources: [],
   splitCheckboxLines: true,
+  composerAppendTrigger: true,
   autoNavOnMoveIn: false,
   openParentTabOnMoveIn: true,
   newTabsInBackground: false,
@@ -776,6 +790,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   okfEnabled: false,
   okfTemplatePath: "",
   drafts: {},
+  draftAppendTargets: {},
   lastSubmitted: {},
   bindings: buildDefaultBindings(),
 };
@@ -1729,6 +1744,8 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.movingNotes.push(toggle("Navigate into parent after moving a note IN", "When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
+    cats.composerCopy.push(toggle('Type "+" to append to an existing note', 'Typing + as the only character in an empty composer opens the note picker. Pick a note and what you send next is appended to the bottom of that note\'s body on a new line, instead of creating a new note. The target clears after one send. Dismissing the picker leaves the + as ordinary text, so markdown "+ " bullets still work. On by default.',
+      () => this.plugin.settings.composerAppendTrigger, (v) => { this.plugin.settings.composerAppendTrigger = v; }, ["append", "plus", "existing", "composer", "add"]));
     cats.composerCopy.push(toggle("Split a pasted checklist into separate tasks", 'When every line of what you submit is a checkbox — "- [ ] milk", "[x] eggs" — create one task per line instead of a single note. Applies even when "split on newlines" is off. On by default.',
       () => this.plugin.settings.splitCheckboxLines, (v) => { this.plugin.settings.splitCheckboxLines = v; }, ["checkbox", "task", "split", "paste", "checklist"]));
     cats.movingNotes.push(toggle("Open the new parent in a background tab after moving a note IN", "When you nest a note into another note, open that parent in a background Stashpad tab so its new home is one click away — without stealing focus from what you're doing. Skipped when the destination is Home or already open in a tab. On by default.",

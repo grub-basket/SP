@@ -39,8 +39,12 @@ export interface AppImporterCallbacks {
   close: () => void;
   popOut?: (state: AppImporterState) => void;
   destinationLabel: string;
-  /** Stashpad ids already in the destination folder, for the re-run guard. */
-  existingSourceIds?: ReadonlySet<string>;
+  /** Stashpad ids already in the destination folder, for the re-run guard.
+   *  0.224.0: a GETTER, not a snapshot. It used to be a Set captured when the
+   *  importer opened, so every re-parse in that session compared against the
+   *  pre-import state — hitting Import twice duplicated everything even with
+   *  "Skip notes already imported" on. */
+  existingSourceIds?: () => ReadonlySet<string>;
 }
 
 export class AppImporterUI {
@@ -240,7 +244,7 @@ export class AppImporterUI {
     this.result = null;
     if (nf) {
       try {
-        this.result = buildAppImport(JSON.parse(nf.text), this.opts, this.cbs.existingSourceIds ?? new Set<string>());
+        this.result = buildAppImport(JSON.parse(nf.text), this.opts, this.cbs.existingSourceIds?.() ?? new Set<string>());
       } catch (e) {
         this.result = null;
         this.summaryEl?.setText(`Could not read ${nf.name}: ${(e as Error).message}`);
@@ -348,7 +352,7 @@ export class AppImportModal extends Modal {
     private onImport: (notes: AppImportNote[], helpers: HelperNote[]) => void | Promise<void>,
     private popOut?: (state: AppImporterState) => void,
     private init: Partial<AppImporterState> = {},
-    private existingSourceIds: ReadonlySet<string> = new Set<string>(),
+    private existingSourceIds: () => ReadonlySet<string> = () => new Set<string>(),
   ) { super(app); }
 
   onOpen(): void {
@@ -369,7 +373,7 @@ export interface AppImporterViewContext {
   state: Partial<AppImporterState>;
   destinationLabel: string;
   onImport: (notes: AppImportNote[], helpers: HelperNote[]) => void | Promise<void>;
-  existingSourceIds?: ReadonlySet<string>;
+  existingSourceIds?: () => ReadonlySet<string>;
   prevLeaf?: WorkspaceLeaf | null;
 }
 

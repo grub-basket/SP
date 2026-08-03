@@ -127,6 +127,18 @@ const TIME_FILTER_OPTIONS: TimeFilterOption[] = [
   { key: "all",   calShort: "All",   rollShort: "ad infinitum",    calLong: "All time",                   rollLong: "All time" },
 ];
 
+/** 0.225.0: a bound composer target for append/prepend mode. Carries `path` and
+ *  `folder` as well as `id` because the target may live in ANOTHER Stashpad —
+ *  the point of the feature is to start typing wherever you happen to be and
+ *  still land the text in the right note. */
+interface AppendTarget {
+  id: StashpadId;
+  label: string;
+  path: string;
+  folder: string;
+  mode: "append" | "prepend";
+}
+
 export class StashpadView extends ItemView {
   /** public: read by AuthorshipTracker (the host interface). */
   plugin: StashpadPlugin;
@@ -236,6 +248,11 @@ export class StashpadView extends ItemView {
   private modeSplit: boolean | null = null;
   private modeEnterSubmits = true; // per-view, defaults true
   private nextDestination: StashpadId | null = null;
+  /** 0.222.0: append mode. When set, the next send appends to this note's body
+   *  instead of creating a note. Cleared after one send (see the note on
+   *  openAppendPicker for why it is deliberately not sticky). */
+  private appendTarget: AppendTarget | null = null;
+  private composerAppendBtn: HTMLButtonElement | null = null;
   /** 0.76.15: when the chosen destination lives in ANOTHER Stashpad
    *  folder, this holds that folder (and a display label). The next
    *  composer submit creates the note THERE, remotely, without
@@ -1817,6 +1834,19 @@ export class StashpadView extends ItemView {
     this.draftsLoadedFor = this.noteFolder;
     const all = this.plugin.settings.drafts ?? {};
     this.composerDraft = all[this.noteFolder] ?? "";
+    // 0.223.0: restore the bound append target alongside the draft. Resolved
+    // against the tree, so a target deleted while we were away simply doesn't
+    // come back (and the draft becomes an ordinary new note — the same
+    // fail-safe the send path already has).
+    const saved = this.plugin.settings.draftAppendTargets?.[this.noteFolder];
+    // Resolved by PATH so a cross-folder target restores too. A target that was
+    // deleted or moved while we were away simply doesn't come back, and the
+    // draft becomes an ordinary new note — the same fail-safe the send path has.
+    const savedFile = saved?.path ? this.app.vault.getAbstractFileByPath(saved.path) : null;
+    this.appendTarget = savedFile instanceof TFile
+      ? { id: saved!.id as StashpadId, label: saved!.label ?? savedFile.basename, path: saved!.path, folder: saved!.folder, mode: saved!.mode === "prepend" ? "prepend" : "append" }
+      : null;
+    this.refreshAppendButton();
     console.debug("[Stashpad] loadDrafts", { folder: this.noteFolder, has: !!all[this.noteFolder], available: Object.keys(all) });
   }
 
@@ -5661,6 +5691,15 @@ export class StashpadView extends ItemView {
 
     const meta = row.createDiv({ cls: "stashpad-note-meta" });
     const metaTop = meta.createDiv({ cls: "stashpad-note-meta-top" });
+    // 0.223.0: on mobile the checkbox goes in the TOP meta row, ahead of the
+    // timestamp. It used to live in meta-bottom (0.87.1), which was fine while
+    // meta-bottom sat in the left-hand meta column — but the 0.120.0 3-section
+    // mobile row moved meta-bottom into the full-width `foot` area UNDER the
+    // body, so the checkbox for a one-line task ended up far below its own
+    // text. Nothing about the render/scroll work touched this; the trial layout
+    // relocated it. Top-left is where a checklist checkbox belongs.
+    const mobileTask = (this.isTask(node) || this.compactMode) && Platform.isMobile;
+    if (mobileTask) this.addTaskCheckbox(metaTop, node);
     metaTop.createSpan({ cls: "stashpad-note-time", text: this.formatTime(node.created) });
     // Drag handle / color swatch: a single element that shows a colored
     // square at rest (when this note has a custom color) and swaps to the
@@ -5677,9 +5716,8 @@ export class StashpadView extends ItemView {
     // 0.87.1: the children-count arrow + (on mobile) the task checkbox share one
     // horizontal line below the timestamp — the mobile checkbox sits just to the
     // LEFT of the arrow (see the desktop addTaskCheckbox call above).
-    const mobileTask = showCheckbox && Platform.isMobile;
     const isPinnedRow = this.isListPinned(node.id);
-    if (childCount > 0 || mobileTask || isPinnedRow) {
+    if (childCount > 0 || isPinnedRow) {
       const metaBottom = meta.createDiv({ cls: "stashpad-note-meta-bottom" });
       // 0.106.x: list-pin indicator — a lucide pin icon under the timestamp,
       // placed before the children-count arrow.
@@ -5688,7 +5726,6 @@ export class StashpadView extends ItemView {
         setIcon(pin, "pin");
         pin.setAttr("aria-label", "Pinned to top of list");
       }
-      if (mobileTask) this.addTaskCheckbox(metaBottom, node);
       if (childCount > 0) {
         const enter = metaBottom.createSpan({ cls: "stashpad-note-enter" });
         if (color) enter.style.color = color;
@@ -6218,6 +6255,14 @@ export class StashpadView extends ItemView {
     ta.addEventListener("input", () => {
       this.composerDraft = ta.value;
       this.debouncedSaveDraft!(ta.value);
+      // 0.222.0: `+` ALONE in the composer means "append to an existing note".
+      // Requiring it to be the whole value is what makes this safe to put on a
+      // single character: it can only fire as the first keystroke into an empty
+      // composer, never mid-sentence. Dismissing the picker leaves the `+`
+      // in place, so a markdown "+ " bullet costs one Escape.
+      if (ta.value === "+" && !this.appendTarget && getSettings().composerAppendTrigger) {
+        this.openAppendPicker();
+      }
     });
     ta.addEventListener("blur", () => { void this.saveDraft(ta.value); });
 
@@ -6467,8 +6512,38 @@ export class StashpadView extends ItemView {
       // and yanked focus/keyboard back to the composer — the reported
       // "cursor stays in the composer" mobile bug.
       const wasFocused = document.activeElement === ta;
-      this.openDestinationPicker(wasFocused);
+      this.openQuickDestinationMenu(e, wasFocused);
     };
+
+    // 0.222.0: append-target chip. Only rendered while a target is bound, so
+    // append mode is never invisible state — you can always see where the next
+    // send is going, and clear it in one tap.
+    const appendBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-append" });
+    this.composerAppendBtn = appendBtn;
+    appendBtn.onmousedown = (e) => e.preventDefault();
+    appendBtn.onclick = (e) => {
+      e.preventDefault();
+      const t = this.appendTarget;
+      const menu = new Menu();
+      if (t) {
+        const flip = t.mode === "prepend" ? "append" : "prepend";
+        menu.addItem((i: any) => i
+          .setTitle(flip === "prepend" ? "Prepend instead (write at the top)" : "Append instead (write at the bottom)")
+          .setIcon(flip === "prepend" ? "corner-right-up" : "corner-down-right")
+          .onClick(() => {
+            this.setAppendTarget({ ...t, mode: flip });
+            this.composerInputEl?.focus();
+          }));
+      }
+      menu.addItem((i: any) => i.setTitle("Change target note…").setIcon("search")
+        .onClick(() => this.openAppendPicker(t?.mode ?? "append")));
+      menu.addItem((i: any) => i.setTitle("Cancel (create a new note instead)").setIcon("x").onClick(() => {
+        this.setAppendTarget(null);
+        this.composerInputEl?.focus();
+      }));
+      menu.showAtMouseEvent(e);
+    };
+    this.refreshAppendButton();
 
     const enterBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn" });
     this.composerEnterBtn = enterBtn;
@@ -6618,6 +6693,27 @@ export class StashpadView extends ItemView {
       // 0.193.0: a block where EVERY line is a checkbox is a task LIST — split it
       // into one task per line even when split-on-newlines is off, since a single
       // note full of checkbox text is almost never the intent (setting-gated).
+      // 0.222.0: append mode short-circuits creation entirely — no split, no
+      // destination, no attachment rehoming (the target already lives here).
+      const append = this.appendTarget;
+      if (append) {
+        this.setAppendTarget(null);
+        // 0.225.0: an attachment staged in THIS composer lives in THIS folder's
+        // _attachments, but a cross-folder target lives elsewhere — the link
+        // would resolve to a file the target's folder doesn't own, which is the
+        // stranding bug 0.213.0 fixed for new notes. Rehome first, exactly as
+        // the remote-send path does.
+        const outText = append.folder && append.folder !== this.noteFolder
+          ? await this.rehomeComposerAttachments(text, append.folder)
+          : text;
+        await this.appendToTarget(append, outText);
+        // Same reasoning as the create path below: whatever this compose staged
+        // now belongs to the note we just wrote into. Leaving the set populated
+        // would let a later send rehome those attachments out from under it.
+        this.composerCreatedAttachments.clear();
+        if (getSettings().autofocusComposerAfterSend) this.composerInputEl?.focus();
+        return;
+      }
       const allChecks = getSettings().splitCheckboxLines && isAllCheckboxLines(text);
       const split = (this.modeSplit ?? getSettings().splitOnLines) || allChecks;
       const dest = this.nextDestination;
@@ -8140,6 +8236,239 @@ export class StashpadView extends ItemView {
     this.composerInputEl?.focus();
   }
 
+  /** Single writer for the append target so the persisted copy can never drift
+   *  from the in-memory one. */
+  private setAppendTarget(t: AppendTarget | null): void {
+    this.appendTarget = t;
+    const all = { ...(this.plugin.settings.draftAppendTargets ?? {}) };
+    // Persist the PATH as well as the id: a cross-folder target isn't in this
+    // view's tree, so an id alone can't be resolved back on reload.
+    if (t) all[this.noteFolder] = { id: t.id, path: t.path, folder: t.folder, mode: t.mode };
+    else delete all[this.noteFolder];
+    this.plugin.settings.draftAppendTargets = all;
+    void this.plugin.saveSettings();
+    this.refreshAppendButton();
+  }
+
+  private refreshAppendButton(): void {
+    const btn = this.composerAppendBtn;
+    if (!btn) return;
+    btn.empty();
+    const t = this.appendTarget;
+    btn.toggleClass("is-active", !!t);
+    btn.toggleClass("is-hidden", !t);
+    if (!t) return;
+    setIcon(btn, t.mode === "prepend" ? "corner-right-up" : "corner-down-right");
+    // Cross-folder targets say WHICH folder — otherwise two notes with the same
+    // title in different Stashpads are indistinguishable on the chip.
+    const where = t.folder && t.folder !== this.noteFolder
+      ? `${t.folder.split("/").pop()} ▸ ${t.label}`
+      : t.label;
+    btn.createSpan({ text: ` ${where}`, cls: "stashpad-btn-text" });
+    btn.title = `${t.mode === "prepend" ? "Prepending to" : "Appending to"} "${where}" — click to change, flip, or cancel`;
+  }
+
+  /** 0.222.0: bind a note to append to; 0.225.0: cross-folder + prepend.
+   *
+   *  Cross-folder is the whole point rather than a bonus: it turns the composer
+   *  into "start typing anywhere, land it in the right note", which is what the
+   *  destination picker does for NEW notes. This is the same move for EXISTING
+   *  ones — a destination picker plus an edit macro.
+   *
+   *  Safe to allow across folders here (unlike a normal cross-folder send)
+   *  because we are writing text into a note that already exists in its own
+   *  folder; there is no new note whose attachments need rehoming. Attachments
+   *  staged in THIS composer are the exception — see appendToTarget.
+   *
+   *  The target is cleared after ONE send rather than staying sticky. Sticky is
+   *  more convenient for a run of appends, but it fails dangerously: forget it
+   *  is on and your next thought is silently buried inside an old note instead
+   *  of becoming its own. Clearing fails safe — the worst case is you create a
+   *  normal note. The chip makes re-binding one tap. */
+  private openAppendPicker(mode: "append" | "prepend" = "append"): void {
+    const ta = this.composerInputEl;
+    const hadPlusOnly = ta?.value === "+";
+    let picked = false;
+    const verb = mode === "prepend" ? "Prepend" : "Append";
+    const bind = (file: TFile, id: StashpadId, label: string, folder: string): void => {
+      this.setAppendTarget({ id, label, path: file.path, folder, mode });
+      // Consume the `+` that opened this; leaving it would prefix the text.
+      if (ta && ta.value === "+") {
+        ta.value = "";
+        this.composerDraft = "";
+        void this.saveDraft("");
+      }
+      ta?.focus();
+    };
+    new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+      mode: "pick", placeholder: `${verb} what you type next to which note?`,
+      onPick: async (item) => {
+        picked = true;
+        if (item.crossFolder) {
+          const file = item.crossFile;
+          // A synthetic "Home — <folder>" root has no file; a folder has no body.
+          if (!file) {
+            new Notice("Pick a note — a folder's Home has no body to write into.");
+            this.composerInputEl?.focus();
+            return;
+          }
+          const id = (item.crossId ?? item.id.replace(/^cross:/, "")) as StashpadId;
+          bind(file, id, file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " "), item.crossFolder);
+          return;
+        }
+        const node = this.tree.get(item.id);
+        if (item.id === ROOT_ID || !node?.file) {
+          new Notice("Pick a note — Home has no body to write into.");
+          this.composerInputEl?.focus();
+          return;
+        }
+        bind(node.file, item.id, this.titleForNode(node), this.noteFolder);
+      },
+      crossFolderNotes: () => this.collectCrossFolderDestinations(),
+      onClose: () => {
+        // Dismissed without picking: the `+` stays exactly as typed, so it is
+        // still usable as a markdown bullet. Only refocus, never rewrite.
+        if (!picked && hadPlusOnly) ta?.focus();
+      },
+    }).open();
+  }
+
+  /** Write `text` into the target note's body — at the end (append) or directly
+   *  after the frontmatter (prepend). Undoable. Returns false if the target
+   *  vanished between binding and sending. */
+  private async appendToTarget(target: AppendTarget, text: string): Promise<boolean> {
+    // Resolve by PATH, not through the tree: the target may live in another
+    // Stashpad, which this view's tree knows nothing about.
+    const found = this.app.vault.getAbstractFileByPath(target.path);
+    const file = found instanceof TFile ? found : null;
+    if (!file) {
+      this.plugin.notifications.show({
+        message: `Could not write to "${target.label}" — it no longer exists at ${target.path}.`,
+        kind: "error", category: "system", folder: this.noteFolder,
+      });
+      return false;
+    }
+    const before = await this.app.vault.read(file);
+    let after: string;
+    if (target.mode === "prepend") {
+      // Insert AFTER the frontmatter block, never before it — a note whose file
+      // starts with anything but `---` loses its frontmatter entirely. Measured
+      // from the metadata cache when available, with a conservative regex
+      // fallback; if neither finds a block, treat the whole file as body.
+      const fmPos = this.app.metadataCache.getFileCache(file)?.frontmatterPosition;
+      let cut = 0;
+      if (fmPos) cut = fmPos.end.offset + 1;
+      else {
+        const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n/.exec(before);
+        if (m) cut = m[0].length;
+      }
+      const head = before.slice(0, cut);
+      const body = before.slice(cut).replace(/^\r?\n+/, "");
+      after = `${head}${text}\n\n${body}`;
+    } else {
+      const sep = before.endsWith("\n") ? "" : "\n";
+      after = `${before}${sep}\n${text}\n`;
+    }
+    await this.app.vault.modify(file, after);
+    // 0.226.0: re-slug here rather than relying on onFileModify. That handler
+    // early-returns for paths outside THIS view's noteFolder, so a cross-folder
+    // write never got slug handling and left the filename describing a first
+    // line that had been replaced. Doing it inline also covers the same-folder
+    // case immediately instead of on the 30s debounce. No-ops when the name
+    // already matches, which is every ordinary append.
+    await this.reslugFile(file, this.stripFrontmatter(after));
+    const path = file.path;
+    const verb = target.mode === "prepend" ? "Prepend" : "Append";
+    const where = target.folder && target.folder !== this.noteFolder
+      ? `${target.folder.split("/").pop()} ▸ ${target.label}`
+      : target.label;
+    // Cross-folder writes are invisible — the row isn't in this list, so without
+    // a notice there is no feedback that anything happened at all.
+    if (target.folder && target.folder !== this.noteFolder) {
+      this.plugin.notifications.show({
+        message: `${verb}ed to “${where}”.`,
+        kind: "success", category: "system", folder: this.noteFolder,
+      });
+    }
+    this.plugin.getUndoStack(this.noteFolder).push({
+      label: `${verb} to "${where}"`,
+      // Re-resolve by path at undo time. A PREPEND changes the note's first
+      // line, so Stashpad's own slug-rename may move the file — resolve by
+      // frontmatter id first and fall back to the original path.
+      // Undo/redo re-slug too, or the filename keeps describing the reverted
+      // first line. Resolve by frontmatter id FIRST, since the write above may
+      // already have renamed the file out from under `path`.
+      undo: async () => {
+        const f = this.plugin.fileByFrontmatterId(target.id, target.folder) ?? this.app.vault.getAbstractFileByPath(path);
+        if (f instanceof TFile) {
+          await this.app.vault.modify(f, before);
+          await this.reslugFile(f, this.stripFrontmatter(before));
+        }
+      },
+      redo: async () => {
+        const f = this.plugin.fileByFrontmatterId(target.id, target.folder) ?? this.app.vault.getAbstractFileByPath(path);
+        if (f instanceof TFile) {
+          await this.app.vault.modify(f, after);
+          await this.reslugFile(f, this.stripFrontmatter(after));
+        }
+      },
+    });
+    return true;
+  }
+
+  /** 0.221.0: a compact destination menu — recent folders first, with a "More…"
+   *  row that opens the full picker.
+   *
+   *  The full picker is right for "find a specific note in a specific folder",
+   *  but it is heavy for the case actually hit on mobile: start typing in
+   *  whichever folder opened, then want the note to land in a different one.
+   *  That is a one-tap decision among a handful of folders, so it gets a
+   *  one-tap menu; anything more specific falls through to the picker,
+   *  unchanged.
+   *
+   *  Sends to the folder's HOME (ROOT_ID) — a quick send means "put this in
+   *  that folder", not "under a particular note", which is the picker's job.
+   *  The draft never moves: this sets a destination for the NEXT send, so the
+   *  collision problem that dogged the carry-the-draft idea never arises. */
+  private openQuickDestinationMenu(e: MouseEvent, wasFocused: boolean): void {
+    const folders = this.plugin.quickDestinationFolders(this.noteFolder);
+    if (!folders.length) { this.openDestinationPicker(wasFocused); return; }
+    const menu = new Menu();
+    if (this.nextDestination) {
+      menu.addItem((i: any) => i.setTitle("Clear destination").setIcon("x").onClick(() => {
+        this.nextDestination = null;
+        this.nextDestinationFolder = null;
+        this.nextDestinationLabel = null;
+        this.refreshDestButton();
+        if (wasFocused) this.composerInputEl?.focus();
+      }));
+      menu.addSeparator();
+    }
+    for (const folder of folders) {
+      const name = folder.split("/").pop() || folder;
+      menu.addItem((i: any) => i
+        .setTitle(name)
+        .setIcon(this.plugin.getFolderIcon(folder) ?? "folder")
+        .onClick(() => {
+          this.nextDestination = ROOT_ID;
+          this.nextDestinationFolder = folder;
+          this.nextDestinationLabel = name;
+          // MRU only — a send must not change which folder opens on launch.
+          this.plugin.recordFolderUsed(folder, { opened: false });
+          this.refreshDestButton();
+          // Straight back to typing — the point is not to lose the mobile
+          // keyboard over a one-tap decision.
+          if (wasFocused) this.composerInputEl?.focus();
+        }));
+    }
+    menu.addSeparator();
+    menu.addItem((i: any) => i
+      .setTitle("More… (pick a note)")
+      .setIcon("search")
+      .onClick(() => this.openDestinationPicker(wasFocused)));
+    menu.showAtMouseEvent(e);
+  }
+
   openDestinationPicker(refocusComposerOnDismiss = false): void {
     // 0.76.36: do NOT blur the composer here. On iOS, blur() dismisses the
     // soft keyboard, and once dismissed a programmatic focus() on the
@@ -8220,8 +8549,13 @@ export class StashpadView extends ItemView {
    *  directly without having to navigate there first. 0.57.2. */
   private collectCrossFolderDestinations(): import("./note-picker").CrossFolderNote[] {
     const out = this.collectCrossFolderNotes();
-    const folders = this.plugin.searchableFolders(this.noteFolder)
-      .filter((f) => f !== this.noteFolder);
+    // 0.224.0: pinned folders lead here too, in folders-panel order, so the
+    // Stashpads you actually send to are the first roots you see. Applied here
+    // rather than inside searchableFolders so plain search results keep their
+    // existing (alphabetical) order.
+    const folders = this.plugin.rankFoldersByPin(
+      this.plugin.searchableFolders(this.noteFolder).filter((f) => f !== this.noteFolder),
+    );
     // Surface each folder's root as a first-class pick. id = ROOT_ID so
     // the cross-folder onPick handler can route directly into the new
     // folder's home.
@@ -9376,10 +9710,26 @@ export class StashpadView extends ItemView {
   cmdImportStashpadApp(): void {
     const focus = this.focusId && this.focusId !== ROOT_ID ? this.tree.get(this.focusId) : null;
     const dest = focus ? `“${this.titleForNode(focus)}”` : `“${this.noteFolder}” (home)`;
-    const run = (notes: AppImportNote[], helpers: HelperNote[]) => this.runAppImport(notes, helpers);
+    // Ids written during THIS importer session. The metadata cache hasn't
+    // parsed the files we just created by the time the importer re-parses, so a
+    // cache-only lookup would still miss them and let a second press duplicate
+    // everything. Scoped to one importer session (a fresh open starts empty),
+    // so deleting notes and re-importing them deliberately still works.
+    const session = new Set<string>();
+    const run = async (notes: AppImportNote[], helpers: HelperNote[]) => {
+      await this.runAppImport(notes, helpers);
+      for (const n of notes) if (!n.synthetic && n.sourceId) session.add(n.sourceId);
+    };
     // Ids already imported into this folder, so a second run can skip them
-    // instead of duplicating everything.
-    const existing = this.importedAppIds(this.noteFolder);
+    // instead of duplicating everything. 0.224.0: recomputed on every parse
+    // rather than snapshotted once — the importer stays open after an import,
+    // so a snapshot made "Skip notes already imported" a no-op on the second
+    // press and the whole export landed twice.
+    const existing = (): ReadonlySet<string> => {
+      const ids = this.importedAppIds(this.noteFolder);
+      for (const id of session) ids.add(id);
+      return ids;
+    };
     const modal = new AppImportModal(
       this.app, dest, run,
       (state) => void this.plugin.openAppImporter({ state, destinationLabel: dest, onImport: run, existingSourceIds: existing }),
@@ -11523,7 +11873,12 @@ export class StashpadView extends ItemView {
       // archive re-dates the live note but files a completed copy in archive/.
       let spawnNextIso: string | null = null;
       let archiveThis = false;
-      this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
+      // 0.224.0: `repainted: true`. This path updates the affected rows itself
+      // (repaintCompletedState below) or does its own full render when the
+      // change is structural — either way the follow-up re-render onFileModify
+      // would otherwise schedule is redundant, and that is the render whose
+      // anchor restore lands slightly off and scrolls the list.
+      this.markFmSelfWrite(t.file.path, true); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (fm) => {
         const rec = newState ? parseRecurrence(fm.repeat as string | undefined) : null;
         const mode = parseRepeatMode(fm.repeatMode);
@@ -11560,7 +11915,21 @@ export class StashpadView extends ItemView {
     }
     // repeatMode "archive": file the completed snapshot after the live note rolled.
     for (const a of archivedSnapshots) await archiveOccurrenceSnapshot(this.app, a.file, a.dueIso, () => this.plugin.mintNoteId());
-    this.render();
+    // 0.224.0: toggling completion is usually just a checkbox glyph + a class,
+    // so repaint in place instead of rebuilding the list (which is what made
+    // the list jump on mobile — colours and mark-as-task were already fixed in
+    // 0.218.0, this path was simply missed).
+    //
+    // A full render IS still required when the change is structural:
+    //   - "hide completed" is on, so the row must actually leave the list
+    //   - a recurring task rolled / spawned a next occurrence / archived a
+    //     snapshot — those add or re-date rows
+    // repaintCompletedState also self-reports false (off-screen row, no
+    // checkbox), so an unhandled case degrades to the old behaviour, never to
+    // a stale row.
+    const structural = this.currentHideCompleted()
+      || rolled.length > 0 || spawned > 0 || archivedSnapshots.length > 0;
+    if (structural || !this.repaintCompletedState(changedIds)) this.render();
     for (const r of rolled) {
       const verb = spawned > 0 ? "Next up" : "Rescheduled";
       this.plugin.notifications.show({ message: `🔁 ${verb}: “${r.title}” → ${formatDateTime(r.when, this.plugin.settings)}.`, kind: "success", category: "system", folder: this.noteFolder });
@@ -14286,28 +14655,44 @@ export class StashpadView extends ItemView {
     const focusClicked = (): void => {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
     };
+    // 0.224.0: these items live in a SUBMENU. Obsidian dismisses the menu a
+    // clicked item belongs to, but on mobile the parent sheet stays up — so
+    // marking a task complete left the overlay covering the very row you were
+    // acting on. Close the ROOT menu explicitly, before running the action, so
+    // the list is visible while it updates.
+    let taskSubmenu: { close?: () => void } | null = null;
+    const taskAct = (fn: () => unknown): void => {
+      focusClicked();
+      // Close the SUBMENU explicitly as well as the root. Closing the root
+      // usually cascades, but the submenu is the sheet actually covering the
+      // row on mobile — so it is the one that must be gone, and it should not
+      // depend on cascade behaviour we don't control.
+      try { taskSubmenu?.close?.(); } catch { /* not all builds expose it */ }
+      menu.close();
+      void fn();
+    };
     const addTaskItems = (target: { addItem: (cb: (it: any) => unknown) => unknown }): void => {
       const isTaskNote = this.isTask(node);
       if (isTaskNote) {
         const isDone = this.isCompleted(node);
-        target.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => { focusClicked(); void this.cmdToggleComplete(); }));
+        target.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => taskAct(() => this.cmdToggleComplete())));
       } else {
         // 0.122.2 (#10): let non-tasks be marked complete too (sets `completed`;
         // the note then counts as a task via the bare-completed field).
-        target.addItem((it: any) => it.setTitle("Mark complete").setIcon("check-circle").onClick(() => { focusClicked(); void this.toggleCompletedForNode(node); }));
-        target.addItem((it: any) => it.setTitle("Turn into task").setIcon("check-square").onClick(() => { focusClicked(); void this.cmdToggleTask(); }));
+        target.addItem((it: any) => it.setTitle("Mark complete").setIcon("check-circle").onClick(() => taskAct(() => this.toggleCompletedForNode(node))));
+        target.addItem((it: any) => it.setTitle("Turn into task").setIcon("check-square").onClick(() => taskAct(() => this.cmdToggleTask())));
       }
-      target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => { focusClicked(); this.cmdAssign(); }));
+      target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => taskAct(() => this.cmdAssign())));
       if (isTaskNote) {
         // 0.125.0: Snooze — reschedule the due date (date-only picker).
-        target.addItem((it: any) => it.setTitle("Snooze (reschedule)…").setIcon("alarm-clock").onClick(() => { focusClicked(); this.cmdSnooze(node); }));
-        target.addItem((it: any) => it.setTitle("Remove from tasks").setIcon("square").onClick(() => { focusClicked(); void this.cmdToggleTask(); }));
+        target.addItem((it: any) => it.setTitle("Snooze (reschedule)…").setIcon("alarm-clock").onClick(() => taskAct(() => this.cmdSnooze(node))));
+        target.addItem((it: any) => it.setTitle("Remove from tasks").setIcon("square").onClick(() => taskAct(() => this.cmdToggleTask())));
       }
     };
     menu.addItem((it: any) => {
       it.setTitle("Task").setIcon("check-square");
       const sub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
-      if (sub && typeof sub.addItem === "function") addTaskItems(sub);
+      if (sub && typeof sub.addItem === "function") { taskSubmenu = sub; addTaskItems(sub); }
       else it.onClick(() => this.openCommandPalette()); // degraded fallback
     });
     menu.addSeparator();

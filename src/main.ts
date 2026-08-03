@@ -981,7 +981,7 @@ export default class StashpadPlugin extends Plugin {
   /** Find a file in `folder` whose frontmatter id is `id`. Used by the
    *  duplicate-repair undo, because changing an id re-slugs the filename and
    *  makes any captured path stale. */
-  private fileByFrontmatterId(folder: string, id: string): TFile | null {
+  fileByFrontmatterId(folder: string, id: string): TFile | null {
     const prefix = folder + "/";
     for (const f of this.app.vault.getMarkdownFiles()) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
@@ -1149,12 +1149,84 @@ export default class StashpadPlugin extends Plugin {
 
   /** Remember the folder the user is currently working in. Cheap and idempotent:
    *  returns immediately when nothing changed, so the active-leaf-change firehose
-   *  doesn't write settings on every tab switch. */
-  recordFolderUsed(folder: string): void {
+   *  doesn't write settings on every tab switch.
+   *
+   *  0.223.0: `lastUsedFolder` and `recentFolders` were being written together,
+   *  which conflated two different questions:
+   *    - lastUsedFolder = "which folder do I OPEN INTO on launch?"
+   *    - recentFolders  = "which folders are worth offering as destinations?"
+   *  A quick-send to another folder should feed the second and NOT the first —
+   *  otherwise firing a note at some folder silently relocates where the plugin
+   *  opens next time. Pass `{ opened: false }` for a send. */
+  recordFolderUsed(folder: string, opts: { opened?: boolean } = {}): void {
     const cleaned = (folder || "").trim().replace(/^\/+|\/+$/g, "");
-    if (!cleaned || this.settings.lastUsedFolder === cleaned) return;
-    this.settings.lastUsedFolder = cleaned;
+    if (!cleaned) return;
+    const opened = opts.opened !== false;
+    const prev = this.settings.recentFolders ?? [];
+    const next = [cleaned, ...prev.filter((f) => f !== cleaned)].slice(0, 8);
+    const mruChanged = next.length !== prev.length || next.some((f, i) => f !== prev[i]);
+    const lastChanged = opened && this.settings.lastUsedFolder !== cleaned;
+    if (!mruChanged && !lastChanged) return;
+    if (opened) this.settings.lastUsedFolder = cleaned;
+    this.settings.recentFolders = next;
     void this.saveSettings();
+  }
+
+  /** 0.224.0: re-rank a folder list so pinned folders lead, in the SAME order
+   *  the folders panel shows them (`folderPanelPinnedAt`, ascending), and
+   *  downranked folders trail. Everything else keeps the order it came in with,
+   *  so each caller's own sort (alphabetical, last-used-first) still decides
+   *  the middle.
+   *
+   *  Pins are a statement about which Stashpads matter, so they should mean the
+   *  same thing everywhere a folder list appears — not only in the panel where
+   *  you set them. */
+  rankFoldersByPin(folders: string[]): string[] {
+    const clean = (f: string): string => (f || "").trim().replace(/^\/+|\/+$/g, "");
+    const pinned = (this.settings.folderPanelPinned ?? []).map(clean);
+    const at = this.settings.folderPanelPinnedAt ?? {};
+    const down = new Set((this.settings.folderPanelDownranked ?? []).map(clean));
+    const pinKey = (f: string): number => {
+      const c = clean(f);
+      const k = at[c];
+      if (typeof k === "number") return k;
+      const i = pinned.indexOf(c);
+      return i >= 0 ? i : 0;
+    };
+    const lead: string[] = [], mid: string[] = [], tail: string[] = [];
+    for (const f of folders) {
+      if (pinned.includes(clean(f))) lead.push(f);
+      else if (down.has(clean(f))) tail.push(f);
+      else mid.push(f);
+    }
+    lead.sort((a, b) => pinKey(a) - pinKey(b));
+    return [...lead, ...mid, ...tail];
+  }
+
+  /** Pin order key for one folder, or null when it isn't pinned. */
+  folderPinRank(folder: string): number | null {
+    const c = (folder || "").trim().replace(/^\/+|\/+$/g, "");
+    const pinned = (this.settings.folderPanelPinned ?? []).map((f) => (f || "").trim().replace(/^\/+|\/+$/g, ""));
+    const i = pinned.indexOf(c);
+    if (i < 0) return null;
+    const at = (this.settings.folderPanelPinnedAt ?? {})[c];
+    return typeof at === "number" ? at : i;
+  }
+
+  /** 0.221.0: folders for the quick-destination menu — recently used first,
+   *  topped up with the rest so a fresh install isn't empty. Excludes the
+   *  folder you're composing in, since "send to where I already am" is what the
+   *  plain send already does. */
+  quickDestinationFolders(exclude: string, limit = 5): string[] {
+    const all = this.discoverStashpadFolders();
+    const recent = (this.settings.recentFolders ?? []).filter((f) => all.includes(f));
+    const rest = all.filter((f) => !recent.includes(f));
+    // 0.224.0: pinned folders lead, then most-recent, then the rest. The cap is
+    // applied AFTER ranking, so a pin can push a stale recent off the short
+    // list — which is the point of pinning.
+    return this.rankFoldersByPin([...recent, ...rest])
+      .filter((f) => f !== exclude)
+      .slice(0, limit);
   }
 
   /** Open the first-run welcome on demand (command palette / settings button),
@@ -4008,9 +4080,11 @@ export default class StashpadPlugin extends Plugin {
     // work in sits wherever its name happens to fall. Only the ordering
     // changes — every folder is still listed, and typing still filters.
     const lastUsed = (this.settings.lastUsedFolder || "").trim();
-    const stashpadFolders = this.discoverStashpadFolders()
-      .slice()
-      .sort((a, b) => (a === lastUsed ? -1 : b === lastUsed ? 1 : 0));
+    const stashpadFolders = this.rankFoldersByPin(
+      this.discoverStashpadFolders()
+        .slice()
+        .sort((a, b) => (a === lastUsed ? -1 : b === lastUsed ? 1 : 0)),
+    );
     const activeView = getActiveView();
     const activeFolder = activeView ? ((activeView).noteFolder ?? "").trim().replace(/^\/+|\/+$/g, "") : "";
 
@@ -4079,13 +4153,23 @@ export default class StashpadPlugin extends Plugin {
     // folder that happened to be open still sank below an alphabetically-earlier
     // one. Sorting here catches both kinds. Array.prototype.sort is stable, so
     // the relative order of everything else is untouched.
-    if (lastUsed) {
-      baseItems.sort((a, b) => {
-        const av = (a as { folder?: string }).folder === lastUsed ? 0 : 1;
-        const bv = (b as { folder?: string }).folder === lastUsed ? 0 : 1;
-        return av - bv;
-      });
-    }
+    //
+    // 0.224.0: pinned folders now outrank last-used. Three tiers, so both rules
+    // survive: pinned (in folders-panel order) → the last-used folder → the
+    // rest. Pinning is an explicit, durable statement about what matters;
+    // last-used is incidental, so it sorts below but still above plain
+    // alphabetical.
+    baseItems.sort((a, b) => {
+      const rank = (x: { folder?: string }): [number, number] => {
+        const f = x.folder ?? "";
+        const pin = f ? this.folderPinRank(f) : null;
+        if (pin !== null) return [0, pin];
+        if (lastUsed && f === lastUsed) return [1, 0];
+        return [2, 0];
+      };
+      const ra = rank(a as { folder?: string }), rb = rank(b as { folder?: string });
+      return ra[0] - rb[0] || ra[1] - rb[1];
+    });
 
     // 0.118.3: optionally surface pinned notes so the switcher can jump
     // straight to one. Title from the filename (sync), same as the folder panel.

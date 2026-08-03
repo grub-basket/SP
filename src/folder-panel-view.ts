@@ -65,7 +65,7 @@ export class StashpadFolderPanelView extends ItemView {
     const pinnedSection = root.createDiv({ cls: "stashpad-folderpanel-section stashpad-folderpanel-pinned" });
     pinnedSection.style.flex = `0 0 ${(frac * 100).toFixed(2)}%`;
     const pinHeading = pinnedSection.createDiv({ cls: "stashpad-folderpanel-heading stashpad-folderpanel-heading-row" });
-    pinHeading.createSpan({ cls: "stashpad-folderpanel-heading-title", text: "Pinned" });
+    pinHeading.createSpan({ cls: "stashpad-folderpanel-heading-title", text: "Pinned notes" });
     const optsBtn = pinHeading.createEl("button", { cls: "stashpad-folderpanel-iconbtn" });
     setIcon(optsBtn, "list");
     optsBtn.setAttr("aria-label", "Pinned view options");
@@ -185,11 +185,13 @@ export class StashpadFolderPanelView extends ItemView {
   /** A pinned item — a folder OR a note — with its shared numeric order key. */
   private unifiedPinnedItems(): PinnedItem[] {
     const items: PinnedItem[] = [];
-    for (const f of this.plugin.discoverStashpadFolders()) {
-      if (this.folderState(f) === "pinned") {
-        items.push({ kind: "folder", folder: StashpadFolderPanelView.clean(f), at: this.folderPinnedAt(f) });
-      }
-    }
+    // 0.224.0: pinned FOLDERS no longer appear up here. They were duplicated —
+    // a pinned folder showed in this section AND ranked at the top of the
+    // folders list below it, so the top half mostly restated the bottom half.
+    // Folder pins keep their meaning (they rank the list below, and now rank
+    // the folder switcher + destination picker too); this section is just for
+    // pinned notes. `folderPinnedAt` / `ensureFolderPinOrder` stay — they still
+    // drive that ranking.
     for (const p of this.plugin.listPinnedNotes()) {
       items.push({ kind: "note", folder: p.folder, id: p.id, file: p.file, at: p.pinnedAt });
     }
