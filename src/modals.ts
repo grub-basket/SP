@@ -3698,6 +3698,32 @@ export interface DuplicateIdGroup {
   files: { path: string; isShown: boolean }[];
 }
 
+/** 0.220.2: frontmatter fields that are Stashpad's own bookkeeping. They very
+ *  often differ between a note and its copy — a conflict copy can sit under a
+ *  different parent, and parentLink/children are DERIVED from parent, so they
+ *  differ as a consequence rather than on their own merit. None of them is a
+ *  reason to prefer one copy over the other, so they are shown separately and
+ *  muted rather than mixed in with real content differences.
+ *
+ *  Deliberately NOT driven by RESERVED_FRONTMATTER: that list is "fields
+ *  Stashpad manages", which mixes bookkeeping (parent, position) with genuine
+ *  user state (attachments, due, pinned). The axis that matters here is "would
+ *  this change which copy I keep", which is a different question. */
+const DUPE_STRUCTURAL_FM = new Set([
+  "id", "parent", "parentLink", "children", "position", "author", "contributors",
+]);
+/** Shown as CONTEXT (which copy is newer) rather than as a difference to weigh. */
+const DUPE_TIMESTAMP_FM = new Set(["created", "modified"]);
+
+/** Stable, readable rendering of a frontmatter value for comparison. */
+function fmValueText(v: unknown): string {
+  if (v === undefined) return "—";
+  if (v === null) return "null";
+  if (Array.isArray(v)) return v.length ? v.map((x) => String(x)).join(", ") : "(empty)";
+  if (typeof v === "object") { try { return JSON.stringify(v); } catch { return String(v); } }
+  return String(v);
+}
+
 export interface DuplicateIdsFolder { folder: string; groups: DuplicateIdGroup[] }
 
 export interface DuplicateIdsModalOpts {
@@ -3797,6 +3823,73 @@ export class DuplicateIdsModal extends Modal {
     }
   }
 
+  /** 0.220.2: compare FRONTMATTER too, not just the body.
+   *
+   *  The body diff alone can say "identical" while the two copies differ in
+   *  ways that decide which one you keep — most importantly `attachments`,
+   *  where one copy references a file the other doesn't. Also due dates,
+   *  completion, colour, tags and assignees: all real user state.
+   *
+   *  Split three ways rather than dumped as one list, because they answer
+   *  different questions: what CONTENT differs, what is merely Stashpad's
+   *  bookkeeping (parent / parentLink / children — often different and rarely
+   *  a reason to prefer a copy), and which copy is NEWER. */
+  private renderFrontmatterDiff(c: HTMLElement, shownPath: string, hiddenPath: string): void {
+    const fmOf = (p: string): Record<string, unknown> => {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) return {};
+      return (this.app.metadataCache.getFileCache(f)?.frontmatter ?? {}) as Record<string, unknown>;
+    };
+    const A = fmOf(shownPath), B = fmOf(hiddenPath);
+    const keys = [...new Set([...Object.keys(A), ...Object.keys(B)])].sort();
+    const content: string[][] = [];
+    const structural: string[][] = [];
+    for (const k of keys) {
+      const va = fmValueText(A[k]), vb = fmValueText(B[k]);
+      if (va === vb) continue;
+      if (DUPE_TIMESTAMP_FM.has(k)) continue;             // reported as context below
+      (DUPE_STRUCTURAL_FM.has(k) ? structural : content).push([k, va, vb]);
+    }
+
+    const wrap = c.createDiv({ cls: "stashpad-dupes-fm" });
+    const table = (host: HTMLElement, rows: string[][]): void => {
+      for (const [k, va, vb] of rows) {
+        const row = host.createDiv({ cls: "stashpad-dupes-fm-row" });
+        row.createSpan({ cls: "stashpad-dupes-fm-key", text: k });
+        row.createSpan({ cls: "stashpad-dupes-fm-a", text: va });
+        row.createSpan({ cls: "stashpad-dupes-fm-b", text: vb });
+      }
+    };
+    if (content.length) {
+      wrap.createDiv({ cls: "stashpad-dupes-fm-head", text: "Frontmatter differences worth checking" });
+      const head = wrap.createDiv({ cls: "stashpad-dupes-fm-row is-head" });
+      head.createSpan({ cls: "stashpad-dupes-fm-key", text: "field" });
+      head.createSpan({ cls: "stashpad-dupes-fm-a", text: "shown" });
+      head.createSpan({ cls: "stashpad-dupes-fm-b", text: "hidden" });
+      table(wrap, content);
+      if (content.some(([k]) => k === "attachments")) {
+        wrap.createDiv({ cls: "stashpad-dupes-fm-note",
+          text: "These notes reference different attachments — check the files before discarding either copy." });
+      }
+    } else {
+      wrap.createDiv({ cls: "stashpad-dupes-fm-note", text: "No meaningful frontmatter differences (attachments, due, colour, tags and the like all match)." });
+    }
+
+    // Timestamps as context: which copy is newer, phrased plainly.
+    const t = (v: unknown): number => { const n = Date.parse(String(v ?? "")); return Number.isFinite(n) ? n : 0; };
+    const ma = t(A.modified ?? A.created), mb = t(B.modified ?? B.created);
+    if (ma && mb && ma !== mb) {
+      wrap.createDiv({ cls: "stashpad-dupes-fm-note",
+        text: mb > ma ? "The HIDDEN copy was modified more recently." : "The SHOWN note was modified more recently." });
+    }
+
+    if (structural.length) {
+      const det = wrap.createEl("details", { cls: "stashpad-dupes-fm-structural" });
+      det.createEl("summary", { text: `${structural.length} structural field${structural.length === 1 ? " differs" : "s differ"} (Stashpad bookkeeping — usually not a reason to prefer a copy)` });
+      table(det, structural);
+    }
+  }
+
   /** Word diff of a hidden copy against the shown note, reusing the split
    *  modal's differ. Read-only — this is for DECIDING, not merging: a sync
    *  conflict copy often differs by a sentence, and that is the thing you need
@@ -3811,12 +3904,13 @@ export class DuplicateIdsModal extends Modal {
     const [a, b] = [await read(shownPath), await read(hiddenPath)];
     const c = this.contentEl;
     c.empty();
-    c.createEl("p", { cls: "setting-item-description", text: "Comparing note bodies. Frontmatter is excluded — the ids differ by definition." });
     const meta = c.createDiv({ cls: "stashpad-dupes-diff-meta" });
     meta.createDiv({ text: `shown: ${shownPath}` });
     meta.createDiv({ text: `hidden: ${hiddenPath}` });
+    this.renderFrontmatterDiff(c, shownPath, hiddenPath);
+    c.createDiv({ cls: "stashpad-dupes-fm-head", text: "Body" });
     if (a === b) {
-      c.createEl("p", { cls: "stashpad-dupes-identical", text: "These two bodies are IDENTICAL — the copy carries nothing the shown note doesn't." });
+      c.createEl("p", { cls: "stashpad-dupes-identical", text: "The bodies are IDENTICAL — any difference between these two is in the frontmatter above." });
     } else {
       const pane = c.createDiv({ cls: "stashpad-dupes-diff" });
       for (const part of splitWordDiff(a, b)) {

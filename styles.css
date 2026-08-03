@@ -6924,3 +6924,36 @@ button.stashpad-btn-loading::after {
   font-size: var(--font-ui-smaller);
   white-space: nowrap;
 }
+
+/* Frontmatter comparison inside the duplicate diff view (0.220.2). Three
+   columns: field, shown value, hidden value. */
+.stashpad-dupes-fm { margin: 4px 0 12px; }
+.stashpad-dupes-fm-head {
+  font-weight: var(--font-semibold, 600);
+  color: var(--text-normal);
+  margin: 12px 0 6px;
+}
+.stashpad-dupes-fm-row {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.7fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  padding: 4px 6px;
+  font-size: var(--font-ui-smaller);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-dupes-fm-row.is-head { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
+.stashpad-dupes-fm-key { color: var(--text-normal); font-family: var(--font-monospace); overflow-wrap: anywhere; }
+.stashpad-dupes-fm-a, .stashpad-dupes-fm-b { color: var(--text-muted); overflow-wrap: anywhere; }
+.stashpad-dupes-fm-b { color: var(--text-accent); }
+.stashpad-dupes-fm-note {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.45;
+}
+.stashpad-dupes-fm-structural { margin-top: 10px; }
+.stashpad-dupes-fm-structural > summary {
+  cursor: pointer;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
