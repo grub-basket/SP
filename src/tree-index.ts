@@ -263,7 +263,13 @@ export class TreeIndex {
     return out;
   }
 
-  hookMetadataCache(onUpdate: () => void): () => void {
+  /** 0.218.0: `onUpdate` now receives whether anything STRUCTURAL changed —
+   *  a note added, removed, reparented or reordered. A frontmatter-only edit
+   *  (color, due date, assignees, task state) reports false, which lets the
+   *  view repaint those attributes on the existing rows instead of rebuilding
+   *  the list. Rebuilding was the historical answer (see the note in onChanged)
+   *  and it is what makes the list jump on a color change. */
+  hookMetadataCache(onUpdate: (structural: boolean) => void): () => void {
     const pathInFolder = (p: string | null | undefined): boolean => {
       const f = this.currentFolder;
       if (!f) return true; // early startup — accept everything
@@ -277,15 +283,21 @@ export class TreeIndex {
     // tree state itself is mutated synchronously by the apply* methods —
     // only the visual update is debounced.
     let dirty = false;
-    const scheduleUpdate = (): void => {
+    // Sticky within one coalesce window: if ANY event in the burst was
+    // structural, the whole burst is treated as structural.
+    let structural = false;
+    const scheduleUpdate = (wasStructural = true): void => {
       dirty = true;
+      structural = structural || wasStructural;
       if (this.coalesceTimer != null) return;
       this.coalesceTimer = window.setTimeout(() => {
         this.coalesceTimer = null;
         if (!dirty) return;
         dirty = false;
+        const s = structural;
+        structural = false;
         this.emit();
-        onUpdate();
+        onUpdate(s);
       }, 16);
     };
 
@@ -304,8 +316,12 @@ export class TreeIndex {
       // it). Repainting on the cache event removes the race: render runs
       // exactly when the fresh frontmatter is available. Coalesced (16ms)
       // so bursts collapse to one paint; render writes nothing, so no loop.
-      this.applyChange(file);
-      scheduleUpdate();
+      // applyChange returns false for a frontmatter-only edit — nothing moved
+      // in the tree. Historically we repainted anyway because the view reads
+      // color/task live; the view now repaints those in place instead, so pass
+      // the distinction through rather than forcing a rebuild.
+      const moved = this.applyChange(file);
+      scheduleUpdate(moved);
     };
     const onCreate = (file: any): void => {
       if (!(file instanceof TFile)) return;

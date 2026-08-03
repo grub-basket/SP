@@ -5,7 +5,7 @@ import { BUILTIN_COLOR_NAMES } from "./text-importer";
 
 /** hex (lower-case) -> human name, inverted from BUILTIN_COLOR_NAMES.
  *
- *  0.211.2: the per-row colour control is a native <select>, and on macOS that
+ *  0.211.2: the per-row color control is a native <select>, and on macOS that
  *  renders as a NATIVE menu — no swatches, no styling, just the option text. A list
  *  of raw hex codes there is unreadable. The names already exist for parsing
  *  "[color: Amber]", so reuse them rather than inventing a second vocabulary.
@@ -94,7 +94,7 @@ export class TextImporterUI {
     opt("Strip list markers", 'Treat a leading "- ", "* " or "1." as a bullet: removed from the text and used for nesting.', "detectLists");
     opt("Keep code blocks whole", "A ``` fenced block stays in one note instead of splitting line by line.", "keepCodeBlocks");
     opt("Paragraph mode", "Consecutive lines form ONE note and a blank line starts the next — for pasting prose. Off = one note per line.", "paragraphMode");
-    opt("Read tasks and colours", 'Understand "[x] done" checkboxes and "[color: red]" / "[color: #hex | alias: name]" tags — so text copied out of Stashpad pastes back with its tasks and colours intact.', "parseMeta");
+    opt("Read tasks and colors", 'Understand "[x] done" checkboxes and "[color: red]" / "[color: #hex | alias: name]" tags — so text copied out of Stashpad pastes back with its tasks and colors intact.', "parseMeta");
     opt(
       "Pasted from the old Stashpad desktop app",
       "That app exports the top parent with no bullet and no indent, its children with a bullet but STILL no indent, and only starts indenting at the third level — so by indent alone the first two levels look identical and the tree flattens. Turn this on and a bullet counts as one level deeper. Leave it OFF for ordinary markdown, where a paragraph followed by a list is not nesting.",
@@ -239,7 +239,7 @@ export class TextImporterUI {
 
       // Nest under the line above / outdent. Solves any shape the parser cannot
       // infer, including exports this toggle set does not anticipate. Meaningless
-      // on a merged row — it has no level or colour of its own any more.
+      // on a merged row — it has no level or color of its own any more.
       const nestBtn = ctrls.createEl("button", { cls: "stashpad-import-ctlbtn", text: "→" });
       nestBtn.title = "Nest under the line above";
       nestBtn.disabled = merged || idx === 0 || note.level > (this.rows[idx - 1]?.level ?? 0);
@@ -249,12 +249,12 @@ export class TextImporterUI {
       outBtn.disabled = merged || note.level <= 1;
       outBtn.onclick = () => { this.levelDelta.set(idx, (this.levelDelta.get(idx) ?? 0) - 1); this.refresh(); };
 
-      // Colour, from Stashpad's own palette.
+      // Color, from Stashpad's own palette.
       const sel = ctrls.createEl("select", { cls: "stashpad-import-color" });
-      const none = sel.createEl("option", { text: "(no colour)" });
+      const none = sel.createEl("option", { text: "(no color)" });
       none.value = "";
       for (const hex of ColorPickerModal.DEFAULT_PALETTE) {
-        // Name when we know it, hex only as a fallback for a custom colour.
+        // Name when we know it, hex only as a fallback for a custom color.
         const o = sel.createEl("option", { text: HEX_TO_NAME[hex.toLowerCase()] ?? hex });
         o.value = hex;
       }

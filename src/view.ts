@@ -6,6 +6,7 @@ import {
 import {
   ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
   archiveSubfolderOf, isArchiveSubfolderPath,
+  isReservedSubfolderName,
   type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
 } from "./types";
 import { TreeIndex } from "./tree-index";
@@ -30,6 +31,8 @@ import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
 import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal } from "./modals";
 import { TextImportModal } from "./text-import-modal";
+import { AppImportModal } from "./stashpad-app-import-modal";
+import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
 import type { ImportNote } from "./text-importer";
 import { isAllCheckboxLines } from "./text-importer";
 import { ComposerAutocomplete } from "./composer-autocomplete";
@@ -318,6 +321,13 @@ export class StashpadView extends ItemView {
   /** When true, the listResizeObserver re-pins scroll to the bottom each time
    *  the list grows. Set after scrollListToBottom; cleared on user scroll. */
   private stickToListBottom = false;
+  /** 0.219.4: an on-disk note count the reconcile has already PROVEN it cannot
+   *  resolve — a rebuild at this count changed nothing, so retrying only costs a
+   *  full list rebuild + re-render. Cleared implicitly by the count changing
+   *  (a note added or removed), so a genuinely stale tree still reconciles. */
+  private reconcileUnresolvableAt: number | null = null;
+  /** Set once the duplicate-id warning has been surfaced, so it never nags. */
+  private reportedDuplicateIds = false;
   /** 0.76.27: timestamp until which the listResizeObserver ignores
    *  scroll adjustments. Set on mobile composer focus/blur — the
    *  keyboard show/hide resizes the list, which otherwise fired the
@@ -381,6 +391,15 @@ export class StashpadView extends ItemView {
    *  final pick / first-by-order when unset. */
   private activeVersionByGroup = new Map<string, StashpadId>();
   private focusComposerOnNextRender = false;
+  /** 0.219.2: handle for the deferred FIRST paint. Obsidian calls onOpen before
+   *  setState, so a view opened at a specific folder would paint the DEFAULT
+   *  folder's notes first and throw them away a moment later — measured as a
+   *  full 120-row render for a folder the user never asked for. The first paint
+   *  is deferred by a tick so an incoming setState can cancel it and render the
+   *  right folder once. Cleared either way; if setState never comes (a plain
+   *  open at the default folder) the timer fires and paints normally, so first
+   *  paint is never actually delayed in that case. */
+  private initialRenderTimer: number | null = null;
   /** 0.213.0: vault paths of attachments THIS composer wrote during the current
    *  compose (drop / paste / paperclip). Lets a send to another folder tell
    *  "staged for this note" apart from "a link the user pasted", which decides
@@ -653,8 +672,13 @@ export class StashpadView extends ItemView {
     // Pop on view teardown.
     this.register(() => popViewScope());
 
-    this.detachTreeHook = this.tree.hookMetadataCache(() => {
-      this.debouncedRender();
+    this.detachTreeHook = this.tree.hookMetadataCache((structural) => {
+      // 0.218.0: a frontmatter-only change (color, completed, due, assignees)
+      // is repainted on the EXISTING rows — rebuilding the list for those is
+      // what made it jump when you set a color or ticked a to-do. Anything
+      // structural, or an attribute change the repaint can't express (a
+      // checkbox appearing), still gets the full render.
+      if (structural || !this.repaintRowAttributes()) this.debouncedRender();
       this.scheduleStructureSnapshot(); // 0.206.0 recovery sidecar (debounced)
     });
     // 0.76.30: self-heal stale trees after a sync burst / cold start.
@@ -850,7 +874,13 @@ export class StashpadView extends ItemView {
     // wins; the helper consumes it so it only applies once.
     const restoredSel = this.foldRestoredSelection(savedCursorId);
     if (restoredSel) this.pendingFocusIds = restoredSel;
-    this.render(initialPolicy);
+    // 0.219.2: deferred by a tick — see initialRenderTimer. setState cancels it
+    // when it is about to render the real folder itself.
+    this.initialRenderTimer = window.setTimeout(() => {
+      this.initialRenderTimer = null;
+      if (!this.viewRoot?.isConnected) return;
+      this.render(initialPolicy);
+    }, 0);
     // 0.91.1: re-assert the selection after post-mount reconcile renders settle.
     this.scheduleSelectionRestore();
     // 0.61.7: defer the tiny resize to ~1s after launch. Obsidian's own
@@ -996,13 +1026,105 @@ export class StashpadView extends ItemView {
       for (const f of this.app.vault.getMarkdownFiles()) {
         const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
         if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
+        // 0.219.3: skip RESERVED subfolders — _archive / _attachments /
+        // _authors / _imports / _exports / _processed and the per-folder
+        // archive/ + trash/. The tree deliberately never descends into them
+        // (TreeIndex.collectMarkdown), so counting their files here compared a
+        // number that includes them against one that never can.
+        //
+        // Archived notes keep their Stashpad `id`, so the `id` test below does
+        // NOT filter them out — which made the mismatch PERMANENT for any
+        // folder that has ever archived a note. A permanent mismatch means this
+        // reconcile rebuilds the tree and re-renders the whole list ~400ms
+        // after EVERY metadata event, including our own frontmatter writes. On
+        // a real vault that is what made the list jump on every color change,
+        // to-do toggle and completed toggle. Measured on the user's device:
+        // onDisk 417 vs tree 368 — 49 archived notes — firing before every
+        // single reported jump.
+        const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
+        if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
         const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
         if (typeof id === "string" && id) onDisk++;
       }
       if (onDisk === this.tree.fileBackedCount()) return; // in sync — no-op
+      // 0.219.2: this fires ~400ms after a metadata event and, when the counts
+      // disagree, rebuilds + renders — which is a full list rebuild and so an
+      // anchor-restore jump. If a vault has a PERSISTENT mismatch (a note the
+      // tree doesn't track, or vice versa) this runs after every frontmatter
+      // write forever, which looks exactly like "the list moves when I change a
+      // color". Logged so a device trace can confirm or clear it: a healthy
+      // vault should show this only while a folder is first loading.
+      // 0.219.4: a rebuild only helps when the tree is STALE. It cannot help
+      // when the gap is structural — TreeIndex keys nodes by frontmatter `id`,
+      // so N files sharing one id collapse to a single node and the counts can
+      // never agree. Before this guard, such a folder rebuilt + re-rendered the
+      // whole list ~400ms after EVERY metadata event, forever: the reported
+      // "the list jumps when I change a color". Measured on the user's vault:
+      // onDisk 418 vs tree 369 — 49 duplicate ids — unchanged by the rebuild.
+      //
+      // So: rebuild once, and if the count did not move, record that this count
+      // is unresolvable and stop. Any real change to the note count clears it.
+      if (onDisk === this.reconcileUnresolvableAt) return;
+      const beforeCount = this.tree.fileBackedCount();
+      this.plugin.trace("reconcile", { folder, onDisk, tree: beforeCount });
       this.tree.rebuild(folder);
+      const afterCount = this.tree.fileBackedCount();
+      if (afterCount === beforeCount) {
+        this.reconcileUnresolvableAt = onDisk;
+        this.plugin.trace("reconcile:unresolvable", { folder, onDisk, tree: afterCount, gap: onDisk - afterCount });
+        this.warnDuplicateIds(folder, onDisk - afterCount);
+        return; // rebuilding changed nothing — re-rendering cannot help either
+      }
       this.debouncedRender();
     }, 400);
+  }
+
+  /** 0.219.4: a persistent on-disk-vs-tree gap almost always means DUPLICATE
+   *  frontmatter ids — two notes claiming the same id collapse into one node,
+   *  so one of them is invisible in the list while still occupying disk. That
+   *  is a real data problem worth telling the user about (Stashpad has an
+   *  integrity check for it), not just something to silently stop retrying.
+   *  Surfaced once per session, and only when the gap is real. */
+  private warnDuplicateIds(folder: string, gap: number): void {
+    if (this.reportedDuplicateIds || gap <= 0) return;
+    this.reportedDuplicateIds = true;
+    const seen = new Map<string, number>();
+    const prefix = folder + "/";
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
+      const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
+      if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id === "string" && id) seen.set(id, (seen.get(id) ?? 0) + 1);
+    }
+    const dupes = [...seen.values()].filter((n) => n > 1).length;
+    if (!dupes) return;   // gap has some other cause — don't guess at it
+    // Deliberately does NOT point at "Check folder integrity": that sweep builds
+    // an id-keyed record too, so it collapses duplicates exactly like the tree
+    // does and cannot see this. Name the affected files here instead, so the
+    // notice is actionable on its own until the dedicated scan lands
+    // (docs/duplicate-ids-plan.md).
+    const examples: string[] = [];
+    for (const [id, n] of seen) {
+      if (n < 2) continue;
+      const paths = [...this.app.vault.getMarkdownFiles()]
+        .filter((f) => this.app.metadataCache.getFileCache(f)?.frontmatter?.id === id)
+        .map((f) => f.path);
+      examples.push(`\`${id}\` — ${paths.length} files: ${paths.slice(0, 3).join(", ")}${paths.length > 3 ? ", …" : ""}`);
+      if (examples.length >= 3) break;
+    }
+    this.plugin.notifications.show({
+      message: [
+        `**${folder}** has ${dupes} duplicate note id${dupes === 1 ? "" : "s"} (${gap} note${gap === 1 ? "" : "s"} share an id with another).`,
+        `Notes sharing an id collapse into ONE row, so some of these are invisible in the list even though the files still exist.`,
+        ...examples.map((e) => `• ${e}`),
+        dupes > examples.length ? `• …and ${dupes - examples.length} more (see console)` : "",
+        `Nothing has been changed. A repair command is planned; until then, giving one copy a different \`id\` in its frontmatter makes it visible again.`,
+      ].filter(Boolean).join("\n"),
+      kind: "warning", category: "system", folder, duration: 0,
+    });
+    console.warn("[Stashpad] duplicate note ids in", folder, [...seen].filter(([, n]) => n > 1).map(([id]) => id));
   }
 
   private focusView(): void {
@@ -1079,6 +1201,10 @@ export class StashpadView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    if (this.initialRenderTimer != null) {
+      window.clearTimeout(this.initialRenderTimer);
+      this.initialRenderTimer = null;
+    }
     clearActiveView(this);
     // Cancel any pending debounced render so it can't fire post-close (the
     // render() isConnected guard also catches it — belt and suspenders). 0.140.9
@@ -1256,6 +1382,12 @@ export class StashpadView extends ItemView {
       // app reload, since Obsidian calls setState after onOpen.
       const restoredSel = this.foldRestoredSelection(savedCursorId);
       if (restoredSel) this.pendingFocusIds = restoredSel;
+      // 0.219.2: this render supersedes the deferred first paint — drop it so
+      // the default folder is never built and discarded.
+      if (this.initialRenderTimer != null) {
+        window.clearTimeout(this.initialRenderTimer);
+        this.initialRenderTimer = null;
+      }
       this.render(policy);
       // 0.91.1: re-assert the selection after post-mount reconcile renders.
       this.scheduleSelectionRestore();
@@ -3073,7 +3205,7 @@ export class StashpadView extends ItemView {
     if (span) { span.empty(); setIcon(span, this.plugin.getFolderIcon(this.noteFolder) ?? "folder"); }
   }
 
-  /** 0.215.0: pick a readable text colour for an accent-filled control.
+  /** 0.215.0: pick a readable text color for an accent-filled control.
    *
    *  Obsidian ships BOTH `--text-on-accent` (white) and
    *  `--text-on-accent-inverted` (black) precisely because a theme's accent can
@@ -3082,7 +3214,7 @@ export class StashpadView extends ItemView {
    *  but unreadable on a bright accent — yellow, lime, cyan — which is exactly
    *  the case this was reported for.
    *
-   *  CSS can't branch on a colour's luminance, so measure the accent as the
+   *  CSS can't branch on a color's luminance, so measure the accent as the
    *  browser actually resolved it and choose. Deferred a frame because the
    *  element has no computed background until it is in the document. The value
    *  written is computed, not a literal, so it doesn't trip the store lint's
@@ -3540,6 +3672,26 @@ export class StashpadView extends ItemView {
 
   /** Select-mode toggle + ⋯ actions menu. Rendered at the START of the
    *  breadcrumb row (left of Home) on every platform. */
+  /** 0.218.0: rebuild JUST the mobile actions cluster, in its existing slot.
+   *
+   *  The select-mode toggle no longer re-renders the list, but the toolbar
+   *  button still has to flip its own icon, title and is-active state. The
+   *  cluster is a handful of stateless buttons holding no focus and no scroll,
+   *  so rebuilding it is free and cannot disturb the list — which is the whole
+   *  point of not calling render(). */
+  private refreshMobileActionsCluster(): void {
+    const old = this.viewRoot?.querySelector<HTMLElement>(".stashpad-mobile-actions");
+    const parent = old?.parentElement;
+    if (!old || !parent) return;
+    const anchor = old.nextSibling;
+    old.remove();
+    // renderActionsCluster appends to `parent`; put the fresh node back where
+    // the old one lived so button order in the toolbar is preserved.
+    this.renderActionsCluster(parent);
+    const fresh = parent.lastElementChild;
+    if (fresh && anchor) parent.insertBefore(fresh, anchor);
+  }
+
   private renderActionsCluster(parent: HTMLElement): void {
     const actions = parent.createDiv({ cls: "stashpad-mobile-actions" });
     // 0.66.0: Stashpad-internal back / forward nav buttons. Stashpad
@@ -3589,7 +3741,13 @@ export class StashpadView extends ItemView {
       // this.listEl, so the restore must read the FRESH element after render —
       // restoring onto the pre-render node is a silent no-op on a detached
       // element.
-      const restoreScroll = this.holdListScroll();
+      this.traceScroll("select-mode");
+      // 0.218.0: no render here. Entering/leaving select mode changes only
+      // which rows carry .is-selected / .is-cursor and the toolbar button's own
+      // icon — no rows are added, removed or reordered. repaintSelectionClasses
+      // (0.73.15, already used by arrow-key nav for the same reason) toggles
+      // those classes on the live rows, so the list physically cannot move and
+      // no scroll restoration is needed.
       if (this.mobileSelectMode) {
         const first = this.firstSelectedId ?? this.selection.values().next().value;
         this.selection.clear();
@@ -3601,8 +3759,8 @@ export class StashpadView extends ItemView {
         }
         this.firstSelectedId = null;
         this.mobileSelectMode = false;
-        this.render();
-        restoreScroll();
+        this.repaintSelectionClasses();
+        this.refreshMobileActionsCluster();
       } else {
         const node = this.currentChildren[Math.max(0, this.cursorIdx)];
         this.mobileSelectMode = true;
@@ -3612,8 +3770,8 @@ export class StashpadView extends ItemView {
           this.lastSelected = node.id;
           this.firstSelectedId = node.id;
         }
-        this.render();
-        restoreScroll();
+        this.repaintSelectionClasses();
+        this.refreshMobileActionsCluster();
         // Unicode bolt ⚡ matches the lightning-bolt icon on the
         // actions button (Obsidian's Notice doesn't render Lucide icons
         // inline, so the emoji is the next-best visual match).
@@ -6817,10 +6975,10 @@ export class StashpadView extends ItemView {
    *
    *  render()'s default policy is ANCHOR-based (re-scroll so the same row sits
    *  at the same visual offset), which is right when CONTENT changed. It is
-   *  wrong for an in-place ATTRIBUTE change — select mode, a colour, a task
+   *  wrong for an in-place ATTRIBUTE change — select mode, a color, a task
    *  checkbox — because those alter row chrome, so the anchor row lands at a
    *  slightly different offset and the list creeps. Measured: ~130px UP per
-   *  colour change / task toggle, and the same on the select toggle.
+   *  color change / task toggle, and the same on the select toggle.
    *
    *  Call BEFORE the mutation, invoke the returned function right after
    *  this.render().
@@ -6834,6 +6992,81 @@ export class StashpadView extends ItemView {
    *    offset stops being the bottom and the list visibly settles backwards
    *    (the "jiggle"). When we started at the bottom we re-pin to the bottom
    *    instead, which absorbs that growth smoothly. */
+  /** 0.218.1: record what actually moves the list, ON THE DEVICE.
+   *
+   *  Emulation has now reported 0px movement four times while the phone still
+   *  showed the list shifting, so the remaining work cannot be done here.
+   *  This samples scrollTop + scrollHeight every frame for ~2s after an action
+   *  and writes the result into the existing debug-trace ring buffer (local
+   *  only, copied out from Settings -> Diagnostics), so a real device can say
+   *  which write lands last and whether the content height is still growing.
+   *
+   *  Zero cost when debugTrace is off — trace() checks the flag, and the rAF
+   *  loop never starts. */
+  private traceScroll(label: string): void {
+    if (!this.plugin.settings.debugTrace) return;
+    const list = this.listEl;
+    if (!list) return;
+    const t0 = performance.now();
+    const start = { top: list.scrollTop, h: list.scrollHeight, c: list.clientHeight };
+    let lastTop = start.top, lastH = start.h;
+    // 0.218.2: the frame sampler says the list moved, not WHO moved it. Trap
+    // assignments to scrollTop on this element and record the caller, so a big
+    // jump names its own culprit instead of being guessed at. Instance-level
+    // override of the native accessor; removed when the window closes.
+    const desc = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop");
+    let trapped = false;
+    if (desc?.get && desc?.set) {
+      try {
+        Object.defineProperty(list, "scrollTop", {
+          configurable: true,
+          get(this: HTMLElement) { return desc.get!.call(this) as number; },
+          set(this: HTMLElement, v: number) {
+            const prev = desc.get!.call(this) as number;
+            // Only interesting when it actually moves, and only for real jumps.
+            if (Math.abs(v - prev) > 8) {
+              const where = (new Error().stack ?? "").split("\n").slice(2, 5)
+                .map((l) => l.trim().replace(/^at\s+/, "").replace(/\s*\(.*$/, "")).join(" < ");
+              (this as unknown as { __spTrace?: (c: string, d: Record<string, unknown>) => void });
+              plugin.trace("scroll:set", { at: label, ms: Math.round(performance.now() - t0), from: Math.round(prev), to: Math.round(v), by: where.slice(0, 120) });
+            }
+            desc.set!.call(this, v);
+          },
+        });
+        trapped = true;
+      } catch { /* accessor override refused — the frame sampler still works */ }
+    }
+    const plugin = this.plugin;
+    const untrap = (): void => {
+      if (!trapped) return;
+      trapped = false;
+      try { delete (list as unknown as Record<string, unknown>).scrollTop; } catch { /* ignore */ }
+    };
+    const tick = (): void => {
+      const el = this.listEl;
+      if (!el || !el.isConnected) return;
+      const dt = performance.now() - t0;
+      // Log only CHANGES, so the buffer holds signal rather than 120 identical
+      // frames — the timestamps still show when each change landed.
+      if (el.scrollTop !== lastTop || el.scrollHeight !== lastH) {
+        this.plugin.trace("scroll", {
+          at: label,
+          ms: Math.round(dt),
+          top: Math.round(el.scrollTop),
+          dTop: Math.round(el.scrollTop - start.top),
+          h: el.scrollHeight,
+          dH: el.scrollHeight - start.h,
+        });
+        lastTop = el.scrollTop;
+        lastH = el.scrollHeight;
+      }
+      if (dt < 2000) requestAnimationFrame(tick);
+      else untrap();
+    };
+    this.plugin.trace("scroll:start", { at: label, top: Math.round(start.top), h: start.h, c: start.c });
+    requestAnimationFrame(tick);
+  }
+
   private holdListScroll(): () => void {
     const list = this.listEl;
     const top = list?.scrollTop ?? 0;
@@ -7308,6 +7541,138 @@ export class StashpadView extends ItemView {
    *  the live selection state and bring each row's .is-cursor /
    *  .is-selected classes in line with it. Used by arrow-key nav and
    *  any other "only the selection changed" path. 0.73.4. */
+  /** 0.218.0: repaint COLOUR on the existing rows, touching no structure.
+   *
+   *  A color is a pure visual attribute — a class plus CSS custom properties
+   *  on the row, its grip and its children-count arrow. Rebuilding 120 rows to
+   *  change one of them was both wasteful and the direct cause of the list
+   *  moving (the rebuild destroys the rows, so the scroll position has to be
+   *  reconstructed afterwards, and it lands slightly off). Nothing is destroyed
+   *  here, so there is nothing to restore: the list cannot move.
+   *
+   *  Repaints EVERY visible row, not just the changed one, because color is
+   *  inherited: a colored note paints a depth-faded side stripe on its
+   *  descendants, so changing one note's color changes its whole subtree's
+   *  appearance. Walking the visible rows is still trivially cheaper than a
+   *  rebuild — no element creation, no markdown re-render, no layout thrash.
+   *
+   *  Mirrors the color half of renderRow; if that gains a new color-driven
+   *  element, add it here too. */
+  /** 0.218.0: repaint every in-place ATTRIBUTE on the live rows — color,
+   *  completed, missed, selection — without touching structure.
+   *
+   *  The general form of the targeted repaints: the metadata hook calls this for
+   *  any frontmatter-only change, so a color set from anywhere (command, menu,
+   *  undo, another window, sync) updates without the list being rebuilt under
+   *  the user.
+   *
+   *  Returns FALSE when it finds a change it cannot express as an attribute —
+   *  specifically a row whose checkbox needs to appear or disappear, which is
+   *  element creation, not a class toggle. The caller then falls back to a full
+   *  render, so a note becoming a task stays correct; it just costs the rebuild
+   *  it genuinely needs. */
+  private repaintRowAttributes(): boolean {
+    const list = this.listEl;
+    if (!list) return false;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>(".stashpad-note"));
+    // Structural pre-check FIRST, before mutating anything, so a fallback render
+    // never lands on half-updated rows.
+    for (const row of rows) {
+      const node = this.tree.get((row.dataset.id ?? "") as StashpadId);
+      if (!node) return false;
+      const wantsCheckbox = this.isTask(node) || this.compactMode;
+      if (wantsCheckbox !== !!row.querySelector(".stashpad-note-task-checkbox")) return false;
+    }
+    this.repaintRowColors();
+    this.repaintSelectionClasses();
+    for (const row of rows) {
+      const node = this.tree.get((row.dataset.id ?? "") as StashpadId);
+      if (!node) continue;
+      const cb = row.querySelector<HTMLElement>(".stashpad-note-task-checkbox");
+      if (cb) {
+        const done = this.isCompleted(node);
+        cb.empty();
+        setIcon(cb, done ? "check-square" : "square");
+        cb.title = done ? "Mark not done" : "Mark done";
+        row.classList.toggle("is-completed", done);
+      }
+      row.classList.toggle("is-missed", this.isMissed(node));
+    }
+    return true;
+  }
+
+  private repaintRowColors(): void {
+    const list = this.listEl;
+    if (!list) return;
+    for (const row of Array.from(list.querySelectorAll<HTMLElement>(".stashpad-note"))) {
+      const id = row.dataset.id ?? "";
+      const node = this.tree.get(id as StashpadId);
+      if (!node) continue;
+      const color = this.colorForNode(node);
+
+      row.classList.toggle("has-color", !!color);
+      if (color) row.style.setProperty("--stashpad-note-color", color);
+      else row.style.removeProperty("--stashpad-note-color");
+
+      // Inherited stripe: only when the note has no color of its own.
+      const inherited = color ? null : this.inheritedColorForNode(node);
+      const showInherited = !!inherited && inherited.depth > 0;
+      row.classList.toggle("has-inherited-color", showInherited);
+      if (showInherited && inherited) {
+        row.style.setProperty("--stashpad-inherited-color", inherited.hex);
+        row.style.setProperty("--stashpad-inherited-depth", String(inherited.depth));
+      } else {
+        row.style.removeProperty("--stashpad-inherited-color");
+        row.style.removeProperty("--stashpad-inherited-depth");
+      }
+
+      const grip = row.querySelector<HTMLElement>(".stashpad-note-grip");
+      if (grip) {
+        grip.classList.toggle("has-color", !!color);
+        if (color) grip.style.setProperty("--stashpad-note-color", color);
+        else grip.style.removeProperty("--stashpad-note-color");
+        const draggable = grip.draggable;
+        grip.title = draggable
+          ? (color ? "Drag to reorder · right-click to change color" : "Drag to reorder")
+          : (color ? "Right-click to change color · drag disabled in this view mode" : "Drag disabled in this view mode");
+      }
+
+      const enter = row.querySelector<HTMLElement>(".stashpad-note-enter");
+      if (enter) {
+        if (color) enter.style.color = color;
+        else enter.style.removeProperty("color");
+      }
+    }
+  }
+
+  /** 0.218.0: repaint COMPLETED (checked / unchecked) in place.
+   *
+   *  Only valid when the checkbox already exists — see cmdToggleTask, where
+   *  making a note a task CREATES the checkbox and is therefore structural.
+   *  Returns false when the fast path does not apply, so the caller can fall
+   *  back to a full render rather than silently leaving a stale row. */
+  private repaintCompletedState(ids: StashpadId[]): boolean {
+    const list = this.listEl;
+    if (!list) return false;
+    const targets: { row: HTMLElement; node: TreeNode; cb: HTMLElement }[] = [];
+    for (const id of ids) {
+      const row = list.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(id)}"]`);
+      const node = this.tree.get(id);
+      const cb = row?.querySelector<HTMLElement>(".stashpad-note-task-checkbox");
+      // Row off-screen / not rendered, or no checkbox to update → not our case.
+      if (!row || !node || !cb) return false;
+      targets.push({ row, node, cb });
+    }
+    for (const { row, node, cb } of targets) {
+      const done = this.isCompleted(node);
+      cb.empty();
+      setIcon(cb, done ? "check-square" : "square");
+      cb.title = done ? "Mark not done" : "Mark done";
+      row.classList.toggle("is-completed", done);
+    }
+    return true;
+  }
+
   private repaintSelectionClasses(): void {
     if (!this.listEl) return;
     const autoExpand = !!this.plugin.settings.autoExpandCursorRow;
@@ -8275,6 +8640,9 @@ export class StashpadView extends ItemView {
         for (const t of targets) {
           if (!t.file) continue;
           priors.push({ id: t.id, path: t.file.path, was: this.colorForNode(t) ?? null });
+          // 0.218.0: repainted in place by repaintRowColors below, so the
+          // follow-up re-render (which is what shifts the list) is skipped.
+          this.markFmSelfWrite(t.file.path, true);
           try {
             await this.app.fileManager.processFrontMatter(t.file, (fm) => {
               if (color) fm.color = color;
@@ -8295,11 +8663,11 @@ export class StashpadView extends ItemView {
             await this.log.append({ type: "palette_color_add", id: ROOT_ID, payload: { color } });
           }
         }
-        // 0.216.4: a colour is an in-place attribute change — the list must not
-        // move. (Anchor restore drifted it ~130px up.)
-        const restoreColorScroll = this.holdListScroll();
-        this.render();
-        restoreColorScroll();
+        // 0.218.0: repaint color on the live rows instead of rebuilding the
+        // list. Nothing is destroyed, so the list cannot move — no scroll
+        // restoration required.
+        this.traceScroll("color");
+        this.repaintRowColors();
         // 0.59.0: push an undo entry so the user can reverse a color
         // change with Cmd+Z. Restores each target's prior color (or
         // removes the color frontmatter entirely if there was none).
@@ -8310,7 +8678,7 @@ export class StashpadView extends ItemView {
             const file = this.fileForNote(m.id, m.path);
             if (!file) continue;
             try {
-              this.markFmSelfWrite(file.path); // body unchanged → no placeholder flash
+              this.markFmSelfWrite(file.path, true); // repainted in place below
               await this.app.fileManager.processFrontMatter(file, (fm) => {
                 if (m.col) fm.color = m.col;
                 else delete fm.color;
@@ -8318,9 +8686,9 @@ export class StashpadView extends ItemView {
             } catch { /* ignore */ }
           }
           this.tree.rebuild(undoFolder);
-          const restore = this.holdListScroll();
-          this.render();
-          restore();
+          // Same in-place repaint as the apply path (0.218.0). tree.rebuild
+          // above refreshes the model the repaint reads from.
+          this.repaintRowColors();
         };
         this.plugin.getUndoStack(undoFolder).push({
           label: priors.length === 1 ? "Color change" : `Color change (${priors.length})`,
@@ -8829,7 +9197,7 @@ export class StashpadView extends ItemView {
   cmdCopyTree(): Promise<void> { return clipboardCmds.cmdCopyTree(this); }
   cmdCopyOutline(): Promise<void> { return clipboardCmds.cmdCopyOutline(this); }
 
-  /** 0.193.0: reverse colour-alias lookup — friendly name → hex for THIS folder.
+  /** 0.193.0: reverse color-alias lookup — friendly name → hex for THIS folder.
    *  (settings.colorAliases stores hex → name, so this scans.) Case-insensitive. */
   private hexForColorAlias(folder: string, name: string): string | null {
     const map = this.plugin.settings.colorAliases?.[folder.replace(/\/+$/, "")] ?? {};
@@ -8908,7 +9276,7 @@ export class StashpadView extends ItemView {
   }
 
   /** Create the parsed notes in order: each note's parent is resolved from the
-   *  already-created note at its parentIndex, colours are stamped after creation,
+   *  already-created note at its parentIndex, colors are stamped after creation,
    *  and the whole batch is ONE undo entry. */
   private async runTextImport(notes: ImportNote[]): Promise<void> {
     if (!notes.length) return;
@@ -8936,8 +9304,8 @@ export class StashpadView extends ItemView {
         });
         createdIds.push(id);
         if (!id) { failed++; continue; }
-        // 0.193.0: an unresolved colour NAME ("[color: boogers]") is looked up in
-        // this folder's own colour aliases before giving up — built-in names like
+        // 0.193.0: an unresolved color NAME ("[color: boogers]") is looked up in
+        // this folder's own color aliases before giving up — built-in names like
         // "amber" were already resolved by the parser.
         let hex = n.color;
         if (!hex && n.colorName) hex = this.hexForColorAlias(folder, n.colorName);
@@ -8947,9 +9315,9 @@ export class StashpadView extends ItemView {
           if (f) {
             try {
               await this.app.fileManager.processFrontMatter(f, (m: any) => { m.color = hex; });
-            } catch { /* colour is cosmetic — never fail the import over it */ }
+            } catch { /* color is cosmetic — never fail the import over it */ }
           }
-          // Carry the friendly colour name across as a folder colour alias, so a
+          // Carry the friendly color name across as a folder color alias, so a
           // round-tripped copy keeps its palette names.
           if (n.colorAlias) {
             try { await this.plugin.setColorAlias(folder, hex, n.colorAlias); } catch { /* ignore */ }
@@ -9009,6 +9377,180 @@ export class StashpadView extends ItemView {
       label: `Import ${made} note${made === 1 ? "" : "s"}`,
       undo: async () => {
         for (const { path } of created) {
+          const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+          if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+    });
+  }
+
+  /** 0.216.0: open the importer for data extracted from the dead Stashpad DESKTOP
+   *  app. Separate from cmdImportText because that one infers structure from
+   *  indentation, while the export carries explicit parent ids — see
+   *  docs/stashpad-app-import-plan.md. */
+  cmdImportStashpadApp(): void {
+    const focus = this.focusId && this.focusId !== ROOT_ID ? this.tree.get(this.focusId) : null;
+    const dest = focus ? `“${this.titleForNode(focus)}”` : `“${this.noteFolder}” (home)`;
+    const run = (notes: AppImportNote[], helpers: HelperNote[]) => this.runAppImport(notes, helpers);
+    // Ids already imported into this folder, so a second run can skip them
+    // instead of duplicating everything.
+    const existing = this.importedAppIds(this.noteFolder);
+    const modal = new AppImportModal(
+      this.app, dest, run,
+      (state) => void this.plugin.openAppImporter({ state, destinationLabel: dest, onImport: run, existingSourceIds: existing }),
+      {},
+      existing,
+    );
+    modal.open();
+  }
+
+  /** Create the imported notes. Same parentIndex walk as runTextImport, plus the
+   *  desktop app's own metadata stamped onto each note.
+   *
+   *  The app's ids, extra parents and attachment records go into `stashpadApp*`
+   *  keys rather than Stashpad's own `attachments` / `parent` fields: those are
+   *  RESERVED (src/types.ts) and Stashpad stamps them itself, and the attachment
+   *  records point at images that no longer exist anywhere. */
+  /** Every Stashpad-app id already present in `folder`, read from frontmatter.
+   *  Cheap: the metadata cache already holds it, so no file reads. */
+  private importedAppIds(folder: string): Set<string> {
+    const out = new Set<string>();
+    const prefix = `${folder.replace(/\/+$/, "")}/`;
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (!f.path.startsWith(prefix)) continue;
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.stashpadAppId;
+      if (typeof id === "string" && id) out.add(id);
+    }
+    return out;
+  }
+
+  private async runAppImport(notes: AppImportNote[], helpers: HelperNote[]): Promise<void> {
+    if (!notes.length && !helpers.length) return;
+    const folder = this.noteFolder;
+    const rootParent: StashpadId = this.focusId ?? ROOT_ID;
+    const collected: Array<{ path: string; content: string }> = [];
+    const createdIds: Array<StashpadId | null> = [];
+    const base = Date.now();
+    let failed = 0;
+
+    this.beginBulkRender();
+    try {
+      for (let i = 0; i < notes.length; i++) {
+        const n = notes[i];
+        const parentId = n.parentIndex == null ? rootParent : (createdIds[n.parentIndex] ?? rootParent);
+        const before = collected.length;
+        // A task arrives as a normalised "[x] " prefix, which createNoteUnder's
+        // existing parser turns into task frontmatter.
+        // Guard the prefix: a handful of notes already start with their own
+        // checkbox, and "[x] [x] foo" would be visible nonsense.
+        const alreadyChecked = /^\s*(?:[-*+]\s*)?\[[ xX]\]/.test(n.body);
+        const body = n.task === "done" && !alreadyChecked ? `[x] ${n.body}` : n.body;
+        const id = await this.createNoteUnder(body, parentId, {
+          record: false,
+          // Real Stashpad timestamp when we have one; otherwise ascending by 1ms
+          // so the import order survives a created-time sort.
+          createdOverride: n.createdAt ?? new Date(base + i).toISOString(),
+          deferRender: true,
+          collectInto: collected,
+        });
+        createdIds.push(id);
+        if (!id) { failed++; continue; }
+
+        const path = collected.length > before ? collected[collected.length - 1].path : null;
+        const f = path ? (this.app.vault.getAbstractFileByPath(path) as TFile | null) : null;
+        if (!f) continue;
+        try {
+          await this.app.fileManager.processFrontMatter(f, (m: any) => {
+            if (n.color) m.color = n.color;
+            // A grouping note the importer invented has no source id to stamp —
+            // stamping one would make the re-run guard skip it next time.
+            if (!n.synthetic && n.sourceId) m.stashpadAppId = n.sourceId;
+            if (n.pinned) {
+              m.pinned = true;
+              // Keep the app's own sidebar order: pinnedAt is just a sort key.
+              m.pinnedAt = base + (n.pinnedOrder ?? 0) * 1000;
+            }
+            if (n.modifiedAt) m.stashpadAppModified = n.modifiedAt;
+            if (n.root && n.root !== "HOME") m.stashpadAppSection = n.root;
+            if (n.orphaned) m.stashpadAppRecovered = true;
+            // Only for the handful of notes Stashpad filed in two places at once;
+            // a folder tree can hold them once, so the other parent is recorded.
+            if (n.extraParents.length) m.stashpadAppAlsoUnder = n.extraParents;
+            if (n.attachments.length) {
+              m.stashpadAppAttachments = n.attachments.map((a) => `${a.name} (${a.type}, ${a.size} bytes)`);
+            }
+          });
+        } catch { /* metadata is not worth failing an import over */ }
+        if (n.color && n.colorAlias) {
+          try { await this.plugin.setColorAlias(folder, n.color, n.colorAlias); } catch { /* ignore */ }
+        }
+      }
+
+      // Reference notes from the export's supporting files, filed under one parent
+      // so they never mix with the user's own notes.
+      if (helpers.length) {
+        const hostId = await this.createNoteUnder(
+          "Stashpad app settings & reference\n\nHow the old desktop app was set up, what was pinned, what was done, "
+          + "and what could not be carried across. Kept together so it never mixes with your actual notes.",
+          rootParent, {
+          record: false, deferRender: true, collectInto: collected,
+        });
+        if (hostId) {
+          for (const h of helpers) {
+            await this.createNoteUnder(`# ${h.title}\n\n${h.body}`, hostId, {
+              record: false, deferRender: true, collectInto: collected,
+            });
+          }
+        }
+      }
+    } finally {
+      try { await this.fmSync.flush(); } catch { /* best effort */ }
+      this.endBulkRender();
+    }
+
+    this.tree.rebuild(folder);
+    this.render();
+    const made = collected.length;
+    const importedIds = createdIds.filter((x): x is StashpadId => !!x);
+    this.plugin.notifications.show({
+      message: `Imported ${made} note${made === 1 ? "" : "s"} from the Stashpad app into **${folder}**${failed ? ` (${failed} failed)` : ""}`,
+      kind: failed ? "warning" : "success",
+      category: "system",
+      affectedIds: importedIds,
+      folder,
+      duration: 0,
+      actions: importedIds.length
+        ? [{
+            label: "Show imported notes",
+            onClick: () => {
+              void (async () => {
+                await this.plugin.openFolderInStashpad(folder);
+                const target = importedIds[0];
+                const v = (this.noteFolder === folder && this.viewRoot?.isConnected)
+                  ? this
+                  : (this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+                      .map((l) => l.view as StashpadView | undefined)
+                      .find((x) => x?.noteFolder === folder));
+                if (!v) return;
+                v.selection.clear();
+                for (const id of importedIds) v.selection.add(id);
+                const idx = v.currentChildren.findIndex((n) => n.id === target);
+                if (idx >= 0) v.cursorIdx = idx;
+                v.render();
+                v.revealCursorRow();
+              })();
+            },
+          }]
+        : undefined,
+    });
+
+    const createdPaths = collected.slice();
+    this.plugin.getUndoStack(folder).push({
+      label: `Import ${made} note${made === 1 ? "" : "s"} from the Stashpad app`,
+      undo: async () => {
+        for (const { path } of createdPaths) {
           const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
           if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
         }
@@ -11420,8 +11962,12 @@ export class StashpadView extends ItemView {
       this.taskTaggedState.set(t.file.path, makeTask);           // 0.85.1
       changedIds.push(t.id);
     }
-    // 0.216.4: adding/removing a checkbox changes row chrome, so the anchor
-    // restore drifts (measured -130px). Hold the exact position instead.
+    // 0.216.4/0.218.0: this one genuinely IS structural — marking a note as a
+    // task CREATES its checkbox element (and on mobile can create the meta row
+    // that hosts it), so there is no in-place repaint to do; it needs the full
+    // render. Hold the scroll across it, since the anchor restore drifts
+    // (measured -130px).
+    this.traceScroll("mark-as-task");
     const restoreTaskScroll = this.holdListScroll();
     this.render();
     restoreTaskScroll();
@@ -11499,21 +12045,32 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     const path = node.file.path;
     const was = this.isCompleted(node);
+    // 0.218.0: frontmatter-only, and repainted in place below — mark it so the
+    // modify handler neither evicts the render cache nor schedules the render
+    // that moves the list.
+    this.markFmSelfWrite(path, true);
     await this.app.fileManager.processFrontMatter(node.file, (m: any) => {
       m.completed = !was;
     });
     this.completedState.set(path, !was); // authoritative, pre-cache-event
     await this.log.append({ type: was ? "uncomplete" : "complete", id: node.id });
-    this.render();
+    // 0.218.0: ticking an EXISTING checkbox swaps an icon and a class — repaint
+    // it in place so the list never moves. The note stays a task either way, so
+    // the checkbox is already there; the guarded fallback covers the cases the
+    // fast path can't see (row scrolled out of the rendered set, no checkbox).
+    this.traceScroll("completed");
+    if (!this.repaintCompletedState([node.id])) this.render();
     const folder = this.noteFolder;
     this.plugin.getUndoStack(folder).push({
       label: was ? "Mark incomplete" : "Mark complete",
       undo: async () => {
         const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
         if (!f) return;
+        this.markFmSelfWrite(path, true);
         await this.app.fileManager.processFrontMatter(f, (m: any) => { m.completed = was; });
+        this.completedState.set(path, was);
         this.tree.rebuild(folder);
-        this.render();
+        if (!this.repaintCompletedState([node.id])) this.render();
       },
     });
   }
@@ -12379,7 +12936,7 @@ export class StashpadView extends ItemView {
       // body and overwrote the whole file. Anything that touched the note's
       // frontmatter while the editor sat open was therefore silently reverted on
       // Save — and the most frequent writer is Stashpad ITSELF: FrontmatterSyncQueue
-      // writing parentLink/children, a colour change, a completed toggle, a drag
+      // writing parentLink/children, a color change, a completed toggle, a drag
       // that rewrites `parent`, an author contribution stamp. Reverting `parent`
       // moves the note back under its old parent on disk.
       //
@@ -13301,15 +13858,22 @@ export class StashpadView extends ItemView {
    *  with the write timestamp. onFileModify consults `wasRecentFmSelfWrite` so it
    *  retags the render cache (no placeholder flash / re-read) instead of evicting.
    *  One-shot per write; 2.5s grace (matches fmSync). */
-  private recentFmSelfWrites = new Map<string, number>();
+  private recentFmSelfWrites = new Map<string, { at: number; repainted: boolean }>();
   /** Call right before a Stashpad frontmatter-only write so the resulting modify
    *  event is recognized as ours. */
-  markFmSelfWrite(path: string): void { this.recentFmSelfWrites.set(path, Date.now()); }
-  private wasRecentFmSelfWrite(path: string): boolean {
-    const t = this.recentFmSelfWrites.get(path);
-    if (t == null) return false;
+  /** `repainted: true` means the caller has ALREADY updated the affected rows in
+   *  place (0.218.0), so the follow-up re-render this would otherwise trigger is
+   *  redundant — and that render is the one that moves the list, because its
+   *  anchor restore lands slightly off. Callers that only write frontmatter and
+   *  rely on the render to repaint (due badges, etc.) leave it false. */
+  markFmSelfWrite(path: string, repainted = false): void {
+    this.recentFmSelfWrites.set(path, { at: Date.now(), repainted });
+  }
+  private wasRecentFmSelfWrite(path: string): { hit: boolean; repainted: boolean } {
+    const e = this.recentFmSelfWrites.get(path);
+    if (!e) return { hit: false, repainted: false };
     this.recentFmSelfWrites.delete(path); // one-shot
-    return Date.now() - t < 2500;
+    return { hit: Date.now() - e.at < 2500, repainted: e.repainted };
   }
 
   private onFileModify = (file: TFile): void => {
@@ -13332,8 +13896,14 @@ export class StashpadView extends ItemView {
     // re-render paints from cache with no filename-placeholder flash and no re-read)
     // — but, unlike the fmSync recovery write above, we STILL re-render so the
     // visible chip / checkbox / due badge updates.
-    if (this.wasRecentFmSelfWrite(file.path)) {
+    const fmSelf = this.wasRecentFmSelfWrite(file.path);
+    if (fmSelf.hit) {
       this.bodyRenderer.retagMtime(file.path, file.stat.mtime);
+      // 0.218.0: when the caller already repainted the row in place, this
+      // render has nothing left to do — and doing it anyway is what moved the
+      // list. Measured: color change repainted in place held at 0px until this
+      // fired ~1.1s later and shifted it 95px.
+      if (fmSelf.repainted) return;
       if (this.deferDuringSyncBurst()) return;
       this.debouncedRender();
       return;

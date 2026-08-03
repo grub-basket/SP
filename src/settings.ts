@@ -1103,7 +1103,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           this.plugin.settings.enablePerfProfiling = v; await this.plugin.saveSettings();
         })), ["perf", "profiling", "timing", "slow"]),
 
-      this.renderDef("Debug trace", "Record low-level diagnostic lines (e.g. tap coordinates vs the row they resolve to) to an in-memory buffer while you reproduce a bug, then copy them below to share. Local only — no network, no file writes; zero overhead when off.", (s) =>
+      this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. Local only — no network, no file writes; zero overhead when off.", (s) =>
         s.addToggle((t) => t.setValue(this.plugin.settings.debugTrace).onChange(async (v) => {
           this.plugin.settings.debugTrace = v; await this.plugin.saveSettings();
         })), ["debug", "trace", "diagnostics", "tap", "log"]),

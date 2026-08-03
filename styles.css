@@ -6685,3 +6685,73 @@ button.stashpad-btn-loading::after {
   height: 20px;
   padding: 0 4px;
 }
+
+/* ---------------------------------------------------------------------------
+   Stashpad desktop-app importer (0.216.0)
+   File drop zone + per-file receipt. Shares .stashpad-import-* with the paste
+   importer; only the file-handling parts are new.
+--------------------------------------------------------------------------- */
+
+.stashpad-appimport-drop {
+  border: 2px dashed var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 18px 14px;
+  margin: 12px 0;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+.stashpad-appimport-drop:hover,
+.stashpad-appimport-drop.is-over {
+  border-color: var(--interactive-accent);
+  background-color: var(--background-modifier-hover);
+}
+.stashpad-appimport-dropicon {
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.stashpad-appimport-drop.is-over .stashpad-appimport-dropicon { color: var(--interactive-accent); }
+.stashpad-appimport-droptitle { font-weight: 600; margin-bottom: 2px; }
+
+.stashpad-appimport-files { margin: 10px 0; }
+.stashpad-appimport-file {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  opacity: 0.6;
+}
+.stashpad-appimport-file.is-present {
+  opacity: 1;
+  background-color: var(--background-modifier-hover);
+}
+.stashpad-appimport-mark { display: flex; flex: 0 0 auto; margin-top: 2px; color: var(--text-muted); }
+.stashpad-appimport-file.is-present .stashpad-appimport-mark { color: var(--color-green); }
+.stashpad-appimport-filebody { flex: 1 1 auto; min-width: 0; }
+.stashpad-appimport-filename { font-weight: 600; }
+.stashpad-appimport-filedetail { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+
+.stashpad-appimport-roots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 4px 0 2px;
+  width: 100%;
+}
+.stashpad-appimport-root {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+
+.stashpad-appimport-warnings { margin: 6px 0; }
+.stashpad-appimport-warning {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  border-left: 3px solid var(--background-modifier-border);
+  padding: 3px 0 3px 9px;
+  margin: 4px 0;
+}

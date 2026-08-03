@@ -7,10 +7,10 @@
  *
  *  Beyond the web app, this understands what the plugin grew since:
  *    - task checkboxes  `[ ] x` / `[x] y`, with an optional `- ` list marker
- *    - colour metadata  `[color: #ffe243 | alias: boogers]`
+ *    - color metadata  `[color: #ffe243 | alias: boogers]`
  *  Together those make Stashpad's own copy output (0.188.0:
  *  `- [x] [color: #ffe243 | alias: boogers] the text`) a lossless ROUND TRIP —
- *  copy notes out of one folder and paste them into another with tasks, colours and
+ *  copy notes out of one folder and paste them into another with tasks, colors and
  *  nesting intact. */
 
 export interface ImportOptions {
@@ -66,12 +66,12 @@ export interface ImportNote {
   level: number;
   /** Index into the returned array of this note's parent, or null for top level. */
   parentIndex: number | null;
-  /** `#rrggbb` when the line carried colour metadata. */
+  /** `#rrggbb` when the line carried color metadata. */
   color: string | null;
-  /** Friendly name that came with the colour, to register as a folder colour alias. */
+  /** Friendly name that came with the color, to register as a folder color alias. */
   colorAlias: string | null;
-  /** A colour NAME we couldn't resolve to a hex (not a built-in). The caller tries
-   *  the folder's own colour aliases before giving up. */
+  /** A color NAME we couldn't resolve to a hex (not a built-in). The caller tries
+   *  the folder's own color aliases before giving up. */
   colorName: string | null;
   /** Whether the line was a checkbox, and if so its state. */
   task: "none" | "open" | "done";
@@ -87,7 +87,7 @@ interface Row {
   merged: boolean;
 }
 
-/** Stashpad's 9 default palette colours and their human names — the same mapping the
+/** Stashpad's 9 default palette colors and their human names — the same mapping the
  *  Stashpad Importer web app used (derived from the original app's palette), so
  *  `[color: Amber]` works without anyone defining an alias first. Lower-cased keys. */
 export const BUILTIN_COLOR_NAMES: Record<string, string> = {
@@ -101,7 +101,7 @@ export const BUILTIN_COLOR_NAMES: Record<string, string> = {
   // slide by one at the top of the list, so `fuchsia` had no entry at all.
   // Added as an alias for the existing hex rather than renaming `pink` — notes
   // already carry baked hexes, and renaming would resolve `[color: pink]` to a
-  // different colour than the ones already in the vault. Anything importing
+  // different color than the ones already in the vault. Anything importing
   // from the old app must map by colorCode, never by name; see
   // docs/stashpad-app-import-plan.md.
   fuchsia: "#c57ab5",
@@ -113,8 +113,8 @@ const LIST_MARKER = /^([-*+]|\d+[.)])\s+/;
 /** Extract `[color: #hex | alias: name]` (alias optional) from the front of a line. */
 function takeColorMeta(s: string): { rest: string; color: string | null; alias: string | null; name: string | null } {
   // Value is either a #hex or a human name ("Amber", or one of the folder's own
-  // colour aliases). The "| alias: name" half is optional — text written by hand
-  // (or pasted from the old Stashpad app, which carries no colours at all) will
+  // color aliases). The "| alias: name" half is optional — text written by hand
+  // (or pasted from the old Stashpad app, which carries no colors at all) will
   // usually just say [color: red].
   const m = s.match(/^\[color:\s*([^\]|]+?)\s*(?:\|\s*alias:\s*([^\]]*?)\s*)?\]\s*/i);
   if (!m) return { rest: s, color: null, alias: null, name: null };
@@ -125,7 +125,7 @@ function takeColorMeta(s: string): { rest: string; color: string | null; alias: 
   const builtin = BUILTIN_COLOR_NAMES[value.toLowerCase()];
   if (builtin) return { rest, color: builtin, alias: alias ?? value, name: null };
   // Unknown name — hand it back for the caller to resolve against this folder's
-  // colour aliases (it can't be resolved here: parsing stays Obsidian-free).
+  // color aliases (it can't be resolved here: parsing stays Obsidian-free).
   return { rest, color: null, alias, name: value };
 }
 
@@ -312,13 +312,13 @@ function assemble(rows: Row[], opts: ImportOptions): ImportNote[] {
     let task: "none" | "open" | "done" = "none";
 
     if (opts.parseMeta) {
-      // Order matters and mirrors what copy emits: [marker] [checkbox] [colour] text.
+      // Order matters and mirrors what copy emits: [marker] [checkbox] [color] text.
       // The marker is already stripped when detectLists is on; strip it here too so
       // metadata still parses when list detection is off.
       first = first.replace(LIST_MARKER, "");
       ({ rest: first, task } = takeCheckbox(first));
       ({ rest: first, color, alias, name: colorName } = takeColorMeta(first));
-      // Tolerate the reverse order ([colour] before [checkbox]) too.
+      // Tolerate the reverse order ([color] before [checkbox]) too.
       if (task === "none") ({ rest: first, task } = takeCheckbox(first));
     }
 

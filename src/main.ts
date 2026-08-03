@@ -47,6 +47,7 @@ import { perf } from "./perf";
 import { RenderCacheStore } from "./render-cache-store";
 import { SettingsStore, MOVED_KEYS } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
+import { APP_IMPORT_VIEW_TYPE, AppImportView, type AppImporterViewContext } from "./stashpad-app-import-modal";
 import { settleNewTab } from "./view-helpers";
 
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
@@ -104,7 +105,14 @@ export default class StashpadPlugin extends Plugin {
     }
   }
   /** Current trace lines joined for copy/clear from the Diagnostics tab. */
-  getDebugTrace(): string { return this.debugBuffer.join("\n"); }
+  /** 0.219.3: stamp the plugin version + platform at the top. A trace pasted
+   *  back without it is ambiguous about which build produced it — which cost a
+   *  round trip when the user wasn't sure whether they were on .1 or .2. */
+  getDebugTrace(): string {
+    if (!this.debugBuffer.length) return "";
+    const head = `# Stashpad ${this.manifest?.version ?? "?"} · ${Platform.isMobileApp ? (Platform.isIosApp ? "iOS" : "Android") : "desktop"}${Platform.isPhone ? " phone" : ""} · Obsidian ${(this.app as unknown as { appId?: string; version?: string }).version ?? "?"}`;
+    return [head, ...this.debugBuffer].join("\n");
+  }
   clearDebugTrace(): void { this.debugBuffer = []; }
   private undoStacks = new Map<string, UndoStack>();
   /** Most-recently-active Stashpad leaf — set on active-leaf-change.
@@ -1229,6 +1237,12 @@ export default class StashpadPlugin extends Plugin {
       TEXT_IMPORT_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new TextImportView(leaf),
     );
+    // 0.216.0: the desktop-app importer gets the same treatment — it takes files
+    // and shows a per-file receipt, which needs more room than a modal gives.
+    this.registerView(
+      APP_IMPORT_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new AppImportView(leaf),
+    );
     // Deep links: `obsidian://stashpad?folder=…&note=<id>&run=reveal[,open]`.
     // Routes into the Stashpad view, reveals a note, runs a small macro. See
     // `docs/deep-links-plan.md`. (Obsidian only allows an action under its own
@@ -1779,6 +1793,12 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-import-text",
       name: "Import pasted text into Stashpad (paste → nested notes)…",
       callback: () => call("cmdImportText"),
+    });
+    // 0.216.0: importer for data extracted from the dead Stashpad desktop app.
+    this.addCommand({
+      id: "stashpad-import-app",
+      name: "Import from the Stashpad app (migrate notes.json export)…",
+      callback: () => call("cmdImportStashpadApp"),
     });
     this.addCommand({
       id: "stashpad-skip-occurrence",
@@ -4710,6 +4730,16 @@ export default class StashpadPlugin extends Plugin {
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({ type: TEXT_IMPORT_VIEW_TYPE, active: true });
     if (leaf.view instanceof TextImportView) leaf.view.setContext({ ...ctx, prevLeaf });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  /** 0.216.0: same pop-out for the Stashpad desktop-app importer, carrying the
+   *  already-loaded files across so they don't have to be dropped again. */
+  async openAppImporter(ctx: Omit<AppImporterViewContext, "prevLeaf">): Promise<void> {
+    const prevLeaf = this.app.workspace.getMostRecentLeaf();
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: APP_IMPORT_VIEW_TYPE, active: true });
+    if (leaf.view instanceof AppImportView) leaf.view.setContext({ ...ctx, prevLeaf });
     this.app.workspace.revealLeaf(leaf);
   }
 
