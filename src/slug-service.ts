@@ -66,10 +66,149 @@ export function stripInlineMarkdown(input: string): string {
 
 const MAX_LEN = 50;
 
+/** 0.230.0: URLs and file paths, removed from a title line BEFORE it is
+ *  tokenised.
+ *
+ *  Without this, the tokeniser's "collapse every non-alphanumeric run to a
+ *  space" rule shreds them into their own words: a note starting
+ *  `Check https://example.com/q3/report?x=1` was named
+ *  `Check-Https-Example-Com-Q3-Report-X-1`. The scheme and the domain are pure
+ *  noise in a filename, and they crowd out the real words because the 50-char
+ *  budget is spent left to right.
+ *
+ *  Deliberately keyed on a SLASH or a SCHEME, never on a bare dotted token:
+ *  `import-service` calls bodyToSlug with a plain basename (`photo.png`), and
+ *  treating that as a path would erase the only text it has.
+ *
+ *  Link text is KEPT, not dropped — `[the Q3 report](https://…)` should be
+ *  titled "The Q3 Report". Only the target is noise. */
+type SlugReplacer = string | ((...args: string[]) => string);
+const URL_OR_PATH_RULES: Array<[RegExp, SlugReplacer]> = [
+  // Obsidian embeds — an image/file transclusion contributes no title text.
+  [/!\[\[[^\]]*\]\]/g, " "],
+  // Markdown image — same reasoning; alt text is usually a filename.
+  [/!\[[^\]]*\]\([^)]*\)/g, " "],
+  // Markdown link: keep the LABEL, drop the target.
+  [/\[([^\]]+)\]\([^)]*\)/g, "$1"],
+  // Wikilink: keep the alias if there is one, else the last path segment.
+  [/\[\[([^\]|]*)\|([^\]]+)\]\]/g, "$2"],
+  [/\[\[([^\]]+)\]\]/g, (_m: string, target: string) => target.split("/").pop() ?? target],
+  // Scheme-bearing URLs (http, https, ftp, obsidian, file, …) and mailto.
+  [/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, " "],
+  [/\bmailto:\S+/gi, " "],
+  // Bare www. hosts, which carry no scheme but are still URLs.
+  [/\bwww\.\S+/gi, " "],
+  // Bare email addresses.
+  [/\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/gi, " "],
+  // Windows absolute paths: C:\Users\... — before the POSIX rule, since the
+  // drive letter would otherwise look like a scheme.
+  [/\b[a-z]:\\[^\s]*/gi, " "],
+  // POSIX-ish paths: anything containing a slash that is not lone punctuation.
+  // Covers /a/b, ./a, ../a, a/b/c.md, ~/notes.
+  [/(?:^|\s)[~.]{0,2}\/[^\s]*/g, " "],
+  // Bare relative paths, but ONLY when they are unmistakably paths: either a
+  // file extension at the end, or two-plus slashes. A single slash between two
+  // plain words is far more often prose — "3/4", "and/or", "km/h", "24/7" —
+  // and eating those turned "Ratio was 3/4 of target" into "Ratio-Target".
+  // Missing `docs/guide` (one slash, no extension) is the deliberate trade:
+  // a false negative leaves a slightly noisy title, a false positive deletes
+  // real words.
+  [/(?:^|\s)[^\s/]+\/[^\s]*\/[^\s]*/g, " "],
+  [/(?:^|\s)[^\s/]+\/[^\s]*\.[a-z0-9]{1,8}\b/gi, " "],
+];
+
+/** 0.232.0: which kinds of noise a title line contained. Drives the trailing
+ *  marker — see MARKER_URL / MARKER_PATH. */
+export function detectUrlsAndPaths(line: string): { url: boolean; path: boolean } {
+  // Links and embeds contribute their LABEL, not their target, so resolve them
+  // first — otherwise `[report](https://x)` and `[[A/B]]` would report a path
+  // that the title never contained.
+  const delinked = line
+    .replace(/!\[\[[^\]]*\]\]/g, " ")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\(([^)]*)\)/g, "$1 $2")
+    .replace(/\[\[[^\]]*\]\]/g, " ");
+  const URL_RES = [
+    /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi,
+    /\bmailto:\S+/gi,
+    /\bwww\.\S+/gi,
+    /\b[^\s@]+@[^\s@]+\.[a-z]{2,}\b/gi,
+  ];
+  let rest = delinked;
+  let url = false;
+  for (const re of URL_RES) {
+    if (re.test(rest)) url = true;
+    re.lastIndex = 0;
+    rest = rest.replace(re, " ");
+  }
+  // Path detection runs on what REMAINS after URLs are gone, mirroring the
+  // order in URL_OR_PATH_RULES. Without this a plain https:// URL matched the
+  // multi-slash path rule and every link got BOTH markers.
+  const path = /\b[a-z]:\\[^\s]*/i.test(rest)
+    || /(?:^|\s)[~.]{0,2}\/[^\s]*/.test(rest)
+    || /(?:^|\s)[^\s/]+\/[^\s]*\/[^\s]*/.test(rest)
+    || /(?:^|\s)[^\s/]+\/[^\s]*\.[a-z0-9]{1,8}\b/i.test(rest);
+  return { url, path };
+}
+
+/** Trailing markers. All-caps "URL" survives the proper-caser untouched;
+ *  "File-Path" is written pre-cased for the same reason. */
+const MARKER_URL = "URL";
+const MARKER_PATH = "File-Path";
+
+/** Strip URLs/paths from a title line. Exported for testing and so callers can
+ *  reason about what the title will contain. */
+export function stripUrlsAndPaths(line: string): string {
+  let out = line;
+  for (const [re, rep] of URL_OR_PATH_RULES) {
+    out = typeof rep === "string" ? out.replace(re, rep) : out.replace(re, rep);
+  }
+  return out.replace(/\s+/g, " ").trim();
+}
+
+/** Last readable segment of the first URL/path in a line — the fallback when
+ *  stripping removes EVERYTHING, so a note whose entire first line is a link
+ *  gets a useful name instead of "Untitled".
+ *  `https://example.com/q3/quarterly-report?x=1` → `quarterly report`. */
+function salvageFromUrl(line: string): string {
+  const m = line.match(/(?:[a-z][a-z0-9+.-]*:\/\/|www\.)\S+|[~.]{0,2}\/[^\s]+|\b[^\s/]+\/[^\s]+/i);
+  if (!m) return "";
+  // Drop query + hash, then take the last non-empty path segment.
+  const bare = m[0].replace(/[?#].*$/, "").replace(/\/+$/, "");
+  const segs = bare.split("/").filter(Boolean);
+  let last = segs.pop() ?? "";
+  // A bare host (no path) — use its main label: example.com -> example.
+  if (segs.length === 0 || /^[a-z][a-z0-9+.-]*:$/i.test(segs[0] ?? "")) {
+    last = last.replace(/^www\./i, "");
+    const labels = last.split(".").filter(Boolean);
+    if (labels.length > 1) last = labels[labels.length - 2];
+  }
+  // Strip a file extension, then let the normal tokeniser handle the rest.
+  return last.replace(/\.[a-z0-9]{1,8}$/i, "").replace(/[-_+]+/g, " ").trim();
+}
+
 export function bodyToSlug(body: string, stopwords: string[] = DEFAULT_STOPWORDS): string {
   const stopSet = stopwords instanceof Set ? stopwords : new Set(stopwords.map((s) => s.toLowerCase()));
-  const firstLine = (body.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
-  if (!firstLine) return "Untitled";
+  const rawFirstLine = (body.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
+  if (!rawFirstLine) return "Untitled";
+  // 0.230.0: drop URLs and file paths before tokenising. If that empties the
+  // line, the line WAS a link — salvage its last path segment rather than
+  // falling through to "Untitled", which would name every link-only note the
+  // same thing and collide their filenames.
+  // 0.232.0: note WHAT was stripped, so the title can carry a trailing marker.
+  // The words themselves are still dropped (a domain in a filename is noise) —
+  // the marker exists purely so "URL" / "File Path" are searchable when you know
+  // a note contains a link but not what it said.
+  const found = detectUrlsAndPaths(rawFirstLine);
+  const markers: string[] = [];
+  if (found.url) markers.push(MARKER_URL);
+  if (found.path) markers.push(MARKER_PATH);
+  const markerSuffix = markers.length ? `-${markers.join("-")}` : "";
+
+  let firstLine = stripUrlsAndPaths(rawFirstLine);
+  if (!firstLine) firstLine = salvageFromUrl(rawFirstLine);
+  // A line that was ONLY a link still gets marked, so it is findable.
+  if (!firstLine) return markerSuffix ? `Untitled${markerSuffix}` : "Untitled";
   // Simplified slug rule (0.59.0): strip apostrophe-likes WITHOUT
   // splitting the word ("don't" → "dont", not "don t" or "Don"), then
   // collapse every other non-alphanumeric run to a space, tokenise,
@@ -91,13 +230,19 @@ export function bodyToSlug(body: string, stopwords: string[] = DEFAULT_STOPWORDS
       if (w.length >= 2 && /^[A-Z0-9]+$/.test(w)) return w;
       return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
     });
+  // Reserve the marker's width up front. The word loop spends the 50-char
+  // budget left to right and STOPS at the limit, so appending afterwards would
+  // let a long title push the marker past MAX_LEN — or drop it entirely, which
+  // is precisely the case (a long line containing a link) the marker is for.
+  const budget = MAX_LEN - markerSuffix.length;
   let slug = "";
   for (const w of words) {
     const next = slug ? `${slug}-${w}` : w;
-    if (next.length > MAX_LEN) break;
+    if (next.length > budget) break;
     slug = next;
   }
-  return slug || "Untitled";
+  if (!slug) return markerSuffix ? `Untitled${markerSuffix}` : "Untitled";
+  return `${slug}${markerSuffix}`;
 }
 
 export function buildFilename(slug: string, id: string): string {

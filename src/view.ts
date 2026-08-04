@@ -7,6 +7,7 @@ import {
   ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
   archiveSubfolderOf, isArchiveSubfolderPath,
   isReservedSubfolderName,
+  isInReservedSubfolder,
   type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
 } from "./types";
 import { TreeIndex } from "./tree-index";
@@ -67,6 +68,8 @@ import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
 import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMeta } from "./cross-vault-clipboard";
 import { importStashZip } from "./stash-package";
+import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
+import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
@@ -139,6 +142,17 @@ interface AppendTarget {
   mode: "append" | "prepend";
 }
 
+/** Title of the parent the importer files its reference notes under. One
+ *  constant, because it is both written and matched against - and when those
+ *  two drifted apart the match silently never fired. */
+const APP_REFERENCE_TITLE = "Stashpad app settings & reference";
+
+/** Below this, an import is over before a progress notice would be read. */
+const PROGRESS_MIN_NOTES = 25;
+/** How often to update the notice and yield a frame. Small enough that the
+ *  count moves visibly, large enough that yielding is not the bottleneck. */
+const PROGRESS_EVERY = 25;
+
 export class StashpadView extends ItemView {
   /** public: read by AuthorshipTracker (the host interface). */
   plugin: StashpadPlugin;
@@ -202,6 +216,7 @@ export class StashpadView extends ItemView {
   private detachSettings: (() => void) | null = null;
   private slugDebouncers = new Map<string, ReturnType<typeof debounce>>();
   private attachmentDebouncers = new Map<string, ReturnType<typeof debounce>>();
+  private externalEditDebouncers = new Map<string, ReturnType<typeof debounce>>();
   /** public: called by AuthorshipTracker (the host interface). */
   debouncedRender: { (): void; cancel?: () => void };
   /** 0.190.0: adaptive render coalescing. A fixed 80ms debounce re-fires every
@@ -252,6 +267,11 @@ export class StashpadView extends ItemView {
    *  instead of creating a note. Cleared after one send (see the note on
    *  openAppendPicker for why it is deliberately not sticky). */
   private appendTarget: AppendTarget | null = null;
+  /** 0.237.0: obscured notes the user has revealed in THIS view. Deliberately
+   *  in-memory and per-view — "revealed" is a viewing state, not a property of
+   *  the note, so it must never be written to the file or shared with another
+   *  tab showing the same note. */
+  private revealedObscured = new Set<StashpadId>();
   private composerAppendBtn: HTMLButtonElement | null = null;
   /** 0.76.15: when the chosen destination lives in ANOTHER Stashpad
    *  folder, this holds that folder (and a display label). The next
@@ -3846,6 +3866,7 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").setDisabled(!hasTargets).onClick(() => this.cmdSetColor()));
     menu.addItem((it: any) => it.setTitle("Toggle complete").setIcon("check-circle").setDisabled(!hasTargets).onClick(() => void this.cmdToggleComplete()));
     menu.addItem((it: any) => it.setTitle("Toggle task (todo)").setIcon("check-square").setDisabled(!hasTargets).onClick(() => void this.cmdToggleTask()));
+    menu.addItem((it: any) => it.setTitle("Obscure / reveal (visual only)").setIcon("eye-off").setDisabled(!hasTargets).onClick(() => void this.cmdToggleObscured()));
     menu.addItem((it: any) => it.setTitle("Set due date…").setIcon("calendar-clock").setDisabled(!hasTargets).onClick(() => this.cmdSetDue()));
     menu.addItem((it: any) => it.setTitle("Assign to…").setIcon("user-plus").setDisabled(!hasTargets).onClick(() => this.cmdAssign()));
     menu.addSeparator();
@@ -5620,6 +5641,10 @@ export class StashpadView extends ItemView {
     if (isCursor && this.cursorHasMoved && this.plugin.settings.autoExpandCursorRow && !this.cursorExpandOverride.has(node.id)) row.addClass("is-cursor-expanded");
     if (isPickTarget) row.addClass("is-pick-target");
     if (this.isCompleted(node)) row.addClass("is-completed");
+    // 0.237.0: visual obscuring. The body is rendered normally and blurred by
+    // CSS — the text is still in the DOM, which is exactly why this is
+    // presented as hiding from a passer-by and never as encryption.
+    if (this.isObscured(node) && !this.revealedObscured.has(node.id)) row.addClass("is-obscured");
     // 0.197.0: a repeating occurrence that ran out its interval unfinished is marked
     // completed so it leaves the active list — but it was MISSED, not done. Without
     // this it would be indistinguishable from work you actually finished.
@@ -5985,6 +6010,7 @@ export class StashpadView extends ItemView {
         // cached HTML, but they're rare in chat-style notes and re-render on the
         // next mtime change anyway.)
         textEl.append(sanitizeHTMLToDom(html));
+        this.applySpoilers(textEl);
       }
       if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
       // Multiplayer footer: author / contributors / last-edit. Each
@@ -6107,26 +6133,71 @@ export class StashpadView extends ItemView {
 
   private renderAttachmentRail(parent: HTMLElement, paths: string[]): void {
     const rail = parent.createDiv({ cls: "stashpad-rail" });
+    const imageCount = paths.filter((p) => isImageExt(p.split(".").pop() ?? "")).length;
+
+    // 0.235.0: the rail picks a layout instead of always drawing thumbnails.
+    // Measured from the RAIL's own width, not the window's — the rail lives in
+    // a note row that may be in a narrow sidebar, and the window says nothing
+    // about that. The width is 0 before layout, in which case fall back to the
+    // parent's, then to a sane desktop default rather than mis-picking
+    // "compact" for everything on first paint.
+    const setting = getSettings().attachmentRailMode;
+    const measured = rail.clientWidth || parent.clientWidth || 600;
+    const mode: RailMode = setting === "auto"
+      ? pickRailMode(paths.length, imageCount, measured)
+      : setting;
+    rail.addClass(`is-${mode}`);
+
     for (const p of paths) {
       const file = this.app.metadataCache.getFirstLinkpathDest(p, "");
       const ext = (p.split(".").pop() ?? "").toLowerCase();
+      const kind = fileKindFor(ext);
+      const baseName = p.split("/").pop() ?? p;
       const box = rail.createDiv({ cls: "stashpad-att" });
-      box.title = p;
-      if (file && IMG_EXT.has(ext)) {
+      box.title = file ? `${baseName} — ${kind.label}` : `${baseName} — missing`;
+      if (!file) box.addClass("is-missing");
+
+      // Thumbnails in EVERY mode, including the filename list — a 24px preview
+      // of the actual image identifies it better than a generic "image" glyph,
+      // and the list has room for it beside the name.
+      const showThumb = !!file && isImageExt(ext);
+      if (showThumb) {
         const img = box.createEl("img", { cls: "stashpad-att-img" });
         img.src = this.app.vault.getResourcePath(file);
         img.alt = p;
       } else {
-        box.createDiv({ cls: "stashpad-att-ext", text: ext.toUpperCase() || "?" });
-        const name = (p.split("/").pop() ?? p).replace(/\.[^.]+$/, "");
-        box.createDiv({ cls: "stashpad-att-name", text: name });
+        // Typed icon + extension. A coloured, recognisable glyph identifies a
+        // file far faster than four grey letters, which is what this used to
+        // be for everything that was not an image.
+        const badge = box.createDiv({ cls: "stashpad-att-badge" });
+        badge.style.setProperty("--stashpad-file-color", kind.color);
+        setIcon(badge, kind.icon);
+        badge.createSpan({ cls: "stashpad-att-badge-ext", text: (ext || "?").toUpperCase() });
       }
+      // The filename view is a list, so every row carries its name; the other
+      // two only name a file when there is no thumbnail to identify it.
+      if (mode === "filename" || (!showThumb && mode !== "compact")) {
+        box.createDiv({ cls: "stashpad-att-name", text: baseName });
+      }
+
       box.onclick = (e) => {
         e.stopPropagation();
-        if (file) { const ws = this.app.workspace; const prev = ws.activeLeaf; void ws.getLeaf("tab").openFile(file).then(() => { settleNewTab(ws, prev); }); }
+        if (!file) return;
+        // 0.234.0: images open in the media viewer. 0.236.0: PDFs too, since
+        // the viewer renders them inline now. Everything else keeps the
+        // open-in-a-tab behaviour — a placeholder card is a worse answer than
+        // the real thing. The viewer carries an "Open in a new tab" action, so
+        // the previous behaviour is always one click away.
+        if (viewerHandles(ext) && getSettings().mediaViewerOnClick) {
+          new MediaViewerModal(this.app, mediaItemsFor(this.app, paths), paths.indexOf(p), (f) => {
+            const ws = this.app.workspace; const prev = ws.activeLeaf;
+            void ws.getLeaf("tab").openFile(f).then(() => { settleNewTab(ws, prev); });
+          }).open();
+          return;
+        }
+        const ws = this.app.workspace; const prev = ws.activeLeaf;
+        void ws.getLeaf("tab").openFile(file).then(() => { settleNewTab(ws, prev); });
       };
-      // 0.184.0: right-click an attachment → copy it to the OS clipboard (images
-      // paste straight into chat / email / editors), open it, or reveal it.
       box.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); this.openAttachmentMenu(e, p, file, ext); };
     }
   }
@@ -6878,6 +6949,15 @@ export class StashpadView extends ItemView {
    *  selection / cursor — those concepts don't apply outside the list. */
   private handleRenderedClick(e: MouseEvent, node: TreeNode): void {
     const targetEl = e.target as HTMLElement | null;
+    // 0.237.0: a spoiler reveals itself and swallows the click, so revealing
+    // never also navigates.
+    const spoiler = targetEl?.closest?.(".stashpad-spoiler") as HTMLElement | null;
+    if (spoiler && !spoiler.hasClass("is-revealed")) {
+      e.preventDefault();
+      e.stopPropagation();
+      spoiler.addClass("is-revealed");
+      return;
+    }
     const tag = targetEl?.closest?.(".tag") as HTMLElement | null;
     if (tag) {
       e.preventDefault();
@@ -6908,6 +6988,34 @@ export class StashpadView extends ItemView {
     // keyboard — acting on it would select whatever row slid under the finger.
     const absorbed = this.shouldAbsorbDismissTap();
     this.traceTap("click", e, idx, absorbed);
+    // 0.237.0: a spoiler inside a LIST ROW. handleRenderedClick only covers the
+    // non-row surfaces (focused header, mini header), so without this a
+    // spoiler was inert everywhere it actually appears.
+    const spoilerEl = (e.target as HTMLElement | null)?.closest?.(".stashpad-spoiler") as HTMLElement | null;
+    if (!absorbed && spoilerEl && !spoilerEl.hasClass("is-revealed")) {
+      e.preventDefault();
+      e.stopPropagation();
+      spoilerEl.addClass("is-revealed");
+      return;
+    }
+    // 0.237.0: first click on an obscured row REVEALS it and does nothing else.
+    // Consuming the click matters: otherwise the same tap that unblurs also
+    // selects or drills in, so you cannot look at a hidden note without acting
+    // on it. Revealing is per-view and in-memory only.
+    if (!absorbed && this.isObscured(node) && !this.revealedObscured.has(node.id)) {
+      const t = e.target as HTMLElement | null;
+      // Let the row's real controls through — tapping the checkbox or the ⋯
+      // menu on a blurred row should still work.
+      if (!t?.closest?.(".stashpad-note-task-checkbox, .stashpad-note-more, .stashpad-expand-toggle, button, a")) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.revealedObscured.add(node.id);
+        const rowEl = (e.currentTarget as HTMLElement | null)
+          ?? this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${node.id}"]`) ?? null;
+        rowEl?.removeClass("is-obscured");
+        return;
+      }
+    }
     if (absorbed) {
       // Remember the note under the finger on this dismissing tap (keyboard-up
       // layout = what the user aimed at) so a double-tap that began here opens
@@ -7382,6 +7490,13 @@ export class StashpadView extends ItemView {
       return;
     }
 
+    // 0.239.0: "Focus the list" must fire FROM an input — leaving the composer
+    // is its entire job, so it belongs ABOVE the inInput guard rather than
+    // below it with the list-mutating shortcuts. It sat below, which meant the
+    // one situation it exists for was the one situation it was discarded in.
+    // Safe here because it only moves focus; it mutates nothing.
+    if (matchBinding(e, b.focusList)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdFocusList(); return; }
+
     if (inInput) return;
 
     // LIST-MUTATING mod shortcuts: only fire when focus is NOT in an input/button.
@@ -7395,6 +7510,7 @@ export class StashpadView extends ItemView {
     if (matchBinding(e, b.moveDown)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdMoveDown(); return; }
     if (matchBinding(e, b.outdent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdOutdent(); return; }
     if (matchBinding(e, b.setColor)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetColor(); return; }
+    if (matchBinding(e, b.toggleObscured)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleObscured(); return; }
     // 0.59.0: select all visible notes.
     if (matchBinding(e, b.selectAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSelectAll(); return; }
     if (matchBinding(e, b.swapWithParent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdSwapWithParent(); return; }
@@ -8939,6 +9055,21 @@ export class StashpadView extends ItemView {
 
   /** Open the color picker for the current selection (or cursor row).
    *  Applies the chosen color to every target's frontmatter; null clears it. */
+  /** 0.227.0: move focus out of the composer and onto the list from anywhere,
+   *  including the command palette. Escape already does this, but only while
+   *  the composer has focus — there was no way to ASK for the list. Lands on
+   *  the last note selected at this level, matching the ArrowUp-out-of-composer
+   *  behaviour rather than inventing a second landing rule. */
+  cmdFocusList(): void {
+    this.composerInputEl?.blur();
+    this.viewRoot?.focus({ preventScroll: true });
+    if (!this.currentChildren.length) return;
+    const lastId = this.lastCursorByFocus.get(this.focusId) ?? this.lastSelected;
+    const idx = lastId ? this.currentChildren.findIndex((n) => n.id === lastId) : -1;
+    this.cursorIdx = idx >= 0 ? idx : this.currentChildren.length - 1;
+    this.selectCursor(false);
+  }
+
   cmdSetColor(): void {
     const targets = this.getActionTargets();
     if (!targets.length) return;
@@ -9716,8 +9847,25 @@ export class StashpadView extends ItemView {
     // everything. Scoped to one importer session (a fresh open starts empty),
     // so deleting notes and re-importing them deliberately still works.
     const session = new Set<string>();
-    const run = async (notes: AppImportNote[], helpers: HelperNote[]) => {
-      await this.runAppImport(notes, helpers);
+    // The destination is chosen inside the importer, so route there before
+    // writing. Switching the view is deliberate: createNoteUnder, the undo stack
+    // and the render path are all scoped to a view's own folder, so importing
+    // "into" a different folder from here would mean a second, untested write
+    // path for the riskiest operation in the plugin.
+    const run = async (notes: AppImportNote[], helpers: HelperNote[], destination: string) => {
+      let target: StashpadView = this;
+      if (destination && destination !== this.noteFolder) {
+        await this.plugin.openFolderInStashpad(destination);
+        const found = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+          .map((l) => l.view as StashpadView | undefined)
+          .find((v) => v?.noteFolder === destination);
+        if (!found) {
+          new Notice(`Could not open "${destination}" - nothing was imported.`);
+          return;
+        }
+        target = found;
+      }
+      await target.runAppImport(notes, helpers);
       for (const n of notes) if (!n.synthetic && n.sourceId) session.add(n.sourceId);
     };
     // Ids already imported into this folder, so a second run can skip them
@@ -9725,16 +9873,46 @@ export class StashpadView extends ItemView {
     // rather than snapshotted once — the importer stays open after an import,
     // so a snapshot made "Skip notes already imported" a no-op on the second
     // press and the whole export landed twice.
-    const existing = (): ReadonlySet<string> => {
-      const ids = this.importedAppIds(this.noteFolder);
+    // Takes the folder: the destination is picked in the importer, so the guard
+    // has to look at wherever the user is actually about to write.
+    const existing = (folder: string): ReadonlySet<string> => {
+      const ids = this.importedAppIds(folder || this.noteFolder);
       for (const id of session) ids.add(id);
       return ids;
     };
+    // Every vault folder, not just the Stashpad ones: importing into a plain
+    // folder is how you convert it, so refusing to offer them would hide the
+    // simplest way to keep an archive separate from existing notes.
+    const stash = new Set(this.plugin.discoverStashpadFolders());
+    const ranked = this.plugin.rankFoldersByPin([...stash]);
+    const others = this.app.vault.getAllLoadedFiles()
+      .filter((f): f is TFolder => f instanceof TFolder && !!f.path && f.path !== "/")
+      .map((f) => f.path)
+      .filter((p) => !stash.has(p))
+      // Top level only, for now: a vault of any size turns the list into a wall
+      // of nested paths, and importing into a subfolder is rare enough to ask
+      // for explicitly later.
+      .filter((p) => !p.includes("/"))
+      // Never offer Stashpad's own machine-managed subfolders (_exports,
+      // _attachments, _authors, archive/, trash/ ...). These showed up as
+      // "<folder>/_exports (not a Stashpad folder yet)" - technically true, and
+      // a destination that would quietly corrupt the folder it belongs to.
+      .filter((p) => !isInReservedSubfolder(p) && !isReservedSubfolderName(p))
+      .sort((a, b) => a.localeCompare(b));
+    const folders = [
+      ...ranked.map((path) => ({ path, isStashpad: true })),
+      ...others.map((path) => ({ path, isStashpad: false })),
+    ];
     const modal = new AppImportModal(
       this.app, dest, run,
-      (state) => void this.plugin.openAppImporter({ state, destinationLabel: dest, onImport: run, existingSourceIds: existing }),
+      (state) => void this.plugin.openAppImporter({
+        state, destinationLabel: dest, onImport: run, existingSourceIds: existing,
+        folders, currentFolder: this.noteFolder,
+      }),
       {},
       existing,
+      folders,
+      this.noteFolder,
     );
     modal.open();
   }
@@ -9759,6 +9937,49 @@ export class StashpadView extends ItemView {
     return out;
   }
 
+  /** Section parents ("Stashpad Todos", "Recovered from Stashpad", …) already in
+   *  this folder, keyed by the source root they represent.
+   *
+   *  0.226.2: these are synthetic too, so like the reference notes they carry no
+   *  stashpadAppId and the id guard cannot see them. Importing a SECOND export
+   *  over the first — the delta from another machine, say — brought in a handful
+   *  of genuinely new notes and built a duplicate section parent to hold them.
+   *  Now the existing one is reused. */
+  private existingSectionParents(folder: string): Map<string, StashpadId> {
+    const out = new Map<string, StashpadId>();
+    const prefix = `${folder.replace(/\/+$/, "")}/`;
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (!f.path.startsWith(prefix)) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      const root = fm?.stashpadAppSectionRoot;
+      const id = fm?.id;
+      if (typeof root === "string" && root && typeof id === "string" && id && !out.has(root)) {
+        out.set(root, id as StashpadId);
+      }
+    }
+    return out;
+  }
+
+  /** True when this folder already holds the importer's reference parent.
+   *  Those notes are synthetic, so they carry no stashpadAppId and the re-run
+   *  guard cannot match them by id — this is what stops a second Import from
+   *  rebuilding the reference tree. */
+  private hasAppReferenceNote(folder: string): boolean {
+    const prefix = `${folder.replace(/\/+$/, "")}/`;
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if (!f.path.startsWith(prefix)) continue;
+      const cache = this.app.metadataCache.getFileCache(f);
+      if (cache?.frontmatter?.stashpadAppReference === true) return true;
+      // Fallback for notes imported before the marker existed (0.226.1). Compare
+      // on letters and digits only: slugification lowercases, drops "&" and
+      // turns spaces into hyphens, so any literal comparison against the title
+      // silently never matches - which is exactly what the first version did.
+      const norm = (x: string): string => x.toLowerCase().replace(/[^a-z0-9]+/g, "");
+      if (norm(f.basename.replace(/-[a-z0-9]{6}$/i, "")).startsWith(norm(APP_REFERENCE_TITLE))) return true;
+    }
+    return false;
+  }
+
   private async runAppImport(notes: AppImportNote[], helpers: HelperNote[]): Promise<void> {
     if (!notes.length && !helpers.length) return;
     const folder = this.noteFolder;
@@ -9768,10 +9989,40 @@ export class StashpadView extends ItemView {
     const base = Date.now();
     let failed = 0;
 
+    const sectionParents = this.existingSectionParents(folder);
+
+    // A full archive is tens of thousands of file writes on the main thread. It
+    // used to run with no feedback at all: the window looked idle, so the
+    // natural thing was to start browsing - and every few hundred notes the list
+    // rebuilt under you and jumped. Two changes: say what is happening, and give
+    // the UI a chance to paint.
+    const total = notes.length + (helpers.length ? helpers.length + 1 : 0);
+    const progress = total > PROGRESS_MIN_NOTES ? new Notice("", 0) : null;
+    const tick = (done: number, what: string): void => {
+      if (!progress) return;
+      const pct = Math.floor((done / Math.max(1, total)) * 100);
+      progress.setMessage(
+        `Importing from Stashpad — ${done.toLocaleString()} of ${total.toLocaleString()} (${pct}%)\n${what}`,
+      );
+    };
+    tick(0, "starting…");
+
     this.beginBulkRender();
     try {
       for (let i = 0; i < notes.length; i++) {
         const n = notes[i];
+        if (i % PROGRESS_EVERY === 0) {
+          tick(i, `into “${folder}”`);
+          // Hand the frame back so the notice actually paints and the window
+          // stays responsive. Without this the whole import is one long block.
+          await new Promise((r) => window.setTimeout(r, 0));
+        }
+        // Reuse a section parent that is already here rather than making a second
+        // one; children below it resolve through createdIds either way.
+        if (n.synthetic && n.root) {
+          const existingId = sectionParents.get(String(n.root));
+          if (existingId) { createdIds.push(existingId); continue; }
+        }
         const parentId = n.parentIndex == null ? rootParent : (createdIds[n.parentIndex] ?? rootParent);
         const before = collected.length;
         // A task arrives as a normalised "[x] " prefix, which createNoteUnder's
@@ -9800,6 +10051,17 @@ export class StashpadView extends ItemView {
             // A grouping note the importer invented has no source id to stamp —
             // stamping one would make the re-run guard skip it next time.
             if (!n.synthetic && n.sourceId) m.stashpadAppId = n.sourceId;
+            // Lets a later import find this section instead of duplicating it.
+            if (n.synthetic && n.root) m.stashpadAppSectionRoot = String(n.root);
+            // Obsidian's own tag key, so they work in search, the tag pane and
+            // Bases without anything extra. Merged with whatever is already
+            // there rather than replacing it, so a re-import cannot wipe tags
+            // the user added by hand.
+            if (n.tags.length) {
+              const prev = Array.isArray(m.tags) ? m.tags.map(String)
+                : typeof m.tags === "string" && m.tags ? [m.tags] : [];
+              m.tags = [...new Set([...prev, ...n.tags])];
+            }
             if (n.pinned) {
               m.pinned = true;
               // Keep the app's own sidebar order: pinnedAt is just a sort key.
@@ -9821,16 +10083,35 @@ export class StashpadView extends ItemView {
         }
       }
 
+      tick(notes.length, "writing the reference notes…");
       // Reference notes from the export's supporting files, filed under one parent
       // so they never mix with the user's own notes.
+      //
+      // 0.226.1: skip them when that parent is already here. These are synthetic —
+      // they carry no stashpadAppId — so the re-run guard, which matches on that
+      // field, cannot see them. Without this check a second Import in the same
+      // session rebuilt the whole reference tree even though every real note was
+      // correctly skipped.
+      if (helpers.length && this.hasAppReferenceNote(folder)) {
+        helpers = [];
+      }
       if (helpers.length) {
         const hostId = await this.createNoteUnder(
-          "Stashpad app settings & reference\n\nHow the old desktop app was set up, what was pinned, what was done, "
+          `${APP_REFERENCE_TITLE}\n\nHow the old desktop app was set up, what was pinned, what was done, `
           + "and what could not be carried across. Kept together so it never mixes with your actual notes.",
           rootParent, {
           record: false, deferRender: true, collectInto: collected,
         });
         if (hostId) {
+          // Mark it, so a later run can recognise it without relying on the
+          // title surviving slugification.
+          const hostPath = collected.length ? collected[collected.length - 1].path : null;
+          const hostFile = hostPath ? (this.app.vault.getAbstractFileByPath(hostPath) as TFile | null) : null;
+          if (hostFile) {
+            try {
+              await this.app.fileManager.processFrontMatter(hostFile, (m: any) => { m.stashpadAppReference = true; });
+            } catch { /* the filename check below still covers it */ }
+          }
           for (const h of helpers) {
             await this.createNoteUnder(`# ${h.title}\n\n${h.body}`, hostId, {
               record: false, deferRender: true, collectInto: collected,
@@ -9839,12 +10120,17 @@ export class StashpadView extends ItemView {
         }
       }
     } finally {
+      // These two are the "settling" the user sees as flicker: the frontmatter
+      // queue draining and the tree rebuilding. Naming them beats an idle window.
+      tick(total, "linking notes to their parents…");
       try { await this.fmSync.flush(); } catch { /* best effort */ }
+      tick(total, "rebuilding the list…");
       this.endBulkRender();
     }
 
     this.tree.rebuild(folder);
     this.render();
+    progress?.hide();
     const made = collected.length;
     const importedIds = createdIds.filter((x): x is StashpadId => !!x);
     this.plugin.notifications.show({
@@ -10988,6 +11274,10 @@ export class StashpadView extends ItemView {
   // --- Navigation ---
 
   private navigateTo(id: StashpadId, opts: { keepForwardStack?: boolean } = {}): void {
+    // 0.237.0: leaving the level re-blurs anything revealed here, when the
+    // setting says reveals are momentary. Signal-like: you looked, you left,
+    // it is hidden again.
+    if (getSettings().obscureReHides) this.revealedObscured.clear();
     // 0.67.0: record pre-change state so back can return here. Skip
     // when keepForwardStack:true (the legacy "we're navigating via
     // back/forward, don't disturb history" signal).
@@ -12430,6 +12720,113 @@ export class StashpadView extends ItemView {
   /** Tag-only task check (used by the H toggle's decision). Distinct
    *  from isTask, which also counts the bare `completed` field for
    *  panel inclusion. */
+  /** 0.237.0: turn `||text||` into a blurred span you tap to reveal.
+   *
+   *  Applied to the RENDERED DOM rather than the markdown source, walking text
+   *  nodes only. That is deliberate: rewriting the source string before
+   *  Markdown rendering would let the delimiters land inside a code fence or a
+   *  link target, and building the span from an HTML string would trip the
+   *  no-raw-HTML security invariant. Walking text nodes cannot touch code, and
+   *  creates real elements.
+   *
+   *  Skips code/pre, so `||` inside a code block stays literal. */
+  private applySpoilers(root: HTMLElement): void {
+    if (!getSettings().spoilerMarkup) return;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const targets: Text[] = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const t = n as Text;
+      if (!t.nodeValue || !/\|\|[^|]/.test(t.nodeValue)) continue;
+      if ((t.parentElement as HTMLElement | null)?.closest("code, pre, .stashpad-spoiler")) continue;
+      targets.push(t);
+    }
+    for (const t of targets) {
+      const parts = (t.nodeValue ?? "").split(/\|\|([^|]+)\|\|/g);
+      if (parts.length < 3) continue;
+      const frag = document.createDocumentFragment();
+      parts.forEach((part, i) => {
+        if (!part) return;
+        // Odd indices are the captured spoiler bodies.
+        if (i % 2 === 1) {
+          const span = frag.createSpan({ cls: "stashpad-spoiler", text: part });
+          span.setAttr("role", "button");
+          span.setAttr("tabindex", "0");
+          span.setAttr("aria-label", "Hidden text — activate to reveal");
+          span.title = "Tap to reveal (visual only)";
+        } else {
+          frag.appendChild(document.createTextNode(part));
+        }
+      });
+      t.replaceWith(frag);
+    }
+  }
+
+  /** 0.237.0: is this note marked to render blurred? */
+  isObscured(node: TreeNode): boolean {
+    if (!node.file) return false;
+    return this.app.metadataCache.getFileCache(node.file)?.frontmatter?.obscured === true;
+  }
+
+  /** Toggle the obscured flag on the selection.
+   *
+   *  This is VISUAL ONLY and the UI says so everywhere it is surfaced. The
+   *  plaintext stays in the markdown file, in the metadata cache, in search
+   *  results, in Obsidian's own editor, in sync, and in every other plugin —
+   *  a CSS blur stops someone glancing at your screen and nothing else. Real
+   *  privacy is the per-folder encryption feature, which this must never be
+   *  confused with; hence "obscure", never "lock" or "encrypt". */
+  async cmdToggleObscured(): Promise<void> {
+    let targets = this.getActionTargets();
+    if (targets.length === 0) {
+      const focused = this.tree.get(this.focusId);
+      if (focused?.file) targets = [focused];
+    }
+    if (targets.length === 0) { new Notice("Nothing to obscure."); return; }
+    const makeObscured = targets.some((t) => !this.isObscured(t));
+    const prior: { id: StashpadId; path: string; was: unknown }[] = [];
+    for (const t of targets) {
+      if (!t.file) continue;
+      const fmNow = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
+      prior.push({ id: t.id, path: t.file.path, was: fmNow?.obscured });
+      this.markFmSelfWrite(t.file.path); // body unchanged
+      await this.app.fileManager.processFrontMatter(t.file, (m: any) => {
+        if (makeObscured) m.obscured = true;
+        else delete m.obscured;
+      });
+      // Revealing is a viewing state; turning obscuring ON must clear it, or
+      // the note stays visible until you navigate away.
+      if (makeObscured) this.revealedObscured.delete(t.id);
+    }
+    const apply = async (rows: { id: StashpadId; path: string; was: unknown }[]): Promise<void> => {
+      for (const r of rows) {
+        const f = this.plugin.fileByFrontmatterId(r.id, this.noteFolder)
+          ?? this.app.vault.getAbstractFileByPath(r.path);
+        if (!(f instanceof TFile)) continue;
+        this.markFmSelfWrite(f.path);
+        await this.app.fileManager.processFrontMatter(f, (m: any) => {
+          if (r.was === true) m.obscured = true;
+          else delete m.obscured;
+        });
+      }
+      this.tree.rebuild(this.noteFolder);
+      this.render();
+    };
+    this.plugin.getUndoStack(this.noteFolder).push({
+      label: makeObscured
+        ? (prior.length === 1 ? "Obscure note" : `Obscure ${prior.length} notes`)
+        : (prior.length === 1 ? "Unobscure note" : `Unobscure ${prior.length} notes`),
+      undo: () => apply(prior),
+      redo: () => apply(prior.map((r) => ({ ...r, was: makeObscured ? true : undefined }))),
+    });
+    this.render();
+    this.plugin.notifications.show({
+      message: makeObscured
+        ? `Obscured ${prior.length} note${prior.length === 1 ? "" : "s"} — visual only, not encrypted.`
+        : `Revealed ${prior.length} note${prior.length === 1 ? "" : "s"}.`,
+      kind: "success", category: "system", folder: this.noteFolder,
+    });
+  }
+
   private isTaskTagged(node: TreeNode): boolean {
     if (!node.file) return false;
     const override = this.taskTaggedState.get(node.file.path);
@@ -14260,6 +14657,14 @@ export class StashpadView extends ItemView {
       this.debouncedRender();
       return;
     }
+    // 0.227.0: everything above returned for one of OUR OWN writes, so reaching
+    // here means the change came from somewhere else — another editor, Obsidian's
+    // own, or sync. Those are the writes with no other trace (no command ran, so
+    // nothing else logs them), and they are what you want to see when a note's
+    // frontmatter or filename drifts from its body. Debounced per path so a
+    // burst from sync, or a character-by-character edit in another pane, records
+    // once instead of hundreds of times.
+    this.logExternalEdit(file);
     // 0.122.6 (#13): drop this file's (possibly stale-content-but-fresh-mtime)
     // render-cache entry so the debounced re-render below recomputes from fresh
     // content — fixes the truncated/attachment-less "earlier version" render
@@ -14344,6 +14749,23 @@ export class StashpadView extends ItemView {
       await this.app.fileManager.renameFile(file, newPath);
       await this.log.append({ type: "rename", id, payload: { from: oldPath, to: newPath } });
     } catch { /* ignore */ }
+  }
+
+  /** 0.227.0: record a not-by-us body edit in the per-folder action log.
+   *  Debounced per path (5s) — a sync burst or a live edit in another pane
+   *  fires `modify` continuously, and one entry per keystroke would drown the
+   *  log it is meant to make readable. */
+  private logExternalEdit(file: TFile): void {
+    let d = this.externalEditDebouncers.get(file.path);
+    if (d) d.cancel();
+    d = debounce(() => {
+      const fmId = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+      const id = (typeof fmId === "string" ? fmId : parseIdFromFilename(file.basename)) ?? ROOT_ID;
+      void this.log.append({ type: "external_edit", id, payload: { path: file.path } });
+      this.externalEditDebouncers.delete(file.path);
+    }, 5000);
+    this.externalEditDebouncers.set(file.path, d);
+    d();
   }
 
   private scheduleAttachmentSync(file: TFile): void {

@@ -9,6 +9,7 @@
  *  Stays Obsidian-free so it can be reasoned about (and tested) on its own.
  */
 import { BUILTIN_COLOR_NAMES, type ImportNote } from "./text-importer";
+import { expandShortcodes } from "./emoji-shortcodes";
 
 /** The desktop app stored colour as an integer 0-9. Index = that colorCode.
  *
@@ -64,7 +65,12 @@ export type AppRoot = (typeof APP_ROOTS)[number] | string;
 /** Roots imported unless the user says otherwise. TRASH is deliberately out:
  *  nothing is soft-deleted in the source, so Trash is only tree membership, and
  *  importing it would silently resurrect deleted notes. */
-export const DEFAULT_ROOTS: AppRoot[] = ["HOME", "TODOS", "SHARE_ROOT", "SHARED_STASHES", "ORPHAN"];
+/** Everything, by default. Earlier this omitted TRASH/SIDEBAR/NOTES_FOOTER on
+ *  the grounds that Trash was deleted material - but a rescue from a dead app
+ *  should default to leaving nothing behind, and silently skipping thousands of
+ *  notes is the worse failure. The section parents make it obvious what came
+ *  from Trash, and unticking it is one click. */
+export const DEFAULT_ROOTS: AppRoot[] = [...APP_ROOTS];
 
 export interface AppImportOptions {
   /** Which source roots to bring across. */
@@ -86,17 +92,26 @@ export interface AppImportOptions {
   /** File each non-Home section (Trash, Todos, Shared…) under a labelled parent
    *  so it stays obvious what a note was in Stashpad. Home stays at top level. */
   sectionParents: boolean;
+  /** Tag each note with what it was in Stashpad, under a `stashpad/` namespace. */
+  addTags: boolean;
+  /** Turn Stashpad's literal `:shortcode:` text into the emoji it rendered as. */
+  expandEmoji: boolean;
 }
 
 export const DEFAULT_APP_IMPORT_OPTIONS: AppImportOptions = {
   roots: [...DEFAULT_ROOTS],
   doneAsTask: true,
-  faithfulColors: false,
+  // The app's own hexes. Off would map onto this plugin's palette instead, which
+  // keeps imports consistent with notes you already had; on reproduces what the
+  // old app actually looked like.
+  faithfulColors: true,
   keepTimestamps: true,
   includeHelpers: true,
   skipAlreadyImported: true,
   groupOrphans: true,
   sectionParents: true,
+  addTags: true,
+  expandEmoji: true,
 };
 
 /** One note to create. Extends the text importer's shape so the existing creation
@@ -119,6 +134,8 @@ export interface AppImportNote extends ImportNote {
   /** A grouping note the importer invented (no counterpart in the source), so
    *  the re-run guard and the id stamp can leave it alone. */
   synthetic?: boolean;
+  /** Obsidian tags describing what this was in Stashpad. Empty when off. */
+  tags: string[];
 }
 
 export interface AppImportResult {
@@ -138,6 +155,7 @@ export interface AppImportResult {
     pinned: number;
     duplicateChildRefs: number;
     alreadyImported: number;
+    emojiExpanded: number;
   };
   warnings: string[];
 }
@@ -157,7 +175,78 @@ interface RawNote {
   pinned?: boolean;
   pinnedOrder?: number | null;
   orphaned?: boolean;
+  markedAsStack?: boolean;
+  isDoc?: boolean;
+  lastVisited?: string | null;
+  taskGrouping?: string | null;
+  customColor?: string | null;
+  comments?: unknown[];
+  sharedWith?: unknown[];
   attachments?: Array<{ name: string; type: string; size: number }>;
+}
+
+/** Section a note belongs to, as a tag-friendly slug. HOME is deliberately not
+ *  tagged: it is the default and would cover most of the archive, saying nothing. */
+const ROOT_TAG: Record<string, string | null> = {
+  HOME: null,
+  TRASH: "trash",
+  TODOS: "todos",
+  SHARE_ROOT: "shared",
+  SHARED_STASHES: "shared-with-me",
+  ORPHAN: "recovered",
+  SIDEBAR: "sidebar",
+  NOTES_FOOTER: "footer",
+};
+
+/** An unticked markdown checkbox. Stashpad's own `done` flag does NOT cover
+ *  these — a note can carry an open checkbox and still be "not done", so this is
+ *  the only signal for a task that is still outstanding. */
+const OPEN_CHECKBOX = /^\s*(?:[-*+]\s*)?\[ \]/m;
+const ANY_CHECKBOX = /^\s*(?:[-*+]\s*)?\[[ xX]\]/m;
+
+/** Tags describing what a note was in Stashpad.
+ *
+ *  Namespaced under `stashpad/` on purpose: these are observations about an
+ *  import, not part of the user's own vocabulary, and Obsidian nests them so the
+ *  whole set collapses under one heading in the tag pane.
+ *
+ *  Only facts that DISCRIMINATE earn a tag. A tag every note carries is noise —
+ *  which is why HOME, and flags that are constant across an archive, are absent. */
+function tagsFor(n: RawNote, root: string, colorName: string | null): string[] {
+  const out: string[] = [];
+  const rootTag = ROOT_TAG[root];
+  if (rootTag) out.push(`stashpad/${rootTag}`);
+
+  const year = (n.createdAt ?? "").slice(0, 4);
+  if (/^\d{4}$/.test(year)) out.push(`stashpad/year/${year}`);
+
+  const text = n.text ?? "";
+  if (n.done) out.push("stashpad/done");
+  // Outstanding work the `done` flag misses entirely.
+  else if (OPEN_CHECKBOX.test(text)) out.push("stashpad/open-task");
+  else if (ANY_CHECKBOX.test(text)) out.push("stashpad/task");
+
+  if (n.pinned) out.push("stashpad/pinned");
+  if (colorName) out.push(`stashpad/colour/${colorName.toLowerCase()}`);
+  if (n.attachments?.length) out.push("stashpad/attachment");
+
+  // Everything below is provenance rather than triage: if the import has to be
+  // redone, these are what let you find the affected notes in seconds instead
+  // of re-deriving them from the export. A tag is only emitted when the
+  // attribute is actually set, so one that is false across an archive costs
+  // nothing - which is why listing them all here is safe.
+  if (new Set((n.parents ?? []).map((p) => p.id)).size > 1) out.push("stashpad/multi-parent");
+  if (new Set(n.children ?? []).size !== (n.children ?? []).length) out.push("stashpad/duplicate-child");
+  if (!(n.text ?? "").trim()) out.push("stashpad/empty");
+  if ((n.text ?? "").includes("~~")) out.push("stashpad/strikethrough");
+  if (n.markedAsStack) out.push("stashpad/stack");
+  if (n.isDoc) out.push("stashpad/doc");
+  if (n.lastVisited) out.push("stashpad/recently-visited");
+  if (n.taskGrouping) out.push(`stashpad/task-grouping/${String(n.taskGrouping).toLowerCase()}`);
+  if (n.customColor) out.push("stashpad/custom-colour");
+  if (n.comments?.length) out.push("stashpad/comments");
+  if (n.sharedWith?.length) out.push("stashpad/shared-with-someone");
+  return out;
 }
 
 /** True when `value` looks like the extraction's notes.json (an array of records
@@ -185,7 +274,7 @@ export function buildAppImport(
   if (!Array.isArray(raw)) {
     return {
       notes: [], byRoot: {},
-      stats: { totalInFile: 0, selected: 0, skippedRoot: 0, done: 0, coloured: 0, withAttachments: 0, attachments: 0, multiParent: 0, orphaned: 0, pinned: 0, duplicateChildRefs: 0, alreadyImported: 0 },
+      stats: { totalInFile: 0, selected: 0, skippedRoot: 0, done: 0, coloured: 0, withAttachments: 0, attachments: 0, multiParent: 0, orphaned: 0, pinned: 0, duplicateChildRefs: 0, alreadyImported: 0, emojiExpanded: 0 },
       warnings: ["That file isn't a Stashpad export — expected a JSON array of notes."],
     };
   }
@@ -197,6 +286,8 @@ export function buildAppImport(
   const wanted = new Set(opts.roots);
   let duplicateChildRefs = 0;
   let skippedRoot = 0;
+  let emojiExpanded = 0;
+  const unknownShortcodes = new Set<string>();
 
   // Roots = notes nobody lists as a child. Structural containers ("Home",
   // "Trash", …) are NOT imported as notes — their children become top level.
@@ -221,8 +312,14 @@ export function buildAppImport(
     // Every parent past the first, deduplicated — the source contains one parent
     // that lists the same child twice, which must not read as multi-parent.
     const parentIds = [...new Set((n.parents ?? []).map((p) => p.id))];
+    // Stashpad kept shortcodes as literal text and expanded them at render time,
+    // so this is the only point where they can become the emoji the user
+    // actually saw. Unknown codes are left exactly as they were.
+    const emoji = opts.expandEmoji ? expandShortcodes(n.text ?? "") : null;
+    if (emoji?.replaced.length) emojiExpanded += emoji.replaced.length;
+    if (emoji?.unknown.length) for (const u of emoji.unknown) unknownShortcodes.add(u);
     const note: AppImportNote = {
-      body: n.text ?? "",
+      body: emoji ? emoji.text : (n.text ?? ""),
       level,
       parentIndex,
       color: hex ?? null,
@@ -238,6 +335,10 @@ export function buildAppImport(
       extraParents: parentIds.slice(1),
       pinned: !!n.pinned,
       pinnedOrder: n.pinnedOrder ?? null,
+      tags: opts.addTags
+        ? [...tagsFor(n, n.root ?? "HOME", entry.appName === "None" ? null : entry.appName),
+           ...(emoji?.replaced.length ? ["stashpad/emoji"] : [])]
+        : [],
     };
     const idx = notes.length;
     notes.push(note);
@@ -306,6 +407,7 @@ export function buildAppImport(
       pinned: false,
       pinnedOrder: null,
       synthetic: true,
+      tags: opts.addTags ? ["stashpad/section"] : [],
     });
     const idx = notes.length - 1;
     sectionIndex.set(rootKind, idx);
@@ -408,6 +510,12 @@ export function buildAppImport(
       `${duplicateChildRefs} duplicate child reference${duplicateChildRefs === 1 ? " in the source was" : "s in the source were"} collapsed, so nothing imports twice.`,
     );
   }
+  if (unknownShortcodes.size) {
+    const list = [...unknownShortcodes].slice(0, 8).join(", ");
+    warnings.push(
+      `${unknownShortcodes.size} shortcode${unknownShortcodes.size === 1 ? "" : "s"} had no emoji mapping and were left as text (${list}${unknownShortcodes.size > 8 ? ", …" : ""}).`,
+    );
+  }
   const withAtt = notes.filter((n) => n.attachments.length);
   if (withAtt.length) {
     warnings.push(
@@ -432,6 +540,7 @@ export function buildAppImport(
       pinned: notes.filter((n) => n.pinned).length,
       duplicateChildRefs,
       alreadyImported,
+      emojiExpanded,
     },
     warnings,
   };

@@ -47,6 +47,8 @@ export interface ModShortcuts {
   moveToBottom: string;     // "Mod+Shift+ArrowDown"
   outdent: string;          // "Mod+[" — re-parent selection to its grandparent
   setColor: string;         // "Shift+:" — open color picker for selection
+  focusList: string;        // "Mod+Shift+L" — move focus from the composer into the list
+  toggleObscured: string;   // "" — blur/unblur the selection (visual only)
 }
 
 /** All keyboard-bindable commands, in display order. The labels and
@@ -68,7 +70,9 @@ export type CommandId =
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
   | "copyNotes" | "cutNotes" | "pasteNotes"
   | "copyForOtherVault" | "cutForOtherVault"
-  | "commandPalette";
+  | "commandPalette"
+  | "focusList"
+  | "toggleObscured";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
  *  When BOTH are set, `preferRight` decides which actually fires. */
@@ -124,6 +128,8 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "moveToBottom",    label: "Move note to bottom",           desc: "Default: Mod+Shift+ArrowDown",                                                            defaultPrimary: "Mod+Shift+ArrowDown" },
   { id: "outdent",         label: "Outdent (move to grandparent)", desc: "Default: Mod+[ — re-parents the selection one level up.",                                defaultPrimary: "Mod+[" },
   { id: "setColor",        label: "Set note color",                desc: "Default: Shift+: or ; — open the color picker for the selection (both chords active).",   defaultPrimary: "Shift+:", defaultSecondary: ";", defaultUseBoth: true },
+  { id: "focusList",       label: "Focus the list",                desc: "Default: Mod+Shift+L — move keyboard focus out of the composer and onto the list, landing on the last note you had selected.", defaultPrimary: "Mod+Shift+L" },
+  { id: "toggleObscured",  label: "Obscure / reveal note",          desc: "Blur the selected note(s) until tapped. VISUAL ONLY — the text stays in the file, in search and in the editor; this hides it from someone glancing at your screen, nothing more. For real privacy use per-folder encryption. No default chord.", defaultPrimary: "" },
   { id: "clone",           label: "Clone (duplicate / copy) selection", desc: "Default: Mod+Shift+D — clone selected notes (with their subtrees) as siblings.",   defaultPrimary: "Mod+Shift+D" },
   { id: "forkNote",        label: "Fork into a separate note (under a chosen parent)", desc: "Duplicate the cursor row (with its subtree) as a separate note and pick which parent it nests under. Distinct from \"Fork as a version\" (a draft within a sheet group). No default chord.", defaultPrimary: "" },
   { id: "insertTemplate",  label: "Insert template (clone an existing note)", desc: "Pick any note in this Stashpad; clone it (with subtree + attachments) into the current view, retimestamped.", defaultPrimary: "" },
@@ -560,6 +566,22 @@ export interface StashpadSettings {
    *  binds an append target. Off = `+` is just a character (markdown `+ ` list
    *  bullets keep working with no dismiss step). */
   composerAppendTrigger: boolean;
+  /** 0.234.0: clicking an image attachment opens the media viewer instead of a
+   *  new tab. Off restores the pre-0.234 behaviour exactly. */
+  mediaViewerOnClick: boolean;
+  /** 0.235.0: how a note's attachment rail lays out. "auto" picks from the file
+   *  mix and the rail's measured width. */
+  attachmentRailMode: "auto" | "thumbnail" | "compact" | "filename";
+  /** 0.237.0: re-blur an obscured note when you navigate away or reload.
+   *  On = Signal-like (reveal is momentary). Off = revealing sticks for the
+   *  session. */
+  obscureReHides: boolean;
+  /** 0.237.0: render ||spoiler|| in note bodies as blurred-until-tapped. */
+  spoilerMarkup: boolean;
+  /** 0.238.0: bulk recolour from the colour-alias swatch applies to EVERY
+   *  Stashpad rather than only the one selected. Off by default — a vault-wide
+   *  write should be opted into, not stumbled into. */
+  bulkRecolorAllFolders: boolean;
   autoNavOnMoveIn: boolean;
   /** 0.191.0: after moving/nesting a note INTO another note, open that destination
    *  parent in a BACKGROUND Stashpad tab — so the note's new home is one click away
@@ -745,6 +767,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
     moveToTop: "Mod+Shift+ArrowUp", moveToBottom: "Mod+Shift+ArrowDown",
     outdent: "Mod+[",
     setColor: "Shift+:",
+    focusList: "Mod+Shift+L",
+    toggleObscured: "",
   },
   customPalette: [],
   colorAliases: {},
@@ -767,6 +791,11 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   trustedXvSources: [],
   splitCheckboxLines: true,
   composerAppendTrigger: true,
+  mediaViewerOnClick: true,
+  attachmentRailMode: "auto",
+  obscureReHides: true,
+  spoilerMarkup: true,
+  bulkRecolorAllFolders: false,
   autoNavOnMoveIn: false,
   openParentTabOnMoveIn: true,
   newTabsInBackground: false,
@@ -1744,6 +1773,25 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.movingNotes.push(toggle("Navigate into parent after moving a note IN", "When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
+    cats.listDisplay.push(toggle("Re-hide obscured notes when you leave", "An obscured note goes back to blurred when you navigate away, switch folders, or reload — revealing it is momentary, like Signal. Off keeps it revealed until you re-hide it or restart. On by default. Note: obscuring is VISUAL ONLY; see the description on the obscure command.",
+      () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
+    cats.listDisplay.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
+      () => this.plugin.settings.spoilerMarkup, (v) => { this.plugin.settings.spoilerMarkup = v; }, ["spoiler", "blur", "hide", "markup", "reveal"]));
+    cats.listDisplay.push(this.renderDef("Attachment layout", "How a note's attachments are laid out. Auto picks per note: thumbnails when the files are mostly images and there is room to see them, a compact icon strip when they would be too small to recognise, and a named list when they are mostly non-images (a spreadsheet is identified by its name, not a preview).", (row) => {
+      row.addDropdown((dd) => {
+        dd.addOption("auto", "Auto");
+        dd.addOption("thumbnail", "Thumbnails");
+        dd.addOption("compact", "Compact icons");
+        dd.addOption("filename", "File names");
+        dd.setValue(this.plugin.settings.attachmentRailMode);
+        dd.onChange(async (v) => {
+          this.plugin.settings.attachmentRailMode = v as "auto" | "thumbnail" | "compact" | "filename";
+          await set();
+        });
+      });
+    }, ["attachment", "rail", "thumbnail", "compact", "layout", "view", "file", "icon"]));
+    cats.listDisplay.push(toggle("Open images in the media viewer", "Clicking an image attached to a note opens a large preview with zoom, rotation and a rail of the note's other files, instead of opening it in a new tab. Non-image files still open in a tab. The viewer has an \u201cOpen in a new tab\u201d button, so nothing is lost either way. On by default.",
+      () => this.plugin.settings.mediaViewerOnClick, (v) => { this.plugin.settings.mediaViewerOnClick = v; }, ["image", "media", "viewer", "lightbox", "preview", "zoom", "attachment"]));
     cats.composerCopy.push(toggle('Type "+" to append to an existing note', 'Typing + as the only character in an empty composer opens the note picker. Pick a note and what you send next is appended to the bottom of that note\'s body on a new line, instead of creating a new note. The target clears after one send. Dismissing the picker leaves the + as ordinary text, so markdown "+ " bullets still work. On by default.',
       () => this.plugin.settings.composerAppendTrigger, (v) => { this.plugin.settings.composerAppendTrigger = v; }, ["append", "plus", "existing", "composer", "add"]));
     cats.composerCopy.push(toggle("Split a pasted checklist into separate tasks", 'When every line of what you submit is a checkbox — "- [ ] milk", "[x] eggs" — create one task per line instead of a single note. Applies even when "split on newlines" is off. On by default.',
@@ -1814,51 +1862,34 @@ export class StashpadSettingTab extends PluginSettingTab {
       ["attachment", "attachments", "shared", "universal", "folder"],
     ));
 
-    cats.foldersStorage.push(this.sectionDef("Cross-Stashpad Search Scope", "Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations. Also: create a new Stashpad.", (host) => {
-      const folders = this.plugin.discoverStashpadFolders();
-      new Setting(host)
-        .setName("Cross-Stashpad Search Scope")
-        .setDesc("Toggle each Stashpad's pill to choose whether its notes contribute to cross-folder search. Excluded folders are still valid move destinations — their notes just don't appear in search results from elsewhere.");
-      if (folders.length === 0) {
-        // The full "what is a Stashpad" explanation now lives in the Help &
-        // Getting started tab, where someone looking for it can actually find
-        // it — it used to exist ONLY here, in a section about search scope, and
-        // disappeared the moment the user had one folder. Keep this short and
-        // point at the real thing.
-        host.createEl("p", { cls: "setting-item-description" }).setText(
-          "No Stashpads found in this vault yet. See the “Help & Getting started” tab for what a Stashpad is and how to make your first one — or create one below.",
-        );
-      } else {
-        const list = host.createDiv({ cls: "stashpad-folder-list" });
-        for (const folder of folders) this.renderFolderScopeRow(list, folder);
-      }
-      let nameInput: HTMLInputElement | null = null;
-      new Setting(host)
-        .setName("Create a new Stashpad")
-        .setDesc("Type a vault-relative folder path. The folder is created (with intermediates) and seeded with a Home note so Stashpad recognizes it.")
-        .addText((t) => { t.setPlaceholder("my-stashpad"); nameInput = (t as any).inputEl as HTMLInputElement; })
-        .addButton((b) =>
-          b.setButtonText("Create").setCta().onClick(async () => {
-            const raw = (nameInput?.value ?? "").trim().replace(/^\/+|\/+$/g, "");
-            if (!raw) { new Notice("Enter a folder name first."); return; }
-            try {
-              await this.plugin.createNewStashpad(raw);
-              new Notice(`Created Stashpad "${raw}".`);
-              if (nameInput) nameInput.value = "";
-              await this.plugin.waitForStashpadFolder(raw, 2000);
-              this.update?.();
-            } catch (e) {
-              new Notice(`Couldn't create: ${(e as Error).message}`);
-            }
-          }));
-    }, ["search", "scope", "exclude", "include", "create", "new", "stashpad", "folder"]));
+    // 0.229.0: the search-scope pills become a declarative GROUP of real
+    // toggles — one definition per Stashpad. Two wins over the hand-rolled
+    // pill: each folder is individually findable in native settings search
+    // (previously only the section was), and Obsidian's own toggle replaces a
+    // hand-built role="switch" with its own keydown/aria handling, so
+    // accessibility stops being ours to maintain.
+    //
+    // These are `render` defs rather than key-bound `control` defs on purpose:
+    // the value is MEMBERSHIP IN AN ARRAY (searchExcludedFolders), not a
+    // settings key, so there is nothing for `key` to bind to.
+    //
+    // Phrased as "Include in cross-Stashpad search" (ON = included) rather
+    // than mirroring the stored `excluded` flag — a toggle labelled with a
+    // negative reads backwards.
+    for (const def of this.searchScopeGroup()) cats.foldersStorage.push(def);
 
-    cats.foldersStorage.push(this.sectionDef("Folder Panel Placement", "Pin, downrank, or hide folders in the Stashpad folder panel. Restore hidden folders here or from the panel's “Hidden” section.", (host) => {
-      new Setting(host)
-        .setName("Folder Panel Placement")
-        .setDesc("Folders you've pinned, downranked, or hidden in the Stashpad folder panel. Pin/downrank from a folder's right-click menu in the panel; restore here or from the panel's “Hidden” section.");
-      this.renderFolderPlacementList(host);
-    }, ["folder", "panel", "pin", "pinned", "downrank", "hide", "hidden", "restore", "placement"]));
+    // 0.228.0: ported from a hand-rolled row+button list to the declarative
+    // `type: "list"`. The framework supplies the delete affordance AND the
+    // Delete/Backspace keyboard shortcut, plus the empty state — so this
+    // DELETES row-rendering code rather than adding any, and each folder row
+    // becomes individually searchable in native settings search.
+    //
+    // No `addItem` here on purpose: folders enter these lists from the panel's
+    // right-click menu, not from settings. That also sidesteps the index
+    // hazard — the mobile add-row is NOT part of the indexed `items` and is not
+    // counted by onDelete indices, so a list WITH an add affordance has to map
+    // indices carefully. This one maps 1:1.
+    for (const def of this.folderPlacementLists()) cats.foldersStorage.push(def);
 
     // 0.121.6: Note Titles folded into Folders & Storage as a trailing
     // sub-section (was its own tab). Keep the labelled "🏷️ Note Titles" header.
@@ -2485,6 +2516,19 @@ export class StashpadSettingTab extends PluginSettingTab {
       text: "Give each per-note color a friendly name. Filters and pickers display the alias instead of the hex code; the underlying color stays the same. The same hex in two Stashpads can have different aliases.",
     });
 
+    // 0.238.0: scope for the swatch-click bulk recolour. Off by default —
+    // rewriting every note of a colour across the whole vault should be
+    // deliberate, not something you discover after doing it.
+    new Setting(parent)
+      .setName("Recolor across all Stashpads")
+      .setDesc("When you click a color swatch below to recolor, apply it to EVERY Stashpad instead of just the one selected above. Colors usually mean the same thing everywhere, so this is for \u201cchange every red note to orange\u201d. Off by default.")
+      .addToggle((t) => t
+        .setValue(this.plugin.settings.bulkRecolorAllFolders)
+        .onChange(async (v) => {
+          this.plugin.settings.bulkRecolorAllFolders = v;
+          await this.plugin.saveSettings();
+        }));
+
     const list = parent.createDiv({ cls: "stashpad-color-aliases-list" });
 
     const renderRows = (): void => {
@@ -3107,10 +3151,26 @@ export class StashpadSettingTab extends PluginSettingTab {
             return;
           }
           if (newColor && newColor.toLowerCase() === hex) { refresh(); return; }
-          const touched = await this.plugin.recolorAllInFolder(folder, hex, newColor ?? null);
-          if (touched > 0) {
-            new Notice(`Recolored ${touched} note${touched === 1 ? "" : "s"}.`);
-          } else if (count === 0) {
+          const vaultWide = this.plugin.settings.bulkRecolorAllFolders;
+          let touched: number;
+          if (vaultWide) {
+            const res = await this.plugin.recolorEverywhere(hex, newColor ?? null);
+            touched = res.total;
+            const folders = Object.keys(res.byFolder);
+            if (touched > 0) {
+              // Name the folders. A bare total hides that one folder may
+              // account for all of it — and this write crossed folders the
+              // user was not looking at, so it has to say where it landed.
+              const where = folders.length <= 3
+                ? folders.join(", ")
+                : `${folders.slice(0, 3).join(", ")} +${folders.length - 3} more`;
+              new Notice(`Recolored ${touched} note${touched === 1 ? "" : "s"} across ${folders.length} Stashpad${folders.length === 1 ? "" : "s"}: ${where}`);
+            }
+          } else {
+            touched = await this.plugin.recolorAllInFolder(folder, hex, newColor ?? null);
+            if (touched > 0) new Notice(`Recolored ${touched} note${touched === 1 ? "" : "s"}.`);
+          }
+          if (touched === 0 && count === 0) {
             // Just move the alias mapping without notes.
             const oldAlias = this.plugin.getColorAlias(folder, hex);
             if (oldAlias) {
@@ -3167,85 +3227,208 @@ export class StashpadSettingTab extends PluginSettingTab {
     };
   }
 
-  private renderFolderScopeRow(parent: HTMLElement, folder: string): void {
-    const row = parent.createDiv({ cls: "stashpad-folder-row" });
-    row.createSpan({ cls: "stashpad-folder-row-label", text: folder });
-
-    const stateEl = row.createSpan({ cls: "stashpad-folder-row-state" });
-    const pill = row.createDiv({ cls: "stashpad-binding-pill" });
-    pill.setAttribute("role", "switch");
-    pill.setAttribute("tabindex", "0");
-    const knob = pill.createDiv({ cls: "stashpad-binding-pill-knob" });
-
-    const isExcluded = (): boolean =>
-      (this.plugin.settings.searchExcludedFolders ?? []).includes(folder);
-    const refresh = (): void => {
-      const excluded = isExcluded();
-      pill.toggleClass("is-right", excluded);
-      pill.setAttribute("aria-checked", String(excluded));
-      knob.setText(excluded ? "X" : "✓");
-      stateEl.setText(excluded ? "Excluded" : "Included");
-      stateEl.toggleClass("is-excluded", excluded);
-      pill.title = excluded
-        ? "Excluded — notes here won't appear in cross-Stashpad search. Click to include."
-        : "Included — notes here appear in cross-Stashpad search. Click to exclude.";
-    };
-
-    const flip = async () => {
-      const list = new Set(this.plugin.settings.searchExcludedFolders ?? []);
-      if (list.has(folder)) list.delete(folder);
-      else list.add(folder);
-      this.plugin.settings.searchExcludedFolders = [...list].sort();
-      refresh();
-      await this.plugin.saveSettings();
-    };
-    pill.onclick = () => void flip();
-    pill.onkeydown = (e) => {
-      if (e.key === " " || e.key === "Enter") {
-        e.preventDefault();
-        void flip();
-      }
-    };
-    refresh();
-  }
-
   /** 0.95.2: settings-window mirror of the folder panel's pin/downrank/hide
    *  placements — lists each customized folder grouped by state with a control
    *  to restore it to normal. The panel's right-click menu is where you SET
    *  these; this is the at-a-glance overview + a second place to restore. */
-  private renderFolderPlacementList(host: HTMLElement): void {
-    const s = this.plugin.settings;
-    const groups: Array<{ key: "folderPanelPinned" | "folderPanelDownranked" | "folderPanelHidden"; label: string; action: string }> = [
-      { key: "folderPanelPinned", label: "Pinned", action: "Unpin" },
-      { key: "folderPanelDownranked", label: "Downranked", action: "Reset" },
-      { key: "folderPanelHidden", label: "Hidden", action: "Unhide" },
-    ];
-    const any = groups.some((g) => (s[g.key] ?? []).length > 0);
-    if (!any) {
-      host.createEl("p", { cls: "setting-item-description" }).setText(
-        "No folders customized yet. Right-click a folder in the Stashpad folder panel to pin, downrank, or hide it.",
-      );
-      return;
+  /** 0.229.0: cross-Stashpad search scope as a searchable group of toggles.
+   *  Replaces renderFolderScopeRow's hand-rolled pill. */
+  private searchScopeGroup(): SettingDefinitionItem[] {
+    const folders = this.plugin.discoverStashpadFolders();
+    const out: SettingDefinitionItem[] = [];
+    if (folders.length === 0) {
+      // Unchanged from the old empty state: the "what IS a Stashpad" answer
+      // lives in Help & Getting started, where someone looking for it can find
+      // it — it must not live only inside a section about search scope.
+      // Keep the HEADING even when the list is empty. sectionDef strips
+      // `.setting-item`, so a bare paragraph rendered a wall of text with no
+      // heading — the section became unidentifiable, which is exactly how a
+      // stale empty state managed to look like a layout bug rather than a
+      // missing list.
+      out.push(this.sectionDef("Cross-Stashpad Search Scope", "", (host) => {
+        new Setting(host).setName("Cross-Stashpad Search Scope").setHeading();
+        host.createEl("p", { cls: "setting-item-description" }).setText(
+          "No Stashpads found in this vault yet. See the “Help & Getting started” tab for what a Stashpad is and how to make your first one — or create one below.",
+        );
+      }, ["search", "scope", "stashpad", "folder"]));
+    } else {
+      out.push({
+        type: "group",
+        heading: "Cross-Stashpad Search Scope",
+        // 1.13.1: a search box scoped to this group. Useful the moment someone
+        // has more than a handful of Stashpads, which is exactly when scanning
+        // the list by eye stops working.
+        search: {
+          placeholder: "Filter Stashpads…",
+          match: (def: any, query: string) => {
+            // Sift semantics (docs/sift.md): all tokens, any order, case-insensitive.
+            const hay = `${def?.name ?? ""} ${(def?.aliases ?? []).join(" ")}`.toLowerCase();
+            return query.toLowerCase().split(/\s+/).filter(Boolean).every((t) => hay.includes(t));
+          },
+        },
+        items: folders.map((folder) => this.renderDef(
+          folder,
+          "Included — notes here appear in cross-Stashpad search. Off excludes them; excluded folders are still valid move destinations.",
+          (s) => {
+            s.addToggle((t) => t
+              .setValue(!(this.plugin.settings.searchExcludedFolders ?? []).includes(folder))
+              .onChange(async (included) => {
+                // Recompute from the CURRENT setting each time rather than
+                // closing over a snapshot — another surface may have changed
+                // the list while this page was open.
+                const list = new Set(this.plugin.settings.searchExcludedFolders ?? []);
+                if (included) list.delete(folder); else list.add(folder);
+                this.plugin.settings.searchExcludedFolders = [...list].sort();
+                await this.plugin.saveSettings();
+              }));
+          },
+          ["search", "scope", "exclude", "include", "stashpad", "folder", folder.toLowerCase()],
+        )),
+      } as SettingDefinitionItem);
     }
-    const restore = async (folder: string) => {
+    // The create-a-Stashpad action stays its own row, below the group.
+    out.push(this.renderDef(
+      "Create a new Stashpad",
+      "Type a vault-relative folder path. The folder is created (with intermediates) and seeded with a Home note so Stashpad recognizes it.",
+      (s) => {
+        let nameInput: HTMLInputElement | null = null;
+        s.addText((t) => { t.setPlaceholder("my-stashpad"); nameInput = (t as any).inputEl as HTMLInputElement; })
+          .addButton((b) => b.setButtonText("Create").setCta().onClick(async () => {
+            const raw = (nameInput?.value ?? "").trim().replace(/^\/+|\/+$/g, "");
+            if (!raw) { new Notice("Enter a folder name first."); return; }
+            try {
+              await this.plugin.createNewStashpad(raw);
+              new Notice(`Created Stashpad "${raw}".`);
+              if (nameInput) nameInput.value = "";
+              await this.plugin.waitForStashpadFolder(raw, 2000);
+              this.update?.();
+            } catch (e) {
+              new Notice(`Couldn't create: ${(e as Error).message}`);
+            }
+          }));
+      },
+      ["create", "new", "stashpad", "folder"],
+    ));
+    return out;
+  }
+
+  /** 0.228.0: the folder-panel placement editor as declarative lists — one
+   *  `type: "list"` per bucket (Pinned / Downranked / Hidden).
+   *
+   *  Each folder is its own definition, so native settings search finds a
+   *  folder by name instead of only finding the section. `onDelete` gives both
+   *  the delete button and the Delete/Backspace shortcut for free. */
+  private folderPlacementLists(): SettingDefinitionItem[] {
+    const s = this.plugin.settings;
+    const out: SettingDefinitionItem[] = [];
+
+    type Placement = "normal" | "pinned" | "downranked" | "hidden";
+    const PLACEMENT_LABELS: Record<Placement, string> = {
+      normal: "Normal",
+      pinned: "Pinned to top",
+      downranked: "Downranked",
+      hidden: "Hidden",
+    };
+
+    const placementOf = (folder: string): Placement =>
+      (s.folderPanelPinned ?? []).includes(folder) ? "pinned"
+        : (s.folderPanelDownranked ?? []).includes(folder) ? "downranked"
+          : (s.folderPanelHidden ?? []).includes(folder) ? "hidden"
+            : "normal";
+
+    /** Single writer for a folder's placement. Always clears the folder from
+     *  ALL THREE lists first — the three states are mutually exclusive, and a
+     *  folder that ended up both pinned and hidden would render inconsistently
+     *  depending on which list a given surface checked first. */
+    const setPlacement = async (folder: string, next: Placement): Promise<void> => {
       s.folderPanelPinned = (s.folderPanelPinned ?? []).filter((f) => f !== folder);
       s.folderPanelDownranked = (s.folderPanelDownranked ?? []).filter((f) => f !== folder);
       s.folderPanelHidden = (s.folderPanelHidden ?? []).filter((f) => f !== folder);
+      if (next === "pinned") s.folderPanelPinned = [...s.folderPanelPinned, folder];
+      else if (next === "downranked") s.folderPanelDownranked = [...s.folderPanelDownranked, folder];
+      else if (next === "hidden") s.folderPanelHidden = [...s.folderPanelHidden, folder];
       await this.plugin.saveSettings();
+      // Rebuild: the row has to move between sections, which no in-place
+      // mutation can express.
       this.update?.();
     };
-    for (const g of groups) {
+
+    /** 0.233.0: every folder row now carries a placement dropdown, so this page
+     *  can SET a placement instead of only undoing one. Previously the only way
+     *  in was the folder panel's right-click menu, which made the settings
+     *  section a read-only mirror — it could undo but never do. */
+    const rowDef = (folder: string, extraAliases: string[]): SettingDefinitionItem =>
+      this.renderDef(
+        folder,
+        "",
+        (row) => {
+          row.addDropdown((dd) => {
+            (Object.keys(PLACEMENT_LABELS) as Placement[]).forEach((k) => dd.addOption(k, PLACEMENT_LABELS[k]));
+            // Read the placement at RENDER time, not from the enclosing loop —
+            // another surface (the folder panel) may have changed it since the
+            // definitions were built.
+            dd.setValue(placementOf(folder));
+            dd.onChange((v) => { void setPlacement(folder, v as Placement); });
+          });
+        },
+        ["folder", "panel", "placement", "pin", "downrank", "hide", folder.toLowerCase(), ...extraAliases],
+      );
+
+    const buckets: Array<{ key: "folderPanelPinned" | "folderPanelDownranked" | "folderPanelHidden"; label: string; verb: string }> = [
+      { key: "folderPanelPinned", label: "Pinned folders", verb: "pin" },
+      { key: "folderPanelDownranked", label: "Downranked folders", verb: "downrank" },
+      { key: "folderPanelHidden", label: "Hidden folders", verb: "hide" },
+    ];
+    const customized = new Set<string>();
+    for (const g of buckets) {
+      // Snapshot the sorted order ONCE and index onDelete into THIS array, so
+      // the row the user deleted is the folder that gets reset even though the
+      // stored array is unsorted.
       const folders = [...(s[g.key] ?? [])].sort();
-      if (folders.length === 0) continue;
-      host.createEl("div", { cls: "stashpad-folder-placement-group", text: `${g.label} (${folders.length})` });
-      const list = host.createDiv({ cls: "stashpad-folder-list" });
-      for (const folder of folders) {
-        const row = list.createDiv({ cls: "stashpad-folder-row" });
-        row.createSpan({ cls: "stashpad-folder-row-label", text: folder });
-        const btn = row.createEl("button", { text: g.action });
-        btn.onclick = () => void restore(folder);
-      }
+      folders.forEach((f) => customized.add(f));
+      out.push({
+        type: "list",
+        heading: folders.length ? `${g.label} (${folders.length})` : g.label,
+        emptyState: `No ${g.label.toLowerCase()}. Use the dropdown beside a folder below to ${g.verb} it — or right-click it in the Stashpad folder panel.`,
+        // Delete = "reset to Normal". Kept alongside the dropdown because it is
+        // the one-gesture path for the common case, and it carries the
+        // Delete/Backspace shortcut.
+        onDelete: (index: number) => { void setPlacement(folders[index], "normal"); },
+        items: folders.map((folder) => rowDef(folder, [g.label.toLowerCase()])),
+      } as SettingDefinitionItem);
     }
+
+    // 0.233.0: the fourth section — every Stashpad NOT already customized.
+    // Without it the page could only ever show folders you had already acted on
+    // elsewhere, so there was no way in.
+    //
+    // A plain `group`, not a `list`: there is nothing to delete here (these
+    // folders have no placement to remove), and a delete affordance on a row
+    // whose state is already Normal would be a no-op control.
+    const others = this.plugin.discoverStashpadFolders()
+      .filter((f) => !customized.has(f))
+      .sort();
+    out.push({
+      type: "group",
+      heading: others.length ? `Other folders (${others.length})` : "Other folders",
+      search: {
+        placeholder: "Filter folders…",
+        match: (def: any, query: string) => {
+          const hay = `${def?.name ?? ""} ${(def?.aliases ?? []).join(" ")}`.toLowerCase();
+          return query.toLowerCase().split(/\s+/).filter(Boolean).every((t) => hay.includes(t));
+        },
+      },
+      items: others.length
+        ? others.map((folder) => rowDef(folder, ["other", "uncustomized", "normal"]))
+        : [this.sectionDef("", "", (host) => {
+            host.createEl("p", { cls: "setting-item-description" }).setText(
+              customized.size
+                ? "Every Stashpad in this vault has a placement set above."
+                : "No Stashpads found in this vault yet.",
+            );
+          })],
+    } as SettingDefinitionItem);
+    return out;
   }
 
   /** One settings row: label + 2 chord recorders + active-slot toggle. */

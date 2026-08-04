@@ -109,6 +109,11 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   // 0.78.1: task scheduling/assignment — Stashpad-managed, so clones /
   // templates must not carry someone else's due date or assignees.
   "due", "assignedTo", "assignedBy",
+  // 0.237.0: visual obscuring ("blurred until tapped"). Stashpad-managed, so a
+  // clone or template must not silently inherit someone else's hidden state —
+  // inheriting it the WRONG way (a note that should be blurred arriving
+  // un-blurred) is the failure that matters.
+  "obscured",
   // 0.86.3: sidebar pin state lives on the note (so it SYNCS with the note
   // across devices). Stashpad-managed; clones/templates must not inherit it.
   "pinned", "pinnedAt",
@@ -320,7 +325,12 @@ export type LogEventType =
   | "archive_migration"
   // 0.146.0: encryption / archive / trash lifecycle — previously surfaced only
   // as notifications; now also recorded in the per-folder action log.
-  | "lock" | "unlock" | "archive" | "restore";
+  | "lock" | "unlock" | "archive" | "restore"
+  // 0.227.0: a body edit that did NOT come from Stashpad — an external editor,
+  // Obsidian's own editor, or sync. Recorded because these are exactly the
+  // writes with no other trace: no command ran, so nothing else logs them, and
+  // they are the ones you want to see when frontmatter drifts.
+  | "external_edit";
 
 export interface LogEvent {
   ts: string;

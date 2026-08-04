@@ -409,6 +409,23 @@ export default class StashpadPlugin extends Plugin {
    *  matches `oldHex` (case-insensitive). When `newHex` is null, the
    *  color frontmatter is REMOVED entirely (note becomes uncolored).
    *  Returns the number of files updated. */
+  /** 0.238.0: the same recolour across EVERY Stashpad, not just one.
+   *
+   *  Colours mean the same thing vault-wide (red = urgent), so "change every
+   *  red note to orange" is a vault-level intent that previously had to be
+   *  repeated folder by folder. Returns the per-folder tally so the caller can
+   *  report WHERE things changed — a single total would hide the case where one
+   *  folder accounts for all of it. */
+  async recolorEverywhere(oldHex: string, newHex: string | null): Promise<{ total: number; byFolder: Record<string, number> }> {
+    const byFolder: Record<string, number> = {};
+    let total = 0;
+    for (const folder of this.discoverStashpadFolders()) {
+      const n = await this.recolorAllInFolder(folder, oldHex, newHex);
+      if (n > 0) { byFolder[folder] = n; total += n; }
+    }
+    return { total, byFolder };
+  }
+
   async recolorAllInFolder(folder: string, oldHex: string, newHex: string | null): Promise<number> {
     const f = folder.replace(/\/+$/, "");
     const wantOld = oldHex.toLowerCase();
@@ -586,6 +603,19 @@ export default class StashpadPlugin extends Plugin {
       repaired, scanned, skipped,
       undo: async () => { await this.restoreSnapshot(before); },
     };
+  }
+
+  /** 0.231.0: last folder set the settings definitions were built against.
+   *  `null` = never checked. */
+  private settingsFolderSignature: string | null = null;
+
+  /** Rebuild the cached setting definitions when the set of discovered
+   *  Stashpads has changed since they were last built. Cheap no-op otherwise. */
+  refreshSettingsIfStashpadsChanged(): void {
+    const sig = this.discoverStashpadFolders().join("\u0000");
+    if (sig === this.settingsFolderSignature) return;
+    this.settingsFolderSignature = sig;
+    this.settingTab?.update?.();
   }
 
   discoverStashpadFolders(): string[] {
@@ -1314,6 +1344,24 @@ export default class StashpadPlugin extends Plugin {
     // wiped the registry against an empty file index.
     this.settingTab = new StashpadSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
+    // 0.231.0: getSettingDefinitions() is called ONCE, here at registration,
+    // and the result is cached in the tab's `settingItems`. Any definition
+    // derived from the VAULT rather than from settings is therefore computed
+    // against a metadata cache that has not finished indexing yet — which is
+    // how the cross-Stashpad search-scope group baked in "No Stashpads found"
+    // permanently (0.229.0 regression: the pre-port code discovered folders
+    // inside a lazy render callback, so it never saw the cold cache).
+    //
+    // update() re-runs getSettingDefinitions() and replaces the cache, so one
+    // refresh once the cache is warm is all this needs. Signature-gated so a
+    // chatty "resolved" event doesn't rebuild the whole settings tree on every
+    // fire, and so a Stashpad created or deleted later is also picked up.
+    this.app.workspace.onLayoutReady(() => {
+      this.refreshSettingsIfStashpadsChanged();
+      this.registerEvent(
+        this.app.metadataCache.on("resolved", () => this.refreshSettingsIfStashpadsChanged()),
+      );
+    });
 
     // 0.83.2: load the persisted render cache before views open, so the
     // first cold paint can hit it instead of reading every body over the
@@ -2084,6 +2132,8 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-move-to-bottom", name: "Move note to bottom", callback: () => call("cmdMoveToBottom") });
     this.addCommand({ id: "stashpad-outdent", name: "Outdent (move to grandparent)", callback: () => call("cmdOutdent") });
     this.addCommand({ id: "stashpad-set-color", name: "Set note color…", callback: () => call("cmdSetColor") });
+    this.addCommand({ id: "stashpad-focus-list", name: "Focus the list (leave the composer)", callback: () => call("cmdFocusList") });
+    this.addCommand({ id: "stashpad-toggle-obscured", name: "Obscure / reveal note (blur \u2014 visual only, not encryption)", callback: () => call("cmdToggleObscured") });
     // "Clone / duplicate / copy" — three synonyms in the name so command-palette
     // fuzzy search hits regardless of which word the user reaches for.
     this.addCommand({ id: "stashpad-clone", name: "Clone selection (duplicate / copy notes)", callback: () => call("cmdClone") });

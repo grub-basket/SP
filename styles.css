@@ -1,3 +1,30 @@
+/* ============================================================
+   iPhone safe areas (0.239.0) — ONE definition, used everywhere.
+
+   WHY THIS KEPT BREAKING: every mobile surface hand-rolled its own
+   `env(safe-area-inset-*)` maths (or forgot it entirely), and in the desktop
+   simulator every inset resolves to 0px — so the layout looks correct in
+   testing and is wrong on the device, every time. Tokens make the correct
+   thing the default, and `scripts/obs-dev` can override them to fake a real
+   phone (see docs/mobile-safe-areas.md).
+
+   Obsidian sets --safe-area-inset-* itself and already ships
+   `viewport-fit=cover`, so prefer its value and fall back to env() for any
+   surface it does not cover (a popout window, an older build).
+
+   NOTE these are ZERO on desktop, so the tokens are safe to use
+   unconditionally — no .is-mobile gating needed.
+   ============================================================ */
+:root {
+  --sp-safe-top: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
+  --sp-safe-bottom: var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px));
+  --sp-safe-left: var(--safe-area-inset-left, env(safe-area-inset-left, 0px));
+  --sp-safe-right: var(--safe-area-inset-right, env(safe-area-inset-right, 0px));
+  /* Minimum comfortable touch target (Apple HIG). Used so a control never
+     ends up smaller than a fingertip just because a container got tight. */
+  --sp-tap-min: 44px;
+}
+
 /* ───────────────────────────────────────────────────────────────────────
    Deliberate CSS-lint exceptions (Obsidian community-plugin review)
 
@@ -1099,7 +1126,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
      runs to the edge — padding, not margin, so there is no blank gap under
      the sheet. env() adds the device safe-area on real phones; the 18px base
      provides the lift everywhere else. */
-  padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+  padding-bottom: calc(18px + var(--sp-safe-bottom));
 }
 @keyframes stashpad-sheet-up { from { transform: translateY(100%); } to { transform: translateY(0); } }
 .stashpad-breadcrumb-modal .stashpad-bc-levels { display: flex; flex-direction: column; gap: 2px; }
@@ -1696,11 +1723,78 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   object-fit: cover;
   display: block;
 }
-.stashpad-att-ext {
+/* 0.235.0: typed file badge — a coloured lucide glyph plus the extension.
+   The colour is an IDENTITY (PDF red, spreadsheets green) rather than a theme
+   value, so it survives a monochrome theme; it sits on a low-opacity tint of
+   itself, which stays legible on both light and dark backgrounds. */
+.stashpad-att-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  width: 100%;
+  height: 100%;
+  color: var(--stashpad-file-color, var(--text-muted));
+  background: color-mix(in srgb, var(--stashpad-file-color, transparent) 12%, transparent);
+  border-radius: 4px;
+}
+.stashpad-att-badge .svg-icon { width: 20px; height: 20px; }
+.stashpad-att-badge-ext {
   font-weight: 700;
-  font-size: 12px;
-  color: var(--text-normal);
-  letter-spacing: 0.5px;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  line-height: 1;
+}
+.stashpad-att.is-missing { opacity: 0.55; border-style: dashed; }
+
+/* --- rail layouts (0.235.0) --- */
+/* Compact: icon-only strip. Used when thumbnails would be too small to
+   recognise, so the space goes to MORE files rather than to smudges. */
+.stashpad-rail.is-compact .stashpad-att { width: 40px; height: 40px; padding: 2px; }
+.stashpad-rail.is-compact .stashpad-att-badge { gap: 0; }
+.stashpad-rail.is-compact .stashpad-att-badge .svg-icon { width: 16px; height: 16px; }
+.stashpad-rail.is-compact .stashpad-att-badge-ext { font-size: 7px; }
+
+/* File names: a vertical list, because a non-visual file is identified by its
+   name and a name needs a whole row to be readable. */
+.stashpad-rail.is-filename {
+  flex-direction: column;
+  flex-wrap: nowrap;
+  overflow-x: hidden;
+  gap: 2px;
+}
+.stashpad-rail.is-filename .stashpad-att {
+  flex-direction: row;
+  width: 100%;
+  height: auto;
+  min-height: 32px;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 4px 8px;
+  text-align: left;
+}
+.stashpad-rail.is-filename .stashpad-att-badge {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+}
+.stashpad-rail.is-filename .stashpad-att-badge .svg-icon { width: 14px; height: 14px; }
+.stashpad-rail.is-filename .stashpad-att-badge-ext { display: none; }
+.stashpad-rail.is-filename .stashpad-att-img {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+}
+.stashpad-rail.is-filename .stashpad-att-name {
+  font-size: var(--font-ui-smaller);
+  margin-top: 0;
+  -webkit-line-clamp: 1;
+  word-break: break-all;
+  text-align: left;
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .stashpad-att-name {
   font-size: 9px;
@@ -2324,7 +2418,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   width: 100%;
   max-width: none;
   margin: 0;
-  padding: 10px 8px calc(env(safe-area-inset-bottom, 0px) + 52px);
+  padding: 10px 8px calc(var(--sp-safe-bottom) + 52px);
 }
 .is-mobile .stashpad-split-view .stashpad-split-tabpanel.is-active .stashpad-split-cursor-ta {
   min-height: calc(1.5em * 6);
@@ -2375,8 +2469,8 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
      0.183.1: 20px shorter so the action bar stays clear of the keyboard. */
   min-height: calc(58vh - 20px);
   /* Notch/Dynamic-Island offset, a quarter shorter (0.75× the inset). */
-  margin-top: calc(env(safe-area-inset-top, 0px) * 0.75 + 8px);
-  max-height: calc(100% - env(safe-area-inset-top, 0px) - 32px);
+  margin-top: calc(var(--sp-safe-top) * 0.75 + 8px);
+  max-height: calc(100% - var(--sp-safe-top) - 32px);
   display: flex;
   flex-direction: column;
   border-radius: 0 0 14px 14px;
@@ -2593,53 +2687,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   margin-left: 4px;
 }
 
-/* Settings: cross-Stashpad search scope (one row per folder + pill) */
-.stashpad-folder-list {
-  display: flex;
-  flex-direction: column;
-  /* 0.121.2: 14px left/right inset so these custom rows align with the Setting
-     rows + section text (PROVISION insets text element types, not custom divs,
-     so the list was sitting flush against the modal edge). */
-  padding: 4px 14px 12px;
-}
-/* 0.95.2: placement overview group heading in settings */
-.stashpad-folder-placement-group {
-  margin-top: 10px;
-  /* 0.121.2: match the 14px inset of its rows + the section text above. */
-  padding-left: 14px;
-  padding-right: 14px;
-  font-size: var(--font-ui-smaller);
-  font-weight: var(--font-semibold);
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.stashpad-folder-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--background-modifier-border);
-}
-.stashpad-folder-row:last-child { border-bottom: 0; }
-.stashpad-folder-row-label {
-  flex: 1 1 auto;
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-small);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-normal);
-}
-.stashpad-folder-row-state {
-  font-size: var(--font-ui-smaller);
-  color: var(--text-muted);
-  min-width: 7ch;
-  text-align: right;
-}
-.stashpad-folder-row-state.is-excluded {
-  color: var(--text-error);
-}
+/* 0.229.0: the settings folder-row + pill CSS is gone. Both editors that used
+   it (cross-Stashpad search scope, folder-panel placement) are now declarative
+   definitions, so Obsidian renders the rows, headings, toggles and empty
+   states. Removed: .stashpad-folder-list, -row, -row:last-child, -row-label,
+   -row-state(.is-excluded), .stashpad-folder-placement-group. */
 
 /* Mobile-only UI tweaks. All selectors gated on .is-mobile so desktop
    stays untouched. Goal: reclaim vertical space, anchor the layout
@@ -2650,8 +2702,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    up but Obsidian seemed to shrink the leaf to compensate, leaving
    the composer sunken anyway. Pure margin on the composer just shifts
    that one element without changing the leaf's content height. */
+/* 0.239.0: + the home-indicator inset. 110px was tuned against a simulator
+   where the inset is 0, so on a real iPhone the composer sat that much closer
+   to the bottom edge than intended. */
 .stashpad-view.is-mobile .stashpad-composer {
-  margin-bottom: 110px;
+  margin-bottom: calc(110px + var(--sp-safe-bottom));
   /* When the textarea blurs (keyboard dismisses), Obsidian's leaf
      resize lags ~300ms behind the focus change — restoring the full
      lift instantly leaves the composer momentarily off-screen until
@@ -6971,3 +7026,455 @@ button.stashpad-btn-loading::after {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ============================================================
+   Media viewer (0.234.0) — large attachment preview with zoom,
+   rotation, pan and a rail of the note's other files.
+   ============================================================ */
+
+/* Near-fullscreen: the point of the viewer is pixels on the image, so the
+   modal's usual comfortable padding works against it. */
+.modal.stashpad-media-modal {
+  width: min(96vw, 1600px);
+  height: min(94vh, 1100px);
+  max-width: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.stashpad-media-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 0;
+  gap: 0;
+}
+
+.stashpad-media-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+.stashpad-media-caption {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.stashpad-media-name {
+  font-weight: var(--font-semibold);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stashpad-media-count {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  flex: 0 0 auto;
+}
+/* Toolbar row, between the stage and the rail. Centred so it reads as a
+   toolbar rather than as leftover header chrome. */
+.stashpad-media-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.stashpad-media-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-media-btn:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+.stashpad-media-zoom {
+  min-width: 4.5ch;
+  text-align: center;
+  font-size: var(--font-ui-smaller);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.stashpad-media-zoom:hover { color: var(--text-normal); }
+
+/* The stage clips the transformed image and owns every gesture. */
+.stashpad-media-stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--background-secondary);
+  cursor: default;
+  outline: none;
+  /* Stop the browser from claiming touch gestures we handle ourselves. */
+  touch-action: none;
+}
+.stashpad-media-stage.is-zoomed { cursor: grab; }
+.stashpad-media-stage.is-panning { cursor: grabbing; }
+
+/* transform-origin 0 0 is REQUIRED: the cursor-anchored zoom maths in
+   zoomAbout() solves for a translate applied at the element origin. With a
+   centred origin the image drifts on every wheel notch. */
+.stashpad-media-pan {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+.stashpad-media-img {
+  display: block;
+  /* Rotation only — pan/zoom live on the parent. */
+  transform-origin: center center;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* A placeholder fills the stage and centres itself, rather than being
+   positioned by the pan transform the images use. */
+.stashpad-media-pan.is-placeholder {
+  width: 100%;
+  height: 100%;
+}
+.stashpad-media-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px;
+  color: var(--text-muted);
+}
+.stashpad-media-ph-ext {
+  font-size: 2.4em;
+  font-weight: var(--font-bold);
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+.stashpad-media-ph-name {
+  font-size: var(--font-ui-small);
+  text-align: center;
+  word-break: break-word;
+  max-width: 40ch;
+}
+
+.stashpad-media-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--background-primary);
+  color: var(--text-muted);
+  opacity: 0.75;
+  cursor: pointer;
+  box-shadow: var(--shadow-s);
+}
+.stashpad-media-nav:hover { opacity: 1; color: var(--text-normal); }
+.stashpad-media-nav.is-prev { left: 10px; }
+.stashpad-media-nav.is-next { right: 10px; }
+
+.stashpad-media-rail {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-top: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+/* No rail (single attachment) → the toolbar is the last row, so it owns the
+   bottom padding instead of butting against the modal edge. */
+.stashpad-media-rail.is-hidden + .stashpad-media-actions,
+.stashpad-media-actions:last-child { padding-bottom: 10px; }
+.stashpad-media-rail.is-hidden { display: none; }
+.stashpad-media-railcell {
+  flex: 0 0 auto;
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-s);
+  border: 2px solid transparent;
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--background-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stashpad-media-railcell:hover { border-color: var(--background-modifier-border-hover); }
+.stashpad-media-railcell.is-active { border-color: var(--interactive-accent); }
+.stashpad-media-railimg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.stashpad-media-railext {
+  font-size: var(--font-ui-smaller);
+  font-weight: var(--font-semibold);
+  color: var(--text-faint);
+}
+
+/* Mobile: full-bleed, bigger touch targets, and the rail gets taller cells
+   because a 56px thumbnail is under the 44px comfortable-tap floor once the
+   gaps are accounted for. */
+/* 0.242.0: inset the MODAL, not each child.
+ *
+ * The previous version padded the header and the rail individually. That left
+ * two things wrong: Obsidian's own close button is positioned relative to the
+ * MODAL (top: 12px), so it stayed under the Dynamic Island no matter what I did
+ * to my own header; and the rail's background still ran to the physical bottom
+ * edge, so the bar read as sitting under the home indicator even though its
+ * cells cleared it.
+ *
+ * Shrinking the modal to the safe rectangle fixes both at once and is simply
+ * less to get wrong: nothing inside it can land in an unsafe zone, including
+ * chrome Obsidian owns. The stage loses its bleed into the notch area, which is
+ * correct — nothing should render there anyway. */
+.is-mobile .modal.stashpad-media-modal {
+  width: calc(100vw - var(--sp-safe-left) - var(--sp-safe-right));
+  max-width: calc(100vw - var(--sp-safe-left) - var(--sp-safe-right));
+  height: calc(100vh - var(--sp-safe-top) - var(--sp-safe-bottom));
+  max-height: calc(100vh - var(--sp-safe-top) - var(--sp-safe-bottom));
+  margin-top: var(--sp-safe-top);
+  margin-bottom: var(--sp-safe-bottom);
+  margin-left: var(--sp-safe-left);
+  margin-right: var(--sp-safe-right);
+  border-radius: 0;
+}
+/* Reclaim the empty 40px .modal-header Obsidian renders on mobile (the close
+   button is a SIBLING, so hiding it loses nothing) and its content padding. */
+.is-mobile .modal.stashpad-media-modal > .modal-header { display: none; }
+.is-mobile .modal.stashpad-media-modal > .modal-content.stashpad-media-root { padding: 0; }
+/* Keep the caption clear of the floating close button at top-right. Longhands
+   only — a `padding:` shorthand below this silently resets it. */
+.is-mobile .stashpad-media-header {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  padding-left: 12px;
+  padding-right: 60px;
+  /* Obsidian's close button is 44px tall at 12px from the modal top, so it
+     extends BELOW a 42px header and clips whatever the next row is (it was
+     sitting on the Details table's "Size" heading). Reserve its full height. */
+  min-height: 56px;
+  box-sizing: border-box;
+}
+.is-mobile .stashpad-media-rail { padding-bottom: 8px; }
+.is-mobile .stashpad-media-nav.is-prev { left: 10px; }
+.is-mobile .stashpad-media-nav.is-next { right: 10px; }
+.is-mobile .stashpad-media-btn { width: 40px; height: 40px; }
+.is-mobile .stashpad-media-nav { width: 44px; height: 44px; }
+.is-mobile .stashpad-media-railcell { width: 64px; height: 64px; }
+/* 0.239.0: was `padding: 10px 12px`, a SHORTHAND that sat below the
+   safe-area longhands and silently reset padding-top to 10px — so the caption
+   went straight back under the Dynamic Island. Longhands only in this file for
+   anything a safe-area token touches. */
+.is-mobile .stashpad-media-header { padding-bottom: 10px; }
+.is-mobile .stashpad-media-actions { gap: 6px; padding: 8px 10px; }
+
+/* PDF frame (0.236.0). Fills the stage; the embedded viewer owns its own
+   scrolling and zoom, so the pan wrapper stays at identity. */
+.stashpad-media-pan.is-frame { width: 100%; height: 100%; }
+.stashpad-media-pdf {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+  background: var(--background-primary);
+}
+.stashpad-media-btn.is-hidden,
+.stashpad-media-zoom.is-hidden { display: none; }
+
+/* ============================================================
+   Obscure + spoiler (0.237.0)
+
+   VISUAL ONLY. The text is still in the DOM, the file, search, sync and every
+   other plugin — this hides content from someone glancing at the screen and
+   nothing more. It is never presented as encryption anywhere in the UI.
+   ============================================================ */
+
+/* An obscured row: body blurred, chrome (timestamp, checkbox, menu) left
+   readable so the row is still operable without revealing it. */
+.stashpad-note.is-obscured .stashpad-note-body,
+.stashpad-note.is-obscured .stashpad-rail {
+  filter: blur(7px);
+  /* Blur alone leaves recognisable word SHAPES and colour; dropping contrast
+     removes the residual silhouette that makes short text guessable. */
+  opacity: 0.75;
+  user-select: none;
+  transition: filter 120ms ease, opacity 120ms ease;
+}
+.stashpad-note.is-obscured { cursor: pointer; }
+.stashpad-note.is-obscured .stashpad-note-body::selection { background: transparent; }
+/* A small persistent marker, so an obscured note is identifiable as
+   deliberately hidden rather than as a rendering glitch. */
+.stashpad-note.is-obscured .stashpad-note-meta-top::after {
+  content: "hidden";
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 4px;
+}
+
+/* Inline ||spoiler||. */
+.stashpad-spoiler {
+  filter: blur(5px);
+  background: var(--background-modifier-hover);
+  border-radius: 3px;
+  cursor: pointer;
+  user-select: none;
+  transition: filter 120ms ease;
+}
+.stashpad-spoiler.is-revealed {
+  filter: none;
+  background: transparent;
+  user-select: auto;
+}
+.stashpad-spoiler:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
+
+/* --- Viewer view modes (0.242.0): Viewer / Grid / Details ------------------ */
+/* The body holds EITHER the stage+rail or a browse surface, so switching mode
+   swaps one child rather than rebuilding the modal. */
+.stashpad-media-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.stashpad-media-stage.is-hidden { display: none; }
+.stashpad-media-browse {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--background-primary);
+}
+.stashpad-media-browse.is-hidden { display: none; }
+.stashpad-media-sep {
+  width: 1px;
+  height: 20px;
+  margin: 0 4px;
+  background: var(--background-modifier-border);
+}
+.stashpad-media-mode.is-active {
+  background: var(--background-modifier-hover);
+  color: var(--text-accent);
+}
+
+/* Grid: auto-fill so the column count follows the width instead of being a
+   fixed number that is wrong on one of phone/desktop. */
+.stashpad-media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 10px;
+  padding: 12px;
+}
+.stashpad-media-gridcell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  border-radius: var(--radius-s);
+  padding: 4px;
+}
+.stashpad-media-gridcell:hover { background: var(--background-modifier-hover); }
+.stashpad-media-gridcell.is-active { border-color: var(--interactive-accent); }
+.stashpad-media-gridcell.is-missing { opacity: 0.5; }
+.stashpad-media-gridthumb {
+  aspect-ratio: 1;
+  border-radius: var(--radius-s);
+  overflow: hidden;
+  background: var(--background-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stashpad-media-gridthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.stashpad-media-gridthumb.is-badge {
+  color: var(--stashpad-file-color, var(--text-muted));
+  background: color-mix(in srgb, var(--stashpad-file-color, transparent) 12%, var(--background-secondary));
+}
+.stashpad-media-gridthumb.is-badge .svg-icon { width: 34px; height: 34px; }
+.stashpad-media-gridname {
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Details: a real table of rows, Explorer-style. */
+.stashpad-media-details { display: flex; flex-direction: column; }
+.stashpad-media-detailrow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 8em 6em 11em;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-small);
+}
+.stashpad-media-detailrow.is-head {
+  cursor: default;
+  font-weight: var(--font-semibold);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  position: sticky;
+  top: 0;
+  background: var(--background-primary);
+  z-index: 1;
+}
+.stashpad-media-detailrow.is-head .stashpad-media-cell { cursor: pointer; }
+.stashpad-media-detailrow:not(.is-head):hover { background: var(--background-modifier-hover); }
+.stashpad-media-detailrow.is-active { background: var(--background-modifier-active-hover); }
+.stashpad-media-detailrow.is-missing { opacity: 0.55; }
+.stashpad-media-cell { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.stashpad-media-cell.is-name { display: flex; align-items: center; gap: 8px; }
+.stashpad-media-cell.is-size { text-align: right; font-variant-numeric: tabular-nums; }
+.stashpad-media-detailicon {
+  flex: 0 0 auto;
+  display: flex;
+  color: var(--stashpad-file-color, var(--text-muted));
+}
+.stashpad-media-detailicon .svg-icon { width: 16px; height: 16px; }
+
+/* Phone: drop the two least useful columns rather than squeezing four into
+   390px, where every one of them would be truncated to uselessness. */
+.is-mobile .stashpad-media-detailrow { grid-template-columns: minmax(0, 1fr) 5.5em; }
+.is-mobile .stashpad-media-cell.is-type,
+.is-mobile .stashpad-media-cell.is-modified { display: none; }
+.is-mobile .stashpad-media-grid { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); }
