@@ -779,7 +779,30 @@ export function mediaItemsFor(app: App, paths: string[]): MediaItem[] {
 /** True when this attachment should open in the viewer rather than a tab.
  *  Non-images still open in the viewer when they sit alongside images, so the
  *  rail stays complete — the viewer offers "Open in a new tab" for them. */
-export function viewerHandles(ext: string): boolean {
-  const e = ext.toLowerCase();
-  return VIEWER_IMG_EXT.has(e) || VIEWER_PDF_EXT.has(e);
+/** Parse the user's comma-separated extension list.
+ *
+ *  Deliberately forgiving about how it is typed: `pdf, .png,JPG` and
+ *  `.pdf,.png,.jpg` mean the same thing. Asking someone to remember whether a
+ *  dot is required is a rule with no upside — strip it, lowercase, trim, and
+ *  drop anything empty. Also accepts whitespace or semicolons as separators,
+ *  since those are the obvious near-misses. */
+export function parseExtList(raw: string): Set<string> {
+  return new Set(
+    (raw || "")
+      .split(/[,;\s]+/)
+      .map((e) => e.trim().toLowerCase().replace(/^\.+/, ""))
+      .filter(Boolean),
+  );
+}
+
+/** Extensions the viewer opens, as a set. Falls back to the built-in list when
+ *  the setting is blank, so clearing the field cannot leave the viewer dead. */
+export function viewerExtensions(raw: string): Set<string> {
+  const parsed = parseExtList(raw);
+  if (parsed.size > 0) return parsed;
+  return new Set([...VIEWER_IMG_EXT, ...VIEWER_PDF_EXT]);
+}
+
+export function viewerHandles(ext: string, raw: string): boolean {
+  return viewerExtensions(raw).has(ext.toLowerCase().replace(/^\.+/, ""));
 }

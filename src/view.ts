@@ -6182,13 +6182,18 @@ export class StashpadView extends ItemView {
 
       box.onclick = (e) => {
         e.stopPropagation();
-        if (!file) return;
+        if (!file) {
+          // 0.244.0: a click that silently does nothing reads as a broken
+          // button. The rail already dims a missing file; say why on click.
+          new Notice(`Attachment not found: ${p}`);
+          return;
+        }
         // 0.234.0: images open in the media viewer. 0.236.0: PDFs too, since
         // the viewer renders them inline now. Everything else keeps the
         // open-in-a-tab behaviour — a placeholder card is a worse answer than
         // the real thing. The viewer carries an "Open in a new tab" action, so
         // the previous behaviour is always one click away.
-        if (viewerHandles(ext) && getSettings().mediaViewerOnClick) {
+        if (viewerHandles(ext, getSettings().mediaViewerExtensions) && getSettings().mediaViewerOnClick) {
           new MediaViewerModal(this.app, mediaItemsFor(this.app, paths), paths.indexOf(p), (f) => {
             const ws = this.app.workspace; const prev = ws.activeLeaf;
             void ws.getLeaf("tab").openFile(f).then(() => { settleNewTab(ws, prev); });

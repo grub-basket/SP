@@ -572,6 +572,9 @@ export interface StashpadSettings {
   /** 0.235.0: how a note's attachment rail lays out. "auto" picks from the file
    *  mix and the rail's measured width. */
   attachmentRailMode: "auto" | "thumbnail" | "compact" | "filename";
+  /** 0.244.0: which extensions open in the media viewer. Comma-separated;
+   *  dots optional. Anything not listed opens in a tab as before. */
+  mediaViewerExtensions: string;
   /** 0.237.0: re-blur an obscured note when you navigate away or reload.
    *  On = Signal-like (reveal is momentary). Off = revealing sticks for the
    *  session. */
@@ -793,6 +796,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   composerAppendTrigger: true,
   mediaViewerOnClick: true,
   attachmentRailMode: "auto",
+  mediaViewerExtensions: "png, jpg, jpeg, gif, webp, svg, bmp, avif, pdf",
   obscureReHides: true,
   spoilerMarkup: true,
   bulkRecolorAllFolders: false,
@@ -1777,6 +1781,20 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
     cats.listDisplay.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
       () => this.plugin.settings.spoilerMarkup, (v) => { this.plugin.settings.spoilerMarkup = v; }, ["spoiler", "blur", "hide", "markup", "reveal"]));
+    cats.listDisplay.push(this.renderDef("File types that open in the media viewer", "Comma-separated list. Dots are optional — \u201cpdf, .png, JPG\u201d and \u201c.pdf,.png,.jpg\u201d both work. Anything not listed opens in a new tab instead (or in your default app, if Obsidian is set up that way). Leave blank to restore the built-in list.", (row) => {
+      row.addText((t) => {
+        t.setPlaceholder("png, jpg, pdf");
+        t.setValue(this.plugin.settings.mediaViewerExtensions);
+        // Persist on COMMIT (blur/Enter), not per keystroke — mid-typing a
+        // list is full of half-written extensions.
+        const el = (t as any).inputEl as HTMLInputElement;
+        el.addEventListener("blur", async () => {
+          this.plugin.settings.mediaViewerExtensions = el.value;
+          await set();
+        });
+        el.addEventListener("keydown", (e: KeyboardEvent) => { if (e.key === "Enter") el.blur(); });
+      });
+    }, ["media", "viewer", "extension", "file type", "pdf", "image", "open", "default app"]));
     cats.listDisplay.push(this.renderDef("Attachment layout", "How a note's attachments are laid out. Auto picks per note: thumbnails when the files are mostly images and there is room to see them, a compact icon strip when they would be too small to recognise, and a named list when they are mostly non-images (a spreadsheet is identified by its name, not a preview).", (row) => {
       row.addDropdown((dd) => {
         dd.addOption("auto", "Auto");

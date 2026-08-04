@@ -1739,7 +1739,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   background: color-mix(in srgb, var(--stashpad-file-color, transparent) 12%, transparent);
   border-radius: 4px;
 }
-.stashpad-att-badge .svg-icon { width: 20px; height: 20px; }
+.stashpad-att-badge .svg-icon { flex: 0 0 auto; width: 20px; height: 20px; }
 .stashpad-att-badge-ext {
   font-weight: 700;
   font-size: 9px;
@@ -7106,6 +7106,20 @@ button.stashpad-btn-loading::after {
   background: var(--background-modifier-hover);
   color: var(--text-normal);
 }
+/* 0.244.0: an <svg> inside a flex container is a flex ITEM, and with the
+   default flex-shrink it collapses to width 0 in a tight box — the icon keeps
+   its height, draws nothing, and every toolbar button reads as an empty grey
+   square. Sizing it explicitly (and refusing to shrink) is what the file-type
+   badges already did, which is why THOSE icons were visible while these were
+   not. Any new icon-in-a-flex-button needs this. */
+.stashpad-media-btn .svg-icon,
+.stashpad-media-nav .svg-icon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+}
+.is-mobile .stashpad-media-btn .svg-icon,
+.is-mobile .stashpad-media-nav .svg-icon { width: 20px; height: 20px; }
 .stashpad-media-zoom {
   min-width: 4.5ch;
   text-align: center;
@@ -7470,7 +7484,7 @@ button.stashpad-btn-loading::after {
   display: flex;
   color: var(--stashpad-file-color, var(--text-muted));
 }
-.stashpad-media-detailicon .svg-icon { width: 16px; height: 16px; }
+.stashpad-media-detailicon .svg-icon { flex: 0 0 auto; width: 16px; height: 16px; }
 
 /* Phone: drop the two least useful columns rather than squeezing four into
    390px, where every one of them would be truncated to uselessness. */
