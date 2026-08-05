@@ -6182,24 +6182,28 @@ export class StashpadView extends ItemView {
 
       box.onclick = (e) => {
         e.stopPropagation();
-        if (!file) {
-          // 0.244.0: a click that silently does nothing reads as a broken
-          // button. The rail already dims a missing file; say why on click.
-          new Notice(`Attachment not found: ${p}`);
-          return;
-        }
-        // 0.234.0: images open in the media viewer. 0.236.0: PDFs too, since
-        // the viewer renders them inline now. Everything else keeps the
-        // open-in-a-tab behaviour — a placeholder card is a worse answer than
-        // the real thing. The viewer carries an "Open in a new tab" action, so
-        // the previous behaviour is always one click away.
-        if (viewerHandles(ext, getSettings().mediaViewerExtensions) && getSettings().mediaViewerOnClick) {
+        // 0.245.0: the decision looks at the WHOLE note, not just this file.
+        // The viewer shows a rail of every attachment, so a zip sitting beside
+        // a photo should still open it — otherwise clicking the wrong tile
+        // strands you away from the rail you were reaching for.
+        const st = getSettings();
+        const siblingExts = paths.map((q) => q.split(".").pop() ?? "");
+        const openViewer = (): void => {
           new MediaViewerModal(this.app, mediaItemsFor(this.app, paths), paths.indexOf(p), (f) => {
             const ws = this.app.workspace; const prev = ws.activeLeaf;
             void ws.getLeaf("tab").openFile(f).then(() => { settleNewTab(ws, prev); });
           }).open();
-          return;
-        }
+        };
+        // 0.245.0: a MISSING file always opens the viewer. There is no file to
+        // open in a tab, and the viewer both explains what is wrong and gets
+        // you to the note's other attachments — strictly better than the
+        // notice this used to show, which left you where you started.
+        if (!file) { openViewer(); return; }
+        if (st.mediaViewerOnClick && viewerHandles(ext, {
+          excluded: st.mediaViewerExcludedExtensions,
+          allTypes: st.mediaViewerAllFileTypes,
+          siblingExts,
+        })) { openViewer(); return; }
         const ws = this.app.workspace; const prev = ws.activeLeaf;
         void ws.getLeaf("tab").openFile(file).then(() => { settleNewTab(ws, prev); });
       };

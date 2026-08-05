@@ -572,9 +572,17 @@ export interface StashpadSettings {
   /** 0.235.0: how a note's attachment rail lays out. "auto" picks from the file
    *  mix and the rail's measured width. */
   attachmentRailMode: "auto" | "thumbnail" | "compact" | "filename";
-  /** 0.244.0: which extensions open in the media viewer. Comma-separated;
-   *  dots optional. Anything not listed opens in a tab as before. */
-  mediaViewerExtensions: string;
+  /** 0.245.0: extensions that must NEVER open in the media viewer. Inverted
+   *  from 0.244.0's include-list — see the comment on viewerHandles. The old
+   *  `mediaViewerExtensions` key is deliberately dropped rather than migrated:
+   *  reading an include list as an exclude list would do exactly the wrong
+   *  thing to every type in it. */
+  mediaViewerExcludedExtensions: string;
+  /** 0.245.0: open the viewer for file types it cannot render either. Off by
+   *  default — a card is a weaker answer than the real app for, say, a .docx,
+   *  so this is opt-in. Note that even when off, an unrenderable file still
+   *  opens the viewer if a SIBLING attachment on the same note is renderable. */
+  mediaViewerAllFileTypes: boolean;
   /** 0.237.0: re-blur an obscured note when you navigate away or reload.
    *  On = Signal-like (reveal is momentary). Off = revealing sticks for the
    *  session. */
@@ -796,7 +804,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   composerAppendTrigger: true,
   mediaViewerOnClick: true,
   attachmentRailMode: "auto",
-  mediaViewerExtensions: "png, jpg, jpeg, gif, webp, svg, bmp, avif, pdf",
+  mediaViewerExcludedExtensions: "",
+  mediaViewerAllFileTypes: false,
   obscureReHides: true,
   spoilerMarkup: true,
   bulkRecolorAllFolders: false,
@@ -1055,7 +1064,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   private helpItems(): SettingDefinitionItem[] {
     const items: SettingDefinitionItem[] = [];
 
-    items.push(this.sectionDef("What Stashpad is", "", (host) => {
+    items.push(this.sectionDef("What this plugin is", "", (host) => {
       host.createEl("p", {
         text:
           "Stashpad turns a folder in your vault into a chat-style outliner: type a line, it becomes " +
@@ -1781,20 +1790,22 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
     cats.listDisplay.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
       () => this.plugin.settings.spoilerMarkup, (v) => { this.plugin.settings.spoilerMarkup = v; }, ["spoiler", "blur", "hide", "markup", "reveal"]));
-    cats.listDisplay.push(this.renderDef("File types that open in the media viewer", "Comma-separated list. Dots are optional — \u201cpdf, .png, JPG\u201d and \u201c.pdf,.png,.jpg\u201d both work. Anything not listed opens in a new tab instead (or in your default app, if Obsidian is set up that way). Leave blank to restore the built-in list.", (row) => {
+    cats.listDisplay.push(toggle("Open every file type in the media viewer", "Open the preview even for files it can't display \u2014 a .docx or a .zip shows a card with its type, size and date, plus a button to open it properly. Off by default, because for those files the real app is usually the better answer. Either way, a file it can't display still opens the viewer when another attachment on the same note can be previewed, so you never lose the row of files.",
+      () => this.plugin.settings.mediaViewerAllFileTypes, (v) => { this.plugin.settings.mediaViewerAllFileTypes = v; }, ["media", "viewer", "all", "file type", "unsupported", "preview"]));
+    cats.listDisplay.push(this.renderDef("File types to keep out of the media viewer", "Comma-separated list of extensions that should always open in a new tab (or your default app) instead of the preview. Dots are optional \u2014 \u201cpdf, .zip, DOCX\u201d works. Leave blank to exclude nothing.", (row) => {
       row.addText((t) => {
-        t.setPlaceholder("png, jpg, pdf");
-        t.setValue(this.plugin.settings.mediaViewerExtensions);
-        // Persist on COMMIT (blur/Enter), not per keystroke — mid-typing a
+        t.setPlaceholder("e.g. pdf, zip");
+        t.setValue(this.plugin.settings.mediaViewerExcludedExtensions);
+        // Persist on COMMIT (blur/Enter), not per keystroke — a half-typed
         // list is full of half-written extensions.
         const el = (t as any).inputEl as HTMLInputElement;
         el.addEventListener("blur", async () => {
-          this.plugin.settings.mediaViewerExtensions = el.value;
+          this.plugin.settings.mediaViewerExcludedExtensions = el.value;
           await set();
         });
         el.addEventListener("keydown", (e: KeyboardEvent) => { if (e.key === "Enter") el.blur(); });
       });
-    }, ["media", "viewer", "extension", "file type", "pdf", "image", "open", "default app"]));
+    }, ["media", "viewer", "exclude", "extension", "file type", "tab", "default app"]));
     cats.listDisplay.push(this.renderDef("Attachment layout", "How a note's attachments are laid out. Auto picks per note: thumbnails when the files are mostly images and there is room to see them, a compact icon strip when they would be too small to recognise, and a named list when they are mostly non-images (a spreadsheet is identified by its name, not a preview).", (row) => {
       row.addDropdown((dd) => {
         dd.addOption("auto", "Auto");
@@ -3263,8 +3274,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       // heading — the section became unidentifiable, which is exactly how a
       // stale empty state managed to look like a layout bug rather than a
       // missing list.
-      out.push(this.sectionDef("Cross-Stashpad Search Scope", "", (host) => {
-        new Setting(host).setName("Cross-Stashpad Search Scope").setHeading();
+      out.push(this.sectionDef("Cross-folder search scope", "", (host) => {
+        new Setting(host).setName("Cross-folder search scope").setHeading();
         host.createEl("p", { cls: "setting-item-description" }).setText(
           "No Stashpads found in this vault yet. See the “Help & Getting started” tab for what a Stashpad is and how to make your first one — or create one below.",
         );
@@ -3272,7 +3283,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     } else {
       out.push({
         type: "group",
-        heading: "Cross-Stashpad Search Scope",
+        heading: "Cross-folder search scope",
         // 1.13.1: a search box scoped to this group. Useful the moment someone
         // has more than a handful of Stashpads, which is exactly when scanning
         // the list by eye stops working.

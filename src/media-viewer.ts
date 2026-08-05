@@ -1,4 +1,4 @@
-import { App, Modal, TFile, setIcon } from "obsidian";
+import { App, Modal, Platform, TFile, setIcon } from "obsidian";
 import { fileKindFor } from "./file-kinds";
 
 /** How the viewer presents the note's files.
@@ -18,6 +18,28 @@ export const VIEWER_IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg
  *  browser's own PDF chrome (its page controls and zoom), so the viewer's zoom
  *  and rotate do not apply and are hidden for PDFs. */
 export const VIEWER_PDF_EXT = new Set(["pdf"]);
+/** Rendered as text. A LIST rather than byte-sniffing: wrongly painting a
+ *  binary as text is far more jarring than showing a file card. */
+export const VIEWER_TEXT_EXT = new Set([
+  "md", "txt", "csv", "tsv", "log", "json", "yaml", "yml", "toml", "xml",
+  "html", "css", "scss", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "rb",
+  "go", "rs", "java", "c", "h", "cpp", "sh", "swift", "kt", "php", "sql",
+  "ini", "conf", "env", "srt", "vtt",
+]);
+
+/** True when the viewer can actually RENDER this extension (image, PDF or
+ *  text) as opposed to only describing it on a card. */
+export function viewerRenders(ext: string): boolean {
+  const e = ext.toLowerCase().replace(/^\.+/, "");
+  return VIEWER_IMG_EXT.has(e) || VIEWER_PDF_EXT.has(e) || VIEWER_TEXT_EXT.has(e);
+}
+
+/** How much text the preview shows before collapsing. Smaller on a phone:
+ *  2000 characters is roughly 25 lines on a 390px screen, which is a wall of
+ *  text rather than a preview. */
+export function textPreviewChars(isMobile: boolean): number {
+  return isMobile ? 800 : 2000;
+}
 
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 40;
@@ -224,9 +246,12 @@ export class MediaViewerModal extends Modal {
     if (!item.file) {
       // Broken link — say so rather than showing an empty stage that reads as
       // a rendering bug.
+      // 0.245.0: a broken link opens the viewer like anything else rather than
+      // bouncing the click — the modal is where you find out WHY it is broken,
+      // and it is also how you reach the rest of the note's files.
       const miss = this.panEl.createDiv({ cls: "stashpad-media-placeholder" });
-      miss.createDiv({ cls: "stashpad-media-ph-ext", text: "!" });
-      miss.createDiv({ cls: "stashpad-media-ph-name", text: `Missing: ${item.path}` });
+      this.renderFileFacts(miss, null, item.path.split(".").pop() ?? "");
+      miss.createDiv({ cls: "stashpad-media-ph-name", text: item.path });
       this.sized = true;
       this.scale = 1; this.tx = 0; this.ty = 0;
       this.panEl.addClass("is-placeholder");
@@ -276,10 +301,12 @@ export class MediaViewerModal extends Modal {
       this.scale = 1; this.tx = 0; this.ty = 0;
       this.panEl.addClass("is-frame");
       this.applyTransform();
+    } else if (VIEWER_TEXT_EXT.has(ext)) {
+      void this.showTextPreview(item.file, ext);
     } else {
-      // Non-image, non-PDF: a labelled placeholder plus the escape hatch.
+      // Non-image, non-PDF, non-text: a labelled card plus the escape hatch.
       const ph = this.panEl.createDiv({ cls: "stashpad-media-placeholder" });
-      ph.createDiv({ cls: "stashpad-media-ph-ext", text: ext.toUpperCase() || "?" });
+      this.renderFileFacts(ph, item.file, ext);
       ph.createDiv({ cls: "stashpad-media-ph-name", text: name });
       const open = ph.createEl("button", { cls: "mod-cta", text: "Open in a new tab" });
       open.onclick = (e) => {
@@ -296,6 +323,78 @@ export class MediaViewerModal extends Modal {
       this.applyTransform();
     }
     this.paintRailSelection();
+  }
+
+  /** Text slide: a first-class stage alongside image and PDF, so prev/next and
+   *  the rail land on it normally instead of it being a special case.
+   *
+   *  Sliced BEFORE it reaches the DOM — dropping a multi-megabyte log into a
+   *  <pre> in one go is what makes a viewer feel broken, and a preview is for
+   *  recognition, not reading. Expanded, the text SCROLLS inside its own box
+   *  rather than growing the modal, so the toolbar and rail stay put. */
+  private async showTextPreview(file: TFile, ext: string): Promise<void> {
+    const cap = textPreviewChars(Platform.isMobile);
+    const wrap = this.panEl.createDiv({ cls: "stashpad-media-textwrap" });
+    this.renderFileFacts(wrap, file, ext);
+    const pre = wrap.createEl("pre", { cls: "stashpad-media-text" });
+    const code = pre.createEl("code");
+    code.setText("Loading\u2026");
+    // Transform controls act on mediaEl; a text slide has none, so they hide
+    // themselves exactly as they do for a PDF.
+    this.mediaEl = null;
+    this.sized = true;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.panEl.addClass("is-frame");
+    this.applyTransform();
+
+    let raw = "";
+    try { raw = await this.app.vault.cachedRead(file); }
+    catch { code.setText("Couldn't read this file."); return; }
+    // The user may have navigated while the read was in flight.
+    if (this.current()?.path !== file.path) return;
+
+    const truncated = raw.length > cap;
+    let expanded = false;
+    const paint = (): void => { code.setText(expanded || !truncated ? raw : raw.slice(0, cap)); };
+    paint();
+    if (!truncated) return;
+
+    const bar = wrap.createDiv({ cls: "stashpad-media-textmore" });
+    const btn = bar.createEl("button", { cls: "stashpad-media-textbtn" });
+    const count = bar.createSpan({ cls: "stashpad-media-textcount" });
+    const sync = (): void => {
+      btn.setText(expanded ? "Show less" : "Show all");
+      count.setText(expanded
+        ? `${raw.length.toLocaleString()} characters`
+        : `showing ${cap.toLocaleString()} of ${raw.length.toLocaleString()}`);
+    };
+    sync();
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      expanded = !expanded;
+      paint();
+      sync();
+      if (!expanded) pre.scrollTop = 0;
+    };
+  }
+
+  /** Name / type / size / modified for a file the viewer cannot show as an
+   *  image. Shared by the text slide, the generic card and the missing-file
+   *  case so all three say the same things in the same order. */
+  private renderFileFacts(host: HTMLElement, file: TFile | null, ext: string): void {
+    const kind = fileKindFor(ext);
+    const strip = host.createDiv({ cls: "stashpad-media-facts" });
+    const icon = strip.createDiv({ cls: "stashpad-media-factsicon" });
+    icon.style.setProperty("--stashpad-file-color", kind.color);
+    setIcon(icon, kind.icon);
+    const meta = strip.createDiv({ cls: "stashpad-media-factsmeta" });
+    meta.createDiv({ cls: "stashpad-media-factstype", text: file ? kind.label : "Missing file" });
+    meta.createDiv({
+      cls: "stashpad-media-factsline",
+      text: file
+        ? `${formatBytes(file.stat.size)} \u00b7 modified ${formatWhen(file.stat.mtime)}`
+        : "This attachment could not be found in the vault.",
+    });
   }
 
   // ---------- view modes ----------
@@ -803,6 +902,28 @@ export function viewerExtensions(raw: string): Set<string> {
   return new Set([...VIEWER_IMG_EXT, ...VIEWER_PDF_EXT]);
 }
 
-export function viewerHandles(ext: string, raw: string): boolean {
-  return viewerExtensions(raw).has(ext.toLowerCase().replace(/^\.+/, ""));
+/** Should a click on `ext` open the viewer, given the note's OTHER attachments?
+ *
+ *  The rule is about the NOTE, not the clicked file. The viewer shows a rail of
+ *  everything attached to that note, so if a zip sits beside a photo, opening
+ *  the zip in a tab strands you away from the rail you were reaching for.
+ *
+ *  Order matters:
+ *   1. an explicitly EXCLUDED type never opens the viewer — that is the opt-out
+ *   2. `allTypes` on: everything else opens it
+ *   3. otherwise: open when the clicked file is renderable, OR any sibling
+ *      attachment on the same note is
+ */
+export function viewerHandles(
+  ext: string,
+  opts: { excluded: string; allTypes: boolean; siblingExts?: string[] },
+): boolean {
+  const e = ext.toLowerCase().replace(/^\.+/, "");
+  if (parseExtList(opts.excluded).has(e)) return false;
+  if (opts.allTypes) return true;
+  if (viewerRenders(e)) return true;
+  return (opts.siblingExts ?? []).some((x) => {
+    const s2 = x.toLowerCase().replace(/^\.+/, "");
+    return !parseExtList(opts.excluded).has(s2) && viewerRenders(s2);
+  });
 }

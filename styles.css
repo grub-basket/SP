@@ -7492,3 +7492,89 @@ button.stashpad-btn-loading::after {
 .is-mobile .stashpad-media-cell.is-type,
 .is-mobile .stashpad-media-cell.is-modified { display: none; }
 .is-mobile .stashpad-media-grid { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); }
+
+/* --- Text slide + file facts (0.245.0) ----------------------------------- */
+.stashpad-media-textwrap {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  box-sizing: border-box;
+  min-height: 0;
+}
+
+/* Identity strip: what this file IS, above whatever preview follows. */
+.stashpad-media-facts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.stashpad-media-factsicon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-s);
+  color: var(--stashpad-file-color, var(--text-muted));
+  background: color-mix(in srgb, var(--stashpad-file-color, transparent) 12%, transparent);
+}
+/* 0.244.0 lesson: an svg in a flex box shrinks to width 0 without this. */
+.stashpad-media-factsicon .svg-icon { flex: 0 0 auto; width: 18px; height: 18px; }
+.stashpad-media-factsmeta { min-width: 0; }
+.stashpad-media-factstype { font-weight: var(--font-semibold); }
+.stashpad-media-factsline {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+/* The preview SCROLLS INSIDE ITSELF. Expanding must never grow the modal, or
+   the toolbar and rail shift under the reader mid-sentence — which is the one
+   thing an expander must not do. */
+.stashpad-media-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  tab-size: 2;
+}
+.stashpad-media-text code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+  color: var(--text-normal);
+}
+.stashpad-media-textmore {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.stashpad-media-textbtn {
+  padding: 3px 10px;
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+.stashpad-media-textcount {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The generic file card reuses the facts strip, so it no longer needs the old
+   big-extension block. */
+.stashpad-media-placeholder .stashpad-media-facts { margin-bottom: 4px; }
+
+.is-mobile .stashpad-media-textwrap { padding: 10px; gap: 6px; }
+.is-mobile .stashpad-media-text { font-size: var(--font-ui-small); }
