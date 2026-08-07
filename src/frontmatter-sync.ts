@@ -282,7 +282,10 @@ export class FrontmatterSyncQueue {
   private computeChildrenLinks(node: TreeNode): string[] {
     const tree = this.getTree();
     return tree.getChildren(node.id)
-      .filter((c) => !!c.file)
+      // Must match rebootstrapFolderFrontmatter's exclusion exactly: the home
+      // note is its own parent by id, and if one writer emits the self-link
+      // while the other strips it, every move rewrites the home note forever.
+      .filter((c) => !!c.file && c.id !== node.id)
       .map((c) => wikilinkFor(c.file!.path));
   }
 }
@@ -304,6 +307,7 @@ export class FrontmatterSyncQueue {
 export async function rebootstrapFolderFrontmatter(
   app: App,
   folder: string,
+  opts?: { onlyIds?: ReadonlySet<string> },
 ): Promise<{ checked: number; written: number }> {
   type Entry = { file: TFile; id: string; parent: string };
 
@@ -339,6 +343,10 @@ export async function rebootstrapFolderFrontmatter(
     const childIds = childrenByParent.get(entry.id) ?? [];
     const links: string[] = [];
     for (const cid of childIds) {
+      // The home note's own `parent` is ROOT_ID, which is also its id — so a
+      // naive adjacency lookup makes it its own child and writes a recovery
+      // link pointing back at the note you're already reading.
+      if (cid === entry.id) continue;
       const e = byId.get(cid);
       if (e) links.push(linkForEntry(e));
     }
@@ -349,6 +357,13 @@ export async function rebootstrapFolderFrontmatter(
   let checked = 0;
   let written = 0;
   for (const entry of byId.values()) {
+    // Targeted mode: the whole folder is still INDEXED (children lists
+    // and parent links can only be computed from the complete adjacency
+    // map, and that's metadata-cache only — no file IO), but only the
+    // ids the caller named are candidates for a write. A cross-folder
+    // move dirties a handful of notes; rewriting the folder is what made
+    // one move look like a whole-folder re-upload to Obsidian Sync.
+    if (opts?.onlyIds && !opts.onlyIds.has(entry.id)) continue;
     checked += 1;
     const desiredParent = computeParent(entry);
     const desiredChildren = computeChildren(entry);

@@ -9362,13 +9362,32 @@ export class StashpadView extends ItemView {
     // moved note's parentLink + the new parent's children). Deferred so the
     // metadata cache reflects the move; skip-if-equal so it only writes what
     // changed; honours the writeRecoveryLinks setting.
-    if (getSettings().writeRecoveryLinks) {
-      const sourceFolder = this.noteFolder;
-      window.setTimeout(() => {
-        void rebootstrapFolderFrontmatter(this.app, sourceFolder);
-        void rebootstrapFolderFrontmatter(this.app, targetDir);
-      }, 350);
+    // 0.253.0: this used to rebootstrap BOTH folders in full. Correct, but it
+    // meant one move rewrote the frontmatter of every stale note in both
+    // folders — archived subtrees included — and every one of those writes is
+    // a file Obsidian Sync re-uploads. The set of notes a move can actually
+    // dirty is small and known here, so name it: the moved notes (their
+    // parentLink and children now point across a folder boundary), the parents
+    // they left, and the parent they joined. ROOT stands in for "top level",
+    // whose children list lives on the home note.
+    const sourceFolder = this.noteFolder;
+    const affectedIds = new Set<string>(plan.map((p) => p.id));
+    affectedIds.add(newParentId);
+    for (const p of plan) {
+      if (p.isRoot) affectedIds.add(p.oldParent ?? ROOT_ID);
     }
+    // Both folders get the same id set: which side a given note is on flips
+    // with undo/redo, and an id that isn't in a folder simply isn't found
+    // there. The setting is read at call time, not captured, so turning
+    // recovery links off later also silences the undo path.
+    const repairMovedLinks = (): void => {
+      if (!getSettings().writeRecoveryLinks) return;
+      window.setTimeout(() => {
+        void rebootstrapFolderFrontmatter(this.app, sourceFolder, { onlyIds: affectedIds });
+        void rebootstrapFolderFrontmatter(this.app, targetDir, { onlyIds: affectedIds });
+      }, 350);
+    };
+    repairMovedLinks();
 
     // 0.91.2: name the moved notes from the pre-move `sources` (they're gone
     // from this folder's tree after the move, so the old tree.get() lookup
@@ -9422,6 +9441,7 @@ export class StashpadView extends ItemView {
         }
         this.tree.rebuild(this.noteFolder);
         this.render();
+        repairMovedLinks();
       },
       redo: async () => {
         for (const p of plan) {
@@ -9436,6 +9456,7 @@ export class StashpadView extends ItemView {
         }
         this.tree.rebuild(this.noteFolder);
         this.render();
+        repairMovedLinks();
       },
     });
   }
