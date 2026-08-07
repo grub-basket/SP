@@ -253,6 +253,9 @@ export interface StashpadSettings {
    *  honor Obsidian's "Excluded files" (userIgnoreFilters), so exclusions
    *  are managed in one place. `.edtz` is always excluded regardless. */
   inheritObsidianExclusions: boolean;
+  /** 0.254.0: type `/` in the composer or the note editor to run a Stashpad
+   *  command from a popup, instead of reaching for a chord or the palette. */
+  slashCommands: boolean;
   /** 0.86.2: folder panel — fraction of height given to the Pinned section
    *  (the rest goes to Folders). Set by dragging the divider. 0.15–0.85. */
   folderPanelPinnedFraction: number;
@@ -735,6 +738,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   enablePerfProfiling: false,
   debugTrace: false,
   writeRecoveryLinks: true,
+  slashCommands: true,
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
   splitOnLines: false,
@@ -1827,6 +1831,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.mediaViewerOnClick, (v) => { this.plugin.settings.mediaViewerOnClick = v; }, ["image", "media", "viewer", "lightbox", "preview", "zoom", "attachment"]));
     cats.composerCopy.push(toggle('Type "+" to append to an existing note', 'Typing + as the only character in an empty composer opens the note picker. Pick a note and what you send next is appended to the bottom of that note\'s body on a new line, instead of creating a new note. The target clears after one send. Dismissing the picker leaves the + as ordinary text, so markdown "+ " bullets still work. On by default.',
       () => this.plugin.settings.composerAppendTrigger, (v) => { this.plugin.settings.composerAppendTrigger = v; }, ["append", "plus", "existing", "composer", "add"]));
+    cats.composerCopy.push(toggle('Type "/" to run a command', 'Start a line with / in the composer or the note editor to search Stashpad\'s commands and run one — the same commands as the palette, without leaving the keyboard. The / is removed when the command runs, and Escape dismisses the list leaving it as ordinary text. Only at the start of a line, so a / mid-sentence stays a / . On by default.',
+      () => this.plugin.settings.slashCommands, (v) => { this.plugin.settings.slashCommands = v; }, ["slash", "command", "composer", "palette", "shortcut"]));
     cats.composerCopy.push(toggle("Split a pasted checklist into separate tasks", 'When every line of what you submit is a checkbox — "- [ ] milk", "[x] eggs" — create one task per line instead of a single note. Applies even when "split on newlines" is off. On by default.',
       () => this.plugin.settings.splitCheckboxLines, (v) => { this.plugin.settings.splitCheckboxLines = v; }, ["checkbox", "task", "split", "paste", "checklist"]));
     cats.movingNotes.push(toggle("Open the new parent in a background tab after moving a note IN", "When you nest a note into another note, open that parent in a background Stashpad tab so its new home is one click away — without stealing focus from what you're doing. Skipped when the destination is Home or already open in a tab. On by default.",

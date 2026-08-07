@@ -6448,6 +6448,14 @@ export class StashpadView extends ItemView {
     // Enter mode takes effect without a rebuild).
     this.composerAutocomplete = new ComposerAutocomplete(this.app, ta, {
       insertsNewline: (e) => !(this.modeEnterSubmits ? !e.shiftKey : e.shiftKey),
+    }, (text) => {
+      // Slash command about to run: persist the composer NOW. Many commands
+      // write settings, and the settings-change handler reconciles the
+      // composer against the last persisted draft — with the debounced save
+      // still pending, that reconciliation can restore an older draft over
+      // what the user just typed.
+      this.composerDraft = text;
+      void this.saveDraft(text);
     });
     this.composerAutocomplete.attach();
 

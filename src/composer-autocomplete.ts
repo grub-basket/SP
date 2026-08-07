@@ -1,6 +1,6 @@
-import { App, Scope, TFile } from "obsidian";
-import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore } from "./types";
-import { getSettings } from "./settings";
+import { App, Scope, TFile, moment } from "obsidian";
+import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore, siftMatch } from "./types";
+import { getSettings, getTemplatesFormats } from "./settings";
 import { MarkdownInput, type MarkdownInputOptions } from "./markdown-input";
 
 /**
@@ -66,6 +66,63 @@ function frontmatterAliases(app: App, file: TFile): string[] {
     .filter((a) => a && !seen.has(a.toLowerCase()) && seen.add(a.toLowerCase()));
 }
 
+/** Relative date phrases offered by the `@` trigger, with the day offset each
+ *  one resolves to. The point of the catalogue is PARTIAL matching: typing
+ *  `@yest` should show "yesterday" *and the date it resolves to* before the
+ *  word is finished. Resolving the partial string directly can't do that —
+ *  "yest" is not a date to any parser — so the phrase list is matched on the
+ *  prefix and the resolution happens against the full phrase.
+ *
+ *  Offsets are in days from today. Phrases whose meaning isn't a fixed offset
+ *  (weekday names, "in 3 weeks") carry a null offset: they're still listed for
+ *  discovery, and resolution is left to the Natural Language Dates plugin,
+ *  which handles them properly. */
+const DATE_PHRASES: Array<{ phrase: string; days: number | null }> = [
+  { phrase: "today", days: 0 },
+  { phrase: "tomorrow", days: 1 },
+  { phrase: "yesterday", days: -1 },
+  { phrase: "next week", days: 7 },
+  { phrase: "last week", days: -7 },
+  { phrase: "in 2 days", days: 2 },
+  { phrase: "in 3 days", days: 3 },
+  { phrase: "in a week", days: 7 },
+  { phrase: "in two weeks", days: 14 },
+  { phrase: "next month", days: null },
+  { phrase: "last month", days: null },
+  { phrase: "the day after tomorrow", days: 2 },
+  { phrase: "the day before yesterday", days: -2 },
+  { phrase: "next monday", days: null },
+  { phrase: "next tuesday", days: null },
+  { phrase: "next wednesday", days: null },
+  { phrase: "next thursday", days: null },
+  { phrase: "next friday", days: null },
+  { phrase: "next saturday", days: null },
+  { phrase: "next sunday", days: null },
+  { phrase: "last friday", days: null },
+  { phrase: "end of week", days: null },
+  { phrase: "end of month", days: null },
+];
+
+/** Commands withheld from the `/` popup.
+ *
+ *  The bar for exclusion is "running this from a half-typed line is
+ *  incoherent", not "this is dangerous" — destructive commands are undoable
+ *  and belong here as much as anywhere. Kept deliberately short: the list is
+ *  meant to grow from real use, not from guesses about what might feel odd.
+ *
+ *  - the palettes: you are already in a command picker.
+ *  - focus-the-list: the slash popup lives in a text field, so the command
+ *    that leaves the text field cannot be driven from inside it sensibly. */
+const SLASH_EXCLUDED = new Set<string>([
+  "stashpad:stashpad-command-palette",
+  "stashpad:stashpad-focus-list",
+]);
+
+/** Callable view of Obsidian's `moment` export (typed as a namespace). */
+const momentFn = moment as unknown as (...args: unknown[]) => {
+  add: (n: number, unit: string) => { format: (f: string) => string };
+};
+
 export class ComposerAutocomplete {
   private popupEl: HTMLDivElement | null = null;
   private items: SuggestItem[] = [];
@@ -98,6 +155,15 @@ export class ComposerAutocomplete {
     /** Passed through to MarkdownInput — chiefly `insertsNewline`, which tells
      *  list continuation whether THIS Enter makes a newline or submits. */
     private inputOpts: MarkdownInputOptions = {},
+    /** 0.254.0: called right after the `/` trigger text is removed and just
+     *  before the chosen command runs, with the composer's resulting text.
+     *
+     *  It exists so the host can PERSIST that text synchronously. Draft saving
+     *  is debounced (250ms), and a command that writes settings broadcasts a
+     *  change whose handler reconciles the composer against the last PERSISTED
+     *  draft — so without this flush, running a command within a moment of
+     *  typing can restore an older draft over what you just wrote. */
+    private onBeforeCommand: ((text: string) => void) | null = null,
   ) {}
 
   attach(): void {
@@ -272,6 +338,25 @@ export class ComposerAutocomplete {
     // auto-closing the moment the query outgrows one. The bare `@` opens
     // immediately (NLD-style); the popup self-closes once the query matches
     // neither a date nor any note.
+    // 0.254.0: slash commands. `/` at the very start of a line (not merely
+    // after any whitespace) then an optional query. Start-of-line is the
+    // deliberate restriction: `/` is ordinary text mid-sentence — dates,
+    // paths, and/or — and a popup that appeared on every one of those would
+    // be a nuisance rather than a feature. Bounded to 32 chars so a long
+    // path-ish line closes the popup instead of leaving it hanging.
+    const slashMatch = getSettings().slashCommands
+      ? before.match(/(?:^|\n)\/([^\n]{0,32})$/)
+      : null;
+    if (slashMatch) {
+      const query = slashMatch[1];
+      return {
+        kind: "command",
+        query,
+        replaceStart: caret - query.length - 1, // include the `/`
+        replaceEnd: caret,
+      };
+    }
+
     const atMatch = before.match(/(^|\s)@([^\n@[#]{0,24})$/);
     if (atMatch) {
       const query = atMatch[2];
@@ -330,6 +415,51 @@ export class ComposerAutocomplete {
     return null;
   }
 
+  /** Resolve one of the catalogue's fixed-offset phrases without any plugin.
+   *  Uses the core Templates plugin's date format when the user has set one,
+   *  so a built-in preview reads the same as the rest of their vault, and
+   *  falls back to ISO. Null for phrases whose offset isn't fixed — those need
+   *  a real parser, and NLD is asked first anyway. */
+  private builtinDate(days: number | null): string | null {
+    if (days === null) return null;
+    const fmt = getTemplatesFormats(this.app)?.dateFormat || "YYYY-MM-DD";
+    try { return momentFn().add(days, "days").format(fmt); } catch { return null; }
+  }
+
+  /** Date preview for a catalogue phrase: NLD if it's installed (it honours
+   *  the user's NLD format + link settings), otherwise the built-in offset. */
+  private resolvePhrase(phrase: string, days: number | null):
+    { formatted: string; asLink: boolean } | null {
+    const viaNld = this.nldResolve(phrase);
+    if (viaNld) return viaNld;
+    const built = this.builtinDate(days);
+    return built ? { formatted: built, asLink: false } : null;
+  }
+
+  /** Stashpad commands offered by the `/` trigger, Sift-matched against the
+   *  query. Built from Obsidian's command registry exactly as the Stashpad
+   *  command palette does (`stashpad:` prefix, "Stashpad: " label stripped),
+   *  so a new command shows up here for free with no second catalogue to
+   *  maintain.
+   *
+   *  A few are held back — see SLASH_EXCLUDED. */
+  private commandItems(query: string): SuggestItem[] {
+    const registry: Record<string, { name?: string }> =
+      (this.app as unknown as { commands?: { commands?: Record<string, { name?: string }> } })
+        .commands?.commands ?? {};
+    const run = (id: string) => (): void => {
+      (this.app as unknown as { commands?: { executeCommandById?: (i: string) => void } })
+        .commands?.executeCommandById?.(id);
+    };
+    return Object.keys(registry)
+      .filter((id) => id.startsWith("stashpad:") && !SLASH_EXCLUDED.has(id))
+      .map((id) => ({ id, name: (registry[id]?.name ?? id).replace(/^(?:\s*Stashpad:\s*)+/i, "").trim() }))
+      .filter((c) => siftMatch(query, c.name))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, 40)
+      .map((c) => ({ label: `⚡ ${c.name}`, insert: "", subtitle: "", run: run(c.id) }));
+  }
+
   // ---------- Suggest generation ----------
 
   private buildItems(state: AutocompleteState): SuggestItem[] {
@@ -375,6 +505,9 @@ export class ComposerAutocomplete {
       // 0.73.3: cap bumped 30 → 50 now that the index includes every file type.
       return fileMatches(50);
     }
+    if (state.kind === "command") {
+      return this.commandItems(q);
+    }
     if (state.kind === "tag") {
       // Tag autocomplete: same all-tokens rule, against the pre-sorted (by
       // usage count) tag list.
@@ -391,16 +524,32 @@ export class ComposerAutocomplete {
     // setting is on — inherited so `@today` matches what NLD would insert.
     const dateInsert = (r: { formatted: string; asLink: boolean }): string =>
       state.inLink || r.asLink ? `[[${r.formatted}]]` : r.formatted;
-    if (q === "") {
-      // Bare `@`: offer a few common relatives (NLD-style). Absent NLD, this
-      // yields nothing and we fall through to a short note list below.
-      for (const phrase of ["today", "tomorrow", "next week"]) {
-        const r = this.nldResolve(phrase);
-        if (r) dateItems.push({ label: `📅 ${phrase}`, insert: dateInsert(r), subtitle: `→ ${r.formatted}` });
-      }
-    } else {
-      const r = this.nldResolve(state.query);
-      if (r) dateItems.push({ label: `📅 ${state.query.trim()}`, insert: dateInsert(r), subtitle: `→ ${r.formatted}` });
+    // 0.254.0: the catalogue is what makes a HALF-TYPED phrase previewable.
+    // Parsing the raw query only ever resolved a complete phrase, so `@yest`
+    // showed nothing and you had to finish the word on faith. Now the query is
+    // matched against the phrase list and each hit is shown with the date it
+    // resolves to, so you can read the answer before committing to it.
+    const seenPhrases = new Set<string>();
+    const pushPhrase = (phrase: string, r: { formatted: string; asLink: boolean }): void => {
+      if (seenPhrases.has(phrase)) return;
+      seenPhrases.add(phrase);
+      dateItems.push({ label: `📅 ${phrase}`, insert: dateInsert(r), subtitle: `→ ${r.formatted}` });
+    };
+    // An exact parse of what the user actually typed always ranks first — it
+    // covers everything the catalogue can't ("3rd of next month", "in 45 min").
+    if (q !== "") {
+      const exact = this.nldResolve(state.query);
+      if (exact) pushPhrase(state.query.trim(), exact);
+    }
+    // Then catalogue phrases the query is a prefix of (bare `@` shows the head
+    // of the list). Prefix, not all-tokens: typing `t` should suggest "today"
+    // and "tomorrow", not every phrase containing a `t`.
+    const phraseLimit = q === "" ? 4 : 8;
+    for (const { phrase, days } of DATE_PHRASES) {
+      if (dateItems.length >= phraseLimit) break;
+      if (q !== "" && !phrase.startsWith(q)) continue;
+      const r = this.resolvePhrase(phrase, days);
+      if (r) pushPhrase(phrase, r);
     }
     // On a bare `@` with date suggestions present, keep the list tight (dates
     // only); otherwise blend in note matches so `@name` still links a note.
@@ -597,6 +746,21 @@ export class ComposerAutocomplete {
     if (!item) return;
     const before = this.ta.value.slice(0, this.state.replaceStart);
     const after = this.ta.value.slice(this.state.replaceEnd);
+    // 0.254.0: a slash-command row runs instead of inserting. The trigger text
+    // goes first and the popup closes BEFORE the command fires — commands open
+    // modals and move focus, and leaving a stale popup (or a stray "/delete")
+    // behind while one of those runs is how this feature would feel broken.
+    if (item.run) {
+      this.ta.value = before + after;
+      const caret = before.length;
+      this.ta.setSelectionRange(caret, caret);
+      this.ta.dispatchEvent(new Event("input", { bubbles: true }));
+      try { this.onBeforeCommand?.(this.ta.value); } catch { /* never block the command */ }
+      const run = item.run;
+      this.close();
+      run();
+      return;
+    }
     const insert = item.insert + trailing;
     this.ta.value = before + insert + after;
     const caret = before.length + insert.length - (trailing ? 0 : item.caretBack ?? 0);
@@ -626,10 +790,13 @@ interface SuggestItem {
   label: string;
   insert: string;
   subtitle: string;
+  /** 0.254.0: slash-command rows ACT instead of inserting. When present, the
+   *  trigger text is removed and this runs; `insert` is ignored. */
+  run?: () => void;
 }
 
 interface AutocompleteState {
-  kind: "tag" | "link" | "at";
+  kind: "tag" | "link" | "at" | "command";
   /** 0.199.2: the trigger sits inside `[[ ]]` — every insert must be a link. */
   inLink?: boolean;
   query: string;
