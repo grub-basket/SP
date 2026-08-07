@@ -134,6 +134,10 @@ export interface AppImportNote extends ImportNote {
   /** A grouping note the importer invented (no counterpart in the source), so
    *  the re-run guard and the id stamp can leave it alone. */
   synthetic?: boolean;
+  /** This note IS the section for its root - either the app's own root note or,
+   *  when the source has none, an invented stand-in. Marked so a later import
+   *  can find it instead of building a second one. */
+  sectionRoot?: AppRoot;
   /** Obsidian tags describing what this was in Stashpad. Empty when off. */
   tags: string[];
 }
@@ -144,7 +148,12 @@ export interface AppImportResult {
   byRoot: Record<string, number>;
   stats: {
     totalInFile: number;
+    /** Real notes from the file. EXCLUDES the section parents the importer
+     *  invents, which otherwise produced "401 of 400 notes selected". */
     selected: number;
+    /** Section parents the importer created, counted separately so they are
+     *  never mistaken for notes that came out of the export. */
+    syntheticParents: number;
     skippedRoot: number;
     done: number;
     coloured: number;
@@ -274,7 +283,7 @@ export function buildAppImport(
   if (!Array.isArray(raw)) {
     return {
       notes: [], byRoot: {},
-      stats: { totalInFile: 0, selected: 0, skippedRoot: 0, done: 0, coloured: 0, withAttachments: 0, attachments: 0, multiParent: 0, orphaned: 0, pinned: 0, duplicateChildRefs: 0, alreadyImported: 0, emojiExpanded: 0 },
+      stats: { totalInFile: 0, selected: 0, syntheticParents: 0, skippedRoot: 0, done: 0, coloured: 0, withAttachments: 0, attachments: 0, multiParent: 0, orphaned: 0, pinned: 0, duplicateChildRefs: 0, alreadyImported: 0, emojiExpanded: 0 },
       warnings: ["That file isn't a Stashpad export — expected a JSON array of notes."],
     };
   }
@@ -351,8 +360,15 @@ export function buildAppImport(
   // notes that were unreachable are impossible to miss. Home has no wrapper:
   // it was the main list, so it becomes the main list here.
   const SECTION: Record<string, { title: string; colour: string | null; blurb: string }> = {
+    HOME: {
+      title: "Home",
+      colour: null,
+      blurb: "The app's main list. Everything that was not in Trash, Todos or Shared lived here.",
+    },
     ORPHAN: {
-      title: "Recovered from Stashpad",
+      // "Recovered" does not say WHY these were recovered. Orphaned is the word
+      // used everywhere else - in notes.json, the exporter and the docs.
+      title: "Orphaned notes (recovered from Stashpad)",
       colour: "amber",
       blurb: "These notes existed in the Stashpad database but were unreachable from Home, so the app could only surface them through search. They are intact.",
     },
@@ -381,14 +397,28 @@ export function buildAppImport(
   };
 
   const sectionIndex = new Map<string, number>();
-  const sectionParent = (rootKind: string): number | null => {
-    if (rootKind === "HOME") return null;
+  const sectionParent = (rootKind: string, real?: RawNote): number | null => {
     const wanted = rootKind === "ORPHAN" ? opts.groupOrphans : opts.sectionParents;
     if (!wanted) return null;
     const cached = sectionIndex.get(rootKind);
     if (cached !== undefined) return cached;
     const meta = SECTION[rootKind] ?? { title: `Stashpad ${rootKind}`, colour: null, blurb: "" };
     const hex = meta.colour ? (BUILTIN_COLOR_NAMES[meta.colour] ?? null) : null;
+
+    // Prefer the app's OWN root note. These are real notes with real ids and
+    // sometimes real content - the previous behaviour skipped every note with a
+    // specialType and substituted a stand-in, so anything written inside HOME,
+    // TRASH or TODOS was silently dropped and could not be recovered by
+    // re-importing, because the guard matches on stashpadAppId and a stand-in
+    // has none. 7 real notes were lost this way on a 12,868-note archive.
+    if (real) {
+      const idx = push(real, null, 1);
+      notes[idx].sectionRoot = rootKind;
+      queued.add(real.id);
+      sectionIndex.set(rootKind, idx);
+      return idx;
+    }
+
     notes.push({
       body: meta.blurb ? `${meta.title}\n\n${meta.blurb}` : meta.title,
       level: 1,
@@ -407,6 +437,7 @@ export function buildAppImport(
       pinned: false,
       pinnedOrder: null,
       synthetic: true,
+      sectionRoot: rootKind,
       tags: opts.addTags ? ["stashpad/section"] : [],
     });
     const idx = notes.length - 1;
@@ -427,10 +458,12 @@ export function buildAppImport(
     const structural = !!root.specialType;
     const queue: Array<{ id: string; parentIndex: number | null; level: number }> = [];
 
-    const host = sectionParent(rootKind);
+    // A structural root IS the section note now, rather than being replaced by
+    // one. ORPHAN has no note of its own - the exporter invents that root - so
+    // it still gets a stand-in.
+    const host = sectionParent(rootKind, structural ? root : undefined);
     const startLevel = host === null ? 1 : 2;
     if (structural) {
-      // The container itself is scaffolding; its children are the content.
       for (const c of root.children ?? []) queue.push({ id: c, parentIndex: host, level: startLevel });
     } else {
       // A detached root IS a real note, and the thing the user could not find.
@@ -529,7 +562,8 @@ export function buildAppImport(
     byRoot,
     stats: {
       totalInFile: all.length,
-      selected: notes.length,
+      selected: notes.filter((n) => !n.synthetic).length,
+      syntheticParents: notes.filter((n) => n.synthetic).length,
       skippedRoot,
       done: notes.filter((n) => n.task === "done").length,
       coloured: notes.filter((n) => n.color).length,

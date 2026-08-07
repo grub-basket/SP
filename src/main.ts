@@ -2887,17 +2887,21 @@ export default class StashpadPlugin extends Plugin {
    *  toast is dismissed. */
   maybeWarnLinkUpdatesOff(): void {
     try {
-      if (this.settings.linkUpdateWarningShown) return;
       if (!this.linkUpdatesDisabled()) return;
-      this.settings.linkUpdateWarningShown = true;
-      void this.saveSettings();
+      // 0.246.0: this used to fire ONCE EVER (gated on linkUpdateWarningShown)
+      // and then stay quiet while links kept breaking. The condition it warns
+      // about is ongoing and silently destructive — a renamed note leaves dead
+      // `[[links]]` behind with no error — so the reminder now recurs each
+      // launch for as long as the setting is off, and stops by itself the
+      // moment it is turned on. A notice you can dismiss but that comes back
+      // while the problem persists is the point.
       this.notifications.show({
         message:
           "Obsidian's **Automatically update internal links** is OFF.\n"
           + "Stashpad renames a note's file when its first line changes, and with that setting off "
           + "Obsidian won't repoint `[[links]]` to the renamed note — so those links break silently.\n"
-          + "Turn it on in Obsidian's **Settings → Files and links**. This notice won't appear again; "
-          + "Stashpad's own settings keep a reminder while it stays off.",
+          + "Turn it on in Obsidian's **Settings → Files and links**. This reminder will keep appearing "
+          + "while the setting is off.",
         kind: "warning",
         category: "system",
         duration: 0,
@@ -8212,7 +8216,27 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async adoptNote(file: TFile): Promise<void> {
-    const { newId } = await import("./id-service");
+    const { newId, readId } = await import("./id-service");
+
+    // Refuse to touch a note that is already a managed note. Adoption exists for
+    // files that are NOT Stashpad notes yet - it mints a fresh id and backfills
+    // frontmatter - so running it over one that already has an identity is
+    // destructive by definition: the new id orphans every child pointing at the
+    // old one.
+    //
+    // This is the belt to suspendFor's braces. Suspension stops the watcher
+    // firing during an import; this stops adoption doing damage even if it does
+    // fire - from a sync, a script, a future caller, or a version where the
+    // suspension is missed.
+    const pre = this.app.metadataCache.getFileCache(file)?.frontmatter as
+      | { id?: unknown; parent?: unknown; stashpadAppId?: unknown } | undefined;
+    // A note the Stashpad-app importer placed. It carries its own id and parent
+    // links, and its source id is the thing a re-import matches on.
+    if (typeof pre?.stashpadAppId === "string" && pre.stashpadAppId.trim()) return;
+    // Or simply a complete note: a usable id AND a parent field present. There
+    // is nothing for adoption to add, so there is no reason to risk it.
+    const preId = readId(pre?.id)?.trim() ?? "";
+    if (preId && !/\s/.test(preId) && pre?.parent !== undefined) return;
     // Build the set of currently-used ids by reading the metadataCache
     // frontmatter for every markdown file in the vault. Cheap — the cache
     // is already populated; we just inspect it.
@@ -8221,7 +8245,8 @@ export default class StashpadPlugin extends Plugin {
       if (f.path === file.path) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
         | { id?: unknown } | undefined;
-      const id = typeof fm?.id === "string" ? fm.id.trim() : "";
+      // readId, not typeof: an id YAML turned into a number is still taken.
+      const id = readId(fm?.id)?.trim() ?? "";
       if (id) usedIds.add(id);
     }
 
@@ -8246,7 +8271,12 @@ export default class StashpadPlugin extends Plugin {
     try {
       await this.app.fileManager.processFrontMatter(file, (fm) => {
         // id: must be a non-empty string, no whitespace.
-        const existingId = typeof fm.id === "string" ? fm.id.trim() : "";
+        // THE damage point. A note whose id YAML read back as a NUMBER -
+        // 489944 rather than "489944" - failed this check, was treated as
+        // unidentified, and had a fresh id minted, orphaning every child that
+        // pointed at the old one. readId recognises it, so the note keeps its
+        // identity and its children keep their parent.
+        const existingId = readId(fm.id)?.trim() ?? "";
         if (!existingId || /\s/.test(existingId) || usedIds.has(existingId)) {
           fm.id = pickFreshId();
           added.push("id");

@@ -3870,8 +3870,12 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Set due date…").setIcon("calendar-clock").setDisabled(!hasTargets).onClick(() => this.cmdSetDue()));
     menu.addItem((it: any) => it.setTitle("Assign to…").setIcon("user-plus").setDisabled(!hasTargets).onClick(() => this.cmdAssign()));
     menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Copy").setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopy()));
-    menu.addItem((it: any) => it.setTitle("Copy tree").setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
+    // 0.246.0: say what the command will ACTUALLY do. "Prefix timestamps when
+    // copying" silently changes the output of these three, so a menu that
+    // always reads "Copy" misdescribes itself whenever the setting is on.
+    const tsSuffix = getSettings().prefixTimestampsOnCopy ? " with timestamps" : "";
+    menu.addItem((it: any) => it.setTitle(`Copy${tsSuffix}`).setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopy()));
+    menu.addItem((it: any) => it.setTitle(`Copy tree${tsSuffix}`).setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
     // 0.214.0: plain Copy/Cut no longer build the cross-vault payload, so these
     // are the way notes travel between vaults — they need to be findable here,
     // not only in the command palette.
@@ -5553,6 +5557,22 @@ export class StashpadView extends ItemView {
    *  Falls back to "(untitled)" for nodes without a resolvable title.
    *  Prefer `bulkActionMessage` for >1-item action confirmations. */
   /** public: read by extracted command modules (commands/*.ts). */
+  /** 0.246.0: titleList for the COPY toasts, mirroring the clipboard content.
+   *
+   *  The plain titleList shows bare titles, so with "prefix timestamps when
+   *  copying" on, the toast previewed something different from what was
+   *  actually copied. A preview that does not match the clipboard is worse
+   *  than no preview — it is a quiet lie about what you now have. */
+  titleListForCopy(nodes: TreeNode[], max = 3): string {
+    if (!getSettings().prefixTimestampsOnCopy) return this.titleList(nodes, max);
+    const titles = nodes.map((n) => {
+      const t = this.titleForNode(n).trim() || "(untitled)";
+      return `"${this.formatTimeInline(n.created)} ${t}"`;
+    });
+    if (titles.length <= max) return titles.join(", ");
+    return `${titles.slice(0, max).join(", ")}, +${titles.length - max} more`;
+  }
+
   titleList(nodes: TreeNode[], max = 3): string {
     if (!nodes.length) return "";
     const titles = nodes.map((n) => this.titleForNode(n).trim() || "(untitled)");
@@ -6958,6 +6978,15 @@ export class StashpadView extends ItemView {
    *  selection / cursor — those concepts don't apply outside the list. */
   private handleRenderedClick(e: MouseEvent, node: TreeNode): void {
     const targetEl = e.target as HTMLElement | null;
+    // 0.246.0: same delegation for the non-row surfaces (focused header, mini
+    // header) — they re-hydrate cached HTML too.
+    const copyBtnR = targetEl?.closest?.(".copy-code-button") as HTMLElement | null;
+    if (copyBtnR) {
+      e.preventDefault();
+      e.stopPropagation();
+      void this.copyCodeFromButton(copyBtnR);
+      return;
+    }
     // 0.237.0: a spoiler reveals itself and swallows the click, so revealing
     // never also navigates.
     const spoiler = targetEl?.closest?.(".stashpad-spoiler") as HTMLElement | null;
@@ -6997,6 +7026,19 @@ export class StashpadView extends ItemView {
     // keyboard — acting on it would select whatever row slid under the finger.
     const absorbed = this.shouldAbsorbDismissTap();
     this.traceTap("click", e, idx, absorbed);
+    // 0.246.0: Obsidian's own code-block copy button. The row body is
+    // re-hydrated from CACHED HTML via sanitizeHTMLToDom, which reproduces the
+    // button's markup but NOT the click handler Obsidian's live post-processor
+    // attached — so it looked correct and did nothing. Delegating here is the
+    // fix that survives the cache, and it has to run BEFORE the row handlers
+    // or the same click also selects the row.
+    const copyBtn = (e.target as HTMLElement | null)?.closest?.(".copy-code-button") as HTMLElement | null;
+    if (!absorbed && copyBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      void this.copyCodeFromButton(copyBtn);
+      return;
+    }
     // 0.237.0: a spoiler inside a LIST ROW. handleRenderedClick only covers the
     // non-row surfaces (focused header, mini header), so without this a
     // spoiler was inert everywhere it actually appears.
@@ -9917,11 +9959,13 @@ export class StashpadView extends ItemView {
       (state) => void this.plugin.openAppImporter({
         state, destinationLabel: dest, onImport: run, existingSourceIds: existing,
         folders, currentFolder: this.noteFolder,
+        ensureFolder: (path) => this.ensureFolder(path),
       }),
       {},
       existing,
       folders,
       this.noteFolder,
+      (path) => this.ensureFolder(path),
     );
     modal.open();
   }
@@ -9991,6 +10035,15 @@ export class StashpadView extends ItemView {
 
   private async runAppImport(notes: AppImportNote[], helpers: HelperNote[]): Promise<void> {
     if (!notes.length && !helpers.length) return;
+    // Disarm the drop-watcher for the duration. It listens for files appearing
+    // in a Stashpad folder, and this is about to create thousands of them - each
+    // one adopted, which mints a FRESH id over a note that already has one and
+    // orphans its children. Restored in a finally inside suspendFor, so a failed
+    // import cannot leave auto-import switched off.
+    return this.plugin.importService.suspendFor(() => this.runAppImportInner(notes, helpers));
+  }
+
+  private async runAppImportInner(notes: AppImportNote[], helpers: HelperNote[]): Promise<void> {
     const folder = this.noteFolder;
     const rootParent: StashpadId = this.focusId ?? ROOT_ID;
     const collected: Array<{ path: string; content: string }> = [];
@@ -10028,8 +10081,10 @@ export class StashpadView extends ItemView {
         }
         // Reuse a section parent that is already here rather than making a second
         // one; children below it resolve through createdIds either way.
-        if (n.synthetic && n.root) {
-          const existingId = sectionParents.get(String(n.root));
+        // A section root may now be the app's OWN note rather than an invented
+        // one, so key on sectionRoot rather than synthetic.
+        if (n.sectionRoot) {
+          const existingId = sectionParents.get(String(n.sectionRoot));
           if (existingId) { createdIds.push(existingId); continue; }
         }
         const parentId = n.parentIndex == null ? rootParent : (createdIds[n.parentIndex] ?? rootParent);
@@ -10061,7 +10116,7 @@ export class StashpadView extends ItemView {
             // stamping one would make the re-run guard skip it next time.
             if (!n.synthetic && n.sourceId) m.stashpadAppId = n.sourceId;
             // Lets a later import find this section instead of duplicating it.
-            if (n.synthetic && n.root) m.stashpadAppSectionRoot = String(n.root);
+            if (n.sectionRoot) m.stashpadAppSectionRoot = String(n.sectionRoot);
             // Obsidian's own tag key, so they work in search, the tag pane and
             // Bases without anything extra. Merged with whatever is already
             // there rather than replacing it, so a re-import cannot wipe tags
@@ -10131,8 +10186,19 @@ export class StashpadView extends ItemView {
     } finally {
       // These two are the "settling" the user sees as flicker: the frontmatter
       // queue draining and the tree rebuilding. Naming them beats an idle window.
-      tick(total, "linking notes to their parents…");
+      // The linking phase is the long one and it used to sit on a single frozen
+      // line, which reads as "hung" rather than "working". fmSync exposes its
+      // queue depth, so report it - and say plainly that it is safe to wait.
+      const linkTotal = this.fmSync.pendingCount();
+      const linkTicker = window.setInterval(() => {
+        const left = this.fmSync.pendingCount();
+        const done = Math.max(0, linkTotal - left);
+        tick(total, linkTotal
+          ? `linking notes to their parents — ${done.toLocaleString()} of ${linkTotal.toLocaleString()} · safe to leave this running`
+          : "linking notes to their parents…");
+      }, 400);
       try { await this.fmSync.flush(); } catch { /* best effort */ }
+      finally { window.clearInterval(linkTicker); }
       tick(total, "rebuilding the list…");
       this.endBulkRender();
     }
@@ -10143,7 +10209,7 @@ export class StashpadView extends ItemView {
     const made = collected.length;
     const importedIds = createdIds.filter((x): x is StashpadId => !!x);
     this.plugin.notifications.show({
-      message: `Imported ${made} note${made === 1 ? "" : "s"} from the Stashpad app into **${folder}**${failed ? ` (${failed} failed)` : ""}`,
+      message: `**Import complete.** ${made} note${made === 1 ? "" : "s"} from the Stashpad app are in **${folder}**, fully linked${failed ? ` (${failed} failed)` : ""}.`,
       kind: failed ? "warning" : "success",
       category: "system",
       affectedIds: importedIds,
@@ -12770,6 +12836,28 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** Copy the code beside Obsidian's own copy button.
+   *
+   *  The button lives INSIDE the <pre>, as a sibling of the <code>, so read the
+   *  <code> rather than the <pre> — `pre.textContent` would swallow the
+   *  button's own text and anything else Obsidian puts in there later. */
+  private async copyCodeFromButton(btn: HTMLElement): Promise<void> {
+    const pre = btn.closest("pre");
+    const code = pre?.querySelector("code");
+    const text = code?.textContent ?? "";
+    if (!text) { new Notice("Nothing to copy."); return; }
+    try {
+      await navigator.clipboard.writeText(text);
+      // Confirm on the button itself, the way Obsidian's own does: a copy you
+      // just clicked does not need a toast telling you it happened.
+      setIcon(btn, "check");
+      btn.setAttr("aria-label", "Copied");
+      window.setTimeout(() => { setIcon(btn, "copy"); btn.setAttr("aria-label", "Copy"); }, 1200);
+    } catch {
+      new Notice("Couldn't copy the code block.");
+    }
+  }
+
   /** 0.237.0: is this note marked to render blurred? */
   isObscured(node: TreeNode): boolean {
     if (!node.file) return false;
@@ -15005,7 +15093,7 @@ export class StashpadView extends ItemView {
     // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
     // normalises selection to the right-clicked row.
     // 0.122.10: ordered above Clone so the plain "Copy text" reads first.
-    menu.addItem((it: any) => it.setTitle("Copy text").setIcon("copy").onClick(() => { focusClicked(); void this.cmdCopy(); }));
+    menu.addItem((it: any) => it.setTitle(`Copy text${getSettings().prefixTimestampsOnCopy ? " with timestamps" : ""}`).setIcon("copy").onClick(() => { focusClicked(); void this.cmdCopy(); }));
     menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }

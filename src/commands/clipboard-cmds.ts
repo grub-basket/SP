@@ -38,7 +38,7 @@ export async function cmdCopy(view: StashpadView): Promise<void> {
   }
   await navigator.clipboard.writeText(joined);
   view.plugin.notifications.show({
-    message: `Copied ${view.titleList(targets)} to clipboard`,
+    message: `Copied ${view.titleListForCopy(targets)} to clipboard`,
     kind: "success",
     category: "system",
     affectedIds: targets.map((t) => t.id),
@@ -155,7 +155,7 @@ export async function cmdCopyTree(view: StashpadView): Promise<void> {
   view.plugin.noteClipboard = { mode: "copy", folder: view.noteFolder, ids: roots.map((r) => r.id), text: outline };
   view.render(); // paint the copy-pending tint
   view.plugin.notifications.show({
-    message: `Copied tree of ${view.titleList(roots)} (${lines.length} entries) — paste in the list to clone, in a note to drop the outline in`,
+    message: `Copied tree of ${view.titleListForCopy(roots)} (${lines.length} entries) — paste in the list to clone, in a note to drop the outline in`,
     kind: "success",
     category: "system",
     affectedIds: roots.map((r) => r.id),

@@ -30,9 +30,42 @@ const EXPECTED = [
 const fmtBytes = (n: number): string =>
   n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
 
+/** Sentinel dropdown value for "create a folder instead of picking one".
+ *
+ *  A `/`-prefixed value cannot collide with a real folder (vault paths are
+ *  relative and never start with a slash). Deliberately NOT a NUL byte: this
+ *  becomes an HTML attribute value, and control characters there are a good way
+ *  to get silently dropped or mangled by the DOM. */
+const NEW_FOLDER = "/new-folder";
+
+/** Clean a typed destination into a safe vault-relative folder path.
+ *
+ *  Nested paths ARE allowed - "notes/Stashpad" creates both levels - because
+ *  wanting the import somewhere other than the vault root is completely normal.
+ *  What is not allowed is escaping the vault: `..` segments are dropped, a
+ *  leading slash is stripped so the path stays relative, and each segment loses
+ *  the characters Obsidian rejects in a file name. So "../../etc/passwd" becomes
+ *  "etc/passwd" - a real folder inside the vault - rather than a path resolving
+ *  somewhere the user never chose.
+ *
+ *  Trailing separators and empty segments collapse, so "notes//x/" is "notes/x"
+ *  rather than a path with a blank folder in the middle. */
+export function sanitizeFolderName(raw: string): string {
+  return raw
+    .split("/")
+    .map((seg) => seg
+      .replace(/[\\:*?"<>|]/g, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^[.\s]+|[.\s]+$/g, "")
+      .slice(0, 80))
+    .filter((seg) => seg.length > 0)
+    .slice(0, 8)
+    .join("/");
+}
+
 interface LoadedFile { name: string; size: number; text: string; kind: "notes" | "helper"; detail: string }
 
-export interface AppImporterState { files: LoadedFile[]; opts: AppImportOptions; destination?: string }
+export interface AppImporterState { files: LoadedFile[]; opts: AppImportOptions; destination?: string; newFolder?: string }
 
 export interface AppImporterCallbacks {
   onImport: (notes: AppImportNote[], helpers: HelperNote[], destination: string) => void | Promise<void>;
@@ -52,6 +85,10 @@ export interface AppImporterCallbacks {
    *  pre-import state — hitting Import twice duplicated everything even with
    *  "Skip notes already imported" on. */
   existingSourceIds?: (folder: string) => ReadonlySet<string>;
+  /** Create (or return) a vault folder by path. Lets the destination picker
+   *  offer "New folder…" instead of making the user leave the importer, create
+   *  a folder by hand, and come back. */
+  ensureFolder?: (path: string) => Promise<void>;
 }
 
 export class AppImporterUI {
@@ -72,15 +109,26 @@ export class AppImporterUI {
   /** Set once the destination has been read back and acknowledged. */
   private confirmed = false;
   private convertEl: HTMLElement | null = null;
+  private busyEl: HTMLElement | null = null;
+  /** Non-empty when the destination is a folder that does not exist yet. */
+  private newFolder = "";
+  private newFolderEl: HTMLElement | null = null;
+  private newFolderInput: HTMLInputElement | null = null;
+  /** Name of the file currently being read, for the checklist row. */
+  private reading = "";
 
   constructor(private app: App, private host: HTMLElement, init: Partial<AppImporterState>, private cbs: AppImporterCallbacks) {
     this.files = init.files ? [...init.files] : [];
     this.opts = { ...DEFAULT_APP_IMPORT_OPTIONS, ...(init.opts ?? {}) };
-    this.destination = init.destination ?? cbs.currentFolder ?? "";
+    // Blank on purpose: an import is a one-shot write of thousands of notes
+    // into a real vault, so the destination should be a decision, never a default
+    // inherited from whichever folder happened to be open.
+    this.destination = init.destination ?? "";
+    this.newFolder = init.newFolder ?? "";
     this.render();
   }
 
-  getState(): AppImporterState { return { files: [...this.files], opts: { ...this.opts }, destination: this.destination }; }
+  getState(): AppImporterState { return { files: [...this.files], opts: { ...this.opts }, destination: this.destination, newFolder: this.newFolder }; }
 
   private get notesFile(): LoadedFile | null { return this.files.find((f) => f.kind === "notes") ?? null; }
   private get helperFiles(): LoadedFile[] { return this.files.filter((f) => f.kind === "helper"); }
@@ -90,29 +138,16 @@ export class AppImporterUI {
     c.empty();
     c.addClass("stashpad-import-host", "stashpad-appimport-host");
 
+    // Sits at the top and the host gets .is-busy, which draws a border right
+    // round the whole panel - so "still running, do not close" is readable from
+    // any part of the window, not only the button you happen to be looking at.
+    this.busyEl = c.createDiv({ cls: "stashpad-appimport-busy" });
+    this.busyEl.hide();
+
     c.createDiv({
       cls: "setting-item-description",
       text: `Import notes exported from the old Stashpad desktop app. Top-level notes go into ${this.cbs.destinationLabel}.`,
     });
-
-    // ---- destination -------------------------------------------------------
-    // Deliberately the FIRST control, above the files: the failure this prevents
-    // is running the whole importer and only then noticing it went to whichever
-    // folder happened to be open.
-    const folders = this.cbs.folders ?? [];
-    if (folders.length) {
-      const known = folders.map((f) => f.path);
-      new Setting(c)
-        .setName("Import into")
-        .setDesc("Which folder these notes are written to. Any vault folder will do — one that isn't a Stashpad folder yet becomes one.")
-        .addDropdown((d) => {
-          for (const f of folders) d.addOption(f.path, f.isStashpad ? f.path : `${f.path}  (not a Stashpad folder yet)`);
-          d.setValue(known.includes(this.destination) ? this.destination : known[0]);
-          this.destination = d.getValue();
-          d.onChange((v) => { this.destination = v; this.confirmed = false; this.refresh(); });
-        });
-      this.convertEl = c.createDiv({ cls: "stashpad-appimport-warning" });
-    }
 
     // ---- drop zone ---------------------------------------------------------
     const drop = c.createDiv({ cls: "stashpad-appimport-drop" });
@@ -183,6 +218,48 @@ export class AppImporterUI {
     toggle("Skip notes already imported", "Leaves out anything whose Stashpad id is already in this folder, so running the import twice doesn't duplicate everything. Turn OFF to import them again anyway.", "skipAlreadyImported");
     toggle("Also import the supporting files", "Adds two short reference notes explaining the colour mapping and what could not come across, plus readable versions of attachments.json / palette.json / manifest.json if you supplied them.", "includeHelpers");
 
+    // ---- destination -------------------------------------------------------
+    // Last, and directly above the button that acts on it: the failure this
+    // prevents is running the whole importer and only then noticing it went to
+    // whichever folder happened to be open.
+    const folders = this.cbs.folders ?? [];
+    new Setting(c)
+      .setName("Import into")
+      .setDesc("Which folder these notes are written to. Any vault folder will do — one that isn't a Stashpad folder yet becomes one.")
+      .addDropdown((d) => {
+        d.addOption("", "Choose a folder…");
+        for (const f of folders) d.addOption(f.path, f.isStashpad ? f.path : `${f.path}  (not a Stashpad folder yet)`);
+        if (this.cbs.ensureFolder) d.addOption(NEW_FOLDER, "＋ New folder…");
+        d.setValue(this.newFolder ? NEW_FOLDER : this.destination);
+        d.onChange((v) => {
+          if (v === NEW_FOLDER) {
+            this.newFolder = this.newFolder || "Stashpad app import";
+            this.destination = this.newFolder;
+          } else {
+            this.newFolder = "";
+            this.destination = v;
+          }
+          this.confirmed = false;
+          this.refresh();
+        });
+      });
+
+    this.newFolderEl = c.createDiv({ cls: "stashpad-appimport-newfolder" });
+    new Setting(this.newFolderEl)
+      .setName("New folder name")
+      .setDesc("Created when you import. A path works too — “notes/Stashpad” creates both folders.")
+      .addText((t) => {
+        this.newFolderInput = t.inputEl;
+        t.setValue(this.newFolder).onChange((v) => {
+          this.newFolder = sanitizeFolderName(v);
+          this.destination = this.newFolder;
+          this.confirmed = false;
+          this.refresh();
+        });
+      });
+
+    this.convertEl = c.createDiv({ cls: "stashpad-appimport-warning" });
+
     this.summaryEl = c.createDiv({ cls: "setting-item-description stashpad-import-count" });
     this.warnEl = c.createDiv({ cls: "stashpad-appimport-warnings" });
     this.doneEl = c.createDiv({ cls: "setting-item-description stashpad-import-done" });
@@ -208,12 +285,18 @@ export class AppImporterUI {
 
   /** Read dropped/picked files, classify them, and acknowledge each one. */
   private async accept(list: File[]): Promise<void> {
+    // Each file is announced the moment it arrives, so a big notes.json reads as
+    // "reading…" rather than the panel looking frozen while it parses.
     for (const f of list) {
+      this.reading = f.name;
+      this.refresh();
+      await new Promise((r) => window.setTimeout(r, 0)); // let the row paint
       let text: string;
       try {
         text = await f.text();
       } catch {
         this.files.push({ name: f.name, size: f.size, text: "", kind: "helper", detail: "could not be read" });
+        this.reading = "";
         continue;
       }
 
@@ -239,6 +322,7 @@ export class AppImporterUI {
       if (kind === "notes") this.files = this.files.filter((x) => x.kind !== "notes");
       this.files = this.files.filter((x) => x.name !== f.name);
       this.files.push({ name: f.name, size: f.size, text, kind, detail });
+      this.reading = "";
     }
     this.refresh();
   }
@@ -250,14 +334,18 @@ export class AppImporterUI {
       list.empty();
       for (const exp of EXPECTED) {
         const got = this.files.find((f) => f.name.toLowerCase() === exp.match);
+        const loading = !got && this.reading.toLowerCase() === exp.match;
         const row = list.createDiv({ cls: got ? "stashpad-appimport-file is-present" : "stashpad-appimport-file" });
         const mark = row.createSpan({ cls: "stashpad-appimport-mark" });
-        setIcon(mark, got ? "check-circle" : (exp.required ? "circle-alert" : "circle-dashed"));
+        setIcon(mark, got ? "check-circle" : loading ? "loader" : (exp.required ? "circle-alert" : "circle-dashed"));
+        if (loading) mark.addClass("stashpad-appimport-spin");
         const body = row.createDiv({ cls: "stashpad-appimport-filebody" });
         body.createSpan({ cls: "stashpad-appimport-filename", text: exp.label });
         body.createSpan({
           cls: "stashpad-appimport-filedetail",
-          text: got ? ` — received, ${fmtBytes(got.size)}, ${got.detail}` : ` — ${exp.required ? "still needed" : "optional"}`,
+          text: got ? ` — received, ${fmtBytes(got.size)}, ${got.detail}`
+            : loading ? " — reading…"
+              : ` — ${exp.required ? "still needed" : "optional"}`,
         });
         body.createDiv({ cls: "setting-item-description", text: exp.desc });
         if (got) {
@@ -280,11 +368,40 @@ export class AppImporterUI {
       }
     }
 
+    if (this.newFolderEl) {
+      if (this.newFolder) this.newFolderEl.show(); else this.newFolderEl.hide();
+      // Reflect the value actually being used. Without this the field kept the
+      // raw text while everything else showed the sanitized name - so typing
+      // "../../etc" left the box reading "../../etc" while the folder about to
+      // be created was "etc" - and the prefilled default never reached the box
+      // at all, showing an empty name next to an enabled Import button.
+      if (this.newFolderInput && this.newFolderInput.value !== this.newFolder) {
+        this.newFolderInput.value = this.newFolder;
+      }
+    }
+
+    if (this.busyEl) {
+      this.host.toggleClass("is-busy", this.busy);
+      if (this.busy) {
+        this.busyEl.setText("⏳ Import running — leave this window open. Closing it now would stop the import part-way through.");
+        this.busyEl.show();
+      } else {
+        this.busyEl.hide();
+      }
+    }
+
     // -- destination notice --------------------------------------------------
     if (this.convertEl) {
       const chosen = (this.cbs.folders ?? []).find((f) => f.path === this.destination);
+      const existsAlready = !!this.newFolder
+        && (this.cbs.folders ?? []).some((f) => f.path.toLowerCase() === this.newFolder.toLowerCase());
       this.convertEl.empty();
-      if (chosen && !chosen.isStashpad) {
+      if (this.newFolder) {
+        this.convertEl.setText(existsAlready
+          ? `“${this.newFolder}” already exists — the notes will be added to it.`
+          : `“${this.newFolder}” doesn't exist yet — it will be created when you import.`);
+        this.convertEl.show();
+      } else if (chosen && !chosen.isStashpad) {
         this.convertEl.setText(
           `“${chosen.path}” isn't a Stashpad folder yet. Importing here will make it one — the notes carry the frontmatter that defines a Stashpad folder, so nothing else has to be set up.`,
         );
@@ -314,6 +431,7 @@ export class AppImporterUI {
         const s = this.result.stats;
         const parts = [
           `${s.selected.toLocaleString()} of ${s.totalInFile.toLocaleString()} notes selected`,
+          s.syntheticParents ? `${s.syntheticParents} section note${s.syntheticParents === 1 ? "" : "s"} added` : null,
           s.done ? `${s.done} completed` : null,
           s.coloured ? `${s.coloured} coloured` : null,
           s.pinned ? `${s.pinned} pinned` : null,
@@ -341,13 +459,14 @@ export class AppImporterUI {
 
     const n = this.result?.stats.selected ?? 0;
     if (this.importBtn) {
-      this.importBtn.disabled = this.busy || (n === 0 && helperCount === 0);
+      this.importBtn.disabled = this.busy || !this.destination || (n === 0 && helperCount === 0);
       const dest = this.destination ? ` into “${this.destination}”` : "";
       this.importBtn.setText(
         this.busy ? "Importing…"
-          : n === 0 ? "Import"
-            : this.confirmed ? `Yes — write ${n.toLocaleString()} note${n === 1 ? "" : "s"}${dest}`
-              : `Import ${n.toLocaleString()} note${n === 1 ? "" : "s"}${dest}`,
+          : !this.destination ? "Choose a folder first"
+            : n === 0 ? "Import"
+              : this.confirmed ? `Yes — write ${n.toLocaleString()} note${n === 1 ? "" : "s"}${dest}`
+                : `Import ${n.toLocaleString()} note${n === 1 ? "" : "s"}${dest}`,
       );
       this.importBtn.toggleClass("mod-warning", this.confirmed && !this.busy);
     }
@@ -378,9 +497,14 @@ export class AppImporterUI {
         ]
       : [];
     if (!notes.length && !helpers.length) return;
+    if (!this.destination) return;
     this.busy = true;
     this.refresh();
     try {
+      if (this.newFolder && this.cbs.ensureFolder) {
+        await this.cbs.ensureFolder(this.newFolder);
+        this.newFolder = "";
+      }
       await this.cbs.onImport(notes, helpers, this.destination);
       this.lastImported = notes.length;
     } finally {
@@ -413,6 +537,7 @@ export class AppImportModal extends Modal {
     private existingSourceIds: (folder: string) => ReadonlySet<string> = () => new Set<string>(),
     private folders: Array<{ path: string; isStashpad: boolean }> = [],
     private currentFolder = "",
+    private ensureFolder?: (path: string) => Promise<void>,
   ) { super(app); }
 
   onOpen(): void {
@@ -422,6 +547,7 @@ export class AppImportModal extends Modal {
       destinationLabel: this.destinationLabel,
       onImport: this.onImport,
       existingSourceIds: this.existingSourceIds,
+      ensureFolder: this.ensureFolder,
       folders: this.folders,
       currentFolder: this.currentFolder,
       close: () => this.close(),
@@ -437,6 +563,7 @@ export interface AppImporterViewContext {
   onImport: (notes: AppImportNote[], helpers: HelperNote[], destination: string) => void | Promise<void>;
   existingSourceIds?: (folder: string) => ReadonlySet<string>;
   folders?: Array<{ path: string; isStashpad: boolean }>;
+  ensureFolder?: (path: string) => Promise<void>;
   currentFolder?: string;
   prevLeaf?: WorkspaceLeaf | null;
 }
@@ -472,6 +599,7 @@ export class AppImportView extends ItemView {
       onImport: this.ctx.onImport,
       existingSourceIds: this.ctx.existingSourceIds,
       folders: this.ctx.folders,
+      ensureFolder: this.ctx.ensureFolder,
       currentFolder: this.ctx.currentFolder,
       close: () => this.closeAndRefocus(),
     });

@@ -7578,3 +7578,22 @@ button.stashpad-btn-loading::after {
 
 .is-mobile .stashpad-media-textwrap { padding: 10px; gap: 6px; }
 .is-mobile .stashpad-media-text { font-size: var(--font-ui-small); }
+
+/* Import in progress. The border is on the host, so the "don't close this"
+   state is visible from any part of the panel — not just the button. */
+.stashpad-appimport-busy {
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  border-radius: 6px;
+  background: var(--background-modifier-error-hover);
+  color: var(--text-normal);
+  font-weight: 600;
+}
+.stashpad-appimport-host.is-busy {
+  outline: 2px solid var(--text-accent);
+  outline-offset: 6px;
+  border-radius: 6px;
+}
+.stashpad-appimport-newfolder .setting-item { border-top: none; padding-top: 0; }
+.stashpad-appimport-spin { animation: stashpad-appimport-spin 1s linear infinite; display: inline-flex; }
+@keyframes stashpad-appimport-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }

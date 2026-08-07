@@ -325,6 +325,10 @@ export interface StashpadSettings {
   alwaysStampCrossVault: boolean;
   /** 0.215.0: set once the one-shot "automatic link updating is off" notice has
    *  been shown, so it never nags. The settings warning stays regardless. */
+  /** 0.246.0: retained so an existing vault's saved value loads without a
+   *  schema mismatch, but NO LONGER READ — the link-update reminder recurs for
+   *  as long as the setting is off rather than firing once. Safe to drop in a
+   *  future cleanup once no installed build still writes it. */
   linkUpdateWarningShown: boolean;
   /** 0.215.0: where NEW attachments are written.
    *  - "per-folder" (default): `<stashpadFolder>/_attachments` — today's behaviour.

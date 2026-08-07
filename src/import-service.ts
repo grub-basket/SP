@@ -55,11 +55,36 @@ export class ImportService {
    *  the whole vault looked like a giant "drop". Armed a beat after
    *  layout-ready, once that storm has passed. */
   private armed = false;
+  /** Nesting depth of suspendFor() calls. While above zero the watcher ignores
+   *  everything.
+   *
+   *  The Stashpad-app importer creates thousands of files inside a Stashpad
+   *  folder, and every one of them fires the create watcher this service listens
+   *  to. Those notes already carry their own id and parent links; adoption would
+   *  mint FRESH ids over the top, which is precisely the failure that orphans a
+   *  note's children. Asking the user to remember a global toggle before a
+   *  one-shot operation is not a safeguard, so the operation disarms it itself. */
+  private suspendDepth = 0;
   setArmed(v: boolean): void { this.armed = v; }
   /** 0.84.10: lets the .stash root-drop watcher (in main) skip the startup
    *  create-storm too — without this it would auto-import every pre-existing
    *  root-level .stash on each launch. */
   isArmed(): boolean { return this.armed; }
+
+  /** True while a bulk operation has the watcher suspended. */
+  isSuspended(): boolean { return this.suspendDepth > 0; }
+
+  /** Run `fn` with the drop-watcher disarmed, restoring it afterwards even if
+   *  `fn` throws — an import that fails half way must not leave auto-import off.
+   *  Nestable, so callers do not have to know about each other. */
+  async suspendFor<T>(fn: () => Promise<T>): Promise<T> {
+    this.suspendDepth++;
+    try {
+      return await fn();
+    } finally {
+      this.suspendDepth = Math.max(0, this.suspendDepth - 1);
+    }
+  }
   private drainTimer: number | null = null;
   private draining = false;
   private static DEBOUNCE_MS = 900;
@@ -82,6 +107,7 @@ export class ImportService {
   /** Called from the vault create/rename watcher. Cheap pre-filter, then
    *  queue + (re)arm the debounced drain. */
   enqueue(file: TFile): void {
+    if (this.suspendDepth > 0) return;
     if (!this.armed) return;
     if (!this.plugin.settings.autoImport) return;
     if (!this.isEligiblePath(file)) return;
@@ -94,6 +120,7 @@ export class ImportService {
    *  moved to `_archive`. Non-reserved direct children of a Stashpad root
    *  only. */
   enqueueFolder(folder: TFolder): void {
+    if (this.suspendDepth > 0) return;
     if (!this.armed) return;
     if (!this.plugin.settings.autoImport) return;
     if (this.suppressed.has(folder.path)) return;
