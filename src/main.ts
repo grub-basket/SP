@@ -114,6 +114,67 @@ export default class StashpadPlugin extends Plugin {
     return [head, ...this.debugBuffer].join("\n");
   }
   clearDebugTrace(): void { this.debugBuffer = []; }
+
+  /** How long a diagnostic mode may stay on before it switches itself off.
+   *  Long enough to span a slow back-and-forth about a bug (report, build,
+   *  reproduce, report again) — short enough that a mode forgotten after that
+   *  exchange isn't still costing something months later. */
+  private static readonly DIAGNOSTIC_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+  /** Record when a diagnostic mode was switched on (or clear the stamp when
+   *  it's switched off). Caller saves settings. */
+  stampDiagnostic(which: "perf" | "trace", enabled: boolean): void {
+    const stamps = { ...(this.settings.diagnosticsEnabledAt ?? { perf: 0, trace: 0 }) };
+    stamps[which] = enabled ? Date.now() : 0;
+    this.settings.diagnosticsEnabledAt = stamps;
+  }
+
+  /** Switch off any diagnostic mode that's been on longer than the TTL.
+   *
+   *  Deliberately time-based rather than session-based: the bugs these modes
+   *  exist for are often cold-start ones that need a restart to reproduce, so
+   *  clearing on load would break the main use case. The in-memory trace
+   *  BUFFER is never auto-cleared either — it's already a bounded ring, and
+   *  wiping it on a timer could destroy a capture in the window between
+   *  reproducing a bug and copying it out.
+   *
+   *  A mode that's on with no stamp was enabled before this existed (or by
+   *  hand in data.json): stamp it now and start its clock, rather than
+   *  switching it off under someone who may be mid-capture. */
+  private async expireStaleDiagnostics(): Promise<void> {
+    const stamps = { ...(this.settings.diagnosticsEnabledAt ?? { perf: 0, trace: 0 }) };
+    const modes: Array<{ key: "perf" | "trace"; on: boolean; label: string; off: () => void }> = [
+      { key: "perf", on: this.settings.enablePerfProfiling, label: "Performance profiling", off: () => { this.settings.enablePerfProfiling = false; } },
+      { key: "trace", on: this.settings.debugTrace, label: "Debug trace", off: () => { this.settings.debugTrace = false; } },
+    ];
+    let changed = false;
+    const turnedOff: string[] = [];
+    for (const m of modes) {
+      if (!m.on) {
+        if (stamps[m.key]) { stamps[m.key] = 0; changed = true; }
+        continue;
+      }
+      if (!stamps[m.key]) { stamps[m.key] = Date.now(); changed = true; continue; }
+      if (Date.now() - stamps[m.key] > StashpadPlugin.DIAGNOSTIC_TTL_MS) {
+        m.off();
+        stamps[m.key] = 0;
+        turnedOff.push(m.label);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    this.settings.diagnosticsEnabledAt = stamps;
+    await this.saveSettings();
+    if (turnedOff.length) {
+      // Never silent: a setting that changes itself without saying so is worse
+      // than one left on, because the next capture would come back empty and
+      // the reason would be invisible.
+      new Notice(
+        `Stashpad turned ${turnedOff.join(" and ")} back off — ${turnedOff.length === 1 ? "it had" : "they had"} been on for over a week. Turn ${turnedOff.length === 1 ? "it" : "them"} on again in Settings → Diagnostics if you still need ${turnedOff.length === 1 ? "it" : "them"}.`,
+        0,
+      );
+    }
+  }
   private undoStacks = new Map<string, UndoStack>();
   /** Most-recently-active Stashpad leaf — set on active-leaf-change.
    *  Used by sidebar panel actions (Search, Home) so they target the
@@ -1314,6 +1375,9 @@ export default class StashpadPlugin extends Plugin {
     // loadSettings so the data.json move is in place when we read.
     await this.migrateLegacyPaths();
     await this.loadSettings();
+    // Before perf.enabled is read from it: a diagnostic left on for over a
+    // week switches itself back off here.
+    await this.expireStaleDiagnostics();
     perf.enabled = !!this.settings.enablePerfProfiling;
     this.encryption = new EncryptionService(
       this.app,

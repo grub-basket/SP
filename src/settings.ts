@@ -294,6 +294,12 @@ export interface StashpadSettings {
    *  writes; a no-op when off. Ships dormant — never needs stripping for the
    *  store / pristine. */
   debugTrace: boolean;
+  /** 0.255.0: epoch ms when a diagnostic mode was last switched ON, so it can
+   *  expire itself if forgotten. 0 = off / never stamped. Both diagnostics
+   *  cost something continuously (perf profiling accumulates timing; the debug
+   *  trace runs a two-second rAF scroll watch after several common actions),
+   *  and a mode left on for months is pure cost with no one reading it. */
+  diagnosticsEnabledAt: { perf: number; trace: number };
   /** 0.83.1: maintain the redundant `parentLink`/`children` recovery
    *  fields on every move. Default true. Turning it off skips those writes
    *  entirely — a big speedup on slow/network drives (each is a full
@@ -736,6 +742,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   folderPanelHidden: [],
   folderPanelPinnedGrouping: "pin-order",
   enablePerfProfiling: false,
+  diagnosticsEnabledAt: { perf: 0, trace: 0 },
   debugTrace: false,
   writeRecoveryLinks: true,
   slashCommands: true,
@@ -1165,12 +1172,16 @@ export class StashpadSettingTab extends PluginSettingTab {
     return [
       this.renderDef("Performance profiling", "Record timing for list rendering, body reads, and file writes. Turn on, use Stashpad normally (especially the slow operations), then run “Dump performance profile” from the command palette and share the result. Off = zero overhead.", (s) =>
         s.addToggle((t) => t.setValue(this.plugin.settings.enablePerfProfiling).onChange(async (v) => {
-          this.plugin.settings.enablePerfProfiling = v; await this.plugin.saveSettings();
+          this.plugin.settings.enablePerfProfiling = v;
+          this.plugin.stampDiagnostic("perf", v);
+          await this.plugin.saveSettings();
         })), ["perf", "profiling", "timing", "slow"]),
 
       this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. Local only — no network, no file writes; zero overhead when off.", (s) =>
         s.addToggle((t) => t.setValue(this.plugin.settings.debugTrace).onChange(async (v) => {
-          this.plugin.settings.debugTrace = v; await this.plugin.saveSettings();
+          this.plugin.settings.debugTrace = v;
+          this.plugin.stampDiagnostic("trace", v);
+          await this.plugin.saveSettings();
         })), ["debug", "trace", "diagnostics", "tap", "log"]),
 
       this.renderDef("Copy / clear debug trace", "Copy the captured debug lines to the clipboard (paste them back to share), or clear the buffer to start a fresh capture.", (s) => {
