@@ -39,7 +39,7 @@ import { OrderStore } from "./order-store";
 import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./structure-snapshot";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
-import { NotificationService, buildFileActions, boldFragment } from "./notifications";
+import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
 import { AuthorRegistry } from "./author-registry";
 import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
@@ -3308,7 +3308,15 @@ export default class StashpadPlugin extends Plugin {
             addedId: !!stampedId, addedParent: stampedParent, addedCreated: stampedCreated },
         });
       }
-      new Notice(`Adopted ${file.basename} → Home`);
+      this.notifications.show({
+        message: `Adopted \`${file.basename}\` → Home`,
+        kind: "success",
+        category: "import",
+        folder: file.parent?.path?.replace(/\/+$/, "") ?? undefined,
+        affectedIds: id ? [id as StashpadId] : undefined,
+        affectedPaths: [file.path],
+        actions: this.adoptionJumpActions([file]),
+      });
     } catch (e) {
       console.warn("Stashpad: orphan auto-fix failed", e);
     }
@@ -6502,6 +6510,54 @@ export default class StashpadPlugin extends Plugin {
     await this.revealNoteByRef(folder, id);
   }
 
+  /** 0.256.0: the jump button for an adoption notification.
+   *
+   *  Adopting a note leaves it somewhere the user wasn't looking — that is the
+   *  whole point of adoption — so the notification needs to be able to take
+   *  them there. One note: open that note. Several: open the note they were all
+   *  adopted UNDER, which for an orphan fix is the folder's home note (adoption
+   *  sets `parent` to ROOT_ID).
+   *
+   *  A batch can span folders, and there is no single parent then. Rather than
+   *  drop the button or pick a folder silently, it targets the folder with the
+   *  most adopted notes and NAMES it in the label, so the button never lands
+   *  somewhere the label didn't promise.
+   *
+   *  Returns [] when there's nothing to open — a button that can't resolve a
+   *  target is worse than no button. */
+  adoptionJumpActions(files: TFile[]): NotificationAction[] {
+    // Only offer a jump for notes that actually live in a Stashpad folder.
+    // `adoptNote` can be run on the active note wherever it sits, and a button
+    // that opens a Stashpad view onto a folder that isn't one is worse than no
+    // button at all.
+    const stashpadFolders = new Set(this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, "")));
+    const usable = files.filter((f) =>
+      f instanceof TFile && stashpadFolders.has(f.parent?.path?.replace(/\/+$/, "") ?? ""));
+    if (usable.length === 0) return [];
+    if (usable.length === 1) {
+      const file = usable[0];
+      return [{
+        label: "Open note",
+        onClick: () => { void this.revealNoteInStashpad(file); },
+      }];
+    }
+    const byFolder = new Map<string, number>();
+    for (const f of usable) {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (dir) byFolder.set(dir, (byFolder.get(dir) ?? 0) + 1);
+    }
+    if (byFolder.size === 0) return [];
+    let target = "";
+    let best = -1;
+    for (const [dir, n] of byFolder) if (n > best) { target = dir; best = n; }
+    const spansFolders = byFolder.size > 1;
+    const leaf = target.slice(target.lastIndexOf("/") + 1);
+    return [{
+      label: spansFolders ? `Open ${leaf} home` : "Open home",
+      onClick: () => { void this.revealNoteByRef(target, ROOT_ID); },
+    }];
+  }
+
   /** 0.174.0: Stashpad notes (in a discovered folder, with an id) that reference
    *  `attachment` — either via a body embed/link (metadataCache.resolvedLinks)
    *  or via the canonical `attachments` frontmatter array. Deduped, folder order.
@@ -8240,6 +8296,8 @@ export default class StashpadPlugin extends Plugin {
 
     let fixed = 0;
     let failed = 0;
+    // Kept so the notification can offer a jump to what was adopted.
+    const fixedFiles: TFile[] = [];
     const log = this.newLog();
     for (const item of plan) {
       try {
@@ -8270,13 +8328,20 @@ export default class StashpadPlugin extends Plugin {
           });
         }
         fixed++;
+        fixedFiles.push(item.file);
       } catch (e) {
         console.warn("Stashpad: orphan fix failed for", item.file.path, e);
         failed++;
       }
     }
     const tail = failed ? ` (${failed} failed — see console)` : "";
-    new Notice(`Fixed ${fixed} note${fixed === 1 ? "" : "s"} in Stashpad folders${tail}.`);
+    this.notifications.show({
+      message: `Fixed ${fixed} note${fixed === 1 ? "" : "s"} in Stashpad folders${tail}.`,
+      kind: failed ? "warning" : "success",
+      category: "import",
+      affectedPaths: fixedFiles.map((f) => f.path),
+      actions: this.adoptionJumpActions(fixedFiles),
+    });
   }
 
   async adoptNote(file: TFile): Promise<void> {
@@ -8397,7 +8462,14 @@ export default class StashpadPlugin extends Plugin {
     const parts: string[] = [];
     if (added.length) parts.push(`added: ${added.join(", ")}`);
     if (renamed) parts.push("renamed with id");
-    new Notice(`Adopted into Stashpad — ${parts.join("; ")}.`);
+    this.notifications.show({
+      message: `Adopted \`${file.basename}\` into Stashpad — ${parts.join("; ")}.`,
+      kind: "success",
+      category: "import",
+      folder: file.parent?.path?.replace(/\/+$/, "") ?? undefined,
+      affectedPaths: [file.path],
+      actions: this.adoptionJumpActions([file]),
+    });
     // Nudge any open Stashpad views to re-pick up the file. The metadataCache
     // change will trigger their tree rebuild on its own; this is just for the
     // log.
