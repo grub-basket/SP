@@ -15157,7 +15157,14 @@ export class StashpadView extends ItemView {
       }));
     }
     menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => this.cmdMovePicker()));
+    // 0.257.0: focusClicked FIRST. Without it this moved whatever the LIST had
+    // selected instead of the note the menu was opened on — and since a list
+    // row is always selected, it always moved the wrong note. Worst from the
+    // focused-note header, where the note you right-clicked isn't even in the
+    // list: you asked to move the parent and a child moved. Every other item in
+    // this menu already normalises (directly, via focusClicked, or via taskAct);
+    // this one was the only hole.
+    menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => { focusClicked(); this.cmdMovePicker(); }));
     menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => {
       await this.changeParent(node, ROOT_ID);
       // 0.72.6: follow the moved note up to Home if the user enabled
@@ -15685,6 +15692,21 @@ export class StashpadView extends ItemView {
 
   private async changeParent(node: TreeNode, newParent: StashpadId, opts: { record?: boolean; quiet?: boolean; silentSuccess?: boolean } = { record: true }): Promise<boolean> {
     if (!node.file) return false;
+    // 0.257.0: the home note IS the folder's root — reparenting it would give
+    // the tree a root with a parent. Previously unreachable in practice (the
+    // home note is never a cursor row and nothing selected it), but normalising
+    // the context menu's "Move to…" to the right-clicked note makes the Home
+    // header's own menu a live path to it. Guarded here rather than by hiding
+    // the menu item, so every caller — drag, hotkey, palette — is covered.
+    if (node.id === ROOT_ID) {
+      this.plugin.notifications.show({
+        message: "The home note can't be moved — it's what the folder's notes hang from.",
+        kind: "warning",
+        category: "move",
+        folder: this.noteFolder,
+      });
+      return false;
+    }
     const file = node.file;
     const oldParent = node.parent;
     // 0.58.2: surface a warning when a move is a no-op so the user knows
