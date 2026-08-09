@@ -9723,6 +9723,7 @@ export class StashpadView extends ItemView {
   cmdCopy(): Promise<void> { return clipboardCmds.cmdCopy(this); }
   cmdCopyCodeBlock(): Promise<void> { return clipboardCmds.cmdCopyCodeBlock(this); }
   cmdCopyTree(): Promise<void> { return clipboardCmds.cmdCopyTree(this); }
+  cmdCopyFocusedSubtree(): Promise<void> { return clipboardCmds.cmdCopyFocusedSubtree(this); }
   cmdCopyOutline(): Promise<void> { return clipboardCmds.cmdCopyOutline(this); }
 
   /** 0.193.0: reverse color-alias lookup — friendly name → hex for THIS folder.
@@ -15105,6 +15106,20 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     const file = node.file;
     const menu = new Menu();
+    /** THE invariant of this menu: an item acts on the note that was
+     *  right-clicked, even when it isn't the selected one — and, from the
+     *  focused-note header, even when it isn't in the list at all. An existing
+     *  multi-selection that already contains this note is preserved.
+     *
+     *  Any item whose command resolves its own targets (i.e. calls
+     *  `getActionTargets()` rather than taking a node) MUST call this first.
+     *  This was five copy-pasted copies of the same line; "Move to…" was the
+     *  one that never got a copy, and it silently moved the wrong note until
+     *  0.257.0. One definition now, so a new item has something to call rather
+     *  than something to remember. */
+    const focusClicked = (): void => {
+      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+    };
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("layout-grid").onClick(() => {
       void this.openInNewStashpadTab(node.id);
     }));
@@ -15125,14 +15140,14 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle(`Copy text${getSettings().prefixTimestampsOnCopy ? " with timestamps" : ""}`).setIcon("copy").onClick(() => { focusClicked(); void this.cmdCopy(); }));
     menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
-      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      focusClicked();
       void this.cmdClone();
     }));
     // 0.122.7: "Cut note" pulled from the menu for now — cut/paste has known bugs
     // and cutting a parent/home note from the context menu is too easy a footgun.
     // Still available via the cutNotes hotkey. (See ui-polish todos.)
     menu.addItem((it: any) => it.setTitle("Fork into a separate note…").setIcon("git-branch").onClick(() => {
-      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      focusClicked();
       this.cmdForkNote();
     }));
     // 0.122.2 (#9): "Insert template…" removed from the right-click menu to keep
@@ -15189,12 +15204,12 @@ export class StashpadView extends ItemView {
       .setTitle(listPinned ? "Unpin from top of list" : "Pin to top of list")
       .setIcon(listPinned ? "pin-off" : "arrow-up-to-line")
       .onClick(() => {
-        if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+        focusClicked();
         void this.cmdToggleListPin();
       }));
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
-      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      focusClicked();
       this.cmdSetColor();
     }));
     // 0.104.x: task actions grouped under a "Task ▸" submenu to keep the
@@ -15207,9 +15222,6 @@ export class StashpadView extends ItemView {
     // setSubmenu is internal/untyped — accessed via the existing `it: any`
     // pattern; falls back to opening the command palette if unavailable
     // (effectively never on the 1.13 minAppVersion floor).
-    const focusClicked = (): void => {
-      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
-    };
     // 0.224.0: these items live in a SUBMENU. Obsidian dismisses the menu a
     // clicked item belongs to, but on mobile the parent sheet stays up — so
     // marking a task complete left the overlay covering the very row you were
@@ -15255,7 +15267,7 @@ export class StashpadView extends ItemView {
       // Route through cmdDelete (not deleteNote directly) so the encryptTrash
       // override applies here too — otherwise right-click Delete sends
       // plaintext to the system trash with "Encrypt items sent to trash" ON.
-      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      focusClicked();
       await this.cmdDelete();
     }));
     menu.addSeparator();

@@ -122,14 +122,37 @@ export async function cmdCopyCodeBlock(view: StashpadView): Promise<void> {
   modal.open();
 }
 
+/** Copy the note(s) you have selected, plus everything nested under them.
+ *
+ *  0.259.0: the `focused note` fallback that used to sit here was DEAD — a list
+ *  row is always selected, so `getActionTargets()` never came back empty and
+ *  the fallback could not fire. "Copy the focused subtree" now has its own
+ *  entry point (`cmdCopyFocusedSubtree`) that means it, rather than being an
+ *  unreachable branch of this one. */
 export async function cmdCopyTree(view: StashpadView): Promise<void> {
-  // Roots: selection > cursor row > focused note (last resort).
-  let roots = view.getActionTargets();
-  if (roots.length === 0) {
-    const focused = view.tree.get(view.focusId);
-    if (focused?.file) roots = [focused];
-  }
+  const roots = view.getActionTargets();
   if (roots.length === 0) { new Notice("Nothing to copy."); return; }
+  await copyTreeFromRoots(view, roots);
+}
+
+/** Copy the note you are currently INSIDE plus its whole subtree, regardless of
+ *  what happens to be selected in the list.
+ *
+ *  0.259.0: the palette command has been named "Copy focused subtree" all
+ *  along, and the settings text promised "the focused note + all descendants",
+ *  but both ran the selection-based copy above — so it copied whichever child
+ *  row was selected, which (since one always is) meant it never once did what
+ *  its own name said. */
+export async function cmdCopyFocusedSubtree(view: StashpadView): Promise<void> {
+  const focused = view.tree.get(view.focusId);
+  if (!focused?.file) {
+    new Notice("No focused note to copy — open a note first.");
+    return;
+  }
+  await copyTreeFromRoots(view, [focused]);
+}
+
+async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[]): Promise<void> {
   const prefix = getSettings().prefixTimestampsOnCopy;
   const lines: string[] = [];
   const walk = async (node: TreeNode, depth: number): Promise<void> => {

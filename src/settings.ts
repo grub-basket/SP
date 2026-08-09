@@ -106,7 +106,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "pickMove",        label: "Move (in-list)",                desc: "Highlight a note in the list with arrows; Enter sets it as parent.",                     defaultPrimary: "O" },
   { id: "merge",           label: "Merge",                         desc: "Concatenate selected notes into the oldest one.",                                        defaultPrimary: "&" },
   { id: "copy",            label: "Copy",                          desc: "Copy selected note bodies to clipboard.",                                                defaultPrimary: "C" },
-  { id: "copyTree",        label: "Copy tree",                     desc: "Copy the focused note + all descendants, indented.",                                     defaultPrimary: "Y" },
+  { id: "copyTree",        label: "Copy tree",                     desc: "Copy the selected note(s) + everything nested under them, indented. For the note you are currently inside, use the \"Copy focused subtree\" command.",                                     defaultPrimary: "Y" },
   { id: "copyLink",        label: "Copy Stashpad link",            desc: "Copy an obsidian://stashpad deep link to the cursor row (or first selected note) — click it anywhere to jump back. No default chord.", defaultPrimary: "" },
   { id: "openEditor",      label: "Open in Obsidian editor",       desc: "Open the cursor row (or focused note) in a regular Obsidian markdown tab.",              defaultPrimary: "Mod+Shift+E" },
   { id: "openTab",         label: "Open in new Stashpad tab",      desc: "Open the cursor row (or focused note) in a new Stashpad tab focused on it.",             defaultPrimary: "T" },

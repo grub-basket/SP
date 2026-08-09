@@ -2107,7 +2107,9 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({
       id: "stashpad-copy-tree",
       name: "Copy focused subtree",
-      callback: () => call("cmdCopyTree"),
+      // 0.259.0: was wired to cmdCopyTree, which copies the SELECTION — so this
+      // command never did what its name said.
+      callback: () => call("cmdCopyFocusedSubtree"),
     });
     // 0.184.0: dismiss every visible notification toast at once (handy when a batch
     // of due reminders / messages stacks up).
