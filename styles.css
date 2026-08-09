@@ -6989,20 +6989,34 @@ button.stashpad-btn-loading::after {
    --text-success / --text-error are defined to be readable on the normal
    background in BOTH themes, so colouring the text instead is correct by
    construction rather than by tuning. */
+/* 0.261.1: WEIGHT, not hue, carries emphasis here — measured against this
+   vault's own themes, every semantic colour fails WCAG AA (4.5:1) for small
+   text on a LIGHT background: success 2.61, warning 2.95, error 4.20, accent
+   4.26. Only --text-muted (6.69) and --text-normal clear it in both themes, so
+   a green/red pairing would be less readable than the grey it replaced — and
+   red/green is the one pairing colour-blind readers cannot separate anyway.
+   Quiet = muted; needs-attention = normal colour at semibold. */
 .stashpad-dupes-badge {
   justify-self: start;
   font-size: var(--font-ui-smaller);
-  font-weight: var(--font-semibold, 600);
+  font-weight: var(--font-normal, 400);
   line-height: 1.5;
   letter-spacing: 0.02em;
-  color: var(--text-error);
+  color: var(--text-muted);
   white-space: nowrap;
+}
+/* The shown copy is the ANCHOR every other row is compared against — one per
+   group, and the exceptional one. It gets the emphasis; "not in the list" is
+   true of nearly every row and shouting it on each would say nothing. */
+.stashpad-dupes-badge.is-shown-badge {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold, 600);
 }
 /* "shown" is the BASELINE state, so it stays neutral — --text-success is a pale
    green that measured 2.61:1 on a light background. Only "hidden" is an
    anomaly, and only it needs to carry colour. --text-muted and --text-error are
    both defined against the normal background, so this holds in either theme. */
-.stashpad-dupes-file.is-shown .stashpad-dupes-badge { color: var(--text-muted); }
+
 /* 0.261.0: paths WRAP again, reversing 0.219.8's per-row horizontal scroll.
    That change stopped rows becoming several lines tall, but it traded one
    problem for a worse one: you had to scroll each row sideways to read the
@@ -7038,8 +7052,8 @@ button.stashpad-btn-loading::after {
 .stashpad-dupes-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .stashpad-dupes-badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .stashpad-dupes-badge.is-conflict {
-  color: var(--text-warning);
-  font-weight: var(--font-normal, 400);
+  color: var(--text-normal);
+  font-weight: var(--font-semibold, 600);
 }
 /* Per-row verdict. Same three-way read as the Compare view: safe / look first. */
 .stashpad-dupes-verdict {
@@ -7047,9 +7061,15 @@ button.stashpad-btn-loading::after {
   color: var(--text-faint);
   font-weight: var(--font-normal, 400);
 }
+/* "same content" is the boring answer — nothing here, move on. Anything that
+   DIFFERS is the row you must read before discarding, so it gets the weight.
+   Not green/red: see the badge block above for the measured reason. */
 .stashpad-dupes-verdict.is-same { color: var(--text-muted); }
 .stashpad-dupes-verdict.is-fields,
-.stashpad-dupes-verdict.is-diff { color: var(--text-accent); }
+.stashpad-dupes-verdict.is-diff {
+  color: var(--text-normal);
+  font-weight: var(--font-semibold, 600);
+}
 /* Destructive action = red LABEL on the ordinary button surface. --text-error
    is defined to be readable against the normal background in both themes, so
    this is legible by construction rather than by tuning a fill. */

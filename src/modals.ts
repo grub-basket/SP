@@ -3933,7 +3933,16 @@ export class DuplicateIdsModal extends Modal {
 
       const main = row.createDiv({ cls: "stashpad-dupes-main" });
       const badges = main.createDiv({ cls: "stashpad-dupes-badges" });
-      badges.createSpan({ cls: "stashpad-dupes-badge", text: f.isShown ? "shown" : "hidden" });
+      // 0.261.1: both badges explain themselves. "hidden" is jargon that means
+      // nothing without the modal's intro paragraph, which you have scrolled
+      // past by the time you are reading rows.
+      const b = badges.createSpan({
+        cls: f.isShown ? "stashpad-dupes-badge is-shown-badge" : "stashpad-dupes-badge",
+        text: f.isShown ? "in the list" : "not in the list",
+      });
+      b.title = f.isShown
+        ? "This is the copy Stashpad shows for this id — the one you see and edit in the list."
+        : "This file is in your vault but never appears in the Stashpad list: another note claimed the same id, and only one of them can be displayed.";
       if (isConflictCopy(f.path)) {
         const cb = badges.createSpan({ cls: "stashpad-dupes-badge is-conflict", text: "conflict copy" });
         cb.title = "The filename marks this as a sync conflict copy. Usually the one to discard — but read it first: a conflict copy can hold the newer edit.";
