@@ -1194,6 +1194,117 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   max-height: 40%;
   overflow-y: auto;
 }
+
+/* 0.258.0 — the heading as a pinned ROW inside the list.
+
+   `position: sticky` is what makes the two behaviours the old code needed two
+   elements for into one: the heading sits in normal flow at the top of the
+   list, and stays put once you scroll past it. The hand-rolled sticky "mini"
+   preview existed only because the header lived outside the list.
+
+   overflow-y is reset to visible: a sticky element cannot stick inside its own
+   scroll container, and the row must not carry its own scrollbar anyway now
+   that it is part of the list. */
+.stashpad-focused.is-heading-row {
+  position: sticky;
+  /* -4px, not 0, to cancel the list's own 4px `padding-top`. At `top: 0` the
+     row pinned 4px BELOW the list's edge, leaving a gap that scrolling notes
+     showed through — the heading read as detached and floating. Same trick and
+     same reason as the old mini header's `top: -4px`. */
+  top: -4px;
+  z-index: 3;
+  max-height: 45vh;
+  overflow-y: visible;
+  background-color: var(--background-primary);
+  cursor: default;
+}
+/* The pinned row must be fully OPAQUE or rows scroll visibly beneath it. The
+   4px reclaimed above is covered by a border of the same background, so the
+   strip is painted without changing where the content sits. */
+.stashpad-focused.is-heading-row {
+  border-top: 4px solid var(--background-primary);
+}
+/* Cursor + selection affordances, matching the note rows so the keyboard
+   cursor reads the same wherever it is. */
+/* Selected state LAYERS the (semi-transparent) hover colour over the opaque
+   base rather than replacing it. Assigning `--background-modifier-hover` to
+   background-color directly made the pinned row see-through — it is an
+   overlay colour with alpha, meant to sit on top of something, and the rows
+   scrolling underneath showed straight through it. */
+.stashpad-focused.is-heading-row.is-selected {
+  background-image: linear-gradient(var(--background-modifier-hover), var(--background-modifier-hover));
+  background-color: var(--background-primary);
+}
+/* Same full inset ring the note rows use (.stashpad-note.is-cursor), not a
+   left-edge bar. Two reasons: the cursor then reads identically wherever it
+   sits, which is the point of the heading being a row at all; and a left bar
+   drew ON TOP of the timestamp on mobile, where the heading has no left
+   padding to clear it. A ring sits on the row's edge, over nothing. */
+.stashpad-focused.is-heading-row.is-cursor {
+  box-shadow: 0 0 0 2px var(--interactive-accent) inset;
+}
+/* Compact the heading once it is stuck rather than merely sitting at the top,
+   so a long note doesn't eat the list while you scroll. Driven by the same
+   IntersectionObserver sentinel the mini header used. */
+/* Scrolled away from the top, the heading collapses to a SINGLE LINE — the
+   behaviour the old sticky mini preview had, and the reason it existed: a long
+   focused note otherwise eats the list you scrolled down to read. The full
+   preview comes back when you return to the top.
+
+   `max-height` alone can't do this (0.258.0's 4.5em attempt just cropped the
+   block mid-paragraph). One line means: the body clamped to one line with an
+   ellipsis, the timestamp un-stacked onto one line, and the authorship strip —
+   a second line by definition — hidden. */
+/* Scroll anchoring OFF for the heading. Collapsing removes ~200px of content
+   from ABOVE the viewport, and Chrome compensates by pushing `scrollTop` down
+   to keep the anchored row still. Scrolling back up then re-expands the
+   heading, which pushes you down again — a loop that left the list stuck in
+   the collapsed state with no way back to the top. Excluding the heading from
+   anchoring lets its size change without the scroll position chasing it. */
+.stashpad-focused.is-heading-row {
+  overflow-anchor: none;
+}
+.stashpad-focused.is-heading-row.is-stuck {
+  overflow: hidden;
+  border-bottom-color: var(--background-modifier-border-hover);
+  align-items: center;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.stashpad-focused.is-heading-row.is-stuck .stashpad-note-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* The rendered body is markdown, so the first line may be a <p>/<h1>/<li>.
+   Kill their block margins or the "one line" is one line plus leading. */
+.stashpad-focused.is-heading-row.is-stuck .stashpad-note-text > * {
+  margin-block: 0;
+  display: inline;
+}
+/* Second lines, by definition — gone while collapsed. */
+.stashpad-focused.is-heading-row.is-stuck .stashpad-note-authorship {
+  display: none;
+}
+/* The expand/collapse toggle too. While stuck the collapse is FORCED — the
+   one-line clamp here wins over the toggle's own expanded state, so the button
+   was visible and did nothing. A control that can't control anything is worse
+   than no control; it comes back the moment you scroll to the top and the
+   collapse is yours to choose again. */
+.stashpad-focused.is-heading-row.is-stuck .stashpad-expand-toggle {
+  display: none;
+}
+/* The timestamp stacks date over time; side by side while collapsed so the
+   meta column is one line too and can't set the row's height on its own. */
+.stashpad-focused.is-heading-row.is-stuck .stashpad-focused-meta-top {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+.stashpad-focused.is-heading-row.is-stuck .stashpad-focused-time {
+  white-space: nowrap;
+}
 .stashpad-focused-meta {
   display: flex;
   flex-direction: column;
@@ -3122,6 +3233,15 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile .stashpad-focused {
   padding: 4px 0 6px;
   max-height: none;
+}
+/* 0.258.0: as a ROW the heading needs the side padding a row has — at 0 the
+   timestamp sat flush against the left edge, under the cursor ring. Longhands
+   only: a `padding` shorthand here would reset the rule above. Matches
+   `.stashpad-note`'s 10px so the heading's timestamp column lines up with the
+   rows beneath it. */
+.stashpad-view.is-mobile .stashpad-focused.is-heading-row {
+  padding-left: 10px;
+  padding-right: 10px;
 }
 .stashpad-view.is-mobile .stashpad-focused .stashpad-note-text.is-clamped {
   -webkit-line-clamp: 1;
@@ -7597,3 +7717,4 @@ button.stashpad-btn-loading::after {
 .stashpad-appimport-newfolder .setting-item { border-top: none; padding-top: 0; }
 .stashpad-appimport-spin { animation: stashpad-appimport-spin 1s linear infinite; display: inline-flex; }
 @keyframes stashpad-appimport-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+

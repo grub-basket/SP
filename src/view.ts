@@ -254,6 +254,25 @@ export class StashpadView extends ItemView {
   private lastSelected: StashpadId | null = null;
   /** public: read by extracted command modules (commands/*.ts). */
   cursorIdx = -1;
+  /** 0.258.0: the cursor is on the pinned HEADING row (the focused note shown
+   *  at the top of its own list) rather than on a child.
+   *
+   *  A separate flag rather than `cursorIdx = -1`, because -1 already means
+   *  "no cursor at all" in a dozen places and overloading it would make every
+   *  one of those checks silently wrong.
+   *
+   *  `currentChildren` deliberately still means CHILDREN OF `focusId` — it is
+   *  read by move planning, the pickers, reorder and several tree walks, and
+   *  redefining it to include the parent would change all of them at once. The
+   *  heading is layered on top for cursor / selection / target resolution
+   *  only. */
+  private cursorOnHeading = false;
+  /** Focus level the last paint was for. Compared each render to detect a level
+   *  change, because the nav paths don't share one entry point — `navigateTo`
+   *  funnels some, but `navigateUp` assigns `focusId` directly and back/forward
+   *  restore snapshots. Level-scoped state resets here rather than in each
+   *  caller, so a nav path added later can't quietly skip it. */
+  private renderedFocusId: StashpadId | null = null;
   /** 0.98.6: after an async restore (e.g. decrypt → importStashZip → tree
    *  rebuild), cursor + select this id once it appears in the list. Cleared when
    *  applied. Survives the intermediate render where the note isn't in the tree yet. */
@@ -464,7 +483,8 @@ export class StashpadView extends ItemView {
    *  that doesn't count as "select mode" in the user's mental model. */
   private mobileSelectMode = false;
   /** Observer that toggles the sticky mini focused-header preview. */
-  private focusedMiniObserver: IntersectionObserver | null = null;
+  /** Removes the heading's scroll listener; see installHeadingStuckObserver. */
+  private headingStuckCleanup: (() => void) | null = null;
   /** When set, the next composer render restores the caret to this index
    *  in the new textarea. Paired with focusComposerOnNextRender. */
   private pendingComposerCaret: number | null = null;
@@ -1245,8 +1265,8 @@ export class StashpadView extends ItemView {
     this.barOverflowRO = null;
     this.composerNarrowObserver?.disconnect();
     this.composerNarrowObserver = null;
-    this.focusedMiniObserver?.disconnect();
-    this.focusedMiniObserver = null;
+    this.headingStuckCleanup?.();
+    this.headingStuckCleanup = null;
     if (this.treeReconcileTimer != null) { window.clearTimeout(this.treeReconcileTimer); this.treeReconcileTimer = null; }
     if (this.autoSyncSettleTimer != null) { window.clearTimeout(this.autoSyncSettleTimer); this.autoSyncSettleTimer = null; }
     this.autoSyncNotice?.hide();
@@ -2162,9 +2182,13 @@ export class StashpadView extends ItemView {
     // the list. In COMPACT mode skip it (matching desktop compact, which omits
     // the focused header) — with the breadcrumb also hidden, leaving the header
     // in left an empty-looking block at the top. Compact = tight list, no header.
-    if (focused.file && Platform.isMobile && !this.compactMode) {
-      this.renderFocusedHeaderMini(list, focused);
-      this.renderFocusedHeader(list, focused);
+    // 0.258.0: ONE heading row, both platforms, sticky at the top of the list.
+    // Replaces the desktop "header above the list" + the mobile
+    // "header in the list plus a sticky mini preview" pair: `position: sticky`
+    // does what the mini was hand-rolled to do, and being a row is what makes
+    // it reachable by keyboard and selectable.
+    if (this.headingNode() && !this.tinyMode) {
+      this.renderFocusedHeader(list, focused, { asRow: true });
     }
     // Render path.
     //   - Nested / Flat: pure Stashpad-note list, rendered in order.
@@ -2286,7 +2310,10 @@ export class StashpadView extends ItemView {
         else this.renderLockedPlaceholder(list, it.lk);
       }
     }
-    if (focused.file && Platform.isMobile && !this.compactMode) this.installFocusedMiniObserver(list);
+    // 0.258.0: install on EVERY platform. This was mobile-only because the
+    // thing it drove (the sticky mini preview) was mobile-only; it now drives
+    // the heading's stuck state, and the heading is on both platforms.
+    if (this.headingNode() && !this.tinyMode) this.installHeadingStuckObserver(list);
   }
 
   /** 0.98.1: a locked-subtree placeholder row. Click → unlock (prompts for the
@@ -2397,6 +2424,7 @@ export class StashpadView extends ItemView {
    *  apparent "reload" on mobile. Falls back to a full render() if
    *  listEl isn't around yet (first paint / view hasn't mounted). */
   refreshList(): void {
+    this.syncLevelScopedState();
     if (!this.listEl) { this.render(); return; }
     const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
     this.currentChildren = this.filterChildren(this.collectViewItems(focused.id));
@@ -2795,6 +2823,7 @@ export class StashpadView extends ItemView {
   private _renderT0: number | null = null;
   /** public: called by extracted command modules (commands/*.ts). */
   render(policy?: ScrollPolicy): void {
+    this.syncLevelScopedState();
     if (perf.enabled) this._renderT0 = performance.now();
     // 0.140.9: bail if the view was torn down. A debounced/deferred render
     // firing after onClose would rebuild the whole UI on detached DOM AND
@@ -2936,7 +2965,10 @@ export class StashpadView extends ItemView {
     // appears at the top of the list when the full header scrolls out.
     // 0.61.1: tiny mode hides the focused-header too. 0.61.2: compact
     // mode also hides it.
-    if (focused.file && !Platform.isMobile && !this.tinyMode && !this.compactMode) this.renderFocusedHeader(chrome, focused);
+    // 0.258.0: the heading no longer renders into `chrome` on desktop. It is a
+    // sticky ROW at the top of the list on every platform now, so that it is
+    // one thing the cursor and selection can address rather than a second
+    // structure living outside the list model. See renderHeadingRow.
 
     this.currentChildren = this.filterChildren(this.collectViewItems(focused.id));
     let selectionMovedByRender = false;
@@ -5361,40 +5393,30 @@ export class StashpadView extends ItemView {
   /** Sticky 1-line preview for the focused header (mobile only). Renders
    *  at the top of the list and is hidden until the full
    *  `.stashpad-focused` row scrolls out of view (toggled by
-   *  installFocusedMiniObserver). */
-  private renderFocusedHeaderMini(parent: HTMLElement, node: TreeNode): void {
-    if (!node.file) return;
-    const mini = parent.createDiv({ cls: "stashpad-focused-mini" });
-    mini.dataset.id = node.id;
-    if (this.isTask(node)) this.addTaskCheckbox(mini, node); // 0.201.4: task state in the sticky header too
-    const text = mini.createDiv({ cls: "stashpad-focused-mini-text" });
-    text.setText(this.titleForNode(node).trim());
-    // 0.123.0: match the full focused header — the sticky preview's lone edit
-    // pencil becomes the context-menu button so the actions are consistent
-    // wherever the focused note's controls appear on mobile.
-    const moreBtn = mini.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-mini-more" });
-    setIcon(moreBtn, "ellipsis-vertical"); // 0.163.1: true vertical kebab (more-vertical is rotated 90° by Obsidian on iOS/macOS)
-    moreBtn.title = "Actions";
-    moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
-  }
-
-  /** IntersectionObserver: hide the sticky mini preview while the full
-   *  focused header is in view; show it when the full one scrolls past
-   *  the top of the list. */
-  private installFocusedMiniObserver(list: HTMLElement): void {
-    const full = list.querySelector(".stashpad-focused");
-    const mini = list.querySelector(".stashpad-focused-mini");
-    if (!full || !mini) return;
-    if (this.focusedMiniObserver) this.focusedMiniObserver.disconnect();
-    this.focusedMiniObserver = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          mini.toggleClass("is-visible", !e.isIntersecting);
-        }
-      },
-      { root: list, threshold: 0.05 },
-    );
-    this.focusedMiniObserver.observe(full);
+   *  installHeadingStuckObserver). */
+  /** 0.258.0: drives `is-stuck` on the pinned heading row.
+   *
+   *  A sticky element can't report its own stuck-ness, so a 1px sentinel
+   *  (pulled back out of layout with a negative margin) is rendered
+   *  immediately ABOVE it: while the sentinel is visible
+   *  the heading is sitting in normal flow; once the sentinel scrolls out, the
+   *  heading is pinned and compacts so a long note doesn't eat the list.
+   *
+   *  Replaces the old mini-preview observer — the mini existed only to fake
+   *  stickiness for a header that lived outside the list, and `position:
+   *  sticky` on a real row does that natively. */
+  private installHeadingStuckObserver(list: HTMLElement): void {
+    if (this.headingStuckCleanup) { this.headingStuckCleanup(); this.headingStuckCleanup = null; }
+    const apply = (): void => {
+      // Re-query each time: render() rebuilds the row, and a handler holding a
+      // stale element would toggle a class on a detached node — which is
+      // exactly how the IntersectionObserver version failed silently.
+      const heading = list.querySelector(".stashpad-focused.is-heading-row");
+      if (heading) heading.toggleClass("is-stuck", list.scrollTop > 2);
+    };
+    list.addEventListener("scroll", apply, { passive: true });
+    this.headingStuckCleanup = () => list.removeEventListener("scroll", apply);
+    apply();
   }
 
   /** Focused-header layout mirrors a list row: [meta | body | actions].
@@ -5403,13 +5425,32 @@ export class StashpadView extends ItemView {
    *  - body: the focused note's rendered body.
    *  - actions: edit pencil + duplicate-tab button. The Show More
    *    toggle (when content overflows) inserts before the pencil. */
-  private renderFocusedHeader(parent: HTMLElement, node: TreeNode): void {
+  private renderFocusedHeader(parent: HTMLElement, node: TreeNode, opts: { asRow?: boolean } = {}): void {
     if (!node.file) return;
     const file = node.file;
     const wrap = parent.createDiv({ cls: "stashpad-focused" });
     // 0.122.2 (#9): the focused-note header gets the same right-click menu as a
     // list row (it IS a note — Copy/Cut/Move/Task/Delete all apply to it).
     wrap.oncontextmenu = (evt) => { evt.preventDefault(); this.openNoteMenu(evt, node); };
+    // 0.258.0: as a row, it carries the same cursor/selected state classes the
+    // note rows use, so one stylesheet drives both and the cursor is visible
+    // wherever it sits. `is-heading-row` is what pins it (sticky, top: 0).
+    if (opts.asRow) {
+      wrap.addClass("is-heading-row");
+      if (this.cursorOnHeading) wrap.addClass("is-cursor");
+      if (this.selection.has(node.id)) wrap.addClass("is-selected");
+      wrap.dataset.headingId = node.id;
+      // Click puts the cursor here — the same contract a note row has, which is
+      // what "selectable" means for the rest of the command surface.
+      wrap.addEventListener("click", (e) => {
+        const el = e.target as HTMLElement | null;
+        // Don't hijack clicks on the header's own controls (pencil, kebab,
+        // task checkbox) or on rendered links inside the body.
+        if (el?.closest("button, a, input, .stashpad-note-check")) return;
+        this.cursorOnHeading = true;
+        this.selectHeadingCursor();
+      });
+    }
 
     // meta column: timestamp + a transparent grip-shaped spacer so the
     // body's left edge column-aligns with each list row's body.
@@ -7137,6 +7178,21 @@ export class StashpadView extends ItemView {
     // Mod-click-deselect should NOT move the cursor onto the just-
     // deselected row (the residual is-cursor highlight is what the user
     // perceived as a "thin highlight left behind").
+    // 0.258.3: acting on a ROW hands the cursor over from the heading.
+    // Without this the heading kept its is-cursor ring after you clicked a
+    // note, and — worse for shift/mod-click, which ADD to the selection rather
+    // than replacing it — the heading's id stayed in `selection`, so it was
+    // silently counted as a target alongside its own children. The heading is
+    // single-select by design (0.258.0), so it leaves the selection entirely.
+    if (this.cursorOnHeading) {
+      this.cursorOnHeading = false;
+      const h = this.headingNode();
+      if (h) {
+        this.selection.delete(h.id);
+        if (this.firstSelectedId === h.id) this.firstSelectedId = null;
+        if (this.lastSelected === h.id) this.lastSelected = null;
+      }
+    }
     const wasEmpty = this.selection.size === 0;
     if (e.shiftKey && this.lastSelected) {
       this.cursorIdx = idx;
@@ -7588,18 +7644,34 @@ export class StashpadView extends ItemView {
       }
       return;
     }
+    // 0.258.0: the pinned heading is a stop in the cursor order, sitting ABOVE
+    // index 0 — which is where it sits on screen. Shift-arrow deliberately does
+    // NOT extend a range onto or off it: a selection spanning a note AND its
+    // own children is not a coherent target for move/delete/clone, so the
+    // heading is a single-select stop (see 0.258.0 design decision).
+    const heading = this.headingNode();
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      // Wrap from last → first.
-      if (this.cursorIdx >= this.currentChildren.length - 1) this.cursorIdx = 0;
-      else this.cursorIdx++;
+      if (this.cursorOnHeading) {
+        this.cursorOnHeading = false;
+        this.cursorIdx = 0;
+      } else if (this.cursorIdx >= this.currentChildren.length - 1) {
+        // Past the last child: onto the heading if there is one, else wrap.
+        if (heading) { this.cursorOnHeading = true; this.selectHeadingCursor(); return; }
+        this.cursorIdx = 0;
+      } else this.cursorIdx++;
       this.selectCursor(e.shiftKey); return;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
-      // Wrap from first → last (consistent with down-wrap).
-      if (this.cursorIdx <= 0) this.cursorIdx = this.currentChildren.length - 1;
-      else this.cursorIdx--;
+      if (this.cursorOnHeading) {
+        // Off the top of the heading wraps to the last child.
+        this.cursorOnHeading = false;
+        this.cursorIdx = this.currentChildren.length - 1;
+      } else if (this.cursorIdx <= 0) {
+        if (heading) { this.cursorOnHeading = true; this.selectHeadingCursor(); return; }
+        this.cursorIdx = this.currentChildren.length - 1;
+      } else this.cursorIdx--;
       this.selectCursor(e.shiftKey); return;
     }
     // Browser-style history nav. Mouse buttons 3/4 are often hijacked by
@@ -7748,7 +7820,33 @@ export class StashpadView extends ItemView {
     this.selectCursor(false);
   }
 
+  /** 0.258.0: land the cursor on the pinned heading and select just it.
+   *  Always single-select — a range containing a note and its own children
+   *  isn't a coherent target set, so the heading never joins one. */
+  private selectHeadingCursor(): void {
+    const h = this.headingNode();
+    if (!h) { this.cursorOnHeading = false; return; }
+    this.cursorHasMoved = true;
+    this.cursorIdx = -1;
+    this.selection.clear();
+    this.selection.add(h.id);
+    this.firstSelectedId = h.id;
+    this.lastSelected = h.id;
+    // Same cheap path the note rows use — a full render() here would rebuild
+    // every row just to flip two classes (the 0.73.4 lesson).
+    this.repaintSelectionClasses();
+    this.stampSelectedCursor();
+    this.plugin.notifyStashpadSelectionChanged();
+    // 0.258.2: deliberately does NOT scroll. An earlier version yanked the list
+    // to the top so the cursor would be "visible" — pointless, because the
+    // heading is sticky and therefore always on screen, and destructive,
+    // because it threw away the user's scroll position every time the cursor
+    // touched the heading. Landing on a pinned row should move nothing.
+  }
+
   private selectCursor(shift: boolean): void {
+    // Moving onto a child always leaves the heading.
+    this.cursorOnHeading = false;
     const node = this.currentChildren[this.cursorIdx];
     if (!node) return;
     // First real cursor move since load — arm the cursor auto-expand (so the
@@ -7929,6 +8027,16 @@ export class StashpadView extends ItemView {
 
   private repaintSelectionClasses(): void {
     if (!this.listEl) return;
+    // 0.258.0: the heading row participates in the fast class-toggle path too.
+    // It is not a `.stashpad-note`, so the row loop below skips it — without
+    // this it kept a stale is-cursor/is-selected after the cursor moved away,
+    // since arrow-key nav deliberately avoids a full render().
+    const headingEl = this.listEl.querySelector<HTMLElement>(".stashpad-focused.is-heading-row");
+    if (headingEl) {
+      const hid = headingEl.dataset.headingId ?? "";
+      headingEl.classList.toggle("is-cursor", this.cursorOnHeading);
+      headingEl.classList.toggle("is-selected", this.selection.has(hid));
+    }
     const autoExpand = !!this.plugin.settings.autoExpandCursorRow;
     const pickIdx = this.inListPicker?.activeIdx ?? -1;
     const rows = this.listEl.querySelectorAll<HTMLElement>(".stashpad-note");
@@ -7966,8 +8074,41 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** Reset state that only makes sense within one focus level, whenever the
+   *  level actually changed. Called from both paint entry points. */
+  private syncLevelScopedState(): void {
+    if (this.renderedFocusId === this.focusId) return;
+    const first = this.renderedFocusId === null;
+    this.renderedFocusId = this.focusId;
+    if (first) return; // the initial paint isn't a level CHANGE
+    // The heading is about to be a DIFFERENT note; a cursor parked on it must
+    // not carry over and silently target the new one.
+    this.cursorOnHeading = false;
+    // 0.258.3 (pre-existing): changing level already cleared the SELECTION but
+    // left mobile select mode switched ON, so you arrived at the new level in a
+    // mode with nothing selected — the actions button acted on nothing and the
+    // only way out was to hunt down the toggle. Select mode is per-level.
+    if (this.mobileSelectMode) {
+      this.mobileSelectMode = false;
+      this.firstSelectedId = null;
+      this.refreshMobileActionsCluster();
+    }
+  }
+
+  /** 0.258.0: the note rendered as the pinned heading row, or null when this
+   *  view isn't showing one (tiny / compact mode, or a focused node with no
+   *  file). Single source of truth for "is there a heading to land on". */
+  headingNode(): TreeNode | null {
+    if (this.tinyMode || this.compactMode) return null;
+    const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
+    return focused?.file ? focused : null;
+  }
+
   /** public: called by AuthorshipTracker (the host interface). */
   getActionTargets(): TreeNode[] {
+    // 0.258.0: cursor-on-heading resolves to the heading note. Checked before
+    // the selection branch is skipped, but AFTER it — an explicit selection
+    // still wins, exactly as it does for a cursor sitting on a child row.
     if (this.selection.size > 0) {
       const targets = [...this.selection].map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n && !!n.file);
       // 0.199.1: return targets in LIST order, not click order. `selection` is
@@ -7987,6 +8128,10 @@ export class StashpadView extends ItemView {
       for (const top of this.currentChildren) walk(top);
       const pos = (id: string): number => order.get(id) ?? Number.MAX_SAFE_INTEGER;
       return targets.sort((a, b) => pos(a.id) - pos(b.id));
+    }
+    if (this.cursorOnHeading) {
+      const h = this.headingNode();
+      if (h) return [h];
     }
     const cur = this.currentChildren[this.cursorIdx];
     return cur ? [cur] : [];
@@ -11383,6 +11528,22 @@ export class StashpadView extends ItemView {
     // setting says reveals are momentary. Signal-like: you looked, you left,
     // it is hidden again.
     if (getSettings().obscureReHides) this.revealedObscured.clear();
+    // 0.258.0: the heading is about to become a DIFFERENT note, so a cursor
+    // parked on it must not silently carry over and target the new one.
+    this.cursorOnHeading = false;
+    // 0.258.3 (pre-existing): leaving a level clears the SELECTION but used to
+    // leave mobile select mode switched on, so you arrived at the new level
+    // still in a mode with nothing selected — the ⚡ actions applied to
+    // nothing and the only way out was to find the toggle again. Select mode
+    // is a per-level activity; changing level ends it.
+    if (this.mobileSelectMode) {
+      this.mobileSelectMode = false;
+      this.firstSelectedId = null;
+      // The cluster is rebuilt by the render this navigation triggers, but
+      // refresh explicitly so the button's state is right even if a caller
+      // navigates without a repaint.
+      this.refreshMobileActionsCluster();
+    }
     // 0.67.0: record pre-change state so back can return here. Skip
     // when keepForwardStack:true (the legacy "we're navigating via
     // back/forward, don't disturb history" signal).
@@ -13476,6 +13637,25 @@ export class StashpadView extends ItemView {
       if (focused?.file) targets = [focused];
     }
     if (targets.length === 0) { new Notice("Nothing selected to delete."); return; }
+    // 0.258.0: never delete a folder's home note — it's the root every other
+    // note in the folder hangs from. Reachable two ways: the fallback just
+    // above (nothing selected while focused on Home) and, now that the heading
+    // is a cursor stop, parking the cursor on Home's own heading row. Dropped
+    // from the target set rather than aborting the whole delete, so a
+    // multi-select that happens to include it still deletes the rest.
+    const withoutHome = targets.filter((t) => t.id !== ROOT_ID);
+    if (withoutHome.length !== targets.length) {
+      if (withoutHome.length === 0) {
+        this.plugin.notifications.show({
+          message: "The home note can't be deleted — it's what the folder's notes hang from.",
+          kind: "warning",
+          category: "delete",
+          folder: this.noteFolder,
+        });
+        return;
+      }
+      targets = withoutHome;
+    }
     // 0.98.32: secure-delete override — when "Encrypt items sent to trash" is ON,
     // a normal delete routes to the encrypted trash (recoverable + Ctrl+Z) instead
     // of plaintext-trashing. Scoped to Stashpad's own delete (per the agreed design).
