@@ -256,6 +256,13 @@ export interface StashpadSettings {
   /** 0.254.0: type `/` in the composer or the note editor to run a Stashpad
    *  command from a popup, instead of reaching for a chord or the palette. */
   slashCommands: boolean;
+  /** 0.264.0: callout type used for link-preview blocks ("info", "quote",
+   *  "abstract"…). Purely cosmetic — it picks the icon and colour Obsidian
+   *  renders. */
+  linkPreviewCallout: string;
+  /** Politeness delay between link-preview fetches, ms. Applies to backfill
+   *  most of all: a sweep over an archive is thousands of requests. */
+  linkPreviewDelayMs: number;
   /** 0.86.2: folder panel — fraction of height given to the Pinned section
    *  (the rest goes to Folders). Set by dragging the divider. 0.15–0.85. */
   folderPanelPinnedFraction: number;
@@ -746,6 +753,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   debugTrace: false,
   writeRecoveryLinks: true,
   slashCommands: true,
+  linkPreviewCallout: "info",
+  linkPreviewDelayMs: 300,
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
   splitOnLines: false,
@@ -1720,6 +1729,26 @@ export class StashpadSettingTab extends PluginSettingTab {
         ["links", "wikilinks", "rename", "broken", "update", "automatically"],
       ));
     }
+
+    cats.composerCopy.push(this.renderDef("Link preview callout style",
+      'Which Obsidian callout type link previews use — "info", "quote", "abstract", "note" and so on. Cosmetic: it decides the icon and colour. Previews are always collapsed by default so a note with several links is not mostly preview.',
+      (s) => s.addText((t) => t
+        .setPlaceholder("info")
+        .setValue(this.plugin.settings.linkPreviewCallout)
+        .onChange(async (v) => {
+          this.plugin.settings.linkPreviewCallout = (v || "info").trim().replace(/[^a-z0-9-]/gi, "") || "info";
+          await set();
+        })), ["link", "preview", "callout", "unfurl", "url"]));
+    cats.composerCopy.push(this.renderDef("Pause between link fetches (ms)",
+      "How long to wait between fetching one link preview and the next. Backfilling an archive is thousands of requests, and hammering a site is both rude and a good way to get rate-limited. 300ms is a reasonable default; raise it if a host starts refusing.",
+      (s) => s.addText((t) => t
+        .setPlaceholder("300")
+        .setValue(String(this.plugin.settings.linkPreviewDelayMs))
+        .onChange(async (v) => {
+          const n = Number(v);
+          this.plugin.settings.linkPreviewDelayMs = Number.isFinite(n) && n >= 0 ? Math.min(10000, n) : 300;
+          await set();
+        })), ["link", "preview", "delay", "rate", "throttle"]));
 
     cats.maintenance.push(this.renderDef("Rebootstrap existing Stashpad folders", "Walk every folder that has a home note: ensure infrastructure (_imports, _exports, drafts file), backfill the redundant parentLink + children frontmatter fields, rename any note whose filename slug no longer matches its body's first line, AND migrate legacy attachment filenames to the new name-first format (`photo-<id>.png`). Safe to run anytime; skip-if-equal means already-synced notes are no-op writes.", (s) =>
       s.addButton((b) =>

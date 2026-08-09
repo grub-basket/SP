@@ -40,6 +40,8 @@ import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./str
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
+import { PreviewCache } from "./link-preview/store";
+import { enrichFile, scanBackfill, estimateSeconds, humanDuration } from "./link-preview/service";
 import { AuthorRegistry } from "./author-registry";
 import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
@@ -1264,6 +1266,111 @@ export default class StashpadPlugin extends Plugin {
     return true;
   }
 
+  /** 0.264.0: per-URL link-preview cache (plugin private folder). */
+  private _previewCache: PreviewCache | null = null;
+  get previewCache(): PreviewCache {
+    if (!this._previewCache) this._previewCache = new PreviewCache(this.app, this.pluginPrivatePath());
+    return this._previewCache;
+  }
+
+  /** Add link previews to specific notes. Reports what it did per note rather
+   *  than a bare total, because "0 added" has three different meanings —
+   *  nothing to do, everything already previewed, or everything failed. */
+  async addLinkPreviews(files: TFile[], opts: { force?: boolean } = {}): Promise<void> {
+    if (!files.length) { new Notice("No notes selected."); return; }
+    const totals = { added: 0, skipped: 0, failed: 0, cached: 0 };
+    for (const f of files) {
+      try {
+        const r = await enrichFile(this.app, this.previewCache, f, {
+          calloutType: this.settings.linkPreviewCallout,
+          delayMs: this.settings.linkPreviewDelayMs,
+          force: opts.force,
+        });
+        totals.added += r.added; totals.skipped += r.skipped;
+        totals.failed += r.failed; totals.cached += r.cached;
+      } catch (e) {
+        console.warn("[Stashpad] link preview failed for", f.path, e);
+        totals.failed++;
+      }
+    }
+    if (!totals.added && !totals.skipped && !totals.failed) {
+      new Notice("No links found in " + (files.length === 1 ? "that note." : "those notes."));
+      return;
+    }
+    const bits = [`Added ${totals.added} preview${totals.added === 1 ? "" : "s"}`];
+    if (totals.cached) bits.push(`${totals.cached} from cache`);
+    if (totals.skipped) bits.push(`${totals.skipped} already had one`);
+    if (totals.failed) bits.push(`${totals.failed} couldn't be fetched`);
+    this.notifications.show({
+      message: bits.join(" · ") + ".",
+      kind: totals.failed && !totals.added ? "warning" : "success",
+      category: "system",
+      affectedPaths: files.map((f) => f.path),
+    });
+  }
+
+  /** Sweep every Stashpad note for un-previewed links.
+   *
+   *  Explicit only, and it ESTIMATES FIRST: an archive is thousands of
+   *  requests, and starting that without saying how long it will take is
+   *  indistinguishable from a hang. */
+  async backfillLinkPreviews(): Promise<void> {
+    const folders = new Set(this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, "")));
+    const files = this.app.vault.getMarkdownFiles().filter((f) => {
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      return folders.has(dir) || [...folders].some((x) => dir.startsWith(x + "/"));
+    });
+    if (!files.length) { new Notice("No Stashpad notes found."); return; }
+
+    const scanning = new Notice(`Scanning ${files.length} notes for links…`, 0);
+    const signal = { cancelled: false };
+    let scan;
+    try { scan = await scanBackfill(this.app, this.previewCache, files, signal); }
+    finally { scanning.hide(); }
+
+    if (!scan.linkCount) { new Notice("Every link already has a preview — nothing to backfill."); return; }
+    const secs = estimateSeconds(scan, this.settings.linkPreviewDelayMs);
+    const toFetch = scan.linkCount - scan.cachedCount;
+    const ok = await new Promise<boolean>((resolve) => {
+      new ConfirmModal(
+        this.app,
+        "Backfill link previews?",
+        `${scan.linkCount} link${scan.linkCount === 1 ? "" : "s"} across ${scan.files.length} note${scan.files.length === 1 ? "" : "s"} have no preview yet`
+          + (scan.cachedCount ? `, and ${scan.cachedCount} of those are already cached` : "")
+          + `. That means about ${toFetch} network request${toFetch === 1 ? "" : "s"}, so roughly `
+          + `${humanDuration(secs)}. It runs in the background and you can keep working; notes are only ever appended to.`,
+        "Start backfill",
+        (c) => resolve(c),
+        "Not now",
+        true,
+      ).open();
+    });
+    if (!ok) return;
+
+    let done = 0, added = 0, failed = 0;
+    const progress = new Notice("Backfilling link previews…", 0);
+    for (const f of scan.files) {
+      if (signal.cancelled) break;
+      try {
+        const r = await enrichFile(this.app, this.previewCache, f, {
+          calloutType: this.settings.linkPreviewCallout,
+          delayMs: this.settings.linkPreviewDelayMs,
+        });
+        added += r.added; failed += r.failed;
+      } catch (e) { console.warn("[Stashpad] backfill failed for", f.path, e); failed++; }
+      done++;
+      progress.setMessage(`Backfilling link previews — ${done}/${scan.files.length} notes, ${added} added`);
+    }
+    progress.hide();
+    this.notifications.show({
+      message: `Backfill finished: ${added} preview${added === 1 ? "" : "s"} added across ${done} note${done === 1 ? "" : "s"}`
+        + (failed ? `, ${failed} link${failed === 1 ? "" : "s"} couldn't be fetched.` : "."),
+      kind: failed && !added ? "warning" : "success",
+      category: "system",
+      duration: 0,
+    });
+  }
+
   openDuplicatesModal(perFolder: { folder: string; groups: DuplicateIdGroup[] }[]): void {
     new DuplicateIdsModal(this.app, perFolder, {
       onDelete: (path, folder) => this.discardDuplicateCopy(path, folder),
@@ -2222,6 +2329,33 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-copy",
       name: "Copy selection",
       callback: () => call("cmdCopy"),
+    });
+    this.addCommand({
+      id: "stashpad-link-previews-selection",
+      name: "Add link previews to the selected note(s)",
+      callback: () => {
+        const v = getActiveView();
+        const targets: TFile[] = (v?.getActionTargets?.() ?? [])
+          .map((n: { file?: TFile | null }) => n.file)
+          .filter((f: TFile | null | undefined): f is TFile => !!f);
+        void this.addLinkPreviews(targets);
+      },
+    });
+    this.addCommand({
+      id: "stashpad-link-previews-refresh",
+      name: "Refresh link previews on the selected note(s) (overwrites)",
+      callback: () => {
+        const v = getActiveView();
+        const targets: TFile[] = (v?.getActionTargets?.() ?? [])
+          .map((n: { file?: TFile | null }) => n.file)
+          .filter((f: TFile | null | undefined): f is TFile => !!f);
+        void this.addLinkPreviews(targets, { force: true });
+      },
+    });
+    this.addCommand({
+      id: "stashpad-link-previews-backfill",
+      name: "Backfill link previews across every Stashpad folder",
+      callback: () => { void this.backfillLinkPreviews(); },
     });
     this.addCommand({
       id: "stashpad-copy-tree",
