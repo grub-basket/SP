@@ -1,4 +1,4 @@
-import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, moment, Notice, setIcon, type SecretStorage } from "obsidian";
+import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, type SecretStorage } from "obsidian";
 import { splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch, ROOT_ID } from "./types";
@@ -3736,6 +3736,8 @@ export interface DuplicateIdsModalOpts {
   /** Re-scan the vault so the list reflects a deletion instead of listing a
    *  file that no longer exists. */
   rescan?: () => DuplicateIdsFolder[];
+  /** 0.262.0: fold one copy into another, then discard the source. */
+  onMerge?: (sourcePath: string, targetPath: string, folder: string) => Promise<boolean>;
 }
 
 /** 0.261.0: a copy whose filename marks it as a sync conflict.
@@ -3930,19 +3932,27 @@ export class DuplicateIdsModal extends Modal {
           : "Move this hidden copy to trash. Undo reverses it.";
         del.onclick = () => { void this.confirmDelete(f.path, folder); };
       }
+      if (this.opts.onMerge && g.files.length > 1) {
+        const mrg = acts.createEl("button", { cls: "stashpad-dupes-act", text: "Merge into…" });
+        mrg.title = "Fold this copy's text and any fields the other copy is missing into that copy, then discard this one.";
+        mrg.onclick = (e) => { this.pickMergeTarget(e, f.path, ordered, folder); };
+      }
 
       const main = row.createDiv({ cls: "stashpad-dupes-main" });
-      const badges = main.createDiv({ cls: "stashpad-dupes-badges" });
-      // 0.261.1: both badges explain themselves. "hidden" is jargon that means
-      // nothing without the modal's intro paragraph, which you have scrolled
-      // past by the time you are reading rows.
-      const b = badges.createSpan({
+      // 0.262.1: "Visible:" / "Hidden:" LABEL the path on the same line, so the
+      // colon introduces something instead of dangling before a line break.
+      // The tooltip carries the explanation the words alone can't.
+      const pathLine = main.createDiv({ cls: "stashpad-dupes-pathline" });
+      const b = pathLine.createSpan({
         cls: f.isShown ? "stashpad-dupes-badge is-shown-badge" : "stashpad-dupes-badge",
-        text: f.isShown ? "in the list" : "not in the list",
+        text: f.isShown ? "Visible: " : "Hidden: ",
       });
       b.title = f.isShown
         ? "This is the copy Stashpad shows for this id — the one you see and edit in the list."
         : "This file is in your vault but never appears in the Stashpad list: another note claimed the same id, and only one of them can be displayed.";
+      const path = pathLine.createSpan({ cls: "stashpad-dupes-path", text: f.path });
+      path.title = f.path;
+      const badges = main.createDiv({ cls: "stashpad-dupes-badges" });
       if (isConflictCopy(f.path)) {
         const cb = badges.createSpan({ cls: "stashpad-dupes-badge is-conflict", text: "conflict copy" });
         cb.title = "The filename marks this as a sync conflict copy. Usually the one to discard — but read it first: a conflict copy can hold the newer edit.";
@@ -3959,8 +3969,6 @@ export class DuplicateIdsModal extends Modal {
           v.title = title;
         });
       }
-      const path = main.createDiv({ cls: "stashpad-dupes-path", text: f.path });
-      path.title = f.path;
     }
   }
 
@@ -3987,6 +3995,51 @@ export class DuplicateIdsModal extends Modal {
       const ta = t(A.modified ?? A.created), tb = t(B.modified ?? B.created);
       return { bodySame: a === b, fieldDiffs, hiddenNewer: !!(ta && tb && tb > ta) };
     } catch { return null; }
+  }
+
+  /** Choose what to merge INTO.
+   *
+   *  Deliberately names the target rather than using "the note above / below".
+   *  Rows are re-ordered (conflict copies sort last), so a positional rule
+   *  would quietly mean something different depending on the sort — and with
+   *  three copies "above" is genuinely ambiguous. With exactly one other copy
+   *  there is no choice to make and it goes straight to the confirm; with more,
+   *  you pick the target by name. */
+  private pickMergeTarget(evt: MouseEvent, sourcePath: string, ordered: { path: string; isShown: boolean }[], folder: string): void {
+    const others = ordered.filter((o) => o.path !== sourcePath);
+    if (others.length === 0) return;
+    if (others.length === 1) { void this.confirmMerge(sourcePath, others[0].path, folder); return; }
+    const menu = new Menu();
+    for (const o of others) {
+      const name = o.path.slice(o.path.lastIndexOf("/") + 1).replace(/\.md$/, "");
+      menu.addItem((it: any) => it
+        .setTitle(o.isShown ? `${name}  (the one in the list)` : name)
+        .setIcon(o.isShown ? "eye" : "file")
+        .onClick(() => { void this.confirmMerge(sourcePath, o.path, folder); }));
+    }
+    menu.showAtMouseEvent(evt);
+  }
+
+  /** Confirm a merge, spelling out exactly what will move. The point of the
+   *  modal is that these copies are hard to tell apart, so "merge" must not be
+   *  a verb the user has to guess the meaning of. */
+  private async confirmMerge(sourcePath: string, targetPath: string, folder: string): Promise<void> {
+    const v = await this.verdictFor(targetPath, sourcePath);
+    const srcName = sourcePath.slice(sourcePath.lastIndexOf("/") + 1).replace(/\.md$/, "");
+    const tgtName = targetPath.slice(targetPath.lastIndexOf("/") + 1).replace(/\.md$/, "");
+    const parts: string[] = [];
+    if (v && !v.bodySame) parts.push("its text is appended under a labelled separator");
+    if (v && v.fieldDiffs > 0) parts.push("any fields “" + tgtName + "” has no value for are filled in from this copy — nothing already set is overwritten");
+    const what = parts.length
+      ? `“${srcName}” is folded into “${tgtName}”: ${parts.join("; ")}. Then “${srcName}” goes to the trash.`
+      : `“${srcName}” has nothing “${tgtName}” is missing, so this is the same as discarding it. It goes to the trash.`;
+    const ok = await new Promise<boolean>((resolve) => {
+      new ConfirmModal(this.app, "Merge this copy?", `${what} Undo restores both.`,
+        "Merge", (c) => resolve(c), "Cancel", true).open();
+    });
+    if (!ok) return;
+    const done = await this.opts.onMerge!(sourcePath, targetPath, folder);
+    if (done) { this.rememberScroll(); this.refresh(); }
   }
 
   /** Confirm, then discard. Deliberately a second step: the modal exists

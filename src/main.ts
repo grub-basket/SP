@@ -8,7 +8,7 @@ import { StashpadTrashView, openTrashView } from "./trash-view";
 import { ReEncryptScheduler } from "./reencrypt-scheduler";
 import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
-import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE } from "./types";
+import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
@@ -1197,9 +1197,77 @@ export default class StashpadPlugin extends Plugin {
     return true;
   }
 
+  /** 0.262.0: fold one copy of a duplicated id INTO another, then discard it.
+   *
+   *  Conservative by construction, because this runs on notes the user has
+   *  already told us are hard to tell apart:
+   *   - the target's body is APPENDED to, never replaced;
+   *   - frontmatter is only filled in where the target has NO value — the
+   *     target always wins a conflict, so merging can't overwrite something
+   *     you meant to keep;
+   *   - the body is only appended when it actually differs, so merging two
+   *     identical copies doesn't duplicate the text.
+   *
+   *  One undo entry restores BOTH sides: the target's original bytes and the
+   *  discarded file. Half-undoing a merge would be worse than not offering it.
+   */
+  async mergeDuplicateCopy(sourcePath: string, targetPath: string, folder: string): Promise<boolean> {
+    const src = this.app.vault.getAbstractFileByPath(sourcePath);
+    const tgt = this.app.vault.getAbstractFileByPath(targetPath);
+    if (!(src instanceof TFile) || !(tgt instanceof TFile)) { new Notice("One of those files is already gone."); return false; }
+    let srcRaw = "", tgtRaw = "";
+    try { srcRaw = await this.app.vault.read(src); tgtRaw = await this.app.vault.read(tgt); }
+    catch (e) { new Notice(`Couldn't read the notes: ${(e as Error).message}`); return false; }
+
+    const bodyOf = (raw: string): string => raw.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+    const srcBody = bodyOf(srcRaw), tgtBody = bodyOf(tgtRaw);
+    const srcFm = (this.app.metadataCache.getFileCache(src)?.frontmatter ?? {}) as Record<string, unknown>;
+    const srcName = sourcePath.slice(sourcePath.lastIndexOf("/") + 1).replace(/\.md$/, "");
+
+    try {
+      if (srcBody && srcBody !== tgtBody) {
+        // Attributed separator: after a merge you need to be able to see which
+        // half came from where, and undo is not a substitute for that.
+        await this.app.vault.append(tgt, `\n\n---\n\n_Merged from ${srcName}:_\n\n${srcBody}\n`);
+      }
+      await this.app.fileManager.processFrontMatter(tgt, (m) => {
+        for (const [k, v] of Object.entries(srcFm)) {
+          if (RESERVED_FRONTMATTER.includes(k as never)) continue;   // Stashpad owns these
+          const cur = m[k];
+          const empty = cur === undefined || cur === null || cur === ""
+            || (Array.isArray(cur) && cur.length === 0);
+          if (empty) m[k] = v;
+        }
+      });
+      await this.app.fileManager.trashFile(src);
+    } catch (e) {
+      new Notice(`Merge failed: ${(e as Error).message}`);
+      return false;
+    }
+
+    this.getUndoStack(folder).push({
+      label: `Merge duplicate (${srcName})`,
+      undo: async () => {
+        const t = this.app.vault.getAbstractFileByPath(targetPath);
+        if (t instanceof TFile) await this.app.vault.modify(t, tgtRaw);
+        if (!this.app.vault.getAbstractFileByPath(sourcePath)) await this.app.vault.create(sourcePath, srcRaw);
+      },
+      redo: async () => { await this.mergeDuplicateCopy(sourcePath, targetPath, folder); },
+    });
+    this.notifications.show({
+      message: `Merged \`${srcName}\` into \`${targetPath.slice(targetPath.lastIndexOf("/") + 1)}\` — Undo restores both.`,
+      kind: "success",
+      category: "system",
+      folder,
+      affectedPaths: [sourcePath, targetPath],
+    });
+    return true;
+  }
+
   openDuplicatesModal(perFolder: { folder: string; groups: DuplicateIdGroup[] }[]): void {
     new DuplicateIdsModal(this.app, perFolder, {
       onDelete: (path, folder) => this.discardDuplicateCopy(path, folder),
+      onMerge: (src, tgt, folder) => this.mergeDuplicateCopy(src, tgt, folder),
       rescan: () => this.duplicateGroupsEverywhere(),
       onRepair: async () => {
         let total = 0;

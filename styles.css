@@ -129,18 +129,33 @@
    instead of hardcoding black (which would then fail on a dark accent) or
    lightening the grey (which only moves the problem). The icon inherits
    currentColor, so it comes along. */
+/* 0.263.0: OUTLINE, not fill. 0.215.0 fixed the legibility of this button by
+   filling with the accent and computing black-or-white text from its luminance
+   — correct, and it still leaves the folder NAME sitting on an arbitrary
+   user-chosen colour, which reads muddy however well the contrast measures.
+
+   A ring sidesteps the whole class: the label is always --text-normal on the
+   normal surface, so it is legible against every accent in every theme without
+   anything being computed, and the accent still marks the state via the border
+   and the icon. This is the same "semantic colour, not a filled pill" rule the
+   badges in the duplicate modal already follow.
+
+   Note "a complementary colour" is not a safe third option: the complement of a
+   mid-green is a mid-magenta, both around the same luminance, so it would look
+   louder while measuring WORSE. Black/white by luminance is the only
+   contrast-safe version of "text on the fill", and that is what this replaces. */
 .stashpad-folder-btn.is-override {
-  background: var(--interactive-accent);
+  background: var(--background-secondary);
+  color: var(--text-normal);
   border-color: var(--interactive-accent);
-  /* --sp-on-accent is chosen at runtime from the accent's luminance (see
-     applyOnAccentText in view.ts) — white on a dark accent, black on a bright
-     one. The fallback covers the frame before that lands. */
-  color: var(--sp-on-accent, var(--text-on-accent));
+  box-shadow: inset 0 0 0 1px var(--interactive-accent);
 }
 .stashpad-folder-btn.is-override:hover {
-  background: var(--interactive-accent-hover, var(--interactive-accent));
-  color: var(--sp-on-accent, var(--text-on-accent));
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
 }
+/* The icon carries the accent, so the state still reads at a glance. */
+.stashpad-folder-btn.is-override .stashpad-btn-icon { color: var(--interactive-accent); }
 .stashpad-time-filter-btns {
   display: flex;
   gap: 4px;
@@ -2042,6 +2057,21 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   background: var(--interactive-accent);
   color: var(--text-on-accent);
   border-color: var(--interactive-accent);
+}
+/* 0.263.0: the folder switcher in the composer rail matches the toolbar one —
+   ring, not fill. It shows the folder NAME, so unlike the icon-only buttons
+   beside it there is text whose legibility depends on the accent. It also
+   never called applyOnAccentText, so it had the static --text-on-accent pair
+   that 0.215.0 replaced everywhere else. */
+.stashpad-composer-btn.stashpad-composer-nav-folder.is-active {
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border-color: var(--interactive-accent);
+  box-shadow: inset 0 0 0 1px var(--interactive-accent);
+}
+.stashpad-composer-btn.stashpad-composer-nav-folder.is-active .svg-icon,
+.stashpad-composer-btn.stashpad-composer-nav-folder.is-active .stashpad-btn-icon {
+  color: var(--interactive-accent);
 }
 .stashpad-composer-send { font-weight: 600; }
 
@@ -7047,9 +7077,14 @@ button.stashpad-btn-loading::after {
   gap: 4px;
   align-items: center;
   flex-wrap: wrap;
-  max-width: 190px;
+  /* Wide enough for Open / Compare / Discard / Merge into… on one line at the
+     900px modal width; still wraps rather than overflowing if a theme's button
+     padding is larger. */
+  max-width: 320px;
 }
 .stashpad-dupes-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+/* Label + path share a line, which is what the colon in "Hidden:" implies. */
+.stashpad-dupes-pathline { min-width: 0; display: flex; align-items: baseline; gap: 4px; }
 .stashpad-dupes-badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .stashpad-dupes-badge.is-conflict {
   color: var(--text-normal);
@@ -7061,13 +7096,18 @@ button.stashpad-btn-loading::after {
   color: var(--text-faint);
   font-weight: var(--font-normal, 400);
 }
-/* "same content" is the boring answer — nothing here, move on. Anything that
-   DIFFERS is the row you must read before discarding, so it gets the weight.
-   Not green/red: see the badge block above for the measured reason. */
-.stashpad-dupes-verdict.is-same { color: var(--text-muted); }
+/* Green = safe to discard, red = read it first (user's call, 0.262.1).
+   Weight is KEPT alongside the hue rather than replaced by it: --text-success
+   measures 2.61:1 on a light background, so the bold is what carries the
+   distinction when the colour alone is faint — and it is also what makes the
+   two readable apart for anyone who can't separate red from green. */
+.stashpad-dupes-verdict.is-same {
+  color: var(--text-success);
+  font-weight: var(--font-semibold, 600);
+}
 .stashpad-dupes-verdict.is-fields,
 .stashpad-dupes-verdict.is-diff {
-  color: var(--text-normal);
+  color: var(--text-error);
   font-weight: var(--font-semibold, 600);
 }
 /* Destructive action = red LABEL on the ordinary button surface. --text-error
