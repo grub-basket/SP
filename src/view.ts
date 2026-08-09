@@ -1143,7 +1143,11 @@ export class StashpadView extends ItemView {
    *  integrity check for it), not just something to silently stop retrying.
    *  Surfaced once per session, and only when the gap is real. */
   private warnDuplicateIds(folder: string, gap: number): void {
-    if (this.reportedDuplicateIds || gap <= 0) return;
+    // 0.261.0: the guard is PLUGIN-level, not per-view. It used to be a field
+    // on the view, so every open Stashpad tab reported the same vault-wide
+    // problem once each — three tabs, three identical toasts. The condition is
+    // about the vault, so the "already said this" flag has to be too.
+    if (this.plugin.reportedDuplicateIds || this.reportedDuplicateIds || gap <= 0) return;
     // 0.219.8: check EVERY folder, not just this one. The reconcile that calls
     // us only ever runs for a folder with an open view, so scoping the warning
     // to `folder` under-reported — a vault with duplicates in three folders
@@ -1151,6 +1155,7 @@ export class StashpadView extends ItemView {
     const perFolder = this.plugin.duplicateGroupsEverywhere();
     if (!perFolder.length) return;   // gap has some other cause — don't guess
     this.reportedDuplicateIds = true;
+    this.plugin.reportedDuplicateIds = true;
     const hidden = perFolder.reduce((n, f) =>
       n + f.groups.reduce((m, g) => m + g.files.filter((x) => !x.isShown).length, 0), 0);
     const where = perFolder.length === 1 ? `**${perFolder[0].folder}**` : `${perFolder.length} folders`;

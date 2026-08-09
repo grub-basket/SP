@@ -1148,8 +1148,59 @@ export default class StashpadPlugin extends Plugin {
 
   /** 0.220.1: one modal for the whole vault. Repair spans every folder listed,
    *  so the single button matches the single view. */
+  /** 0.261.0: session flag so the vault-wide duplicate-id warning is shown
+   *  ONCE, not once per open Stashpad view. Public because the views set it. */
+  reportedDuplicateIds = false;
+
+  /** 0.261.0: discard one copy of a duplicated id — trash the file and put an
+   *  undo on that folder's stack.
+   *
+   *  Notes only, deliberately: a duplicate is a COPY, and its attachments are
+   *  usually the very same files the copy it duplicates points at. Trashing
+   *  those would break the note being kept. */
+  async discardDuplicateCopy(path: string, folder: string): Promise<boolean> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) { new Notice("That file is already gone."); return false; }
+    let content = "";
+    try { content = await this.app.vault.read(file); }
+    catch (e) {
+      new Notice(`Couldn't read ${path} — not discarding it: ${(e as Error).message}`);
+      return false;
+    }
+    try {
+      // fileManager.trashFile honours the user's own "deleted files" setting
+      // (system trash / vault .trash / permanent) rather than overriding it.
+      await this.app.fileManager.trashFile(file);
+    } catch (e) {
+      new Notice(`Couldn't discard ${path}: ${(e as Error).message}`);
+      return false;
+    }
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    this.getUndoStack(folder).push({
+      label: `Discard duplicate copy (${name})`,
+      undo: async () => {
+        if (this.app.vault.getAbstractFileByPath(path)) return; // already back
+        await this.app.vault.create(path, content);
+      },
+      redo: async () => {
+        const f = this.app.vault.getAbstractFileByPath(path);
+        if (f instanceof TFile) await this.app.fileManager.trashFile(f);
+      },
+    });
+    this.notifications.show({
+      message: `Discarded \`${name}\` — Undo in the list restores it.`,
+      kind: "success",
+      category: "delete",
+      folder,
+      affectedPaths: [path],
+    });
+    return true;
+  }
+
   openDuplicatesModal(perFolder: { folder: string; groups: DuplicateIdGroup[] }[]): void {
     new DuplicateIdsModal(this.app, perFolder, {
+      onDelete: (path, folder) => this.discardDuplicateCopy(path, folder),
+      rescan: () => this.duplicateGroupsEverywhere(),
       onRepair: async () => {
         let total = 0;
         for (const { folder, groups } of perFolder) {

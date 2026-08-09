@@ -6942,7 +6942,10 @@ button.stashpad-btn-loading::after {
    every row overflowed its box, and the badges staggered because each row sized
    itself to its own path. A two-column grid with a fixed badge column keeps the
    badges aligned and lets the path wrap inside the row. */
-.stashpad-dupes-modal { max-width: min(720px, 94vw); }
+/* 0.261.0: wider. Paths in this modal are long by nature (conflict copies
+   carry a date stamp in the filename) and the extra room is the cheapest
+   part of making them readable. */
+.stashpad-dupes-modal { max-width: min(900px, 96vw); width: min(900px, 96vw); }
 .stashpad-dupes-list { max-height: 46vh; overflow-y: auto; margin-top: 10px; }
 .stashpad-dupes-group {
   border: 1px solid var(--background-modifier-border);
@@ -7000,26 +7003,60 @@ button.stashpad-btn-loading::after {
    anomaly, and only it needs to carry colour. --text-muted and --text-error are
    both defined against the normal background, so this holds in either theme. */
 .stashpad-dupes-file.is-shown .stashpad-dupes-badge { color: var(--text-muted); }
-/* 0.219.8: one scrollbar PER ROW rather than wrapping. Wrapping kept long paths
-   inside the row but made each row several lines tall, so a folder with sync
-   conflict copies (long names) became a wall. Each path now stays on one line
-   and scrolls horizontally within its own row: rows stay uniform height, the
-   start of every path lines up, and the tail is still reachable. */
+/* 0.261.0: paths WRAP again, reversing 0.219.8's per-row horizontal scroll.
+   That change stopped rows becoming several lines tall, but it traded one
+   problem for a worse one: you had to scroll each row sideways to read the
+   filename — the only part that tells the copies apart — and it pushed the
+   action buttons out of reach.
+
+   Wrapping is safe here now because the row is capped at two lines and the
+   actions live on the LEFT, so neither the text nor the buttons can be pushed
+   anywhere. Full path stays in the tooltip. */
 .stashpad-dupes-path {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   line-height: 1.5;
   min-width: 0;
-  white-space: nowrap;
-  overflow-x: auto;
-  overscroll-behavior-x: contain;   /* don't chain to the modal's own scroll */
-  scrollbar-width: thin;
-  padding-bottom: 2px;              /* room for the scrollbar so it can't clip text */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 /* Duplicate modal: per-row actions + the compare view (0.219.8). */
-.stashpad-dupes-file { grid-template-columns: 62px minmax(0, 1fr) auto; }
-.stashpad-dupes-actions { display: flex; gap: 4px; align-items: center; }
+/* Actions column FIRST — see renderGroup. */
+.stashpad-dupes-file { grid-template-columns: auto minmax(0, 1fr); }
+.stashpad-dupes-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  flex-wrap: wrap;
+  max-width: 190px;
+}
+.stashpad-dupes-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.stashpad-dupes-badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.stashpad-dupes-badge.is-conflict {
+  color: var(--text-warning);
+  font-weight: var(--font-normal, 400);
+}
+/* Per-row verdict. Same three-way read as the Compare view: safe / look first. */
+.stashpad-dupes-verdict {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  font-weight: var(--font-normal, 400);
+}
+.stashpad-dupes-verdict.is-same { color: var(--text-muted); }
+.stashpad-dupes-verdict.is-fields,
+.stashpad-dupes-verdict.is-diff { color: var(--text-accent); }
+/* Destructive action = red LABEL on the ordinary button surface. --text-error
+   is defined to be readable against the normal background in both themes, so
+   this is legible by construction rather than by tuning a fill. */
+.stashpad-dupes-act.is-danger { color: var(--text-error); }
+.stashpad-dupes-act.is-danger:hover {
+  background: var(--background-modifier-error-hover, var(--background-modifier-hover));
+}
 .stashpad-dupes-act {
   padding: 1px 8px;
   font-size: var(--font-ui-smaller);

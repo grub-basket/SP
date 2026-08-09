@@ -3730,6 +3730,57 @@ export interface DuplicateIdsFolder { folder: string; groups: DuplicateIdGroup[]
 export interface DuplicateIdsModalOpts {
   /** Give every hidden copy across ALL listed folders a fresh id. */
   onRepair?: () => void | Promise<void>;
+  /** 0.261.0: discard ONE copy — trash it, with undo on the folder's stack.
+   *  Resolves true when the file is gone. */
+  onDelete?: (path: string, folder: string) => Promise<boolean>;
+  /** Re-scan the vault so the list reflects a deletion instead of listing a
+   *  file that no longer exists. */
+  rescan?: () => DuplicateIdsFolder[];
+}
+
+/** 0.261.0: a copy whose filename marks it as a sync conflict.
+ *
+ *  Obsidian Sync writes "(conflicted copy ...)"; other tools use
+ *  "sync-conflict" or a bare "conflict". Matching the word alone covers all of
+ *  them, and a false positive costs only sort ORDER — nothing is decided by
+ *  this beyond where the row sits. */
+function isConflictCopy(path: string): boolean {
+  return /conflict/i.test(path);
+}
+
+/** How one copy compares to the note being shown. Computed for every row up
+ *  front so the list answers "is this worth looking at" without a click. */
+interface DupeVerdict {
+  bodySame: boolean;
+  /** Count of non-structural, non-timestamp frontmatter fields that differ. */
+  fieldDiffs: number;
+  hiddenNewer: boolean;
+}
+
+/** Turn a verdict into a short badge. Says what DIFFERS rather than
+ *  "equal/different", because the actionable question is never "are these the
+ *  same" but "is there anything in this copy I would lose". "Same content" is
+ *  the safe-to-discard signal; anything else means read it first. */
+function describeVerdict(v: DupeVerdict): { label: string; cls: string; title: string } {
+  const newer = v.hiddenNewer ? " · newer" : "";
+  if (v.bodySame && v.fieldDiffs === 0) {
+    return {
+      label: `same content${newer}`,
+      cls: "is-same",
+      title: "Body and meaningful frontmatter both match the shown note. Only Stashpad's own bookkeeping differs, so nothing is lost by discarding this copy.",
+    };
+  }
+  if (!v.bodySame && v.fieldDiffs === 0) {
+    return { label: `text differs${newer}`, cls: "is-diff", title: "The body text is not the same. Compare before discarding — this copy may hold an edit the shown note doesn't." };
+  }
+  if (v.bodySame) {
+    return {
+      label: `${v.fieldDiffs} field${v.fieldDiffs === 1 ? " differs" : "s differ"}${newer}`,
+      cls: "is-fields",
+      title: "Same body, but real note state differs (attachments, due date, colour, tags and the like). Compare before discarding.",
+    };
+  }
+  return { label: `text + ${v.fieldDiffs} field${v.fieldDiffs === 1 ? "" : "s"}${newer}`, cls: "is-diff", title: "Both the body and real note state differ. Compare before discarding." };
 }
 
 /** 0.220.1: ONE modal for the whole vault, sectioned by folder.
@@ -3755,9 +3806,38 @@ export class DuplicateIdsModal extends Modal {
     return { ids, hidden };
   }
 
+  /** Scroll offset of the list, remembered across a trip into Compare. Without
+   *  it, Back re-rendered from scratch and dumped you at the top — on a vault
+   *  with a dozen groups that means finding your place again after every
+   *  single comparison. */
+  private listScrollTop = 0;
+
+  /** The element that actually scrolls is `.stashpad-dupes-list` (it carries
+   *  `max-height` + `overflow-y`), NOT contentEl — reading contentEl.scrollTop
+   *  returns 0 forever and "restoring" it does nothing. */
+  private rememberScroll(): void {
+    const l = this.contentEl.querySelector<HTMLElement>(".stashpad-dupes-list");
+    if (l) this.listScrollTop = l.scrollTop;
+  }
+
   onOpen(): void {
     this.modalEl.addClass("stashpad-dupes-modal");
     this.titleEl.setText("Duplicate note ids");
+    this.render();
+  }
+
+  /** Re-read the vault and repaint. Used after a deletion so the list can't
+   *  offer actions on a file that is already in the trash. */
+  private refresh(): void {
+    if (this.opts.rescan) this.folders = this.opts.rescan();
+    if (!this.folders.length) {
+      const c = this.contentEl;
+      c.empty();
+      c.createEl("p", { text: "No duplicate ids left — every note in these folders now has an id of its own." });
+      const row = c.createDiv({ cls: "stashpad-modal-btns" });
+      row.createEl("button", { cls: "mod-cta", text: "Close" }).onclick = () => this.close();
+      return;
+    }
     this.render();
   }
 
@@ -3789,7 +3869,7 @@ export class DuplicateIdsModal extends Modal {
         cls: "stashpad-dupes-folder-meta",
         text: `${groups.length} id${groups.length === 1 ? "" : "s"} · ${fHidden} hidden`,
       });
-      for (const g of groups) this.renderGroup(list, g);
+      for (const g of groups) this.renderGroup(list, g, folder);
     }
 
     const row = c.createDiv({ cls: "stashpad-modal-btns" });
@@ -3800,27 +3880,127 @@ export class DuplicateIdsModal extends Modal {
       fix.title = "Across every folder listed. Nothing is deleted — each hidden copy becomes its own visible note, and Undo reverses it.";
       fix.onclick = () => { const f = this.opts.onRepair!; this.close(); void f(); };
     }
+    // Put the user back where they were (see rememberScroll). After the frame,
+    // because the rows have to exist before there is anything to scroll.
+    if (this.listScrollTop) {
+      const target = this.listScrollTop;
+      requestAnimationFrame(() => { list.scrollTop = target; });
+    }
   }
 
-  private renderGroup(list: HTMLElement, g: DuplicateIdGroup): void {
+  private renderGroup(list: HTMLElement, g: DuplicateIdGroup, folder: string): void {
     const box = list.createDiv({ cls: "stashpad-dupes-group" });
     const head = box.createDiv({ cls: "stashpad-dupes-group-head" });
     head.createEl("code", { text: g.id });
     head.createSpan({ cls: "stashpad-dupes-count", text: `${g.files.length} files` });
     const shown = g.files.find((f) => f.isShown);
-    for (const f of g.files) {
+
+    // 0.261.0: shown note first, then ordinary copies, then CONFLICT copies
+    // last. A conflict copy is the most likely thing to discard, so it belongs
+    // at the bottom of the group where the eye finishes rather than mixed in.
+    // Stable within each band, so the underlying order still shows through.
+    const ordered = [...g.files].sort((a, b) => {
+      const rank = (f: { path: string; isShown: boolean }): number =>
+        f.isShown ? 0 : isConflictCopy(f.path) ? 2 : 1;
+      return rank(a) - rank(b);
+    });
+
+    for (const f of ordered) {
       const row = box.createDiv({ cls: f.isShown ? "stashpad-dupes-file is-shown" : "stashpad-dupes-file" });
-      row.createSpan({ cls: "stashpad-dupes-badge", text: f.isShown ? "shown" : "hidden" });
-      const path = row.createSpan({ cls: "stashpad-dupes-path", text: f.path });
-      path.title = f.path;
+
+      // Actions FIRST in the DOM (and so on the left): paths are long, wrap to
+      // several lines, and when the buttons trailed them they were pushed out
+      // of reach and had to be scrolled to.
       const acts = row.createDiv({ cls: "stashpad-dupes-actions" });
       acts.createEl("button", { cls: "stashpad-dupes-act", text: "Open" })
         .onclick = () => { this.app.workspace.openLinkText(f.path, "", true); };
       if (!f.isShown && shown) {
         const cmp = acts.createEl("button", { cls: "stashpad-dupes-act", text: "Compare" });
         cmp.title = `Diff this copy against ${shown.path}`;
-        cmp.onclick = () => { void this.showDiff(shown.path, f.path); };
+        cmp.onclick = () => { this.rememberScroll(); void this.showDiff(shown.path, f.path); };
       }
+      if (this.opts.onDelete && g.files.length > 1) {
+        // NOT Obsidian's `mod-warning`: that is a FILLED red button, and colouring
+        // its label red on top left an unreadable red block. Same lesson the
+        // badges above already record (0.219.7b) — semantic text colour on the
+        // normal button surface, never a fill plus a matching foreground.
+        const del = acts.createEl("button", { cls: "stashpad-dupes-act is-danger", text: "Discard" });
+        del.title = f.isShown
+          ? "Move THIS note to trash. It is the copy currently visible in the list — check the others first. Undo reverses it."
+          : "Move this hidden copy to trash. Undo reverses it.";
+        del.onclick = () => { void this.confirmDelete(f.path, folder); };
+      }
+
+      const main = row.createDiv({ cls: "stashpad-dupes-main" });
+      const badges = main.createDiv({ cls: "stashpad-dupes-badges" });
+      badges.createSpan({ cls: "stashpad-dupes-badge", text: f.isShown ? "shown" : "hidden" });
+      if (isConflictCopy(f.path)) {
+        const cb = badges.createSpan({ cls: "stashpad-dupes-badge is-conflict", text: "conflict copy" });
+        cb.title = "The filename marks this as a sync conflict copy. Usually the one to discard — but read it first: a conflict copy can hold the newer edit.";
+      }
+      // Verdict per row, so the list answers "is this worth opening" without a
+      // click. Async (it reads both files), filled in when it resolves.
+      if (!f.isShown && shown) {
+        const v = badges.createSpan({ cls: "stashpad-dupes-verdict", text: "comparing…" });
+        void this.verdictFor(shown.path, f.path).then((res) => {
+          if (!res) { v.setText("compare failed"); return; }
+          const { label, cls, title } = describeVerdict(res);
+          v.setText(label);
+          v.addClass(cls);
+          v.title = title;
+        });
+      }
+      const path = main.createDiv({ cls: "stashpad-dupes-path", text: f.path });
+      path.title = f.path;
+    }
+  }
+
+  /** Compare a copy against the shown note the same way the Compare view does,
+   *  so the row badge and the detail view can never disagree. */
+  private async verdictFor(shownPath: string, hiddenPath: string): Promise<DupeVerdict | null> {
+    const fileOf = (p: string): TFile | null => {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      return f instanceof TFile ? f : null;
+    };
+    const fa = fileOf(shownPath), fb = fileOf(hiddenPath);
+    if (!fa || !fb) return null;
+    try {
+      const strip = (raw: string): string => raw.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
+      const [a, b] = [strip(await this.app.vault.cachedRead(fa)), strip(await this.app.vault.cachedRead(fb))];
+      const A = (this.app.metadataCache.getFileCache(fa)?.frontmatter ?? {}) as Record<string, unknown>;
+      const B = (this.app.metadataCache.getFileCache(fb)?.frontmatter ?? {}) as Record<string, unknown>;
+      let fieldDiffs = 0;
+      for (const k of new Set([...Object.keys(A), ...Object.keys(B)])) {
+        if (DUPE_STRUCTURAL_FM.has(k) || DUPE_TIMESTAMP_FM.has(k)) continue;
+        if (fmValueText(A[k]) !== fmValueText(B[k])) fieldDiffs++;
+      }
+      const t = (v: unknown): number => { const n = Date.parse(String(v ?? "")); return Number.isFinite(n) ? n : 0; };
+      const ta = t(A.modified ?? A.created), tb = t(B.modified ?? B.created);
+      return { bodySame: a === b, fieldDiffs, hiddenNewer: !!(ta && tb && tb > ta) };
+    } catch { return null; }
+  }
+
+  /** Confirm, then discard. Deliberately a second step: the modal exists
+   *  because these files are hard to tell apart, which is exactly when a
+   *  one-click delete is the wrong shape. */
+  private async confirmDelete(path: string, folder: string): Promise<void> {
+    const name = path.slice(path.lastIndexOf("/") + 1);
+    const ok = await new Promise<boolean>((resolve) => {
+      new ConfirmModal(
+        this.app,
+        "Discard this copy?",
+        `“${name}” goes to the trash. The other copies of this id are untouched, and Undo in the list reverses it.`,
+        "Discard",
+        (confirmed) => resolve(confirmed),
+        "Keep it",
+        true,   // focus Cancel — this one deletes a file
+      ).open();
+    });
+    if (!ok) return;
+    const done = await this.opts.onDelete!(path, folder);
+    if (done) {
+      this.rememberScroll();
+      this.refresh();
     }
   }
 
