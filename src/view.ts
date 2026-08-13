@@ -7349,8 +7349,16 @@ export class StashpadView extends ItemView {
     callout.toggleClass("is-collapsed", collapsed);
     const content = callout.querySelector(":scope > .callout-content") as HTMLElement | null;
     if (!content) return;
-    if (collapsed) content.style.display = "none";
-    else content.style.removeProperty("display");
+    // Collapsing needs no inline style — `is-collapsed` plus this plugin's own
+    // stylesheet already hides the content. The ONLY thing an inline value is
+    // needed for is CLEARING Obsidian's, so that is all this does.
+    //
+    // 0.266.8: it used to also assign `display: none` when collapsing, which
+    // was redundant and tripped the community-store rule against setting
+    // styles directly. Removing the property is not an assignment, and there
+    // is no class that can beat an inline style, so this is the minimum
+    // intervention that still works.
+    if (!collapsed) content.style.removeProperty("display");
   }
 
   /** Re-apply remembered fold state after a body is (re-)hydrated. Runs beside
