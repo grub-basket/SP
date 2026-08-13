@@ -24,6 +24,7 @@ writeFileSync(entry, [
   `export * from ${JSON.stringify(resolve("src/link-preview/parse-og.ts"))};`,
   `export * from ${JSON.stringify(resolve("src/link-preview/fetch.ts"))};`,
   `export * from ${JSON.stringify(resolve("src/link-preview/store.ts"))};`,
+  `export * from ${JSON.stringify(resolve("src/paste-path.ts"))};`,
 ].join("\n"));
 const bundle = join(dir, "lp.mjs");
 execFileSync("npx", ["esbuild", entry,
@@ -34,6 +35,7 @@ execFileSync("npx", ["esbuild", entry,
 const {
   extractLinkMeta, parseMetaTags, parseJsonLd, urlKey, isFetchableUrl,
   extractUrls, existingPreviewKeys, renderPreviewCallout, appendPreviews, previewMarker, replacePreview,
+  normalisePastedPath,
 } = await import(bundle);
 
 let pass = 0, fail = 0;
@@ -121,7 +123,11 @@ t("ignores non-http", extractUrls("obsidian://open and file:///tmp/x"), []);
                   meta: { url: "https://x.test/a", title: "T", description: "line one\n\nline two", via: "opengraph" } };
   const md = renderPreviewCallout(entry);
   t("every line is quote-prefixed", md.split("\n").every((l) => l.startsWith(">")), true);
-  t("collapsed by default", md.startsWith("> [!info]-"), true);
+  // EXPANDED by default: `-` renders the content with display:none, which hid
+  // the description entirely — the thing the feature exists to capture.
+  t("expanded by default", md.startsWith("> [!info]+"), true);
+  t("collapsed is opt-in",
+    renderPreviewCallout(entry, { collapsed: true }).startsWith("> [!info]-"), true);
 }
 t("failure renders a block too",
   renderPreviewCallout({ v: 1, url: "https://x.test/a", fetchedAt: "z", ok: false, reason: "HTTP 404" })
@@ -146,6 +152,17 @@ t("failure renders a block too",
   t("still exactly two markers", (after.match(/sp:link-preview/g) || []).length, 2);
   t("no-op when the url has no block", replacePreview(after, "https://c.test/3", "X"), after);
 }
+
+// --- pasted paths: the shapes a real copy/paste actually produces ---
+t("plain path", normalisePastedPath("/Users/you/Downloads/a.pdf"), "/Users/you/Downloads/a.pdf");
+t("surrounding whitespace", normalisePastedPath("  /tmp/a.pdf \n"), "/tmp/a.pdf");
+t("double quoted", normalisePastedPath('"/tmp/my file.pdf"'), "/tmp/my file.pdf");
+t("single quoted", normalisePastedPath("'/tmp/my file.pdf'"), "/tmp/my file.pdf");
+t("shell-escaped spaces", normalisePastedPath("/tmp/my\\ file\\ v2.pdf"), "/tmp/my file v2.pdf");
+t("shell-escaped parens", normalisePastedPath("/tmp/report\\ \\(final\\).pdf"), "/tmp/report (final).pdf");
+t("file:// URL", normalisePastedPath("file:///tmp/a%20b.pdf"), "/tmp/a b.pdf");
+t("backslash before a normal char is kept",
+  normalisePastedPath("/tmp/a\\bc.pdf"), "/tmp/a\\bc.pdf");
 
 rmSync(dir, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);

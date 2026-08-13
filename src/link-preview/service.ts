@@ -17,6 +17,7 @@ export interface EnrichResult {
 
 export interface EnrichOptions {
   calloutType?: string;
+  collapsed?: boolean;
   /** Refetch and REPLACE existing previews. Off by default: the user is
    *  expected to correct these by hand, and a refresh must be asked for. */
   force?: boolean;
@@ -69,7 +70,7 @@ export async function enrichFile(
     // link is more useful than silence: it is somewhere to type the title in,
     // and it records that the link WAS tried.
     if (!entry.ok) out.failed++;
-    blocks.push({ url, markdown: renderPreviewCallout(entry, { calloutType: opts.calloutType }) });
+    blocks.push({ url, markdown: renderPreviewCallout(entry, { calloutType: opts.calloutType, collapsed: opts.collapsed }) });
   }
 
   if (!blocks.length) return out;

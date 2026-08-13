@@ -43,6 +43,8 @@ export function shouldShowWelcome(plugin: StashpadPlugin): boolean {
 export class WelcomeModal extends Modal {
   private plugin: StashpadPlugin;
   private folderName = DEFAULT_STASHPAD_FOLDER;
+  /** Bring up the folder switcher + panels once the folder exists. */
+  private openPanels = true;
   /** Set when a button handler runs, so onClose can tell "user picked
    *  something" from "user dismissed with Escape / the X". */
   private choice: OnboardingChoice | null = null;
@@ -95,6 +97,20 @@ export class WelcomeModal extends Modal {
         }, 0);
       });
 
+    // 0.266.7: setup can bring up the sidebars too.
+    //
+    // Both panels have had their own commands for a long time, but a new user
+    // has no reason to guess they exist — so setup finished with a bare list
+    // and the two surfaces that make the plugin legible (folder switcher,
+    // pinned/task panels) stayed hidden until someone went looking. Opt-out
+    // rather than opt-in: on first run the roomier layout is the one worth
+    // showing, and closing a sidebar is obvious in a way that discovering one
+    // is not.
+    new Setting(contentEl)
+      .setName("Open the side panels too")
+      .setDesc("Shows the folder switcher and the Stashpad panels alongside the list.")
+      .addToggle((t) => t.setValue(this.openPanels).onChange((v) => { this.openPanels = v; }));
+
     const buttons = contentEl.createDiv({ cls: "stashpad-welcome-buttons" });
 
     const laterBtn = buttons.createEl("button", { text: "Set up later" });
@@ -144,6 +160,13 @@ export class WelcomeModal extends Modal {
       this.choice = choice;
       this.close();
       await this.plugin.openFolderInStashpad(folder);
+      // AFTER the list is open, so the sidebars attach around an existing view
+      // rather than racing it. Failing to open a panel must not turn a
+      // successful setup into an error notice — the folder is made either way.
+      if (this.openPanels) {
+        try { await this.plugin.openSetupPanels(); }
+        catch (e) { console.warn("[Stashpad] setup: opening panels failed", e); }
+      }
     } catch (e) {
       this.busy = false;
       const msg = e instanceof Error ? e.message : String(e);

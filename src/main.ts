@@ -40,6 +40,10 @@ import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./str
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
+/** Where quick-switcher shortcut stubs live. One folder so they never mix
+ *  with real notes and are trivial to delete en masse. */
+const SHORTCUT_DIR = "Stashpad Shortcuts";
+
 import { PreviewCache } from "./link-preview/store";
 import { enrichFile, scanBackfill, estimateSeconds, humanDuration } from "./link-preview/service";
 import { AuthorRegistry } from "./author-registry";
@@ -1283,6 +1287,7 @@ export default class StashpadPlugin extends Plugin {
       try {
         const r = await enrichFile(this.app, this.previewCache, f, {
           calloutType: this.settings.linkPreviewCallout,
+          collapsed: this.settings.linkPreviewCollapsed,
           delayMs: this.settings.linkPreviewDelayMs,
           force: opts.force,
         });
@@ -1307,6 +1312,135 @@ export default class StashpadPlugin extends Plugin {
       category: "system",
       affectedPaths: files.map((f) => f.path),
     });
+  }
+
+  /** Paths waiting on a debounced auto-enrich, and the timer draining them. */
+  private autoPreviewQueue = new Set<string>();
+  private autoPreviewTimer: number | null = null;
+  /** Paths WE just wrote. Our own write fires another `modify`, and without
+   *  this the watcher would answer its own event forever. */
+  private autoPreviewSelfWrites = new Map<string, number>();
+
+  /** 0.265.0: queue a note for automatic preview fetching.
+   *
+   *  Heavily deferred on purpose. This fires on `modify`, which means it fires
+   *  while the user is typing — enriching mid-keystroke would fetch a
+   *  half-typed URL and write to the note under the cursor. The debounce is
+   *  long enough that it only lands once you have stopped. */
+  private queueAutoPreview(file: TFile): void {
+    if (!this.settings.linkPreviewAuto) return;
+    const recent = this.autoPreviewSelfWrites.get(file.path);
+    if (recent && Date.now() - recent < 10_000) return;   // our own write, echoing back
+    const dir = file.parent?.path?.replace(/\/+$/, "") ?? "";
+    const folders = this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, ""));
+    if (!folders.some((f) => dir === f || dir.startsWith(f + "/"))) return;
+    this.autoPreviewQueue.add(file.path);
+    if (this.autoPreviewTimer != null) window.clearTimeout(this.autoPreviewTimer);
+    this.autoPreviewTimer = window.setTimeout(() => { void this.drainAutoPreviews(); }, 8000);
+  }
+
+  private async drainAutoPreviews(): Promise<void> {
+    this.autoPreviewTimer = null;
+    const paths = [...this.autoPreviewQueue];
+    this.autoPreviewQueue.clear();
+    for (const p of paths) {
+      if (!this.settings.linkPreviewAuto) return;   // turned off while we waited
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) continue;
+      try {
+        const r = await enrichFile(this.app, this.previewCache, f, {
+          calloutType: this.settings.linkPreviewCallout,
+          collapsed: this.settings.linkPreviewCollapsed,
+          delayMs: this.settings.linkPreviewDelayMs,
+        });
+        // Only mark a self-write when we ACTUALLY wrote. Marking
+        // unconditionally would suppress a genuine later edit for 10s.
+        if (r.added > 0) {
+          this.autoPreviewSelfWrites.set(p, Date.now());
+          // Quiet by design: an automatic feature announcing itself on every
+          // note you save is noise. Failures stay silent too — they are
+          // recorded in the note as a stub and in the cache.
+        }
+      } catch (e) {
+        console.warn("[Stashpad] auto link preview failed", p, e);
+      }
+    }
+  }
+
+  /** 0.266.1: one markdown file per Stashpad folder, so the QUICK SWITCHER can
+   *  launch a Stashpad tab.
+   *
+   *  Obsidian's switcher only knows about files, so a Stashpad folder is
+   *  invisible to it. These stubs give it something to find. The stub is not a
+   *  document you read — opening it REPLACES itself with the Stashpad view for
+   *  its folder (see the file-open handler), so switcher → type → Enter lands
+   *  you in Stashpad in one step rather than opening a note that merely
+   *  contains a link you then have to click.
+   *
+   *  Kept in one folder rather than one stub per Stashpad folder root, so they
+   *  never mix with real notes and are trivial to delete en masse. */
+  async createFolderShortcuts(): Promise<void> {
+    const dir = SHORTCUT_DIR;
+    const folders = this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, "")).filter(Boolean);
+    // Folders are discovered from the notes on disk, not from a setting, so
+    // there is deliberately no fallback to a configured default: a shortcut to
+    // a folder that holds no Stashpad notes would open an empty view and look
+    // broken. Say what to do instead of just reporting the absence.
+    if (!folders.length) {
+      new Notice("No Stashpad folders found yet — create one first, then run this again.");
+      return;
+    }
+    try {
+      if (!(await this.app.vault.adapter.exists(dir))) await this.app.vault.createFolder(dir);
+    } catch (e) {
+      new Notice(`Couldn't create the shortcuts folder: ${(e as Error).message}`);
+      return;
+    }
+    let made = 0, existing = 0;
+    for (const folder of folders) {
+      const leaf = folder.split("/").pop() || folder;
+      // Prefixed so typing "sp" in the switcher surfaces every one of them
+      // together, instead of them scattering through unrelated results.
+      const path = `${dir}/Stashpad — ${leaf}.md`;
+      if (this.app.vault.getAbstractFileByPath(path)) { existing++; continue; }
+      const body = [
+        "---",
+        `stashpadShortcut: "${folder}"`,
+        "---",
+        "",
+        `Opening this file opens the **${leaf}** Stashpad.`,
+        "",
+        "It exists so Obsidian's quick switcher can reach a Stashpad folder —",
+        "the switcher only finds files, and a Stashpad is a folder. Deleting it",
+        "removes the shortcut and nothing else; your notes are untouched.",
+        "",
+      ].join("\n");
+      try { await this.app.vault.create(path, body); made++; }
+      catch (e) { console.warn("[Stashpad] shortcut create failed", path, e); }
+    }
+    this.notifications.show({
+      message: made
+        ? `Created ${made} switcher shortcut${made === 1 ? "" : "s"} in **${dir}**`
+          + (existing ? ` (${existing} already existed).` : ". Open the quick switcher and type a folder name.")
+        : `Every Stashpad folder already has a shortcut in **${dir}**.`,
+      kind: "success",
+      category: "system",
+    });
+  }
+
+  /** Turn a shortcut stub into the Stashpad view it stands for.
+   *
+   *  Replaces the leaf rather than opening a second tab: the stub is a
+   *  launcher, and leaving it behind would mean the switcher's result stays
+   *  open as a stray markdown tab every time it is used. */
+  private async openShortcutTarget(target: WorkspaceLeaf, file: TFile): Promise<boolean> {
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as
+      | { stashpadShortcut?: unknown } | undefined;
+    const folder = typeof fm?.stashpadShortcut === "string" ? fm.stashpadShortcut.trim() : "";
+    if (!folder) return false;
+    await target.setViewState({ type: STASHPAD_VIEW_TYPE, state: { folderOverride: folder }, active: true });
+    this.app.workspace.setActiveLeaf(target, { focus: true });
+    return true;
   }
 
   /** Sweep every Stashpad note for un-previewed links.
@@ -1354,6 +1488,7 @@ export default class StashpadPlugin extends Plugin {
       try {
         const r = await enrichFile(this.app, this.previewCache, f, {
           calloutType: this.settings.linkPreviewCallout,
+          collapsed: this.settings.linkPreviewCollapsed,
           delayMs: this.settings.linkPreviewDelayMs,
         });
         added += r.added; failed += r.failed;
@@ -1546,6 +1681,17 @@ export default class StashpadPlugin extends Plugin {
       .slice(0, limit);
   }
 
+  /** 0.266.7: bring up both sidebars as part of setup.
+   *
+   *  Each has had its own command for a long time, which is no help to someone
+   *  who doesn't yet know the panels exist. Sequential rather than parallel:
+   *  both attach to the workspace, and racing two setViewState calls into the
+   *  same sidebar is how you get one of them silently dropped. */
+  async openSetupPanels(): Promise<void> {
+    await openFolderPanelView(this.app);
+    await openStashpadPanelsView(this.app);
+  }
+
   /** Open the first-run welcome on demand (command palette / settings button),
    *  regardless of whether it has already been answered. */
   showWelcome(): void {
@@ -1675,6 +1821,30 @@ export default class StashpadPlugin extends Plugin {
     // through okfActiveFolders so it never runs when OKF is off / for non-OKF /
     // archive folders. Frontmatter writes are "modify" events (not listened here),
     // so this can't loop on its own work; index.md is ignored explicitly.
+    // 0.265.0: automatic link previews, when enabled. Both events matter — a
+    // note arriving from the share sheet or a sync fires `create`, not
+    // `modify`, and that inbound case is the main reason to want this on.
+    this.registerEvent(this.app.vault.on("modify", (f) => {
+      if (f instanceof TFile && f.extension === "md") this.queueAutoPreview(f);
+    }));
+    this.registerEvent(this.app.vault.on("create", (f) => {
+      if (f instanceof TFile && f.extension === "md") this.queueAutoPreview(f);
+    }));
+    // 0.266.1: a shortcut stub swaps itself for the Stashpad it names.
+    // 0.266.1: `active-leaf-change`, NOT `file-open`. Measured with listeners
+    // on all three: opening a file raises active-leaf-change and layout-change
+    // but never file-open, so a file-open hook did nothing at all. This also
+    // hands us the leaf directly, so there is no lookup to get wrong.
+    //
+    // Terminates on its own: the swapped leaf is a Stashpad view, which fails
+    // the markdown test on the re-entrant event.
+    this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
+      if (!leaf) return;
+      const file = (leaf.view as unknown as { file?: TFile }).file;
+      if (leaf.view?.getViewType?.() !== "markdown" || !file || file.extension !== "md") return;
+      if (!file.path.startsWith(SHORTCUT_DIR + "/")) return;   // cheap reject before reading metadata
+      window.setTimeout(() => { void this.openShortcutTarget(leaf, file); }, 0);
+    }));
     this.registerEvent(this.app.vault.on("create", (f) => this.onOkfFileEvent(f.path)));
     this.registerEvent(this.app.vault.on("delete", (f) => this.onOkfFileEvent(f.path)));
     this.registerEvent(this.app.vault.on("rename", (f, oldPath) => { this.onOkfFileEvent(f.path); this.onOkfFileEvent(oldPath); }));
@@ -2351,6 +2521,11 @@ export default class StashpadPlugin extends Plugin {
           .filter((f: TFile | null | undefined): f is TFile => !!f);
         void this.addLinkPreviews(targets, { force: true });
       },
+    });
+    this.addCommand({
+      id: "stashpad-create-folder-shortcuts",
+      name: "Create quick-switcher shortcuts for every Stashpad folder",
+      callback: () => { void this.createFolderShortcuts(); },
     });
     this.addCommand({
       id: "stashpad-link-previews-backfill",
@@ -8766,7 +8941,19 @@ function mergeBindings(
   }
   if (raw && typeof raw === "object") {
     for (const m of COMMAND_META) {
-      const r = raw[m.id];
+      let r = raw[m.id];
+      // 0.266.1: coerce a BARE STRING binding into the object shape.
+      //
+      // Found in a real data.json: `move: "Q"` while every other entry was
+      // `{primary, secondary, …}`. `matchBinding` destructures `.primary`, so
+      // a string yields undefined and the command fires on NOTHING — not the
+      // old key, not the new one. It reads as "something hijacked my shortcut"
+      // when in fact nothing is listening at all.
+      //
+      // Skipping it (the previous behaviour) silently reverted the user's
+      // choice to the default instead, which is its own quiet wrongness.
+      // Coercing keeps what they picked AND makes it work.
+      if (typeof r === "string") r = { primary: r, secondary: "", preferRight: false, useBoth: false };
       if (!r || typeof r !== "object") continue;
       out[m.id] = {
         primary: typeof r.primary === "string" ? r.primary : out[m.id].primary,

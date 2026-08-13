@@ -263,6 +263,13 @@ export interface StashpadSettings {
   /** Politeness delay between link-preview fetches, ms. Applies to backfill
    *  most of all: a sweep over an archive is thousands of requests. */
   linkPreviewDelayMs: number;
+  /** 0.265.0: fetch previews automatically for links in notes as they are
+   *  saved, instead of only on an explicit command. OFF by default — it turns
+   *  typing a URL into a network request and a note write. */
+  linkPreviewAuto: boolean;
+  /** Start preview callouts folded shut. Off by default: folding hides the
+   *  description, which is the thing worth capturing. */
+  linkPreviewCollapsed: boolean;
   /** 0.86.2: folder panel — fraction of height given to the Pinned section
    *  (the rest goes to Folders). Set by dragging the divider. 0.15–0.85. */
   folderPanelPinnedFraction: number;
@@ -755,6 +762,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   slashCommands: true,
   linkPreviewCallout: "info",
   linkPreviewDelayMs: 300,
+  linkPreviewAuto: false,
+  linkPreviewCollapsed: false,
   useTemplatesFormat: false,
   prefixTimestampsOnCopy: true,
   splitOnLines: false,
@@ -1730,6 +1739,14 @@ export class StashpadSettingTab extends PluginSettingTab {
       ));
     }
 
+    cats.composerCopy.push(toggle("Add link previews automatically",
+      "When a note containing a link is saved, fetch that link's title and description and add a preview to the note — without you running a command. Off by default: it turns typing a URL into a network request and a write to the note. Previews are still never overwritten, so anything you have edited by hand is safe. If the list feels jumpy while notes are being written, turn this off.",
+      () => this.plugin.settings.linkPreviewAuto, (v) => { this.plugin.settings.linkPreviewAuto = v; },
+      ["link", "preview", "auto", "automatic", "unfurl", "url"]));
+    cats.composerCopy.push(toggle("Start link previews folded",
+      "Show preview callouts collapsed to just their title. Off by default — folding hides the description, which is the part worth keeping. Turn it on if notes with several links feel dominated by previews.",
+      () => this.plugin.settings.linkPreviewCollapsed, (v) => { this.plugin.settings.linkPreviewCollapsed = v; },
+      ["link", "preview", "collapsed", "folded", "callout"]));
     cats.composerCopy.push(this.renderDef("Link preview callout style",
       'Which Obsidian callout type link previews use — "info", "quote", "abstract", "note" and so on. Cosmetic: it decides the icon and colour. Previews are always collapsed by default so a note with several links is not mostly preview.',
       (s) => s.addText((t) => t

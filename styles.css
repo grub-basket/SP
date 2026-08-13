@@ -1286,17 +1286,35 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   padding-top: 6px;
   padding-bottom: 6px;
 }
-.stashpad-focused.is-heading-row.is-stuck .stashpad-note-text {
-  display: -webkit-box;
-  -webkit-line-clamp: 1;
-  -webkit-box-orient: vertical;
+/* 0.266.6: while stuck, the rendered body is REPLACED by a plain one-line
+   preview rather than clamped — for compactness. No markdown, no images, no
+   callout chrome, and the swap is a class toggle rather than a re-render.
+
+   The clamp it replaces was not broken: measured on a body opening with a
+   link-preview callout, the old rule collapsed it to 20px, because it also
+   forced the children to `display: inline`. Recorded here so nobody
+   "re-fixes" a block-content bug that was never the problem. */
+.stashpad-heading-stuck-line {
+  display: none;
+  min-width: 0;
+  flex: 1;
+  white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  line-height: 1.4;
 }
-/* The rendered body is markdown, so the first line may be a <p>/<h1>/<li>.
-   Kill their block margins or the "one line" is one line plus leading. */
-.stashpad-focused.is-heading-row.is-stuck .stashpad-note-text > * {
-  margin-block: 0;
-  display: inline;
+.stashpad-focused.is-heading-row.is-stuck .stashpad-focused-body {
+  display: none;
+}
+.stashpad-focused.is-heading-row.is-stuck .stashpad-heading-stuck-line {
+  display: block;
+}
+/* The attachment rail and anything else the body brought with it go too — the
+   collapsed heading is one line of text and nothing else. */
+.stashpad-focused.is-heading-row.is-stuck .stashpad-attachment-rail {
+  display: none;
 }
 /* Second lines, by definition — gone while collapsed. */
 .stashpad-focused.is-heading-row.is-stuck .stashpad-note-authorship {
@@ -7110,12 +7128,32 @@ button.stashpad-btn-loading::after {
   color: var(--text-error);
   font-weight: var(--font-semibold, 600);
 }
-/* Destructive action = red LABEL on the ordinary button surface. --text-error
-   is defined to be readable against the normal background in both themes, so
-   this is legible by construction rather than by tuning a fill. */
-.stashpad-dupes-act.is-danger { color: var(--text-error); }
-.stashpad-dupes-act.is-danger:hover {
-  background: var(--background-modifier-error-hover, var(--background-modifier-hover));
+/* Destructive action = red LABEL, never a red fill.
+   Measured: --text-error on the default button surface scores 3.31:1 in the
+   light theme — under AA — because that surface is darker than the modal
+   behind it. Dropping to a transparent background puts the label on the
+   modal's own background instead and takes it to ~4.2:1, which is the ceiling
+   --text-error allows in this theme. Going further would mean hard-coding a
+   red, which breaks in dark mode; semibold carries the rest. */
+/* Destructive action: ordinary button surface with a red label at rest, and on
+   hover the two SWAP — red fill, light label. A fill is fine here precisely
+   because the foreground changes in the same rule; what broke twice before was
+   setting a red background and leaving the red text behind it. */
+.stashpad-dupes-act.is-danger {
+  color: var(--text-error);
+  font-weight: var(--font-semibold, 600);
+}
+/* Hover keeps the NEUTRAL surface. --background-modifier-error-hover is a
+   solid red fill, so pairing it with the red label reproduced the exact
+   red-on-red block this button was fixed for in 0.261.0 — the same
+   fill-plus-independent-foreground mistake, one state later. If a destructive
+   button ever wants a red fill, its label has to change colour in the same
+   rule; it is never a background-only edit. */
+.stashpad-dupes-act.is-danger:hover,
+.stashpad-dupes-act.is-danger:focus-visible {
+  background: var(--text-error);
+  color: var(--text-on-accent, white);
+  border-color: var(--text-error);
 }
 .stashpad-dupes-act {
   padding: 1px 8px;
@@ -7815,3 +7853,72 @@ button.stashpad-btn-loading::after {
 .stashpad-appimport-spin { animation: stashpad-appimport-spin 1s linear infinite; display: inline-flex; }
 @keyframes stashpad-appimport-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
+
+/* 0.265.1 — callout folding inside Stashpad's own rendered bodies.
+
+   Stashpad renders note markdown into its own containers, NOT into Obsidian's
+   `.markdown-preview-view`, and Obsidian scopes its callout-collapse rules to
+   that container. So `.is-collapsed` was landing on the element and styling
+   nothing: the chevron sat there, clicking it toggled a class, and the content
+   never moved. (Measured: `parentIsMarkdownPreview: false`, computed display
+   `block` with the class applied.)
+
+   Consequence beyond the fold button: a callout authored `[!info]-` also
+   rendered fully expanded in Stashpad, so "start folded" was invisible here
+   until now. Supplying the rule is what makes both work. */
+.stashpad-note-text .callout.is-collapsed > .callout-content,
+.stashpad-focused-body .callout.is-collapsed > .callout-content,
+.stashpad-detail-body .callout.is-collapsed > .callout-content {
+  display: none;
+}
+/* The chevron's rotation is scoped the same way, so it needs the same
+   treatment or a folded callout points the wrong direction. */
+.stashpad-note-text .callout.is-collapsible .callout-fold,
+.stashpad-focused-body .callout.is-collapsible .callout-fold,
+.stashpad-detail-body .callout.is-collapsible .callout-fold {
+  transition: transform 100ms ease;
+}
+.stashpad-note-text .callout.is-collapsed .callout-fold,
+.stashpad-focused-body .callout.is-collapsed .callout-fold,
+.stashpad-detail-body .callout.is-collapsed .callout-fold {
+  transform: rotate(-90deg);
+}
+/* 0.265.2: the CHEVRON is the fold affordance, not the whole title — the title
+   has to stay available for the row's double-click-to-enter gesture. Padded
+   out to a real tap target since the glyph itself is tiny on a phone; the
+   negative margin keeps the layout where it was. */
+.stashpad-note-text .callout.is-collapsible .callout-fold,
+.stashpad-focused-body .callout.is-collapsible .callout-fold,
+.stashpad-detail-body .callout.is-collapsible .callout-fold {
+  cursor: pointer;
+  padding: 8px;
+  margin: -8px;
+}
+
+/* 0.266.0 — paste-a-path row under the dropzone. Desktop only; the field isn't
+   rendered on mobile, where reading an arbitrary path isn't possible. */
+.stashpad-dropzone-path {
+  margin-top: 12px;
+}
+.stashpad-dropzone-path-label {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.stashpad-dropzone-path-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.stashpad-dropzone-path-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-dropzone-path-status {
+  margin-top: 6px;
+  min-height: 1.4em;              /* reserve the line so the modal doesn't jump */
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}

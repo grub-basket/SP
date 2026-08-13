@@ -1,4 +1,5 @@
 import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, type SecretStorage } from "obsidian";
+import { normalisePastedPath } from "./paste-path";
 import { splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch, ROOT_ID } from "./types";
@@ -3678,10 +3679,97 @@ export class DropzoneModal extends Modal {
       doc.body.appendChild(input);
       input.click();
     };
+
+    // 0.266.0: paste a path instead of navigating the OS picker.
+    //
+    // The request was "open the picker AT this path". That turns out not to be
+    // available: this dropzone uses a web `<input type="file">`, which cannot
+    // be pre-navigated, and the Electron dialog option that could
+    // (`defaultPath`) lives on the main process — `@electron/remote` is gone in
+    // current Electron and Obsidian exposes no dialog API.
+    //
+    // So it does the better thing instead: it reads the file and imports it
+    // DIRECTLY. That serves the actual goal — not touching the picker at all —
+    // rather than making the picker slightly less annoying.
+    //
+    // Desktop only. Reading an arbitrary absolute path needs Node's fs, which
+    // does not exist on mobile; the field simply isn't rendered there.
+    if (Platform.isDesktopApp) this.renderPathField(take);
+  }
+
+  /** Text field that turns a pasted path into an imported file. */
+  private renderPathField(take: (files: File[]) => void): void {
+    const wrap = this.contentEl.createDiv({ cls: "stashpad-dropzone-path" });
+    wrap.createDiv({
+      cls: "stashpad-dropzone-path-label",
+      text: "…or paste a path",
+    });
+    const row = wrap.createDiv({ cls: "stashpad-dropzone-path-row" });
+    const input = row.createEl("input", {
+      type: "text",
+      cls: "stashpad-dropzone-path-input",
+      attr: { placeholder: "/Users/you/Downloads/report.pdf", spellcheck: "false" },
+    });
+    const status = wrap.createDiv({ cls: "stashpad-dropzone-path-status" });
+    const btn = row.createEl("button", { cls: "mod-cta", text: "Add" });
+
+    const submit = async (): Promise<void> => {
+      const raw = input.value.trim();
+      if (!raw) return;
+      status.setText("");
+      const path = normalisePastedPath(raw);
+      try {
+        const fs = (window as unknown as { require: (m: string) => {
+          statSync: (p: string) => { isDirectory: () => boolean; isFile: () => boolean; size: number };
+          readFileSync: (p: string) => Uint8Array;
+        } }).require("fs");
+        const st = fs.statSync(path);
+        if (st.isDirectory()) {
+          // A folder can't be imported and can't seed the picker either, so
+          // say what it can do rather than failing silently.
+          try {
+            const { shell } = (window as unknown as { require: (m: string) => { shell: { openPath: (p: string) => void } } }).require("electron");
+            shell.openPath(path);
+            // Opening it is the useful half; saying what to do next is the
+            // other half. The window behind this message IS a dropzone, so
+            // dragging from the window that just opened is the shortest route
+            // for several files at once — and it beats pasting each path.
+            status.setText("That's a folder — opened it in your file manager. Drag files from there onto this window, or paste a single file's path.");
+          } catch {
+            status.setText("That's a folder, not a file. Paste the path of a file to import it.");
+          }
+          return;
+        }
+        if (!st.isFile()) { status.setText("That path isn't a file."); return; }
+        const bytes = fs.readFileSync(path);
+        const name = path.split(/[\\/]/).pop() || "file";
+        // A real File, so it flows through the SAME import path as a drop or a
+        // picker selection — no second code path to keep in step.
+        const file = new File([new Uint8Array(bytes)], name);
+        take([file]);
+      } catch (e) {
+        const msg = (e as { code?: string; message?: string });
+        status.setText(
+          msg.code === "ENOENT" ? "No file at that path."
+            : msg.code === "EACCES" ? "No permission to read that file."
+            : `Couldn't read it: ${msg.message ?? "unknown error"}`,
+        );
+      }
+    };
+
+    btn.onclick = () => { void submit(); };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); void submit(); }
+    });
+    // Pasting is the whole point, so select-all on focus makes replacing a
+    // previous attempt one action rather than three.
+    input.addEventListener("focus", () => input.select());
   }
 
   onClose(): void { this.contentEl.empty(); }
 }
+
+
 
 /** 0.219.6: a real view of duplicate note ids, replacing the wall-of-text
  *  notice that listed them inline.

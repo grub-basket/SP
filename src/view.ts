@@ -1,5 +1,5 @@
 import {
-  App, ItemView, MarkdownRenderer, Menu, Notice, Platform,
+  App, ItemView, Keymap, MarkdownRenderer, Menu, Notice, Platform,
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce,
   moment, sanitizeHTMLToDom, setIcon,
 } from "obsidian";
@@ -89,6 +89,16 @@ const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avi
 const RENDER_CALM_MS = 900;
 const RENDER_BURST_THRESHOLD = 5;
 const RENDER_STORM_DELAY_MS = 700;
+
+/** Hysteresis band for the pinned heading's `is-stuck` collapse. Two thresholds
+ *  rather than one because the class changes the very height it is measured
+ *  from — see installHeadingStuckObserver for the oscillation this prevents. */
+const STICK_ON_PX = 8;
+const STICK_OFF_PX = 2;
+
+/** Below this the list is too short to position anything inside — see the
+ *  scroll-to-id re-assert chain, which otherwise churns forever trying. */
+const MIN_SCROLLABLE_PX = 48;
 
 
 const VIEW_MODE_LABELS: Record<ViewMode, string> = {
@@ -225,11 +235,13 @@ export class StashpadView extends ItemView {
    *  render. We count change events in a rolling window and, once it looks like a
    *  storm rather than typing, stretch the debounce so we render ONCE after things
    *  go quiet instead of ~12x/second. */
-  private renderBurstCount = 0;
-  private renderBurstWindowAt = 0;
+  /** 0.266.6: timestamps of recent change events, pruned to RENDER_CALM_MS.
+   *
+   *  Replaces a count plus a sticky flag, which misread a slow trickle as a
+   *  permanent storm — see scheduleRender. Holding the timestamps means "storm"
+   *  is a RATE that is recomputed from scratch each time, so it cannot latch. */
+  private renderBurstTimes: number[] = [];
   private renderTimer: number | null = null;
-  /** True while change events are arriving faster than a human could cause. */
-  private renderStorm = false;
   /** 0.216.1: until this timestamp, debounced renders use a LONGER trailing
    *  delay so the burst of self-inflicted events after our own note creation
    *  (vault create, metadata resolve, metadata changed, fmSync parentLink
@@ -527,25 +539,56 @@ export class StashpadView extends ItemView {
     // wait during a sync storm so the list settles once instead of thrashing.
     const scheduleRender = (): void => {
       const now = Date.now();
-      // Reset only after a genuine QUIET GAP. (A fixed rolling window was the first
-      // attempt and it silently defeated itself: the window boundary cleared the
-      // storm flag every second, dropping straight back to the snappy delay and
-      // re-rendering — measured as no improvement at all.)
-      if (now - this.renderBurstWindowAt > RENDER_CALM_MS) {
-        this.renderBurstCount = 0;
-        this.renderStorm = false;
+      // 0.266.6: "storm" is a RATE — how many change events landed in the last
+      // RENDER_CALM_MS — recomputed from scratch every call.
+      //
+      // It used to be a running count plus a sticky flag, reset only when the
+      // gap between two CONSECUTIVE events exceeded the calm window. That reads
+      // as "reset when things go quiet", but it actually means "reset only if
+      // no two events are ever closer than 900ms" — so a slow, steady trickle
+      // pinned the view in storm mode indefinitely while the burst count
+      // climbed without bound. Worse, the storm delay (700ms) is SHORTER than
+      // the calm window, so a trickle at roughly the storm's own cadence could
+      // never clear it. Simulated: events every 800ms — about 1.25/sec, nobody's
+      // idea of a storm — ended in storm mode with a burst count of 30, and
+      // that is the 703ms metronome the phone traces show.
+      //
+      // A window that holds timestamps cannot latch: when the rate drops the
+      // old entries simply age out. The earlier note here warned that a rolling
+      // window "silently defeated itself" by clearing every second; that was a
+      // window over the COUNT, which threw away the history it needed. Keeping
+      // the timestamps is what makes the rolling version correct — verified
+      // against a true 50ms burst (still a storm), an 800ms trickle (not), and
+      // a burst followed by a trickle (recovers).
+      this.renderBurstTimes.push(now);
+      const cutoff = now - RENDER_CALM_MS;
+      while (this.renderBurstTimes.length && this.renderBurstTimes[0] < cutoff) {
+        this.renderBurstTimes.shift();
       }
-      this.renderBurstWindowAt = now;
-      this.renderBurstCount++;
-      if (this.renderBurstCount > RENDER_BURST_THRESHOLD) this.renderStorm = true;
-      const delay = this.renderStorm
+      const storm = this.renderBurstTimes.length > RENDER_BURST_THRESHOLD;
+      // 0.266.3: the ~700ms render cadence on the phone was this debounce
+      // sitting in storm mode, not a stray timer — so the open question is what
+      // keeps FEEDING it. Trace the caller: a storm only persists while change
+      // events keep arriving, and the stack says which source is producing
+      // them. Cheap (a string split, only while the debugger is on) and it
+      // turns the next dump into a name instead of another hypothesis.
+      if (this.plugin.settings.debugTrace) {
+        this.plugin.trace("render:sched", {
+          burst: this.renderBurstTimes.length,
+          storm: storm ? 1 : 0,
+          by: (new Error().stack ?? "").split("\n").slice(2, 5)
+            .map((l) => l.trim().replace(/^at\s+/, "").replace(/\s*\(.*$/, "")).join(" < ").slice(0, 140),
+        });
+      }
+      const delay = storm
         ? RENDER_STORM_DELAY_MS
         : (now < this.postCreateSettleUntil ? 400 : 80);
       if (this.renderTimer != null) window.clearTimeout(this.renderTimer);
       this.renderTimer = window.setTimeout(() => {
         this.renderTimer = null;
-        // NB: don't clear the storm flag here — the storm ends when events stop
-        // arriving (the calm check above), not when we happen to get a render in.
+        // NB: nothing to clear here. Getting a render in doesn't end a storm —
+        // events stopping does, and that falls out of the window above ageing
+        // its timestamps out on the next call.
         if (this.renderSuppressed()) return;
         this.render();
       }, delay);
@@ -608,6 +651,7 @@ export class StashpadView extends ItemView {
     host.addClass("stashpad-scroll-host");
     this.viewRoot = host.createDiv({ cls: "stashpad-view" });
     this.viewRoot.setAttribute("tabindex", "0");
+    this.installKeyboardTrace();
     this.viewRoot.addEventListener("focusin", () => setActiveView(this));
     this.viewRoot.addEventListener("click", () => setActiveView(this));
     // Mouse side-buttons: button 3 = back, button 4 = forward.
@@ -2828,6 +2872,94 @@ export class StashpadView extends ItemView {
   private _renderT0: number | null = null;
   /** public: called by extracted command modules (commands/*.ts). */
   render(policy?: ScrollPolicy): void {
+    // 0.265.2 (flicker investigation): renders are traced with an ID and a
+    // DEPTH. The working hypothesis for the mobile scroll flicker is "several
+    // renders running at once while the keyboard is up", and a flat log of
+    // "render" lines cannot show overlap — two sequential renders and two
+    // nested ones look identical. An id plus a depth makes an overlap visible
+    // as an overlap. Zero cost when the trace is off (trace() checks first).
+    const renderId = ++StashpadView.renderSeq;
+    StashpadView.renderDepth++;
+    this.plugin.trace("render:start", {
+      id: renderId,
+      depth: StashpadView.renderDepth,
+      folder: this.noteFolder,
+      focus: this.focusId,
+      rows: this.currentChildren.length,
+      top: Math.round(this.listEl?.scrollTop ?? -1),
+      h: this.listEl?.scrollHeight ?? -1,
+      kb: this.keyboardVisible ? 1 : 0,
+    });
+    try {
+      this.renderInner(policy);
+    } finally {
+      this.plugin.trace("render:end", {
+        id: renderId,
+        depth: StashpadView.renderDepth,
+        top: Math.round(this.listEl?.scrollTop ?? -1),
+        h: this.listEl?.scrollHeight ?? -1,
+      });
+      StashpadView.renderDepth--;
+    }
+  }
+
+  /** 0.265.2 (flicker investigation): track and trace the on-screen keyboard.
+   *
+   *  The reported symptom is "flicker when the keyboard is visible", and the
+   *  trace previously had no way to say whether it was. iOS fires no keyboard
+   *  event, so this infers it two ways and records both — `visualViewport`
+   *  height collapsing is the reliable signal, focus is the intent. Recording
+   *  the RESIZE separately matters: a viewport resize while the list is
+   *  scrolled is itself a plausible cause, not just context for one.
+   *
+   *  Everything here is inert unless the debug trace is switched on. */
+  private installKeyboardTrace(): void {
+    const vv = (window as unknown as { visualViewport?: {
+      height: number; addEventListener: (t: string, f: () => void) => void;
+      removeEventListener: (t: string, f: () => void) => void } }).visualViewport;
+    let lastH = vv?.height ?? window.innerHeight;
+    const onResize = (): void => {
+      const h = vv?.height ?? window.innerHeight;
+      const delta = h - lastH;
+      if (Math.abs(delta) < 60) return;   // orientation jitter, not a keyboard
+      lastH = h;
+      // A big SHRINK is the keyboard arriving; a big grow is it leaving.
+      this.keyboardVisible = delta < 0;
+      this.plugin.trace("keyboard", {
+        visible: this.keyboardVisible ? 1 : 0,
+        vh: Math.round(h),
+        delta: Math.round(delta),
+        listTop: Math.round(this.listEl?.scrollTop ?? -1),
+        listH: this.listEl?.scrollHeight ?? -1,
+      });
+    };
+    if (vv) {
+      vv.addEventListener("resize", onResize);
+      this.register(() => vv.removeEventListener("resize", onResize));
+    }
+    // Focus is the INTENT signal — it lands before the viewport moves, so a
+    // trace showing focus-then-resize-then-render tells a different story from
+    // resize-then-render.
+    const onFocusIn = (e: FocusEvent): void => {
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT")) {
+        this.plugin.trace("keyboard:focus", { el: t.className.slice(0, 40) });
+      }
+    };
+    this.viewRoot.addEventListener("focusin", onFocusIn);
+    this.register(() => this.viewRoot.removeEventListener("focusin", onFocusIn));
+  }
+
+  /** Monotonic render id + live nesting depth, shared across views — the
+   *  flicker may well involve two DIFFERENT views rendering at once, which a
+   *  per-instance counter would hide. */
+  private static renderSeq = 0;
+  private static renderDepth = 0;
+  /** Best-effort "is the on-screen keyboard up". Tracked from focus and from
+   *  visualViewport, because neither alone is reliable on iOS. */
+  private keyboardVisible = false;
+
+  private renderInner(policy?: ScrollPolicy): void {
     this.syncLevelScopedState();
     if (perf.enabled) this._renderT0 = performance.now();
     // 0.140.9: bail if the view was torn down. A debounced/deferred render
@@ -3167,6 +3299,19 @@ export class StashpadView extends ItemView {
           const align = scrollPolicy.align;
           const listForScroll = this.listEl;
           const apply = () => {
+            // 0.266.5: don't chase a target the list has no room to show.
+            //
+            // Measured at a phone-sized, half-height window: the composer and
+            // the pinned heading can squeeze the list's clientHeight to EIGHT
+            // pixels. scrollIntoView then cannot put the row anywhere that
+            // satisfies `block`, so each re-assert in this chain moves the
+            // scroll again and re-triggers the sticky-heading work — churn that
+            // can never converge because the viewport, not the position, is the
+            // problem. The same squeeze happens on a real phone whenever the
+            // keyboard is up (the traces show the list at h:202).
+            //
+            // Below that floor the honest thing is to leave the scroll alone.
+            if (listForScroll.clientHeight < MIN_SCROLLABLE_PX) return;
             this.suppressScrollSave = true;
             const row = listForScroll.querySelector(`[data-id="${targetId}"]`);
             if (row) row.scrollIntoView({ block: align, behavior: "auto" });
@@ -5199,7 +5344,7 @@ export class StashpadView extends ItemView {
     } else {
       homeBtn.setText("Home");
     }
-    homeBtn.onclick = () => this.navigateTo(ROOT_ID);
+    homeBtn.onclick = (e) => this.crumbActivate(e, ROOT_ID);
     if (this.focusId === ROOT_ID) {
       // 0.61.4: even at root, surface the exit-compact button + the
       // children-count chip when applicable. The earlier early-return
@@ -5253,7 +5398,7 @@ export class StashpadView extends ItemView {
         const id = c.id;
         const el = bar.createSpan({ cls: "stashpad-crumb", text: c.label });
         el.title = c.label;
-        el.onclick = () => this.navigateTo(id);
+        el.onclick = (e) => this.crumbActivate(e, id);
         // Right-click (desktop) or long-press (mobile) → context menu
         // for opening the crumb's note in a new Stashpad tab or a regular
         // Obsidian editor tab.
@@ -5417,7 +5562,45 @@ export class StashpadView extends ItemView {
       // stale element would toggle a class on a detached node — which is
       // exactly how the IntersectionObserver version failed silently.
       const heading = list.querySelector(".stashpad-focused.is-heading-row");
-      if (heading) heading.toggleClass("is-stuck", list.scrollTop > 2);
+      if (!heading) return;
+      const stuck = heading.hasClass("is-stuck");
+
+      // 0.266.3: hysteresis, because `is-stuck` CHANGES THE HEIGHT it is
+      // measured from.
+      //
+      // Sticking collapses the heading to one line, which shortens the content.
+      // On a short note that removes the overflow entirely, so the browser
+      // clamps scrollTop to 0 — which reads as "not stuck", so the heading
+      // expands, which restores the overflow, which allows the scroll again.
+      // That is a self-sustaining oscillation: measured on the phone as
+      // scrollHeight flipping 625 ↔ 394 indefinitely, and felt as the heading
+      // flickering and swallowing taps meant for the row below it.
+      //
+      // Two guards break the loop. Once stuck, only a decisive scroll back to
+      // the very top releases it, so the 0-or-2px region can't flip state on
+      // its own; and a list that cannot scroll WHILE COLLAPSED never unsticks
+      // on that basis, since expanding is precisely what would make it
+      // scrollable again.
+      // The two thresholds ARE the whole fix. Sticking needs a decisive scroll;
+      // releasing needs a return to the very top. Nothing in between moves it,
+      // so the collapse shortening the content — which clamps scrollTop to 0 —
+      // releases once and then cannot re-stick, because 0 is not past the
+      // sticking threshold.
+      //
+      // 0.266.7: an earlier third guard here ALSO refused to release whenever
+      // the collapsed list wasn't scrollable. That was aimed at the same
+      // oscillation the hysteresis already handles, and it broke the ordinary
+      // case: a note short enough that collapsing removes the overflow stayed
+      // stuck at the top of the list forever, so the heading never expanded and
+      // its Show-more toggle stayed hidden. Modelled both rules against the
+      // height feedback — hysteresis alone gives zero flips in the oscillation
+      // case AND releases correctly at the top, so the guard bought nothing.
+      if (!stuck) {
+        if (list.scrollTop > STICK_ON_PX) heading.addClass("is-stuck");
+        return;
+      }
+      if (list.scrollTop > STICK_OFF_PX) return;
+      heading.removeClass("is-stuck");
     };
     list.addEventListener("scroll", apply, { passive: true });
     this.headingStuckCleanup = () => list.removeEventListener("scroll", apply);
@@ -5436,7 +5619,30 @@ export class StashpadView extends ItemView {
     const wrap = parent.createDiv({ cls: "stashpad-focused" });
     // 0.122.2 (#9): the focused-note header gets the same right-click menu as a
     // list row (it IS a note — Copy/Cut/Move/Task/Delete all apply to it).
-    wrap.oncontextmenu = (evt) => { evt.preventDefault(); this.openNoteMenu(evt, node); };
+    // 0.266.3: right-click / long-press PUTS THE CURSOR ON THE HEADING before
+    // the menu opens.
+    //
+    // openNoteMenu's own `focusClicked` normalises the SELECTION, which is
+    // enough for the items that call it — but a command reached through "More
+    // commands…" resolves its own targets via getActionTargets(), and that
+    // falls back to the cursor row. On the heading the cursor was still down in
+    // the list, so "Add link previews" reported nothing selected (or, worse,
+    // silently acted on a child — the 0.257.0 Move bug through a second door).
+    //
+    // A right-click is an unambiguous "I mean THIS one", so it should focus the
+    // heading the way a left-click already does. Clearing a selection that
+    // doesn't contain the heading matches what focusClicked would do a moment
+    // later anyway, so this changes nothing for the items that normalise and
+    // fixes the ones that can't.
+    wrap.oncontextmenu = (evt) => {
+      evt.preventDefault();
+      if (opts.asRow) {
+        if (!this.selection.has(node.id)) { this.selection.clear(); this.lastSelected = null; }
+        this.cursorOnHeading = true;
+        this.selectHeadingCursor();
+      }
+      this.openNoteMenu(evt, node);
+    };
     // 0.258.0: as a row, it carries the same cursor/selected state classes the
     // note rows use, so one stylesheet drives both and the cursor is visible
     // wherever it sits. `is-heading-row` is what pins it (sticky, top: 0).
@@ -5468,6 +5674,24 @@ export class StashpadView extends ItemView {
     // untoggleable) unless you climbed back out to its list row.
     if (this.isTask(node)) this.addTaskCheckbox(metaTop, node);
 
+    // 0.266.6: the pinned heading's collapsed state shows a PLAIN one-line
+    // preview rather than a clamped copy of the rendered body.
+    //
+    // Compactness is the point: no markdown, no images, no callout chrome, and
+    // an explicit "…" when further lines exist. Swapping the two is a CSS class
+    // rather than a re-render, so scrolling never triggers layout work.
+    //
+    // NOT because the old clamp was broken. The suspicion was that
+    // `-webkit-line-clamp` cannot shrink a body opening with a block element (a
+    // link-preview callout), which would have explained a heading that stopped
+    // collapsing on scroll. Measured, and it is false: the old rule forced the
+    // children to `display: inline`, and the same callout body clamped to 20px.
+    // So that bug has some other cause — most likely the sticky oscillation
+    // fixed in 0.266.3 — and this change should not be credited with it.
+    if (opts.asRow) {
+      const stuck = wrap.createDiv({ cls: "stashpad-heading-stuck-line" });
+      stuck.textContent = this.stuckPreviewText(node);
+    }
     const body = wrap.createDiv({ cls: "stashpad-focused-body" });
     // Markdown rendered inside the focused header includes #tags and
     // [[wikilinks]] — without explicit click delegation those elements
@@ -5550,7 +5774,7 @@ export class StashpadView extends ItemView {
     ancestors.forEach((a, i) => {
       const seg = bc.createSpan({ cls: "stashpad-row-breadcrumb-seg", text: this.titleForNode(a) });
       seg.title = `Focus into "${this.titleForNode(a)}"`;
-      seg.onclick = (e) => { e.stopPropagation(); this.navigateTo(a.id); };
+      seg.onclick = (e) => { e.stopPropagation(); this.crumbActivate(e, a.id); };
       if (i < ancestors.length - 1) {
         bc.createSpan({ cls: "stashpad-row-breadcrumb-sep", text: " / " });
       }
@@ -5630,6 +5854,32 @@ export class StashpadView extends ItemView {
   }
 
   /** public: read by view-sort's compareForSort (the SortHost interface). */
+  /** One plain line for the collapsed pinned heading.
+   *
+   *  titleForNode already resolves "the note's first heading, else its first
+   *  body line" and strips inline markdown, which is exactly the line to show —
+   *  so this only adds the "there is more below" marker. CSS handles the other
+   *  ellipsis, the one for a single line too long to fit; this one means
+   *  "further lines exist", which no amount of overflow styling can convey. */
+  private stuckPreviewText(node: TreeNode, knownText?: string): string {
+    const title = this.titleForNode(node).trim();
+    if (!node.file) return title;
+    const body = knownText ?? this.plugin.renderCacheStore.get(node.file.path)?.text ?? "";
+    const lines = body.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    return lines.length > 1 ? `${title} …` : title;
+  }
+
+  /** Refresh the collapsed heading's preview once the body text is actually
+   *  known. At heading-render time the render cache is often cold — measured on
+   *  a fresh drill-in — so titleForNode falls back to the FILENAME SLUG and the
+   *  collapsed heading would show "child a" for a note whose first line reads
+   *  "Parent heading line one." */
+  private refreshStuckPreview(container: HTMLElement, node: TreeNode, text: string): void {
+    const row = container.closest(".stashpad-focused.is-heading-row");
+    const line = row?.querySelector(".stashpad-heading-stuck-line");
+    if (line) line.textContent = this.stuckPreviewText(node, text);
+  }
+
   titleForNode(node: TreeNode): string {
     if (!node.file) return "Untitled";
     const cache = this.app.metadataCache.getFileCache(node.file);
@@ -6023,7 +6273,13 @@ export class StashpadView extends ItemView {
     if (opts.clamp && !expanded) textEl.addClass("is-clamped");
     container.toggleClass("is-body-expanded", opts.clamp === true && expanded);
     if (this.compactMode || this.tinyMode) { textEl.addClass("is-plain"); textEl.textContent = entry.text; }
-    else { textEl.append(sanitizeHTMLToDom(entry.html)); }
+    else {
+      textEl.append(sanitizeHTMLToDom(entry.html));
+      // The prepaint is a real body the user can look at, not a placeholder, so
+      // it needs the fold state too — otherwise a re-render flashes the callout
+      // open before renderNoteBodyNow closes it again a tick later.
+      this.applyCalloutFold(textEl, node.id);
+    }
   }
 
   private renderNoteBodyNow(
@@ -6077,7 +6333,9 @@ export class StashpadView extends ItemView {
         // next mtime change anyway.)
         textEl.append(sanitizeHTMLToDom(html));
         this.applySpoilers(textEl);
+        this.applyCalloutFold(textEl, node.id);
       }
+      this.refreshStuckPreview(container, node, text);
       if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
       // Multiplayer footer: author / contributors / last-edit. Each
       // sub-piece is gated by its own toggle in settings; the row only
@@ -7030,7 +7288,133 @@ export class StashpadView extends ItemView {
    *  surface that ISN'T a row (focused header body, mini header, etc.).
    *  Same routing as handleRowClick's tag/link branches; doesn't touch
    *  selection / cursor — those concepts don't apply outside the list. */
+  /** 0.265.1: fold/unfold a collapsible callout that was re-hydrated from the
+   *  render cache.
+   *
+   *  Exactly the 0.246.0 code-block-copy problem again: note bodies are
+   *  restored from cached HTML, which reproduces the callout's markup —
+   *  `is-collapsible`, the fold chevron, the title — but NOT the click handler
+   *  Obsidian attaches when it renders a callout live. So the chevron looked
+   *  real and did nothing, and the same callout folded fine in Obsidian's own
+   *  editor.
+   *
+   *  Toggling the class is enough: `is-collapsed` is what Obsidian's own CSS
+   *  keys the hidden content off, so this drives the same state its handler
+   *  would rather than reimplementing the animation.
+   *
+   *  Returns true when it handled the click, so callers stop there instead of
+   *  also selecting or navigating the row. */
+  /** Fold state the USER chose, per note, so a re-render doesn't undo it.
+   *
+   *  Bodies are rebuilt from cached HTML, which carries the state the note was
+   *  AUTHORED in — so before this, expanding a preview and then getting any
+   *  re-render snapped it shut again. That was survivable while renders were
+   *  rare; at the 700ms storm cadence it closes under you while you read.
+   *
+   *  In-memory and per-view on purpose: this is "what I'm looking at right
+   *  now", not a document property, and writing it to the note would mean a
+   *  vault write per fold — which is itself a change event feeding the storm.
+   *  Capped so a long session over a big folder can't grow it without bound. */
+  private calloutFold = new Map<StashpadId, Map<string, boolean>>();
+  private static readonly CALLOUT_FOLD_MAX = 200;
+
+  /** Identify a callout within its body.
+   *
+   *  Position alone breaks when the note is edited above the callout, and the
+   *  title alone breaks when a note holds two previews of the same page — so
+   *  both, and a miss simply falls back to the authored state rather than
+   *  applying the wrong callout's fold. Safe failure is the point: the worst
+   *  case is today's behaviour. */
+  private calloutKey(callout: HTMLElement, idx: number): string {
+    const title = (callout.querySelector(":scope > .callout-title .callout-title-inner")
+      ?.textContent ?? "").trim().slice(0, 80);
+    return `${idx}:${title}`;
+  }
+
+  /** Drive one callout's collapsed state.
+   *
+   *  0.266.2: the class alone is not enough for a callout authored collapsed.
+   *  Obsidian's renderer writes an INLINE `display: none` onto the content of a
+   *  `[!info]-` callout, on top of `is-collapsed`, and an inline style outranks
+   *  any stylesheet — so toggling only the class removed `is-collapsed`,
+   *  rotated the chevron, and left the body hidden. A `[!info]+` callout
+   *  carries no inline style, which is why the 0.265.2 toggle tested clean:
+   *  previews had just moved to `+`, so the shape under test was the new one
+   *  while every note enriched at 0.264.0 was the old one.
+   *
+   *  Clearing the inline value (rather than setting `display: block`) leaves
+   *  the class plus the stylesheet as the single source of truth, so this can't
+   *  fight Obsidian's own rules or hardcode the wrong display type. */
+  private setCalloutCollapsed(callout: HTMLElement, collapsed: boolean): void {
+    callout.toggleClass("is-collapsed", collapsed);
+    const content = callout.querySelector(":scope > .callout-content") as HTMLElement | null;
+    if (!content) return;
+    if (collapsed) content.style.display = "none";
+    else content.style.removeProperty("display");
+  }
+
+  /** Re-apply remembered fold state after a body is (re-)hydrated. Runs beside
+   *  applySpoilers, which exists for the same reason: cached HTML restores
+   *  markup, not the state the user put it in. */
+  private applyCalloutFold(root: HTMLElement, id: StashpadId | null): void {
+    if (!id) return;
+    const saved = this.calloutFold.get(id);
+    if (!saved?.size) return;
+    const cals = Array.from(root.querySelectorAll<HTMLElement>(".callout"));
+    cals.forEach((cal, i) => {
+      const want = saved.get(this.calloutKey(cal, i));
+      if (want !== undefined) this.setCalloutCollapsed(cal, want);
+    });
+  }
+
+  private rememberCalloutFold(callout: HTMLElement, collapsed: boolean, id: StashpadId): void {
+    const body = callout.closest(
+      ".stashpad-note-text, .stashpad-focused-body, .stashpad-detail-body",
+    ) as HTMLElement | null;
+    if (!body || !id) return;
+    const idx = Array.from(body.querySelectorAll<HTMLElement>(".callout")).indexOf(callout);
+    if (idx < 0) return;
+    let saved = this.calloutFold.get(id);
+    if (!saved) {
+      if (this.calloutFold.size >= StashpadView.CALLOUT_FOLD_MAX) {
+        const oldest = this.calloutFold.keys().next().value;
+        if (oldest !== undefined) this.calloutFold.delete(oldest);
+      }
+      saved = new Map();
+      this.calloutFold.set(id, saved);
+    }
+    saved.set(this.calloutKey(callout, idx), collapsed);
+  }
+
+  private maybeToggleCallout(e: MouseEvent, ownerId: StashpadId): boolean {
+    const el = e.target as HTMLElement | null;
+    // 0.265.2: only the CHEVRON folds, not the whole title.
+    //
+    // Obsidian folds on a title click because nothing else competes for it. In
+    // a Stashpad row, double-click enters the note — so folding on the title
+    // meant a double-click folded, unfolded, and navigated, which reads as a
+    // flicker. `stopPropagation` on the click doesn't help: `dblclick` is a
+    // separate event and fires anyway.
+    //
+    // Restricting to the chevron removes the conflict outright rather than
+    // arbitrating it with a timer, which would have put a delay on every fold
+    // to serve the rarer gesture. The chevron's hit area is enlarged in CSS so
+    // it stays tappable on a phone.
+    const fold = el?.closest?.(".callout-fold") as HTMLElement | null;
+    if (!fold) return false;
+    const callout = fold.closest(".callout") as HTMLElement | null;
+    if (!callout || !callout.classList.contains("is-collapsible")) return false;
+    e.preventDefault();
+    e.stopPropagation();
+    const collapsed = !callout.classList.contains("is-collapsed");
+    this.setCalloutCollapsed(callout, collapsed);
+    // 0.266.4: remember it, so the next render doesn't undo it.
+    this.rememberCalloutFold(callout, collapsed, ownerId);
+    return true;
+  }
+
   private handleRenderedClick(e: MouseEvent, node: TreeNode): void {
+    if (this.maybeToggleCallout(e, node.id)) return;
     const targetEl = e.target as HTMLElement | null;
     // 0.246.0: same delegation for the non-row surfaces (focused header, mini
     // header) — they re-hydrate cached HTML too.
@@ -7086,6 +7470,9 @@ export class StashpadView extends ItemView {
     // attached — so it looked correct and did nothing. Delegating here is the
     // fix that survives the cache, and it has to run BEFORE the row handlers
     // or the same click also selects the row.
+    // 0.265.1: fold a callout instead of selecting the row. Must run before the
+    // row handlers for the same reason the copy button does.
+    if (!absorbed && this.maybeToggleCallout(e, node.id)) return;
     const copyBtn = (e.target as HTMLElement | null)?.closest?.(".copy-code-button") as HTMLElement | null;
     if (!absorbed && copyBtn) {
       e.preventDefault();
@@ -11976,6 +12363,26 @@ export class StashpadView extends ItemView {
     } catch (e) {
       console.warn("[Stashpad] background parent tab failed", e);
     }
+  }
+
+  /** 0.266.7: what a click on a breadcrumb crumb does.
+   *
+   *  Plain click navigates in place, as before. Mod+click opens the crumb in a
+   *  new Stashpad tab — the gesture every other link in Obsidian already uses,
+   *  so it needs no discovering. `Keymap.isModEvent` is Obsidian's own test, so
+   *  this follows the platform (Cmd on macOS, Ctrl elsewhere) and middle-click
+   *  rather than hardcoding a key.
+   *
+   *  Focus follows the user's preference by construction: openInNewStashpadTab
+   *  ends in settleNewTab, which hands focus back when "new tabs open in the
+   *  background" is on. */
+  private crumbActivate(e: MouseEvent, id: StashpadId): void {
+    if (Keymap.isModEvent(e)) {
+      e.preventDefault();
+      void this.openInNewStashpadTab(id);
+      return;
+    }
+    this.navigateTo(id);
   }
 
   private async openInNewStashpadTab(focusId: StashpadId): Promise<void> {

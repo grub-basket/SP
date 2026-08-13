@@ -123,18 +123,27 @@ export function extractUrls(body: string): string[] {
 
 /** Render one preview as an Obsidian callout.
  *
- *  Collapsed by default (`-`): a note with several links would otherwise be
- *  mostly preview. Every line is quote-prefixed, including blank ones, or the
- *  callout ends early and the rest of the description leaks into the note as
- *  ordinary text. */
-export function renderPreviewCallout(entry: PreviewEntry, opts: { calloutType?: string } = {}): string {
+ *  EXPANDED by default (`+`, which is foldable but starts open). 0.264.0
+ *  shipped `-` on the reasoning that a note with several links would otherwise
+ *  be mostly preview — but that hides the description, which is the entire
+ *  point of capturing it. Measured: `-` renders the content with
+ *  `is-collapsed` and `display: none`, so the text is there and invisible on
+ *  every platform. Collapsing is now opt-in.
+ *
+ *  Every line is quote-prefixed, including blank ones, or the callout ends
+ *  early and the rest of the description leaks into the note as ordinary
+ *  text. */
+export function renderPreviewCallout(
+  entry: PreviewEntry, opts: { calloutType?: string; collapsed?: boolean } = {},
+): string {
   const type = opts.calloutType || "info";
+  const fold = opts.collapsed ? "-" : "+";
   const m = entry.meta;
   const q = (s: string): string => s.split("\n").map((l) => `> ${l}`.trimEnd()).join("\n");
 
   if (!entry.ok || !m) {
     return [
-      `> [!${type}]- Link preview unavailable`,
+      `> [!${type}]${fold} Link preview unavailable`,
       `> ${previewMarker(entry.url)}`,
       `> ${entry.url}`,
       `> _${entry.reason ?? "could not be fetched"}_`,
@@ -143,7 +152,7 @@ export function renderPreviewCallout(entry: PreviewEntry, opts: { calloutType?: 
 
   const title = m.title || m.url;
   const lines: string[] = [
-    `> [!${type}]- ${title.replace(/\n/g, " ")}`,
+    `> [!${type}]${fold} ${title.replace(/\n/g, " ")}`,
     `> ${previewMarker(entry.url)}`,
     `> [${title.replace(/[[\]]/g, "")}](${m.canonicalUrl || m.url})`,
   ];
