@@ -7592,14 +7592,41 @@ button.stashpad-btn-loading::after {
 
 /* An obscured row: body blurred, chrome (timestamp, checkbox, menu) left
    readable so the row is still operable without revealing it. */
+/* 0.267.11 — blurred TEXT without a compositing layer.
+
+   `filter: blur()` promotes every element it touches to its own compositing
+   layer. Measured on an iPhone with 89 covered rows on screen: median frame
+   time was unchanged at 17ms, but p90 went 17ms -> 172ms and the worst frame
+   hit 862ms. That is the shape of jank — most frames fine, one in ten
+   catastrophic — and it is invisible in a median, which is why the same
+   measurement on a desktop showed 16.7ms either way and said "free".
+
+   Transparent text with a shadow blurs the glyphs during ordinary text
+   painting: no layer, no filter, nothing to composite. Images and other
+   non-text content still need the real thing, but there are few of those per
+   row, so the layer count stops scaling with the number of NOTES. */
 .stashpad-note.is-obscured .stashpad-note-body,
 .stashpad-note.is-obscured .stashpad-rail {
-  filter: blur(7px);
+  color: transparent;
+  /* An explicit colour, not currentColor — that is transparent here. */
+  text-shadow: 0 0 7px var(--text-normal);
   /* Blur alone leaves recognisable word SHAPES and colour; dropping contrast
      removes the residual silhouette that makes short text guessable. */
   opacity: 0.75;
+  -webkit-user-select: none;
   user-select: none;
-  transition: filter 120ms ease, opacity 120ms ease;
+  transition: opacity 120ms ease;
+}
+/* Anything that is not text still needs a real blur — bounded per row, rather
+   than one layer per note. */
+.stashpad-note.is-obscured .stashpad-note-body :is(img, svg, video, canvas, iframe, .internal-embed) {
+  filter: blur(10px);
+}
+/* Descendants inherit the transparent colour, but a rule of their own would
+   re-introduce a visible one — links and tags most of all. */
+.stashpad-note.is-obscured .stashpad-note-body :is(a, code, mark, strong, em, .tag, .cm-hashtag) {
+  color: transparent;
+  text-shadow: 0 0 7px var(--text-normal);
 }
 .stashpad-note.is-obscured { cursor: pointer; }
 .stashpad-note.is-obscured .stashpad-note-body::selection { background: transparent; }
@@ -7997,11 +8024,49 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
    revealing it. Without this a global or per-folder blur left the pinned
    heading — the largest text on screen — perfectly legible. */
 .stashpad-focused.is-obscured .stashpad-focused-body,
-.stashpad-focused.is-obscured .stashpad-heading-stuck-line {
-  filter: blur(7px);
+.stashpad-focused.is-obscured .stashpad-heading-stuck-line,
+.stashpad-focused.is-obscured .stashpad-focused-body :is(a, code, mark, strong, em, .tag) {
+  color: transparent;
+  text-shadow: 0 0 7px var(--text-normal);
   opacity: 0.75;
   -webkit-user-select: none;
   user-select: none;
-  transition: filter 120ms ease, opacity 120ms ease;
+  transition: opacity 120ms ease;
+}
+.stashpad-focused.is-obscured .stashpad-focused-body :is(img, svg, video, canvas, iframe, .internal-embed) {
+  filter: blur(10px);
 }
 .stashpad-focused.is-obscured { cursor: pointer; }
+
+/* 0.267.12 — solid-bar covering, the cheap option.
+
+   text-shadow blur avoids a compositing layer but still computes a gaussian
+   PER GLYPH every time the text paints. A bar skips the blur maths and, with
+   the text hidden rather than merely transparent, skips glyph rasterisation
+   too — leaving one filled rectangle per row.
+
+   `visibility: hidden` rather than `display: none` so the row keeps its exact
+   height: the list must not reflow when a note is covered or revealed.
+   Visibility is inherited, so the bar re-declares itself visible. */
+.stashpad-view.obscure-solid .stashpad-note.is-obscured .stashpad-note-body,
+.stashpad-view.obscure-solid .stashpad-focused.is-obscured .stashpad-focused-body {
+  visibility: hidden;
+  position: relative;
+  color: inherit;
+  text-shadow: none;
+  opacity: 1;
+}
+.stashpad-view.obscure-solid .stashpad-note.is-obscured .stashpad-note-body::after,
+.stashpad-view.obscure-solid .stashpad-focused.is-obscured .stashpad-focused-body::after {
+  content: "";
+  visibility: visible;
+  position: absolute;
+  inset: 0;
+  border-radius: 4px;
+  background: var(--background-modifier-border);
+}
+/* Images inside a covered row need no blur here — the bar is over them. */
+.stashpad-view.obscure-solid .stashpad-note.is-obscured .stashpad-note-body :is(img, svg, video, canvas, iframe, .internal-embed),
+.stashpad-view.obscure-solid .stashpad-focused.is-obscured .stashpad-focused-body :is(img, svg, video, canvas, iframe, .internal-embed) {
+  filter: none;
+}

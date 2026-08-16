@@ -106,7 +106,30 @@ export default class StashpadPlugin extends Plugin {
     if (data) { try { payload = " " + JSON.stringify(data); } catch { payload = " [unserializable]"; } }
     // performance.now() is monotonic and devtools-free — fine on mobile.
     const t = Math.round(performance.now());
-    this.debugBuffer.push(`+${t}ms ${category}${payload}`);
+    // 0.267.10: collapse an identical repeat into a count.
+    //
+    // With three Stashpad tabs open, one change event produced three IDENTICAL
+    // render:sched lines at the same millisecond — one per view — and they
+    // crowded the 300-line buffer with no information in them. Collapsing keeps
+    // the same history in fewer lines, which means more of the useful past
+    // survives AND less text to hand to the clipboard, which on iOS is a slow
+    // bridge call that scales with payload.
+    //
+    // Compared on category + payload only, deliberately: the timestamps differ
+    // by a millisecond or two and that is exactly the difference worth losing.
+    const line = `${category}${payload}`;
+    const prev = this.debugBuffer[this.debugBuffer.length - 1];
+    if (prev !== undefined) {
+      const bare = prev.replace(/^\+\d+ms /, "").replace(/ \(x\d+\)$/, "");
+      if (bare === line) {
+        const seen = /\(x(\d+)\)$/.exec(prev);
+        const n = seen ? Number(seen[1]) + 1 : 2;
+        this.debugBuffer[this.debugBuffer.length - 1] =
+          prev.replace(/ \(x\d+\)$/, "") + ` (x${n})`;
+        return;
+      }
+    }
+    this.debugBuffer.push(`+${t}ms ${line}`);
     if (this.debugBuffer.length > StashpadPlugin.DEBUG_BUFFER_MAX) {
       this.debugBuffer.splice(0, this.debugBuffer.length - StashpadPlugin.DEBUG_BUFFER_MAX);
     }
@@ -2564,20 +2587,60 @@ export default class StashpadPlugin extends Plugin {
     // over) a toggle bound to a hotkey can UNCOVER everything on a second
     // press, which is the one outcome that must not be one keystroke away.
     // "Cover" is therefore idempotent: pressing it again does nothing.
+    // 0.267.11: the diagnostics you actually reach for mid-repro, as commands.
+    //
+    // Copy and Clear existed only as buttons in Settings, four taps away — and
+    // the moment you want them is the moment you have just reproduced
+    // something, when leaving the view to go find them is when the state you
+    // captured gets buried under the renders that opening settings causes.
+    this.addCommand({
+      id: "stashpad-copy-debug-trace",
+      name: "Diagnostics: copy debug trace to clipboard",
+      callback: () => {
+        const text = this.getDebugTrace();
+        if (!text) { new Notice("Debug trace is empty — turn it on and reproduce the issue first."); return; }
+        navigator.clipboard.writeText(text).then(
+          () => new Notice(`Debug trace copied (${text.split("\n").length} lines).`),
+          () => new Notice("Couldn't access the clipboard."),
+        );
+      },
+    });
+    this.addCommand({
+      id: "stashpad-clear-debug-trace",
+      name: "Diagnostics: clear debug trace",
+      callback: () => { this.clearDebugTrace(); new Notice("Debug trace cleared."); },
+    });
+    this.addCommand({
+      id: "stashpad-toggle-debug-trace",
+      name: "Diagnostics: turn the debug trace on / off",
+      callback: () => {
+        this.settings.debugTrace = !this.settings.debugTrace;
+        this.stampDiagnostic("trace", this.settings.debugTrace);
+        void this.saveSettings();
+        new Notice(this.settings.debugTrace
+          ? "Debug trace ON — reproduce the issue, then copy the trace."
+          : "Debug trace OFF.");
+      },
+    });
+    this.addCommand({
+      id: "stashpad-measure-scroll",
+      name: "Diagnostics: measure scroll performance (writes to the debug trace)",
+      callback: () => call("cmdMeasureScrollPerf"),
+    });
     this.addCommand({
       id: "stashpad-obscure-everything",
-      name: "Cover (obscure) every note everywhere \u2014 visual only",
+      name: "Cover every note everywhere (global \u2014 visual only)",
       callback: () => {
         void this.setObscureAll(true);
-        new Notice("Stashpad: every note is covered. Tap a note to peek at it.", 5000);
+        new Notice("Stashpad: global cover ON \u2014 every note is covered. Tap one to peek at it.", 5000);
       },
     });
     this.addCommand({
       id: "stashpad-unobscure-everything",
-      name: "Uncover every note (turn off the global obscure)",
+      name: "Uncover every note everywhere (global \u2014 visual only)",
       callback: () => {
         void this.setObscureAll(false);
-        new Notice("Stashpad: global cover is off. Notes obscured individually stay hidden.", 5000);
+        new Notice("Stashpad: global cover OFF \u2014 notes covered individually stay covered.", 5000);
       },
     });
     this.addCommand({

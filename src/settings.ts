@@ -637,6 +637,14 @@ export interface StashpadSettings {
    *  Some people do want it vault-wide (cover everything, everywhere, then put
    *  all the devices down), hence the choice rather than a hardcoded answer. */
   obscureAllScope: "device" | "synced";
+  /** 0.267.12: how a covered note is drawn.
+   *
+   *  "blur" keeps the shape of the text, which reads as "something is here,
+   *  hidden". "solid" paints a bar over it — cheaper AND hides more, since a
+   *  blur still leaks word shapes and lengths, and short text is guessable
+   *  from those. Blur is the default only because it is what the feature has
+   *  always looked like. */
+  obscureStyle: "blur" | "solid";
   /** 0.237.0: render ||spoiler|| in note bodies as blurred-until-tapped. */
   spoilerMarkup: boolean;
   /** 0.238.0: bulk recolour from the colour-alias swatch applies to EVERY
@@ -866,6 +874,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureAll: false,
   obscureFolders: {},
   obscureAllScope: "device",
+  obscureStyle: "blur",
   spoilerMarkup: true,
   bulkRecolorAllFolders: false,
   autoNavOnMoveIn: false,
@@ -1914,6 +1923,19 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
     cats.listDisplay.push(toggle("Obscure every note, everywhere", "Blur every note in every Stashpad \u2014 for handing someone your screen, or working somewhere overlooked. This OVERRIDES everything else while it is on: a folder set to Never and a note set not to obscure are both covered. Nothing is rewritten, so they come back exactly as they were when you turn it off. Tapping a note still reveals it one at a time. VISUAL ONLY: the text is unchanged in the file and still turns up in search.",
       () => this.plugin.getObscureAll(), (v) => { void this.plugin.setObscureAll(v); }, ["obscure", "blur", "hide", "all", "global", "privacy", "panic"]));
+    cats.listDisplay.push(this.renderDef("How covered notes look", "\"Blur\" keeps the shape of the text. \"Solid bar\" paints over it — faster on a phone, because a blur has to be computed for every glyph every time the text is drawn, and it hides more, since a blur still leaks word shapes and lengths. Either way the text is untouched in the file.", (st) => {
+      st.addDropdown((d) => {
+        d.addOption("blur", "Blur");
+        d.addOption("solid", "Solid bar (faster)");
+        d.setValue(this.plugin.settings.obscureStyle === "solid" ? "solid" : "blur");
+        d.onChange(async (v) => {
+          this.plugin.settings.obscureStyle = v === "solid" ? "solid" : "blur";
+          await this.plugin.saveSettings();
+          this.plugin.reHideAndRefreshAllViews();
+        });
+      });
+    }, ["obscure", "blur", "solid", "redact", "style", "performance"]));
+
     cats.listDisplay.push(this.renderDef("Where the global cover applies", "\"This device only\" keeps the switch on the screen you flipped it on \u2014 covering your phone leaves a desktop nobody is standing near untouched, and uncovering there later cannot uncover your phone. \"All devices\" syncs it with the rest of your settings, for when you want everything covered everywhere at once.", (st) => {
       st.addDropdown((d) => {
         d.addOption("device", "This device only");

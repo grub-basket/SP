@@ -12,6 +12,11 @@ const ctx = await esbuild.context({
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   minify: prod,
+  // 0.267.9: keep function names even when minified. The debug trace records
+  // WHICH code asked for a render, and in a minified build that came back as
+  // "i < Us" — present, useless. A trace whose one diagnostic field is
+  // unreadable costs a whole round trip with the user to discover that.
+  keepNames: true,
   outfile: "main.js",
 });
 

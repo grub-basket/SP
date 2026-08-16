@@ -246,6 +246,11 @@ export class StashpadView extends ItemView {
    *  edit re-renders through the file-modify path anyway, so nothing is lost by
    *  never warming the same path twice. */
   private warmedCrumbs = new Set<string>();
+  /** 0.267.9: a render was skipped because this view was not on screen. Flushed
+   *  the moment it becomes visible, so a deferred render is never a lost one. */
+  private pendingVisibleRender = false;
+  /** When the last render:sched stack was captured — see the rate limit. */
+  private lastSchedStackAt = 0;
   private renderTimer: number | null = null;
   /** 0.216.1: until this timestamp, debounced renders use a LONGER trailing
    *  delay so the burst of self-inflicted events after our own note creation
@@ -577,7 +582,21 @@ export class StashpadView extends ItemView {
       // events keep arriving, and the stack says which source is producing
       // them. Cheap (a string split, only while the debugger is on) and it
       // turns the next dump into a name instead of another hypothesis.
+      // 0.267.10: capturing a stack is EXPENSIVE, and this runs on every render
+      // schedule. With tracing on that made the whole app perceptibly slower —
+      // reported as "hitting copy on the debug log takes a few seconds, it used
+      // to be instant". The copy was never slow; everything was, because the
+      // debugger was paying for a stack unwind on every scheduled render, and
+      // keepNames made each unwind produce more string to build.
+      //
+      // Rate-limited to one capture per RATE window. The caller is only news
+      // when it CHANGES, so a sample is worth as much as every occurrence and
+      // costs a fraction — while a burst still gets its first frame captured,
+      // which is the one that says what started it.
       if (this.plugin.settings.debugTrace) {
+        const nowMs = Date.now();
+        const wantStack = nowMs - this.lastSchedStackAt > 250;
+        if (wantStack) this.lastSchedStackAt = nowMs;
         // 0.266.9: the caller capture came back EMPTY on iOS, which cost a whole
         // trace. `slice(2, 5)` assumed V8's format, where the stack starts with
         // an "Error" line and frames read `at fn (file)`. WebKit has no header
@@ -587,7 +606,7 @@ export class StashpadView extends ItemView {
         // Parse instead of assume: drop a leading "Error", accept BOTH frame
         // shapes, and drop this scheduler's own frames so the first name shown
         // is the actual caller.
-        const frames = (new Error().stack ?? "").split("\n")
+        const frames = !wantStack ? [] : (new Error().stack ?? "").split("\n")
           .map((l) => l.trim())
           .filter((l) => l && !/^Error\b/.test(l))
           .map((l) => l.replace(/^at\s+/, "").replace(/\s*\(.*$/, "").replace(/@.*$/, "").trim())
@@ -599,7 +618,7 @@ export class StashpadView extends ItemView {
           // scheduling the next one and the list can never settle — which is
           // exactly the shape an 80ms metronome with unchanging state has.
           inRender: StashpadView.renderDepth > 0 ? 1 : 0,
-          by: frames.slice(0, 4).join(" < ").slice(0, 160) || "(no stack)",
+          by: !wantStack ? "(sampled out)" : (frames.slice(0, 4).join(" < ").slice(0, 160) || "(no stack)"),
         });
       }
       const delay = storm
@@ -1049,7 +1068,33 @@ export class StashpadView extends ItemView {
   private treeReconcileTimer: number | null = null;
   /** True while a bulk op (long split paste, rebootstrap) is writing, so
    *  metadata-driven re-renders are dropped to avoid per-note flicker. */
+  /** Obsidian calls this when the view is laid out, which includes becoming
+   *  visible — the moment a render deferred by renderSuppressed must happen. */
+  onResize(): void {
+    if (!this.pendingVisibleRender) return;
+    if (!this.listEl || this.listEl.clientHeight === 0) return;   // still hidden
+    this.pendingVisibleRender = false;
+    this.render();
+  }
+
   private renderSuppressed(): boolean {
+    // 0.267.9: a view nobody can see does not need to render NOW.
+    //
+    // A phone trace showed one child-note creation rendering THREE views: the
+    // visible one, plus background tabs holding 339 and 713 rows, each
+    // reporting a list height of 0 because they are not on screen. Rebuilding
+    // 700 offscreen rows competes with the visible list for the main thread at
+    // exactly the moment it is trying to settle — which is the stutter.
+    //
+    // Deferred rather than dropped: the view is marked dirty and renders when
+    // it becomes visible, so switching to that tab shows current data. Checked
+    // via the container rather than a workspace API because what matters is
+    // literally whether it has been laid out.
+    if (this.listEl && this.containerEl.isConnected && this.listEl.clientHeight === 0
+        && this.leaf.view === this && !this.pendingVisibleRender) {
+      this.pendingVisibleRender = true;
+      return true;
+    }
     return this.bulkRenderDepth > 0
       || this.bulkSettleTimer != null
       || this.autoSyncDeferActive
@@ -3087,6 +3132,9 @@ export class StashpadView extends ItemView {
     // sticky toggle + expand button instead.
     root.toggleClass("is-tiny", this.tinyMode);
     root.toggleClass("is-compact", this.compactMode);
+    // 0.267.12: how covered notes are drawn — one class on the root so the
+    // choice costs a class toggle rather than per-row work.
+    root.toggleClass("obscure-solid", getSettings().obscureStyle === "solid");
     // 0.63.6 perf: also toggle classes on the leaf wrapper and the
     // workspace-tabs ancestor. Earlier code used CSS `:has()` to reach
     // these elements from the view-root's class, but `:has()` triggers
@@ -7297,7 +7345,38 @@ export class StashpadView extends ItemView {
         if (remote) this.composerInputEl?.focus();
       }
     };
-    sendBtn.onclick = () => void submit();
+    // 0.267.10: on mobile, act on touchend rather than waiting for the click.
+    //
+    // 0.216.0 gave Send the same `mousedown -> preventDefault` guard its
+    // siblings have, to stop the tap blurring the textarea and dismissing the
+    // keyboard before submit ran. That fixed the keyboard but made the tap
+    // itself unreliable: on iOS the mouse events are SYNTHESISED after the
+    // touch sequence, and preventDefault on a synthesised mousedown can
+    // suppress the click that was meant to follow. A button that works most of
+    // the time is worse than one that never did, because you stop watching it.
+    //
+    // Handling touchend removes the dependency on that synthesised click
+    // entirely. preventDefault there stops the mouse emulation altogether, so
+    // the keyboard still cannot be dismissed by the tap — and the guard below
+    // means a double fire is impossible even if some platform still delivers
+    // both.
+    let lastSubmitAt = 0;
+    const fireSubmit = (): void => {
+      const now = Date.now();
+      if (now - lastSubmitAt < 600) return;
+      lastSubmitAt = now;
+      void submit();
+    };
+    sendBtn.onclick = () => fireSubmit();
+    if (Platform.isMobile) {
+      sendBtn.addEventListener("touchend", (e) => {
+        // Only a real tap on the button — a drag that happens to end here is
+        // not a press, and multi-touch is not either.
+        if (e.changedTouches.length !== 1) return;
+        e.preventDefault();
+        fireSubmit();
+      });
+    }
 
     ta.addEventListener("keydown", (e) => {
       const submitsOnEnter = this.modeEnterSubmits;
@@ -13745,6 +13824,64 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** 0.267.9: measure real scroll frame times in THIS view, on THIS device.
+   *
+   *  Desktop showed the blur costing nothing — 16.7ms either way with 126
+   *  covered rows — but a phone has far less compositing memory and GPU fill
+   *  rate, and `filter: blur()` spends both. That question cannot be answered
+   *  from a laptop, and "does it feel smooth?" is not an answer either.
+   *
+   *  So: an identical, programmatic sweep that anyone can run twice — once
+   *  covered, once not — producing numbers that can be compared. Frame DELTAS
+   *  during a real scroll, because that captures paint and compositing, which
+   *  is where a blur actually costs; a synchronous layout loop would miss it.
+   *
+   *  Reports the row and blurred counts alongside, since a comparison between
+   *  two runs showing different amounts on screen would be meaningless. */
+  async cmdMeasureScrollPerf(): Promise<void> {
+    const list = this.listEl;
+    if (!list) { new Notice("Open a Stashpad list first."); return; }
+    const maxTop = list.scrollHeight - list.clientHeight;
+    if (maxTop < 40) {
+      new Notice("This list is too short to scroll — open a folder with more notes and try again.", 6000);
+      return;
+    }
+    new Notice("Measuring… don't touch the screen for a few seconds.", 4000);
+    const startTop = list.scrollTop;
+    const times: number[] = [];
+    await new Promise<void>((done) => {
+      let last = performance.now(), n = 0, dir = 1;
+      const step = (): void => {
+        const now = performance.now();
+        times.push(now - last);
+        last = now;
+        list.scrollTop += dir * 60;
+        if (list.scrollTop <= 0 || list.scrollTop >= maxTop - 1) dir *= -1;
+        if (++n < 90) window.requestAnimationFrame(step);
+        else done();
+      };
+      window.requestAnimationFrame(step);
+    });
+    list.scrollTop = startTop;
+    // Drop the first frame: it carries the cost of starting, not of scrolling.
+    const f = times.slice(1).sort((a, b) => a - b);
+    const at = (q: number): number => Math.round(f[Math.min(f.length - 1, Math.floor(f.length * q))] * 10) / 10;
+    const covered = this.containerEl.querySelectorAll(".is-obscured").length;
+    const rows = this.containerEl.querySelectorAll(".stashpad-note").length;
+    const result = {
+      coverOn: this.plugin.getObscureAll() ? 1 : 0,
+      rows, covered,
+      median: at(0.5), p90: at(0.9), worst: Math.round(f[f.length - 1] * 10) / 10,
+      frames: f.length,
+    };
+    this.plugin.trace("perf:scroll", result);
+    new Notice(
+      `Scroll: median ${result.median}ms · p90 ${result.p90}ms · worst ${result.worst}ms\n`
+      + `${rows} rows, ${covered} covered, cover ${result.coverOn ? "ON" : "OFF"}`,
+      12000,
+    );
+  }
+
   /** Drop every "I peeked at this" reveal in THIS view. Called when the obscure
    *  settings change, so a switch turned on covers notes revealed before it. */
   clearObscureReveals(): void { this.revealedObscured.clear(); }
@@ -15181,7 +15318,27 @@ export class StashpadView extends ItemView {
             await this.bodyRenderer.primeRender(f as TFile, body);
             // Batched splits defer the render to a single pass at the end
             // (see createNotesBatch) so a long paste doesn't repaint per note.
-            if (!opts.deferRender) this.render();
+            if (!opts.deferRender) {
+              this.render();
+              // 0.267.14: that render already shows the finished row, so every
+              // render the create sets in motion after it is redundant — and
+              // visible, as 3-4 brief flickers.
+              //
+              // 0.216.1 stretched the debounce to 400ms for two seconds, but a
+              // trailing debounce does not COALESCE a trickle: the create
+              // event, the metadata resolve, and the fmSync parentLink write
+              // ~100ms out each arrive after the previous one has already
+              // fired, so each got its own repaint. Suppressing outright and
+              // rendering ONCE when it settles is what the 400ms window was
+              // reaching for.
+              //
+              // Suppression only affects DEBOUNCED renders. Direct render()
+              // calls still paint, so typing a second note during the window
+              // still shows its row instantly — which is the whole point of
+              // the synthetic insert above and must not regress.
+              this.beginBulkRender();
+              this.endBulkRender(1200);
+            }
             this.fmSync.scheduleParentChange(id, null, parentId);
           } else {
             // 0.76.15: remote send — the note belongs to another
