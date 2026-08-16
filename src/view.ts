@@ -70,7 +70,7 @@ import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMet
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
+import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -241,6 +241,11 @@ export class StashpadView extends ItemView {
    *  permanent storm — see scheduleRender. Holding the timestamps means "storm"
    *  is a RATE that is recomputed from scratch each time, so it cannot latch. */
   private renderBurstTimes: number[] = [];
+  /** Crumb paths already warmed by warmCrumbTitles — see the loop it prevents.
+   *  Bounded by the number of distinct notes visited as breadcrumbs, and a real
+   *  edit re-renders through the file-modify path anyway, so nothing is lost by
+   *  never warming the same path twice. */
+  private warmedCrumbs = new Set<string>();
   private renderTimer: number | null = null;
   /** 0.216.1: until this timestamp, debounced renders use a LONGER trailing
    *  delay so the burst of self-inflicted events after our own note creation
@@ -573,11 +578,28 @@ export class StashpadView extends ItemView {
       // them. Cheap (a string split, only while the debugger is on) and it
       // turns the next dump into a name instead of another hypothesis.
       if (this.plugin.settings.debugTrace) {
+        // 0.266.9: the caller capture came back EMPTY on iOS, which cost a whole
+        // trace. `slice(2, 5)` assumed V8's format, where the stack starts with
+        // an "Error" line and frames read `at fn (file)`. WebKit has no header
+        // line and frames read `fn@file`, so slicing off two lines threw away
+        // real frames and the normaliser matched nothing.
+        //
+        // Parse instead of assume: drop a leading "Error", accept BOTH frame
+        // shapes, and drop this scheduler's own frames so the first name shown
+        // is the actual caller.
+        const frames = (new Error().stack ?? "").split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l && !/^Error\b/.test(l))
+          .map((l) => l.replace(/^at\s+/, "").replace(/\s*\(.*$/, "").replace(/@.*$/, "").trim())
+          .filter((l) => l && !/scheduleRender|debouncedRender/.test(l));
         this.plugin.trace("render:sched", {
           burst: this.renderBurstTimes.length,
           storm: storm ? 1 : 0,
-          by: (new Error().stack ?? "").split("\n").slice(2, 5)
-            .map((l) => l.trim().replace(/^at\s+/, "").replace(/\s*\(.*$/, "")).join(" < ").slice(0, 140),
+          // Is a render ON THE STACK right now? If this is ever 1, a render is
+          // scheduling the next one and the list can never settle — which is
+          // exactly the shape an 80ms metronome with unchanging state has.
+          inRender: StashpadView.renderDepth > 0 ? 1 : 0,
+          by: frames.slice(0, 4).join(" < ").slice(0, 160) || "(no stack)",
         });
       }
       const delay = storm
@@ -5912,12 +5934,28 @@ export class StashpadView extends ItemView {
   private warmCrumbTitles(nodes: TreeNode[]): void {
     const cold = nodes.filter((n) => {
       if (!n.file) return false;
+      // 0.266.9: warm each crumb AT MOST ONCE per view.
+      //
+      // This runs from renderBreadcrumb, i.e. on every render, and it ends by
+      // calling debouncedRender — so it is a render scheduling another render.
+      // That is safe only while "is it cold?" reliably flips to false after a
+      // warm. If anything keeps an entry cold — an eviction, a store that never
+      // took the write, a path that doesn't round-trip — the answer never
+      // changes and the two feed each other forever at the debounce interval.
+      //
+      // A phone trace showed exactly that: renders every ~83ms (the 80ms
+      // debounce plus work) with identical geometry, indefinitely, while
+      // focused deep enough to have crumbs. Rather than trust the cache to
+      // settle, remember what has been warmed here; then a second warm is
+      // impossible by construction and the loop cannot form regardless of cause.
+      if (this.warmedCrumbs.has(n.file.path)) return false;
       if (this.app.metadataCache.getFileCache(n.file)?.headings?.[0]?.heading) return false;
       // Cold = no cache ENTRY at all. A cached-but-empty body (text === "")
       // legitimately falls back to the filename, so don't re-warm it every paint.
       return !this.plugin.renderCacheStore.get(n.file.path);
     });
     if (!cold.length) return;
+    for (const n of cold) if (n.file) this.warmedCrumbs.add(n.file.path);
     void Promise.all(cold.map((n) => this.bodyRenderer.getOrComputeRender(n.file!).catch(() => null)))
       .then((results) => {
         // Only repaint if at least one warm produced usable text (avoids a
@@ -12299,6 +12337,36 @@ export class StashpadView extends ItemView {
       return f;
     }
 
+    // 0.266.9: the loop above asks the METADATA CACHE for each file's id, and
+    // the cache has not parsed a file that was written moments ago — so right
+    // after a folder is created it reports "no home note" for a home note that
+    // is already on disk. That is how a brand-new Stashpad ended up with two
+    // notes carrying id __root__.
+    //
+    // The path is knowable without the cache, so check it directly. This also
+    // keeps `vault.create` below from throwing "file already exists" now that
+    // createNewStashpad writes this very filename.
+    const existing = this.app.vault.getAbstractFileByPath(desiredPath);
+    if (existing instanceof TFile) return existing;
+
+    // Same cold-cache window, but for a home note written under an OLDER name
+    // (a bare `Home.md`, which is what createNewStashpad produced before
+    // 0.266.9). The loop above would adopt and rename it once the cache warms;
+    // in the meantime it is invisible, and creating alongside it is what makes
+    // the duplicate. Read the frontmatter off disk to settle it.
+    //
+    // Bounded deliberately: only files the cache has NO frontmatter for, and
+    // only ones named like a home note — so this is a couple of reads on a cold
+    // folder, not a scan of every note.
+    for (const f of files) {
+      if (this.app.metadataCache.getFileCache(f)?.frontmatter) continue;
+      if (!/^home\b/i.test(f.basename)) continue;
+      try {
+        const head = (await this.app.vault.cachedRead(f)).slice(0, 400);
+        if (new RegExp(`^id:\\s*["']?${ROOT_ID}["']?\\s*$`, "m").test(head)) return f;
+      } catch { /* unreadable — fall through and create */ }
+    }
+
     // No home note exists yet — create at the canonical path.
     const created = new Date().toISOString();
     const body = [
@@ -12314,12 +12382,7 @@ export class StashpadView extends ItemView {
    *  Sanitises to alnum + dash + underscore so the filename is safe on
    *  every filesystem. */
   private buildHomeFilename(folder: string): string {
-    const lastSeg = folder.split("/").filter(Boolean).pop() ?? "Stashpad";
-    const slug = lastSeg
-      .replace(/[^A-Za-z0-9_-]+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-+|-+$/g, "");
-    return `Home-${slug || "Stashpad"}.md`;
+    return buildHomeFilename(folder);
   }
   private async migrateNullParents(): Promise<void> {
     const folder = this.noteFolder;

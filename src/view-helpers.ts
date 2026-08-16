@@ -217,3 +217,23 @@ export function rankTags<T extends { raw: string; label: string; count: number }
     .sort((a, b) => b.s - a.s || b.t.count - a.t.count || a.t.label.localeCompare(b.t.label))
     .map((x) => x.t);
 }
+
+/** The canonical home-note filename for a Stashpad folder.
+ *
+ *  Folder-tagged rather than a bare `Home.md` so several Stashpads don't all
+ *  produce identically-named files in Obsidian's quick switcher. Sanitised to
+ *  alnum + dash + underscore so it is safe on every filesystem.
+ *
+ *  0.266.9: shared, because it was private to the view while `createNewStashpad`
+ *  independently wrote `Home.md`. Two different paths for the same note meant a
+ *  brand-new folder ended up with TWO notes carrying `id: __root__` — the
+ *  duplicate every new user's ID check reported. One definition, one filename.
+ */
+export function buildHomeFilename(folder: string): string {
+  const lastSeg = folder.split("/").filter(Boolean).pop() ?? "Stashpad";
+  const slug = lastSeg
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `Home-${slug || "Stashpad"}.md`;
+}

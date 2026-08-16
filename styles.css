@@ -7922,3 +7922,29 @@ button.stashpad-btn-loading::after {
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
 }
+
+/* 0.266.11 — text selection inside Stashpad's own text controls.
+
+   On mobile, dragging to highlight text in the composer opened the app's
+   sidebar instead of selecting anything. Obsidian's own editor does not do
+   this, and the reason is measurable: Obsidian's mobile CSS sets
+   `user-select: none` app-wide — that is what lets an edge drag be a sidebar
+   gesture — and CodeMirror explicitly re-enables `user-select: text` on
+   `.cm-content`. Measured: `.cm-content` computes `text`, our composer
+   textarea computed `none`, inherited from an ancestor rather than set by any
+   rule of ours.
+
+   A control that cannot select text turns a selection drag into an unclaimed
+   horizontal swipe, which the gesture handler then takes. Restoring selection
+   on our text controls is both the fix and the correct value — a textarea the
+   user cannot select from is wrong on every platform.
+
+   Scoped to text controls inside Stashpad surfaces. `styles.css` is loaded
+   globally, so a bare `textarea` rule would reach into core and other plugins. */
+[class*="stashpad-"] textarea,
+[class*="stashpad-"] input:not([type="checkbox"]):not([type="radio"]),
+textarea[class*="stashpad-"],
+input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
+  -webkit-user-select: text;
+  user-select: text;
+}

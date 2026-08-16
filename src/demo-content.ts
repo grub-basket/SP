@@ -15,6 +15,7 @@ import { normalizePath, type App } from "obsidian";
 import type StashpadPlugin from "./main";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { ROOT_ID } from "./types";
+import { buildHomeFilename } from "./view-helpers";
 
 interface DemoNote {
   /** Symbolic key, local to this file — mapped to a minted id at seed time. */
@@ -135,12 +136,15 @@ export async function seedDemoContent(app: App, plugin: StashpadPlugin, folder: 
   // Home note. Uses the folder's own leaf name as the title so the demo reads
   // as "the user's stash", not a hardcoded "My Stash".
   const leaf = dir.split("/").pop() || dir;
-  // Match view.ts's buildHomeFilename exactly (`Home-<folder slug>.md`). Getting
-  // this wrong isn't fatal — ensureHomeNote finds the id=__root__ note whatever
-  // it's called and renames it — but that means the user's brand-new demo folder
-  // renames a file the first time they open it, for no reason.
-  const homeSlug = leaf.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
-  const homePath = `${dir}/Home-${homeSlug || "Stashpad"}.md`;
+  // 0.266.10: the SHARED buildHomeFilename, not a local copy of its rules.
+  //
+  // This comment used to say "match view.ts's buildHomeFilename exactly" and
+  // then restate the logic — which is the setup that produced the duplicate
+  // home note. createNewStashpad had its own third version, drifted to a bare
+  // `Home.md`, and the view then created a second root note because it was
+  // looking for a different filename. A comment asking the reader to keep two
+  // copies in step is a bug waiting for its moment; one function cannot drift.
+  const homePath = `${dir}/${buildHomeFilename(dir)}`;
   if (await adapter.exists(homePath)) {
     skipped++;
   } else {

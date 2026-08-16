@@ -54,7 +54,7 @@ import { RenderCacheStore } from "./render-cache-store";
 import { SettingsStore, MOVED_KEYS } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
 import { APP_IMPORT_VIEW_TYPE, AppImportView, type AppImporterViewContext } from "./stashpad-app-import-modal";
-import { settleNewTab } from "./view-helpers";
+import { settleNewTab, buildHomeFilename } from "./view-helpers";
 
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
  *  the next load knows to un-ghost the deferred Stashpad tabs. */
@@ -116,7 +116,28 @@ export default class StashpadPlugin extends Plugin {
    *  round trip when the user wasn't sure whether they were on .1 or .2. */
   getDebugTrace(): string {
     if (!this.debugBuffer.length) return "";
-    const head = `# Stashpad ${this.manifest?.version ?? "?"} · ${Platform.isMobileApp ? (Platform.isIosApp ? "iOS" : "Android") : "desktop"}${Platform.isPhone ? " phone" : ""} · Obsidian ${(this.app as unknown as { appId?: string; version?: string }).version ?? "?"}`;
+    const os = Platform.isMobileApp ? (Platform.isIosApp ? "iOS" : "Android") : "desktop";
+    // Obsidian's version is NOT on the app object — `app.version` is undefined,
+    // which is why every trace collected so far said "Obsidian ?". The user
+    // agent carries it (`obsidian/1.12.7`), so read it from there.
+    const obsidian = (navigator.userAgent.match(/obsidian\/([0-9][0-9.]*)/i) ?? [])[1] ?? "?";
+    // Device name, when there is a real one to give. Obsidian Sync's device
+    // name is the user's OWN label ("Work laptop", "iPhone"), which is the only
+    // string here that distinguishes two devices of the same kind — a user
+    // agent cannot, since every iPhone reports "iPhone". Absent Sync there is
+    // no device name to be had, so the field is simply omitted rather than
+    // padded with something that looks like an answer.
+    const sync = (this.app as unknown as {
+      internalPlugins?: { plugins?: Record<string, { instance?: { deviceName?: unknown } }> };
+    }).internalPlugins?.plugins?.sync?.instance;
+    const device = typeof sync?.deviceName === "string" ? sync.deviceName.trim() : "";
+    const bits = [
+      `# Stashpad ${this.manifest?.version ?? "?"}`,
+      device || os,
+      device ? `${os}${Platform.isPhone ? " phone" : ""}` : (Platform.isPhone ? "phone" : ""),
+      `Obsidian ${obsidian}`,
+    ].filter(Boolean);
+    const head = bits.join(" · ");
     return [head, ...this.debugBuffer].join("\n");
   }
   clearDebugTrace(): void { this.debugBuffer = []; }
@@ -416,7 +437,13 @@ export default class StashpadPlugin extends Plugin {
     }
     // Seed Home note. Use the same shape createNoteUnder/the home note
     // bootstrap uses so the rest of the plugin recognizes it.
-    const homePath = `${cleaned}/Home.md`;
+    // 0.266.9: the CANONICAL home filename, the same one the view's
+    // ensureHomeNote looks for. This used to write a bare `Home.md`, which the
+    // view then failed to recognise as the home note it wanted — the metadata
+    // cache has not parsed a just-written file, so its id lookup found nothing
+    // and it created a SECOND note with id __root__. Writing the right name is
+    // what stops the duplicate at its source.
+    const homePath = `${cleaned}/${buildHomeFilename(cleaned)}`;
     if (await adapter.exists(homePath)) {
       // A Home already exists — make sure its frontmatter is shaped right
       // so the discovery passes. We don't overwrite an existing body.
