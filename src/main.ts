@@ -2549,6 +2549,34 @@ export default class StashpadPlugin extends Plugin {
         void this.addLinkPreviews(targets, { force: true });
       },
     });
+    // 0.267.6: a panic switch needs to be reachable in one action, not four
+    // taps into settings — that is the whole point of it.
+    //
+    // TWO commands rather than one toggle, deliberately. Under the
+    // circumstances this exists for (someone walked up, you handed your phone
+    // over) a toggle bound to a hotkey can UNCOVER everything on a second
+    // press, which is the one outcome that must not be one keystroke away.
+    // "Cover" is therefore idempotent: pressing it again does nothing.
+    this.addCommand({
+      id: "stashpad-obscure-everything",
+      name: "Cover (obscure) every note everywhere \u2014 visual only",
+      callback: () => {
+        this.settings.obscureAll = true;
+        void this.saveSettings();
+        this.reHideAndRefreshAllViews();
+        new Notice("Stashpad: every note is covered. Tap a note to peek at it.", 5000);
+      },
+    });
+    this.addCommand({
+      id: "stashpad-unobscure-everything",
+      name: "Uncover every note (turn off the global obscure)",
+      callback: () => {
+        this.settings.obscureAll = false;
+        void this.saveSettings();
+        this.reHideAndRefreshAllViews();
+        new Notice("Stashpad: global cover is off. Notes obscured individually stay hidden.", 5000);
+      },
+    });
     this.addCommand({
       id: "stashpad-create-folder-shortcuts",
       name: "Create quick-switcher shortcuts for every Stashpad folder",
@@ -4577,6 +4605,26 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** 0.267.6: re-render every view AND drop the "I already peeked at this"
+   *  state first.
+   *
+   *  `revealedObscured` is per-view and in-memory — deliberately, since
+   *  revealing is a viewing state rather than a property of the note. But
+   *  nothing cleared it when the obscure SETTINGS changed, so flipping the
+   *  global switch off and on left every note revealed before the flip still
+   *  showing. Reported as "it is not covering up the five notes at the bottom
+   *  that I revealed before".
+   *
+   *  Turning the switch on is an explicit "hide everything, now". Honouring a
+   *  stale peek defeats exactly the moment the switch exists for. */
+  reHideAndRefreshAllViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const v = leaf.view as any;
+      v?.clearObscureReveals?.();
+      if (typeof v?.render === "function") v.render();
+    }
+  }
+
   /** Repaint open folder panels — e.g. after a settings change flips a folder's
    *  archive flag, so its icon updates without waiting for a vault event. */
   refreshFolderPanels(): void {
@@ -4592,6 +4640,26 @@ export default class StashpadPlugin extends Plugin {
     const key = (folder || "").replace(/\/+$/, "");
     const v = this.settings.folderIcons?.[key];
     return v && v.trim() ? v.trim() : undefined;
+  }
+
+  /** 0.267.0: does this folder obscure its notes by default?
+   *
+   *  THREE-VALUED, like the per-note flag and for the same reason. `true` and
+   *  `false` are both explicit answers that beat the global switch; removing
+   *  the key means "no opinion", which follows it. Storing `false` as absence
+   *  would make "don't obscure this folder" silently stop working the moment
+   *  the global switch went on — which is exactly when someone would be
+   *  relying on it.
+   *
+   *  Pass null to clear. */
+  async setFolderObscured(folder: string, on: boolean | null): Promise<void> {
+    const key = (folder || "").replace(/\/+$/, "");
+    if (!key) return;
+    this.settings.obscureFolders = { ...(this.settings.obscureFolders ?? {}) };
+    if (on === null) delete this.settings.obscureFolders[key];
+    else this.settings.obscureFolders[key] = on;
+    await this.saveSettings();
+    this.reHideAndRefreshAllViews();
   }
 
   /** 0.118.0: persist a folder's icon (empty/undefined clears it), then refresh

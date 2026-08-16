@@ -828,6 +828,9 @@ export class StashpadView extends ItemView {
       this.completedState.set(file.path, !!fm?.completed);
       // 0.85.1: resync the task-ness override too, now that the cache is fresh.
       this.taskTaggedState.set(file.path, this.taggedFromFm(fm));
+      // 0.267.1: the cache is now authoritative for this file, so drop our
+      // override rather than letting it shadow a change made elsewhere.
+      this.obscuredState.delete(file.path);
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       for (const map of [this.completedState, this.taskTaggedState]) {
@@ -5668,6 +5671,29 @@ export class StashpadView extends ItemView {
     // 0.258.0: as a row, it carries the same cursor/selected state classes the
     // note rows use, so one stylesheet drives both and the cursor is visible
     // wherever it sits. `is-heading-row` is what pins it (sticky, top: 0).
+    // 0.267.0: the focused header obscures too.
+    //
+    // is-obscured was only ever applied to list ROWS. With per-note obscuring
+    // that was a small gap — you had deliberately drilled into the note. With a
+    // global or per-folder default it is a hole: the pinned heading is the
+    // largest text on screen, and leaving it readable while everything under it
+    // blurs defeats the entire point of the switch.
+    if (this.isObscured(node) && !this.revealedObscured.has(node.id)) {
+      wrap.addClass("is-obscured");
+      // Same contract as a row: the first tap reveals and does nothing else,
+      // so you can look without also acting.
+      wrap.addEventListener("click", (e) => {
+        const t = e.target as HTMLElement | null;
+        if (t?.closest("button, a, input, .stashpad-note-check")) return;
+        if (this.revealedObscured.has(node.id)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.revealedObscured.add(node.id);
+        wrap.removeClass("is-obscured");
+        const hb = wrap.querySelector<HTMLElement>(".stashpad-obscure-badge");
+        if (hb) this.paintObscureBadge(hb, node);
+      }, true);
+    }
     if (opts.asRow) {
       wrap.addClass("is-heading-row");
       if (this.cursorOnHeading) wrap.addClass("is-cursor");
@@ -5689,6 +5715,9 @@ export class StashpadView extends ItemView {
     // body's left edge column-aligns with each list row's body.
     const meta = wrap.createDiv({ cls: "stashpad-focused-meta" });
     const metaTop = meta.createDiv({ cls: "stashpad-focused-meta-top" });
+    // 0.267.2: the drilled-in note needs the control too — otherwise the one
+    // note you are actually looking at is the only one without it.
+    if (this.isObscured(node)) this.addObscureBadge(metaTop, node);
     metaTop.createSpan({ cls: "stashpad-focused-time stashpad-note-time", text: this.formatTime(node.created) });
     metaTop.createDiv({ cls: "stashpad-focused-grip-spacer" });
     // 0.201.4: when the FOCUSED note is a task, show its completion checkbox in
@@ -6079,6 +6108,16 @@ export class StashpadView extends ItemView {
     // relocated it. Top-left is where a checklist checkbox belongs.
     const mobileTask = (this.isTask(node) || this.compactMode) && Platform.isMobile;
     if (mobileTask) this.addTaskCheckbox(metaTop, node);
+    // 0.267.2: the "hidden" marker is a BUTTON, not decoration.
+    //
+    // It used to be a CSS ::after on this row, which cannot be tapped — so the
+    // only per-note control was a right-click menu, and on a phone that is a
+    // long-press away from something you can already see. The badge is exactly
+    // where the eye lands when a note is blurred, so it should be the control.
+    //
+    // Shown whenever the note is obscured, INCLUDING while revealed, so the way
+    // back is always visible — a revealed note that offered no way to re-hide
+    // was the original complaint.
     metaTop.createSpan({ cls: "stashpad-note-time", text: this.formatTime(node.created) });
     // Drag handle / color swatch: a single element that shows a colored
     // square at rest (when this note has a custom color) and swaps to the
@@ -6092,6 +6131,10 @@ export class StashpadView extends ItemView {
     grip.draggable = draggable;
     if (!draggable) grip.title = color ? "Right-click to change color · drag disabled in this view mode" : "Drag disabled in this view mode";
     if (color) grip.style.setProperty("--stashpad-note-color", color);
+    // 0.267.6: the hide/reveal chip sits AFTER the timestamp and the grip, so
+    // the meta column keeps reading time-first and the chip does not displace
+    // the two things whose position people navigate by.
+    if (this.isObscured(node)) this.addObscureBadge(metaTop, node);
     // 0.87.1: the children-count arrow + (on mobile) the task checkbox share one
     // horizontal line below the timestamp — the mobile checkbox sits just to the
     // LEFT of the arrow (see the desktop addTaskCheckbox call above).
@@ -6676,6 +6719,35 @@ export class StashpadView extends ItemView {
       cls: "stashpad-composer-input",
       attr: { rows: "2", placeholder: this.composerPlaceholder(enterSubmits, splitMode) },
     });
+
+    // 0.267.1 (CONFIRMED on device): keep a selection drag inside the composer
+    // from reaching Obsidian's sidebar gesture.
+    //
+    // Dragging to highlight text opened the left/right sidebar instead. The
+    // first attempt restored `user-select: text`, on the theory that a control
+    // which cannot select text leaves the drag unclaimed — measured and true,
+    // but it did NOT fix the gesture, which means the handler never consults
+    // selection at all.
+    //
+    // So this aims a layer lower: if Obsidian listens on the document during
+    // the bubble phase, stopping propagation at the textarea keeps the drag
+    // from ever reaching it. `stopPropagation` only, never `preventDefault` —
+    // the browser must keep its own native scrolling and selection behaviour,
+    // and this only hides the event from listeners further up.
+    //
+    // That this works proves the handler is bubble-phase and bound above this
+    // element — the earlier user-select attempt failed because the handler
+    // never consults selection at all.
+    //
+    // Trade-off, accepted knowingly: these events become invisible to anything
+    // upstream over the composer, Obsidian's own gestures included. That IS the
+    // point, but it is indiscriminate — which is why it is scoped to this one
+    // control and not to a container.
+    if (Platform.isMobile) {
+      for (const evt of ["touchstart", "touchmove"]) {
+        ta.addEventListener(evt, (e) => { e.stopPropagation(); }, { passive: true });
+      }
+    }
     ta.value = this.composerDraft;
 
     // 0.179.0: full-screen button (top-right of the composer) — opens the current
@@ -7551,6 +7623,8 @@ export class StashpadView extends ItemView {
         const rowEl = (e.currentTarget as HTMLElement | null)
           ?? this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${node.id}"]`) ?? null;
         rowEl?.removeClass("is-obscured");
+        const badgeEl = rowEl?.querySelector<HTMLElement>(".stashpad-obscure-badge");
+        if (badgeEl) this.paintObscureBadge(badgeEl, node);
         return;
       }
     }
@@ -13060,6 +13134,18 @@ export class StashpadView extends ItemView {
    *  self-corrects on the parse-triggered re-render, and the "changed"
    *  listener still fills the map for create-render stability. */
   private completedState = new Map<string, boolean>();
+  /** 0.267.1: obscured OVERRIDE per path — the same device as completedState
+   *  and taskTaggedState, for the same reason.
+   *
+   *  cmdToggleObscured wrote frontmatter and then re-rendered, while isObscured
+   *  read the value straight back out of the metadataCache. The cache has not
+   *  reparsed by then, so the render showed the OLD value: obscuring one note
+   *  looked like it did nothing, and obscuring five blurred only the ones whose
+   *  reparse happened to land first. Exactly the "top two of five" report.
+   *
+   *  Three-valued like the flag itself: true / false / "absent". Cleared by the
+   *  metadataCache "changed" listener once the real value catches up. */
+  private obscuredState = new Map<string, boolean | "absent">();
   /** 0.85.1: task-TAG OVERRIDE per path — the exact analogue of
    *  `completedState`, for the SAME reason. The task TOGGLE read tag-ness
    *  (`isTaskTagged`) straight from the live metadataCache, both to DECIDE the
@@ -13532,10 +13618,165 @@ export class StashpadView extends ItemView {
     }
   }
 
-  /** 0.237.0: is this note marked to render blurred? */
+  /** 0.237.0: is this note marked to render blurred?
+   *
+   *  0.267.0: three sources can now say so — the note, its folder, and a global
+   *  switch — so the PRECEDENCE is written down rather than left to whichever
+   *  check happens to run first:
+   *
+   *    1. an explicit per-note value wins, in both directions;
+   *    2. otherwise the folder default;
+   *    3. otherwise the global switch.
+   *
+   *  "In both directions" is what makes this usable. `obscured: false` is now
+   *  meaningful rather than merely absent: it is how one note opts OUT of a
+   *  folder that is obscured by default, which is the first thing anyone wants
+   *  after turning a folder on. Absent still means "no opinion", so existing
+   *  notes are unaffected and the flag is only written when the user acts. */
+  /** What this folder would do absent any per-note value — folder default,
+   *  else the global switch. Used when writing the flag: turning a note OFF
+   *  inside an obscured-by-default folder has to write an explicit `false`,
+   *  because deleting the key would just fall back to the default and the note
+   *  would stay blurred, which reads as the command doing nothing. */
+  private defaultObscured(): boolean {
+    const s = getSettings();
+    const perFolder = s.obscureFolders?.[this.noteFolder.replace(/\/+$/, "")];
+    if (typeof perFolder === "boolean") return perFolder;
+    // Not the global switch: when that is on, cmdToggleObscured returns early,
+    // so this is only ever consulted while the folder default is what matters.
+    return false;
+  }
+
+  /** The tappable "hidden" badge — it toggles whether the note is SHOWN, and
+   *  never whether it is obscured.
+   *
+   *  0.267.4: it used to un-obscure a hidden note, which meant the control
+   *  could delete itself: the badge only exists on an obscured note, so one tap
+   *  removed the flag and the badge vanished with no way back from the row.
+   *  Reported as "after two toggles the badge disappears completely".
+   *
+   *  So the badge is now purely a peek switch, which is also what makes it
+   *  worth having on a phone: tapping the note BODY reveals too, but the body
+   *  is also the double-tap-to-enter target, and a small dedicated control is
+   *  not. Changing whether a note is obscured writes to the file, so it stays
+   *  a deliberate act in the menu, where all three states are spelled out. */
+  private addObscureBadge(host: HTMLElement, node: TreeNode): void {
+    const btn = host.createEl("button", { cls: "stashpad-obscure-badge" });
+    this.paintObscureBadge(btn, node);
+    // 0.267.5: the badge owns its pointer events outright, the same way the
+    // task checkbox and the expand toggle already do.
+    //
+    // Stopping `click` alone is not enough: `dblclick` is a SEPARATE event and
+    // fires regardless, so two quick taps on the badge still drilled into the
+    // note. Same trap as the callout fold in 0.265.2 — worth stating plainly,
+    // since stopping a click feels like it should cover the double.
+    //
+    // `mousedown` goes too, because that is what starts row selection: without
+    // it, tapping the badge selects the row underneath as a side effect.
+    btn.addEventListener("mousedown", (e) => e.stopPropagation());
+    btn.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
+    btn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.toggleObscureForNode(node);
+    };
+  }
+
+  /** What the badge SAYS, in one place.
+   *
+   *  0.267.2: revealing a row deliberately does not re-render — it strips the
+   *  class off the element in place, which is what keeps a peek cheap. So the
+   *  badge has to be repainted by hand there, or it keeps saying "hidden" on a
+   *  note that is plainly visible. Same failure as the context-menu label
+   *  offering "Reveal" on an already-revealed note: both read a two-valued
+   *  answer out of a three-valued state. */
+  private paintObscureBadge(btn: HTMLElement, node: TreeNode): void {
+    const revealed = this.revealedObscured.has(node.id);
+    btn.toggleClass("is-revealed", revealed);
+    btn.textContent = revealed ? "revealed" : "hidden";
+    btn.setAttribute("aria-label", revealed ? "Hide this note again" : "Stop obscuring this note");
+    btn.title = revealed ? "Hide again (visual only)" : "Stop obscuring this note (visual only)";
+  }
+
+  /** Badge action for ONE note, independent of the current selection — the
+   *  badge is attached to a specific row, so it must never act on whatever
+   *  happens to be selected elsewhere. */
+  /** What the MENU item does — which is not what the badge does.
+   *
+   *  The badge is a peek switch and deliberately never writes. The menu is
+   *  where the note's actual state is changed, so it covers all three cases:
+   *  a revealed note is hidden again (no write), and otherwise the obscured
+   *  flag is flipped. Keeping these separate is what stops the badge from
+   *  being able to remove itself. */
+  private async menuObscureAction(node: TreeNode): Promise<void> {
+    if (this.isObscured(node) && this.revealedObscured.has(node.id)) {
+      this.toggleObscureForNode(node);   // hide again; viewing state only
+      return;
+    }
+    const prevSel = new Set(this.selection);
+    const prevCursorOnHeading = this.cursorOnHeading;
+    this.selection.clear();
+    this.selection.add(node.id);
+    try { await this.cmdToggleObscured(); }
+    finally {
+      this.selection.clear();
+      for (const id of prevSel) this.selection.add(id);
+      this.cursorOnHeading = prevCursorOnHeading;
+      this.render();
+    }
+  }
+
+  private toggleObscureForNode(node: TreeNode): void {
+    if (this.revealedObscured.has(node.id)) this.revealedObscured.delete(node.id);
+    else this.revealedObscured.add(node.id);
+    // Repaint the affected row in place rather than re-rendering the list: this
+    // is a viewing state, it changes one element, and a full render here would
+    // move the list under a finger that just tapped a small target.
+    const rowEl = this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${node.id}"]`) ?? null;
+    const headEl = this.containerEl.querySelector<HTMLElement>(`.stashpad-focused[data-heading-id="${node.id}"]`)
+      ?? (this.headingNode()?.id === node.id
+        ? this.containerEl.querySelector<HTMLElement>(".stashpad-focused")
+        : null);
+    for (const el of [rowEl, headEl]) {
+      if (!el) continue;
+      el.toggleClass("is-obscured", !this.revealedObscured.has(node.id));
+      const badge = el.querySelector<HTMLElement>(".stashpad-obscure-badge");
+      if (badge) this.paintObscureBadge(badge, node);
+    }
+  }
+
+  /** Drop every "I peeked at this" reveal in THIS view. Called when the obscure
+   *  settings change, so a switch turned on covers notes revealed before it. */
+  clearObscureReveals(): void { this.revealedObscured.clear(); }
+
   isObscured(node: TreeNode): boolean {
     if (!node.file) return false;
-    return this.app.metadataCache.getFileCache(node.file)?.frontmatter?.obscured === true;
+    const s = getSettings();
+    // 0.267.7: the global switch is an OVERRIDE, checked FIRST — not a
+    // fallback checked last.
+    //
+    // It used to sit at the bottom of the chain, so any note carrying an
+    // explicit `obscured: false` stayed readable through it. Measured: with the
+    // switch on, four of five rows covered and the opted-out one did not. That
+    // is the switch failing at the only job it has. "Cover everything" has to
+    // mean everything, or it cannot be trusted in the moment it exists for —
+    // and that moment does not allow for auditing which notes opted out.
+    //
+    // The cost is real and accepted: while the global switch is on, a folder
+    // set to "Never" and a note set to "don't obscure" are both overruled.
+    // Both come back exactly as they were the moment it goes off, because
+    // neither is modified — the switch outranks them rather than rewriting
+    // them.
+    if (s.obscureAll === true) return true;
+    const pending = this.obscuredState.get(node.file.path);
+    const own = pending !== undefined
+      ? (pending === "absent" ? undefined : pending)
+      : this.app.metadataCache.getFileCache(node.file)?.frontmatter?.obscured;
+    if (own === true || own === false) return own;
+    const folder = this.noteFolder.replace(/\/+$/, "");
+    const perFolder = s.obscureFolders?.[folder];
+    if (typeof perFolder === "boolean") return perFolder;
+    return false;
   }
 
   /** Toggle the obscured flag on the selection.
@@ -13553,6 +13794,31 @@ export class StashpadView extends ItemView {
       if (focused?.file) targets = [focused];
     }
     if (targets.length === 0) { new Notice("Nothing to obscure."); return; }
+
+    // 0.267.7: with the global cover on, nothing per-note can change what you
+    // SEE — the switch overrides every note. Writing the flag anyway would look
+    // like the command silently failed, so say what is actually going on rather
+    // than editing files to no visible effect.
+    if (getSettings().obscureAll) {
+      new Notice("Everything is covered by the global switch — turn it off to change notes individually.", 6000);
+      return;
+    }
+
+    // 0.267.0: RE-HIDE first. If a target is obscured and currently revealed,
+    // this control's obvious job is to put it back — not to strip the flag and
+    // unhide it permanently, which is what it used to do and is very hard to
+    // notice you have done.
+    //
+    // It is also the cheap path: re-hiding is a viewing state, so it touches no
+    // file, needs no undo entry, and cannot fail. Only when nothing is revealed
+    // does this fall through to actually changing the notes.
+    const revealed = targets.filter((t) => this.isObscured(t) && this.revealedObscured.has(t.id));
+    if (revealed.length > 0) {
+      for (const t of revealed) this.revealedObscured.delete(t.id);
+      this.render();
+      return;
+    }
+
     const makeObscured = targets.some((t) => !this.isObscured(t));
     const prior: { id: StashpadId; path: string; was: unknown }[] = [];
     for (const t of targets) {
@@ -13560,10 +13826,16 @@ export class StashpadView extends ItemView {
       const fmNow = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
       prior.push({ id: t.id, path: t.file.path, was: fmNow?.obscured });
       this.markFmSelfWrite(t.file.path); // body unchanged
+      const willBe: boolean | "absent" =
+        makeObscured ? true : (this.defaultObscured() ? false : "absent");
       await this.app.fileManager.processFrontMatter(t.file, (m: any) => {
-        if (makeObscured) m.obscured = true;
+        if (willBe === true) m.obscured = true;
+        else if (willBe === false) m.obscured = false;  // explicit opt-out
         else delete m.obscured;
       });
+      // Write through BEFORE the render, so what is drawn matches what was
+      // just written rather than whatever the cache still believes.
+      this.obscuredState.set(t.file.path, willBe);
       // Revealing is a viewing state; turning obscuring ON must clear it, or
       // the note stays visible until you navigate away.
       if (makeObscured) this.revealedObscured.delete(t.id);
@@ -13575,9 +13847,15 @@ export class StashpadView extends ItemView {
         if (!(f instanceof TFile)) continue;
         this.markFmSelfWrite(f.path);
         await this.app.fileManager.processFrontMatter(f, (m: any) => {
+          // `was` is now three-valued (true / false / absent) since an explicit
+          // false is meaningful — restoring it as "absent" would silently
+          // re-obscure a note the user had opted out.
           if (r.was === true) m.obscured = true;
+          else if (r.was === false) m.obscured = false;
           else delete m.obscured;
         });
+        this.obscuredState.set(f.path,
+          r.was === true ? true : r.was === false ? false : "absent");
       }
       this.tree.rebuild(this.noteFolder);
       this.render();
@@ -15842,6 +16120,27 @@ export class StashpadView extends ItemView {
     // list: you asked to move the parent and a child moved. Every other item in
     // this menu already normalises (directly, via focusClicked, or via taskAct);
     // this one was the only hole.
+    // 0.267.1: obscure/reveal on the ROW menu, not only the lightning menu.
+    //
+    // Without it there was no per-note control at all once a global or folder
+    // default was on: a note carrying an explicit "don't obscure" had no
+    // visible way back, and the state was invisible too. The title states the
+    // CURRENT state rather than a bare "toggle", so the menu answers "is this
+    // one hidden?" without having to try it.
+    // 0.267.2: THREE states, not two. `isObscured` stays true for a note that
+    // is merely revealed — revealing is a viewing state, not a change to the
+    // note — so asking it alone offered "Reveal" on something already revealed.
+    //
+    // Routed through the same per-node action the badge uses, so the label and
+    // the behaviour cannot drift apart.
+    const obscured = this.isObscured(node);
+    const shown = obscured && this.revealedObscured.has(node.id);
+    menu.addItem((it: any) => it
+      .setTitle(shown ? "Hide this note again"
+        : obscured ? "Stop obscuring this note"
+        : "Obscure this note (visual only)")
+      .setIcon(shown || !obscured ? "eye-off" : "eye")
+      .onClick(() => { focusClicked(); void this.menuObscureAction(node); }));
     menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => { focusClicked(); this.cmdMovePicker(); }));
     menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => {
       await this.changeParent(node, ROOT_ID);

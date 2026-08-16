@@ -7603,16 +7603,57 @@ button.stashpad-btn-loading::after {
 }
 .stashpad-note.is-obscured { cursor: pointer; }
 .stashpad-note.is-obscured .stashpad-note-body::selection { background: transparent; }
-/* A small persistent marker, so an obscured note is identifiable as
-   deliberately hidden rather than as a rendering glitch. */
-.stashpad-note.is-obscured .stashpad-note-meta-top::after {
-  content: "hidden";
+/* 0.267.2 — the marker is a real BUTTON now, not a ::after.
+
+   It still reads as a small quiet chip, but it is the per-note control: tap it
+   to re-hide a revealed note, or to stop obscuring a hidden one. A pseudo-
+   element could not be tapped, which left the right-click menu as the only
+   per-note affordance — a long-press away, on a phone, from something already
+   on screen.
+
+   Sized for a finger: the visible chip stays small while the tap target is
+   padded out to a usable height, with the extra pulled back out of layout so
+   the meta row does not grow. */
+.stashpad-obscure-badge {
   font-size: var(--font-ui-smaller);
+  line-height: 1.4;
   color: var(--text-faint);
+  background: transparent;
   border: 1px solid var(--background-modifier-border);
   border-radius: 3px;
   padding: 0 4px;
+  /* 0.267.6: the chip now FOLLOWS the timestamp and grip, so its spacing moved
+     to the left side. */
   margin-left: 4px;
+  cursor: pointer;
+  box-shadow: none;
+  height: auto;
+  min-height: 0;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.stashpad-obscure-badge:hover {
+  color: var(--text-normal);
+  border-color: var(--background-modifier-border-hover);
+}
+/* Revealed: the badge is the way back, so it stops being faint and says so. */
+.stashpad-obscure-badge.is-revealed {
+  color: var(--text-muted);
+  border-style: dashed;
+}
+/* The badge must stay readable on a row whose body is blurred — it is chrome,
+   like the timestamp and the menu, not content. */
+.stashpad-note.is-obscured .stashpad-obscure-badge,
+.stashpad-focused.is-obscured .stashpad-obscure-badge {
+  filter: none;
+  opacity: 1;
+  -webkit-user-select: auto;
+  user-select: auto;
+}
+.is-mobile .stashpad-obscure-badge {
+  padding: 4px 6px;
+  margin-top: -4px;
+  margin-bottom: -4px;
 }
 
 /* Inline ||spoiler||. */
@@ -7948,3 +7989,19 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   -webkit-user-select: text;
   user-select: text;
 }
+
+/* 0.267.0 — the focused header obscures like a row does.
+
+   Same treatment as `.stashpad-note.is-obscured`: blur the body, leave the
+   chrome (timestamp, actions) readable so the header stays operable without
+   revealing it. Without this a global or per-folder blur left the pinned
+   heading — the largest text on screen — perfectly legible. */
+.stashpad-focused.is-obscured .stashpad-focused-body,
+.stashpad-focused.is-obscured .stashpad-heading-stuck-line {
+  filter: blur(7px);
+  opacity: 0.75;
+  -webkit-user-select: none;
+  user-select: none;
+  transition: filter 120ms ease, opacity 120ms ease;
+}
+.stashpad-focused.is-obscured { cursor: pointer; }

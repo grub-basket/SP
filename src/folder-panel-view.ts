@@ -890,6 +890,23 @@ export class StashpadFolderPanelView extends ItemView {
       .onClick(() => void this.setFolderState(folder, state === "downranked" ? "normal" : "downranked")));
     menu.addItem((i) => i.setTitle("Hide from list").setIcon("eye-off")
       .onClick(() => void this.setFolderState(folder, "hidden")));
+    // 0.267.0: per-folder obscure default. Lives here rather than in settings
+    // because it is a property OF THIS FOLDER, and this menu is where the
+    // folder's other properties (placement, icon, encryption) already are —
+    // a settings page listing every folder would be a second place to look.
+    const obs = this.plugin.settings.obscureFolders?.[folder.replace(/\/+$/, "")];
+    menu.addItem((i) => i
+      .setTitle(obs === true ? "Don't obscure notes by default" : "Obscure notes by default")
+      .setIcon(obs === true ? "eye" : "eye-off")
+      .onClick(() => void this.plugin.setFolderObscured(folder, obs !== true)));
+    // Only offered once the folder HAS an opinion, since that is the only time
+    // clearing it does anything. Without this there is no way back to
+    // "follow the global switch" — an explicit no would silently outrank it
+    // forever, which is a trap rather than a preference.
+    if (typeof obs === "boolean") {
+      menu.addItem((i) => i.setTitle("Obscuring: follow the global setting").setIcon("rotate-ccw")
+        .onClick(() => void this.plugin.setFolderObscured(folder, null)));
+    }
     menu.addSeparator();
     menu.addItem((i) => i.setTitle("Rename…").setIcon("pencil")
       .onClick(() => this.renameFolder(folder)));

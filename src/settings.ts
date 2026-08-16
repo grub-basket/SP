@@ -614,6 +614,17 @@ export interface StashpadSettings {
    *  On = Signal-like (reveal is momentary). Off = revealing sticks for the
    *  session. */
   obscureReHides: boolean;
+  /** 0.267.0: obscure EVERY note, in every folder, regardless of the per-note
+   *  flag. A panic switch rather than a preference — for handing someone your
+   *  screen, or working somewhere overlooked. Individual notes can still be
+   *  revealed by tapping; the setting governs the resting state. */
+  obscureAll: boolean;
+  /** 0.267.0: folders whose notes are obscured by default, keyed by cleaned
+   *  folder path. A per-folder answer, because "hide my journal" and "hide
+   *  nothing in my work notes" are both reasonable at once. An explicit
+   *  per-note `obscured` value still wins — see isObscured for the precedence
+   *  and why it is written down. */
+  obscureFolders: Record<string, boolean>;
   /** 0.237.0: render ||spoiler|| in note bodies as blurred-until-tapped. */
   spoilerMarkup: boolean;
   /** 0.238.0: bulk recolour from the colour-alias swatch applies to EVERY
@@ -840,6 +851,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   mediaViewerExcludedExtensions: "",
   mediaViewerAllFileTypes: false,
   obscureReHides: true,
+  obscureAll: false,
+  obscureFolders: {},
   spoilerMarkup: true,
   bulkRecolorAllFolders: false,
   autoNavOnMoveIn: false,
@@ -1401,6 +1414,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   private pfeRerender: (() => void) | null = null;
   /** 0.118.6: selected folder for the (searchable) per-folder icon control in
    *  Folders & Storage. */
+  private obscurePickFolder: string | null = null;
   private iconPickFolder: string | null = null;
 
   private renderPerFolderEncryption(host: HTMLElement): void {
@@ -1701,6 +1715,38 @@ export class StashpadSettingTab extends PluginSettingTab {
       paint(this.plugin.getFolderIcon(this.iconPickFolder) ?? "");
     }, ["icon", "folder", "tab", "lucide", "emoji", "switcher"]));
 
+    // 0.267.1: per-folder obscure default, mirrored here from the folder
+    // panel's right-click menu. The menu is where you reach for it while
+    // working; settings is where you go to see them ALL at once, which the
+    // menu cannot show — you would have to right-click every folder to learn
+    // which ones are set.
+    cats.listDisplay.push(this.renderDef("Obscure notes by default, per folder", "Choose whether a folder's notes start blurred, when the vault-wide switch above is OFF. \"Follow global\" means no opinion; \"Always\" and \"Never\" are explicit answers for this folder, and a note with its own setting overrides its folder. While the vault-wide switch is ON it covers everything regardless. VISUAL ONLY.", (st) => {
+      const folders = this.plugin.discoverStashpadFolders();
+      if (folders.length === 0) { st.setDesc("No Stashpad folders found yet."); return; }
+      if (!this.obscurePickFolder || !folders.includes(this.obscurePickFolder)) this.obscurePickFolder = folders[0];
+      let modeDrop: import("obsidian").DropdownComponent | null = null;
+      const modeFor = (f: string): string => {
+        const v = this.plugin.settings.obscureFolders?.[f.replace(/\/+$/, "")];
+        return v === true ? "always" : v === false ? "never" : "global";
+      };
+      st.addDropdown((d) => {
+        for (const f of folders) d.addOption(f, f.split("/").pop() || f);
+        d.setValue(this.obscurePickFolder!);
+        d.onChange((v) => { this.obscurePickFolder = v; modeDrop?.setValue(modeFor(v)); });
+      });
+      st.addDropdown((d) => {
+        modeDrop = d;
+        d.addOption("global", "Follow global");
+        d.addOption("always", "Always obscure");
+        d.addOption("never", "Never obscure");
+        d.setValue(modeFor(this.obscurePickFolder!));
+        d.onChange(async (v) => {
+          await this.plugin.setFolderObscured(this.obscurePickFolder!,
+            v === "always" ? true : v === "never" ? false : null);
+        });
+      });
+    }, ["obscure", "blur", "hide", "folder", "default", "privacy"]));
+
     cats.importExport.push(this.renderDef("Dedicated import subfolder (optional)", "Optional. A subfolder (relative to each Stashpad folder) where dropped .stash files auto-import. Leave blank to just drop files into the Stashpad folder itself (recommended). Suggested name: _imports.", (s) =>
       s.addText((t) => t.setValue(this.plugin.settings.importDropFolder).setPlaceholder("_imports (leave blank to use the folder root)").onChange(async (v) => {
         this.plugin.settings.importDropFolder = (v || "").trim().replace(/^\/+|\/+$/g, "");
@@ -1853,6 +1899,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
     cats.listDisplay.push(toggle("Re-hide obscured notes when you leave", "An obscured note goes back to blurred when you navigate away, switch folders, or reload — revealing it is momentary, like Signal. Off keeps it revealed until you re-hide it or restart. On by default. Note: obscuring is VISUAL ONLY; see the description on the obscure command.",
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
+    cats.listDisplay.push(toggle("Obscure every note, everywhere", "Blur every note in every Stashpad \u2014 for handing someone your screen, or working somewhere overlooked. This OVERRIDES everything else while it is on: a folder set to Never and a note set not to obscure are both covered. Nothing is rewritten, so they come back exactly as they were when you turn it off. Tapping a note still reveals it one at a time. VISUAL ONLY: the text is unchanged in the file and still turns up in search.",
+      () => this.plugin.settings.obscureAll, (v) => { this.plugin.settings.obscureAll = v; this.plugin.reHideAndRefreshAllViews(); }, ["obscure", "blur", "hide", "all", "global", "privacy", "panic"]));
     cats.listDisplay.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
       () => this.plugin.settings.spoilerMarkup, (v) => { this.plugin.settings.spoilerMarkup = v; }, ["spoiler", "blur", "hide", "markup", "reveal"]));
     cats.listDisplay.push(toggle("Open every file type in the media viewer", "Open the preview even for files it can't display \u2014 a .docx or a .zip shows a card with its type, size and date, plus a button to open it properly. Off by default, because for those files the real app is usually the better answer. Either way, a file it can't display still opens the viewer when another attachment on the same note can be previewed, so you never lose the row of files.",
