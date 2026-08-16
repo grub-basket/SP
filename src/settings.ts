@@ -625,6 +625,18 @@ export interface StashpadSettings {
    *  per-note `obscured` value still wins — see isObscured for the precedence
    *  and why it is written down. */
   obscureFolders: Record<string, boolean>;
+  /** 0.267.8: does the global cover travel between devices, or stay on the one
+   *  you flipped it on?
+   *
+   *  "device" by default. The switch is about the SCREEN in front of you —
+   *  someone is looking over your shoulder, or you are handing your phone
+   *  across — and that is not a fact about the vault. Synced, covering your
+   *  phone would also cover a desktop nobody is standing near, and worse,
+   *  uncovering on that desktop later would uncover the phone.
+   *
+   *  Some people do want it vault-wide (cover everything, everywhere, then put
+   *  all the devices down), hence the choice rather than a hardcoded answer. */
+  obscureAllScope: "device" | "synced";
   /** 0.237.0: render ||spoiler|| in note bodies as blurred-until-tapped. */
   spoilerMarkup: boolean;
   /** 0.238.0: bulk recolour from the colour-alias swatch applies to EVERY
@@ -853,6 +865,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureReHides: true,
   obscureAll: false,
   obscureFolders: {},
+  obscureAllScope: "device",
   spoilerMarkup: true,
   bulkRecolorAllFolders: false,
   autoNavOnMoveIn: false,
@@ -1900,7 +1913,22 @@ export class StashpadSettingTab extends PluginSettingTab {
     cats.listDisplay.push(toggle("Re-hide obscured notes when you leave", "An obscured note goes back to blurred when you navigate away, switch folders, or reload — revealing it is momentary, like Signal. Off keeps it revealed until you re-hide it or restart. On by default. Note: obscuring is VISUAL ONLY; see the description on the obscure command.",
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
     cats.listDisplay.push(toggle("Obscure every note, everywhere", "Blur every note in every Stashpad \u2014 for handing someone your screen, or working somewhere overlooked. This OVERRIDES everything else while it is on: a folder set to Never and a note set not to obscure are both covered. Nothing is rewritten, so they come back exactly as they were when you turn it off. Tapping a note still reveals it one at a time. VISUAL ONLY: the text is unchanged in the file and still turns up in search.",
-      () => this.plugin.settings.obscureAll, (v) => { this.plugin.settings.obscureAll = v; this.plugin.reHideAndRefreshAllViews(); }, ["obscure", "blur", "hide", "all", "global", "privacy", "panic"]));
+      () => this.plugin.getObscureAll(), (v) => { void this.plugin.setObscureAll(v); }, ["obscure", "blur", "hide", "all", "global", "privacy", "panic"]));
+    cats.listDisplay.push(this.renderDef("Where the global cover applies", "\"This device only\" keeps the switch on the screen you flipped it on \u2014 covering your phone leaves a desktop nobody is standing near untouched, and uncovering there later cannot uncover your phone. \"All devices\" syncs it with the rest of your settings, for when you want everything covered everywhere at once.", (st) => {
+      st.addDropdown((d) => {
+        d.addOption("device", "This device only");
+        d.addOption("synced", "All devices (syncs)");
+        d.setValue(this.plugin.settings.obscureAllScope === "synced" ? "synced" : "device");
+        d.onChange(async (v) => {
+          // Carry the CURRENT state across the change, so switching scope can
+          // never uncover something that was covered a moment ago.
+          const wasOn = this.plugin.getObscureAll();
+          this.plugin.settings.obscureAllScope = v === "synced" ? "synced" : "device";
+          await this.plugin.saveSettings();
+          await this.plugin.setObscureAll(wasOn);
+        });
+      });
+    }, ["obscure", "blur", "sync", "device", "local", "scope", "privacy"]));
     cats.listDisplay.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
       () => this.plugin.settings.spoilerMarkup, (v) => { this.plugin.settings.spoilerMarkup = v; }, ["spoiler", "blur", "hide", "markup", "reveal"]));
     cats.listDisplay.push(toggle("Open every file type in the media viewer", "Open the preview even for files it can't display \u2014 a .docx or a .zip shows a card with its type, size and date, plus a button to open it properly. Off by default, because for those files the real app is usually the better answer. Either way, a file it can't display still opens the viewer when another attachment on the same note can be previewed, so you never lose the row of files.",

@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, setIcon, debounce, type App } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId } from "./id-service";
 import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
@@ -55,6 +55,7 @@ import { SettingsStore, MOVED_KEYS } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
 import { APP_IMPORT_VIEW_TYPE, AppImportView, type AppImporterViewContext } from "./stashpad-app-import-modal";
 import { settleNewTab, buildHomeFilename } from "./view-helpers";
+import { resolveObscureAll } from "./obscure-scope";
 
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
  *  the next load knows to un-ghost the deferred Stashpad tabs. */
@@ -118,9 +119,15 @@ export default class StashpadPlugin extends Plugin {
     if (!this.debugBuffer.length) return "";
     const os = Platform.isMobileApp ? (Platform.isIosApp ? "iOS" : "Android") : "desktop";
     // Obsidian's version is NOT on the app object — `app.version` is undefined,
-    // which is why every trace collected so far said "Obsidian ?". The user
-    // agent carries it (`obsidian/1.12.7`), so read it from there.
-    const obsidian = (navigator.userAgent.match(/obsidian\/([0-9][0-9.]*)/i) ?? [])[1] ?? "?";
+    // which is why every trace collected before 0.266.9 said "Obsidian ?".
+    //
+    // 0.267.8: `apiVersion`, the API's own export. 0.266.9 read it out of the
+    // user agent instead, which FAILED COMMUNITY-STORE REVIEW under
+    // obsidianmd/platform ("avoid using the navigator API to detect the
+    // operating system"). The rule is right beyond the review: a UA string is
+    // a parse of something not promised to hold that shape, while apiVersion
+    // is the documented answer and cannot drift.
+    const obsidian = apiVersion || "?";
     // Device name, when there is a real one to give. Obsidian Sync's device
     // name is the user's OWN label ("Work laptop", "iPhone"), which is the only
     // string here that distinguishes two devices of the same kind — a user
@@ -2561,9 +2568,7 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-obscure-everything",
       name: "Cover (obscure) every note everywhere \u2014 visual only",
       callback: () => {
-        this.settings.obscureAll = true;
-        void this.saveSettings();
-        this.reHideAndRefreshAllViews();
+        void this.setObscureAll(true);
         new Notice("Stashpad: every note is covered. Tap a note to peek at it.", 5000);
       },
     });
@@ -2571,9 +2576,7 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-unobscure-everything",
       name: "Uncover every note (turn off the global obscure)",
       callback: () => {
-        this.settings.obscureAll = false;
-        void this.saveSettings();
-        this.reHideAndRefreshAllViews();
+        void this.setObscureAll(false);
         new Notice("Stashpad: global cover is off. Notes obscured individually stay hidden.", 5000);
       },
     });
@@ -4640,6 +4643,39 @@ export default class StashpadPlugin extends Plugin {
     const key = (folder || "").replace(/\/+$/, "");
     const v = this.settings.folderIcons?.[key];
     return v && v.trim() ? v.trim() : undefined;
+  }
+
+  /** localStorage key for the DEVICE-scoped global cover. Deliberately not in
+   *  data.json: that file syncs, which is the very thing "device only" means to
+   *  avoid. */
+  private static readonly OBSCURE_ALL_LOCAL = "stashpad:obscure-all";
+
+  /** Is the global cover on, for THIS device?
+   *
+   *  0.267.8: reads whichever store the scope names. When the scope is "device"
+   *  and this device has never set it, it falls back to the synced value rather
+   *  than to false — so switching to device scope while everything is covered
+   *  cannot silently UNCOVER it. A privacy control must never fail open. */
+  getObscureAll(): boolean {
+    const raw = window.localStorage.getItem(StashpadPlugin.OBSCURE_ALL_LOCAL);
+    const local = raw === "1" ? true : raw === "0" ? false : null;
+    return resolveObscureAll(
+      this.settings.obscureAllScope === "synced" ? "synced" : "device",
+      this.settings.obscureAll === true,
+      local,
+    );
+  }
+
+  /** Set the global cover in whichever store the scope names, then re-cover
+   *  every view (which also drops any note you had peeked at). */
+  async setObscureAll(on: boolean): Promise<void> {
+    if (this.settings.obscureAllScope === "synced") {
+      this.settings.obscureAll = on;
+      await this.saveSettings();
+    } else {
+      window.localStorage.setItem(StashpadPlugin.OBSCURE_ALL_LOCAL, on ? "1" : "0");
+    }
+    this.reHideAndRefreshAllViews();
   }
 
   /** 0.267.0: does this folder obscure its notes by default?

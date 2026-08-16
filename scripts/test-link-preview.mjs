@@ -16,7 +16,11 @@ import { join, resolve } from "node:path";
 
 const dir = mkdtempSync(join(tmpdir(), "sp-lp-"));
 const stub = join(dir, "obsidian.mjs");
-writeFileSync(stub, "export function requestUrl(){ throw new Error('stub'); }\n");
+writeFileSync(stub, [
+  "export function requestUrl(){ throw new Error('stub'); }",
+  "export function setIcon(){}",
+  "export const Platform = { isMobile: false };",
+].join("\n") + "\n");
 // One entry point re-exporting both modules — esbuild refuses --outfile with
 // multiple inputs, and a single bundle keeps the import below simple.
 const entry = join(dir, "entry.ts");
@@ -25,6 +29,7 @@ writeFileSync(entry, [
   `export * from ${JSON.stringify(resolve("src/link-preview/fetch.ts"))};`,
   `export * from ${JSON.stringify(resolve("src/link-preview/store.ts"))};`,
   `export * from ${JSON.stringify(resolve("src/paste-path.ts"))};`,
+  `export * from ${JSON.stringify(resolve("src/obscure-scope.ts"))};`,
 ].join("\n"));
 const bundle = join(dir, "lp.mjs");
 execFileSync("npx", ["esbuild", entry,
@@ -35,7 +40,7 @@ execFileSync("npx", ["esbuild", entry,
 const {
   extractLinkMeta, parseMetaTags, parseJsonLd, urlKey, isFetchableUrl,
   extractUrls, existingPreviewKeys, renderPreviewCallout, appendPreviews, previewMarker, replacePreview,
-  normalisePastedPath,
+  normalisePastedPath, resolveObscureAll,
 } = await import(bundle);
 
 let pass = 0, fail = 0;
@@ -163,6 +168,16 @@ t("shell-escaped parens", normalisePastedPath("/tmp/report\\ \\(final\\).pdf"), 
 t("file:// URL", normalisePastedPath("file:///tmp/a%20b.pdf"), "/tmp/a b.pdf");
 t("backslash before a normal char is kept",
   normalisePastedPath("/tmp/a\\bc.pdf"), "/tmp/a\\bc.pdf");
+
+// --- resolveObscureAll -----------------------------------------------------
+// The FALLBACK is the point of these: getting it wrong uncovers notes the user
+// had covered, which is the one failure mode a privacy control must not have.
+t("synced scope follows the synced value", resolveObscureAll("synced", true, null), true);
+t("synced scope ignores a local value", resolveObscureAll("synced", false, true), false);
+t("device scope uses this device's answer", resolveObscureAll("device", false, true), true);
+t("device scope can differ from synced", resolveObscureAll("device", true, false), false);
+t("device with NO local answer inherits covered — never uncovers", resolveObscureAll("device", true, null), true);
+t("device with no local answer and nothing synced stays off", resolveObscureAll("device", false, null), false);
 
 rmSync(dir, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);

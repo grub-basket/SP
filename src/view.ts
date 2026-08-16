@@ -13767,7 +13767,7 @@ export class StashpadView extends ItemView {
     // Both come back exactly as they were the moment it goes off, because
     // neither is modified — the switch outranks them rather than rewriting
     // them.
-    if (s.obscureAll === true) return true;
+    if (this.plugin.getObscureAll()) return true;
     const pending = this.obscuredState.get(node.file.path);
     const own = pending !== undefined
       ? (pending === "absent" ? undefined : pending)
@@ -13799,7 +13799,7 @@ export class StashpadView extends ItemView {
     // SEE — the switch overrides every note. Writing the flag anyway would look
     // like the command silently failed, so say what is actually going on rather
     // than editing files to no visible effect.
-    if (getSettings().obscureAll) {
+    if (this.plugin.getObscureAll()) {
       new Notice("Everything is covered by the global switch — turn it off to change notes individually.", 6000);
       return;
     }
