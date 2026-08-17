@@ -163,12 +163,17 @@ export default class StashpadPlugin extends Plugin {
     // Throttled rather than per-line because setItem is synchronous: doing it on
     // every line during a render storm would add its cost to the very thing
     // being measured, which is how a diagnostic starts lying.
-    const now = performance.now();
-    if (category.endsWith("-begin") || now - this.lastSyncMirrorAt >= StashpadPlugin.TRACE_SYNC_MIRROR_MS) {
-      this.lastSyncMirrorAt = now;
-      this.mirrorTraceSync();
+    // 0.268.18: with persistence off, tracing touches NOTHING on disk — no
+    // timer is even scheduled. The buffer is still fully populated and both
+    // copy commands still work; only surviving a crash is given up.
+    if (this.settings.debugTracePersist) {
+      const now = performance.now();
+      if (category.endsWith("-begin") || now - this.lastSyncMirrorAt >= StashpadPlugin.TRACE_SYNC_MIRROR_MS) {
+        this.lastSyncMirrorAt = now;
+        this.mirrorTraceSync();
+      }
+      this.scheduleTraceFlush();
     }
-    this.scheduleTraceFlush();
   }
 
   /** 0.268.8: mirror the ring buffer to disk so a trace survives a force-quit.
@@ -228,7 +233,7 @@ export default class StashpadPlugin extends Plugin {
    *  Resolution is the watchdog tick, 250ms. */
   private static readonly TRACE_LS_HEARTBEAT_KEY = "stashpad:debug-trace-heartbeat";
   private beatSync(): void {
-    if (!this.settings.debugTrace) return;
+    if (!this.settings.debugTrace || !this.settings.debugTracePersist) return;
     try {
       localStorage.setItem(StashpadPlugin.TRACE_LS_HEARTBEAT_KEY, JSON.stringify({
         at: Math.round(performance.now()),
@@ -246,6 +251,7 @@ export default class StashpadPlugin extends Plugin {
     } catch { return ""; }
   }
   private mirrorTraceSync(): void {
+    if (!this.settings.debugTracePersist) return;
     try {
       const tail = this.debugBuffer.slice(-StashpadPlugin.TRACE_LS_MAX_LINES).join("\n");
       localStorage.setItem(StashpadPlugin.TRACE_LS_KEY, tail);
@@ -274,7 +280,7 @@ export default class StashpadPlugin extends Plugin {
   /** Write the current buffer out. Best-effort by design: a diagnostic that
    *  throws into whatever called trace() would be worse than a missing file. */
   private async flushTraceToDisk(): Promise<void> {
-    if (!this.settings.debugTrace) return;
+    if (!this.settings.debugTrace || !this.settings.debugTracePersist) return;
     // 0.268.9: never write before the previous session's file has been rotated
     // aside. Measured, not theorised: without this the new session's own first
     // flush landed in debug-trace.log while onload was still awaiting earlier
@@ -2257,7 +2263,9 @@ export default class StashpadPlugin extends Plugin {
     // Rotation already happened at the top of onload. All that's left is to
     // clean up when tracing is off, so an install that never uses it (or one
     // whose diagnostic just aged out above) keeps no files around.
-    if (!this.settings.debugTrace) await this.removeTraceFiles();
+    // Clean up when either switch is off, so turning persistence off leaves no
+    // file behind for a later session to rotate and hand back.
+    if (!this.settings.debugTrace || !this.settings.debugTracePersist) await this.removeTraceFiles();
     perf.enabled = !!this.settings.enablePerfProfiling;
     this.encryption = new EncryptionService(
       this.app,
@@ -3078,7 +3086,7 @@ export default class StashpadPlugin extends Plugin {
       callback: () => {
         void this.getPreviousTrace().then((text) => {
           if (!text) {
-            new Notice("No trace from a previous session. One is saved only while the debug trace is switched on.");
+            new Notice("No trace from a previous session. One is kept only while BOTH the debug trace and \"Save the debug trace to disk\" are switched on.");
             return;
           }
           navigator.clipboard.writeText(text).then(

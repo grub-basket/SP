@@ -308,6 +308,9 @@ export interface StashpadSettings {
    *  writes; a no-op when off. Ships dormant — never needs stripping for the
    *  store / pristine. */
   debugTrace: boolean;
+  /** 0.268.18: mirror the trace to disk so it survives a crash or force-quit.
+   *  OFF by default — see the comment on the default below. */
+  debugTracePersist: boolean;
   /** 0.255.0: epoch ms when a diagnostic mode was last switched ON, so it can
    *  expire itself if forgotten. 0 = off / never stamped. Both diagnostics
    *  cost something continuously (perf profiling accumulates timing; the debug
@@ -809,6 +812,13 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   enablePerfProfiling: false,
   diagnosticsEnabledAt: { perf: 0, trace: 0 },
   debugTrace: false,
+  // 0.268.18: OFF. Persistence was added for a bug thought to hang the app,
+  // where a force-quit would take the only copy of the trace with it. That
+  // turned out not to be the fault, and meanwhile leaving the trace on meant a
+  // localStorage stamp every 250ms and a file write every second, indefinitely,
+  // on the user's disk. A capability worth having for a crash is not worth
+  // paying for continuously, so it is now asked for rather than assumed.
+  debugTracePersist: false,
   writeRecoveryLinks: true,
   slashCommands: true,
   linkPreviewCallout: "info",
@@ -1366,13 +1376,20 @@ export class StashpadSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })), ["perf", "profiling", "timing", "slow"]),
 
-      this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. While it's on, a copy is also written beside Stashpad's settings file (about once a second) so the trace survives a crash or a force-quit — switching it off deletes that copy. Local only — no network; zero overhead when off.", (s) =>
+      this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. Kept in memory only, so nothing is written to disk unless you also turn on the setting below. Local only — no network; zero overhead when off.", (s) =>
         s.addToggle((t) => t.setValue(this.plugin.settings.debugTrace).onChange(async (v) => {
           this.plugin.settings.debugTrace = v;
           this.plugin.stampDiagnostic("trace", v);
           await this.plugin.saveSettings();
           if (!v) await this.plugin.removeTraceFiles();
         })), ["debug", "trace", "diagnostics", "tap", "log"]),
+
+      this.renderDef("Save the debug trace to disk", "Only useful for a bug that CRASHES Obsidian or hangs it badly enough to need a force-quit, which would otherwise take the trace with it. While on, a copy is written beside Stashpad's settings file about once a second and a marker is saved every quarter second; the previous session's copy is kept so you can retrieve it after a restart. Leave it off otherwise — the trace still records everything and both copy commands still work, so this only buys surviving a crash, and it writes to your disk continuously for as long as it's on. Turning it off deletes both copies.", (s) =>
+        s.addToggle((t) => t.setValue(this.plugin.settings.debugTracePersist).onChange(async (v) => {
+          this.plugin.settings.debugTracePersist = v;
+          await this.plugin.saveSettings();
+          if (!v) await this.plugin.removeTraceFiles();
+        })), ["debug", "trace", "disk", "persist", "crash", "force-quit"]),
 
       this.renderDef("Copy / clear debug trace", "Copy the captured debug lines to the clipboard (paste them back to share), or clear the buffer to start a fresh capture.", (s) => {
         s.addButton((b) => b.setButtonText("Copy").onClick(async () => {
