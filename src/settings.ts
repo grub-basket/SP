@@ -930,14 +930,43 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
 };
 
 let current: StashpadSettings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
-const listeners = new Set<() => void>();
+const listeners = new Set<(sig: string) => void>();
 
 export function getSettings(): StashpadSettings { return current; }
+/** 0.268.13: keys whose change cannot affect how a list RENDERS.
+ *
+ *  A settings save broadcasts to every open view and each one re-rendered
+ *  unconditionally. A trace from a real session showed 21 views repainting on a
+ *  single save — two of them 714 and 341 rows — for a composer DRAFT, which is
+ *  the most frequent write there is: it fires as you type.
+ *
+ *  The list is deliberately tiny and the default is to re-render. An unknown key
+ *  changing still repaints everything, so the failure mode of this optimisation
+ *  is "no faster", never "stale UI". Drafts are safe to skip because the
+ *  listener syncs the composer's text directly and reports whether it did. */
+const RENDER_IRRELEVANT_KEYS: ReadonlySet<string> = new Set([
+  "drafts", "lastSubmitted", "draftAppendTargets",
+  "notifiedDueKeys", "persistReminderLog", "settingsRev",
+]);
+
+function renderSignature(s: StashpadSettings): string {
+  const bag = s as unknown as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const k of Object.keys(bag).sort()) {
+    if (RENDER_IRRELEVANT_KEYS.has(k)) continue;
+    try { parts.push(`${k}=${JSON.stringify(bag[k])}`); } catch { parts.push(`${k}=?`); }
+  }
+  return parts.join("|");
+}
+
 export function setSettings(next: StashpadSettings): void {
   current = next;
-  for (const fn of listeners) fn();
+  // Computed ONCE per save and handed to every listener. Per-view computation
+  // would repeat this work for each open view, which is the cost being removed.
+  const sig = renderSignature(next);
+  for (const fn of listeners) fn(sig);
 }
-export function onSettingsChange(fn: () => void): () => void {
+export function onSettingsChange(fn: (sig: string) => void): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);
 }
@@ -1077,6 +1106,89 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
 
   getSettingDefinitions(): SettingDefinitionItem[] {
+    // 0.268.7 diagnostic: the base `update()` calls this on every declarative
+    // re-render, so the CALL RATE is the thing worth seeing. One line per open
+    // is normal; a burst of them means something is driving update() in a loop
+    // (see refreshSettingsIfStashpadsChanged in main.ts), which is the shape a
+    // frozen settings window would have.
+    const t0 = performance.now();
+    const defs = this.buildSettingDefinitions();
+    this.plugin.trace("settings:defs", { ms: Math.round(performance.now() - t0) });
+    return this.instrumentDefs(defs, "");
+  }
+
+  /** 0.268.14: time EVERY settings item, not just the Hotkeys rows.
+   *
+   *  Hotkeys was instrumented alone because that was the reported symptom, and
+   *  it came back innocent — 2-5ms, every time. Which leaves the possibility
+   *  that the expensive thing is on another page, or in a page's own display(),
+   *  and the trace simply had nothing to say about it. Wrapping centrally here
+   *  covers every section without touching each renderer.
+   *
+   *  Timings aggregate per page and flush as ONE line per burst, so coverage
+   *  goes up without the line count following it. */
+  private instrumentDefs(items: SettingDefinitionItem[], path: string): SettingDefinitionItem[] {
+    return items.map((it) => {
+      const raw = it as unknown as Record<string, unknown>;
+      const name = typeof raw.name === "string" ? raw.name : "?";
+      const here = path ? `${path} › ${name}` : name;
+      const out: Record<string, unknown> = { ...raw };
+
+      if (typeof raw.render === "function") {
+        const orig = raw.render as (s: Setting) => void;
+        out.render = (s: Setting): void => {
+          const t0 = performance.now();
+          try { orig.call(this, s); }
+          catch (e) {
+            // 0.268.17: contain a row that throws.
+            //
+            // An exception here escaped into Obsidian's page builder, which
+            // abandoned the rest of the page AND left the settings navigation
+            // dead — after opening Hotkeys, no other section could be clicked.
+            // One unrenderable row is a bad row; it is not a reason to lose the
+            // whole settings window, and the containment costs nothing.
+            //
+            // Traced with the item's name, so the next occurrence identifies
+            // itself instead of needing another round of instrumentation.
+            this.plugin.trace("settings:item-error", {
+              page: path || name, item: name,
+              err: (e as Error)?.message ?? String(e),
+            });
+            try { s.setName(name); s.setDesc("This setting could not be displayed. See the debug trace."); } catch { /* last resort */ }
+          }
+          finally { this.noteItemRender(path || name, performance.now() - t0); }
+        };
+      }
+      if (Array.isArray(raw.items)) {
+        out.items = this.instrumentDefs(raw.items as SettingDefinitionItem[], here);
+      }
+      if (typeof raw.page === "function") {
+        const origPage = raw.page as () => { display?: () => void };
+        out.page = (): unknown => {
+          // A page builds lazily on navigation, and its display() is where an
+          // imperative tab does all its work — the begin/end pair is what makes
+          // "opened this page, never finished" readable after a force-quit.
+          this.plugin.trace("settings:page-begin", { page: here });
+          const p = origPage.call(this);
+          const disp = p?.display;
+          if (typeof disp === "function") {
+            p.display = (): void => {
+              this.plugin.trace("settings:page-display-begin", { page: here });
+              const t0 = performance.now();
+              try { disp.call(p); }
+              finally {
+                this.plugin.trace("settings:page-display", { page: here, ms: Math.round(performance.now() - t0) });
+              }
+            };
+          }
+          return p;
+        };
+      }
+      return out as unknown as SettingDefinitionItem;
+    });
+  }
+
+  private buildSettingDefinitions(): SettingDefinitionItem[] {
     return SETTINGS_TABS.map((t) => {
       // Migrated tabs use declarative `items` (per-setting search). Unmigrated
       // tabs still render imperatively via a SettingPage (searchable by page
@@ -1254,11 +1366,12 @@ export class StashpadSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         })), ["perf", "profiling", "timing", "slow"]),
 
-      this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. Local only — no network, no file writes; zero overhead when off.", (s) =>
+      this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. While it's on, a copy is also written beside Stashpad's settings file (about once a second) so the trace survives a crash or a force-quit — switching it off deletes that copy. Local only — no network; zero overhead when off.", (s) =>
         s.addToggle((t) => t.setValue(this.plugin.settings.debugTrace).onChange(async (v) => {
           this.plugin.settings.debugTrace = v;
           this.plugin.stampDiagnostic("trace", v);
           await this.plugin.saveSettings();
+          if (!v) await this.plugin.removeTraceFiles();
         })), ["debug", "trace", "diagnostics", "tap", "log"]),
 
       this.renderDef("Copy / clear debug trace", "Copy the captured debug lines to the clipboard (paste them back to share), or clear the buffer to start a fresh capture.", (s) => {
@@ -2484,7 +2597,47 @@ export class StashpadSettingTab extends PluginSettingTab {
       aliases: ["hotkey", "shortcut", "keybind", "binding", "key"],
       render: (s: Setting) => this.renderBindingRow(s, meta),
     }));
+    this.plugin.trace("settings:hotkey-items", { rows: rows.length });
     return [intro, ...rows];
+  }
+
+  /** 0.268.7 diagnostic: the Hotkeys page is by far the heaviest — one row per
+   *  command, each building a segmented control, two inputs and four buttons.
+   *  Rows render one at a time, so the interesting number is the TOTAL for the
+   *  page, not any single row. Accumulate and emit one line once the synchronous
+   *  render burst finishes, so a slow page costs one trace line rather than 58.
+   *
+   *  This is what separates the two candidate causes of a frozen window: a
+   *  single large `ms` here means the page itself is slow to build, whereas a
+   *  small `ms` repeated many times means something is re-rendering it in a
+   *  loop and the render cost is incidental. */
+  private itemRenderMs = new Map<string, number>();
+  private itemRenderRows = new Map<string, number>();
+  private itemRenderFlush: number | null = null;
+
+  private noteItemRender(page: string, ms: number): void {
+    // Mark the START of a burst as its own line. If the window hangs partway
+    // through, the flush below never runs — so a "begin" with no matching
+    // "settings:item-render" after it is the finding, not a gap in the data.
+    if (this.itemRenderFlush === null) this.plugin.trace("settings:item-render-begin");
+    this.itemRenderMs.set(page, (this.itemRenderMs.get(page) ?? 0) + ms);
+    this.itemRenderRows.set(page, (this.itemRenderRows.get(page) ?? 0) + 1);
+    if (this.itemRenderFlush !== null) return;
+    this.itemRenderFlush = window.setTimeout(() => {
+      this.itemRenderFlush = null;
+      // Slowest page first: with every section covered, the ordering is the
+      // answer to "which one is expensive" without reading the whole line.
+      const rows = [...this.itemRenderMs.entries()].sort((a, b) => b[1] - a[1]);
+      for (const [page, total] of rows) {
+        this.plugin.trace("settings:item-render", {
+          page,
+          rows: this.itemRenderRows.get(page) ?? 0,
+          ms: Math.round(total),
+        });
+      }
+      this.itemRenderMs.clear();
+      this.itemRenderRows.clear();
+    }, 0);
   }
 
   /** 0.71.0: JD Index Builder settings section.
@@ -3660,9 +3813,32 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
 
   /** One settings row: label + 2 chord recorders + active-slot toggle. */
+  // 0.268.14: the per-row timing wrapper that used to live here is gone. Every
+  // item's render is now wrapped centrally in instrumentDefs, which already
+  // covers these rows — keeping both would double-count them.
   private renderBindingRow(row: Setting, meta: CommandMeta): void {
     row.setName(meta.label).setDesc(meta.desc);
     row.settingEl.addClass("stashpad-binding-row");
+    // 0.268.17: a MISSING entry used to throw right here — `get()[which]` on
+    // undefined — and that single throw killed the whole Hotkeys page and the
+    // settings navigation with it. It happened when a synced device running an
+    // older build wrote a bindings map that predates a command and this one
+    // adopted it wholesale (fixed at source in main.ts, healAdoptedBindings).
+    //
+    // Restored at its shipped default rather than skipped, so a row that came
+    // back empty still works and still shows the chord the user expects. Kept
+    // even with the source fixed: this is the last line between one absent key
+    // and an unusable settings window, and it costs a property check.
+    if (!this.plugin.settings.bindings[meta.id]) {
+      this.plugin.trace("settings:binding-missing", { id: meta.id });
+      this.plugin.settings.bindings[meta.id] = {
+        primary: meta.defaultPrimary,
+        secondary: meta.defaultSecondary ?? "",
+        preferRight: false,
+        useBoth: !!meta.defaultUseBoth,
+      };
+      void this.plugin.saveSettings();
+    }
     const get = () => this.plugin.settings.bindings[meta.id];
 
     let primaryInput: HTMLInputElement;

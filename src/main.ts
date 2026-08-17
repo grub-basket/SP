@@ -95,7 +95,10 @@ export default class StashpadPlugin extends Plugin {
    *  Purely local — no network, no file writes. Capped so a long session
    *  can't grow it unbounded. */
   private debugBuffer: string[] = [];
-  private static readonly DEBUG_BUFFER_MAX = 300;
+  /** 0.268.14: raised with the wider instrumentation. More lines per second
+   *  means a 300-line window covered less wall-clock time, and the interesting
+   *  moment is always the one that just scrolled out. */
+  private static readonly DEBUG_BUFFER_MAX = 900;
   /** Record a structured diagnostic line. No-op (and zero cost beyond the
    *  flag check) unless debug tracing is enabled. Hard to misuse: data is
    *  JSON-stringified defensively so a circular/huge value can't throw out
@@ -129,11 +132,407 @@ export default class StashpadPlugin extends Plugin {
         return;
       }
     }
+    // Remember what ran last, for the stall watchdog's `after`. A stall line
+    // must not become its own antecedent, or a run of them reports "after
+    // stall" and loses the thing that actually preceded the freeze.
+    if (category !== "stall") this.lastTraceCategory = category;
     this.debugBuffer.push(`+${t}ms ${line}`);
     if (this.debugBuffer.length > StashpadPlugin.DEBUG_BUFFER_MAX) {
       this.debugBuffer.splice(0, this.debugBuffer.length - StashpadPlugin.DEBUG_BUFFER_MAX);
     }
+    // 0.268.12: a "…-begin" marker says a risky operation is STARTING, and if
+    // that operation is what hangs, every ASYNC route to disk is already lost —
+    // the vault adapter's write returns a promise, and a synchronous freeze
+    // never yields to run it. Measured: calling the flush here and then blocking
+    // for nine seconds left the marker absent from the file the whole time.
+    //
+    // localStorage.setItem is the one store that is synchronous, so it has
+    // finished before the freezing code gets its next statement. That is the
+    // only evidence a terminal freeze can leave, and it is what makes "began X,
+    // never finished" readable after a force-quit. Folded into the previous
+    // session's trace on the next load.
+    // 0.268.14: mirror synchronously on a THROTTLE, not only on "-begin".
+    //
+    // Every async route to disk is lost to a synchronous freeze, so whatever the
+    // sync mirror last held is the entire record of a terminal hang. Firing it
+    // only on "-begin" meant the blind spot was "everything since the last risky
+    // operation started", which in practice was the whole interesting stretch.
+    // Now the blind spot is bounded by the throttle instead: at most ~250ms of
+    // lines can be lost, whatever was happening.
+    //
+    // Throttled rather than per-line because setItem is synchronous: doing it on
+    // every line during a render storm would add its cost to the very thing
+    // being measured, which is how a diagnostic starts lying.
+    const now = performance.now();
+    if (category.endsWith("-begin") || now - this.lastSyncMirrorAt >= StashpadPlugin.TRACE_SYNC_MIRROR_MS) {
+      this.lastSyncMirrorAt = now;
+      this.mirrorTraceSync();
+    }
+    this.scheduleTraceFlush();
   }
+
+  /** 0.268.8: mirror the ring buffer to disk so a trace survives a force-quit.
+   *
+   *  The buffer is memory-only, which is fine for a bug you can click away from
+   *  and lose for one that HANGS the window — the case this was added for. If
+   *  the app has to be killed, the only copy goes with it.
+   *
+   *  Two properties matter, and they pull against each other:
+   *
+   *   - The write must not land in the hot path. Tracing happens inside the very
+   *     renders under investigation, so a write per line would change what we
+   *     are trying to measure. Hence a debounced flush, fire-and-forget.
+   *   - The flush must run BEFORE the freeze, not after. A hang blocks the main
+   *     thread, so nothing scheduled during it will run. A short debounce is
+   *     what makes the lines leading UP TO the hang land — which is exactly the
+   *     part worth keeping. The last second or so before a hang may be lost;
+   *     everything before it is not.
+   *
+   *  Kept out of the vault proper (it lives beside data.json in the plugin dir)
+   *  so it never shows up as a note, and deliberately NOT one of the store's
+   *  watched paths, so writing it cannot trigger the external-settings reload. */
+  private static readonly TRACE_FILE = "debug-trace.log";
+  private static readonly TRACE_PREV_FILE = "debug-trace.prev.log";
+  private static readonly TRACE_FLUSH_MS = 1000;
+  private traceFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** False until this session has moved the previous session's file aside.
+   *  Gates every write — see flushTraceToDisk. */
+  private traceRotateDone = false;
+
+  /** Null when the plugin directory is unknown. Falling back to "" would resolve
+   *  to the VAULT ROOT and drop a stray log file among the user's notes — a
+   *  diagnostic must never litter the vault it is diagnosing. Every caller
+   *  treats null as "skip", so the feature simply does nothing in that case. */
+  private tracePath(prev = false): string | null {
+    const dir = this.manifest?.dir;
+    if (!dir) return null;
+    return `${dir}/${prev ? StashpadPlugin.TRACE_PREV_FILE : StashpadPlugin.TRACE_FILE}`;
+  }
+
+  /** Synchronous mirror, for the one case an async write cannot cover. Capped
+   *  because localStorage is a shared, quota-limited store and a diagnostic has
+   *  no business filling it; the tail is the part that matters anyway. */
+  private static readonly TRACE_LS_KEY = "stashpad:debug-trace-sync";
+  private static readonly TRACE_LS_MAX_LINES = 250;
+  private static readonly TRACE_SYNC_MIRROR_MS = 250;
+  private lastSyncMirrorAt = -1e9;
+
+  /** 0.268.14: a synchronous "still running" stamp, separate from the buffer
+   *  mirror and deliberately tiny so it can be written on every watchdog tick.
+   *
+   *  It answers the one question a terminal freeze otherwise destroys: WHEN did
+   *  the main thread stop. The trace's last line only says when something last
+   *  happened to be traced, which can be long before the hang; the gap between
+   *  the final heartbeat and that line is the difference between "it hung doing
+   *  X" and "it hung a while after X, doing something we never instrumented".
+   *  Resolution is the watchdog tick, 250ms. */
+  private static readonly TRACE_LS_HEARTBEAT_KEY = "stashpad:debug-trace-heartbeat";
+  private beatSync(): void {
+    if (!this.settings.debugTrace) return;
+    try {
+      localStorage.setItem(StashpadPlugin.TRACE_LS_HEARTBEAT_KEY, JSON.stringify({
+        at: Math.round(performance.now()),
+        after: this.lastTraceCategory || "?",
+        focused: !document.hidden && document.hasFocus(),
+      }));
+    } catch { /* quota or unavailable */ }
+  }
+
+  private takeHeartbeat(): string {
+    try {
+      const v = localStorage.getItem(StashpadPlugin.TRACE_LS_HEARTBEAT_KEY) ?? "";
+      if (v) localStorage.removeItem(StashpadPlugin.TRACE_LS_HEARTBEAT_KEY);
+      return v;
+    } catch { return ""; }
+  }
+  private mirrorTraceSync(): void {
+    try {
+      const tail = this.debugBuffer.slice(-StashpadPlugin.TRACE_LS_MAX_LINES).join("\n");
+      localStorage.setItem(StashpadPlugin.TRACE_LS_KEY, tail);
+    } catch { /* quota or unavailable — the debounced file copy still runs */ }
+  }
+
+  /** Take and clear the synchronous mirror. Cleared on read so a snapshot is
+   *  reported once, against the session it belongs to, rather than resurfacing
+   *  under later ones. */
+  private takeSyncMirror(): string {
+    try {
+      const v = localStorage.getItem(StashpadPlugin.TRACE_LS_KEY) ?? "";
+      if (v) localStorage.removeItem(StashpadPlugin.TRACE_LS_KEY);
+      return v;
+    } catch { return ""; }
+  }
+
+  private scheduleTraceFlush(): void {
+    if (this.traceFlushTimer !== null) return;
+    this.traceFlushTimer = setTimeout(() => {
+      this.traceFlushTimer = null;
+      void this.flushTraceToDisk();
+    }, StashpadPlugin.TRACE_FLUSH_MS);
+  }
+
+  /** Write the current buffer out. Best-effort by design: a diagnostic that
+   *  throws into whatever called trace() would be worse than a missing file. */
+  private async flushTraceToDisk(): Promise<void> {
+    if (!this.settings.debugTrace) return;
+    // 0.268.9: never write before the previous session's file has been rotated
+    // aside. Measured, not theorised: without this the new session's own first
+    // flush landed in debug-trace.log while onload was still awaiting earlier
+    // steps, and the rotate then preserved THAT — so restarting to recover a
+    // crash trace was what destroyed it. Skipping a flush costs nothing, since
+    // the buffer is in memory and the next flush writes it all.
+    if (!this.traceRotateDone) return;
+    const path = this.tracePath();
+    if (!path) return;
+    const text = this.getDebugTrace();
+    if (!text) return;
+    try { await this.app.vault.adapter.write(path, text); } catch { /* best effort */ }
+  }
+
+  /** On load, move any file left by the previous session aside before the new
+   *  one starts overwriting it. That file is the whole point of this feature:
+   *  after a force-quit it holds the trace from the run that froze. */
+  private async rotateTraceFile(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const cur = this.tracePath();
+    const prev = this.tracePath(true);
+    if (!cur || !prev) return;
+    // The synchronous mirror may hold lines the debounced file copy never got —
+    // by definition, since it exists for the freeze that stopped the file copy
+    // running. Keep BOTH rather than choosing: they cover different moments, and
+    // picking the "newer" one by length or timestamp would be a guess that
+    // silently discards the evidence this feature exists to preserve.
+    const sync = this.takeSyncMirror();
+    const beat = this.takeHeartbeat();
+    try {
+      let body = "";
+      if (await adapter.exists(cur)) body = await adapter.read(cur);
+      if (sync.trim()) {
+        body += `${body ? "\n" : ""}--- last synchronous snapshot (survives a force-quit; may overlap the lines above) ---\n${sync}`;
+      }
+      if (beat.trim()) {
+        // Last for a reason: it is the first thing worth reading. Compare `at`
+        // against the final line's timestamp — a large gap means the thread died
+        // somewhere no trace point covers, and the instrumentation, not the
+        // theory, is what needs widening next.
+        body += `${body ? "\n" : ""}--- last heartbeat before this session ended (250ms resolution) ---\n${beat}`;
+      }
+      if (body.trim()) await adapter.write(prev, body);
+      if (await adapter.exists(cur)) await adapter.remove(cur);
+    } catch { /* best effort */ }
+  }
+
+  /** The previous session's trace, for the copy command. Empty when there
+   *  isn't one — a fresh install, or a clean shutdown after a clear. */
+  async getPreviousTrace(): Promise<string> {
+    const p = this.tracePath(true);
+    if (!p) return "";
+    try {
+      const adapter = this.app.vault.adapter;
+      if (!(await adapter.exists(p))) return "";
+      return await adapter.read(p);
+    } catch { return ""; }
+  }
+
+  /** Remove both files. Called when the trace is cleared or switched off, so
+   *  turning the diagnostic off leaves nothing of it behind. */
+  async removeTraceFiles(): Promise<void> {
+    // The synchronous mirror is part of the trace, so "delete it all" has to
+    // include it — otherwise switching the diagnostic off leaves a copy behind
+    // in localStorage and the next load resurrects it into a fresh prev file.
+    this.takeSyncMirror();
+    this.takeHeartbeat();
+    const adapter = this.app.vault.adapter;
+    for (const p of [this.tracePath(), this.tracePath(true)]) {
+      if (!p) continue;
+      try { if (await adapter.exists(p)) await adapter.remove(p); } catch { /* best effort */ }
+    }
+  }
+  /** 0.268.10: main-thread stall watchdog.
+   *
+   *  The first freeze trace ruled out both suspects rather than finding one: the
+   *  Hotkeys rows render in 2-3ms and the page re-renders only a handful of
+   *  times, so neither "slow page" nor "render loop" survives. The trace simply
+   *  STOPS, because a blocked main thread cannot record anything — the absence
+   *  of lines is the one thing every hang looks like, whatever caused it.
+   *
+   *  A timer cannot fire during a stall either, but it fires immediately AFTER
+   *  one, late by however long the thread was blocked. That lateness is the
+   *  measurement: it gives the freeze a duration and a position in the trace,
+   *  which is what turns "it stopped here" into "it was blocked for N ms right
+   *  after X". `after` names the last thing traced, since a stall can begin long
+   *  after the previous line and adjacency alone would mislead. */
+  private static readonly STALL_TICK_MS = 250;
+  /** Report threshold. Well above ordinary scheduling jitter and GC pauses, so
+   *  a line here means a stall a person would actually notice. */
+  private static readonly STALL_REPORT_MS = 400;
+  /** Threshold while the window is unfocused. Comfortably above the ~1s ceiling
+   *  of background timer throttling, so noise stays out and a genuine
+   *  multi-second freeze still lands. */
+  private static readonly STALL_UNFOCUSED_REPORT_MS = 2500;
+  private stallLastTick = 0;
+  private lastTraceCategory = "";
+
+  /** Runs for the whole session: `trace()` no-ops when the debug trace is off,
+   *  so the standing cost is one 250ms timer doing a subtraction. Starting it
+   *  unconditionally means a stall that happens BEFORE the user thinks to turn
+   *  tracing on still leaves the timer in place to catch the next one. */
+  private startStallWatchdog(): void {
+    this.stallLastTick = performance.now();
+    let wasUnfocused = false;
+    this.registerInterval(window.setInterval(() => {
+      const now = performance.now();
+      const late = now - this.stallLastTick - StashpadPlugin.STALL_TICK_MS;
+      this.stallLastTick = now;
+      // Stamp BEFORE any early return below: a heartbeat that only lands on
+      // "interesting" ticks would go quiet for ordinary reasons and be
+      // indistinguishable from the thread dying, which is the one thing it is
+      // here to tell apart.
+      this.beatSync();
+      // 0.268.12: RAISE the bar when unfocused rather than going silent.
+      //
+      // A background window is throttled to roughly one timer a second, which
+      // this arithmetic cannot tell from a 750ms freeze, so 0.268.10 simply
+      // refused to judge an unfocused window. That was too blunt: a real freeze
+      // produced NO line at all, and a missing line is indistinguishable from
+      // "nothing happened" — the diagnostic failed exactly when it mattered.
+      //
+      // Throttling has a ceiling of about a second, so a threshold well above it
+      // separates the two without discarding anything: ordinary throttle noise
+      // stays out, a multi-second freeze still gets recorded whatever the window
+      // was doing. `focused` is on every line so a suspicious one can be judged
+      // rather than guessed at.
+      const doc = document;
+      const focused = !doc.hidden && doc.hasFocus();
+      // One tick of grace on the way back to focus: that interval straddles the
+      // change and its lateness belongs to the throttled side of it.
+      const justRefocused = focused && wasUnfocused;
+      wasUnfocused = !focused;
+      if (justRefocused) return;
+      const threshold = focused
+        ? StashpadPlugin.STALL_REPORT_MS
+        : StashpadPlugin.STALL_UNFOCUSED_REPORT_MS;
+      if (late >= threshold) {
+        this.trace("stall", { ms: Math.round(late), focused, after: this.lastTraceCategory || "?" });
+      }
+    }, StashpadPlugin.STALL_TICK_MS));
+  }
+
+  /** 0.268.11: find out who eats Mod+A.
+   *
+   *  Select-all works in the composer on a 15-plugin dev vault, so the fault is
+   *  environmental and no amount of reading this repo will settle it. What can
+   *  settle it is watching the key travel.
+   *
+   *  Two probes bracket every other listener. The capture one is the EARLIEST
+   *  point Stashpad can observe a keypress; the bubble one is the LAST. Reading
+   *  the pair:
+   *
+   *    both lines            nobody consumed it — Stashpad's own handling is
+   *                          the thing at fault, not a rival listener
+   *    capture only          something between the two consumed it; if
+   *                          `handled` is absent it was not us
+   *    neither line          a listener registered BEFORE Stashpad (Obsidian
+   *                          itself, or a plugin loaded earlier) took it, and
+   *                          no amount of work inside this plugin can win
+   *
+   *  Deliberately not limited to the composer: "it did not fire" and "it fired
+   *  somewhere unexpected" look identical if the probe only reports one place. */
+  private installSelectAllProbe(): void {
+    const isSelectAll = (e: KeyboardEvent): boolean =>
+      e.key?.toLowerCase() === "a" && (e.metaKey || e.ctrlKey) && !e.altKey;
+    const describe = (e: KeyboardEvent): Record<string, unknown> => {
+      const t = e.target as HTMLElement | null;
+      return {
+        target: t?.tagName ?? "?",
+        cls: (t && typeof t.className === "string" && t.className.split(" ")[0]) || "",
+        prevented: e.defaultPrevented,
+      };
+    };
+    this.registerDomEvent(window, "keydown", (e: KeyboardEvent) => {
+      if (isSelectAll(e)) this.trace("key:mod-a-seen", describe(e));
+    }, { capture: true });
+    this.registerDomEvent(window, "keydown", (e: KeyboardEvent) => {
+      if (isSelectAll(e)) this.trace("key:mod-a-survived", describe(e));
+    });
+  }
+
+  /** 0.268.15: photograph the settings window while it is unresponsive.
+   *
+   *  The freeze is NOT a main-thread hang — the rest of the app keeps working
+   *  and commands still run, which is why the stall watchdog correctly reported
+   *  nothing. A dead UI on a live thread is a different fault: the clicks are
+   *  landing somewhere other than the row, or the modal is no longer where it
+   *  appears to be.
+   *
+   *  So the decisive measurement is elementFromPoint. If a click on a settings
+   *  row resolves to something that is not that row — a stale overlay, a modal
+   *  background left behind, a zero-size container — that IS the bug, named
+   *  outright rather than inferred. Sampled at several points because a partial
+   *  cover looks identical to a whole one at a single coordinate. */
+  private snapshotSettingsWindow(): Record<string, unknown> {
+    const describe = (el: Element | null): string => {
+      if (!el) return "none";
+      const cls = typeof el.className === "string" && el.className ? `.${el.className.trim().split(/\s+/).join(".")}` : "";
+      return `${el.tagName.toLowerCase()}${cls}`.slice(0, 120);
+    };
+    const out: Record<string, unknown> = {};
+    try {
+      const setting = (this.app as unknown as { setting?: { activeTab?: { id?: string } | null } }).setting;
+      out.activeTab = setting?.activeTab?.id ?? null;
+      out.modals = document.querySelectorAll(".modal").length;
+      out.modalBgs = document.querySelectorAll(".modal-bg").length;
+      out.menus = document.querySelectorAll(".menu").length;
+      out.suggestions = document.querySelectorAll(".suggestion-container").length;
+      out.settingItems = document.querySelectorAll(".setting-item").length;
+      out.bindingRows = document.querySelectorAll(".stashpad-binding-row").length;
+      out.activeEl = describe(document.activeElement);
+
+      const modal = document.querySelector(".modal.mod-settings") ?? document.querySelector(".modal");
+      if (!modal) { out.modalFound = false; return out; }
+      out.modalFound = true;
+      const r = modal.getBoundingClientRect();
+      out.modalRect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+      const cs = getComputedStyle(modal);
+      out.modalStyle = {
+        pointerEvents: cs.pointerEvents, opacity: cs.opacity, display: cs.display,
+        visibility: cs.visibility, zIndex: cs.zIndex, transform: cs.transform,
+      };
+
+      // The heart of it: at each sample point, is the topmost element inside the
+      // modal, or has something else taken the hit?
+      const pts: Array<Record<string, unknown>> = [];
+      for (const [fx, fy] of [[0.5, 0.25], [0.5, 0.5], [0.5, 0.75], [0.25, 0.5], [0.75, 0.5]]) {
+        const x = Math.round(r.x + r.width * fx);
+        const y = Math.round(r.y + r.height * fy);
+        const hit = document.elementFromPoint(x, y);
+        pts.push({
+          at: `${Math.round(fx * 100)}%,${Math.round(fy * 100)}%`,
+          hit: describe(hit),
+          insideModal: !!hit && modal.contains(hit),
+          blockedBy: !!hit && !modal.contains(hit) ? describe(hit) : null,
+        });
+      }
+      out.hitTest = pts;
+      out.allInsideModal = pts.every((p) => p.insideModal === true);
+
+      // A container with no height still "renders" rows that can never be hit.
+      const content = modal.querySelector(".vertical-tab-content, .modal-content");
+      if (content) {
+        const cr = content.getBoundingClientRect();
+        out.contentRect = { w: Math.round(cr.width), h: Math.round(cr.height) };
+        out.contentScroll = {
+          scrollH: (content as HTMLElement).scrollHeight,
+          clientH: (content as HTMLElement).clientHeight,
+          scrollTop: (content as HTMLElement).scrollTop,
+        };
+      }
+    } catch (e) {
+      out.error = (e as Error)?.message ?? "unknown";
+    }
+    return out;
+  }
+
   /** Current trace lines joined for copy/clear from the Diagnostics tab. */
   /** 0.219.3: stamp the plugin version + platform at the top. A trace pasted
    *  back without it is ambiguous about which build produced it — which cost a
@@ -170,7 +569,13 @@ export default class StashpadPlugin extends Plugin {
     const head = bits.join(" · ");
     return [head, ...this.debugBuffer].join("\n");
   }
-  clearDebugTrace(): void { this.debugBuffer = []; }
+  clearDebugTrace(): void {
+    this.debugBuffer = [];
+    // Clearing must clear the DISK copy too. Leaving it behind would mean the
+    // next copy command hands back lines the user just asked to be rid of.
+    if (this.traceFlushTimer !== null) { clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
+    void this.removeTraceFiles();
+  }
 
   /** How long a diagnostic mode may stay on before it switches itself off.
    *  Long enough to span a slow back-and-forth about a bug (report, build,
@@ -344,6 +749,13 @@ export default class StashpadPlugin extends Plugin {
     // 0.83.2: flush any pending render-cache writes (the store's save is
     // debounced, so a recent change could still be in the buffer).
     try { await this._renderCacheStore?.save(); } catch { /* best-effort */ }
+    // 0.268.8: land the last trace lines. A clean unload is the one shutdown
+    // where nothing is lost, so take it — the debounced flush may still be
+    // pending, and its timer will not survive us.
+    try {
+      if (this.traceFlushTimer !== null) { clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
+      await this.flushTraceToDisk();
+    } catch { /* best-effort */ }
   }
 
   /** Vault-relative path to a file/dir inside the plugin's private
@@ -736,8 +1148,26 @@ export default class StashpadPlugin extends Plugin {
   /** Rebuild the cached setting definitions when the set of discovered
    *  Stashpads has changed since they were last built. Cheap no-op otherwise. */
   refreshSettingsIfStashpadsChanged(): void {
+    const scanT0 = performance.now();
     const sig = this.discoverStashpadFolders().join("\u0000");
-    if (sig === this.settingsFolderSignature) return;
+    const scanMs = performance.now() - scanT0;
+    if (sig === this.settingsFolderSignature) {
+      // 0.268.7 diagnostic: the no-op path still SCANS the vault, and it runs on
+      // every metadataCache "resolved" — which fires continuously while Sync is
+      // landing files. A cheap no-op is fine; an expensive one repeated is not,
+      // so record the scan cost only when it is slow enough to matter.
+      if (scanMs >= 5) this.trace("settings:folder-scan", { ms: Math.round(scanMs), noop: true });
+      return;
+    }
+    // 0.268.7 diagnostic: the signature genuinely changed, so the whole settings
+    // tab is rebuilt. If these lines repeat, the folder set is FLAPPING rather
+    // than settling, and each flap forces a full declarative re-render of every
+    // settings page — which is the shape a frozen settings window would have.
+    this.trace("settings:update", {
+      ms: Math.round(scanMs),
+      folders: this.knownStashpadFolders?.size ?? 0,
+      first: this.settingsFolderSignature === null,
+    });
     this.settingsFolderSignature = sig;
     this.settingTab?.update?.();
   }
@@ -1791,6 +2221,18 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async onload(): Promise<void> {
+    // 0.268.9: rotate the previous session's trace FIRST — before settings load,
+    // before migrations, before anything can emit a line. This used to sit after
+    // several awaits, and the new session's own first flush beat it to the file.
+    //
+    // Unconditional, because settings aren't loaded yet and the file's existence
+    // is the only question that matters: if one is there, it belongs to the run
+    // that just ended, and after a force-quit it is the only copy. Whether the
+    // user still wants tracing at all is settled below, once settings are read.
+    try { await this.rotateTraceFile(); } catch { /* best-effort */ }
+    this.traceRotateDone = true;
+    this.startStallWatchdog();
+    this.installSelectAllProbe();
     // Keep the dedup-at-creation id index current as files are parsed (our own
     // creates AND notes synced in from other devices). Never removes on delete —
     // a stale id only forces a re-roll, which is safe.
@@ -1807,6 +2249,15 @@ export default class StashpadPlugin extends Plugin {
     // Before perf.enabled is read from it: a diagnostic left on for over a
     // week switches itself back off here.
     await this.expireStaleDiagnostics();
+    // 0.268.8: move the previous session's trace file aside BEFORE anything
+    // starts writing the new one. If that session was force-quit, this is the
+    // only surviving copy — rotating rather than overwriting is the whole
+    // reason the file is useful. Runs after expireStaleDiagnostics so a trace
+    // that just aged out doesn't leave a rotated file nobody asked for.
+    // Rotation already happened at the top of onload. All that's left is to
+    // clean up when tracing is off, so an install that never uses it (or one
+    // whose diagnostic just aged out above) keeps no files around.
+    if (!this.settings.debugTrace) await this.removeTraceFiles();
     perf.enabled = !!this.settings.enablePerfProfiling;
     this.encryption = new EncryptionService(
       this.app,
@@ -2594,6 +3045,19 @@ export default class StashpadPlugin extends Plugin {
     // something, when leaving the view to go find them is when the state you
     // captured gets buried under the renders that opening settings causes.
     this.addCommand({
+      id: "stashpad-snapshot-settings-window",
+      name: "Diagnostics: snapshot the settings window (run it WHILE settings is unresponsive)",
+      callback: () => {
+        const snap = this.snapshotSettingsWindow();
+        this.trace("settings:snapshot", snap);
+        const text = JSON.stringify(snap, null, 1);
+        navigator.clipboard.writeText(text).then(
+          () => new Notice("Settings snapshot copied — paste it into the bug report."),
+          () => new Notice("Snapshot recorded to the debug trace (clipboard unavailable)."),
+        );
+      },
+    });
+    this.addCommand({
       id: "stashpad-copy-debug-trace",
       name: "Diagnostics: copy debug trace to clipboard",
       callback: () => {
@@ -2603,6 +3067,25 @@ export default class StashpadPlugin extends Plugin {
           () => new Notice(`Debug trace copied (${text.split("\n").length} lines).`),
           () => new Notice("Couldn't access the clipboard."),
         );
+      },
+    });
+    // 0.268.8: the buffer is memory-only, so a bug that HANGS the window and
+    // forces a kill takes the trace with it. The flush-to-disk copy survives
+    // that; this is how you get it back after restarting.
+    this.addCommand({
+      id: "stashpad-copy-previous-debug-trace",
+      name: "Diagnostics: copy debug trace from the PREVIOUS session (after a crash or force-quit)",
+      callback: () => {
+        void this.getPreviousTrace().then((text) => {
+          if (!text) {
+            new Notice("No trace from a previous session. One is saved only while the debug trace is switched on.");
+            return;
+          }
+          navigator.clipboard.writeText(text).then(
+            () => new Notice(`Previous session's trace copied (${text.split("\n").length} lines).`),
+            () => new Notice("Couldn't access the clipboard."),
+          );
+        });
       },
     });
     this.addCommand({
@@ -2617,8 +3100,11 @@ export default class StashpadPlugin extends Plugin {
         this.settings.debugTrace = !this.settings.debugTrace;
         this.stampDiagnostic("trace", this.settings.debugTrace);
         void this.saveSettings();
+        // Switching it off removes the on-disk copies as well, so turning the
+        // diagnostic off actually turns it off rather than leaving a file behind.
+        if (!this.settings.debugTrace) void this.removeTraceFiles();
         new Notice(this.settings.debugTrace
-          ? "Debug trace ON — reproduce the issue, then copy the trace."
+          ? "Debug trace ON — reproduce the issue, then copy the trace. It's also saved to disk, so it survives a force-quit."
           : "Debug trace OFF.");
       },
     });
@@ -8674,6 +9160,7 @@ export default class StashpadPlugin extends Plugin {
         if (baseline !== undefined && JSON.stringify(s[k]) !== baseline) continue; // ours is dirty — keep it
         s[k] = disk[k];
         anyChanged = true;
+        if (k === "bindings") this.healAdoptedBindings();
         if (k.startsWith("folderPanel")) panelChanged = true;
       }
       this.lastSeenSettingsRev = diskRev;
@@ -8690,6 +9177,28 @@ export default class StashpadPlugin extends Plugin {
    *  The adoption rule in guardedSave is "ours unchanged + disk changed => take
    *  disk's", and it can only be applied to a key we have a baseline for. Limiting
    *  the baseline to 8 keys is what limited the protection to 8 keys. */
+  /** 0.268.17: re-complete `bindings` after an adoption.
+   *
+   *  Load runs the raw value through mergeBindings, which starts from
+   *  buildDefaultBindings() and therefore always yields an entry for every
+   *  command. The adoption paths did not: they assign `ours[k] = disk[k]`
+   *  wholesale, so a `bindings` map written by a device on an OLDER Stashpad —
+   *  one that predates a command — replaced the complete in-memory map with an
+   *  incomplete one, mid-session.
+   *
+   *  The settings UI then read settings.bindings[id] for a command the map had
+   *  never heard of and indexed undefined, which threw while building the
+   *  Hotkeys page and left Obsidian's settings navigation dead: after visiting
+   *  Hotkeys, no other section could be opened. It cleared on reload precisely
+   *  because reload goes through mergeBindings again.
+   *
+   *  Re-merging is lossless — every value present on disk is kept, and only the
+   *  missing ids come back at their defaults. */
+  private healAdoptedBindings(): void {
+    const s = this.settings as unknown as Record<string, unknown>;
+    try { s.bindings = mergeBindings(s.bindings, undefined, undefined); } catch { /* keep what we have */ }
+  }
+
   private snapshotSettingsBaseline(): void {
     const all = this.settings as unknown as Record<string, unknown>;
     this.settingsBaseline = {};
@@ -8776,6 +9285,7 @@ export default class StashpadPlugin extends Plugin {
       const critical = adopted.filter((k) => protectedSet.has(k.replace(" (merged)", "")));
       if (adopted.length) {
         adoptedAny = true;
+        if (adopted.some((k) => k.startsWith("bindings"))) this.healAdoptedBindings();
         console.warn(`[Stashpad] settings collision: on-disk keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
         if (critical.length) new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${critical.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
         setSettings(this.settings);

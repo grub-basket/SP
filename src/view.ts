@@ -884,8 +884,11 @@ export class StashpadView extends ItemView {
         this.debouncedRender();
       }
     }));
-    this.detachSettings = onSettingsChange(() => {
+    this.detachSettings = onSettingsChange((sig: string) => {
       this.loadConfig();
+      /** Set when the draft reconciliation below actually changes something the
+       *  user can see, so a skipped render is never a skipped update. */
+      let touched = false;
       // Cross-tab draft sync: if another Stashpad tab on the same folder
       // just cleared its draft (post-submit broadcast), drop our stale
       // in-memory composerDraft so it doesn't get blur-saved back to disk.
@@ -898,6 +901,7 @@ export class StashpadView extends ItemView {
       if (persisted === "" && this.composerDraft !== "" && liveText === "") {
         this.composerDraft = "";
         if (this.composerInputEl) this.composerInputEl.value = "";
+        touched = true;
       } else if (persisted === "" && liveText !== "") {
         // User is typing — keep their text but sync composerDraft to it
         // so the next save reflects reality.
@@ -907,6 +911,16 @@ export class StashpadView extends ItemView {
       // this, deleting all chars in the composer (debounced empty-save
       // → loud broadcast → render tears down the textarea) silently
       // dropped focus.
+      // Nothing that affects this list changed, and the composer reconciliation
+      // above did not touch anything either — so there is nothing to repaint.
+      // This is the whole saving: a draft save now costs one comparison per open
+      // view instead of a full render each.
+      const changed = sig !== this.settingsRenderSig;
+      this.settingsRenderSig = sig;
+      if (!changed && !touched) {
+        this.plugin.trace("render:skip-settings", { folder: this.noteFolder });
+        return;
+      }
       const hadComposerFocus = !!this.composerInputEl
         && document.activeElement === this.composerInputEl;
       if (hadComposerFocus) this.focusComposerOnNextRender = true;
@@ -1054,7 +1068,15 @@ export class StashpadView extends ItemView {
     // shouldn't yank the view to the bottom on the next render. Re-arming the flag
     // is the composer-submit / scrollToBottomOnNextRender path's job.
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
-      if (leaf === this.leaf) { if (getSettings().focusComposerOnOpen) this.focusComposer(); else this.focusView(); }
+      if (leaf === this.leaf) {
+        // 0.268.16: second route for a deferred render, because the fix above
+        // means far more of them are deferred and onResize is now the only
+        // thing standing between a hidden view and stale content. Becoming the
+        // active leaf is the other moment "hidden" stops being true, and paying
+        // a redundant flush here is cheaper than one tab showing old data.
+        this.flushPendingVisibleRender();
+        if (getSettings().focusComposerOnOpen) this.focusComposer(); else this.focusView();
+      }
       else this.stickToListBottom = false;
     }));
   }
@@ -1071,9 +1093,20 @@ export class StashpadView extends ItemView {
   /** Obsidian calls this when the view is laid out, which includes becoming
    *  visible — the moment a render deferred by renderSuppressed must happen. */
   onResize(): void {
+    this.flushPendingVisibleRender();
+  }
+
+  /** Render now if one was deferred while this view was offscreen AND it is
+   *  actually laid out again. Safe to call from anywhere: it no-ops when
+   *  nothing is owed or the view is still hidden. */
+  private flushPendingVisibleRender(): void {
     if (!this.pendingVisibleRender) return;
     if (!this.listEl || this.listEl.clientHeight === 0) return;   // still hidden
     this.pendingVisibleRender = false;
+    this.plugin.trace("render:flush-deferred", { folder: this.noteFolder });
+    // The tree may have moved on while this view was not rendering, so rebuild
+    // rather than repainting a stale model — the deferral is longer now.
+    this.tree.rebuild(this.noteFolder);
     this.render();
   }
 
@@ -1090,8 +1123,18 @@ export class StashpadView extends ItemView {
     // it becomes visible, so switching to that tab shows current data. Checked
     // via the container rather than a workspace API because what matters is
     // literally whether it has been laid out.
+    // 0.268.16: `!this.pendingVisibleRender` used to be part of this condition,
+    // which inverted the whole guard after its first use. Once the flag was set,
+    // the term went false, the branch stopped matching, and every SUBSEQUENT
+    // render on that hidden view fell through and ran. So exactly one render was
+    // deferred and the rest behaved as if the suppression did not exist.
+    //
+    // A trace showed the cost: one settings save rebuilt 23 views, among them a
+    // 714-row and two 342-row lists reporting height 0 because they are not on
+    // screen, and the main thread stalled 407ms. The flag records that a render
+    // is owed, so it must not also decide whether one is suppressed.
     if (this.listEl && this.containerEl.isConnected && this.listEl.clientHeight === 0
-        && this.leaf.view === this && !this.pendingVisibleRender) {
+        && this.leaf.view === this) {
       this.pendingVisibleRender = true;
       return true;
     }
@@ -8182,6 +8225,9 @@ export class StashpadView extends ItemView {
   /** The window the keydown listener is bound to — the leaf's own (popout-aware).
    *  Defaults to the main window; set in onOpen. 0.140.17 */
   private keydownWindow: Window = window;
+  /** Last render-relevant settings signature this view acted on. Empty until the
+   *  first broadcast, so the first one always renders. 0.268.13 */
+  private settingsRenderSig = "";
   private onDocKeyDown = (e: KeyboardEvent): void => {
     if (!this.viewRoot.isConnected) return;
     // Run when our Stashpad leaf is the active one, regardless of where focus
