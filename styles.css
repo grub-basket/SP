@@ -8070,3 +8070,53 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-view.obscure-solid .stashpad-focused.is-obscured .stashpad-focused-body :is(img, svg, video, canvas, iframe, .internal-embed) {
   filter: none;
 }
+
+/* 0.268.3 — the link rail: outgoing links and backlinks, both opt-in.
+
+   A SEPARATE row from the attachment rail on purpose. Files, outgoing links and
+   backlinks are three different kinds of thing, and one undifferentiated strip
+   of chips would say less than no strip at all. Chips rather than tiles, since
+   a note has no thumbnail and a name is the whole content. */
+.stashpad-link-rail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.stashpad-link-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.stashpad-link-chip:hover {
+  color: var(--text-normal);
+  border-color: var(--background-modifier-border-hover);
+  background: var(--background-modifier-hover);
+}
+/* Direction is carried by the icon AND by the border, never by colour alone. */
+.stashpad-link-chip.is-in {
+  border-style: dashed;
+}
+.stashpad-link-chip-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  opacity: 0.7;
+}
+.stashpad-link-chip-icon .svg-icon { width: 12px; height: 12px; }
+.stashpad-link-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A covered note hides its links too — they are content, not chrome. */
+.stashpad-note.is-obscured .stashpad-link-rail,
+.stashpad-focused.is-obscured .stashpad-link-rail {
+  visibility: hidden;
+}

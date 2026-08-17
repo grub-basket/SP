@@ -30,6 +30,7 @@ writeFileSync(entry, [
   `export * from ${JSON.stringify(resolve("src/link-preview/store.ts"))};`,
   `export * from ${JSON.stringify(resolve("src/paste-path.ts"))};`,
   `export * from ${JSON.stringify(resolve("src/obscure-scope.ts"))};`,
+  `export { bodyToSlug, classifyReferenceOnly } from ${JSON.stringify(resolve("src/slug-service.ts"))};`,
 ].join("\n"));
 const bundle = join(dir, "lp.mjs");
 execFileSync("npx", ["esbuild", entry,
@@ -40,7 +41,7 @@ execFileSync("npx", ["esbuild", entry,
 const {
   extractLinkMeta, parseMetaTags, parseJsonLd, urlKey, isFetchableUrl,
   extractUrls, existingPreviewKeys, renderPreviewCallout, appendPreviews, previewMarker, replacePreview,
-  normalisePastedPath, resolveObscureAll,
+  normalisePastedPath, resolveObscureAll, bodyToSlug, classifyReferenceOnly,
 } = await import(bundle);
 
 let pass = 0, fail = 0;
@@ -178,6 +179,31 @@ t("device scope uses this device's answer", resolveObscureAll("device", false, t
 t("device scope can differ from synced", resolveObscureAll("device", true, false), false);
 t("device with NO local answer inherits covered — never uncovers", resolveObscureAll("device", true, null), true);
 t("device with no local answer and nothing synced stays off", resolveObscureAll("device", false, null), false);
+
+// --- titles for notes that are nothing but a reference ---------------------
+// These notes are created BY attaching or pasting, so they have no prose to
+// borrow a name from. They used to all land on "Untitled", which is useless
+// and collides.
+t("embed names the file and its type", bodyToSlug("![[holiday-photo.png]]"), "Attachment-PNG-Holiday-Photo");
+t("embed with a size still names the file", bodyToSlug("![[report.pdf|300]]"), "Attachment-PDF-Report");
+t("markdown image is an attachment too", bodyToSlug("![alt](diagrams/system-map.svg)"), "Attachment-SVG-System-Map");
+t("obsidian deep link", bodyToSlug("obsidian://open?vault=x&file=Some%20Note"), "Deeplink-Open");
+t("wikilink uses its alias", bodyToSlug("[[Projects/Q3 Report|Quarterly numbers]]"), "Link-Quarterly-Numbers");
+t("wikilink without an alias uses the leaf", bodyToSlug("[[Projects/Q3 Report]]"), "Link-Q3-Report");
+t("bare url", bodyToSlug("https://example.com/posts/why-rust-is-fast"), "Link-Why-Rust-Fast");
+
+// TEXT WINS. A note that says something is named after what it says, whether
+// or not a link sits next to it — this is the override that matters most.
+t("text beside a link wins", bodyToSlug("Notes from the vendor call https://example.com/x"),
+  "Notes-Vendor-Call-URL");
+t("text after an embed wins", bodyToSlug("![[chart.png]] revenue is up in Q3"), "Revenue-Up-Q3");
+t("plain prose is untouched", bodyToSlug("Buy milk on the way home"), "Buy-Milk-Way-Home");
+t("a genuinely empty note is still Untitled", bodyToSlug("   "), "Untitled");
+
+// The classifier itself, since the kind drives the prefix.
+t("classify embed", classifyReferenceOnly("![[a/b/file.png]]"), { kind: "Attachment", label: "file", ext: "PNG" });
+t("classify deeplink", classifyReferenceOnly("stashpad://note/abc"), { kind: "Deeplink", label: "abc", ext: "" });
+t("prose is not a reference", classifyReferenceOnly("just some words"), null);
 
 rmSync(dir, { recursive: true, force: true });
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -4854,7 +4854,7 @@ export default class StashpadPlugin extends Plugin {
       const last = p.split("/").filter(Boolean).pop() ?? "";
       if (!last) return false;
       const reserved = new Set(
-        [this.settings.importDropFolder, this.settings.exportFolder, "_attachments", "_processed", "_authors", "_exports", "_imports", "_archive", ".archive", "_deleted"]
+        [this.settings.importDropFolder, this.settings.exportFolder, "_attachments", "_processed", "_failed-imports", "_authors", "_exports", "_imports", "_archive", ".archive", "_deleted"]
           .map((s) => (s ?? "").trim().replace(/^\/+|\/+$/g, ""))
           .filter(Boolean),
       );

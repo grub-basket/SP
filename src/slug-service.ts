@@ -187,6 +187,62 @@ function salvageFromUrl(line: string): string {
   return last.replace(/\.[a-z0-9]{1,8}$/i, "").replace(/[-_+]+/g, " ").trim();
 }
 
+/** What a line that is NOTHING BUT a reference actually points at.
+ *
+ *  0.268.0: stripping links and embeds leaves an empty string for a line that
+ *  was only a reference, and `salvageFromUrl` only rescues things containing a
+ *  slash. An attachment note therefore fell through to "Untitled" — and those
+ *  are the notes that most need a name, since they are usually created BY
+ *  attaching a file and have no prose to borrow from.
+ *
+ *  Returns the kind (so the title can say what it is holding), a label to name
+ *  it with, and the file extension where there is one.
+ *
+ *  Order matters: an embed is checked before a plain wikilink because `![[x]]`
+ *  also matches `[[x]]`, and a deep link before a generic URL because
+ *  `obsidian://` is a URL too. */
+export function classifyReferenceOnly(line: string): { kind: "Attachment" | "Deeplink" | "Link"; label: string; ext: string } | null {
+  const trimmed = line.trim();
+  const base = (target: string): { label: string; ext: string } => {
+    const clean = target.split(/[?#]/)[0].replace(/\/+$/, "");
+    const leaf = clean.split("/").pop() ?? clean;
+    const m = /^(.*?)\.([A-Za-z0-9]{1,8})$/.exec(leaf);
+    return m
+      ? { label: m[1].replace(/[-_+]+/g, " ").trim(), ext: m[2].toUpperCase() }
+      : { label: leaf.replace(/[-_+]+/g, " ").trim(), ext: "" };
+  };
+
+  // Obsidian embed: ![[file.png]] or ![[file.png|300]]
+  let m = /^!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]$/.exec(trimmed);
+  if (m) { const b = base(m[1]); return { kind: "Attachment", label: b.label, ext: b.ext }; }
+  // Markdown image: ![alt](path). The alt text is usually the filename again,
+  // so the target is the more reliable name.
+  m = /^!\[[^\]]*\]\(([^)]+)\)$/.exec(trimmed);
+  if (m) { const b = base(m[1]); return { kind: "Attachment", label: b.label, ext: b.ext }; }
+  // Deep link, ours or another app's.
+  m = /^<?((?:obsidian|stashpad):\/\/\S+?)>?$/i.exec(trimmed);
+  if (m) {
+    const b = base(m[1].replace(/^[a-z]+:\/\//i, ""));
+    return { kind: "Deeplink", label: b.label || "link", ext: "" };
+  }
+  // Wikilink, alias first when there is one.
+  m = /^\[\[([^\]|]+)(?:\|([^\]]+))?\]\]$/.exec(trimmed);
+  if (m) {
+    const b = base(m[2] ? m[2] : m[1]);
+    return { kind: "Link", label: b.label, ext: b.ext };
+  }
+  // Markdown link with a label worth using.
+  m = /^\[([^\]]+)\]\([^)]*\)$/.exec(trimmed);
+  if (m) return { kind: "Link", label: m[1].trim(), ext: "" };
+  // Bare URL.
+  m = /^<?((?:[a-z][a-z0-9+.-]*:\/\/|www\.)\S+?)>?$/i.exec(trimmed);
+  if (m) {
+    const b = base(m[1].replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").replace(/^www\./i, ""));
+    return { kind: "Link", label: b.label || "link", ext: b.ext };
+  }
+  return null;
+}
+
 export function bodyToSlug(body: string, stopwords: string[] = DEFAULT_STOPWORDS): string {
   const stopSet = stopwords instanceof Set ? stopwords : new Set(stopwords.map((s) => s.toLowerCase()));
   const rawFirstLine = (body.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
@@ -204,6 +260,29 @@ export function bodyToSlug(body: string, stopwords: string[] = DEFAULT_STOPWORDS
   if (found.url) markers.push(MARKER_URL);
   if (found.path) markers.push(MARKER_PATH);
   const markerSuffix = markers.length ? `-${markers.join("-")}` : "";
+
+  // 0.268.0: a line that is NOTHING BUT a reference is named after what it
+  // points at, prefixed with the kind of thing it is.
+  //
+  // Checked BEFORE stripping, not after. Stripping keeps a wikilink's alias, so
+  // `[[Q3|Quarterly numbers]]` never reached the empty-string branch and came
+  // out as bare prose, indistinguishable from a note that actually said
+  // "Quarterly numbers". An attachment fared worse: embeds strip to nothing and
+  // the URL salvage only rescues things containing a slash, so those notes
+  // landed on "Untitled" — useless, and colliding with every other one, on
+  // exactly the notes that have no prose to fall back on.
+  //
+  // TEXT STILL WINS. The classifier is anchored to the whole line, so anything
+  // with prose beside the link takes the ordinary path below.
+  const ref = classifyReferenceOnly(rawFirstLine);
+  if (ref) {
+    const head = ref.ext ? `${ref.kind} ${ref.ext}` : ref.kind;
+    // Back through the tokeniser so length, casing and stopwords stay in one
+    // place. The prefix is passed as a word and survives because it is not a
+    // stopword.
+    const slugged = bodyToSlug(`${head} ${ref.label}`.trim(), stopwords);
+    if (slugged && slugged !== "Untitled") return slugged;
+  }
 
   let firstLine = stripUrlsAndPaths(rawFirstLine);
   if (!firstLine) firstLine = salvageFromUrl(rawFirstLine);

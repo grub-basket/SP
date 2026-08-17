@@ -280,7 +280,7 @@ const FIND_VIEW = (folder) => `
 // ---- commands -------------------------------------------------------------
 function die(msg) { console.error(msg); process.exit(1); }
 
-const nodesNeeded = ["ls", "tree", "cat", "find", "path", "info", "open", "add", "done"].includes(CMD);
+const nodesNeeded = ["ls", "tree", "cat", "find", "path", "info", "open", "add", "done", "move"].includes(CMD);
 const nodes = nodesNeeded ? loadTree() : null;
 
 switch (CMD) {
@@ -372,8 +372,42 @@ switch (CMD) {
     console.log(`${t.id} → ${r.completed ? "completed" : "reopened"}`);
     break;
   }
+  case "move": {
+    // 0.268.4: the first verb that replaces a MODAL rather than adding a new
+    // capability. "Move to…" is a picker, and a picker is a dead end from a
+    // terminal — the CLI could create and complete notes but never reorganise
+    // them, so any task that needed reparenting stopped here.
+    //
+    // Drives `changeParent`, the method the picker calls once you have chosen,
+    // rather than the picker's own UI. That is the durable seam: the modal's
+    // markup changes often and this method does not, and it already handles
+    // the tree update, the frontmatter write and the undo entry.
+    const t = resolveTarget(nodes, pos[0] ?? die("move needs a target"));
+    const destArg = pos[1] ?? die('move needs a destination (an id, a title, or "/" for root)');
+    const dest = resolveTarget(nodes, destArg);
+    if (t.id === ROOT_ID) die("can't move the root");
+    if (t.id === dest.id) die("a note cannot be its own parent");
+    const r = await obsDevEval(`${FIND_VIEW(FOLDER)}
+      if (!view) return { __error: "no open Stashpad view on folder ${FOLDER} — run: sp open / first" };
+      const node = view.tree.get(${JSON.stringify(t.id)});
+      if (!node) return { __error: "id not in live tree (view on a different folder?)" };
+      // Guard the cycle here as well as in the plugin: a CLI is exactly where
+      // someone types a descendant's id by mistake, and the failure mode is a
+      // tree that cannot be rendered.
+      let walk = view.tree.get(${JSON.stringify(dest.id)});
+      while (walk && walk.id !== "__root__") {
+        if (walk.id === node.id) return { __error: "that destination is inside the note you are moving" };
+        walk = walk.parent ? view.tree.get(walk.parent) : null;
+      }
+      const ok = await view.changeParent(node, ${JSON.stringify(dest.id)}, { silentSuccess: true });
+      view.render();
+      return { ok };`);
+    if (!r.ok) die("move refused by the plugin");
+    console.log(`moved ${t.id} → ${dest.id === ROOT_ID ? "/" : dest.id}`);
+    break;
+  }
   default:
-    console.log(`sp — Stashpad CLI. Commands: ls tree cat find path info open add done
+    console.log(`sp — Stashpad CLI. Commands: ls tree cat find path info open add done move
 Flags: --vault <path> --folder <name> -d <depth>
 Targets: id | id-prefix | Title/Path/Segments (Sift match) | "/" for root`);
 }

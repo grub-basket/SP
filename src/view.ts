@@ -1733,6 +1733,7 @@ export class StashpadView extends ItemView {
         this.plugin.settings.exportFolder,
         "_attachments",
         "_processed",
+        "_failed-imports",
         "_authors",
       ]
         .map((s) => (s ?? "").trim().replace(/^\/+|\/+$/g, ""))
@@ -2960,6 +2961,7 @@ export class StashpadView extends ItemView {
       h: this.listEl?.scrollHeight ?? -1,
       kb: this.keyboardVisible ? 1 : 0,
     });
+    this.backlinkIndex = null;   // rebuilt on demand; never carried across renders
     try {
       this.renderInner(policy);
     } finally {
@@ -6466,6 +6468,7 @@ export class StashpadView extends ItemView {
       }
       this.refreshStuckPreview(container, node, text);
       if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
+      this.renderLinkRail(container, node);
       // Multiplayer footer: author / contributors / last-edit. Each
       // sub-piece is gated by its own toggle in settings; the row only
       // renders if at least one piece is enabled AND has data.
@@ -6582,6 +6585,108 @@ export class StashpadView extends ItemView {
       container.empty();
       this.renderNoteBody(container, node, opts);
     };
+  }
+
+  /** 0.268.3: path -> notes that link to it, built ONCE per render.
+   *
+   *  `resolvedLinks` is a vault-wide map of every link in every file. Reading
+   *  it per rendered row would be the render-cost mistake this file already
+   *  made twice, so it is inverted once and reused for the whole pass, then
+   *  dropped. Rebuilt on the next render rather than cached across renders,
+   *  because a stale backlink list is worse than a cheap rebuild: it names
+   *  notes that no longer point here.
+   *
+   *  Null until something asks for it, so a vault with the setting off never
+   *  pays anything at all. */
+  private backlinkIndex: Map<string, string[]> | null = null;
+
+  private backlinksFor(path: string): string[] {
+    if (!this.backlinkIndex) {
+      const idx = new Map<string, string[]>();
+      const resolved = (this.app.metadataCache as unknown as {
+        resolvedLinks?: Record<string, Record<string, number>>;
+      }).resolvedLinks ?? {};
+      for (const [from, targets] of Object.entries(resolved)) {
+        for (const to of Object.keys(targets)) {
+          const list = idx.get(to);
+          if (list) list.push(from); else idx.set(to, [from]);
+        }
+      }
+      this.backlinkIndex = idx;
+    }
+    return this.backlinkIndex.get(path) ?? [];
+  }
+
+  /** 0.268.3: the notes this one links to, and the notes that link back.
+   *
+   *  A SEPARATE row from the attachment rail, deliberately. Files, outgoing
+   *  links and backlinks are three different kinds of thing, and one
+   *  undifferentiated strip of chips would say less than no strip at all.
+   *
+   *  Outgoing links come from Obsidian's own parse (`getFileCache().links`)
+   *  rather than a regex over the body. It already did the work, it handles
+   *  aliases and headings correctly, and it means this does not touch the
+   *  cached render entry's shape. */
+  private renderLinkRail(parent: HTMLElement, node: TreeNode): void {
+    const s = getSettings();
+    if (!node.file || (!s.railShowOutgoing && !s.railShowBacklinks)) return;
+
+    const seen = new Set<string>();
+    const entries: { label: string; path: string; dir: "out" | "in" }[] = [];
+
+    if (s.railShowOutgoing) {
+      const links = this.app.metadataCache.getFileCache(node.file)?.links ?? [];
+      for (const l of links) {
+        const dest = this.app.metadataCache.getFirstLinkpathDest(l.link, node.file.path);
+        // Files already have the attachment rail; this row is about NOTES.
+        if (!dest || dest.extension !== "md") continue;
+        if (seen.has(`out:${dest.path}`)) continue;
+        seen.add(`out:${dest.path}`);
+        entries.push({ label: l.displayText || dest.basename, path: dest.path, dir: "out" });
+      }
+    }
+    if (s.railShowBacklinks) {
+      for (const from of this.backlinksFor(node.file.path)) {
+        if (!from.endsWith(".md") || from === node.file.path) continue;
+        if (seen.has(`in:${from}`)) continue;
+        // 0.268.3: ignore Stashpad's OWN bookkeeping links.
+        //
+        // fmSync writes `parentLink` and `children` as wikilinks for recovery,
+        // and `resolvedLinks` counts them like any other. Measured on a plain
+        // test folder: a note with ONE real backlink reported four, the other
+        // three being its parent and siblings via frontmatter. A backlink list
+        // that is mostly the tree you are already looking at is worse than no
+        // list.
+        //
+        // Obsidian parses frontmatter links separately from body links, so the
+        // test is simply "does its BODY link here" rather than a guess about
+        // field names.
+        const src = this.app.vault.getAbstractFileByPath(from);
+        if (!(src instanceof TFile)) continue;
+        const bodyLinks = this.app.metadataCache.getFileCache(src)?.links ?? [];
+        const linksInBody = bodyLinks.some((l) =>
+          this.app.metadataCache.getFirstLinkpathDest(l.link, from)?.path === node.file!.path);
+        if (!linksInBody) continue;
+        seen.add(`in:${from}`);
+        entries.push({ label: from.split("/").pop()?.replace(/\.md$/, "") ?? from, path: from, dir: "in" });
+      }
+    }
+    if (!entries.length) return;
+
+    const rail = parent.createDiv({ cls: "stashpad-link-rail" });
+    for (const e of entries) {
+      const chip = rail.createDiv({ cls: `stashpad-link-chip is-${e.dir}` });
+      setIcon(chip.createSpan({ cls: "stashpad-link-chip-icon" }), e.dir === "out" ? "arrow-up-right" : "corner-down-left");
+      chip.createSpan({ cls: "stashpad-link-chip-label", text: e.label });
+      chip.title = e.dir === "out" ? `Links to ${e.path}` : `${e.path} links here`;
+      chip.onclick = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const f = this.app.vault.getAbstractFileByPath(e.path);
+        if (f instanceof TFile) void this.openFileAtEnd(f);
+      };
+      chip.addEventListener("dblclick", (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+    }
   }
 
   private renderAttachmentRail(parent: HTMLElement, paths: string[]): void {
@@ -6927,13 +7032,39 @@ export class StashpadView extends ItemView {
     // <stashpad>/_attachments and an ![[wikilink]] is appended to the
     // textarea body.
     const importAndAppend = async (files: File[]): Promise<void> => {
+      // 0.268.1: a dropped `.stash` is a BUNDLE, not an attachment. Routing is
+      // the import service's job, since it already owns the encrypted queue and
+      // the "waiting" notification; this only lays out what comes back.
+      const routed = await this.plugin.importService.routeDroppedFiles(
+        files, this.noteFolder, (f) => this.importAttachment(f),
+      );
       let appended = "";
-      for (const f of files) {
-        const link = await this.importAttachment(f);
-        if (!link) continue;
+      for (const link of routed.links) {
         const cur = ta.value + appended;
         const sep = cur && !cur.endsWith("\n") ? "\n" : "";
         appended += `${sep}${link}\n`;
+      }
+      // ONE summary, never one notice per file. A five-file drop that imported
+      // two bundles, parked an encrypted one and attached the rest should read
+      // as a single sentence.
+      if (routed.imported || routed.parked || routed.failed) {
+        const bits: string[] = [];
+        if (routed.imported) bits.push(`imported ${routed.imported} bundle${routed.imported === 1 ? "" : "s"}`);
+        if (routed.attached) bits.push(`attached ${routed.attached} file${routed.attached === 1 ? "" : "s"}`);
+        if (routed.parked) bits.push(`${routed.parked} encrypted bundle${routed.parked === 1 ? "" : "s"} waiting for a password`);
+        if (routed.failed) bits.push(`${routed.failed} failed`);
+        const msg = `Stashpad: ${bits.join(", ")}.`;
+        if (routed.parked) {
+          this.plugin.notifications.show({
+            message: msg, kind: "info", category: "system",
+            actions: [{
+              label: "Import now",
+              onClick: () => void this.plugin.importService.importPendingEncrypted(),
+            }],
+          });
+        } else {
+          new Notice(msg, 6000);
+        }
       }
       if (appended) {
         ta.value = ta.value + appended;
@@ -15734,7 +15865,15 @@ export class StashpadView extends ItemView {
         affectedPaths: [path],
         folder: this.noteFolder,
       });
-      return `![[${path}]]`;
+      // 0.268.2: name first, then the file, separated by a SPACE.
+      //
+      // A bare attachment link leaves the note with nothing to read: it shows
+      // blank in the list, and its filename comes from the path rather than
+      // from anything the user chose. A space rather than a newline keeps it
+      // one line, so the note still reads as a single item.
+      const s = getSettings();
+      const ref = s.attachmentsEmbedded ? `![[${path}]]` : `[[${path}]]`;
+      return s.attachmentNamePrefix ? `${file.name} ${ref}` : ref;
     } catch (e) {
       new Notice(`Stashpad: attachment failed (${(e as Error).message})`);
       return null;

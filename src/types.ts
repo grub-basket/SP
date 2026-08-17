@@ -160,7 +160,7 @@ export function isStashpadSidecar(path: string): boolean {
 }
 
 export const RESERVED_SUBFOLDER_NAMES: ReadonlySet<string> = new Set([
-  "_attachments", "_authors", "_exports", "_imports", "_processed",
+  "_attachments", "_authors", "_exports", "_imports", "_processed", "_failed-imports",
   "_archive", ".archive", // .archive is legacy (pre-0.79.10)
 ]);
 

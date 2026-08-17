@@ -168,10 +168,30 @@ export class NoteBodyRenderer {
     // 0.209.1: require a non-space char in the target. `![[   ]]` used to match,
     // which pushed "   " as an attachment AND deleted that text from the body —
     // so a stray pair of brackets made visible text disappear.
-    const text = body.replace(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (_m, p1) => {
+    let text = body.replace(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (_m, p1) => {
       attachments.push(p1);
       return "";
-    }).replace(/\n{3,}/g, "\n\n").trim();
+    });
+    // 0.268.2: a PLAIN wikilink to a file is an attachment too.
+    //
+    // The rail used to recognise embeds only, so attaching without embedding
+    // left the file out of the rail AND left its link sitting in the body as
+    // text. That made "don't embed my attachments" strictly worse than
+    // embedding, which is not a real choice.
+    //
+    // Decided by the extension rather than by asking the vault: it is a string
+    // test, it works before the file exists, and it cannot be wrong in a way
+    // that loses data — a false positive moves a link into the rail, where it
+    // is still a link. `.md` is excluded because a wikilink to a NOTE is a
+    // reference, not a file, and belongs in the text.
+    text = text.replace(/\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (m, p1: string) => {
+      const target = String(p1).trim();
+      const ext = /\.([A-Za-z0-9]{1,8})$/.exec(target.split(/[?#]/)[0])?.[1]?.toLowerCase();
+      if (!ext || ext === "md") return m;   // a note link stays in the body
+      attachments.push(target);
+      return "";
+    });
+    text = text.replace(/\n{3,}/g, "\n\n").trim();
     return { text, attachments };
   }
 }

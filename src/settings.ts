@@ -645,6 +645,26 @@ export interface StashpadSettings {
    *  from those. Blur is the default only because it is what the feature has
    *  always looked like. */
   obscureStyle: "blur" | "solid";
+  /** 0.268.2: put the file's name in front of the link when you attach one.
+   *
+   *  On by default. An attachment on its own is a link and nothing else, so the
+   *  note reads as blank in the list and sorts under a name derived from the
+   *  file path rather than anything you chose. The name in front gives the note
+   *  something to say and something to search for. */
+  attachmentNamePrefix: boolean;
+  /** 0.268.2: attach files as an EMBED (`![[x]]`) rather than a plain link
+   *  (`[[x]]`). On by default, which is the existing behaviour. Off suits
+   *  people who want a list of files rather than a wall of previews. */
+  attachmentsEmbedded: boolean;
+  /** 0.268.3: show the notes THIS note links to, under the attachment rail.
+   *  Off by default — it is useful for a hub note and noise for everything
+   *  else, and a capture-first list should stay quiet unless asked. */
+  railShowOutgoing: boolean;
+  /** 0.268.3: show the notes that link TO this one. Off by default, and
+   *  separately from outgoing, because "what does this point at" and "who
+   *  cares about this" are different questions and people want them at
+   *  different times. */
+  railShowBacklinks: boolean;
   /** 0.237.0: render ||spoiler|| in note bodies as blurred-until-tapped. */
   spoilerMarkup: boolean;
   /** 0.238.0: bulk recolour from the colour-alias swatch applies to EVERY
@@ -875,6 +895,10 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureFolders: {},
   obscureAllScope: "device",
   obscureStyle: "blur",
+  attachmentNamePrefix: true,
+  attachmentsEmbedded: true,
+  railShowOutgoing: false,
+  railShowBacklinks: false,
   spoilerMarkup: true,
   bulkRecolorAllFolders: false,
   autoNavOnMoveIn: false,
@@ -1686,7 +1710,7 @@ export class StashpadSettingTab extends PluginSettingTab {
             this.plugin.settings.importDropFolder,
             this.plugin.settings.exportFolder,
             // Stashpad-reserved subfolders — a notes folder must not BE or live under one.
-            "_attachments", "_processed", "_authors", "_deleted", "archive", "trash", ".stashpad",
+            "_attachments", "_processed", "_failed-imports", "_authors", "_deleted", "archive", "trash", ".stashpad",
           ].map((x) => (x ?? "").trim().replace(/^\/+|\/+$/g, "")).filter(Boolean));
           if (segs.some((seg) => reserved.has(seg))) {
             new Notice(`"${cleaned}" uses a reserved Stashpad subfolder name. Pick something else.`);
@@ -1923,6 +1947,16 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
     cats.listDisplay.push(toggle("Obscure every note, everywhere", "Blur every note in every Stashpad \u2014 for handing someone your screen, or working somewhere overlooked. This OVERRIDES everything else while it is on: a folder set to Never and a note set not to obscure are both covered. Nothing is rewritten, so they come back exactly as they were when you turn it off. Tapping a note still reveals it one at a time. VISUAL ONLY: the text is unchanged in the file and still turns up in search.",
       () => this.plugin.getObscureAll(), (v) => { void this.plugin.setObscureAll(v); }, ["obscure", "blur", "hide", "all", "global", "privacy", "panic"]));
+    cats.listDisplay.push(toggle("Put the file name in front of an attachment", "When you attach a file, the note reads \"report.pdf\" followed by the file itself, separated by a space. Without it the note is a link and nothing else, so it shows up blank in the list and is hard to search for. On by default.",
+      () => this.plugin.settings.attachmentNamePrefix, (v) => { this.plugin.settings.attachmentNamePrefix = v; }, ["attachment", "file", "name", "prefix", "title"]));
+    cats.listDisplay.push(toggle("Embed attached files", "Attach files as an embed, so images and PDFs preview in the note. Turn this off to insert a plain link instead, which keeps a note with several files readable as a list. On by default. Either way the file is in the rail.",
+      () => this.plugin.settings.attachmentsEmbedded, (v) => { this.plugin.settings.attachmentsEmbedded = v; }, ["attachment", "embed", "link", "preview", "file"]));
+
+    cats.listDisplay.push(toggle("Show outgoing links in the rail", "List the notes this note links to, in a row under its files. Off by default: it earns its place on a hub note and is noise on everything else. Files are unaffected \u2014 they are always in the rail.",
+      () => this.plugin.settings.railShowOutgoing, (v) => { this.plugin.settings.railShowOutgoing = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "links", "outgoing", "backlinks"]));
+    cats.listDisplay.push(toggle("Show backlinks in the rail", "List the notes that link TO this one, in a row under its files. Off by default. Kept separate from outgoing links because \"what does this point at\" and \"who refers to this\" are different questions.",
+      () => this.plugin.settings.railShowBacklinks, (v) => { this.plugin.settings.railShowBacklinks = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "backlinks", "incoming", "links"]));
+
     cats.listDisplay.push(this.renderDef("How covered notes look", "\"Blur\" keeps the shape of the text. \"Solid bar\" paints over it — faster on a phone, because a blur has to be computed for every glyph every time the text is drawn, and it hides more, since a blur still leaks word shapes and lengths. Either way the text is untouched in the file.", (st) => {
       st.addDropdown((d) => {
         d.addOption("blur", "Blur");

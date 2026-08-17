@@ -11,7 +11,7 @@ import { ConfirmModal, ImportDupChoiceModal } from "./modals";
 /** Reserved subfolders inside a Stashpad folder — never treated as drop
  *  targets, and the import engine ignores files that land inside them. */
 const RESERVED_SUBFOLDERS = new Set([
-  "_attachments", "_authors", "_exports", "_imports", "_processed", "_archive",
+  "_attachments", "_authors", "_exports", "_imports", "_processed", "_failed-imports", "_archive",
   ".archive", // legacy (pre-0.79.10) — keep ignoring any that exist
   "archive", "trash", // 0.136.0: per-folder archive/trash subfolders
 ]);
@@ -932,8 +932,155 @@ export class ImportService {
       return true;
     } catch (e) {
       console.warn("[Stashpad] loose .stash import failed", file.path, e);
+      await this.quarantineFailedImport(file, root, e);
       return false;
     }
+  }
+
+  /** 0.268.5: move a bundle we could not read into `_failed-imports/`, with a
+   *  note saying why.
+   *
+   *  A failure used to be left exactly where it was. That is right about not
+   *  destroying it and wrong about everything else: it sits among your notes,
+   *  it looks identical to a bundle that is merely waiting for a password, and
+   *  the sweep finds it again on every pass and fails again, forever.
+   *
+   *  `_failed-imports` is a reserved subfolder, so the sweep stops seeing it.
+   *  The file is MOVED rather than deleted, because we could not read it and
+   *  therefore cannot know what it was worth.
+   *
+   *  Only genuine read and parse failures reach here. A cancelled password
+   *  prompt returns earlier without throwing, so choosing "not now" never
+   *  quarantines anything. */
+  private async quarantineFailedImport(file: TFile, root: string, err: unknown): Promise<void> {
+    try {
+      const dir = root ? `${root}/_failed-imports` : "_failed-imports";
+      if (!(this.app.vault.getAbstractFileByPath(dir) instanceof TFolder)) {
+        await this.app.vault.createFolder(dir).catch(() => { /* raced or exists */ });
+      }
+      let dest = `${dir}/${file.name}`;
+      for (let i = 2; this.app.vault.getAbstractFileByPath(dest); i++) {
+        dest = `${dir}/${file.basename}-${i}.${file.extension}`;
+      }
+      await this.app.fileManager.renameFile(file, dest);
+      // A sibling MARKDOWN file with real frontmatter, not a .txt.
+      //
+      // The trade-off, decided deliberately: `_failed-imports` is reserved to
+      // STASHPAD, not to Obsidian, so a .md here does show up in the quick
+      // switcher, search and the graph, where a .txt would have stayed quiet.
+      // In exchange the record is queryable — `type: stashpad-failed-import`
+      // gives a Base something to filter on, so "everything that failed to
+      // import, when, and why" is a view rather than a folder you go and read.
+      // A failure record with structured fields is worth more than a silent
+      // one, and anyone who disagrees can exclude the folder in Obsidian's
+      // own settings.
+      //
+      // NO `id` and NO `parent`, deliberately. Those two fields are what make
+      // a file a Stashpad NOTE; without them this can never be adopted into
+      // the tree, appear in the list, or be counted by folder discovery.
+      const reason = err instanceof Error ? err.message : String(err);
+      const noteName = dest.replace(/\.[^.]+$/, "") + ".error.md";
+      const yaml = (v: string): string => `"${v.replace(/"/g, '\\"')}"`;
+      await this.app.vault.create(noteName,
+        [
+          `---`,
+          `type: stashpad-failed-import`,
+          `file: ${yaml(file.name)}`,
+          `folder: ${yaml(root)}`,
+          `failedAt: ${new Date().toISOString()}`,
+          `reason: ${yaml(reason)}`,
+          `---`,
+          ``,
+          `# Could not import ${file.name}`,
+          ``,
+          `Stashpad could not read this bundle, so it was moved here instead of`,
+          `being imported. Nothing was deleted.`,
+          ``,
+          `**Reason:** ${reason}`,
+          ``,
+          `Move the \`.stash\` file back into **${root || "the folder above"}** to try`,
+          `again, or delete both files if you no longer need it.`,
+        ].join("\n"),
+      ).catch(() => { /* the move is what matters; the record is a courtesy */ });
+    } catch (e2) {
+      // Quarantine failing must never turn a failed import into a crash. The
+      // file simply stays where it was, which is the old behaviour.
+      console.warn("[Stashpad] could not quarantine a failed import", file.path, e2);
+    }
+  }
+
+  /** 0.268.1: route a batch of DROPPED files.
+   *
+   *  The composer dropzone used to hand every file to the attachment path, so a
+   *  `.stash` was written into `_attachments` and linked as a file. It was never
+   *  imported, never prompted for a password, and could not be rescued later
+   *  either, because `_attachments` is a reserved subfolder the sweep skips by
+   *  design. Dropping the same bundle into the folder itself behaved completely
+   *  differently, which is the worse kind of inconsistency: the surface inside
+   *  the plugin was the one that did the wrong thing.
+   *
+   *  PARTITION FIRST, act second, so the caller can describe what happened in
+   *  one sentence instead of narrating file by file:
+   *    - plaintext bundle  -> imported now
+   *    - encrypted bundle  -> staged and PARKED, never prompted inline
+   *    - anything else     -> handed back to `attach`
+   *
+   *  Encrypted bundles deliberately do not prompt here. A drop is not consent to
+   *  a password modal, least of all several in a row for a multi-file drop. They
+   *  join the queue that already exists, and the user answers once, when they
+   *  choose to.
+   *
+   *  Staging goes to the folder ROOT rather than `_attachments`, or the parked
+   *  bundle would sit somewhere the importer refuses to look. */
+  async routeDroppedFiles(
+    files: File[],
+    folder: string,
+    attach: (f: File) => Promise<string | null>,
+  ): Promise<{ imported: number; parked: number; attached: number; failed: number; links: string[] }> {
+    const root = (folder || "").replace(/\/+$/, "");
+    const out = { imported: 0, parked: 0, attached: 0, failed: 0, links: [] as string[] };
+    const existingIds = this.liveRootIds(root);
+
+    for (const f of files) {
+      if (!/\.stash$/i.test(f.name)) {
+        const link = await attach(f);
+        if (link) { out.links.push(link); out.attached++; } else out.failed++;
+        continue;
+      }
+      try {
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        const staged = await this.stageBundle(root, f.name, bytes);
+        if (!staged) { out.failed++; continue; }
+        if (isEncryptedStash(bytes)) {
+          this.parkEncrypted(staged.path);
+          out.parked++;
+          continue;
+        }
+        const ok = await this.importOneStash(staged, root, existingIds, false);
+        if (ok) out.imported++; else out.failed++;
+      } catch (e) {
+        console.warn("[Stashpad] dropped .stash could not be routed", f.name, e);
+        out.failed++;
+      }
+    }
+    return out;
+  }
+
+  /** Write dropped bundle bytes into the folder root under a free name.
+   *
+   *  Suppressed first: the drop-watcher is listening for exactly this file
+   *  appearing, and without it the watcher and this method would both try to
+   *  import the same bundle. */
+  private async stageBundle(root: string, name: string, bytes: Uint8Array): Promise<TFile | null> {
+    const safe = name.replace(/[^\w.\-]+/g, "_").replace(/\.stash$/i, "");
+    let path = root ? `${root}/${safe}.stash` : `${safe}.stash`;
+    for (let i = 2; this.app.vault.getAbstractFileByPath(path); i++) {
+      path = root ? `${root}/${safe}-${i}.stash` : `${safe}-${i}.stash`;
+    }
+    this.suppress(path, 60000);
+    await this.app.vault.createBinary(path, bytes.buffer as ArrayBuffer);
+    const f = this.app.vault.getAbstractFileByPath(path);
+    return f instanceof TFile ? f : null;
   }
 
   async importLooseStashesIn(folder: string, opts: { auto?: boolean } = {}): Promise<number> {
