@@ -78,6 +78,10 @@ export interface TreeNode {
 
 export type TimeFilter = "all" | "year" | "month" | "week" | "day";
 
+/** 0.270.0: which end of its sibling list a note is pinned to. Frontmatter
+ *  `listPinned` stores this; legacy `true` reads as "top". */
+export type ListPinEdge = "top" | "bottom";
+
 /** Per-folder view mode (settings.viewModes keyed by folder path).
  *  - "nested" (default): tree, immediate children of focus.
  *  - "flat": all descendants of focus, flat, sorted by the current sort mode.

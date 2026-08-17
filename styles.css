@@ -1633,6 +1633,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   width: 13px;
   height: 13px;
 }
+/* 0.270.0: a bottom pin points down, so the badge reads as "held at the end"
+   rather than looking identical to a top pin. */
+.stashpad-note-listpin.is-pinned-bottom svg {
+  transform: rotate(180deg);
+}
 
 /* 0.99.5: a note sitting on a pending CUT (note clipboard) — ghosted + dashed
    outline, like a cut file in a file manager. Cleared when the cut is pasted

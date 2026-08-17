@@ -64,7 +64,7 @@ export type CommandId =
   | "exportStash" | "importStash" | "pickFolder"
   | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
   | "swapWithParent"
-  | "togglePin" | "listPin"
+  | "togglePin" | "listPin" | "listPinBottom"
   | "toggleTask" | "setDue" | "openAllTasks"
   | "jumpToTop" | "jumpToBottom"
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
@@ -144,7 +144,8 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "copyCodeBlock",   label: "Copy code from codeblock",      desc: "Default: { — copy the contents of the cursor row's first codeblock (or pick one when multiple exist).", defaultPrimary: "{" },
   { id: "swapWithParent",  label: "Swap with parent (ouroboros)",  desc: "Promote the cursor row above its current parent; the parent slides under it (carrying its other children). No default — bind in this tab.", defaultPrimary: "" },
   { id: "togglePin",       label: "Pin / unpin selected note",     desc: "Default: P — toggle the sidebar pin state of the cursor row (or focused note).", defaultPrimary: "P" },
-  { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. No default chord.", defaultPrimary: "" },
+  { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
+  { id: "listPinBottom",   label: "Pin / unpin to bottom of list", desc: "Float the cursor row (or selection) to the BOTTOM of its list. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: G — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "G" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
   { id: "openAllTasks",    label: "Open all tasks (aggregate view)", desc: "Default: Shift+T — open the aggregate “All tasks” view collecting tasks across every Stashpad folder.", defaultPrimary: "Shift+T" },
@@ -307,6 +308,11 @@ export interface StashpadSettings {
    *  you can copy from the Diagnostics tab. Purely local, no network, no file
    *  writes; a no-op when off. Ships dormant — never needs stripping for the
    *  store / pristine. */
+  /** 0.269.0: when a Stashpad note is opened in an ordinary editor tab — the
+   *  quick switcher, a wikilink, the file explorer — close that tab and show
+   *  the note inside Stashpad instead. Off by default: it changes what a very
+   *  ordinary action does, so it has to be chosen. */
+  openNotesInStashpad: boolean;
   debugTrace: boolean;
   /** 0.268.18: mirror the trace to disk so it survives a crash or force-quit.
    *  OFF by default — see the comment on the default below. */
@@ -811,6 +817,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   folderPanelPinnedGrouping: "pin-order",
   enablePerfProfiling: false,
   diagnosticsEnabledAt: { perf: 0, trace: 0 },
+  openNotesInStashpad: false,
   debugTrace: false,
   // 0.268.18: OFF. Persistence was added for a bug thought to hang the app,
   // where a force-quit would take the only copy of the trace with it. That
@@ -2276,6 +2283,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.autofocusComposerAfterSend, (v) => { this.plugin.settings.autofocusComposerAfterSend = v; }, ["composer", "focus", "send"]));
     cats.composerCopy.push(toggle("Focus composer when opening a note", "Focus the composer when you open or switch into a Stashpad view. OFF (default) focuses the LIST instead, so arrow-key navigation works right away instead of the composer grabbing focus every time. (Separate from 'after sending' above.)",
       () => this.plugin.settings.focusComposerOnOpen, (v) => { this.plugin.settings.focusComposerOnOpen = v; }, ["composer", "focus", "open", "navigate", "list"]));
+    cats.windowsTabs.push(toggle("Open Stashpad notes in Stashpad", "When a Stashpad note is opened in an ordinary editor tab — from the quick switcher, a wikilink in another note, the file explorer, a search result, or a third-party switcher — close that tab and show the note inside Stashpad instead. Off by default. Stashpad's own \"Open in Obsidian editor\" is exempt and always reaches the editor, so this cannot loop; switching to an editor tab you already had open is also left alone. Only notes with a Stashpad id in a known Stashpad folder are affected.",
+      () => this.plugin.settings.openNotesInStashpad, (v) => { this.plugin.settings.openNotesInStashpad = v; }, ["open", "route", "redirect", "intercept", "editor", "switcher", "wikilink", "quick switcher"]));
     cats.windowsTabs.push(toggle("Search opens the note in its list (in context)", "When you pick a search result, open the LIST that contains the note (focus its parent) and scroll to the note — so you see it in context instead of landing on the focused-note header. On by default.",
       () => this.plugin.settings.searchOpensInContext, (v) => { this.plugin.settings.searchOpensInContext = v; }, ["search", "context", "list", "scroll", "parent"]));
     cats.windowsTabs.push(toggle("Open in new window — duplicate tab", "ON: the new-window button (in the time-filter row) duplicates the current Stashpad tab — original stays open in the main window. OFF: the leaf is MOVED to the new window, closing the original tab.",

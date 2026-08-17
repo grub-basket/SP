@@ -819,8 +819,13 @@ export class StashpadFolderPanelView extends ItemView {
   /** A folder's ROOT-level (Home) list-pinned notes — backs the folder-panel
    *  reveal. Reuses childrenOf(folder, ROOT_ID) + the listPinned frontmatter. */
   private folderHomePinnedNotes(folder: string): TFile[] {
-    return this.childrenOf(folder, ROOT_ID).filter((f) =>
-      (this.app.metadataCache.getFileCache(f)?.frontmatter as any)?.listPinned === true);
+    // 0.270.0: `listPinned` is "top" | "bottom" now; legacy `true` == "top".
+    // Accept all three — an `=== true` test would silently drop every note
+    // pinned since the bottom-pin feature landed.
+    return this.childrenOf(folder, ROOT_ID).filter((f) => {
+      const v = (this.app.metadataCache.getFileCache(f)?.frontmatter as any)?.listPinned;
+      return v === true || v === "top" || v === "bottom";
+    });
   }
 
   /** Collapsible "Hidden (N)" group at the bottom of the Folders list, so hidden

@@ -9,6 +9,7 @@ import {
   isReservedSubfolderName,
   isInReservedSubfolder,
   type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
+  type ListPinEdge,
 } from "./types";
 import { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
@@ -2696,7 +2697,12 @@ export class StashpadView extends ItemView {
         const a = parseAuthorRef(this.app.metadataCache.getFileCache(n.file)?.frontmatter?.author);
         if (!a || a.id !== authorId) return false;
       }
-      if (cutoff && n.created) {
+      // 0.270.0: a list pin is a deliberate "keep this here" — it outranks the
+      // TIME filter, so pinned notes stay put as the window slides (the point of
+      // pinning a reference note to the bottom of a chronological list). Content
+      // filters (tag/color/author/…) still apply: those are "show me only X",
+      // where silently including a pinned non-match would be wrong.
+      if (cutoff && n.created && !this.isListPinned(n.id)) {
         const t = Date.parse(n.created);
         if (!Number.isNaN(t) && t < cutoff) return false;
       }
@@ -6237,9 +6243,11 @@ export class StashpadView extends ItemView {
       // 0.106.x: list-pin indicator — a lucide pin icon under the timestamp,
       // placed before the children-count arrow.
       if (isPinnedRow) {
+        const edge = this.listPinEdge(node.id) ?? "top";
         const pin = metaBottom.createSpan({ cls: "stashpad-note-listpin" });
+        pin.addClass(edge === "bottom" ? "is-pinned-bottom" : "is-pinned-top");
         setIcon(pin, "pin");
-        pin.setAttr("aria-label", "Pinned to top of list");
+        pin.setAttr("aria-label", `Pinned to ${edge} of list`);
       }
       if (childCount > 0) {
         const enter = metaBottom.createSpan({ cls: "stashpad-note-enter" });
@@ -8553,7 +8561,8 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.expandAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdExpandAll(); return; }
       if (matchBinding(e, sb.collapseAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdCollapseAll(); return; }
       if (matchBinding(e, sb.togglePin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdTogglePin(); return; }
-      if (matchBinding(e, sb.listPin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin(); return; }
+      if (matchBinding(e, sb.listPin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin("top"); return; }
+      if (matchBinding(e, sb.listPinBottom)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin("bottom"); return; }
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
     }
@@ -12928,6 +12937,10 @@ export class StashpadView extends ItemView {
     // back to the tab to the right — which is rarely what the user wants.
     const originLeaf = this.leaf;
     const leaf = ws.getLeaf("tab");
+    // 0.269.0: this IS "open in the Obsidian editor", so it must reach the
+    // editor even when notes are being routed into Stashpad. Stamped before
+    // openFile so the router sees the mark on the very first file-open event.
+    this.plugin.markEditorBypass(leaf, file);
     await leaf.openFile(file, { active: true });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
@@ -13118,14 +13131,24 @@ export class StashpadView extends ItemView {
     else if (unpinned > 0) new Notice(`Unpinned ${unpinned} note${unpinned === 1 ? "" : "s"} from sidebar.`);
   }
 
-  /** Is this note list-pinned (floated to the top of its sibling list)?
+  /** Which END of the sibling list this note is pinned to, or null if unpinned.
+   *  0.270.0: `listPinned` accepts "top" | "bottom"; legacy `true` reads as
+   *  "top" so notes pinned before this release keep their behavior. */
+  listPinEdge(id: StashpadId): ListPinEdge | null {
+    const node = this.tree.get(id);
+    if (!node?.file) return null;
+    const ov = this.listPinnedState.get(node.file.path);
+    if (ov) return ov.pinned ? (ov.edge ?? "top") : null;
+    const raw = this.app.metadataCache.getFileCache(node.file)?.frontmatter?.listPinned;
+    if (raw === true || raw === "top") return "top";
+    if (raw === "bottom") return "bottom";
+    return null;
+  }
+
+  /** Is this note list-pinned (floated to either end of its sibling list)?
    *  Distinct from the sidebar pin (plugin.isPinned). Reads frontmatter. */
   isListPinned(id: StashpadId): boolean {
-    const node = this.tree.get(id);
-    if (!node?.file) return false;
-    const ov = this.listPinnedState.get(node.file.path);
-    if (ov) return ov.pinned;
-    return this.app.metadataCache.getFileCache(node.file)?.frontmatter?.listPinned === true;
+    return this.listPinEdge(id) !== null;
   }
   private listPinnedAt(id: StashpadId): number {
     const node = this.tree.get(id);
@@ -13136,30 +13159,37 @@ export class StashpadView extends ItemView {
     const t = typeof v === "string" ? Date.parse(v) : NaN;
     return Number.isNaN(t) ? 0 : t;
   }
-  /** Float list-pinned children to the top of `base` (in pin order). Returns
-   *  `base` unchanged when nothing in this parent is pinned — so unpinned
-   *  lists keep EXACTLY their prior ordering/behavior (zero regression risk). */
+  /** Float list-pinned children to the ends of `base` (in pin order): notes
+   *  pinned "top" lead, notes pinned "bottom" trail. Returns `base` unchanged
+   *  when nothing in this parent is pinned — so unpinned lists keep EXACTLY
+   *  their prior ordering/behavior (zero regression risk). */
   private hoistListPinned(parentId: StashpadId, base: StashpadId[]): StashpadId[] {
     const childIds = this.tree.getChildren(parentId).map((n) => n.id);
     if (!childIds.some((id) => this.isListPinned(id))) return base;
     // base may be empty (manual order unset) — fall back to the tree's order.
     const seen = new Set(base);
     const full = [...base, ...childIds.filter((id) => !seen.has(id))];
-    const pinned = full.filter((id) => this.isListPinned(id)).sort((a, b) => this.listPinnedAt(a) - this.listPinnedAt(b));
-    const rest = full.filter((id) => !this.isListPinned(id));
-    return [...pinned, ...rest];
+    const byPinTime = (a: StashpadId, b: StashpadId) => this.listPinnedAt(a) - this.listPinnedAt(b);
+    const top = full.filter((id) => this.listPinEdge(id) === "top").sort(byPinTime);
+    const bottom = full.filter((id) => this.listPinEdge(id) === "bottom").sort(byPinTime);
+    const rest = full.filter((id) => this.listPinEdge(id) === null);
+    return [...top, ...rest, ...bottom];
   }
 
-  /** Toggle the list pin (float-to-top) on the action targets. Distinct from
-   *  the sidebar pin (cmdTogglePin). Writes listPinned/listPinnedAt + undo. */
-  async cmdToggleListPin(): Promise<void> {
+  /** Toggle the list pin on the action targets, at either END of the list.
+   *  Distinct from the sidebar pin (cmdTogglePin). Writes listPinned/
+   *  listPinnedAt + undo. Re-running with the SAME edge unpins; running with
+   *  the other edge MOVES the pin across rather than unpinning. */
+  async cmdToggleListPin(edge: ListPinEdge = "top"): Promise<void> {
     let targets = this.getActionTargets();
     if (targets.length === 0) {
       const focused = this.tree.get(this.focusId);
       if (focused?.file) targets = [focused];
     }
     if (targets.length === 0) { new Notice("Nothing to pin."); return; }
-    const anyUnpinned = targets.some((t) => !this.isListPinned(t.id));
+    // Pin when anything isn't already pinned to THIS edge (so "pin to bottom"
+    // on a top-pinned note moves it down instead of unpinning it).
+    const anyUnpinned = targets.some((t) => this.listPinEdge(t.id) !== edge);
     const prior: { path: string; listPinned: unknown; listPinnedAt: unknown }[] = [];
     const stamp = new Date().toISOString();
     const changed: StashpadId[] = [];
@@ -13170,9 +13200,9 @@ export class StashpadView extends ItemView {
       const at = anyUnpinned ? (typeof fm?.listPinnedAt === "string" ? Date.parse(fm.listPinnedAt) || Date.parse(stamp) : Date.parse(stamp)) : 0;
       // Override now so the re-sort below reflects the new state immediately
       // (the metadata cache lags the frontmatter write by a tick).
-      this.listPinnedState.set(t.file.path, { pinned: anyUnpinned, at });
+      this.listPinnedState.set(t.file.path, { pinned: anyUnpinned, at, edge });
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
-        if (anyUnpinned) { m.listPinned = true; if (!m.listPinnedAt) m.listPinnedAt = stamp; }
+        if (anyUnpinned) { m.listPinned = edge; if (!m.listPinnedAt) m.listPinnedAt = stamp; }
         else { delete m.listPinned; delete m.listPinnedAt; }
       });
       changed.push(t.id);
@@ -13181,11 +13211,11 @@ export class StashpadView extends ItemView {
     this.tree.rebuild(folder);
     this.render();
     this.plugin.notifications.show({
-      message: anyUnpinned ? `Pinned ${changed.length} to top of list` : `Unpinned ${changed.length} from list`,
+      message: anyUnpinned ? `Pinned ${changed.length} to ${edge} of list` : `Unpinned ${changed.length} from list`,
       kind: "success", category: "edit", affectedIds: changed, folder,
     });
     this.plugin.getUndoStack(folder).push({
-      label: anyUnpinned ? `Pin to top (${changed.length})` : `Unpin from top (${changed.length})`,
+      label: anyUnpinned ? `Pin to ${edge} (${changed.length})` : `Unpin from ${edge} (${changed.length})`,
       undo: async () => {
         for (const p of prior) {
           const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
@@ -13194,9 +13224,11 @@ export class StashpadView extends ItemView {
             if (p.listPinned === undefined) delete m.listPinned; else m.listPinned = p.listPinned;
             if (p.listPinnedAt === undefined) delete m.listPinnedAt; else m.listPinnedAt = p.listPinnedAt;
           });
-          const wasPinned = p.listPinned === true;
+          const priorEdge: ListPinEdge | null =
+            p.listPinned === true || p.listPinned === "top" ? "top"
+            : p.listPinned === "bottom" ? "bottom" : null;
           const at = typeof p.listPinnedAt === "string" ? (Date.parse(p.listPinnedAt) || 0) : 0;
-          this.listPinnedState.set(p.path, { pinned: wasPinned, at });
+          this.listPinnedState.set(p.path, { pinned: priorEdge !== null, at, edge: priorEdge ?? undefined });
         }
         this.tree.rebuild(folder);
         this.render();
@@ -13419,7 +13451,7 @@ export class StashpadView extends ItemView {
    *  pin/unpin re-sorts the list on THIS render rather than n+1 (the metadata
    *  cache lags a frontmatter write). Reads fall back to the live cache when
    *  there's no override. */
-  private listPinnedState = new Map<string, { pinned: boolean; at: number }>();
+  private listPinnedState = new Map<string, { pinned: boolean; at: number; edge?: ListPinEdge }>();
 
   /** 0.197.0: was this occurrence closed out as MISSED (interval elapsed unfinished)
    *  rather than actually completed? Frontmatter-backed so it survives body edits. */
@@ -16502,15 +16534,32 @@ export class StashpadView extends ItemView {
         if (pinned) await this.plugin.unpinNote(pinRef);
         else await this.plugin.pinNote(pinRef);
       }));
-    // 0.105.0: list pin — float to the top of THIS list (distinct from sidebar).
-    const listPinned = this.isListPinned(node.id);
-    menu.addItem((it: any) => it
-      .setTitle(listPinned ? "Unpin from top of list" : "Pin to top of list")
-      .setIcon(listPinned ? "pin-off" : "arrow-up-to-line")
-      .onClick(() => {
-        focusClicked();
-        void this.cmdToggleListPin();
-      }));
+    // 0.105.0: list pin — float to an end of THIS list (distinct from sidebar).
+    // 0.270.0: now a submenu, since there are two ends to pin to. A pinned note
+    // also ignores the time filter, so the label says so once here rather than
+    // surprising the user later.
+    const pinEdge = this.listPinEdge(node.id);
+    menu.addItem((it: any) => {
+      it.setTitle("Pin in list").setIcon(pinEdge ? "pin-off" : "pin");
+      const sub = it.setSubmenu();
+      sub.addItem((s: any) => s
+        .setTitle("Top of list")
+        .setIcon("arrow-up-to-line")
+        .setChecked(pinEdge === "top")
+        .onClick(() => { focusClicked(); void this.cmdToggleListPin("top"); }));
+      sub.addItem((s: any) => s
+        .setTitle("Bottom of list")
+        .setIcon("arrow-down-to-line")
+        .setChecked(pinEdge === "bottom")
+        .onClick(() => { focusClicked(); void this.cmdToggleListPin("bottom"); }));
+      if (pinEdge) {
+        sub.addSeparator();
+        sub.addItem((s: any) => s
+          .setTitle("Unpin from list")
+          .setIcon("pin-off")
+          .onClick(() => { focusClicked(); void this.cmdToggleListPin(pinEdge); }));
+      }
+    });
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       focusClicked();

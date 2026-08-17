@@ -2239,6 +2239,7 @@ export default class StashpadPlugin extends Plugin {
     this.traceRotateDone = true;
     this.startStallWatchdog();
     this.installSelectAllProbe();
+    this.installStashpadNoteRouter();
     // Keep the dedup-at-creation id index current as files are parsed (our own
     // creates AND notes synced in from other devices). Never removes on delete —
     // a stale id only forces a re-roll, which is safe.
@@ -2831,9 +2832,9 @@ export default class StashpadPlugin extends Plugin {
     // with the settings "Lock now" buttons and the idle auto-lock — the session
     // key now simply lives until Obsidian closes.)
 
-    const call = (method: string) => {
+    const call = (method: string, ...args: unknown[]) => {
       const v = getActiveView();
-      if (v && typeof v[method] === "function") v[method]();
+      if (v && typeof v[method] === "function") v[method](...args);
     };
 
     this.addCommand({
@@ -3408,7 +3409,8 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-task-review", name: "Open daily task review", callback: () => new TaskReviewModal(this.app, this).open() });
     this.addCommand({ id: "stashpad-swap-with-parent", name: "Swap with parent (ouroboros)", callback: () => call("cmdSwapWithParent") });
     this.addCommand({ id: "stashpad-toggle-pin", name: "Pin / unpin selected note (sidebar)", callback: () => call("cmdTogglePin") });
-    this.addCommand({ id: "stashpad-list-pin", name: "Pin / unpin to top of list", callback: () => call("cmdToggleListPin") });
+    this.addCommand({ id: "stashpad-list-pin", name: "Pin / unpin to top of list", callback: () => call("cmdToggleListPin", "top") });
+    this.addCommand({ id: "stashpad-list-pin-bottom", name: "Pin / unpin to bottom of list", callback: () => call("cmdToggleListPin", "bottom") });
     // 0.61.1: tiny mode — opens a popout window with the minimal shell
     // (folder/focus title + list + composer + sticky/expand controls).
     this.addCommand({
@@ -7605,6 +7607,134 @@ export default class StashpadPlugin extends Plugin {
     return null;
   }
 
+  // ---------------------------------------------------------------------------
+  // 0.269.0: open Stashpad notes IN Stashpad.
+  //
+  // With the setting on, a Stashpad note that lands in an ordinary editor tab
+  // — the quick switcher, a wikilink from another note, the file explorer, a
+  // search hit — is taken out of that tab and shown inside Stashpad instead.
+  // The point is not having to find your way back to Stashpad after Obsidian's
+  // own navigation drops you in the editor.
+  //
+  // Two problems shape the design, and both are solved structurally rather
+  // than by timing, because a timer or a "busy" flag races and the failure
+  // mode of a race here is an infinite loop.
+  //
+  // 1. Stashpad's OWN "Open in Obsidian editor" must still reach the editor.
+  //    Every place Stashpad deliberately opens an editor stamps the leaf with
+  //    `EDITOR_BYPASS` first, and the interceptor honours that stamp. It is a
+  //    property of the leaf, so it holds however many file-open events fire.
+  //    A leaf opened by the user is unstamped, so it is intercepted.
+  //
+  // 2. The interceptor must never fight itself. It closes the leaf it
+  //    intercepted; that leaf can never fire again. Redirecting to Stashpad
+  //    opens a Stashpad VIEW, not a markdown file, so it never re-enters here.
+  //    Third-party switchers all bottom out in the same `file-open` event —
+  //    that is what makes this the right hook: it is not tied to any
+  //    particular way of opening a note.
+  //
+  // Not intercepted: notes already open in a tab (switching to an existing
+  // editor tab is honoured — closing a tab the user deliberately holds open
+  // would be hostile), a leaf that is not the active one (a split or a
+  // background tab is a deliberate placement), and non-Stashpad notes.
+  // ---------------------------------------------------------------------------
+
+  /** Set on a leaf by every Stashpad-initiated editor open, checked by the
+   *  interceptor. Symbol-keyed so it cannot collide with anything Obsidian or
+   *  another plugin puts on the leaf. */
+  static readonly EDITOR_BYPASS = Symbol.for("stashpad.editorBypass");
+
+  /** Mark a leaf as a deliberate editor open, exempt from interception. Every
+   *  Stashpad code path that opens an editor on purpose must call this before
+   *  `openFile` — the deep-link `open` action, "Open in Obsidian editor", the
+   *  aggregate view, the index builder. */
+  markEditorBypass(leaf: WorkspaceLeaf, file: TFile): void {
+    const bag = leaf as unknown as Record<symbol, unknown>;
+    bag[StashpadPlugin.EDITOR_BYPASS] = true;
+    bag[StashpadPlugin.EDITOR_BYPASS_PATH] = file.path;
+  }
+
+  private installStashpadNoteRouter(): void {
+    this.registerEvent(this.app.workspace.on("file-open", (file) => {
+      const leaf = this.app.workspace.activeLeaf;
+      if (!leaf) return;
+      const isMarkdownLeaf = leaf.view?.getViewType?.() === "markdown";
+      // `file-open` carries no leaf, so we read the active one — but that is
+      // only trustworthy when it actually DISPLAYS the opened file. On a tab
+      // close / focus shift the active leaf is some other tab that merely
+      // regained focus, and acting on it closed the wrong tab (0.269.1).
+      const shows = (leaf.view as unknown as { file?: TFile } | undefined)?.file;
+      const pertains = file instanceof TFile && shows?.path === file.path;
+
+      // Record file-per-leaf on EVERY markdown open, BEFORE any early return.
+      // Previously this only ran as the last guard, so a tab Stashpad itself
+      // opened (bypass → early return) was never recorded; when its bypass was
+      // later cleared, the "already had this file" guard was blind and the tab
+      // got routed away and detached. Record first, decide after.
+      let hadBefore = false;
+      if (pertains && isMarkdownLeaf) hadBefore = this.leafHadFileBefore(leaf, file as TFile);
+
+      if (!this.settings.openNotesInStashpad) return;
+      if (!(file instanceof TFile) || file.extension !== "md") return;
+      // Only an ordinary editor tab is a candidate. A Stashpad view is where
+      // we are sending things, and anything else is a deliberate placement.
+      if (!isMarkdownLeaf) return;
+      if (!pertains) return;
+      if ((leaf as unknown as Record<symbol, boolean>)[StashpadPlugin.EDITOR_BYPASS]) return;
+      if (!this.isStashpadNoteFile(file)) return;
+      // A tab that was ALREADY showing this note is the user switching to a
+      // tab they kept open, not opening the note afresh. Leave it be.
+      if (hadBefore) return;
+      this.trace("route:note-to-stashpad", { path: file.path });
+      // Redirect first, then close. If revealing fails for any reason the tab
+      // stays where it is, and the user is not left with nothing open.
+      void this.revealNoteInStashpad(file).then(() => {
+        // Re-check: the user may have moved on during the await.
+        if (leaf.view?.getViewType?.() === "markdown"
+          && (leaf.view as unknown as { file?: TFile }).file?.path === file.path) {
+          leaf.detach();
+        }
+      }).catch(() => { /* leave the editor tab open */ });
+    }));
+    // Clear a bypass stamp once the leaf's file changes away from the one it
+    // was opened on. Done on file-open rather than on a timer, so it is exact.
+    //
+    // 0.269.1: this used to fire on ANY file-open while the stamped leaf merely
+    // happened to be active — including `file-open` with NO file (which Obsidian
+    // emits when a tab closes). That stripped the bypass from a tab Stashpad had
+    // deliberately opened, and the router then closed it. Clear only when this
+    // leaf genuinely moved to a DIFFERENT file of its own.
+    this.registerEvent(this.app.workspace.on("file-open", (file) => {
+      if (!(file instanceof TFile)) return; // a fileless open is not "moved away"
+      const leaf = this.app.workspace.activeLeaf;
+      if (!leaf) return;
+      const bag = leaf as unknown as Record<symbol, unknown>;
+      if (!bag[StashpadPlugin.EDITOR_BYPASS]) return;
+      // The event must pertain to THIS leaf — i.e. it is the tab now showing it.
+      const shows = (leaf.view as unknown as { file?: TFile } | undefined)?.file;
+      if (shows?.path !== file.path) return;
+      const stampedFor = bag[StashpadPlugin.EDITOR_BYPASS_PATH];
+      if (typeof stampedFor === "string" && stampedFor !== file.path) {
+        delete bag[StashpadPlugin.EDITOR_BYPASS];
+        delete bag[StashpadPlugin.EDITOR_BYPASS_PATH];
+      }
+    }));
+  }
+
+  /** The bypass is tied to the file it was granted for, so a wikilink followed
+   *  from a bypassed tab is routed like any other open. */
+  static readonly EDITOR_BYPASS_PATH = Symbol.for("stashpad.editorBypassPath");
+
+  /** Did this leaf already hold `file` before the current open? Tracked
+   *  per-leaf so "switch to a tab I left open" is distinguishable from "open
+   *  this note in a tab that had something else". */
+  private lastFileByLeaf = new WeakMap<WorkspaceLeaf, string>();
+  private leafHadFileBefore(leaf: WorkspaceLeaf, file: TFile): boolean {
+    const prev = this.lastFileByLeaf.get(leaf);
+    this.lastFileByLeaf.set(leaf, file.path);
+    return prev === file.path;
+  }
+
   /** 0.76.19: true when `file` is a Stashpad note — lives in a known
    *  Stashpad folder AND has an `id` in frontmatter. */
   private isStashpadNoteFile(file: TFile): boolean {
@@ -7805,7 +7935,12 @@ export default class StashpadPlugin extends Plugin {
     for (const token of actions) {
       if (token === "reveal") continue;
       if (token === "open") {
-        if (file) await this.app.workspace.getLeaf("tab").openFile(file);
+        // A deep link that asks for the EDITOR gets the editor, routing or not.
+        if (file) {
+          const leaf = this.app.workspace.getLeaf("tab");
+          this.markEditorBypass(leaf, file);
+          await leaf.openFile(file);
+        }
         continue;
       }
       console.warn(`[stashpad] deep link: unknown action “${token}” — skipped.`);
