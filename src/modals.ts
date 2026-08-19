@@ -1454,11 +1454,20 @@ export class NoteWorkbenchView extends ItemView {
     return ok;
   }
 
+  /** 0.270.1: focus the origin BEFORE detaching, not after. Detaching the
+   *  ACTIVE tab makes Obsidian focus the tab to its right — which, after
+   *  "Obsidian editor", is the editor tab this pop-out just spawned. Setting
+   *  focus first turns this into a BACKGROUND close, and Obsidian does not move
+   *  focus when a background tab closes, so the origin keeps it. The post-detach
+   *  re-assert stays as a belt-and-braces for the case where the origin could
+   *  not take focus first (it is a no-op when focus is already correct). */
   private closeAndRefocus(): void {
     const prev = this.prevLeaf;
     this.closingIntentionally = true;
+    const canReturn = !!prev && this.leafStillOpen(prev);
+    if (canReturn) this.app.workspace.setActiveLeaf(prev!, { focus: true });
     this.leaf.detach();
-    if (prev && this.leafStillOpen(prev)) this.app.workspace.setActiveLeaf(prev, { focus: true });
+    if (canReturn && this.leafStillOpen(prev!)) this.app.workspace.setActiveLeaf(prev!, { focus: true });
   }
 
   async onClose(): Promise<void> {

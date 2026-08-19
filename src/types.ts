@@ -76,7 +76,14 @@ export interface TreeNode {
   created: string;
 }
 
+/** LEGACY time-filter keys. Superseded by the count+unit model
+ *  (`TimeUnit` + `ViewConfigState.timeFilterCount`), but still written and
+ *  read in view state so older saved layouts migrate. See
+ *  `docs/time-filter-numeric.md`. */
 export type TimeFilter = "all" | "year" | "month" | "week" | "day";
+
+/** Unit for the numeric time filter ("last N <unit>"). */
+export type TimeUnit = "hour" | "day" | "week" | "month" | "year";
 
 /** 0.270.0: which end of its sibling list a note is pinned to. Frontmatter
  *  `listPinned` stores this; legacy `true` reads as "top". */
@@ -315,7 +322,13 @@ export type ScrollPolicy =
 
 export interface ViewConfigState {
   focusId: StashpadId;
+  /** Legacy; still written (derived) + read as the migration source. */
   timeFilter: TimeFilter;
+  /** 0 = All time. Absent in pre-numeric state → migrate from `timeFilter`. */
+  timeFilterCount?: number;
+  timeFilterUnit?: TimeUnit;
+  /** Frozen epoch-ms cutoff when the filter is ABSOLUTE; null/absent = relative. */
+  timeFilterAnchor?: number | null;
 }
 
 export type LogEventType =

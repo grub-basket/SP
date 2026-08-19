@@ -939,10 +939,66 @@
   color: var(--interactive-accent);
 }
 /* Mobile: the time filter moves into the combined-filters accordion.
-   Hide both the button row AND the fallback select here — the accordion's
-   Time section provides the UI. */
+   Hide the bar's time controls here — the accordion's Time section
+   (populateTimeMenuBody) provides the UI, including the numeric
+   count+unit expression and the relative/absolute toggle. */
 .stashpad-view.is-mobile .stashpad-time-filter-btns,
 .stashpad-view.is-mobile .stashpad-time-filter-select { display: none; }
+
+/* 0.271.0: numeric time-filter expression (number + unit + rel/abs + All). */
+.stashpad-time-expr {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.stashpad-time-expr-num {
+  width: 4.5ch;
+  padding: 4px 2px 4px 6px;
+  text-align: center;
+  font-size: var(--font-ui-smaller);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+}
+.stashpad-time-expr-unit {
+  padding: 4px 6px;
+  font-size: var(--font-ui-smaller);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  max-width: 10ch;
+}
+.stashpad-time-expr-abs {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px;
+}
+.stashpad-time-expr-abs .svg-icon { width: 14px; height: 14px; }
+.stashpad-time-expr-abs.is-disabled { opacity: 0.5; }
+
+/* Popover / mobile-accordion variant: full-width row with taller,
+   thumb-sized controls. */
+.stashpad-sort-popover-row.stashpad-time-expr-row { cursor: default; }
+.stashpad-time-expr-popover { width: 100%; gap: 6px; }
+.stashpad-time-expr-popover .stashpad-time-expr-num {
+  flex: 0 0 auto;
+  width: 6ch;
+  height: 34px;
+}
+.stashpad-time-expr-popover .stashpad-time-expr-unit {
+  flex: 1 1 auto;
+  max-width: none;
+  height: 34px;
+}
+.stashpad-time-expr-popover .stashpad-time-expr-abs,
+.stashpad-time-expr-popover .stashpad-time-expr-all {
+  height: 34px;
+  flex: 0 0 auto;
+}
 
 .stashpad-breadcrumb {
   font-size: var(--font-ui-small);
@@ -2988,7 +3044,9 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    of whether the group is showing — no more chevron jump on expand/collapse. */
 .stashpad-view.is-mobile .stashpad-composer-btn-group { order: 1; }
 .stashpad-view.is-mobile .stashpad-composer-rail-toggle { order: 2; }
-.stashpad-view.is-mobile .stashpad-composer-send { order: 3; }
+/* 0.270.3: Send used to be `order: 3` here, as the last rail item. It is no
+   longer a rail item at all (see the ungrouped Send rule below), so the rail's
+   right-hand run ends at the toggle and the reserved padding holds Send's spot. */
 /* nav cluster pushed to the far left; everything after it (collapse chevron,
    secondary group, send) stays on the right. */
 .stashpad-view.is-mobile .stashpad-composer-nav { margin-right: auto; gap: 6px; }
@@ -3030,6 +3088,17 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile .stashpad-composer-btn.is-active { color: var(--interactive-accent); }
 .stashpad-view.is-mobile .stashpad-composer-btn .stashpad-btn-text { display: none; }
 /* Send keeps its accent fill so it reads as the primary action. */
+/* 0.270.3: Send is UNGROUPED — it is a direct child of `.stashpad-composer`
+   now, not a rail item, and is pinned over the rail's right end on its own
+   layer. Nothing else in the composer can paint or hit-test above it: the
+   z-index puts it last within the composer's stacking context, and being out of
+   flow it can no longer be clipped or reordered by the rail (whose collapsible
+   group carries `overflow: hidden` + an `opacity` stacking context).
+   The geometry is deliberately IDENTICAL to what it replaced: the button's right
+   edge sat 4px inside the rail, and the rail now reserves 42px on the right
+   (32px box + the 6px flex gap + that 4px) so the toggle and the secondary group
+   land exactly where they did. */
+.stashpad-view.is-mobile .stashpad-composer { position: relative; }
 .stashpad-view.is-mobile .stashpad-composer-send {
   background: var(--interactive-accent);
   color: var(--text-on-accent);
@@ -3038,9 +3107,23 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
      equidistant at any width, no per-element margin to drift. The accent fill
      alone marks it as the primary action; an invisible ::before (below) extends
      the tap target well past the box so it stays easy to hit near the edge. */
-  margin-right: 4px; /* small inset so it isn't flush to the screen edge */
   border-radius: 8px;
-  position: relative;
+  position: absolute;
+  /* The rail is the composer's last row and the composer's own bottom padding is
+     2px, so this bottom offset sits Send exactly on the rail's baseline.
+     Longhands only, and the side inset carries `--sp-safe-right` so that in
+     LANDSCAPE the button moves in off the rounded corner / sensor housing
+     instead of under it (0 in portrait and on desktop, so it costs nothing). */
+  right: calc(4px + var(--sp-safe-right));
+  bottom: 2px;
+  z-index: 10;
+  pointer-events: auto;
+  /* No double-tap-zoom delay, and an explicit statement that touches here are a
+     press — not the start of a pan or a browser gesture. */
+  touch-action: manipulation;
+}
+.stashpad-view.is-mobile .stashpad-composer-btn-rail {
+  padding-right: calc(42px + var(--sp-safe-right));
 }
 .stashpad-view.is-mobile .stashpad-composer-send:hover { color: var(--text-on-accent); }
 /* 0.162.0: invisible hit-area extender — grows the tappable region ~8px in every
@@ -8124,4 +8207,19 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-note.is-obscured .stashpad-link-rail,
 .stashpad-focused.is-obscured .stashpad-link-rail {
   visibility: hidden;
+}
+
+/* 0.270.2: pinned-notes-vs-filters control in the time-filter bar. The
+   "partial" state (pins survive the time filter only) reads as half-strength so
+   the three states are distinguishable at a glance without a text label. */
+.stashpad-pin-filter-btn.is-partial {
+  opacity: 0.62;
+}
+
+/* 0.270.2: separator between the time-period rows and the pinned-notes rows in
+   the shared time menu (mobile combined-filters accordion + desktop overflow). */
+.stashpad-view-popover-sep {
+  height: 1px;
+  margin: 6px 0;
+  background: var(--background-modifier-border);
 }

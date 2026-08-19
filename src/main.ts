@@ -2169,9 +2169,23 @@ export default class StashpadPlugin extends Plugin {
     // 0.224.0: pinned folders lead, then most-recent, then the rest. The cap is
     // applied AFTER ranking, so a pin can push a stale recent off the short
     // list — which is the point of pinning.
-    return this.rankFoldersByPin([...recent, ...rest])
-      .filter((f) => f !== exclude)
-      .slice(0, limit);
+    //
+    // 0.270.3: EVERY pinned folder is offered, however many there are. The cap
+    // limits only how many UNPINNED folders top the list up. Pinning is the
+    // user saying "I want this one within reach", and a fixed cap of five was
+    // silently dropping the sixth pin — the exact folder they had asked for.
+    // Pins that overflow a menu are still one scroll away; a pin that is
+    // absent is a broken promise.
+    const ranked = this.rankFoldersByPin([...recent, ...rest]).filter((f) => f !== exclude);
+    const pinnedSet = new Set(
+      (this.settings.folderPanelPinned ?? []).map((f) => (f || "").trim().replace(/^\/+|\/+$/g, "")),
+    );
+    const pinned = ranked.filter((f) => pinnedSet.has(f));
+    const unpinned = ranked.filter((f) => !pinnedSet.has(f));
+    // All pins, then unpinned folders only up to the cap. With five or more
+    // pins the menu is pins alone; with fewer, recents fill the remaining slots.
+    const topUp = Math.max(0, limit - pinned.length);
+    return [...pinned, ...unpinned.slice(0, topUp)];
   }
 
   /** 0.266.7: bring up both sidebars as part of setup.
@@ -8954,6 +8968,12 @@ export default class StashpadPlugin extends Plugin {
     // 0.170.2: "E" was reassigned from "Open in Obsidian editor" (openEditor) to the
     // new in-app editor (edit). Move a STALE openEditor="E" (the old default) to its
     // new chord so E doesn't fire two commands. Idempotent — only touches an exact "E".
+    // 0.270.2: `pinnedIgnoreFilters` (0.270.1, boolean) became the three-way
+    // `pinnedFilterMode`. Preserve a user's choice: true -> "all", false -> "none".
+    if (typeof (data)?.pinnedIgnoreFilters === "boolean" && typeof (data)?.pinnedFilterMode !== "string") {
+      (data).pinnedFilterMode = (data).pinnedIgnoreFilters ? "all" : "none";
+      delete (data).pinnedIgnoreFilters;
+    }
     if (data?.shortcuts && data.shortcuts.openEditor === "E") data.shortcuts.openEditor = "Mod+Shift+E";
     if (data?.bindings?.openEditor && data.bindings.openEditor.primary === "E") data.bindings.openEditor.primary = "Mod+Shift+E";
     this.settings = {

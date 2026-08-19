@@ -736,6 +736,16 @@ export interface StashpadSettings {
    *  via the cross-parent picker), drill into the new destination
    *  parent so the user follows the note. Off by default. */
   autoNavOnMoveOut: boolean;
+  /** 0.270.2: how much a pin outranks the filters. Applies to BOTH pin kinds
+   *  (the list pin and the sidebar pin).
+   *    "all"  — a pinned note is never hidden by any filter (default).
+   *    "time" — a pinned note survives the TIME filter, but the content filters
+   *             (tag / colour / author / hide-completed / attachments-only /
+   *             imported-only) still hide it if it does not match.
+   *    "none" — pins get no special treatment; filters hide them like any note.
+   *  Replaced the 0.270.1 boolean `pinnedIgnoreFilters` (true -> "all",
+   *  false -> "none"); that key is migrated on load. */
+  pinnedFilterMode: "all" | "time" | "none";
   /** Notification history buffer cap. 0 or negative = unlimited.
    *  Default 5000. Persisted alongside the live history in
    *  `<pluginDir>/notifications.json`. */
@@ -924,6 +934,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   autoPairBrackets: true,
   showEditorLineNumbers: true,
   autoNavOnMoveOut: false,
+  pinnedFilterMode: "all",
   autoExpandCursorRow: false,
   expandBodiesByDefault: false,
   autoOpenDetailPanel: false,
@@ -2165,6 +2176,15 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.openParentTabOnMoveIn, (v) => { this.plugin.settings.openParentTabOnMoveIn = v; }, ["background", "tab", "move", "in", "parent"]));
     cats.movingNotes.push(toggle("Navigate to destination after moving a note OUT", "When you outdent a note, move it via the cross-parent picker, or send it to Home, automatically drill into the destination parent. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveOut, (v) => { this.plugin.settings.autoNavOnMoveOut = v; }, ["navigate", "move", "out"]));
+    cats.listDisplay.push(this.renderDef("Pinned notes vs filters", "How much a pin outranks the filters. \"Never hide\" keeps a pinned note visible no matter what. \"Keep through time filters only\" holds it in place as you narrow the time window, but still hides it when it does not match a tag / colour / author filter. \"Filter like any note\" gives pins no special treatment. Applies to both pin kinds (pinned in the list, and pinned to the sidebar).", (s) => {
+      s.addDropdown((d) => {
+        d.addOption("all", "Never hide pinned notes");
+        d.addOption("time", "Keep through time filters only");
+        d.addOption("none", "Filter like any note");
+        d.setValue(this.plugin.settings.pinnedFilterMode);
+        d.onChange(async (v) => { this.plugin.settings.pinnedFilterMode = v as "all" | "time" | "none"; await set(); });
+      });
+    }, ["pin", "pinned", "filter", "time", "hide", "tag", "colour", "color"]));
     cats.listDisplay.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",
       () => this.plugin.settings.doubleClickToFocus, (v) => { this.plugin.settings.doubleClickToFocus = v; }, ["double", "click", "open", "focus"]));
     cats.misc.push(toggle("Sheet versions (alternate drafts)", "Treat notes that share a 'sheet-group' frontmatter id as alternate versions of one item: only the active version shows as a row, and its siblings collapse into a tab bar at the bottom of that row. Use \"Fork as version\" on a note to start. Off by default — when off, no note is ever hidden by this feature and the commands do nothing.",

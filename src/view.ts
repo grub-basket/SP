@@ -8,7 +8,7 @@ import {
   archiveSubfolderOf, isArchiveSubfolderPath,
   isReservedSubfolderName,
   isInReservedSubfolder,
-  type StashpadId, type TimeFilter, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
+  type StashpadId, type TimeFilter, type TimeUnit, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
   type ListPinEdge,
 } from "./types";
 import { TreeIndex } from "./tree-index";
@@ -101,6 +101,12 @@ const STICK_OFF_PX = 2;
  *  scroll-to-id re-assert chain, which otherwise churns forever trying. */
 const MIN_SCROLLABLE_PX = 48;
 
+/** Re-assert schedule for a positional scroll policy (restore / scroll-to-id).
+ *  Same wall-clock coverage the fixed chain always had — what changed (0.270.1)
+ *  is that a step only re-scrolls when the list's geometry actually moved since
+ *  the previous step (see scheduleSettleApplies). */
+const SCROLL_SETTLE_STEPS_MS = [60, 200, 600];
+
 
 const VIEW_MODE_LABELS: Record<ViewMode, string> = {
   nested: "Nested",
@@ -120,26 +126,50 @@ interface NavSnapshot {
   focusId: StashpadId;
 }
 
-interface TimeFilterOption {
-  key: TimeFilter;
-  /** Short label in calendar mode (e.g. "Today"). */
-  calShort: string;
-  /** Short label in rolling mode (e.g. "24h"). */
-  rollShort: string;
-  /** Tooltip in calendar mode. */
-  calLong: string;
-  /** Tooltip in rolling mode. */
-  rollLong: string;
+/** 0.271.0: the time filter is now a free "last N <unit>" expression rather
+ *  than a fixed chip row. See `docs/time-filter-numeric.md`. */
+interface TimeUnitMeta {
+  key: TimeUnit;
+  /** Plural noun for labels ("days"). Singular = drop the trailing "s". */
+  plural: string;
+  /** Compact suffix for the bar summary ("d"). */
+  abbr: string;
+  /** Milliseconds per unit in ROLLING mode. week/month/year keep the exact
+   *  legacy constants (7 / 30 / 365 days) so migrated filters don't shift. */
+  ms: number;
+  /** moment() startOf() key for CALENDAR mode. */
+  startOf: string;
+  /** Calendar label at count === 1 (the old chip label). */
+  calOne: string;
 }
-const TIME_FILTER_OPTIONS: TimeFilterOption[] = [
-  // "All" sits at the end of the row now (the user wanted it after the
-  // bounded filters, not before).
-  { key: "day",   calShort: "Today", rollShort: "24h",  calLong: "Since midnight today",       rollLong: "Last 24 hours" },
-  { key: "week",  calShort: "Week",  rollShort: "7d",   calLong: "Since Monday this week",     rollLong: "Last 7 days" },
-  { key: "month", calShort: "Month", rollShort: "30d",  calLong: "Since the 1st of this month", rollLong: "Last 30 days" },
-  { key: "year",  calShort: "Year",  rollShort: "365d", calLong: "Since January 1 this year",  rollLong: "Last 365 days" },
-  { key: "all",   calShort: "All",   rollShort: "ad infinitum",    calLong: "All time",                   rollLong: "All time" },
+const TIME_UNITS: TimeUnitMeta[] = [
+  { key: "hour",  plural: "hours",  abbr: "h", ms: 3600_000,          startOf: "hour",    calOne: "This hour" },
+  { key: "day",   plural: "days",   abbr: "d", ms: 86400_000,         startOf: "day",     calOne: "Today" },
+  { key: "week",  plural: "weeks",  abbr: "w", ms: 7 * 86400_000,     startOf: "isoWeek", calOne: "This week" },
+  { key: "month", plural: "months", abbr: "mo", ms: 30 * 86400_000,   startOf: "month",   calOne: "This month" },
+  { key: "year",  plural: "years",  abbr: "y", ms: 365 * 86400_000,   startOf: "year",    calOne: "This year" },
 ];
+const timeUnitMeta = (u: TimeUnit): TimeUnitMeta =>
+  TIME_UNITS.find((m) => m.key === u) ?? TIME_UNITS[1];
+
+/** One-tap presets, kept so the common cases survive the move away from
+ *  chips (they are the whole mobile story — see populateTimeMenuBody). */
+const TIME_PRESETS: Array<{ count: number; unit: TimeUnit }> = [
+  { count: 24, unit: "hour" },
+  { count: 7,  unit: "day" },
+  { count: 30, unit: "day" },
+  { count: 365, unit: "day" },
+  { count: 0,  unit: "day" },
+];
+
+/** Legacy chip key → count+unit. The ONLY migration path for saved state. */
+const LEGACY_TIME_FILTER: Record<TimeFilter, { count: number; unit: TimeUnit }> = {
+  all:   { count: 0, unit: "day" },
+  day:   { count: 1, unit: "day" },
+  week:  { count: 1, unit: "week" },
+  month: { count: 1, unit: "month" },
+  year:  { count: 1, unit: "year" },
+};
 
 /** 0.225.0: a bound composer target for append/prepend mode. Carries `path` and
  *  `folder` as well as `id` because the target may live in ANOTHER Stashpad —
@@ -189,7 +219,13 @@ export class StashpadView extends ItemView {
 
   /** public: read by extracted command modules (commands/*.ts). */
   focusId: StashpadId = ROOT_ID;
-  private timeFilter: TimeFilter = "all";
+  /** Numeric time filter: "last `timeFilterCount` `timeFilterUnit`".
+   *  count 0 = All time (no cutoff). */
+  private timeFilterCount = 0;
+  private timeFilterUnit: TimeUnit = "day";
+  /** ABSOLUTE mode: a frozen epoch-ms cutoff. null = RELATIVE (the window
+   *  slides as time passes). Set by freezing the current relative cutoff. */
+  private timeFilterAnchor: number | null = null;
   /** When true, time filters use CALENDAR boundaries (start of today /
    *  this week / this month / this year) instead of rolling N-day
    *  windows backward from now. View-local; not persisted. */
@@ -1469,10 +1505,10 @@ export class StashpadView extends ItemView {
   setEphemeralState(state: unknown): void {
     const s = state as Partial<ViewConfigState> | null;
     if (s?.focusId) this.focusId = s.focusId;
-    if (s?.timeFilter) this.timeFilter = s.timeFilter;
+    this.applyTimeFilterState(s);
   }
   getEphemeralState(): Record<string, unknown> {
-    return { focusId: this.focusId, timeFilter: this.timeFilter };
+    return { focusId: this.focusId, ...this.timeFilterState() };
   }
 
   // Persisted in workspace.json — survives reloads and app restarts.
@@ -1481,7 +1517,7 @@ export class StashpadView extends ItemView {
     return {
       ...base,
       folderOverride: this.folderOverride,
-      timeFilter: this.timeFilter,
+      ...this.timeFilterState(),
       focusId: this.focusId,
       // Persist the per-view filter state so reloads restore the same
       // view (tag filter, calendar/rolling mode).
@@ -1514,7 +1550,7 @@ export class StashpadView extends ItemView {
     }) | null) ?? null;
     if (s) {
       if ("folderOverride" in s) this.folderOverride = s.folderOverride ?? null;
-      if (s.timeFilter) this.timeFilter = s.timeFilter;
+      this.applyTimeFilterState(s);
       if (s.focusId) this.focusId = s.focusId;
       // 0.132.0: a fresh tab opened "in context" from search carries the note id
       // to cursor/reveal once the list renders.
@@ -2104,28 +2140,109 @@ export class StashpadView extends ItemView {
     else await this.saveDraft(this.composerDraft);
   }
 
+  /** The ONE producer of the time cutoff consumed by filterChildren — so
+   *  `pinnedFilterMode` keeps working off the same predicate. */
   private timeFilterCutoff(): number | null {
-    if (this.timeFilter === "all") return null;
+    if (this.timeFilterCount <= 0) return null;
+    // ABSOLUTE: a fixed point in time, frozen when the user pinned it. It
+    // does NOT slide, which is the whole point of the mode.
+    if (this.timeFilterAnchor !== null) return this.timeFilterAnchor;
+    return this.computeRelativeCutoff();
+  }
+
+  /** Evaluate the "last N <unit>" expression against NOW. */
+  private computeRelativeCutoff(): number | null {
+    const n = this.timeFilterCount;
+    if (n <= 0) return null;
+    const meta = timeUnitMeta(this.timeFilterUnit);
     if (this.timeFilterCalendar) {
-      // Calendar-aligned: start of today / this week (Monday) / this
-      // month / this year, in the user's local timezone via moment.
-      const m = (moment as any)();
-      switch (this.timeFilter) {
-        case "day":   return m.startOf("day").valueOf();
-        case "week":  return m.startOf("isoWeek").valueOf();
-        case "month": return m.startOf("month").valueOf();
-        case "year":  return m.startOf("year").valueOf();
+      // Calendar-aligned: start of the current period, then back N-1 whole
+      // periods. At n === 1 this is exactly the old Today/Week/Month/Year.
+      const m = (moment as any)().startOf(meta.startOf);
+      return (n > 1 ? m.subtract(n - 1, meta.plural) : m).valueOf();
+    }
+    return Date.now() - n * meta.ms;
+  }
+
+  /** Whether any time cutoff is in force (used by the "filter is active" hints). */
+  private timeFilterActive(): boolean { return this.timeFilterCount > 0; }
+
+  /** Legacy chip key closest to the current spec. Written into view state so
+   *  an older build (or an older saved layout round-trip) still restores
+   *  something sane. `hour` has no legacy equivalent → "day". */
+  private legacyTimeFilter(): TimeFilter {
+    if (this.timeFilterCount <= 0) return "all";
+    switch (this.timeFilterUnit) {
+      case "week": return "week";
+      case "month": return "month";
+      case "year": return "year";
+      default: return "day";
+    }
+  }
+
+  /** The time-filter half of view state. Writes the new count/unit/anchor
+   *  keys AND the derived legacy `timeFilter` key (back-compat: an older
+   *  build, or any consumer still reading the chip key, keeps working). */
+  private timeFilterState(): Record<string, unknown> {
+    return {
+      timeFilter: this.legacyTimeFilter(),
+      timeFilterCount: this.timeFilterCount,
+      timeFilterUnit: this.timeFilterUnit,
+      timeFilterAnchor: this.timeFilterAnchor,
+    };
+  }
+
+  /** Restore from view state, migrating pre-0.271.0 state that only carries
+   *  the legacy chip key. The legacy mapping preserves the exact cutoff in
+   *  both rolling and calendar mode, so no saved filter silently changes. */
+  private applyTimeFilterState(s: Partial<ViewConfigState> | null | undefined): void {
+    if (!s) return;
+    if (typeof s.timeFilterCount === "number" && Number.isFinite(s.timeFilterCount)) {
+      this.timeFilterCount = Math.max(0, Math.floor(s.timeFilterCount));
+      if (s.timeFilterUnit && TIME_UNITS.some((u) => u.key === s.timeFilterUnit)) {
+        this.timeFilterUnit = s.timeFilterUnit;
       }
+      const a = s.timeFilterAnchor;
+      this.timeFilterAnchor = typeof a === "number" && Number.isFinite(a) ? a : null;
+      return;
     }
-    // Rolling N-day windows from "now" — the original behavior.
-    const now = Date.now();
-    switch (this.timeFilter) {
-      case "day": return now - 86400_000;
-      case "week": return now - 7 * 86400_000;
-      case "month": return now - 30 * 86400_000;
-      case "year": return now - 365 * 86400_000;
+    if (s.timeFilter && s.timeFilter in LEGACY_TIME_FILTER) {
+      const mig = LEGACY_TIME_FILTER[s.timeFilter];
+      this.timeFilterCount = mig.count;
+      this.timeFilterUnit = mig.unit;
+      this.timeFilterAnchor = null;
     }
-    return null;
+  }
+
+  private timeFilterAnchorLabel(): string {
+    const t = this.timeFilterAnchor;
+    if (t === null) return "";
+    const fmt = this.timeFilterUnit === "hour" ? "D MMM HH:mm" : "D MMM YYYY";
+    return (moment as any)(t).format(fmt);
+  }
+
+  /** Compact label for the bar / accordion summary. */
+  private timeFilterShortLabel(): string {
+    if (this.timeFilterCount <= 0) return "All";
+    if (this.timeFilterAnchor !== null) return this.timeFilterAnchorLabel();
+    const meta = timeUnitMeta(this.timeFilterUnit);
+    if (this.timeFilterCalendar && this.timeFilterCount === 1) return meta.calOne;
+    return `${this.timeFilterCount}${meta.abbr}`;
+  }
+
+  /** Full sentence for tooltips. */
+  private timeFilterLongLabel(): string {
+    if (this.timeFilterCount <= 0) return "All time";
+    if (this.timeFilterAnchor !== null) return `Since ${this.timeFilterAnchorLabel()} (fixed)`;
+    const meta = timeUnitMeta(this.timeFilterUnit);
+    const n = this.timeFilterCount;
+    const noun = n === 1 ? meta.plural.replace(/s$/, "") : meta.plural;
+    if (this.timeFilterCalendar) {
+      return n === 1
+        ? `Since the start of ${meta.calOne.replace(/^This /, "this ").replace(/^Today$/, "today")}`
+        : `Since the start of the period ${n - 1} ${n - 1 === 1 ? noun : meta.plural} ago`;
+    }
+    return `Last ${n} ${noun}`;
   }
   private allowedByBases(): Set<string> | null { return null; }
   /** Per-folder view mode lookup. Absent entry = "nested" (the default). */
@@ -2686,7 +2803,16 @@ export class StashpadView extends ItemView {
     const importedOnly = this.importedOnly;
     const authorId = this.authorFilter;
     if (!cutoff && !tag && !color && !hideCompleted && !attachmentsOnly && !importedOnly && !authorId) return children;
+    // 0.270.2: how far a pin outranks the filters is a three-way setting.
+    // "all"  - a pinned note is never hidden (early return below).
+    // "time" - it survives the TIME cutoff only; the content filters below still
+    //          apply, so a pin cannot pollute a tag/colour/author-filtered view.
+    // "none" - no special treatment.
+    // Covers BOTH pin kinds (list pin + sidebar pin) per "pinned notes of any kind".
+    const pinMode = this.plugin.settings.pinnedFilterMode;
     return children.filter((n) => {
+      const pinned = pinMode !== "none" && this.isPinnedAnyKind(n.id);
+      if (pinned && pinMode === "all") return true;
       // 0.88.1: imported-only + by-author filters (node-level, like tag/color).
       if (importedOnly) {
         if (!n.file) return false;
@@ -2697,12 +2823,7 @@ export class StashpadView extends ItemView {
         const a = parseAuthorRef(this.app.metadataCache.getFileCache(n.file)?.frontmatter?.author);
         if (!a || a.id !== authorId) return false;
       }
-      // 0.270.0: a list pin is a deliberate "keep this here" — it outranks the
-      // TIME filter, so pinned notes stay put as the window slides (the point of
-      // pinning a reference note to the bottom of a chronological list). Content
-      // filters (tag/color/author/…) still apply: those are "show me only X",
-      // where silently including a pinned non-match would be wrong.
-      if (cutoff && n.created && !this.isListPinned(n.id)) {
+      if (cutoff && n.created && !pinned) {
         const t = Date.parse(n.created);
         if (!Number.isNaN(t) && t < cutoff) return false;
       }
@@ -3146,9 +3267,20 @@ export class StashpadView extends ItemView {
     // `else if (prevScroll > 0)` branch below would restore the
     // now-stale prevScroll, freezing the view at the old "bottom" which
     // is now mid-list. Honouring stickToListBottom shortcircuits that.
+    // 0.270.1: "at bottom" only means something when there was a bottom to be
+    // at. A list whose content FITS satisfies the geometric test trivially
+    // (scrollTop 0 + clientHeight >= scrollHeight), so leaving a 2-row focused
+    // note for a 300-row parent — a preserve render, e.g. navigateTo with no
+    // saved cursor for the target level — would read "was at bottom" and pin
+    // the huge new list to its bottom. The user asked to go up a level, not to
+    // land at the end of it. stickToListBottom still wins outright: that flag
+    // is an explicit intent (composer send), not an inference.
+    const prevScrollable = !!this.listEl
+      && this.listEl.scrollHeight > this.listEl.clientHeight + 2;
     const prevAtBottom = !!this.listEl
       && (this.stickToListBottom
-        || this.listEl.scrollTop + this.listEl.clientHeight >= this.listEl.scrollHeight - 2);
+        || (prevScrollable
+          && this.listEl.scrollTop + this.listEl.clientHeight >= this.listEl.scrollHeight - 2));
     // 0.216.0: reuse the composer whenever its baked-in inputs are unchanged —
     // which includes every render a SEND triggers (the file-create render, the
     // settings-broadcast render, the metadata-cache render). The focused
@@ -3396,13 +3528,10 @@ export class StashpadView extends ItemView {
             // Release after the scroll event fires (microtask).
             Promise.resolve().then(() => { this.suppressScrollSave = false; });
           };
-          apply();
-          requestAnimationFrame(apply);
-          setTimeout(apply, 60);
-          setTimeout(apply, 200);
-          // Final hard re-assert after layout has fully settled — the
-          // scroll listener can stamp from here forward.
-          setTimeout(apply, 600);
+          // 0.270.1: re-assert only on the steps where the geometry moved.
+          // The final step releases the scroll-save guard, so the scroll
+          // listener can stamp from there forward.
+          this.scheduleSettleApplies(listForRestore, apply, () => { this.suppressScrollSave = false; });
           break;
         }
         case "follow-cursor":
@@ -3441,15 +3570,14 @@ export class StashpadView extends ItemView {
             if (row) row.scrollIntoView({ block: align, behavior: "auto" });
             Promise.resolve().then(() => { this.suppressScrollSave = false; });
           };
-          apply();
-          requestAnimationFrame(apply);
-          setTimeout(apply, 60);
-          setTimeout(apply, 200);
-          setTimeout(apply, 600);
-          // Belt-and-suspenders: after the last apply settles, hold the
-          // suppress flag a touch longer so any tail scroll events from
-          // the browser's smooth-scroll-completion don't sneak through.
-          setTimeout(() => { this.suppressScrollSave = false; }, 700);
+          // 0.270.1: re-assert only on the steps where the geometry moved —
+          // an unconditional re-scroll of a settled 300-row list is the churn
+          // this chain was producing. Belt-and-suspenders: hold the suppress
+          // flag a touch past the last apply so tail scroll events from the
+          // browser's own scroll completion don't sneak through.
+          this.scheduleSettleApplies(listForScroll, apply, () => {
+            window.setTimeout(() => { this.suppressScrollSave = false; }, 100);
+          });
           break;
         }
       }
@@ -3639,35 +3767,47 @@ export class StashpadView extends ItemView {
     // Icon flips with the mode so a glance tells you which is active:
     //   calendar = calendar/start-of-period boundaries
     //   history  = rolling window N units back from now
-    setIcon(calBtn, this.timeFilterCalendar ? "calendar" : "history");
+    setIcon(calBtn, this.timeFilterCalendar ? "calendar" : "clock");
     calBtn.title = this.timeFilterCalendar
       ? "Calendar mode: filters use start-of-day/week/month/year. Click for rolling windows."
       : "Rolling mode: filters look back N days from now. Click for calendar boundaries.";
     if (this.timeFilterCalendar) calBtn.addClass("is-active");
     calBtn.onclick = (e) => {
       e.preventDefault();
-      this.timeFilterCalendar = !this.timeFilterCalendar;
-      this.persistFocus();
+      this.setTimeFilterCalendar(!this.timeFilterCalendar);
+    };
+    // 0.270.2: pinned-notes-vs-filters, as a filter-bar control rather than a
+    // buried setting — it is something you flip while looking at a filtered
+    // list, not something you configure once. Cycles all -> time -> none.
+    // Same setting as "Pinned notes vs filters" in settings; changing either
+    // moves the other.
+    const PIN_MODES = [
+      { key: "all"  as const, icon: "pin",     cls: "is-active",
+        label: "Pinned notes are never hidden by a filter.", next: "keep them through time filters only" },
+      { key: "time" as const, icon: "pin",     cls: "is-active is-partial",
+        label: "Pinned notes survive the time filter, but tag / colour / author filters still hide them.", next: "filter them like any other note" },
+      { key: "none" as const, icon: "pin-off", cls: "",
+        label: "Pinned notes are filtered like any other note.", next: "never hide them" },
+    ];
+    const pinIdx = Math.max(0, PIN_MODES.findIndex((m) => m.key === this.plugin.settings.pinnedFilterMode));
+    const pinMode = PIN_MODES[pinIdx];
+    const pinBtn = btns.createEl("button", { cls: "stashpad-time-filter-btn stashpad-pin-filter-btn" });
+    setIcon(pinBtn, pinMode.icon);
+    pinBtn.title = `${pinMode.label} Click to ${pinMode.next}.`;
+    if (pinMode.cls) pinMode.cls.split(" ").forEach((c) => pinBtn.addClass(c));
+    pinBtn.onclick = (e) => {
+      e.preventDefault();
+      this.plugin.settings.pinnedFilterMode = PIN_MODES[(pinIdx + 1) % PIN_MODES.length].key;
+      void this.plugin.saveSettings();
       this.render();
     };
-    for (const opt of TIME_FILTER_OPTIONS) {
-      const short = this.timeFilterCalendar ? opt.calShort : opt.rollShort;
-      const long  = this.timeFilterCalendar ? opt.calLong  : opt.rollLong;
-      const b = btns.createEl("button", { cls: "stashpad-time-filter-btn", text: short });
-      b.title = long;
-      if (this.timeFilter === opt.key) b.addClass("is-active");
-      b.onclick = (e) => { e.preventDefault(); this.setTimeFilter(opt.key); };
-    }
 
-    // Compact dropdown (hidden by default; shown via CSS when narrow).
-    const sel = bar.createEl("select", { cls: "stashpad-time-filter-select" });
-    for (const opt of TIME_FILTER_OPTIONS) {
-      const long = this.timeFilterCalendar ? opt.calLong : opt.rollLong;
-      const o = sel.createEl("option", { text: long });
-      o.value = opt.key;
-      if (this.timeFilter === opt.key) o.selected = true;
-    }
-    sel.onchange = () => this.setTimeFilter(sel.value as TimeFilter);
+    // 0.271.0: the chip row (24h / 7d / 30d / 365d / ∞) is replaced by a free
+    // "last N <unit>" expression: number input + unit select + a
+    // relative/absolute toggle. The same controls are built into
+    // populateTimeMenuBody so MOBILE (which hides this whole row) and the
+    // desktop ⋯ overflow popover get them too.
+    this.buildTimeFilterExpression(btns);
 
     // 0.61.2: three view-mode buttons at the end of the time-filter row
     // (after the time buttons, NOT anchored to the right). Tiny mode,
@@ -3763,7 +3903,7 @@ export class StashpadView extends ItemView {
       { key: "nav",     icon: "folder-search",      title: "Folder & search", memberSel: [".stashpad-folder-btn", ".stashpad-search-btn"], memberKeys: ["folder", "search"], collapsePrio: 5, displayIdx: 0 },
       { key: "filter",  icon: "filter",             title: "Tag & color",     memberSel: [".stashpad-tag-filter-btn", ".stashpad-color-filter-btn"], memberKeys: ["tag", "color"], collapsePrio: 3, displayIdx: 1 },
       { key: "arrange", icon: "sliders-horizontal", title: "Sort & view",     memberSel: [".stashpad-sort-btn", ".stashpad-view-btn"], memberKeys: ["sort", "view"], collapsePrio: 4, displayIdx: 2 },
-      { key: "time",    icon: "clock",              title: "Time",            memberSel: [".stashpad-time-filter-btns", ".stashpad-time-filter-select"], memberKeys: ["time"], collapsePrio: 2, displayIdx: 3 },
+      { key: "time",    icon: "clock",              title: "Time",            memberSel: [".stashpad-time-filter-btns"], memberKeys: ["time"], collapsePrio: 2, displayIdx: 3 },
       { key: "window",  icon: "app-window",         title: "Window & layout", memberSel: [".stashpad-view-mode-btns"], memberKeys: ["mode"], collapsePrio: 1, displayIdx: 4 },
     ];
 
@@ -3871,7 +4011,7 @@ export class StashpadView extends ItemView {
       case "folder": return !!this.folderOverride;
       case "tag": return !!this.tagFilter;
       case "color": return !!this.colorFilter;
-      case "time": return this.timeFilter !== "all";
+      case "time": return this.timeFilterActive();
       case "sort": return this.currentViewMode() === "nested"
         && this.sortStore.getMode(this.noteFolder, this.focusId) !== "manual";
       case "view": return this.currentViewMode() !== "nested"
@@ -3932,7 +4072,7 @@ export class StashpadView extends ItemView {
       { key: "view", title: "View", summary: () => VIEW_MODE_LABELS[this.currentViewMode()],
         populate: (b) => this.populateViewMenuBody(b, close) },
       { key: "time", title: "Time filter",
-        summary: () => { const opt = TIME_FILTER_OPTIONS.find((o) => o.key === this.timeFilter); return opt ? (this.timeFilterCalendar ? opt.calShort : opt.rollShort) : "All"; },
+        summary: () => this.timeFilterShortLabel(),
         populate: (b) => this.populateTimeMenuBody(b, close) },
       { key: "mode", title: "View mode", summary: () => this.compactMode ? "Compact on" : "Tiny · Compact · Window",
         populate: (b) => this.populateModeMenuBody(b, close) },
@@ -4567,7 +4707,7 @@ export class StashpadView extends ItemView {
     // the four sections lights up the accent border.
     const tagOn = !!this.tagFilter;
     const colorOn = !!this.colorFilter;
-    const timeOn = this.timeFilter !== "all";
+    const timeOn = this.timeFilterActive();
     const sortOn = this.sortStore.getMode(this.noteFolder, this.focusId) !== "manual";
     const viewOn = this.currentViewMode() !== "nested"
       || this.currentHideChildless()
@@ -4657,11 +4797,7 @@ export class StashpadView extends ItemView {
       {
         key: "time",
         title: "Time filter",
-        summary: () => {
-          const opt = TIME_FILTER_OPTIONS.find((o) => o.key === this.timeFilter);
-          if (!opt) return "All";
-          return this.timeFilterCalendar ? opt.calShort : opt.rollShort;
-        },
+        summary: () => this.timeFilterShortLabel(),
         populate: (body) => this.populateTimeMenuBody(body, close),
       },
       {
@@ -4989,6 +5125,80 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** The "last N <unit>" expression controls: number input + unit select +
+   *  relative/absolute toggle + an All-time clear. Shared by the desktop
+   *  filter bar and by populateTimeMenuBody (mobile accordion + desktop ⋯
+   *  popover), so there is exactly one implementation of the interaction.
+   *
+   *  Commits happen on `change` (blur / Enter / picker close), NOT on every
+   *  keystroke: a full `render()` rebuilds the bar and would steal focus
+   *  mid-typing. Local state is patched in place instead. */
+  private buildTimeFilterExpression(host: HTMLElement, variant: "bar" | "popover" = "bar"): void {
+    const wrap = host.createDiv({
+      cls: `stashpad-time-expr ${variant === "popover" ? "stashpad-time-expr-popover" : ""}`.trim(),
+    });
+
+    const num = wrap.createEl("input", { cls: "stashpad-time-expr-num", type: "number" });
+    num.min = "0";
+    num.step = "1";
+    num.value = String(this.timeFilterCount);
+    num.title = "How many units back. 0 = all time.";
+    num.setAttribute("aria-label", "Time filter amount");
+
+    const unitSel = wrap.createEl("select", { cls: "stashpad-time-expr-unit" });
+    for (const u of TIME_UNITS) {
+      const o = unitSel.createEl("option", { text: u.plural });
+      o.value = u.key;
+      if (u.key === this.timeFilterUnit) o.selected = true;
+    }
+    unitSel.setAttribute("aria-label", "Time filter unit");
+
+    const absBtn = wrap.createEl("button", {
+      cls: "stashpad-time-filter-btn stashpad-time-expr-abs",
+    });
+    const allBtn = wrap.createEl("button", {
+      cls: "stashpad-time-filter-btn stashpad-time-expr-all", text: "All",
+    });
+    allBtn.title = "Clear the time filter (show all notes).";
+
+    const syncLocal = (): void => {
+      const abs = this.timeFilterAnchor !== null;
+      setIcon(absBtn, abs ? "anchor" : "history");
+      absBtn.title = abs
+        ? `Fixed since ${this.timeFilterAnchorLabel()} — the window does NOT move as time passes. Click for a sliding window.`
+        : `Sliding window (${this.timeFilterLongLabel()}) — it moves with the clock. Click to freeze it at today's cutoff.`;
+      absBtn.toggleClass("is-active", abs);
+      absBtn.toggleClass("is-disabled", this.timeFilterCount <= 0);
+      allBtn.toggleClass("is-active", this.timeFilterCount <= 0);
+      num.value = String(this.timeFilterCount);
+    };
+    syncLocal();
+
+    // In the popover/accordion, NEVER full-render: it would tear down the
+    // popover the user is still touching. The bar variant only avoids the
+    // full render while typing (focus), and re-renders on the buttons.
+    const soft = variant === "popover";
+    const commit = (count: number, unit: TimeUnit): void => {
+      this.setTimeFilterSpec(count, unit, { rerender: false });
+      syncLocal();
+    };
+    num.onchange = () => commit(Number(num.value), unitSel.value as TimeUnit);
+    num.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); num.blur(); } };
+    unitSel.onchange = () => commit(Number(num.value), unitSel.value as TimeUnit);
+    absBtn.onclick = (e) => {
+      e.preventDefault();
+      // No cutoff exists at "all time", so there is nothing to freeze.
+      if (this.timeFilterCount <= 0) { new Notice("Set a time window first."); return; }
+      this.setTimeFilterAbsolute(this.timeFilterAnchor === null, { rerender: !soft });
+      if (soft) syncLocal();
+    };
+    allBtn.onclick = (e) => {
+      e.preventDefault();
+      this.setTimeFilterSpec(0, this.timeFilterUnit, { rerender: !soft });
+      if (soft) syncLocal();
+    };
+  }
+
   /** Render the time-filter rows into `container`. Used by the mobile
    *  accordion section (desktop renders its own button row + select
    *  fallback in renderListBar). The Calendar / Rolling toggle is
@@ -5006,23 +5216,92 @@ export class StashpadView extends ItemView {
     });
     calRow.onclick = (e) => {
       if (e.target !== calCheck) { e.preventDefault(); calCheck.checked = !calCheck.checked; }
-      this.timeFilterCalendar = calCheck.checked;
-      this.persistFocus();
-      this.refreshList();
+      this.setTimeFilterCalendar(calCheck.checked, { rerender: false });
     };
 
-    // Period rows — same shape as sort rows, with active highlighting
-    // on the currently-selected period.
-    for (const opt of TIME_FILTER_OPTIONS) {
+    // 0.271.0: absolute/relative toggle. MUST live here, not only on the bar —
+    // mobile hides the bar's time controls entirely and reaches time filtering
+    // only through this body.
+    const absRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
+    const absCheck = absRow.createEl("input", { type: "checkbox" });
+    absCheck.checked = this.timeFilterAnchor !== null;
+    absRow.createDiv({ cls: "stashpad-view-popover-main" })
+      .createSpan({ cls: "stashpad-view-popover-label", text: "Fixed start date" });
+    absRow.createDiv({
+      cls: "stashpad-view-popover-desc",
+      text: this.timeFilterAnchor !== null
+        ? `Frozen at ${this.timeFilterAnchorLabel()} — the window stays put as time passes.`
+        : "Off = a sliding window (e.g. \"last 14 days\" always means the last 14 days). On freezes today's cutoff into a fixed date.",
+    });
+    absRow.onclick = (e) => {
+      if (e.target !== absCheck) { e.preventDefault(); absCheck.checked = !absCheck.checked; }
+      if (absCheck.checked && this.timeFilterCount <= 0) {
+        absCheck.checked = false;
+        new Notice("Set a time window first.");
+        return;
+      }
+      this.setTimeFilterAbsolute(absCheck.checked, { rerender: false });
+    };
+
+    // Custom "last N <unit>" row — the numeric control. On mobile the native
+    // number input opens the numeric keypad and the <select> opens the OS
+    // wheel picker, so no bespoke touch widget is needed.
+    container.createDiv({ cls: "stashpad-view-popover-sep" });
+    container.createDiv({ cls: "stashpad-view-popover-desc", text: "Show notes from the last…" });
+    const exprRow = container.createDiv({ cls: "stashpad-sort-popover-row stashpad-time-expr-row" });
+    // Stop clicks inside the inputs from closing the wrapping popover.
+    exprRow.onclick = (e) => { e.stopPropagation(); };
+    this.buildTimeFilterExpression(exprRow, "popover");
+
+    // Presets — the common cases stay one tap, which is what the chip row
+    // was good at and what mobile most needs.
+    for (const p of TIME_PRESETS) {
       const row = container.createDiv({ cls: "stashpad-sort-popover-row" });
-      if (this.timeFilter === opt.key) row.addClass("is-active");
-      const long = this.timeFilterCalendar ? opt.calLong : opt.rollLong;
-      row.createSpan({ cls: "stashpad-sort-popover-label", text: long });
+      const isActive = this.timeFilterCount === p.count
+        && (p.count === 0 || this.timeFilterUnit === p.unit);
+      if (isActive) row.addClass("is-active");
+      const meta = timeUnitMeta(p.unit);
+      row.createSpan({
+        cls: "stashpad-sort-popover-label",
+        text: p.count === 0 ? "All time" : `Last ${p.count} ${meta.plural}`,
+      });
       row.onclick = (e) => {
         e.preventDefault();
         e.stopPropagation();
         onPicked();
-        if (this.timeFilter !== opt.key) this.setTimeFilter(opt.key);
+        this.setTimeFilterSpec(p.count, p.unit);
+      };
+    }
+
+    // 0.270.2: pinned-notes-vs-filters lives here too, not only as the bar
+    // button — this body is shared by the mobile combined-filters accordion and
+    // the desktop overflow popover, and the bar button is hidden in BOTH of
+    // those cases (mobile hides the button row outright). Without this the
+    // control is simply unreachable on mobile.
+    container.createDiv({ cls: "stashpad-view-popover-sep" });
+    const PIN_ROWS = [
+      { key: "all"  as const, label: "Never hide pinned notes",
+        desc: "A pinned note stays visible whatever the filters say." },
+      { key: "time" as const, label: "Keep pins through time filters only",
+        desc: "Pins survive the time window, but tag / colour / author filters still hide them." },
+      { key: "none" as const, label: "Filter pinned notes like any note",
+        desc: "Pins get no special treatment." },
+    ];
+    container.createDiv({ cls: "stashpad-view-popover-desc", text: "Pinned notes vs filters" });
+    for (const m of PIN_ROWS) {
+      const row = container.createDiv({ cls: "stashpad-sort-popover-row" });
+      if (this.plugin.settings.pinnedFilterMode === m.key) row.addClass("is-active");
+      row.createSpan({ cls: "stashpad-sort-popover-label", text: m.label });
+      row.title = m.desc;
+      row.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onPicked();
+        if (this.plugin.settings.pinnedFilterMode !== m.key) {
+          this.plugin.settings.pinnedFilterMode = m.key;
+          void this.plugin.saveSettings();
+          this.refreshList();
+        }
       };
     }
   }
@@ -5100,12 +5379,41 @@ export class StashpadView extends ItemView {
     this.render();
   }
 
-  private setTimeFilter(tf: TimeFilter): void {
-    if (this.timeFilter === tf) return;
-    this.timeFilter = tf;
+  /** Apply a count+unit expression. Re-freezes the absolute anchor when the
+   *  filter is in ABSOLUTE mode, otherwise the number input would look inert
+   *  (the frozen cutoff would ignore the new expression). */
+  private setTimeFilterSpec(count: number, unit: TimeUnit, opts: { rerender?: boolean } = {}): void {
+    const n = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+    if (n === this.timeFilterCount && unit === this.timeFilterUnit) return;
+    this.timeFilterCount = n;
+    this.timeFilterUnit = unit;
+    if (n <= 0) this.timeFilterAnchor = null;
+    else if (this.timeFilterAnchor !== null) this.timeFilterAnchor = this.computeRelativeCutoff();
     this.reconcileSelectionAfterFilter();
     this.persistFocus(); // queue a workspace.json save so reload restores it
-    this.render();
+    if (opts.rerender === false) this.refreshList(); else this.render();
+  }
+
+  /** Flip the calendar/rolling boundary style, re-freezing if absolute. */
+  private setTimeFilterCalendar(on: boolean, opts: { rerender?: boolean } = {}): void {
+    if (this.timeFilterCalendar === on) return;
+    this.timeFilterCalendar = on;
+    if (this.timeFilterAnchor !== null) this.timeFilterAnchor = this.computeRelativeCutoff();
+    this.reconcileSelectionAfterFilter();
+    this.persistFocus();
+    // rerender:false keeps an open popover/accordion alive (a full render()
+    // rebuilds the bar and detaches it mid-interaction).
+    if (opts.rerender === false) this.refreshList(); else this.render();
+  }
+
+  /** Flip RELATIVE (sliding window) ↔ ABSOLUTE (cutoff frozen at this instant). */
+  private setTimeFilterAbsolute(on: boolean, opts: { rerender?: boolean } = {}): void {
+    const next = on && this.timeFilterCount > 0 ? this.computeRelativeCutoff() : null;
+    if (next === this.timeFilterAnchor) return;
+    this.timeFilterAnchor = next;
+    this.reconcileSelectionAfterFilter();
+    this.persistFocus();
+    if (opts.rerender === false) this.refreshList(); else this.render();
   }
 
   /** After a filter change, drop selected ids that no longer pass the
@@ -7423,7 +7731,33 @@ export class StashpadView extends ItemView {
     this.composerNarrowObserver?.disconnect();
     this.composerNarrowObserver = ro;
 
-    const sendBtn = btnRail.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-send" });
+    // 0.270.3: Send is UNGROUPED — a direct child of the composer, not a member
+    // of the button rail. Inside the rail it was one flex item among several,
+    // sharing the rail's flow (and the collapsible group's `overflow: hidden` /
+    // `opacity` stacking context) with nothing to guarantee it painted last. As
+    // its own composer child it can be given its own layer: mobile CSS pins it
+    // absolutely over the rail's right end with a z-index, so no sibling in the
+    // composer can be painted or hit-tested over it. The layout is unchanged —
+    // the rail reserves exactly the width Send used to occupy.
+    //
+    // NOTE: this deliberately leaves the textarea and its ancestors untouched.
+    // The `touchstart`/`touchmove` guard above still sits on the textarea, in
+    // the same place in the tree, so the swipe-to-highlight fix is unaffected.
+    const sendBtn = composer.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-send" });
+    // 0.270.3: the same guard the textarea carries, for the same reason. Send is
+    // the rightmost control in the view, and its invisible hit-area extender
+    // (`::before`, -8px) reaches into the strip along the screen edge where
+    // Obsidian listens for the drawer gesture. The textarea case PROVED that
+    // handler is bubble-phase and bound above us, so stopping propagation at the
+    // button keeps a press that begins on Send from ever reaching it.
+    // `stopPropagation` only, never `preventDefault` — the button's own
+    // `touchend` handler below is on this same element and is unaffected
+    // (`stopPropagation` does not silence same-element listeners).
+    if (Platform.isMobile) {
+      for (const evt of ["touchstart", "touchmove"]) {
+        sendBtn.addEventListener(evt, (e) => { e.stopPropagation(); }, { passive: true });
+      }
+    }
     // 0.216.0: every sibling button already guards mousedown (destBtn's comment
     // documents why: stealing focus dismisses the mobile keyboard). Send was
     // the ONE button without it, so a tap on Send blurred the textarea at
@@ -12765,7 +13099,7 @@ export class StashpadView extends ItemView {
       await leaf.setViewState({
         type: STASHPAD_VIEW_TYPE,
         active: false,
-        state: { focusId, timeFilter: this.timeFilter, folderOverride: this.folderOverride },
+        state: { focusId, ...this.timeFilterState(), folderOverride: this.folderOverride },
       });
       // getLeaf("tab") fronts the new tab; hand focus straight back so the move
       // never interrupts the user's place.
@@ -12804,7 +13138,7 @@ export class StashpadView extends ItemView {
       active: true,
       state: {
         focusId,
-        timeFilter: this.timeFilter,
+        ...this.timeFilterState(),
         folderOverride: this.folderOverride,
       },
     });
@@ -13075,7 +13409,7 @@ export class StashpadView extends ItemView {
       filtersActive: {
         tag: this.tagFilter ?? null,
         color: this.colorFilter ?? null,
-        time: this.timeFilter ?? null,
+        time: this.timeFilterLongLabel(),
         hideCompleted: this.currentHideCompleted(),
         hideChildless: this.currentHideChildless(),
         attachmentsOnly: this.currentAttachmentsOnly(),
@@ -13143,6 +13477,14 @@ export class StashpadView extends ItemView {
     if (raw === true || raw === "top") return "top";
     if (raw === "bottom") return "bottom";
     return null;
+  }
+
+  /** Pinned in EITHER sense: floated in this list, or pinned to the sidebar
+   *  panel. Backs the "pinned notes ignore filters" rule. Granularity (letting
+   *  the two pin kinds behave differently here) is a deliberate TODO. */
+  isPinnedAnyKind(id: StashpadId): boolean {
+    if (this.isListPinned(id)) return true;
+    return this.plugin.isPinned({ folder: this.noteFolder, id });
   }
 
   /** Is this note list-pinned (floated to either end of its sibling list)?
@@ -16294,6 +16636,65 @@ export class StashpadView extends ItemView {
     }
     return `${d.format("YYYY.MM.DD")} ${d.format("HH:mm:ss A")}`;
   }
+  /** 0.270.1: run a positional scroll (`restore` / `scroll-to-id`) now, then
+   *  RE-run it only on the steps where the list's geometry actually changed.
+   *
+   *  The old shape was an unconditional chain — apply at 0 / rAF / 60 / 200 /
+   *  600ms — which meant that on a big list every one of those five steps
+   *  moved the scroll again even when nothing had shifted. On a 347-row root
+   *  list each move also re-triggers the sticky-heading work and the lazy-body
+   *  observer, so the settled list kept being nudged for 600ms after the
+   *  navigation: visible churn, and it is the churn the flicker report
+   *  describes when you navigate UP into a large parent.
+   *
+   *  Gating on "did scrollHeight or clientHeight move since the last look"
+   *  turns the chain into what it was always trying to be — re-apply *after*
+   *  the row set settles — without inventing another timer. In the settled
+   *  case it collapses to one apply plus the rAF confirmation; in the
+   *  still-growing case (async markdown / attachment layout) it re-applies
+   *  exactly as before.
+   *
+   *  clientHeight is watched as well as scrollHeight deliberately: on iOS the
+   *  soft keyboard shrinks the list to ~200px and Obsidian regrows the leaf a
+   *  beat later, so a scroll computed against the squeezed viewport lands
+   *  clamped and the content slides ~336px when the viewport comes back. When
+   *  that transition is in flight the tail step is pushed out past
+   *  keyboardTransitionUntil so the final apply lands on the settled viewport
+   *  rather than the squeezed one. */
+  private scheduleSettleApplies(list: HTMLElement, apply: () => void, done?: () => void): void {
+    let lastH = list.scrollHeight;
+    let lastVH = list.clientHeight;
+    apply();
+    let finished = false;
+    const step = (final: boolean) => (): void => {
+      if (finished) return;
+      // A newer render replaced the list, or the view was torn down: stop
+      // touching it, but still release the caller's guard.
+      if (!list.isConnected || list !== this.listEl) {
+        if (final) { finished = true; done?.(); }
+        return;
+      }
+      const h = list.scrollHeight;
+      const vh = list.clientHeight;
+      const moved = h !== lastH || vh !== lastVH;
+      lastH = h;
+      lastVH = vh;
+      if (moved) apply();
+      if (final) { finished = true; done?.(); }
+    };
+    requestAnimationFrame(step(false));
+    // If the on-screen keyboard is mid-transition the viewport is still
+    // moving; carry the tail past the end of that transition so the last
+    // apply sees the height the user will actually be looking at.
+    const kbTail = this.keyboardTransitionUntil - Date.now() + 200;
+    const tail = Math.max(SCROLL_SETTLE_STEPS_MS[SCROLL_SETTLE_STEPS_MS.length - 1], kbTail);
+    for (const ms of SCROLL_SETTLE_STEPS_MS) {
+      if (ms >= tail) continue;
+      window.setTimeout(step(false), ms);
+    }
+    window.setTimeout(step(true), tail);
+  }
+
   private scrollListToBottom(): void {
     const list = this.listEl;
     if (!list) return;
