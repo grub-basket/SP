@@ -6032,6 +6032,30 @@ export class StashpadView extends ItemView {
         return;
       }
       if (list.scrollTop > STICK_OFF_PX) return;
+      // 0.271.1: do NOT unstick while the list is auto-pinning to the bottom.
+      //
+      // The hysteresis above assumes scrollTop only moves when the USER scrolls.
+      // That holds until a note is added: scrollListToBottom sets
+      // stickToListBottom, and the listResizeObserver then FORCES scrollTop to
+      // scrollHeight on every height change — turning a height change back into
+      // a scroll change, the one thing the hysteresis relies on not happening.
+      //
+      // With a long focused header the loop is: pinned to bottom → scrollTop
+      // past STICK_ON → stick → collapse to one line → content now fits → list
+      // non-scrollable → scrollTop clamps to 0 → (here) unstick → expand →
+      // overflow returns → re-pin to bottom → stick → … forever. Reported on a
+      // phone as the header rubber-banding the instant a note was added while
+      // two long notes filled the viewport.
+      //
+      // 0.266.7 removed an earlier "don't unstick while non-scrollable" guard as
+      // redundant with the hysteresis — correct for USER scrolling, which is the
+      // only case where the guard fired then. Scoping it to stickToListBottom
+      // restores the loop protection for the auto-pin case WITHOUT the
+      // regression 0.266.7 fixed (a short note staying stuck forever): once the
+      // user touches the list, stickToListBottom clears and normal hysteresis
+      // resumes, so the ordinary case is untouched. While pinned the header is
+      // scrolled out of view at the top anyway, so staying stuck is invisible.
+      if (this.stickToListBottom) return;
       heading.removeClass("is-stuck");
     };
     list.addEventListener("scroll", apply, { passive: true });

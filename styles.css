@@ -1443,6 +1443,17 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   max-height: none;
   overflow-y: visible;
 }
+/* 0.271.2: the ROW itself also caps its height (max-height: 45vh, above) with
+   overflow: visible — so an expanded body/attachment-list grows PAST that cap
+   while the row's own border-bottom stays drawn at the 45vh line. The divider
+   stranded above the fleshed-out vertical file list. Dropping the body cap
+   (above) was only half of it; the row cap has to go too, or the box the border
+   belongs to never grows. Scoped to :not(.is-stuck) because stuck has its own
+   compact height, and to a direct-child :has() so it only fires for a heading
+   whose OWN body is expanded (:has() is used across this sheet already). */
+.stashpad-focused.is-heading-row:not(.is-stuck):has(> .stashpad-focused-body.is-body-expanded) {
+  max-height: none;
+}
 .stashpad-focused-body > :first-child { margin-top: 0; }
 .stashpad-focused-body > :last-child { margin-bottom: 0; }
 .stashpad-focused-actions {
