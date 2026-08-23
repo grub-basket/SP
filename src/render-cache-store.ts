@@ -4,7 +4,12 @@ import type { RenderEntry } from "./note-body-renderer";
 /** Bump when the shape of a cached render changes in a way that makes old
  *  entries wrong (e.g. MarkdownRenderer output format, or RenderEntry
  *  fields). A schema mismatch on load discards the whole store. */
-const CACHE_SCHEMA = 1;
+// 0.271.6: bumped to 2 — the non-destructive rail change (embeds/links now stay
+// in the body instead of being stripped) makes every pre-0.271.6 cached render
+// wrong (their `text` has the attachments removed). Discarding the store forces
+// a lazy recompute per note on next render, so existing notes pick up the inline
+// embeds without a mass re-render on load.
+const CACHE_SCHEMA = 2;
 
 /** 0.200.0 (perf L3): LRU bound. Entries hold full body text + rendered HTML,
  *  so an unbounded cache grows toward vault size and its save cost grows with

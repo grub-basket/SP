@@ -1440,6 +1440,7 @@ export class StashpadView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    this.hideInstantTooltip();
     if (this.initialRenderTimer != null) {
       window.clearTimeout(this.initialRenderTimer);
       this.initialRenderTimer = null;
@@ -7072,6 +7073,30 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** 0.271.5: a single reusable tooltip element, shown instantly at the cursor.
+   *  Lives on document.body so the rail's `overflow-x: auto` cannot clip it. */
+  private railTooltipEl: HTMLElement | null = null;
+  private hideInstantTooltip = (): void => {
+    this.railTooltipEl?.remove();
+    this.railTooltipEl = null;
+  };
+  private attachInstantTooltip(el: HTMLElement, text: string): void {
+    const place = (e: MouseEvent): void => {
+      if (!this.railTooltipEl) {
+        const doc = el.ownerDocument ?? document;
+        this.railTooltipEl = doc.body.createDiv({ cls: "stashpad-instant-tip", text });
+      } else {
+        this.railTooltipEl.setText(text);
+      }
+      // Same offset as the native tooltip: just below-right of the pointer.
+      this.railTooltipEl.style.left = `${e.clientX + 12}px`;
+      this.railTooltipEl.style.top = `${e.clientY + 16}px`;
+    };
+    el.addEventListener("mouseenter", place);
+    el.addEventListener("mousemove", place);
+    el.addEventListener("mouseleave", this.hideInstantTooltip);
+  }
+
   private renderAttachmentRail(parent: HTMLElement, paths: string[]): void {
     const rail = parent.createDiv({ cls: "stashpad-rail" });
     const imageCount = paths.filter((p) => isImageExt(p.split(".").pop() ?? "")).length;
@@ -7084,10 +7109,34 @@ export class StashpadView extends ItemView {
     // "compact" for everything on first paint.
     const setting = getSettings().attachmentRailMode;
     const measured = rail.clientWidth || parent.clientWidth || 600;
-    const mode: RailMode = setting === "auto"
+    // 0.271.5: the flipper is a TEMPORARY per-view override, not a global write.
+    // Writing the global setting made every open view re-render (thousands of
+    // rows across tabs) on a single tap — the user flagged exactly this. The
+    // override lives in memory on this view, so a flip re-renders only THIS
+    // view and resets on reload; the persistent default stays the settings one.
+    const mode: RailMode = this.railModeOverride ?? (setting === "auto"
       ? pickRailMode(paths.length, imageCount, measured)
-      : setting;
+      : setting);
     rail.addClass(`is-${mode}`);
+
+    // 0.271.4: a layout flipper as a pseudo-file at the START of the rail, so a
+    // note with many attachments can be switched between the horizontal card
+    // grid and the vertical filename list in one tap without a trip to
+    // settings. It writes the GLOBAL attachmentRailMode (a display preference),
+    // so every rail flips together — matching how a layout toggle is expected
+    // to behave. Shown only with 2+ items; flipping a single file is pointless.
+    if (paths.length >= 2) {
+      const cycle: RailMode[] = ["thumbnail", "filename", "compact"];
+      const next = cycle[(cycle.indexOf(mode) + 1) % cycle.length];
+      const flip = rail.createDiv({ cls: "stashpad-att stashpad-att-flip" });
+      flip.title = `Attachment layout: ${mode} — tap for ${next}`;
+      setIcon(flip, mode === "filename" ? "layout-grid" : "layout-list");
+      flip.onclick = (e) => {
+        e.stopPropagation();
+        this.railModeOverride = next;   // per-view, in-memory; re-renders only this view
+        this.render();
+      };
+    }
 
     for (const p of paths) {
       const file = this.app.metadataCache.getFirstLinkpathDest(p, "");
@@ -7095,7 +7144,14 @@ export class StashpadView extends ItemView {
       const kind = fileKindFor(ext);
       const baseName = p.split("/").pop() ?? p;
       const box = rail.createDiv({ cls: "stashpad-att" });
-      box.title = file ? `${baseName} — ${kind.label}` : `${baseName} — missing`;
+      // 0.271.5: instant tooltip at the cursor instead of the native `title`,
+      // which only appears after a ~1s delay. Same position as native (follows
+      // the pointer), just no wait — the whole point of a rail is quick
+      // identification, and a clamped name plus a one-second-late tooltip is not
+      // quick. aria-label keeps the accessible name; the visual tip is custom.
+      const tipText = file ? `${baseName} — ${kind.label}` : `${baseName} — missing`;
+      box.setAttribute("aria-label", tipText);
+      this.attachInstantTooltip(box, tipText);
       if (!file) box.addClass("is-missing");
 
       // Thumbnails in EVERY mode, including the filename list — a 24px preview
@@ -8594,6 +8650,11 @@ export class StashpadView extends ItemView {
   /** Last render-relevant settings signature this view acted on. Empty until the
    *  first broadcast, so the first one always renders. 0.268.13 */
   private settingsRenderSig = "";
+  /** 0.271.5: temporary per-view attachment-rail layout, set by the rail's
+   *  flipper. null = follow the global `attachmentRailMode` setting. In-memory,
+   *  so it resets on reload — the flipper is a quick "show me this differently
+   *  right now", not a persisted preference. */
+  private railModeOverride: RailMode | null = null;
   private onDocKeyDown = (e: KeyboardEvent): void => {
     if (!this.viewRoot.isConnected) return;
     // Run when our Stashpad leaf is the active one, regardless of where focus

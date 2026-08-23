@@ -164,34 +164,32 @@ export class NoteBodyRenderer {
   }
 
   private splitAttachments(body: string): { text: string; attachments: string[] } {
+    // 0.271.6 (#3): NON-DESTRUCTIVE. The body is returned UNCHANGED — every
+    // embed and link renders inline as Obsidian would render it — and the rail
+    // is an ADDITIVE index built from the same references. Nothing is swallowed
+    // out of the text, regardless of extension. (Earlier this removed file
+    // embeds/links from the body and put them only in the rail; that was the
+    // "bad call from the start" — an image now shows inline AND as a rail chip.)
+    //
+    // The rail still indexes FILES only. A note reference (`[[Note]]`,
+    // `![[2026-08-18]]`, `.md`) is not an attachment — it stays purely a
+    // body link, and shows in the backlinks / outgoing-links rails instead.
     const attachments: string[] = [];
-    // 0.209.1: require a non-space char in the target. `![[   ]]` used to match,
-    // which pushed "   " as an attachment AND deleted that text from the body —
-    // so a stray pair of brackets made visible text disappear.
-    let text = body.replace(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (_m, p1) => {
-      attachments.push(p1);
-      return "";
-    });
-    // 0.268.2: a PLAIN wikilink to a file is an attachment too.
-    //
-    // The rail used to recognise embeds only, so attaching without embedding
-    // left the file out of the rail AND left its link sitting in the body as
-    // text. That made "don't embed my attachments" strictly worse than
-    // embedding, which is not a real choice.
-    //
-    // Decided by the extension rather than by asking the vault: it is a string
-    // test, it works before the file exists, and it cannot be wrong in a way
-    // that loses data — a false positive moves a link into the rail, where it
-    // is still a link. `.md` is excluded because a wikilink to a NOTE is a
-    // reference, not a file, and belongs in the text.
-    text = text.replace(/\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (m, p1: string) => {
-      const target = String(p1).trim();
+    const isFile = (raw: string): string | null => {
+      const target = raw.trim();
       const ext = /\.([A-Za-z0-9]{1,8})$/.exec(target.split(/[?#]/)[0])?.[1]?.toLowerCase();
-      if (!ext || ext === "md") return m;   // a note link stays in the body
-      attachments.push(target);
-      return "";
-    });
-    text = text.replace(/\n{3,}/g, "\n\n").trim();
-    return { text, attachments };
+      return ext && ext !== "md" ? target : null;
+    };
+    // Embeds: `![[file.ext]]`.
+    for (const m of body.matchAll(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g)) {
+      const f = isFile(m[1]); if (f) attachments.push(f);
+    }
+    // Plain links: `[[file.ext]]`. The negative lookbehind skips the `[[` inside
+    // an `![[…]]` embed so a file embed is not counted twice.
+    for (const m of body.matchAll(/(?<!!)\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g)) {
+      const f = isFile(m[1]); if (f) attachments.push(f);
+    }
+    // De-dupe: the same file embedded and linked should be one rail chip.
+    return { text: body, attachments: [...new Set(attachments)] };
   }
 }

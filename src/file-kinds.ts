@@ -81,13 +81,17 @@ export type RailMode = "thumbnail" | "compact" | "filename";
  */
 export function pickRailMode(
   count: number,
-  imageCount: number,
+  _imageCount: number,
   availableWidth: number,
 ): RailMode {
   if (count === 0) return "compact";
-  const mostlyImages = imageCount / count >= 0.5;
-  if (!mostlyImages) return "filename";
-  // Width each thumbnail would get if they all sat in one row, including gaps.
+  // 0.271.3: auto is always HORIZONTAL now — thumbnail cards when they fit,
+  // else a compact icon strip. Previously a rail that was not mostly images
+  // fell back to the vertical "filename" list; that surprised people (a note
+  // with a couple of docs looked completely different from one with photos),
+  // so the vertical list is now an explicit opt-in (settings → attachment rail
+  // → Filename) rather than something auto chose for you. `_imageCount` is kept
+  // in the signature for callers but no longer steers the layout.
   const per = availableWidth / count - 6;
   if (per < 90) return "compact";
   return "thumbnail";

@@ -1963,6 +1963,31 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   line-height: 1;
 }
 .stashpad-att.is-missing { opacity: 0.55; border-style: dashed; }
+/* 0.271.4: the layout-flipper pseudo-file. Reads as a control, not a file —
+   dashed border + muted, accent on hover. Sits first in the rail. */
+.stashpad-att-flip {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+.stashpad-att-flip:hover {
+  color: var(--text-accent);
+  border-color: var(--text-accent);
+}
+.stashpad-att-flip .svg-icon { width: 20px; height: 20px; }
+/* 0.271.3: in thumbnail mode a NON-image card shows a type badge AND a filename,
+   but the base badge is height:100% — it filled the whole 64px card, so the name
+   below it overflowed the card and clipped mid-word. Let the badge share the
+   card with the name instead of eating it, and clamp the name to one line so
+   badge + name fit. Only cards that actually carry a name are touched (image
+   cards keep their full-bleed thumbnail). */
+.stashpad-rail.is-thumbnail .stashpad-att:has(.stashpad-att-name) .stashpad-att-badge {
+  height: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.stashpad-rail.is-thumbnail .stashpad-att-name {
+  -webkit-line-clamp: 1;
+}
 
 /* --- rail layouts (0.235.0) --- */
 /* Compact: icon-only strip. Used when thumbnails would be too small to
@@ -8233,4 +8258,24 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   height: 1px;
   margin: 6px 0;
   background: var(--background-modifier-border);
+}
+
+/* 0.271.5: instant attachment tooltip — shown at the cursor with no delay,
+   parented to <body> so the rail's overflow can't clip it. */
+.stashpad-instant-tip {
+  position: fixed;
+  z-index: var(--layer-tooltip, 100);
+  pointer-events: none;
+  max-width: 320px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--background-secondary-alt, var(--background-secondary));
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: var(--shadow-s);
+  font-size: 12px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
