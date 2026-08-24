@@ -39,6 +39,7 @@ import { OrderStore } from "./order-store";
 import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./structure-snapshot";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
+import { createAliasesForFolder } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
@@ -3575,6 +3576,32 @@ export default class StashpadPlugin extends Plugin {
       // (persistent notice + bar), shared with the settings button.
       callback: () => { void this.runRebootstrapWithUI().catch(() => { /* error notice already shown */ }); },
     });
+    // 0.271.7: create readable aliases for the CURRENT folder's notes, so
+    // Obsidian's quick switcher / links show the title instead of the
+    // slug-and-id filename. Scope is the current folder only (said so in the
+    // name), append-only, and never automatic — this command or a rebootstrap.
+    this.addCommand({
+      id: "stashpad-create-aliases-folder",
+      name: "Create aliases from titles for THIS folder's notes (append-only)",
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+          .map((l) => l.view as unknown as { noteFolder?: string })
+          .find((v) => v === (this.app.workspace.activeLeaf?.view as unknown))
+          ?? this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+            .map((l) => l.view as unknown as { noteFolder?: string })[0];
+        const folder = view?.noteFolder;
+        if (!folder) return false;
+        if (checking) return true;
+        void createAliasesForFolder(this.app, folder, (f) => this.isStashpadNoteFile(f))
+          .then(({ scanned, written }) => {
+            new Notice(written > 0
+              ? `Stashpad: added aliases to ${written} note${written === 1 ? "" : "s"} in "${folder}" (${scanned} checked).`
+              : `Stashpad: every note in "${folder}" already had its alias (${scanned} checked).`);
+          })
+          .catch((e) => { console.warn("[Stashpad] create aliases failed", e); new Notice("Stashpad: couldn't create aliases — see console."); });
+        return true;
+      },
+    });
     this.addCommand({
       id: "stashpad-adopt-note",
       name: "Adopt active note into Stashpad (fill missing frontmatter)",
@@ -4699,7 +4726,10 @@ export default class StashpadPlugin extends Plugin {
         // metadata cache, skip-if-equal, writes only what's actually
         // different. Paced internally so multi-folder rebootstrap
         // doesn't stall the FS.
-        const stats = await rebootstrapFolderFrontmatter(this.app, folder);
+        // 0.271.7: a full rebootstrap also backfills readable aliases
+        // (append-only). This is the "run rebootstrap again" path the user
+        // means; the narrower recovery-link backfill stays alias-free.
+        const stats = await rebootstrapFolderFrontmatter(this.app, folder, { writeAliases: true });
         fmChecked += stats.checked;
         fmWritten += stats.written;
         // 0.58.1: rename files whose slug no longer matches their body's

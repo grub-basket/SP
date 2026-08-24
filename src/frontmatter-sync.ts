@@ -3,6 +3,7 @@ import { ROOT_ID, type StashpadId, type TreeNode } from "./types";
 import type { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
 import { getSettings } from "./settings";
+import { deriveCleanTitle } from "./alias-service";
 
 const PARENT_LINK_FIELD = "parentLink";
 const CHILDREN_FIELD = "children";
@@ -307,7 +308,7 @@ export class FrontmatterSyncQueue {
 export async function rebootstrapFolderFrontmatter(
   app: App,
   folder: string,
-  opts?: { onlyIds?: ReadonlySet<string> },
+  opts?: { onlyIds?: ReadonlySet<string>; writeAliases?: boolean },
 ): Promise<{ checked: number; written: number }> {
   type Entry = { file: TFile; id: string; parent: string };
 
@@ -377,13 +378,36 @@ export async function rebootstrapFolderFrontmatter(
     const parentEqual = (currentParent ?? null) === (desiredParent ?? null);
     const childrenEqual = currentChildren.length === desiredChildren.length
       && currentChildren.every((v, i) => v === desiredChildren[i]);
-    if (parentEqual && childrenEqual) continue;
+    // 0.271.7: rebootstrap also backfills the readable alias when asked. Compute
+    // the title (async file read) BEFORE the sync processFrontMatter callback,
+    // and decide whether it is missing so a note that only needs an alias is not
+    // skipped by the parent/children equality check. Append-only.
+    let aliasToAdd: string | null = null;
+    if (opts?.writeAliases) {
+      const title = await deriveCleanTitle(app, entry.file);
+      if (title) {
+        const cur = fm?.aliases;
+        const list: string[] = Array.isArray(cur)
+          ? cur.filter((x: unknown): x is string => typeof x === "string")
+          : (typeof cur === "string" && (cur as string).trim() ? [cur as string] : []);
+        const listable = cur === undefined || Array.isArray(cur) || typeof cur === "string";
+        if (listable && !list.some((a) => a === title)) aliasToAdd = title;
+      }
+    }
+    if (parentEqual && childrenEqual && aliasToAdd === null) continue;
     try {
       await app.fileManager.processFrontMatter(entry.file, (m) => {
         if (desiredParent) m[PARENT_LINK_FIELD] = desiredParent;
         else delete m[PARENT_LINK_FIELD];
         if (desiredChildren.length > 0) m[CHILDREN_FIELD] = desiredChildren;
         else delete m[CHILDREN_FIELD];
+        if (aliasToAdd !== null) {
+          const cur = m.aliases;
+          const list: string[] = Array.isArray(cur)
+            ? cur.filter((x: unknown): x is string => typeof x === "string")
+            : (typeof cur === "string" && cur.trim() ? [cur] : []);
+          if (!list.some((a) => a === aliasToAdd)) { list.push(aliasToAdd); m.aliases = list; }
+        }
       });
       written += 1;
       // Spread writes so a 1000-note vault doesn't stall the FS in
