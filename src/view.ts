@@ -31,7 +31,7 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal , DuplicateIdsModal, type DuplicateIdGroup} from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal} from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import { AppImportModal } from "./stashpad-app-import-modal";
 import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
@@ -71,6 +71,7 @@ import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMet
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
+import { QUICK_ACTION_CATALOG } from "./quick-actions";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
@@ -6201,6 +6202,7 @@ export class StashpadView extends ItemView {
       moreBtn.title = "Actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = moreBtn;
+      this.maybeAddQuickButton(actions, node, moreBtn);
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-pencil" });
       setIcon(pencil, "pencil");
@@ -6631,6 +6633,7 @@ export class StashpadView extends ItemView {
       // carries Focus / Open in editor / everything (the two separate focus +
       // edit buttons were too cramped on a phone). Press-and-hold is avoided
       // deliberately (it would fight drag-reorder / nesting).
+      this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
       setIcon(moreBtn, "ellipsis-vertical");
       moreBtn.title = "Actions";
@@ -6649,6 +6652,7 @@ export class StashpadView extends ItemView {
       // "More actions" button — opens the same context menu as right-click
       // (Copy Stashpad link, Delete, Split, Move, …). One menu button keeps the
       // row uncluttered as the action set grows, instead of a button per action.
+      this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
       setIcon(moreBtn, "ellipsis-vertical");
       moreBtn.title = "More actions";
@@ -16901,6 +16905,71 @@ export class StashpadView extends ItemView {
       if (sub && typeof sub.addItem === "function") add(sub);
       else it.onClick(() => this.openCommandPalette());
     });
+  }
+
+  /** 0.272.0: show the note's text large enough to read across a table. */
+  cmdRevealLargeText(node: TreeNode): void {
+    if (!node.file) return;
+    const title = this.titleForNode(node).trim();
+    const body = this.plugin.renderCacheStore.get(node.file.path)?.text ?? "";
+    if (body.trim()) { new LargeTextModal(this.app, title, body).open(); return; }
+    // Not cached yet (row never shown): read the file, strip frontmatter.
+    void this.app.vault.cachedRead(node.file).then((raw) => {
+      new LargeTextModal(this.app, title, this.stripFrontmatter(raw)).open();
+    }).catch(() => new Notice("Couldn't read that note."));
+  }
+
+  /** 0.272.0: run one quick-action by id against `node`. Normalises the
+   *  selection to the clicked note first (same invariant as openNoteMenu), so
+   *  the selection-based cmd* helpers act on the note the user tapped. */
+  private runQuickAction(id: string, node: TreeNode): void {
+    if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+    switch (id) {
+      case "copy":      void this.cmdCopy(); break;
+      case "copyTree":  void this.cmdCopyTree(); break;
+      case "move":      this.cmdMovePicker(); break;
+      case "clone":     void this.cmdClone(); break;
+      case "setColor":  this.cmdSetColor(); break;
+      case "blur":      void this.cmdToggleObscured(); break;
+      case "setDue":    this.cmdSetDue(); break;
+      case "archive":   void this.cmdMoveToArchive(); break;
+      case "largeText": this.cmdRevealLargeText(node); break;
+      case "edit":      void this.cmdEdit(node); break;
+      default: /* unknown id (stale settings) — skip silently */ break;
+    }
+  }
+
+  /** 0.272.0: add the star quick-action button to a row/header actions cluster,
+   *  before the ⋮ menu button. Hidden entirely when the user has emptied the
+   *  quick-action list (nothing to show). `before`, when given, positions the
+   *  star ahead of that element (the focused header creates its ⋮ first). */
+  private maybeAddQuickButton(container: HTMLElement, node: TreeNode, before?: HTMLElement): void {
+    if ((getSettings().quickMenuActions ?? []).length === 0) return;
+    const btn = container.createEl("button", { cls: "stashpad-pencil stashpad-note-quick" });
+    setIcon(btn, "star");
+    btn.title = "Quick actions";
+    btn.onclick = (e) => { e.stopPropagation(); this.openQuickMenu(e, node); };
+    if (before) container.insertBefore(btn, before);
+  }
+
+  /** 0.272.0: the short, user-curated quick menu opened by the star button.
+   *  Sits before the full ⋮ menu; contents come from `settings.quickMenuActions`
+   *  in that order. Falls back to nothing (button hidden) when the list is
+   *  empty — see the star-button render guard. */
+  private openQuickMenu(evt: MouseEvent, node: TreeNode): void {
+    if (!node.file) return;
+    const ids = getSettings().quickMenuActions ?? [];
+    const byId = new Map(QUICK_ACTION_CATALOG.map((a) => [a.id, a]));
+    const menu = new Menu();
+    let added = 0;
+    for (const id of ids) {
+      const def = byId.get(id);
+      if (!def) continue;   // stale/unknown id
+      menu.addItem((it: any) => it.setTitle(def.label).setIcon(def.icon).onClick(() => this.runQuickAction(id, node)));
+      added += 1;
+    }
+    if (added === 0) { this.openNoteMenu(evt, node); return; }   // nothing configured → fall back to full menu
+    menu.showAtMouseEvent(evt);
   }
 
   private openNoteMenu(evt: MouseEvent, node: TreeNode): void {

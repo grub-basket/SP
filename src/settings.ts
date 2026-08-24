@@ -10,6 +10,7 @@ import { IconSuggest } from "./icon-suggest";
 import type StashpadPlugin from "./main";
 import { RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
+import { QUICK_ACTION_CATALOG } from "./quick-actions";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal } from "./modals";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
@@ -308,6 +309,10 @@ export interface StashpadSettings {
    *  you can copy from the Diagnostics tab. Purely local, no network, no file
    *  writes; a no-op when off. Ships dormant — never needs stripping for the
    *  store / pristine. */
+  /** 0.272.0: ordered list of quick-action ids shown in the per-note star menu
+   *  (a short, user-curated menu that sits before the full ⋮ menu). Empty hides
+   *  the star button entirely. Ids are QUICK_ACTION keys. */
+  quickMenuActions: string[];
   /** 0.269.0: when a Stashpad note is opened in an ordinary editor tab — the
    *  quick switcher, a wikilink, the file explorer — close that tab and show
    *  the note inside Stashpad instead. Off by default: it changes what a very
@@ -827,6 +832,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   folderPanelPinnedGrouping: "pin-order",
   enablePerfProfiling: false,
   diagnosticsEnabledAt: { perf: 0, trace: 0 },
+  quickMenuActions: ["copy", "move", "blur", "largeText"],
   openNotesInStashpad: false,
   debugTrace: false,
   // 0.268.18: OFF. Persistence was added for a bug thought to hang the app,
@@ -1523,6 +1529,31 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  section FRESH at display time (so folder-dependent content is never stale).
    *  Searchable by the section name/aliases. Strips the default row chrome and
    *  hands the section a plain host element to fill. */
+  /** 0.272.0: the quick-action (star) menu customization — one checkbox per
+   *  catalog action; checked ones make up `quickMenuActions` in catalog order.
+   *  Emptying every box hides the star button entirely. */
+  private quickMenuSection(): SettingDefinitionItem {
+    return this.sectionDef(
+      "Quick actions menu (the star button)",
+      "A short, tap-first menu on each note, shown before the full ⋮ menu. Pick which actions appear; uncheck them all to hide the star button. Actions run on the note you tapped.",
+      (host) => {
+        const chosen = new Set(this.plugin.settings.quickMenuActions ?? []);
+        for (const def of QUICK_ACTION_CATALOG) {
+          const row = new Setting(host).setName(def.label);
+          row.addToggle((t) => t.setValue(chosen.has(def.id)).onChange(async (on) => {
+            if (on) chosen.add(def.id); else chosen.delete(def.id);
+            // Persist in CATALOG order so the menu order is stable and matches
+            // what this list shows top-to-bottom.
+            this.plugin.settings.quickMenuActions =
+              QUICK_ACTION_CATALOG.filter((a) => chosen.has(a.id)).map((a) => a.id);
+            await this.plugin.saveSettings();
+          }));
+        }
+      },
+      ["quick", "menu", "star", "actions", "shortcut", "copy", "move", "blur", "large text"],
+    );
+  }
+
   private sectionDef(
     name: string,
     desc: string,
@@ -2307,6 +2338,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.openNotesInStashpad, (v) => { this.plugin.settings.openNotesInStashpad = v; }, ["open", "route", "redirect", "intercept", "editor", "switcher", "wikilink", "quick switcher"]));
     cats.windowsTabs.push(toggle("Search opens the note in its list (in context)", "When you pick a search result, open the LIST that contains the note (focus its parent) and scroll to the note — so you see it in context instead of landing on the focused-note header. On by default.",
       () => this.plugin.settings.searchOpensInContext, (v) => { this.plugin.settings.searchOpensInContext = v; }, ["search", "context", "list", "scroll", "parent"]));
+    cats.windowsTabs.push(this.quickMenuSection());
     cats.windowsTabs.push(toggle("Open in new window — duplicate tab", "ON: the new-window button (in the time-filter row) duplicates the current Stashpad tab — original stays open in the main window. OFF: the leaf is MOVED to the new window, closing the original tab.",
       () => this.plugin.settings.popoutDuplicates, (v) => { this.plugin.settings.popoutDuplicates = v; }, ["popout", "window", "duplicate"]));
     cats.windowsTabs.push(toggle("Search results open in a new tab", "When you pick a result in the Search modal, open it in a new Stashpad tab instead of navigating the current tab. Applies to same-folder and cross-Stashpad results alike. On by default.",

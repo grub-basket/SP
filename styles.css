@@ -8279,3 +8279,29 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 0.272.0: "Reveal in large text" modal — big, high-contrast, readable across a
+   table. Fills most of the screen; the reading area scrolls; the top bar scales. */
+.stashpad-largetext-modal { width: min(92vw, 900px); height: min(90vh, 900px); }
+.stashpad-largetext-modal .modal-content { display: flex; flex-direction: column; height: 100%; padding: 0; }
+.stashpad-largetext-bar {
+  display: flex; gap: 8px; justify-content: flex-end;
+  padding: 8px 10px; border-bottom: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+.stashpad-largetext-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary); color: var(--text-normal); cursor: pointer;
+}
+.stashpad-largetext-btn:hover { background: var(--background-modifier-hover); }
+.stashpad-largetext-scroll { flex: 1 1 auto; overflow-y: auto; padding: 24px 28px; cursor: zoom-out; }
+.stashpad-largetext-title {
+  font-size: 0.5em; font-weight: 700; color: var(--text-muted);
+  margin-bottom: 0.4em; line-height: 1.2;
+}
+.stashpad-largetext-body {
+  font-weight: 600; line-height: 1.25; color: var(--text-normal);
+  white-space: pre-wrap; word-break: break-word;
+}

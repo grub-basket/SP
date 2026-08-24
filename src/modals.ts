@@ -4265,3 +4265,58 @@ export class DuplicateIdsModal extends Modal {
 
   onClose(): void { this.contentEl.empty(); }
 }
+
+/** 0.272.0: "Reveal in large text" — show a note's text big enough to hand your
+ *  screen to someone across a table. Plain, high-contrast, scrollable, with
+ *  +/- to scale (remembered in localStorage). Tap anywhere, Esc, or the close
+ *  button dismisses. Deliberately NOT a markdown render: the point is legibility
+ *  at a distance, so it shows the note's text large and unstyled. */
+export class LargeTextModal extends Modal {
+  private static readonly SIZE_KEY = "stashpad:large-text-size";
+  private size: number;
+  constructor(app: App, private noteTitle: string, private bodyText: string) {
+    super(app);
+    let s = 48;
+    try { const v = Number(localStorage.getItem(LargeTextModal.SIZE_KEY)); if (Number.isFinite(v) && v >= 20 && v <= 160) s = v; } catch { /* default */ }
+    this.size = s;
+  }
+
+  onOpen(): void {
+    this.modalEl?.addClass("stashpad-largetext-modal");
+    this.contentEl.empty();
+    this.titleEl?.setText("");
+
+    const bar = this.contentEl.createDiv({ cls: "stashpad-largetext-bar" });
+    const mk = (icon: string, label: string, fn: () => void): void => {
+      const b = bar.createEl("button", { cls: "stashpad-largetext-btn" });
+      setIcon(b, icon); b.setAttr("aria-label", label); b.title = label;
+      b.onclick = (e) => { e.stopPropagation(); fn(); };
+    };
+    mk("minus", "Smaller", () => this.bump(-6));
+    mk("plus", "Larger", () => this.bump(6));
+    mk("x", "Close", () => this.close());
+
+    const scroll = this.contentEl.createDiv({ cls: "stashpad-largetext-scroll" });
+    // Tapping the reading area (not the buttons) dismisses — the common "I'm
+    // done showing it" gesture.
+    scroll.onclick = () => this.close();
+    if (this.noteTitle.trim()) {
+      scroll.createDiv({ cls: "stashpad-largetext-title", text: this.noteTitle.trim() });
+    }
+    const body = this.bodyText.trim();
+    this.textEl = scroll.createDiv({ cls: "stashpad-largetext-body", text: body || "(empty note)" });
+    this.applySize();
+  }
+
+  private textEl: HTMLElement | null = null;
+  private bump(delta: number): void {
+    this.size = Math.max(20, Math.min(160, this.size + delta));
+    try { localStorage.setItem(LargeTextModal.SIZE_KEY, String(this.size)); } catch { /* non-fatal */ }
+    this.applySize();
+  }
+  private applySize(): void {
+    if (this.textEl) this.textEl.style.fontSize = `${this.size}px`;
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}
