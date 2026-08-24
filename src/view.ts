@@ -71,7 +71,7 @@ import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMet
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { QUICK_ACTION_CATALOG } from "./quick-actions";
+import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE } from "./quick-actions";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
@@ -16922,7 +16922,14 @@ export class StashpadView extends ItemView {
   /** 0.272.0: run one quick-action by id against `node`. Normalises the
    *  selection to the clicked note first (same invariant as openNoteMenu), so
    *  the selection-based cmd* helpers act on the note the user tapped. */
-  private runQuickAction(id: string, node: TreeNode): void {
+  private runQuickAction(id: string, node: TreeNode, evt?: MouseEvent | KeyboardEvent): void {
+    // "More commands…" opens the full ⋮ menu; it needs a position, so it does
+    // NOT normalise the selection here (openNoteMenu does that itself).
+    if (id === "more") {
+      const mouse = evt instanceof MouseEvent ? evt : this.lastQuickMenuEvt;
+      if (mouse) this.openNoteMenu(mouse, node);
+      return;
+    }
     if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
     switch (id) {
       case "copy":      void this.cmdCopy(); break;
@@ -16956,8 +16963,10 @@ export class StashpadView extends ItemView {
    *  Sits before the full ⋮ menu; contents come from `settings.quickMenuActions`
    *  in that order. Falls back to nothing (button hidden) when the list is
    *  empty — see the star-button render guard. */
+  private lastQuickMenuEvt: MouseEvent | null = null;
   private openQuickMenu(evt: MouseEvent, node: TreeNode): void {
     if (!node.file) return;
+    this.lastQuickMenuEvt = evt;   // fallback position for "More commands…"
     const ids = getSettings().quickMenuActions ?? [];
     const byId = new Map(QUICK_ACTION_CATALOG.map((a) => [a.id, a]));
     const menu = new Menu();
@@ -16965,10 +16974,15 @@ export class StashpadView extends ItemView {
     for (const id of ids) {
       const def = byId.get(id);
       if (!def) continue;   // stale/unknown id
-      menu.addItem((it: any) => it.setTitle(def.label).setIcon(def.icon).onClick(() => this.runQuickAction(id, node)));
+      menu.addItem((it: any) => it.setTitle(def.label).setIcon(def.icon).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
       added += 1;
     }
     if (added === 0) { this.openNoteMenu(evt, node); return; }   // nothing configured → fall back to full menu
+    // "More commands…" escape hatch to the full ⋮ menu, on by default.
+    if (getSettings().quickMenuIncludeMore) {
+      menu.addSeparator();
+      menu.addItem((it: any) => it.setTitle(QUICK_MENU_MORE.label).setIcon(QUICK_MENU_MORE.icon).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction("more", node, e)));
+    }
     menu.showAtMouseEvent(evt);
   }
 

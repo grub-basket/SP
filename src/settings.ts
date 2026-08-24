@@ -313,6 +313,10 @@ export interface StashpadSettings {
    *  (a short, user-curated menu that sits before the full ⋮ menu). Empty hides
    *  the star button entirely. Ids are QUICK_ACTION keys. */
   quickMenuActions: string[];
+  /** 0.272.1: append a "More commands…" escape hatch (opens the full ⋮ menu) to
+   *  the quick menu. A separate boolean rather than a catalog id so it defaults
+   *  on for existing installs without a migration. */
+  quickMenuIncludeMore: boolean;
   /** 0.269.0: when a Stashpad note is opened in an ordinary editor tab — the
    *  quick switcher, a wikilink, the file explorer — close that tab and show
    *  the note inside Stashpad instead. Off by default: it changes what a very
@@ -833,6 +837,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   enablePerfProfiling: false,
   diagnosticsEnabledAt: { perf: 0, trace: 0 },
   quickMenuActions: ["copy", "move", "blur", "largeText"],
+  quickMenuIncludeMore: true,
   openNotesInStashpad: false,
   debugTrace: false,
   // 0.268.18: OFF. Persistence was added for a bug thought to hang the app,
@@ -1537,6 +1542,13 @@ export class StashpadSettingTab extends PluginSettingTab {
       "Quick actions menu (the star button)",
       "A short, tap-first menu on each note, shown before the full ⋮ menu. Pick which actions appear; uncheck them all to hide the star button. Actions run on the note you tapped.",
       (host) => {
+        new Setting(host)
+          .setName("End with \"More commands…\"")
+          .setDesc("Append an item that opens the full ⋮ menu, so nothing is out of reach.")
+          .addToggle((t) => t.setValue(this.plugin.settings.quickMenuIncludeMore).onChange(async (v) => {
+            this.plugin.settings.quickMenuIncludeMore = v;
+            await this.plugin.saveSettings();
+          }));
         const chosen = new Set(this.plugin.settings.quickMenuActions ?? []);
         for (const def of QUICK_ACTION_CATALOG) {
           const row = new Setting(host).setName(def.label);

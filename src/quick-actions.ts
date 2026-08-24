@@ -18,3 +18,9 @@ export const QUICK_ACTION_CATALOG: readonly QuickActionDef[] = [
   { id: "largeText", label: "Reveal in large text", icon: "maximize" },
   { id: "edit",      label: "Edit in Stashpad",     icon: "pencil-line" },
 ];
+
+/** Label/icon for the "More commands…" escape hatch. NOT a catalog action —
+ *  it is a separate boolean (`quickMenuIncludeMore`) appended to the quick menu,
+ *  so it defaults on for everyone (a brand-new key) without a migration that the
+ *  settings collision guard would clobber. */
+export const QUICK_MENU_MORE = { label: "More commands…", icon: "ellipsis" };

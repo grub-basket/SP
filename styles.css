@@ -2253,11 +2253,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    areas. Scoped to NON-compact mobile (compact has its own dense layout). */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note.is-task {
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto auto auto;
   grid-template-areas:
-    "meta toggle more"
-    "body body  body"
-    "foot foot  foot";
+    "meta toggle quick more"
+    "body body   body  body"
+    "foot foot   foot  foot";
   align-items: center;
   row-gap: 2px;
   column-gap: 8px;
@@ -2270,6 +2270,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note-body { grid-area: body; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note-meta-bottom { grid-area: foot; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle { grid-area: toggle; }
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-quick { grid-area: quick; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more { grid-area: more; }
 /* Timestamp reads horizontally (one line) on mobile so it "spreads out"
    across the top row instead of stacking date over time. */
@@ -2280,6 +2281,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    they read at the same visual weight as the timestamp text (was 28px box /
    14px icon, which looked chunkier than the time). */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle,
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-quick,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more {
   align-self: center;
   width: 22px;
