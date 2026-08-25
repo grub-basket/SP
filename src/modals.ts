@@ -3844,7 +3844,12 @@ export interface DuplicateIdsModalOpts {
  *  them, and a false positive costs only sort ORDER — nothing is decided by
  *  this beyond where the row sits. */
 function isConflictCopy(path: string): boolean {
-  return /conflict/i.test(path);
+  // 0.272.4: match the PARENTHETICAL sync-conflict marker Obsidian (and similar
+  // tools) append — `Note (conflicted copy <device> <timestamp>).md` — not a
+  // bare "conflict" anywhere in the name. A note legitimately titled
+  // "…conflict…" is not a conflict copy, which the old /conflict/i mislabelled.
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return /\((?:conflicted copy|sync[- ]?conflict)\b/i.test(name);
 }
 
 /** How one copy compares to the note being shown. Computed for every row up
@@ -3958,6 +3963,11 @@ export class DuplicateIdsModal extends Modal {
       text: "Most of these are copies that kept their frontmatter — a sync conflict copy, a re-import, or a restored backup. "
         + "Compare a hidden copy against the one being shown before deciding: a conflict copy can hold edits the shown note doesn't.",
     });
+    c.createEl("p", {
+      cls: "setting-item-description",
+      text: "“Visible” just means the copy the app happens to display for this id — whichever one the tree loaded first — NOT the better or original copy. "
+        + "A sync-conflict copy can end up being the visible one, so read the recommendation on each id rather than trusting visible / hidden.",
+    });
 
     const list = c.createDiv({ cls: "stashpad-dupes-list" });
     for (const { folder, groups } of this.folders) {
@@ -4004,6 +4014,32 @@ export class DuplicateIdsModal extends Modal {
       return rank(a) - rank(b);
     });
 
+    // 0.272.4: which copy to KEEP is independent of which the app happens to
+    // show. When exactly one side is a sync-conflict copy and the other isn't,
+    // recommend by NAME — the clean copy is almost always the keeper, even when
+    // the tree is displaying the conflict copy (as it can, and did in the report
+    // that prompted this). Names on their own line so a long filename is legible.
+    const conflicts = g.files.filter((f) => isConflictCopy(f.path));
+    const cleans = g.files.filter((f) => !isConflictCopy(f.path));
+    if (conflicts.length >= 1 && cleans.length >= 1) {
+      const nameOf = (p: string): string => p.slice(p.lastIndexOf("/") + 1);
+      const keep = (cleans.find((f) => f.isShown) ?? cleans[0]);
+      const rec = box.createDiv({ cls: "stashpad-dupes-rec" });
+      rec.createDiv({ cls: "stashpad-dupes-rec-head", text: "Recommendation" });
+      const keepLine = rec.createDiv({ cls: "stashpad-dupes-rec-line is-keep" });
+      keepLine.createSpan({ cls: "stashpad-dupes-rec-verb", text: "Keep" });
+      keepLine.createSpan({ cls: "stashpad-dupes-rec-file", text: nameOf(keep.path) });
+      for (const cf of conflicts) {
+        const dl = rec.createDiv({ cls: "stashpad-dupes-rec-line is-discard" });
+        dl.createSpan({ cls: "stashpad-dupes-rec-verb", text: "Discard / merge" });
+        dl.createSpan({ cls: "stashpad-dupes-rec-file", text: nameOf(cf.path) });
+      }
+      if (conflicts.some((f) => f.isShown)) {
+        rec.createDiv({ cls: "stashpad-dupes-rec-note",
+          text: "Heads up: the app is currently showing the CONFLICT copy — “visible” just means the one it displays, not the one to keep." });
+      }
+    }
+
     for (const f of ordered) {
       const row = box.createDiv({ cls: f.isShown ? "stashpad-dupes-file is-shown" : "stashpad-dupes-file" });
 
@@ -4013,11 +4049,6 @@ export class DuplicateIdsModal extends Modal {
       const acts = row.createDiv({ cls: "stashpad-dupes-actions" });
       acts.createEl("button", { cls: "stashpad-dupes-act", text: "Open" })
         .onclick = () => { this.app.workspace.openLinkText(f.path, "", true); };
-      if (!f.isShown && shown) {
-        const cmp = acts.createEl("button", { cls: "stashpad-dupes-act", text: "Compare" });
-        cmp.title = `Diff this copy against ${shown.path}`;
-        cmp.onclick = () => { this.rememberScroll(); void this.showDiff(shown.path, f.path); };
-      }
       if (this.opts.onDelete && g.files.length > 1) {
         // NOT Obsidian's `mod-warning`: that is a FILLED red button, and colouring
         // its label red on top left an unreadable red block. Same lesson the
@@ -4040,6 +4071,15 @@ export class DuplicateIdsModal extends Modal {
       // colon introduces something instead of dangling before a line break.
       // The tooltip carries the explanation the words alone can't.
       const pathLine = main.createDiv({ cls: "stashpad-dupes-pathline" });
+      // 0.272.4: Compare sits at the START of the path line — right next to the
+      // note this row identifies — instead of in the left action cluster, so a
+      // row's "is this worth keeping?" control is on the same line as its id.
+      // At the line start (not after the wrapping path) it stays reachable.
+      if (!f.isShown && shown) {
+        const cmp = pathLine.createEl("button", { cls: "stashpad-dupes-act stashpad-dupes-compare-inline", text: "Compare" });
+        cmp.title = `Diff this copy against ${shown.path}`;
+        cmp.onclick = () => { this.rememberScroll(); void this.showDiff(shown.path, f.path); };
+      }
       const b = pathLine.createSpan({
         cls: f.isShown ? "stashpad-dupes-badge is-shown-badge" : "stashpad-dupes-badge",
         text: f.isShown ? "Visible: " : "Hidden: ",
@@ -4124,14 +4164,41 @@ export class DuplicateIdsModal extends Modal {
     const v = await this.verdictFor(targetPath, sourcePath);
     const srcName = sourcePath.slice(sourcePath.lastIndexOf("/") + 1).replace(/\.md$/, "");
     const tgtName = targetPath.slice(targetPath.lastIndexOf("/") + 1).replace(/\.md$/, "");
-    const parts: string[] = [];
-    if (v && !v.bodySame) parts.push("its text is appended under a labelled separator");
-    if (v && v.fieldDiffs > 0) parts.push("any fields “" + tgtName + "” has no value for are filled in from this copy — nothing already set is overwritten");
-    const what = parts.length
-      ? `“${srcName}” is folded into “${tgtName}”: ${parts.join("; ")}. Then “${srcName}” goes to the trash.`
-      : `“${srcName}” has nothing “${tgtName}” is missing, so this is the same as discarding it. It goes to the trash.`;
+
+    // 0.272.4: the "nothing missing" line used to look only at the body and the
+    // NON-structural field diff, so a copy that differed only in Stashpad's
+    // structural frontmatter (parent / children / …) or timestamps read as
+    // "nothing missing" — untrue. Detect the full frontmatter delta, and say
+    // plainly that those fields differ and are NOT merged (the kept copy's win).
+    const fmOf = (p: string): Record<string, unknown> => {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      return f instanceof TFile ? ((this.app.metadataCache.getFileCache(f)?.frontmatter ?? {}) as Record<string, unknown>) : {};
+    };
+    const A = fmOf(targetPath), B = fmOf(sourcePath);
+    let structuralDelta = 0;
+    for (const k of new Set([...Object.keys(A), ...Object.keys(B)])) {
+      if (!DUPE_STRUCTURAL_FM.has(k) && !DUPE_TIMESTAMP_FM.has(k)) continue;
+      if (fmValueText(A[k]) !== fmValueText(B[k])) structuralDelta++;
+    }
+
+    // What the merge actually MOVES from the discarded copy into the kept one.
+    const moves: string[] = [];
+    if (v && !v.bodySame) moves.push("its body text, appended under a labelled separator");
+    if (v && v.fieldDiffs > 0) moves.push(`values for any fields “${tgtName}” left blank (nothing already set is overwritten)`);
+
+    // Filenames on their own lines (ConfirmModal splits the message on newlines).
+    const lines = [`Keep:  ${tgtName}`, `Discard:  ${srcName}`, ""];
+    if (moves.length) {
+      lines.push(`Before it is discarded, “${srcName}” folds into “${tgtName}”: ${moves.join("; and ")}.`);
+    } else if (structuralDelta > 0) {
+      lines.push(`“${srcName}” matches “${tgtName}” in body and content fields. Only Stashpad's own structural / timestamp fields differ, and those are NOT merged — “${tgtName}” keeps its own — so “${srcName}” is discarded as it is.`);
+    } else {
+      lines.push(`“${srcName}” has nothing “${tgtName}” is missing, so merging is the same as discarding it.`);
+    }
+    lines.push("", "“" + srcName + "” goes to the trash. Undo restores both.");
+
     const ok = await new Promise<boolean>((resolve) => {
-      new ConfirmModal(this.app, "Merge this copy?", `${what} Undo restores both.`,
+      new ConfirmModal(this.app, "Merge this copy?", lines.join("\n"),
         "Merge", (c) => resolve(c), "Cancel", true).open();
     });
     if (!ok) return;
@@ -4192,12 +4259,26 @@ export class DuplicateIdsModal extends Modal {
     }
 
     const wrap = c.createDiv({ cls: "stashpad-dupes-fm" });
+    // 0.272.4: render the ACTUAL diff inside each value, not just the two values
+    // side by side — the shown cell keeps what is unique to it (red) and the
+    // hidden cell keeps what is unique to it (green), with the common parts
+    // plain. On a home note whose `children` list holds hundreds of entries the
+    // one differing item is otherwise impossible to spot. Each cell wraps and
+    // scrolls within its own height cap (see CSS) so one giant field does not
+    // dominate the table.
+    const fillDiff = (cell: HTMLElement, va: string, vb: string, side: "a" | "b"): void => {
+      for (const part of splitWordDiff(va, vb)) {
+        if (part.t === "eq") { cell.createSpan({ text: part.s }); continue; }
+        if (side === "a" && part.t === "del") cell.createSpan({ cls: "stashpad-diff-del", text: part.s });
+        if (side === "b" && part.t === "ins") cell.createSpan({ cls: "stashpad-diff-ins", text: part.s });
+      }
+    };
     const table = (host: HTMLElement, rows: string[][]): void => {
       for (const [k, va, vb] of rows) {
         const row = host.createDiv({ cls: "stashpad-dupes-fm-row" });
         row.createSpan({ cls: "stashpad-dupes-fm-key", text: k });
-        row.createSpan({ cls: "stashpad-dupes-fm-a", text: va });
-        row.createSpan({ cls: "stashpad-dupes-fm-b", text: vb });
+        fillDiff(row.createSpan({ cls: "stashpad-dupes-fm-a" }), va, vb, "a");
+        fillDiff(row.createSpan({ cls: "stashpad-dupes-fm-b" }), va, vb, "b");
       }
     };
     if (content.length) {
@@ -4224,7 +4305,11 @@ export class DuplicateIdsModal extends Modal {
     }
 
     if (structural.length) {
+      // 0.272.4: expanded by default — the user is here to compare, so the
+      // frontmatter should be open, not one more click away. Still a <details>
+      // so a home note's enormous children list can be folded away once seen.
       const det = wrap.createEl("details", { cls: "stashpad-dupes-fm-structural" });
+      det.setAttr("open", "");
       det.createEl("summary", { text: `${structural.length} structural field${structural.length === 1 ? " differs" : "s differ"} (Stashpad bookkeeping — usually not a reason to prefer a copy)` });
       table(det, structural);
     }
@@ -4286,16 +4371,8 @@ export class LargeTextModal extends Modal {
     this.contentEl.empty();
     this.titleEl?.setText("");
 
-    const bar = this.contentEl.createDiv({ cls: "stashpad-largetext-bar" });
-    const mk = (icon: string, label: string, fn: () => void): void => {
-      const b = bar.createEl("button", { cls: "stashpad-largetext-btn" });
-      setIcon(b, icon); b.setAttr("aria-label", label); b.title = label;
-      b.onclick = (e) => { e.stopPropagation(); fn(); };
-    };
-    mk("minus", "Smaller", () => this.bump(-6));
-    mk("plus", "Larger", () => this.bump(6));
-    mk("x", "Close", () => this.close());
-
+    // 0.272.4: reading area first, controls at the BOTTOM-MIDDLE — reachable by
+    // thumb on a phone and out of the way of the text on desktop.
     const scroll = this.contentEl.createDiv({ cls: "stashpad-largetext-scroll" });
     // Tapping the reading area (not the buttons) dismisses — the common "I'm
     // done showing it" gesture.
@@ -4306,6 +4383,16 @@ export class LargeTextModal extends Modal {
     const body = this.bodyText.trim();
     this.textEl = scroll.createDiv({ cls: "stashpad-largetext-body", text: body || "(empty note)" });
     this.applySize();
+
+    const bar = this.contentEl.createDiv({ cls: "stashpad-largetext-bar" });
+    const mk = (icon: string, label: string, fn: () => void): void => {
+      const b = bar.createEl("button", { cls: "stashpad-largetext-btn" });
+      setIcon(b, icon); b.setAttr("aria-label", label); b.title = label;
+      b.onclick = (e) => { e.stopPropagation(); fn(); };
+    };
+    mk("minus", "Smaller", () => this.bump(-6));
+    mk("plus", "Larger", () => this.bump(6));
+    mk("x", "Close", () => this.close());
   }
 
   private textEl: HTMLElement | null = null;

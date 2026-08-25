@@ -196,6 +196,25 @@
   padding: 4px 6px;
 }
 .stashpad-time-filter-cal .svg-icon { width: 14px; height: 14px; }
+/* 0.272.4: single-day filter button + its date-picker popover. */
+.stashpad-day-filter-btn { display: inline-flex; align-items: center; justify-content: center; padding: 4px 6px; }
+.stashpad-day-filter-btn .svg-icon { width: 14px; height: 14px; }
+.stashpad-day-filter-pop {
+  position: fixed;
+  z-index: var(--layer-menu, 100);
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  box-shadow: var(--shadow-s);
+}
+.stashpad-day-filter-pop input[type="date"] {
+  font-size: var(--font-ui-small); padding: 4px 6px;
+  background: var(--background-primary); color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border); border-radius: 6px;
+}
+.stashpad-day-filter-pop-btns { display: flex; gap: 8px; justify-content: flex-end; }
 .stashpad-time-filter-select {
   flex: 1 1 auto;
   min-width: 0;
@@ -5091,6 +5110,21 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 }
 .stashpad-detail-body > :first-child { margin-top: 0; }
 .stashpad-detail-body > :last-child { margin-bottom: 0; }
+/* 0.272.4: the detail panel obscures with the note. Same technique as a list
+   row — transparent glyphs with a shadow (no compositing layer) for text, a
+   real blur for images/embeds. Title, meta and body are all covered. */
+.stashpad-detail-scroll.is-obscured { cursor: pointer; }
+.stashpad-detail-scroll.is-obscured :is(.stashpad-detail-title, .stashpad-detail-body, .stashpad-detail-metarow),
+.stashpad-detail-scroll.is-obscured .stashpad-detail-body :is(a, code, mark, strong, em, .tag) {
+  color: transparent;
+  text-shadow: 0 0 7px var(--text-normal);
+  opacity: 0.75;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.stashpad-detail-scroll.is-obscured .stashpad-detail-body :is(img, svg, video, canvas, iframe, .internal-embed) {
+  filter: blur(10px);
+}
 .stashpad-detail-footer-meta {
   display: flex;
   flex-direction: column;
@@ -7227,6 +7261,35 @@ button.stashpad-btn-loading::after {
   max-width: 320px;
 }
 .stashpad-dupes-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+/* 0.272.4: per-id keep/discard recommendation (conflict copy vs clean). */
+.stashpad-dupes-rec {
+  margin: 6px 0 8px; padding: 8px 10px; border-radius: 6px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-dupes-rec-head {
+  font-size: var(--font-ui-smaller); color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px;
+}
+.stashpad-dupes-rec-line { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; line-height: 1.4; }
+.stashpad-dupes-rec-verb { flex: 0 0 auto; font-weight: var(--font-semibold, 600); }
+.stashpad-dupes-rec-line.is-keep .stashpad-dupes-rec-verb { color: var(--color-green); }
+.stashpad-dupes-rec-line.is-discard .stashpad-dupes-rec-verb { color: var(--text-error); }
+.stashpad-dupes-rec-file { min-width: 0; overflow-wrap: anywhere; font-family: var(--font-monospace); font-size: var(--font-ui-smaller); }
+.stashpad-dupes-rec-note { margin-top: 6px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+/* 0.272.4: on a narrow window / mobile the filename is the ONLY thing that tells
+   the copies apart, and the 2-line clamp + left action column pushed it off
+   screen (there is no hover tooltip on a phone). Stack the row: actions on top,
+   the FULL filename on its own line below, unclamped. */
+@media (max-width: 640px) {
+  .stashpad-dupes-file { grid-template-columns: 1fr; gap: 6px; }
+  .stashpad-dupes-actions { max-width: none; }
+  .stashpad-dupes-pathline { flex-wrap: wrap; }
+  .stashpad-dupes-path {
+    -webkit-line-clamp: unset; display: block; flex: 1 1 100%;
+    overflow: visible;
+  }
+}
 /* Label + path share a line, which is what the colon in "Hidden:" implies. */
 .stashpad-dupes-pathline { min-width: 0; display: flex; align-items: baseline; gap: 4px; }
 .stashpad-dupes-badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -7376,11 +7439,24 @@ button.stashpad-btn-loading::after {
   padding: 4px 6px;
   font-size: var(--font-ui-smaller);
   border-bottom: 1px solid var(--background-modifier-border);
+  /* 0.272.4: top-align so each row grows to its OWN content — a `children`
+     field with hundreds of entries no longer stretches its siblings. */
+  align-items: start;
 }
 .stashpad-dupes-fm-row.is-head { color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; }
 .stashpad-dupes-fm-key { color: var(--text-normal); font-family: var(--font-monospace); overflow-wrap: anywhere; }
-.stashpad-dupes-fm-a, .stashpad-dupes-fm-b { color: var(--text-muted); overflow-wrap: anywhere; }
-.stashpad-dupes-fm-b { color: var(--text-accent); }
+.stashpad-dupes-fm-a, .stashpad-dupes-fm-b {
+  color: var(--text-muted); overflow-wrap: anywhere; white-space: pre-wrap;
+  /* Cap a monster value (hundreds of children) and scroll it WITHIN its cell,
+     so the row keeps its own bounded height instead of filling the modal. */
+  max-height: 9em; overflow-y: auto;
+}
+.stashpad-dupes-fm-b { color: var(--text-muted); }
+/* Inside a value: the parts unique to each copy are coloured, common parts plain. */
+.stashpad-dupes-fm-a .stashpad-diff-del,
+.stashpad-dupes-fm-b .stashpad-diff-ins { border-radius: 3px; padding: 0 1px; }
+/* Compare sits inline at the start of a duplicate row's path line. */
+.stashpad-dupes-compare-inline { flex: 0 0 auto; align-self: center; }
 .stashpad-dupes-fm-note {
   margin-top: 8px;
   color: var(--text-muted);
@@ -7756,6 +7832,29 @@ button.stashpad-btn-loading::after {
 }
 .stashpad-note.is-obscured { cursor: pointer; }
 .stashpad-note.is-obscured .stashpad-note-body::selection { background: transparent; }
+
+/* 0.272.4 — two-step reveal (blur mode). `is-text-revealed` un-blurs the TEXT
+   while `is-obscured` is still present, so images/attachments stay blurred until
+   a second tap removes `is-obscured` entirely. One additive override, so the
+   text-blur selectors above stay as they are. */
+.stashpad-note.is-obscured.is-text-revealed :is(.stashpad-note-body, .stashpad-rail),
+.stashpad-note.is-obscured.is-text-revealed .stashpad-note-body :is(a, code, mark, strong, em, .tag, .cm-hashtag),
+.stashpad-focused.is-obscured.is-text-revealed :is(.stashpad-focused-body, .stashpad-heading-stuck-line),
+.stashpad-focused.is-obscured.is-text-revealed .stashpad-focused-body :is(a, code, mark, strong, em, .tag),
+.stashpad-note.is-obscured.is-text-revealed .stashpad-link-rail,
+.stashpad-focused.is-obscured.is-text-revealed .stashpad-link-rail {
+  color: var(--text-normal);
+  text-shadow: none;
+  opacity: 1;
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* Images/attachments keep the real blur through the text-revealed step (both
+   in the body and in the attachment rail's thumbnails). */
+.stashpad-note.is-obscured .stashpad-rail .stashpad-att-img,
+.stashpad-focused.is-obscured .stashpad-rail .stashpad-att-img {
+  filter: blur(10px);
+}
 /* 0.267.2 — the marker is a real BUTTON now, not a ::after.
 
    It still reads as a small quiet chip, but it is the per-note control: tap it
@@ -8287,8 +8386,10 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-largetext-modal { width: min(92vw, 900px); height: min(90vh, 900px); }
 .stashpad-largetext-modal .modal-content { display: flex; flex-direction: column; height: 100%; padding: 0; }
 .stashpad-largetext-bar {
-  display: flex; gap: 8px; justify-content: flex-end;
-  padding: 8px 10px; border-bottom: 1px solid var(--background-modifier-border);
+  /* 0.272.4: bottom-middle controls (reachable by thumb on mobile). */
+  display: flex; gap: 12px; justify-content: center;
+  padding: 10px 10px calc(10px + var(--sp-safe-bottom));
+  border-top: 1px solid var(--background-modifier-border);
   flex: 0 0 auto;
 }
 .stashpad-largetext-btn {

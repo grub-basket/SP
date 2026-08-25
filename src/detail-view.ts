@@ -43,6 +43,9 @@ export class StashpadDetailView extends ItemView {
    *  switches) both append a composer to the live root → stacked input boxes.
    *  Each render captures a token; after an await it aborts if superseded. */
   private renderToken = 0;
+  /** 0.272.4: path of the obscured note the user revealed in this panel, if any.
+   *  A different note re-blurs (reveal is per-note, in-memory). */
+  private detailObscureRevealed: string | null = null;
   /** 0.74.2: ids of children-list rows currently expanded into their
    *  own subtrees — same pattern as StashpadPanelsView.expanded. Key
    *  is "<folder>|<id>" so expansion state is scoped per folder
@@ -239,6 +242,18 @@ export class StashpadDetailView extends ItemView {
     // below (flex column on the root keeps it anchored to the bottom
     // and lets it ride up as the panel shrinks).
     const scroll = root.createDiv({ cls: "stashpad-detail-scroll" });
+
+    // 0.272.4: the detail panel obscures with the note, like the list does —
+    // otherwise a blurred note is plainly readable the moment the cursor lands
+    // on it. Tap to reveal (per file, in-memory); a different note re-blurs.
+    if (this.plugin.isFileObscured(file) && this.detailObscureRevealed !== file.path) {
+      scroll.addClass("is-obscured");
+      scroll.addEventListener("click", (e) => {
+        if ((e.target as HTMLElement | null)?.closest("button, a, input")) return;
+        this.detailObscureRevealed = file.path;
+        scroll.removeClass("is-obscured");
+      });
+    }
 
     // Header — title + small metadata row + open-in-tab button.
     const header = scroll.createDiv({ cls: "stashpad-detail-header" });

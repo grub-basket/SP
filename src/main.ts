@@ -5259,6 +5259,19 @@ export default class StashpadPlugin extends Plugin {
    *  and this device has never set it, it falls back to the synced value rather
    *  than to false — so switching to device scope while everything is covered
    *  cannot silently UNCOVER it. A privacy control must never fail open. */
+  /** 0.272.4: obscure state for a FILE (no view / TreeNode needed), so the
+   *  detail panel can blur the cursored note the same way the list does. Mirrors
+   *  view.isObscured minus the view-local write-through map: global override,
+   *  then the note's own `obscured` frontmatter, then the folder default. */
+  isFileObscured(file: TFile): boolean {
+    if (this.getObscureAll()) return true;
+    const own = this.app.metadataCache.getFileCache(file)?.frontmatter?.obscured;
+    if (own === true || own === false) return own;
+    const folder = (file.parent?.path ?? "").replace(/\/+$/, "");
+    const pf = this.settings.obscureFolders?.[folder];
+    return typeof pf === "boolean" ? pf : false;
+  }
+
   getObscureAll(): boolean {
     const raw = window.localStorage.getItem(StashpadPlugin.OBSCURE_ALL_LOCAL);
     const local = raw === "1" ? true : raw === "0" ? false : null;

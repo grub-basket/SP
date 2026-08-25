@@ -1,4 +1,4 @@
-import { App, Modal, Platform, TFile, setIcon } from "obsidian";
+import { App, Menu, Modal, Notice, Platform, TFile, setIcon } from "obsidian";
 import { fileKindFor } from "./file-kinds";
 
 /** How the viewer presents the note's files.
@@ -160,6 +160,9 @@ export class MediaViewerModal extends Modal {
       const f = this.items[this.idx]?.file;
       if (f) { this.close(); this.onOpenInTab(f); }
     });
+    // 0.272.4: copy — the image itself to the clipboard for images, the
+    // attachment link for anything else.
+    act("copy", "Copy (image to clipboard, else a link)", () => void this.copyCurrent());
 
     // View-mode switch. Only meaningful with more than one file — with a single
     // attachment there is nothing to browse, so the whole group is omitted
@@ -205,6 +208,40 @@ export class MediaViewerModal extends Modal {
 
   onClose(): void {
     this.contentEl.empty();
+  }
+
+  /** 0.272.4: right-click menu for the (non-pdf) stage — Copy + Open. */
+  private openStageMenu(e: MouseEvent, file: TFile): void {
+    const m = new Menu();
+    m.addItem((i) => i.setTitle("Copy image").setIcon("copy").onClick(() => void this.copyCurrent()));
+    m.addItem((i) => i.setTitle("Open in a new tab").setIcon("external-link").onClick(() => { this.close(); this.onOpenInTab(file); }));
+    m.showAtMouseEvent(e);
+  }
+
+  /** Copy the current item: the IMAGE itself to the clipboard for an image, or
+   *  the attachment link for anything else. */
+  private async copyCurrent(): Promise<void> {
+    const file = this.items[this.idx]?.file;
+    if (!file) { new Notice("Nothing to copy."); return; }
+    if (VIEWER_IMG_EXT.has(file.extension.toLowerCase()) && this.mediaEl instanceof HTMLImageElement && this.mediaEl.naturalWidth) {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = this.mediaEl.naturalWidth;
+        canvas.height = this.mediaEl.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("no drawing context");
+        ctx.drawImage(this.mediaEl, 0, 0);
+        const blob: Blob = await new Promise((res, rej) =>
+          canvas.toBlob((b) => (b ? res(b) : rej(new Error("could not encode the image"))), "image/png"));
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        new Notice("Image copied to the clipboard.");
+      } catch (err) {
+        new Notice(`Couldn't copy the image: ${(err as Error).message}`);
+      }
+      return;
+    }
+    try { await navigator.clipboard.writeText(`![[${file.path}]]`); new Notice("Attachment link copied."); }
+    catch { new Notice("Couldn't copy to the clipboard."); }
   }
 
   // ---------- items ----------
@@ -266,6 +303,9 @@ export class MediaViewerModal extends Modal {
       img.alt = item.path;
       img.draggable = false;
       this.mediaEl = img;
+      // 0.272.4: right-click an image → Copy (a PDF is an iframe with its own
+      // menu, so this is images / other non-pdf stage content only).
+      img.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); this.openStageMenu(e, item.file); };
       const onReady = (): void => {
         this.naturalW = img.naturalWidth || img.clientWidth;
         this.naturalH = img.naturalHeight || img.clientHeight;

@@ -244,6 +244,11 @@ export class StashpadView extends ItemView {
   /** 0.88.1: when true, show only notes that came in via import
    *  (frontmatter `imported: true`). Per-session, like tag/color. */
   private importedOnly = false;
+  /** 0.272.4: filter to a single DAY (start-of-day epoch ms). A note matches
+   *  when it was created that day, links to that date (`[[YYYY-MM-DD]]`), or has
+   *  a task `due` that day. null = off. Separate from the time cutoff, which is
+   *  a rolling/absolute window. */
+  private dateFilter: number | null = null;
   /** 0.88.1: when set, show only notes whose author id matches. Per-session. */
   private authorFilter: string | null = null;
   /** public: read by AuthorshipTracker (the host interface). */
@@ -355,6 +360,11 @@ export class StashpadView extends ItemView {
    *  the note, so it must never be written to the file or shared with another
    *  tab showing the same note. */
   private revealedObscured = new Set<StashpadId>();
+  /** 0.272.4: two-step reveal. `revealedObscured` = TEXT shown; this second set
+   *  = images/attachments shown too. First tap reveals text (media stays
+   *  blurred if the note has any), second reveals media — so a glance doesn't
+   *  dump every image at once. A note with no media reveals fully in one tap. */
+  private mediaRevealedObscured = new Set<StashpadId>();
   private composerAppendBtn: HTMLButtonElement | null = null;
   /** 0.76.15: when the chosen destination lives in ANOTHER Stashpad
    *  folder, this holds that folder (and a display label). The next
@@ -2796,6 +2806,63 @@ export class StashpadView extends ItemView {
     return out;
   }
 
+  /** 0.272.4: does this note belong to `dayStart` (start-of-day epoch ms)?
+   *  Created that day, OR links to the date as `[[YYYY-MM-DD]]`, OR its task
+   *  `due` falls that day. */
+  private nodeMatchesDate(n: TreeNode, dayStart: number): boolean {
+    if (!n.file) return false;
+    // Compare by CALENDAR DAY, not an epoch window: a bare `2026-08-18` (created
+    // or due) parses as UTC midnight, which a local ms-window would shift out of
+    // the day. moment().format normalises both sides to the local calendar day.
+    const dayStr = (moment as any)(dayStart).format("YYYY-MM-DD");
+    const sameDay = (v: unknown): boolean => {
+      if (v == null || v === "") return false;
+      const m = (moment as any)(typeof v === "number" ? v : String(v));
+      return m.isValid() && m.format("YYYY-MM-DD") === dayStr;
+    };
+    if (sameDay(n.created)) return true;
+    const fm = this.app.metadataCache.getFileCache(n.file)?.frontmatter;
+    if (fm && sameDay(fm.due)) return true;
+    const links = this.app.metadataCache.getFileCache(n.file)?.links ?? [];
+    return links.some((l) => l.link.includes(dayStr) || (l.displayText ?? "").includes(dayStr));
+  }
+
+  /** Set/clear the single-day filter and repaint. */
+  setDateFilter(dayStart: number | null): void {
+    this.dateFilter = dayStart;
+    this.render();
+  }
+  getDateFilter(): number | null { return this.dateFilter; }
+
+  /** 0.272.4: a small popover with a native date input to pick the day filter.
+   *  Native input so mobile gets the OS date wheel and desktop a real picker. */
+  openDayFilterPicker(anchor: HTMLElement): void {
+    const doc = anchor.ownerDocument ?? document;
+    doc.querySelectorAll(".stashpad-day-filter-pop").forEach((p) => p.remove());
+    const pop = doc.body.createDiv({ cls: "stashpad-day-filter-pop" });
+    const input = pop.createEl("input", { type: "date" });
+    input.value = (moment as any)(this.dateFilter ?? Date.now()).format("YYYY-MM-DD");
+    const row = pop.createDiv({ cls: "stashpad-day-filter-pop-btns" });
+    let done = false;
+    const cleanup = (): void => { if (done) return; done = true; pop.remove(); doc.removeEventListener("mousedown", onDoc, true); };
+    const onDoc = (ev: MouseEvent): void => { if (!pop.contains(ev.target as Node) && ev.target !== anchor) cleanup(); };
+    row.createEl("button", { cls: "mod-cta", text: "Apply" }).onclick = () => {
+      const ms = (moment as any)(input.value, "YYYY-MM-DD").startOf("day").valueOf();
+      cleanup();
+      if (Number.isFinite(ms)) this.setDateFilter(ms);
+    };
+    row.createEl("button", { text: this.dateFilter !== null ? "Clear" : "Cancel" }).onclick = () => {
+      const wasSet = this.dateFilter !== null;
+      cleanup();
+      if (wasSet) this.setDateFilter(null);
+    };
+    const r = anchor.getBoundingClientRect();
+    pop.style.left = `${Math.min(r.left, (doc.defaultView?.innerWidth ?? 9999) - 240)}px`;
+    pop.style.top = `${r.bottom + 4}px`;
+    setTimeout(() => doc.addEventListener("mousedown", onDoc, true), 0);
+    input.focus();
+  }
+
   private filterChildren(children: TreeNode[]): TreeNode[] {
     // Sheet versions collapse FIRST and unconditionally (before the
     // no-filters early-return below): non-active versions of a group are
@@ -2808,7 +2875,8 @@ export class StashpadView extends ItemView {
     const attachmentsOnly = this.currentAttachmentsOnly();
     const importedOnly = this.importedOnly;
     const authorId = this.authorFilter;
-    if (!cutoff && !tag && !color && !hideCompleted && !attachmentsOnly && !importedOnly && !authorId) return children;
+    const dateFilter = this.dateFilter;
+    if (!cutoff && !tag && !color && !hideCompleted && !attachmentsOnly && !importedOnly && !authorId && dateFilter === null) return children;
     // 0.270.2: how far a pin outranks the filters is a three-way setting.
     // "all"  - a pinned note is never hidden (early return below).
     // "time" - it survives the TIME cutoff only; the content filters below still
@@ -2833,6 +2901,7 @@ export class StashpadView extends ItemView {
         const t = Date.parse(n.created);
         if (!Number.isNaN(t) && t < cutoff) return false;
       }
+      if (dateFilter !== null && !pinned && !this.nodeMatchesDate(n, dateFilter)) return false;
       if (tag) {
         if (!n.file) return false;
         if (this.tagFilter === TAG_FILTER_TAGGED) { if (!this.nodeHasAnyTag(n)) return false; }
@@ -3782,6 +3851,15 @@ export class StashpadView extends ItemView {
       e.preventDefault();
       this.setTimeFilterCalendar(!this.timeFilterCalendar);
     };
+    // 0.272.4: filter to a single DAY — notes created, linked, or due that day.
+    const dayBtn = btns.createEl("button", { cls: "stashpad-time-filter-btn stashpad-day-filter-btn" });
+    setIcon(dayBtn, "calendar-days");
+    const activeDay = this.dateFilter !== null;
+    if (activeDay) dayBtn.addClass("is-active");
+    dayBtn.title = activeDay
+      ? `Showing notes for ${(moment as any)(this.dateFilter).format("D MMM YYYY")} — created that day, linking to it, or due then. Click to change or clear.`
+      : "Filter to one day: notes created that day, linking to it (“[[YYYY-MM-DD]]”), or with a task due then.";
+    dayBtn.onclick = (e) => { e.preventDefault(); this.openDayFilterPicker(dayBtn); };
     // 0.270.2: pinned-notes-vs-filters, as a filter-bar control rather than a
     // buried setting — it is something you flip while looking at a filtered
     // list, not something you configure once. Cycles all -> time -> none.
@@ -5211,6 +5289,23 @@ export class StashpadView extends ItemView {
    *  surfaced as a checkbox at the top — flipping it changes the period
    *  rows' labels (Today vs 24h, etc.) on the next open. */
   private populateTimeMenuBody(container: HTMLElement, onPicked: () => void): void {
+    // 0.272.4: single-day filter — reachable on mobile, where the bar (and its
+    // day button) is hidden. A native date input for the OS picker.
+    const dayRow = container.createDiv({ cls: "stashpad-view-popover-row" });
+    dayRow.createDiv({ cls: "stashpad-view-popover-main" })
+      .createSpan({ cls: "stashpad-view-popover-label", text: "Filter to one day" });
+    dayRow.createDiv({ cls: "stashpad-view-popover-desc", text: "Notes created that day, linking to it, or with a task due then." });
+    const dayControls = dayRow.createDiv({ cls: "stashpad-day-filter-pop-btns" });
+    const dayInput = dayControls.createEl("input", { type: "date" });
+    dayInput.value = (moment as any)(this.dateFilter ?? Date.now()).format("YYYY-MM-DD");
+    dayInput.onchange = () => {
+      const ms = (moment as any)(dayInput.value, "YYYY-MM-DD").startOf("day").valueOf();
+      if (Number.isFinite(ms)) { this.dateFilter = ms; this.refreshList(); }
+    };
+    if (this.dateFilter !== null) {
+      dayControls.createEl("button", { text: "Clear" }).onclick = () => { this.dateFilter = null; this.refreshList(); onPicked(); };
+    }
+
     const calRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
     const calCheck = calRow.createEl("input", { type: "checkbox" });
     calCheck.checked = this.timeFilterCalendar;
@@ -6115,20 +6210,18 @@ export class StashpadView extends ItemView {
     // global or per-folder default it is a hole: the pinned heading is the
     // largest text on screen, and leaving it readable while everything under it
     // blurs defeats the entire point of the switch.
-    if (this.isObscured(node) && !this.revealedObscured.has(node.id)) {
+    if (this.isObscured(node) && !this.isFullyRevealed(node.id)) {
       wrap.addClass("is-obscured");
-      // Same contract as a row: the first tap reveals and does nothing else,
-      // so you can look without also acting.
+      if (this.revealedObscured.has(node.id)) wrap.addClass("is-text-revealed");
+      // Same contract as a row: a tap reveals and does nothing else, so you can
+      // look without also acting — now in two steps (text, then media).
       wrap.addEventListener("click", (e) => {
         const t = e.target as HTMLElement | null;
         if (t?.closest("button, a, input, .stashpad-note-check")) return;
-        if (this.revealedObscured.has(node.id)) return;
+        if (this.isFullyRevealed(node.id)) return;
         e.preventDefault();
         e.stopPropagation();
-        this.revealedObscured.add(node.id);
-        wrap.removeClass("is-obscured");
-        const hb = wrap.querySelector<HTMLElement>(".stashpad-obscure-badge");
-        if (hb) this.paintObscureBadge(hb, node);
+        this.advanceObscureReveal(node, wrap);
       }, true);
     }
     if (opts.asRow) {
@@ -6465,7 +6558,10 @@ export class StashpadView extends ItemView {
     // 0.237.0: visual obscuring. The body is rendered normally and blurred by
     // CSS — the text is still in the DOM, which is exactly why this is
     // presented as hiding from a passer-by and never as encryption.
-    if (this.isObscured(node) && !this.revealedObscured.has(node.id)) row.addClass("is-obscured");
+    if (this.isObscured(node) && !this.isFullyRevealed(node.id)) {
+      row.addClass("is-obscured");
+      if (this.revealedObscured.has(node.id)) row.addClass("is-text-revealed");
+    }
     // 0.197.0: a repeating occurrence that ran out its interval unfinished is marked
     // completed so it leaves the active list — but it was MISSED, not done. Without
     // this it would be indistinguishable from work you actually finished.
@@ -8314,19 +8410,16 @@ export class StashpadView extends ItemView {
     // Consuming the click matters: otherwise the same tap that unblurs also
     // selects or drills in, so you cannot look at a hidden note without acting
     // on it. Revealing is per-view and in-memory only.
-    if (!absorbed && this.isObscured(node) && !this.revealedObscured.has(node.id)) {
+    if (!absorbed && this.isObscured(node) && !this.isFullyRevealed(node.id)) {
       const t = e.target as HTMLElement | null;
       // Let the row's real controls through — tapping the checkbox or the ⋯
       // menu on a blurred row should still work.
       if (!t?.closest?.(".stashpad-note-task-checkbox, .stashpad-note-more, .stashpad-expand-toggle, button, a")) {
         e.preventDefault();
         e.stopPropagation();
-        this.revealedObscured.add(node.id);
         const rowEl = (e.currentTarget as HTMLElement | null)
           ?? this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${node.id}"]`) ?? null;
-        rowEl?.removeClass("is-obscured");
-        const badgeEl = rowEl?.querySelector<HTMLElement>(".stashpad-obscure-badge");
-        if (badgeEl) this.paintObscureBadge(badgeEl, node);
+        if (rowEl) this.advanceObscureReveal(node, rowEl);   // two-step: text, then media
         return;
       }
     }
@@ -12750,7 +12843,7 @@ export class StashpadView extends ItemView {
     // 0.237.0: leaving the level re-blurs anything revealed here, when the
     // setting says reveals are momentary. Signal-like: you looked, you left,
     // it is hidden again.
-    if (getSettings().obscureReHides) this.revealedObscured.clear();
+    if (getSettings().obscureReHides) { this.revealedObscured.clear(); this.mediaRevealedObscured.clear(); }
     // 0.258.0: the heading is about to become a DIFFERENT note, so a cursor
     // parked on it must not silently carry over and target the new one.
     this.cursorOnHeading = false;
@@ -14469,8 +14562,11 @@ export class StashpadView extends ItemView {
   }
 
   private toggleObscureForNode(node: TreeNode): void {
-    if (this.revealedObscured.has(node.id)) this.revealedObscured.delete(node.id);
-    else this.revealedObscured.add(node.id);
+    // The badge is an explicit control, so it reveals/hides FULLY in one tap
+    // (text + media) — the gradual two-step is for tapping the blurred body.
+    const revealing = !this.revealedObscured.has(node.id);
+    if (revealing) { this.revealedObscured.add(node.id); this.mediaRevealedObscured.add(node.id); }
+    else { this.revealedObscured.delete(node.id); this.mediaRevealedObscured.delete(node.id); }
     // Repaint the affected row in place rather than re-rendering the list: this
     // is a viewing state, it changes one element, and a full render here would
     // move the list under a finger that just tapped a small target.
@@ -14481,7 +14577,8 @@ export class StashpadView extends ItemView {
         : null);
     for (const el of [rowEl, headEl]) {
       if (!el) continue;
-      el.toggleClass("is-obscured", !this.revealedObscured.has(node.id));
+      el.toggleClass("is-obscured", !revealing);
+      el.removeClass("is-text-revealed");   // full reveal or full hide, never partial
       const badge = el.querySelector<HTMLElement>(".stashpad-obscure-badge");
       if (badge) this.paintObscureBadge(badge, node);
     }
@@ -14547,7 +14644,46 @@ export class StashpadView extends ItemView {
 
   /** Drop every "I peeked at this" reveal in THIS view. Called when the obscure
    *  settings change, so a switch turned on covers notes revealed before it. */
-  clearObscureReveals(): void { this.revealedObscured.clear(); }
+  clearObscureReveals(): void { this.revealedObscured.clear(); this.mediaRevealedObscured.clear(); }
+
+  /** True once a note is FULLY revealed (text + media), so it should no longer
+   *  carry `is-obscured`. */
+  private isFullyRevealed(id: StashpadId): boolean { return this.mediaRevealedObscured.has(id); }
+
+  /** Does this revealed element hold anything that needs the second (media)
+   *  step — a real blurred image/embed, or an image chip in the rail? */
+  private hasBlurrableMedia(el: HTMLElement): boolean {
+    return !!el.querySelector(
+      ".stashpad-note-body :is(img, svg, video, canvas, iframe, .internal-embed),"
+      + " .stashpad-focused-body :is(img, svg, video, canvas, iframe, .internal-embed),"
+      + " .stashpad-rail .stashpad-att-img",
+    );
+  }
+
+  /** Advance the two-step reveal for `node`, updating `el`'s classes in place
+   *  (no re-render — a peek stays cheap). First call reveals text; second
+   *  reveals media. A note with no media is fully revealed in one call. */
+  private advanceObscureReveal(node: TreeNode, el: HTMLElement): void {
+    if (!this.revealedObscured.has(node.id)) {
+      this.revealedObscured.add(node.id);
+      // Solid-cover mode paints one opaque bar over everything, so a text-only
+      // step would reveal nothing — reveal fully in one tap there. Blur mode
+      // gets the two-step (text, then media) when the note has media.
+      const twoStep = getSettings().obscureStyle !== "solid" && this.hasBlurrableMedia(el);
+      if (twoStep) {
+        el.addClass("is-text-revealed");           // text shown, media still blurred
+      } else {
+        this.mediaRevealedObscured.add(node.id);   // nothing more to show
+        el.removeClass("is-obscured");
+      }
+    } else if (!this.mediaRevealedObscured.has(node.id)) {
+      this.mediaRevealedObscured.add(node.id);
+      el.removeClass("is-obscured");
+      el.removeClass("is-text-revealed");
+    }
+    const badge = el.querySelector<HTMLElement>(".stashpad-obscure-badge");
+    if (badge) this.paintObscureBadge(badge, node);
+  }
 
   isObscured(node: TreeNode): boolean {
     if (!node.file) return false;
