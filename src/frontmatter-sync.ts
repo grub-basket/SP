@@ -351,6 +351,14 @@ export async function rebootstrapFolderFrontmatter(
       const e = byId.get(cid);
       if (e) links.push(linkForEntry(e));
     }
+    // 0.272.5: sort deterministically. The order came from getMarkdownFiles(),
+    // which is filesystem order and DIFFERS BETWEEN DEVICES — so each device
+    // wrote the same children list in a different order, skip-if-equal failed,
+    // and the two re-wrote each other's copies forever. That is the "keeps
+    // doing a large sync even though it says fully synced" churn: not new notes,
+    // just this field flip-flopping. A stable sort makes every device produce
+    // byte-identical output, so the write happens once and then stops.
+    links.sort();
     return links;
   };
 
