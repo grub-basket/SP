@@ -9,7 +9,10 @@ import type { RenderEntry } from "./note-body-renderer";
 // wrong (their `text` has the attachments removed). Discarding the store forces
 // a lazy recompute per note on next render, so existing notes pick up the inline
 // embeds without a mass re-render on load.
-const CACHE_SCHEMA = 2;
+// 0.272.2: bumped to 3 — file embeds are now de-embedded to visible links (no
+// inline preview), so a cached `text`/`html` from schema 2 renders the old
+// inline image. Same lazy per-note recompute on next render.
+const CACHE_SCHEMA = 3;
 
 /** 0.200.0 (perf L3): LRU bound. Entries hold full body text + rendered HTML,
  *  so an unbounded cache grows toward vault size and its save cost grows with

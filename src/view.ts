@@ -195,6 +195,10 @@ const PROGRESS_MIN_NOTES = 25;
  *  count moves visibly, large enough that yielding is not the bottleneck. */
 const PROGRESS_EVERY = 25;
 
+/** 0.272.3: combined link-rail count above which the outgoing / backlinks rows
+ *  split onto their own lines by type. Below it, a mixed row stays on one line. */
+const LINK_RAIL_SPLIT_AT = 5;
+
 export class StashpadView extends ItemView {
   /** public: read by AuthorshipTracker (the host interface). */
   plugin: StashpadPlugin;
@@ -7061,19 +7065,35 @@ export class StashpadView extends ItemView {
     }
     if (!entries.length) return;
 
-    const rail = parent.createDiv({ cls: "stashpad-link-rail" });
-    for (const e of entries) {
-      const chip = rail.createDiv({ cls: `stashpad-link-chip is-${e.dir}` });
-      setIcon(chip.createSpan({ cls: "stashpad-link-chip-icon" }), e.dir === "out" ? "arrow-up-right" : "corner-down-left");
-      chip.createSpan({ cls: "stashpad-link-chip-label", text: e.label });
-      chip.title = e.dir === "out" ? `Links to ${e.path}` : `${e.path} links here`;
-      chip.onclick = (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const f = this.app.vault.getAbstractFileByPath(e.path);
-        if (f instanceof TFile) void this.openFileAtEnd(f);
-      };
-      chip.addEventListener("dblclick", (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+    const paintRow = (list: typeof entries): void => {
+      const rail = parent.createDiv({ cls: "stashpad-link-rail" });
+      for (const e of list) {
+        const chip = rail.createDiv({ cls: `stashpad-link-chip is-${e.dir}` });
+        setIcon(chip.createSpan({ cls: "stashpad-link-chip-icon" }), e.dir === "out" ? "arrow-up-right" : "corner-down-left");
+        chip.createSpan({ cls: "stashpad-link-chip-label", text: e.label });
+        chip.title = e.dir === "out" ? `Links to ${e.path}` : `${e.path} links here`;
+        chip.onclick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const f = this.app.vault.getAbstractFileByPath(e.path);
+          if (f instanceof TFile) void this.openFileAtEnd(f);
+        };
+        chip.addEventListener("dblclick", (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+      }
+    };
+
+    // 0.272.3: split onto two rows BY TYPE once the combined row gets crowded —
+    // outgoing on its own line, backlinks on another — so a hub note with many
+    // links reads by kind instead of one long mixed scroll. A short list (both
+    // kinds, few links) stays on one line; a list that is all one kind is
+    // already single-type, so it never needs splitting.
+    const outs = entries.filter((e) => e.dir === "out");
+    const ins = entries.filter((e) => e.dir === "in");
+    if (entries.length > LINK_RAIL_SPLIT_AT && outs.length > 0 && ins.length > 0) {
+      paintRow(outs);
+      paintRow(ins);
+    } else {
+      paintRow(entries);
     }
   }
 
@@ -7124,13 +7144,16 @@ export class StashpadView extends ItemView {
     rail.addClass(`is-${mode}`);
 
     // 0.271.4: a layout flipper as a pseudo-file at the START of the rail, so a
-    // note with many attachments can be switched between the horizontal card
-    // grid and the vertical filename list in one tap without a trip to
-    // settings. It writes the GLOBAL attachmentRailMode (a display preference),
-    // so every rail flips together — matching how a layout toggle is expected
-    // to behave. Shown only with 2+ items; flipping a single file is pointless.
+    // note with many attachments can be switched between the compact icon strip
+    // and the vertical filename list in one tap without a trip to settings.
+    // 0.271.5: a TEMPORARY per-view override (railModeOverride), so it re-renders
+    // only this view and resets on reload — not a global write. Shown only with
+    // 2+ items; flipping a single file is pointless.
+    // 0.272.2: the big "thumbnail" card grid is NOT a flip stop (the user's
+    // request) — it stays the default/settings choice, but the flipper toggles
+    // between the two denser layouts.
     if (paths.length >= 2) {
-      const cycle: RailMode[] = ["thumbnail", "filename", "compact"];
+      const cycle: RailMode[] = ["filename", "compact"];
       const next = cycle[(cycle.indexOf(mode) + 1) % cycle.length];
       const flip = rail.createDiv({ cls: "stashpad-att stashpad-att-flip" });
       flip.title = `Attachment layout: ${mode} — tap for ${next}`;

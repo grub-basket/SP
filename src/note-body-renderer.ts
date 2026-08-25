@@ -164,32 +164,37 @@ export class NoteBodyRenderer {
   }
 
   private splitAttachments(body: string): { text: string; attachments: string[] } {
-    // 0.271.6 (#3): NON-DESTRUCTIVE. The body is returned UNCHANGED — every
-    // embed and link renders inline as Obsidian would render it — and the rail
-    // is an ADDITIVE index built from the same references. Nothing is swallowed
-    // out of the text, regardless of extension. (Earlier this removed file
-    // embeds/links from the body and put them only in the rail; that was the
-    // "bad call from the start" — an image now shows inline AND as a rail chip.)
+    // 0.272.2: a FILE embed shows in the rail, NOT inline. `![[photo.png]]` used
+    // to render its image preview in the note body (0.271.6, #3). The user found
+    // that too heavy: a file embed now loses its inline preview but KEEPS its
+    // text as a plain link (`[[photo.png]]`, visible), and the file goes to the
+    // rail — "as though they weren't embedded." Only the leading `!` is removed.
     //
-    // The rail still indexes FILES only. A note reference (`[[Note]]`,
-    // `![[2026-08-18]]`, `.md`) is not an attachment — it stays purely a
-    // body link, and shows in the backlinks / outgoing-links rails instead.
+    // A NOTE embed (`![[Note]]`, `![[2026-08-18]]`, `.md`) is a transclusion, not
+    // an attachment: left exactly as-is so it still renders inline. Plain file
+    // links (`[[photo.png]]`) already show as text; they just also index in the
+    // rail. Note LINKS stay body-only and show in the backlinks / outgoing rails.
     const attachments: string[] = [];
     const isFile = (raw: string): string | null => {
       const target = raw.trim();
       const ext = /\.([A-Za-z0-9]{1,8})$/.exec(target.split(/[?#]/)[0])?.[1]?.toLowerCase();
       return ext && ext !== "md" ? target : null;
     };
-    // Embeds: `![[file.ext]]`.
-    for (const m of body.matchAll(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g)) {
+    // File embeds → de-embed to a visible link (drop the `!`) + rail. Note
+    // embeds are returned untouched so they still transclude.
+    const text = body.replace(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (m, p1: string) => {
+      const f = isFile(p1);
+      if (!f) return m;               // note transclusion — keep the embed
+      attachments.push(f);
+      return m.slice(1);              // `![[file]]` -> `[[file]]` (link, no preview)
+    });
+    // Plain file links → rail (text already visible). Lookbehind skips the `[[`
+    // inside any remaining `![[…]]` (there are none after the replace, but a
+    // note embed's inner brackets must not be miscounted).
+    for (const m of text.matchAll(/(?<!!)\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g)) {
       const f = isFile(m[1]); if (f) attachments.push(f);
     }
-    // Plain links: `[[file.ext]]`. The negative lookbehind skips the `[[` inside
-    // an `![[…]]` embed so a file embed is not counted twice.
-    for (const m of body.matchAll(/(?<!!)\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g)) {
-      const f = isFile(m[1]); if (f) attachments.push(f);
-    }
-    // De-dupe: the same file embedded and linked should be one rail chip.
-    return { text: body, attachments: [...new Set(attachments)] };
+    // De-dupe: the same file embedded and linked is one rail chip.
+    return { text, attachments: [...new Set(attachments)] };
   }
 }
