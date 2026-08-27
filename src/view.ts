@@ -7,7 +7,7 @@ import {
   ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
   archiveSubfolderOf, isArchiveSubfolderPath,
   isReservedSubfolderName,
-  isInReservedSubfolder,
+  isInReservedSubfolder, writeCompletedFm,
   type StashpadId, type TimeFilter, type TimeUnit, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
   type ListPinEdge,
 } from "./types";
@@ -13837,7 +13837,7 @@ export class StashpadView extends ItemView {
           if (mode === "complete" || mode === "interval") {
             // This occurrence is genuinely finished — it stays completed, and a
             // fresh incomplete one is created for the next interval.
-            fm.completed = true;
+            writeCompletedFm(fm, true);
             delete fm.missed;
             spawnNextIso = nextIso;
           } else {
@@ -13849,8 +13849,7 @@ export class StashpadView extends ItemView {
             if (mode === "archive") archiveThis = true;
           }
           rolled.push({ title: (t.file!.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim()) || "task", when: next });
-        } else if (newState) fm.completed = true;
-        else delete fm.completed;
+        } else writeCompletedFm(fm, newState);
       });
       if (spawnNextIso) {
         const made = await spawnNextOccurrence(this.app, t.file, spawnNextIso, () => this.plugin.mintNoteId());
@@ -14361,8 +14360,12 @@ export class StashpadView extends ItemView {
     // modify handler neither evicts the render cache nor schedules the render
     // that moves the list.
     this.markFmSelfWrite(path, true);
+    /** Prior completion stamp, restored verbatim on undo so re-completing via
+     *  undo doesn't falsify WHEN the task was actually finished. 0.273.1 */
+    let wasAt: unknown;
     await this.app.fileManager.processFrontMatter(node.file, (m: any) => {
-      m.completed = !was;
+      wasAt = m.completedAt;
+      writeCompletedFm(m, !was);
     });
     this.completedState.set(path, !was); // authoritative, pre-cache-event
     await this.log.append({ type: was ? "uncomplete" : "complete", id: node.id });
@@ -14379,7 +14382,10 @@ export class StashpadView extends ItemView {
         const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
         if (!f) return;
         this.markFmSelfWrite(path, true);
-        await this.app.fileManager.processFrontMatter(f, (m: any) => { m.completed = was; });
+        await this.app.fileManager.processFrontMatter(f, (m: any) => {
+          writeCompletedFm(m, was);
+          if (was && wasAt !== undefined) m.completedAt = wasAt;   // restore the real stamp
+        });
         this.completedState.set(path, was);
         this.tree.rebuild(folder);
         if (!this.repaintCompletedState([node.id])) this.render();
@@ -15726,6 +15732,11 @@ export class StashpadView extends ItemView {
       // 0.170.2: re-slug the filename to match the new first line (user chose auto-rename).
       const renamedTo = await this.reslugFile(file, nb);
       const finalPath = renamedTo ?? originalPath;
+      // 0.274.0: record the in-app edit so the activity heatmap can count it.
+      // `external_edit` covers writes from elsewhere; this is the matching entry
+      // for edits made through Stashpad's own editor (which are self-writes and
+      // otherwise leave no log trace).
+      void this.log.append({ type: "edit", id: target.id, payload: { path: finalPath } });
       this.tree.rebuild(this.noteFolder);
       this.render();
       this.plugin.notifications.show({

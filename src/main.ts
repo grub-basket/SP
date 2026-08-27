@@ -32,7 +32,7 @@ import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
-import { ROOT_ID, parseAssignees } from "./types";
+import { ROOT_ID, parseAssignees, writeCompletedFm } from "./types";
 import { parseRecurrence, nextDueOnComplete, parseDuration, parseRepeatMode } from "./recurrence";
 import { spawnNextOccurrence, claimOccurrenceMissed } from "./recurrence-spawn";
 import { OrderStore } from "./order-store";
@@ -2753,6 +2753,16 @@ export default class StashpadPlugin extends Plugin {
     this.addRibbonIcon("panel-right", "Open Stashpad detail panel (right sidebar)", () => {
       void openStashpadDetailView(this.app);
     });
+    // 0.274.0: calendar ribbon entry — opens the Due calendar (month grid of
+    // notes created / due / linking to each day). Right-click opens the
+    // activity heatmap, the log-driven companion.
+    const cal = this.addRibbonIcon("calendar", "Open Stashpad due calendar", () => {
+      void openAggregateView(this, "calendar");
+    });
+    cal.addEventListener("contextmenu", (evt) => {
+      evt.preventDefault();
+      void openAggregateView(this, "heatmap");
+    });
 
     // Shares openStashpadEntryPoint with the ribbon (0.208.2) so the two can't
     // drift apart again.
@@ -2959,6 +2969,32 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-open-all-tasks",
       name: "Open aggregated Tasks view",
       callback: () => void openAggregateView(this, "tasks"),
+    });
+    // 0.273.0: the master index — every note across every folder, with facet
+    // filters (author / tag / color / attachments / imported / links / search).
+    this.addCommand({
+      id: "stashpad-open-all-notes",
+      name: "Open aggregated All notes view (master index / database)",
+      callback: () => void openAggregateView(this, "index"),
+    });
+    // 0.273.1: each task as a created→completed span on a time axis.
+    this.addCommand({
+      id: "stashpad-open-task-timeline",
+      name: "Open aggregated Task timeline view (created → completed spans)",
+      callback: () => void openAggregateView(this, "timeline"),
+    });
+    // 0.274.0: due calendar — a month grid of notes by created/due/linked day
+    // (same membership rule as the main view's day filter).
+    this.addCommand({
+      id: "stashpad-open-due-calendar",
+      name: "Open aggregated Due calendar view (month grid by day)",
+      callback: () => void openAggregateView(this, "calendar"),
+    });
+    // 0.274.0: activity heatmap — GitHub-style per-day action counts from the log.
+    this.addCommand({
+      id: "stashpad-open-activity-heatmap",
+      name: "Open aggregated Activity heatmap view (per-day action counts)",
+      callback: () => void openAggregateView(this, "heatmap"),
     });
     // 0.138.0: re-encrypt sweep — the review view + the one-modal batch command.
     this.addCommand({
@@ -8321,7 +8357,7 @@ export default class StashpadPlugin extends Plugin {
         if (Number.isFinite(curDue) && curDue > now) return; // already rolled forward — done
         const rec = parseRecurrence(fm.repeat as string | undefined);
         if (rec) { fm.due = new Date(nextDueOnComplete(rec, Number.isFinite(curDue) ? curDue : null, now)).toISOString(); delete fm.completed; }
-        else fm.completed = true;
+        else writeCompletedFm(fm as Record<string, unknown>, true);
       });
     } catch (e) { console.warn("[Stashpad] auto-resolve failed", f.path, e); }
   }

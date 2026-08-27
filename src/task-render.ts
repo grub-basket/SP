@@ -1,6 +1,7 @@
 import { App, Notice, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
 import { collectTasks, type TaskItem } from "./task-collect";
+import { writeCompletedFm } from "./types";
 import { DueDatePickerModal } from "./modals";
 import { formatDateOnly, formatTimeOnly } from "./format";
 
@@ -180,7 +181,7 @@ export function renderTaskTriage(
   }
 
   const toggleCompleted = async (t: TaskItem): Promise<void> => {
-    try { await app.fileManager.processFrontMatter(t.file, (m: any) => { m.completed = !(m.completed === true); }); }
+    try { await app.fileManager.processFrontMatter(t.file, (m: any) => { writeCompletedFm(m, !(m.completed === true)); }); }
     catch (e) { new Notice(`Couldn't update task: ${(e as Error).message}`); return; }
     rerender();
   };

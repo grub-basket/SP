@@ -5,7 +5,7 @@ import {
   STASHPAD_PANELS_VIEW_TYPE,
   STASHPAD_VIEW_TYPE,
   fmHasTag,
-  parseAssignees,
+  parseAssignees, writeCompletedFm,
   parseAuthorRef,
   type PinnedNoteRef,
   type StashpadId,
@@ -1039,7 +1039,7 @@ export class StashpadPanelsView extends ItemView {
   private async toggleTaskCompleted(t: TaskItem): Promise<void> {
     try {
       await this.app.fileManager.processFrontMatter(t.file, (m: any) => {
-        m.completed = !(m.completed === true);
+        writeCompletedFm(m, !(m.completed === true));
       });
     } catch (e) {
       new Notice(`Couldn't update task: ${(e as Error).message}`);

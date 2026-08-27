@@ -19,6 +19,14 @@ export interface TaskItem {
   /** 0.131.1: the note's author (creator). Most tasks have an author but no
    *  assignee, so the author is what you filter/see by for your own tasks. */
   author: { id: string; name: string } | null;
+  /** 0.273.1 (timeline): when the note was created (epoch ms, 0 = unknown). */
+  created: number;
+  /** When it was completed — the `completedAt` stamp when present, else null.
+   *  A completed task with no stamp predates 0.273.1's stamping; the timeline
+   *  approximates those from the file's mtime and says so. */
+  completedAt: number | null;
+  /** File mtime (epoch ms) — the approximation source above. */
+  modifiedMs: number;
 }
 
 /** Title from a note filename: drop the trailing `-id` suffix, dashes → spaces.
@@ -75,6 +83,9 @@ export function collectTasks(app: App, plugin: StashpadPlugin): TaskItem[] {
       assignedTo: parseAssignees(fm),
       assignedBy: parseAuthorRef(fm.assignedBy),
       author: parseAuthorRef(fm.author),
+      created: (() => { const t = Date.parse(String(fm.created ?? "")); return Number.isFinite(t) ? t : 0; })(),
+      completedAt: (() => { const t = Date.parse(String(fm.completedAt ?? "")); return Number.isFinite(t) ? t : null; })(),
+      modifiedMs: f.stat.mtime,
     });
   }
   return out;

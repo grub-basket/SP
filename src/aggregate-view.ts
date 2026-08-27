@@ -6,6 +6,10 @@ import { STASHPAD_AGGREGATE_VIEW_TYPE, archiveSubfolderOf } from "./types";
 /** One row of the locked-subtree registry (`settings.lockedSubtrees`). */
 type LockedEntry = { folder: string; blob: string; parentId?: string | null; title?: string; count?: number; created?: string; rootId?: string; prevSibling?: string | null };
 import { renderTaskTriage, defaultTaskTriageState, type TaskTriageState } from "./task-render";
+import { renderMasterIndex, defaultIndexState, type IndexState } from "./aggregate-index";
+import { renderTaskTimeline, defaultTimelineState, type TimelineState } from "./task-timeline";
+import { renderDueCalendar, defaultDueCalendarState, type DueCalendarState } from "./due-calendar";
+import { renderActivityHeatmap, defaultHeatmapState, type HeatmapState } from "./activity-heatmap";
 import { renderAggModeBar, type AggMode } from "./agg-modes";
 import { returnToOriginOnClose } from "./leaf-return";
 import { settleNewTab } from "./view-helpers";
@@ -13,7 +17,7 @@ import { settleNewTab } from "./view-helpers";
 // Obsidian types `moment` as a namespace (not callable); cast to a callable.
 const momentFn = moment as unknown as (...args: unknown[]) => { fromNow: () => string };
 
-export type AggregateMode = "encrypted" | "archived" | "tasks" | "watch";
+export type AggregateMode = "encrypted" | "archived" | "tasks" | "watch" | "index" | "timeline" | "calendar" | "heatmap";
 
 interface AggregateState { mode: AggregateMode }
 
@@ -36,16 +40,24 @@ export class StashpadAggregateView extends ItemView {
   private taskState: TaskTriageState = defaultTaskTriageState();
   /** 0.130.0: view mode for the "archived" tab (same chip set as Trash). */
   private archiveSubMode: AggMode = "byfolder";
+  /** 0.273.0: facet state for the "index" (All notes) tab. */
+  private indexState: IndexState = defaultIndexState();
+  /** 0.273.1: filter state for the "timeline" tab. */
+  private timelineState: TimelineState = defaultTimelineState();
+  /** 0.274.0: state for the "calendar" (due calendar) tab. */
+  private calendarState: DueCalendarState = defaultDueCalendarState();
+  /** 0.274.0: state for the "heatmap" (activity heatmap) tab. */
+  private heatmapState: HeatmapState = defaultHeatmapState();
 
   constructor(leaf: WorkspaceLeaf, private plugin: StashpadPlugin) { super(leaf); }
 
   getViewType(): string { return STASHPAD_AGGREGATE_VIEW_TYPE; }
-  getDisplayText(): string { return this.mode === "archived" ? "All archived" : this.mode === "tasks" ? "All tasks" : this.mode === "watch" ? "Previously encrypted" : "All encrypted"; }
-  getIcon(): string { return this.mode === "archived" ? "archive" : this.mode === "tasks" ? "check-square" : this.mode === "watch" ? "history" : "lock"; }
+  getDisplayText(): string { return this.mode === "archived" ? "All archived" : this.mode === "tasks" ? "All tasks" : this.mode === "watch" ? "Previously encrypted" : this.mode === "index" ? "All notes" : this.mode === "timeline" ? "Task timeline" : this.mode === "calendar" ? "Due calendar" : this.mode === "heatmap" ? "Activity heatmap" : "All encrypted"; }
+  getIcon(): string { return this.mode === "archived" ? "archive" : this.mode === "tasks" ? "check-square" : this.mode === "watch" ? "history" : this.mode === "index" ? "table" : this.mode === "timeline" ? "calendar-range" : this.mode === "calendar" ? "calendar" : this.mode === "heatmap" ? "activity" : "lock"; }
 
   getState(): Record<string, unknown> { return { ...super.getState(), mode: this.mode }; }
   async setState(state: AggregateState, result: unknown): Promise<void> {
-    if (state?.mode === "archived" || state?.mode === "encrypted" || state?.mode === "tasks" || state?.mode === "watch") this.mode = state.mode;
+    if (state?.mode === "archived" || state?.mode === "encrypted" || state?.mode === "tasks" || state?.mode === "watch" || state?.mode === "index" || state?.mode === "timeline" || state?.mode === "calendar" || state?.mode === "heatmap") this.mode = state.mode;
     await super.setState(state, result as ViewStateResult);
     await this.render();
   }
@@ -59,10 +71,24 @@ export class StashpadAggregateView extends ItemView {
     // .stashenc RENAMES and all plain-archive changes left the view stale.
     const touchEnc = (p: string) => p.endsWith(".stashenc") && !p.startsWith("_deleted/");
     const touchArchiveMd = (p: string) => p.endsWith(".md") && /(^|\/)archive\//.test(p);
-    const touch = (p: string) => touchEnc(p) || touchArchiveMd(p);
+    // 0.273.0: the "All notes" index reflects every plain note, so ANY .md
+    // change refreshes it. Gated on the mode so the other tabs keep their
+    // narrow triggers, and debounced by scheduleRender either way.
+    // 0.274.0: the calendar + heatmap also read every plain note (calendar for
+    // created/due/link days; heatmap resolves ids → titles), so any .md
+    // create/delete/rename refreshes them too. Debounced by scheduleRender.
+    const mdModes = () => this.mode === "index" || this.mode === "timeline" || this.mode === "calendar" || this.mode === "heatmap";
+    const touch = (p: string) => touchEnc(p) || touchArchiveMd(p) || (mdModes() && p.endsWith(".md"));
     this.registerEvent(this.app.vault.on("create", (f) => { if (touch(f.path)) this.scheduleRender(); }));
     this.registerEvent(this.app.vault.on("delete", (f) => { if (touch(f.path)) this.scheduleRender(); }));
     this.registerEvent(this.app.vault.on("rename", (f, oldPath) => { if (touch(f.path) || touch(oldPath)) this.scheduleRender(); }));
+    // Edits change titles/tags/links/due — which the index, timeline, and
+    // calendar all show. The heatmap re-reads the (possibly large) log on every
+    // render, so it stays on the discrete create/delete/rename triggers + the
+    // manual refresh button rather than firing on every keystroke-debounced edit.
+    this.registerEvent(this.app.vault.on("modify", (f) => {
+      if ((this.mode === "index" || this.mode === "timeline" || this.mode === "calendar") && f.path.endsWith(".md")) this.scheduleRender();
+    }));
     await this.render();
   }
 
@@ -103,6 +129,30 @@ export class StashpadAggregateView extends ItemView {
 
     if (this.mode === "tasks") {
       renderTaskTriage(root.createDiv(), this.app, this.plugin, this.taskState, {
+        onOpen: (folder, id) => void this.plugin.revealNoteByRef(folder, id),
+      });
+      return;
+    }
+    if (this.mode === "index") {
+      void renderMasterIndex(root.createDiv(), this.app, this.plugin, this.indexState, {
+        onOpen: (folder, id) => void this.plugin.revealNoteByRef(folder, id),
+      });
+      return;
+    }
+    if (this.mode === "timeline") {
+      renderTaskTimeline(root.createDiv(), this.app, this.plugin, this.timelineState, {
+        onOpen: (folder, id) => void this.plugin.revealNoteByRef(folder, id),
+      });
+      return;
+    }
+    if (this.mode === "calendar") {
+      void renderDueCalendar(root.createDiv(), this.app, this.plugin, this.calendarState, {
+        onOpen: (folder, id) => void this.plugin.revealNoteByRef(folder, id),
+      });
+      return;
+    }
+    if (this.mode === "heatmap") {
+      void renderActivityHeatmap(root.createDiv(), this.app, this.plugin, this.heatmapState, {
         onOpen: (folder, id) => void this.plugin.revealNoteByRef(folder, id),
       });
       return;

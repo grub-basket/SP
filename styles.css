@@ -8408,3 +8408,300 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   font-weight: 600; line-height: 1.25; color: var(--text-normal);
   white-space: pre-wrap; word-break: break-word;
 }
+
+/* 0.273.0: "All notes" master index (aggregate tab, mode "index"). */
+.stashpad-index { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.stashpad-index-bar {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+}
+.stashpad-index-search {
+  flex: 1 1 180px; min-width: 140px;
+  padding: 5px 8px; border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary); color: var(--text-normal);
+  font-size: var(--font-ui-small);
+}
+.stashpad-index-select {
+  font-size: var(--font-ui-smaller); padding: 3px 6px; border-radius: 6px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary); color: var(--text-normal);
+  max-width: 150px;
+}
+.stashpad-index-chip {
+  font-size: var(--font-ui-smaller); padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--background-modifier-border);
+  background: transparent; color: var(--text-muted); cursor: pointer;
+}
+.stashpad-index-chip:hover { background: var(--background-modifier-hover); }
+.stashpad-index-chip.is-active {
+  color: var(--text-on-accent); background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+}
+.stashpad-index-count { font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.stashpad-index-list { display: flex; flex-direction: column; min-height: 0; }
+.stashpad-index-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 8px; border-bottom: 1px solid var(--background-modifier-border);
+  border-radius: 4px; cursor: pointer;
+}
+.stashpad-index-row:hover { background: var(--background-modifier-hover); }
+.stashpad-index-main { min-width: 0; flex: 1 1 auto; }
+.stashpad-index-title {
+  color: var(--text-normal); font-size: var(--font-ui-small);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Obscured note: its title is CONTENT, so it blurs here exactly like a row's
+   body does (transparent glyphs + shadow — no compositing layer). */
+.stashpad-index-title.is-blurred {
+  color: transparent;
+  text-shadow: 0 0 7px var(--text-normal);
+  opacity: 0.75;
+  -webkit-user-select: none; user-select: none;
+}
+.stashpad-index-home-badge {
+  margin-left: 6px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-faint); border: 1px solid var(--background-modifier-border);
+  border-radius: 4px; padding: 0 4px; vertical-align: middle;
+}
+.stashpad-index-meta {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  font-size: var(--font-ui-smaller); color: var(--text-muted);
+}
+.stashpad-index-folder { color: var(--text-accent); }
+.stashpad-index-tag { color: var(--text-faint); }
+.stashpad-index-icons { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; color: var(--text-faint); }
+.stashpad-index-ic .svg-icon { width: 14px; height: 14px; }
+.stashpad-index-swatch { width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--background-modifier-border); }
+
+/* 0.273.1: Task timeline (aggregate mode "timeline"). Rows = tasks; each bar
+   spans creation → completion (or → now while open) on a shared time axis. */
+.stashpad-timeline { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.stashpad-timeline-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.stashpad-timeline-empty { color: var(--text-faint); padding: 16px 4px; }
+.stashpad-timeline-axis { display: flex; align-items: flex-end; }
+.stashpad-timeline-axis-label { flex: 0 0 180px; }
+.stashpad-timeline-axis-track {
+  position: relative; flex: 1 1 auto; height: 20px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-timeline-tick {
+  position: absolute; bottom: 2px; transform: translateX(-50%);
+  font-size: 9px; color: var(--text-faint); white-space: nowrap;
+}
+.stashpad-timeline-row {
+  display: flex; align-items: center; gap: 0;
+  padding: 4px 0; border-bottom: 1px solid var(--background-modifier-border);
+  cursor: pointer; border-radius: 4px;
+}
+.stashpad-timeline-row:hover { background: var(--background-modifier-hover); }
+.stashpad-timeline-title {
+  flex: 0 0 180px; min-width: 0; padding: 0 8px;
+  font-size: var(--font-ui-smaller); color: var(--text-normal);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stashpad-timeline-sub { color: var(--text-faint); font-size: 9px; }
+.stashpad-timeline-track { position: relative; flex: 1 1 auto; height: 14px; }
+.stashpad-timeline-span {
+  position: absolute; top: 2px; height: 10px; border-radius: 5px;
+  display: flex; align-items: center; justify-content: flex-end;
+}
+.stashpad-timeline-span.is-done { background: var(--interactive-accent); opacity: 0.85; }
+.stashpad-timeline-span.is-open {
+  background: repeating-linear-gradient(45deg,
+    var(--background-modifier-border), var(--background-modifier-border) 4px,
+    var(--background-modifier-border-hover) 4px, var(--background-modifier-border-hover) 8px);
+  border: 1px solid var(--background-modifier-border-hover);
+}
+/* Approximated end (completed before completion dates existed): dashed edge. */
+.stashpad-timeline-span.is-approx { border-right: 2px dashed var(--text-faint); opacity: 0.6; }
+.stashpad-timeline-check { color: var(--text-on-accent); display: inline-flex; margin-right: 1px; }
+.stashpad-timeline-check .svg-icon { width: 8px; height: 8px; }
+/* Narrow window: shrink the title column so bars keep room. */
+@media (max-width: 640px) {
+  .stashpad-timeline-title, .stashpad-timeline-axis-label { flex-basis: 110px; }
+}
+
+/* ===== Due calendar (0.274.0) ===================================== */
+.stashpad-cal { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+.stashpad-cal-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.stashpad-cal-nav { display: flex; align-items: center; gap: 4px; }
+.stashpad-cal-navbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0; border-radius: 6px;
+  background: transparent; border: none; color: var(--text-muted); cursor: pointer;
+}
+.stashpad-cal-navbtn:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-cal-month { font-weight: 600; min-width: 9.5em; text-align: center; }
+.stashpad-cal-today {
+  font-size: var(--font-ui-smaller); padding: 3px 9px; border-radius: 6px;
+  background: var(--background-modifier-hover); border: none; color: var(--text-muted); cursor: pointer;
+}
+.stashpad-cal-today:hover { color: var(--text-normal); }
+.stashpad-cal-legend { display: flex; gap: 5px; margin-left: auto; }
+.stashpad-cal-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px;
+  border-radius: 999px; font-size: var(--font-ui-smaller); cursor: pointer;
+  background: var(--background-modifier-hover); color: var(--text-muted);
+  border: 1px solid transparent;
+}
+.stashpad-cal-chip .stashpad-cal-dot { display: inline-flex; }
+.stashpad-cal-chip .stashpad-cal-dot .svg-icon { width: 12px; height: 12px; }
+.stashpad-cal-chip:not(.is-active) { opacity: 0.5; }
+.stashpad-cal-chip.is-created.is-active { color: var(--sp-cal-created); border-color: var(--sp-cal-created); }
+.stashpad-cal-chip.is-due.is-active { color: var(--sp-cal-due); border-color: var(--sp-cal-due); }
+.stashpad-cal-chip.is-link.is-active { color: var(--sp-cal-link); border-color: var(--sp-cal-link); }
+
+/* Reason palette — defined on :root so a color always exists; theme-aware. */
+:root {
+  --sp-cal-created: #2e9e5b;
+  --sp-cal-due: #d9822b;
+  --sp-cal-link: #4a8fd6;
+}
+:root:not([data-theme="light"]) {
+  --sp-cal-created: #4cc38a;
+  --sp-cal-due: #e0a458;
+  --sp-cal-link: #6ba6e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --sp-cal-created: #4cc38a;
+    --sp-cal-due: #e0a458;
+    --sp-cal-link: #6ba6e0;
+  }
+}
+:root[data-theme="dark"] {
+  --sp-cal-created: #4cc38a;
+  --sp-cal-due: #e0a458;
+  --sp-cal-link: #6ba6e0;
+}
+
+.stashpad-cal-grid {
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px;
+}
+.stashpad-cal-dow {
+  text-align: center; font-size: var(--font-ui-smaller); color: var(--text-faint);
+  font-weight: 600; padding-bottom: 2px; text-transform: uppercase; letter-spacing: 0.03em;
+}
+.stashpad-cal-cell {
+  min-height: 84px; border: 1px solid var(--background-modifier-border);
+  border-radius: 8px; padding: 4px; display: flex; flex-direction: column; gap: 2px;
+  background: var(--background-primary); overflow: hidden;
+}
+.stashpad-cal-cell.is-out { opacity: 0.42; background: var(--background-secondary); }
+.stashpad-cal-cell.is-today { border-color: var(--interactive-accent); box-shadow: inset 0 0 0 1px var(--interactive-accent); }
+.stashpad-cal-cell.has-hits { background: var(--background-secondary-alt); }
+.stashpad-cal-cellhead { display: flex; align-items: center; justify-content: space-between; }
+.stashpad-cal-daynum { font-size: var(--font-ui-smaller); color: var(--text-muted); font-weight: 600; }
+.stashpad-cal-cell.is-today .stashpad-cal-daynum { color: var(--interactive-accent); }
+.stashpad-cal-cellcount {
+  font-size: 9px; color: var(--text-faint); background: var(--background-modifier-hover);
+  border-radius: 999px; padding: 0 5px; line-height: 1.5;
+}
+.stashpad-cal-note {
+  display: flex; align-items: center; gap: 4px; min-width: 0;
+  padding: 1px 5px; border-radius: 5px; cursor: pointer;
+  background: var(--background-modifier-hover);
+  border-left: 3px solid var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-cal-note:hover { background: var(--background-modifier-active-hover); }
+.stashpad-cal-note.is-created { border-left-color: var(--sp-cal-created); }
+.stashpad-cal-note.is-due { border-left-color: var(--sp-cal-due); }
+.stashpad-cal-note.is-link { border-left-color: var(--sp-cal-link); }
+.stashpad-cal-note .stashpad-cal-dot { display: inline-flex; flex: 0 0 auto; color: var(--text-muted); }
+.stashpad-cal-note .stashpad-cal-dot .svg-icon { width: 11px; height: 11px; }
+.stashpad-cal-note.is-created .stashpad-cal-dot { color: var(--sp-cal-created); }
+.stashpad-cal-note.is-due .stashpad-cal-dot { color: var(--sp-cal-due); }
+.stashpad-cal-note.is-link .stashpad-cal-dot { color: var(--sp-cal-link); }
+.stashpad-cal-note-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-cal-note-title.is-blurred { filter: blur(4px); }
+.stashpad-cal-note.is-obscured { cursor: default; }
+.stashpad-cal-note-folder { color: var(--text-faint); font-size: 10px; margin-left: auto; flex: 0 0 auto; }
+.stashpad-cal-more {
+  align-self: flex-start; background: none; border: none; padding: 0 2px;
+  color: var(--text-accent); font-size: 10px; cursor: pointer;
+}
+.stashpad-cal-more:hover { text-decoration: underline; }
+.stashpad-cal-daypanel {
+  border: 1px solid var(--background-modifier-border); border-radius: 8px;
+  padding: 8px; display: flex; flex-direction: column; gap: 4px;
+  background: var(--background-secondary);
+}
+.stashpad-cal-daypanel-head { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 2px; }
+.stashpad-cal-daypanel-head .stashpad-trash-iconbtn { margin-left: auto; }
+.stashpad-cal-note.is-full { padding: 4px 8px; }
+
+@media (max-width: 640px) {
+  .stashpad-cal-legend { margin-left: 0; }
+  .stashpad-cal-grid { gap: 2px; }
+  .stashpad-cal-cell { min-height: 58px; padding: 2px; border-radius: 5px; }
+  /* Chips get cramped on a phone — collapse to reason dots + a count. */
+  .stashpad-cal-note { padding: 1px 3px; }
+  .stashpad-cal-note-title, .stashpad-cal-note-folder { display: none; }
+  .stashpad-cal-note.is-full .stashpad-cal-note-title,
+  .stashpad-cal-note.is-full .stashpad-cal-note-folder { display: block; }
+  .stashpad-cal-note.is-full .stashpad-cal-note-folder { display: inline; }
+  .stashpad-cal-dow { font-size: 9px; }
+}
+
+/* ===== Activity heatmap (0.274.0) ================================ */
+.stashpad-heat {
+  display: flex; flex-direction: column; gap: 12px; min-height: 0;
+  --heat-cell: 13px; --heat-gap: 3px; --heat-labelw: 28px;
+  /* Scale defined HERE, not on :root — these reference Obsidian theme vars
+     (--interactive-accent etc.) which are defined on body.theme-*, so at :root
+     scope they resolve to empty and every cell renders transparent. On the
+     component (a body descendant) the theme vars are in scope. */
+  --sp-heat-outline: rgba(127,127,127,0.16);
+  --sp-heat-0: var(--background-modifier-border);
+  --sp-heat-1: color-mix(in srgb, var(--interactive-accent) 28%, var(--background-primary));
+  --sp-heat-2: color-mix(in srgb, var(--interactive-accent) 50%, var(--background-primary));
+  --sp-heat-3: color-mix(in srgb, var(--interactive-accent) 74%, var(--background-primary));
+  --sp-heat-4: var(--interactive-accent);
+}
+.stashpad-heat-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.stashpad-heat-chipic { display: inline-flex; margin-right: 3px; }
+.stashpad-heat-chipic .svg-icon { width: 12px; height: 12px; }
+.stashpad-index-chip.is-house:not(.is-active) { opacity: 0.4; }
+.stashpad-heat-scroll { overflow-x: auto; padding-bottom: 4px; }
+.stashpad-heat-wrap { display: inline-flex; flex-direction: column; gap: 4px; min-width: min-content; }
+.stashpad-heat-months { display: flex; gap: 4px; }
+.stashpad-heat-daylabels-spacer { flex: 0 0 var(--heat-labelw); }
+.stashpad-heat-monthcols { display: flex; gap: var(--heat-gap); }
+.stashpad-heat-monthlabel { width: var(--heat-cell); font-size: 9px; color: var(--text-faint); white-space: nowrap; overflow: visible; }
+.stashpad-heat-body { display: flex; gap: 4px; }
+.stashpad-heat-daylabels { display: flex; flex-direction: column; gap: var(--heat-gap); flex: 0 0 var(--heat-labelw); }
+.stashpad-heat-daylabel { height: var(--heat-cell); font-size: 9px; color: var(--text-faint); line-height: var(--heat-cell); }
+.stashpad-heat-cells { display: flex; gap: var(--heat-gap); }
+.stashpad-heat-col { display: flex; flex-direction: column; gap: var(--heat-gap); }
+.stashpad-heat-cell {
+  width: var(--heat-cell); height: var(--heat-cell); border-radius: 3px;
+  background: var(--sp-heat-0); cursor: pointer;
+  outline: 1px solid var(--sp-heat-outline); outline-offset: -1px;
+}
+.stashpad-heat-cell[data-level="0"] { background: var(--sp-heat-0); cursor: default; }
+.stashpad-heat-cell[data-level="1"] { background: var(--sp-heat-1); }
+.stashpad-heat-cell[data-level="2"] { background: var(--sp-heat-2); }
+.stashpad-heat-cell[data-level="3"] { background: var(--sp-heat-3); }
+.stashpad-heat-cell[data-level="4"] { background: var(--sp-heat-4); }
+.stashpad-heat-cell.is-future { visibility: hidden; }
+.stashpad-heat-cell.is-today { outline: 1.5px solid var(--text-normal); }
+.stashpad-heat-cell.is-selected { outline: 2px solid var(--interactive-accent); outline-offset: 0; }
+
+.stashpad-heat-legendrow { display: flex; align-items: center; gap: 4px; font-size: 9px; color: var(--text-faint); }
+.stashpad-heat-legendcell { width: var(--heat-cell); height: var(--heat-cell); border-radius: 3px; outline: 1px solid var(--sp-heat-outline); outline-offset: -1px; }
+.stashpad-heat-legendcell[data-level="0"] { background: var(--sp-heat-0); }
+.stashpad-heat-legendcell[data-level="1"] { background: var(--sp-heat-1); }
+.stashpad-heat-legendcell[data-level="2"] { background: var(--sp-heat-2); }
+.stashpad-heat-legendcell[data-level="3"] { background: var(--sp-heat-3); }
+.stashpad-heat-legendcell[data-level="4"] { background: var(--sp-heat-4); }
+
+.stashpad-heat-event {
+  display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 6px;
+}
+.stashpad-heat-event.is-openable { cursor: pointer; }
+.stashpad-heat-event.is-openable:hover { background: var(--background-modifier-hover); }
+.stashpad-heat-eventic { display: inline-flex; color: var(--text-muted); flex: 0 0 auto; }
+.stashpad-heat-eventic .svg-icon { width: 14px; height: 14px; }
+.stashpad-heat-eventlabel { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-heat-eventmeta { color: var(--text-faint); font-size: var(--font-ui-smaller); flex: 0 0 auto; }

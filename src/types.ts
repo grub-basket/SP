@@ -261,6 +261,17 @@ export function matchesObsidianIgnore(path: string, filters: string[] | undefine
  *  in any order. Empty query matches everything. See docs/sift.md. Exported
  *  so simple inputs (e.g. the assignee picker) reuse it instead of
  *  re-implementing `includes`. */
+/** 0.273.1: the ONE way to flip a task's completion in frontmatter. Also
+ *  stamps/clears `completedAt`, which the task timeline needs — before this,
+ *  only the recurrence spawner recorded WHEN something was completed, so a
+ *  timeline had a start for every bar and an end for almost none. Deliberately
+ *  not in RESERVED_FRONTMATTER: `completed` itself isn't, and a stamp that
+ *  outlives its flag (or vice versa) would be worse than both cloning together. */
+export function writeCompletedFm(fm: Record<string, unknown>, on: boolean): void {
+  if (on) { fm.completed = true; fm.completedAt = new Date().toISOString(); }
+  else { delete fm.completed; delete fm.completedAt; }
+}
+
 export function siftMatch(query: string, haystack: string): boolean {
   const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return true;
@@ -347,7 +358,12 @@ export type LogEventType =
   // Obsidian's own editor, or sync. Recorded because these are exactly the
   // writes with no other trace: no command ran, so nothing else logs them, and
   // they are the ones you want to see when frontmatter drifts.
-  | "external_edit";
+  | "external_edit"
+  // 0.274.0: a body edit made THROUGH Stashpad's own editor (the edit modal /
+  // split-save chokepoint). Distinct from `external_edit` (edited elsewhere) so
+  // the activity heatmap can count "edited in Stashpad" as first-class work —
+  // without it, in-app edits left no trace in the log at all.
+  | "edit";
 
 export interface LogEvent {
   ts: string;

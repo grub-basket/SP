@@ -380,6 +380,7 @@ export class LogModal extends Modal {
       case "archive": return `Archived ${ev.id}${p.to ? ` → ${p.to}` : ""}${p.encrypted === false ? " (plaintext)" : ""}`;
       case "restore": return `Restored ${ev.id}${p.to ? ` → ${p.to}` : ""} from trash`;
       case "external_edit": return `Edited outside Stashpad — ${p.path ?? ev.id}`;
+      case "edit": return `Edited ${p.path ?? ev.id}`;
       default: return JSON.stringify(p);
     }
   }

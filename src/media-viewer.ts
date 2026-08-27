@@ -305,7 +305,7 @@ export class MediaViewerModal extends Modal {
       this.mediaEl = img;
       // 0.272.4: right-click an image → Copy (a PDF is an iframe with its own
       // menu, so this is images / other non-pdf stage content only).
-      img.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); this.openStageMenu(e, item.file); };
+      img.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); if (item.file) this.openStageMenu(e, item.file); };
       const onReady = (): void => {
         this.naturalW = img.naturalWidth || img.clientWidth;
         this.naturalH = img.naturalHeight || img.clientHeight;
