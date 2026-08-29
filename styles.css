@@ -2670,6 +2670,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   color: var(--text-faint);
   font-size: var(--font-ui-smaller);
 }
+/* Custom-delimiter split (0.275.3) */
+.stashpad-split-custom { display: flex; flex-direction: column; gap: 8px; }
+.stashpad-split-custom-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.stashpad-split-custom-input { flex: 1 1 200px; min-width: 120px; }
+.stashpad-split-custom-rm { display: inline-flex; align-items: center; gap: 5px; font-size: var(--font-ui-smaller); color: var(--text-muted); white-space: nowrap; cursor: pointer; }
+.stashpad-split-custom-rm input { margin: 0; }
 /* 0.169.0: "Open in a tab" button + the full-leaf ("popped out") layout. */
 .stashpad-split-popout-btn { display: inline-flex; align-items: center; gap: 6px; }
 .stashpad-split-popout-icon { display: inline-flex; }

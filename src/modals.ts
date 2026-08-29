@@ -1,6 +1,6 @@
 import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, type SecretStorage } from "obsidian";
 import { normalisePastedPath } from "./paste-path";
-import { splitIntoChunks, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
+import { splitIntoChunks, splitByDelimiter, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch, ROOT_ID } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
@@ -469,7 +469,7 @@ function splitWordDiff(a: string, b: string): SplitDiffPart[] {
 export interface WorkbenchState {
   /** 0.170.0: top-level surface — plain Edit, or the Split methods. Shares text. */
   surface: "edit" | "split";
-  mode: "line" | "cursor" | "preset";
+  mode: "line" | "cursor" | "preset" | "custom";
   presetMode: SplitMode;
   nest: boolean;
   cursorText: string;
@@ -516,8 +516,12 @@ export class NoteWorkbench {
   private lines: string[];
   private lineCursorIdx: number;
   private surface: "edit" | "split" = "split";
-  private mode: "line" | "cursor" | "preset" = "line";
+  private mode: "line" | "cursor" | "preset" | "custom" = "line";
   private presetMode: SplitMode = "paragraphs";
+  // 0.275.3: custom-delimiter split. `customRemove` off = nondestructive (the
+  // delimiter stays at the end of each piece, e.g. split on "." keeps periods).
+  private customDelimiter = "";
+  private customRemove = false;
   private nest = false;
   private cursorTextarea: HTMLTextAreaElement | null = null;
   /** 0.185.0: composer-parity autocomplete bound to the live editor textarea.
@@ -732,7 +736,15 @@ export class NoteWorkbench {
     if (this.surface === "edit") { await this.saveEdit(); return; }
     if (this.mode === "line") await this.commitLine();
     else if (this.mode === "cursor") await this.commitCursor();
+    else if (this.mode === "custom") await this.commitCustom();
     else await this.commitPreset();
+  }
+
+  private async commitCustom(): Promise<void> {
+    const chunks = splitByDelimiter(this.body, this.customDelimiter, this.customRemove);
+    if (chunks.length < 2) { new Notice("That delimiter wouldn't split this note into more than one part."); return; }
+    await this.cb.onSplitMany(chunks, this.nest);
+    this.cb.onDone();
   }
 
   private async saveEdit(): Promise<void> {
@@ -961,10 +973,13 @@ export class NoteWorkbench {
       modeBtn(label, this.mode === "preset" && this.presetMode === m,
         () => { this.mode = "preset"; this.presetMode = m; this.render(); }, presetIcon[m], disabled);
     });
+    // 0.275.3: split on a custom symbol/string you type.
+    modeBtn("Custom", this.mode === "custom", () => { this.mode = "custom"; this.render(); }, "scissors");
 
     // Preview for the active mode.
     if (this.mode === "line") this.renderLineMode();
     else if (this.mode === "cursor") this.renderEditorSections();
+    else if (this.mode === "custom") this.renderCustomMode();
     else this.renderPresetMode();
 
     const help = this.host.createDiv({ cls: "stashpad-split-help" });
@@ -1006,10 +1021,11 @@ export class NoteWorkbench {
     // Update just the help line — a full re-render would drop the cursor caret.
     nestCb.onchange = () => { this.nest = nestCb.checked; setHelp(); };
 
-    const splitCount = this.mode === "preset" ? splitIntoChunks(this.body, this.presetMode).length : 0;
+    const splitCount = this.mode === "preset" ? splitIntoChunks(this.body, this.presetMode).length
+      : this.mode === "custom" ? splitByDelimiter(this.body, this.customDelimiter, this.customRemove).length : 0;
     const splitBtn = right.createEl("button", { cls: "stashpad-split-confirm-btn mod-cta" });
     setIcon(splitBtn.createSpan({ cls: "stashpad-split-btn-icon" }), "split");
-    splitBtn.createSpan({ text: this.mode === "preset" && splitCount >= 2 ? `Split into ${splitCount}` : "Split" });
+    splitBtn.createSpan({ text: (this.mode === "preset" || this.mode === "custom") && splitCount >= 2 ? `Split into ${splitCount}` : "Split" });
     splitBtn.onmousedown = (e) => e.preventDefault(); // don't blur the textarea
     splitBtn.onclick = () => this.commit();
   }
@@ -1028,6 +1044,46 @@ export class NoteWorkbench {
       head.appendChild(this.makeCopyButton(() => c, `Copy part ${i + 1}`));
       card.createDiv({ cls: "stashpad-split-part-body", text: c });
     });
+  }
+
+  /** 0.275.3: custom-delimiter split UI — a text box for the symbol/string, a
+   *  "remove it on split" toggle (off = keep the delimiter in each note), and a
+   *  live preview. Repaints in place on input so the field keeps focus. */
+  private renderCustomMode(): void {
+    const wrap = this.host.createDiv({ cls: "stashpad-split-custom" });
+    const row = wrap.createDiv({ cls: "stashpad-split-custom-row" });
+    const input = row.createEl("input", { type: "text", cls: "stashpad-split-custom-input", attr: { placeholder: "Split on…  (e.g. .  or  —  or any text)" } });
+    input.value = this.customDelimiter;
+    const rmWrap = row.createEl("label", { cls: "stashpad-split-custom-rm" });
+    const rmCb = rmWrap.createEl("input", { type: "checkbox" });
+    rmCb.checked = this.customRemove;
+    rmWrap.createSpan({ text: "Remove it on split" });
+    const list = wrap.createDiv({ cls: "stashpad-split-preset-list" });
+    const paint = (): void => {
+      this.customDelimiter = input.value;
+      this.customRemove = rmCb.checked;
+      const chunks = splitByDelimiter(this.body, this.customDelimiter, this.customRemove);
+      list.empty();
+      if (!this.customDelimiter) {
+        list.createDiv({ cls: "stashpad-split-empty", text: "Type a symbol or text to split on. It stays in each note unless you tick “Remove it on split”." });
+      } else if (chunks.length < 2) {
+        list.createDiv({ cls: "stashpad-split-empty", text: "That delimiter wouldn't split the note into more than one part." });
+      } else {
+        chunks.forEach((c, i) => {
+          const card = list.createDiv({ cls: "stashpad-split-part-card" });
+          const head = card.createDiv({ cls: "stashpad-split-part-num" });
+          head.createSpan({ cls: "stashpad-split-part-title", text: `Part ${i + 1}` });
+          head.appendChild(this.makeCopyButton(() => c, `Copy part ${i + 1}`));
+          card.createDiv({ cls: "stashpad-split-part-body", text: c });
+        });
+      }
+      const btn = this.host.querySelector(".stashpad-split-confirm-btn span:last-child") as HTMLElement | null;
+      if (btn) btn.setText(chunks.length >= 2 ? `Split into ${chunks.length}` : "Split");
+    };
+    input.oninput = paint;
+    rmCb.onchange = paint;
+    paint();
+    window.setTimeout(() => input.focus(), 0);
   }
 
   private renderLineMode(): void {

@@ -56,6 +56,7 @@ import { SettingsStore, MOVED_KEYS } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
 import { APP_IMPORT_VIEW_TYPE, AppImportView, type AppImporterViewContext } from "./stashpad-app-import-modal";
 import { settleNewTab, buildHomeFilename } from "./view-helpers";
+import { returnToOriginOnClose } from "./leaf-return";
 import { resolveObscureAll } from "./obscure-scope";
 
 /** 0.89.1: localStorage key — set right before an update-triggered app reload so
@@ -7650,6 +7651,12 @@ export default class StashpadPlugin extends Plugin {
     });
     this.app.workspace.revealLeaf(leaf);
     settleNewTab(this.app.workspace, prev); // 0.199.0 background-tabs behavior
+    // 0.275.3: closing this spawned folder tab returns focus to where it was
+    // opened FROM (the aggregate index / calendar / timeline row, a deep link,
+    // etc.) instead of falling to the tab on the right. activateViewForFolder is
+    // the single new-folder-tab bottleneck, so wiring it here covers every
+    // view that opens a note. No-ops when prev is null or is this same leaf.
+    returnToOriginOnClose(this.app.workspace, leaf, prev, (ref) => this.registerEvent(ref));
     return leaf;
   }
 

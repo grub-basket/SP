@@ -50,6 +50,26 @@ export function splitIntoChunks(text: string, mode: SplitMode): string[] {
   return chunks.filter(Boolean);
 }
 
+/** 0.275.3: split on a user-supplied delimiter STRING (literal, not regex — a
+ *  "." means a period). NONDESTRUCTIVE by default: the delimiter stays at the
+ *  end of each piece, so splitting a paragraph on "." keeps the periods and each
+ *  sentence becomes its own note. `removeDelimiter` strips it instead. Each
+ *  piece is trimmed of leading/trailing whitespace and empties are dropped. */
+export function splitByDelimiter(text: string, delimiter: string, removeDelimiter: boolean): string[] {
+  const norm = text.replace(/\r\n/g, "\n");
+  if (!delimiter) return [norm.trim()].filter(Boolean);
+  const out: string[] = [];
+  let idx = 0;
+  for (;;) {
+    const at = norm.indexOf(delimiter, idx);
+    if (at === -1) { out.push(norm.slice(idx)); break; }
+    const end = at + delimiter.length;
+    out.push(norm.slice(idx, removeDelimiter ? at : end));
+    idx = end;
+  }
+  return out.map((s) => s.trim()).filter(Boolean);
+}
+
 /** 0.76.33: setIcon that never leaves a blank button. If `name` isn't
  *  in this Obsidian build's bundled Lucide set (older iPad/iOS app
  *  versions lag desktop, so some names that resolve on desktop don't

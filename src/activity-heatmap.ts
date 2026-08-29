@@ -47,7 +47,10 @@ export function defaultHeatmapState(): HeatmapState {
   return {
     weeks: 26,
     buckets: { created: true, edited: true, tasks: true, files: true, moved: true, vault: true, deleted: true },
-    openDay: null,
+    // 0.275.3: pre-select TODAY so the detail panel isn't blank on open (and
+    // today's cell reads as selected). Once open, the user's clicks / closing
+    // the panel take over normally.
+    openDay: (moment as unknown as (ms?: number) => { format: (f: string) => string })(Date.now()).format("YYYY-MM-DD"),
   };
 }
 
