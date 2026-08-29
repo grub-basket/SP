@@ -935,6 +935,23 @@ export class StashpadFolderPanelView extends ItemView {
     // .stashenc bundles, or unlock them all back. Only when encryption is set up.
     if (this.plugin.encryption?.isConfigured?.()) {
       menu.addSeparator();
+      // 0.276.5: per-folder encryption ON/OFF. Marks the folder as one whose
+      // notes should be encrypted — the Encrypt-all sweep locks any plaintext
+      // in it. Setting it is non-destructive (it does not encrypt on its own);
+      // the two actions below still lock/unlock immediately.
+      const cleanF = folder.replace(/\/+$/, "");
+      const encOn = (this.plugin.settings.folderEncPrefs?.[cleanF])?.encryptContent === true;
+      menu.addItem((i) => i.setTitle(encOn ? "Encryption: ON for this folder" : "Turn on encryption for this folder")
+        .setIcon(encOn ? "shield-check" : "shield")
+        .onClick(async () => {
+          const prefs = this.plugin.settings.folderEncPrefs ?? {};
+          this.plugin.settings.folderEncPrefs = { ...prefs, [cleanF]: { ...(prefs[cleanF] ?? {}), encryptContent: !encOn } };
+          await this.plugin.saveSettings();
+          new Notice(!encOn
+            ? "Encryption on for this folder. Run “Encrypt (lock) all notes” or Encrypt-all to lock its existing notes."
+            : "Encryption off for this folder.");
+          this.render();
+        }));
       menu.addItem((i) => i.setTitle("Encrypt (lock) all notes in folder").setIcon("lock")
         .onClick(() => void this.plugin.lockFolder(folder)));
       if (this.app.vault.getFiles().some((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") === folder.replace(/\/+$/, ""))) {

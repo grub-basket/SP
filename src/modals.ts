@@ -1331,8 +1331,13 @@ export class NoteWorkbenchModal extends Modal {
   /** 0.170.5: set when the close is intentional (Save/Split done, or pop-out) so the
    *  unsaved-edits guard is skipped. */
   private committing = false;
-  constructor(app: App, private body: string, private cbs: WorkbenchCommandCallbacks, private init: Partial<WorkbenchState> = {}) {
+  /** 0.276.8: fired once when the modal actually closes (Save, Split, or a
+   *  confirmed discard) — the multi-note edit queue uses it to advance to the
+   *  next note whether this one was saved or dismissed. */
+  private onClosed?: () => void;
+  constructor(app: App, private body: string, private cbs: WorkbenchCommandCallbacks, private init: Partial<WorkbenchState> = {}, onClosed?: () => void) {
     super(app);
+    this.onClosed = onClosed;
   }
   onOpen(): void {
     this.modalEl.addClass("stashpad-split-modal");
@@ -1375,7 +1380,7 @@ export class NoteWorkbenchModal extends Modal {
       true,
     ).open();
   }
-  onClose(): void { this.ui?.destroy(); this.ui = null; this.contentEl.empty(); }
+  onClose(): void { this.ui?.destroy(); this.ui = null; this.contentEl.empty(); const cb = this.onClosed; this.onClosed = undefined; cb?.(); }
 }
 
 /** Context injected into a popped-out NoteWorkbenchView. `prevLeaf` is the tab to

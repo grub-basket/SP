@@ -72,10 +72,22 @@ const M = moment as unknown as { (ms?: number): MomentLike; (s: string, f: strin
 
 interface DayEntry { total: number; byBucket: Map<Bucket, number>; events: LogEvent[]; }
 
+/** 0.276.8: cache the parsed log keyed by the file's stat (mtime+size), so a
+ *  re-render that didn't change the log (facet toggle, day click, or another
+ *  view's refresh) reuses the parse instead of re-reading + re-parsing the whole
+ *  file. The action log grows without bound, so on an active vault a repeated
+ *  full re-parse per render was a real renderer cost (spun fans during heavy
+ *  note churn with the heatmap open). Cache lives on the plugin instance. */
+type LogCache = { mtime: number; size: number; events: LogEvent[] };
 async function readLog(app: App, plugin: StashpadPlugin): Promise<LogEvent[]> {
   const path = plugin.newLog().getLogPath();
   const adapter = app.vault.adapter;
   if (!(await adapter.exists(path))) return [];
+  let stat: { mtime?: number; size?: number } | null = null;
+  try { stat = await adapter.stat(path); } catch { /* no stat → skip cache */ }
+  const holder = plugin as unknown as { _heatLogCache?: LogCache };
+  const c = holder._heatLogCache;
+  if (stat && c && c.mtime === stat.mtime && c.size === stat.size) return c.events;
   let raw = "";
   try { raw = await adapter.read(path); } catch { return []; }
   const out: LogEvent[] = [];
@@ -87,6 +99,7 @@ async function readLog(app: App, plugin: StashpadPlugin): Promise<LogEvent[]> {
       if (ev && typeof ev.ts === "string" && typeof ev.type === "string") out.push(ev);
     } catch { /* skip a torn line */ }
   }
+  if (stat && stat.mtime != null && stat.size != null) holder._heatLogCache = { mtime: stat.mtime, size: stat.size, events: out };
   return out;
 }
 

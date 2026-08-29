@@ -91,6 +91,10 @@ const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avi
 const RENDER_CALM_MS = 900;
 const RENDER_BURST_THRESHOLD = 5;
 const RENDER_STORM_DELAY_MS = 700;
+/** 0.276.9: at/above this many notes, a bulk delete collapses the affected rows
+ *  immediately (optimistic) before the async trash + rebuild. Below it, the
+ *  normal render is already snappy, so we don't alter single/small deletes. */
+const OPTIMISTIC_ROWS = 4;
 
 /** Hysteresis band for the pinned heading's `is-stuck` collapse. Two thresholds
  *  rather than one because the class changes the very height it is measured
@@ -4403,7 +4407,7 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Collapse all").setIcon("fold-vertical").onClick(() => this.cmdCollapseAll()));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").setDisabled(!hasTargets).onClick(() => this.cmdOpenInNewStashpadTab()));
-    menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").setDisabled(!hasTargets).onClick(() => void this.cmdEdit()));
+    menu.addItem((it: any) => it.setTitle(this.selection.size > 1 ? "Edit in Stashpad (one at a time)" : "Edit in Stashpad").setIcon("pencil-line").setDisabled(!hasTargets).onClick(() => this.cmdEditQueue()));
     menu.addItem((it: any) => it.setTitle("Open in Obsidian editor").setIcon("pencil").setDisabled(!hasTargets).onClick(() => this.cmdOpenInEditor()));
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Move…").setIcon("arrow-right-circle").setDisabled(!hasTargets).onClick(() => this.cmdMovePicker()));
@@ -4438,6 +4442,7 @@ export class StashpadView extends ItemView {
     }
     menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
     menu.addItem((it: any) => it.setTitle("Merge").setIcon("merge").setDisabled(this.selection.size < 2).onClick(() => void this.cmdMerge()));
+    menu.addItem((it: any) => it.setTitle("Merge with…").setIcon("merge").setDisabled(!hasTargets).onClick(() => this.cmdMergeWith()));
     // Split only operates on a single note — the cmdSplit modal would
     // be ambiguous across a multi-selection. Disable when 2+ selected.
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("scissors").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdSplit()));
@@ -9108,7 +9113,7 @@ export class StashpadView extends ItemView {
       // fires on its shifted form (matchKey ignores Shift), so Shift+E must consume
       // the event first or "E" would swallow it. (The shifted-key trap.)
       if (matchBinding(e, sb.editParent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdEditParent(); return; }
-      if (matchBinding(e, sb.edit)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdEdit(); return; }
+      if (matchBinding(e, sb.edit)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdEditQueue(); return; }
       if (matchBinding(e, sb.clone)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdClone(); return; }
       if (matchBinding(e, sb.forkNote)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdForkNote(); return; }
       if (matchBinding(e, sb.insertTemplate)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInsertTemplate(); return; }
@@ -9759,6 +9764,12 @@ export class StashpadView extends ItemView {
       return true;
     });
     if (roots.length === 0) return;
+    // 0.276.9: optimistic UI — for a bulk delete, collapse the selected rows
+    // immediately so the list closes up while the subtrees are trashed in the
+    // background. The render() below reconciles from the rebuilt tree.
+    if (sources.length >= OPTIMISTIC_ROWS && this.listEl) {
+      for (const s of sources) this.listEl.querySelector<HTMLElement>(`.stashpad-note[data-id="${s.id}"]`)?.addClass("is-vanishing");
+    }
     const folder = this.noteFolder;
     const rootIds = roots.map((r) => r.id);
     let blobs: string[] = [];
@@ -11128,6 +11139,12 @@ export class StashpadView extends ItemView {
       },
     });
 
+    // 0.276.9: optimistic UI — collapse the merged-away rows immediately so they
+    // "disappear together" while the reparent + trash runs. The final render()
+    // (or the undo) reconciles from the tree.
+    if (targets.length >= OPTIMISTIC_ROWS && this.listEl) {
+      for (let i = 1; i < targets.length; i++) this.listEl.querySelector<HTMLElement>(`.stashpad-note[data-id="${targets[i].id}"]`)?.addClass("is-vanishing");
+    }
     try {
     for (let i = 1; i < targets.length; i++) {
       const t = targets[i];
@@ -11192,6 +11209,36 @@ export class StashpadView extends ItemView {
       setTimeout(tryReselect, 400);
     }
 
+  }
+
+  /** 0.276.7: "Merge with…" — pick a TARGET note via search and merge the current
+   *  selection INTO it. Reuses the tested cmdMerge engine (oldest-created note is
+   *  kept, bodies joined in creation order, children inherited, the kept note's
+   *  parent retained, full undo) by unioning the picked target into the selection
+   *  and running it — so a single selected note can be merged into a searched one,
+   *  which the plain Merge (2+ selected) can't do. Same-folder only. */
+  cmdMergeWith(): void {
+    const selected = this.getActionTargets();
+    if (!selected.length) {
+      const focused = this.tree.get(this.focusId);
+      if (!focused?.file) { new Notice("Select a note (or notes), then pick the note to merge them into."); return; }
+      selected.push(focused);
+    }
+    const selectedIds = new Set(selected.map((t) => t.id));
+    new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+      mode: "pick", placeholder: "Merge into which note? (search)", allowCreate: false,
+      onPick: async (item) => {
+        const targetId = item.id;
+        if (!targetId) return;
+        const union = new Set(selectedIds);
+        union.add(targetId);
+        if (union.size < 2) { new Notice("Pick a different note to merge into."); return; }
+        // Hand the union to the tested merge engine via the selection.
+        this.selection.clear();
+        for (const id of union) this.selection.add(id);
+        await this.cmdMerge();
+      },
+    }).open();
   }
 
   // Clipboard commands — implementations live in commands/clipboard-cmds.ts.
@@ -15488,6 +15535,15 @@ export class StashpadView extends ItemView {
     // attachments are NOT auto-deleted (no checkbox to opt in) — the
     // safer default for an unattended path.
     const performDelete = async (alsoAtts: boolean) => {
+        // 0.276.9: optimistic UI for a BULK delete — collapse the affected rows
+        // immediately so the list closes up without waiting for the async trash
+        // + tree rebuild. Purely visual; the final render() rebuilds from the
+        // tree, so a partial failure (or the undo) restores the correct rows.
+        if (allNotes.length >= OPTIMISTIC_ROWS && this.listEl) {
+          for (const n of allNotes) {
+            this.listEl.querySelector<HTMLElement>(`.stashpad-note[data-id="${n.id}"]`)?.addClass("is-vanishing");
+          }
+        }
         const snap = await this.snapshotNotes(allNotes, alsoAtts);
         let attsRemoved = 0;
         if (alsoAtts) {
@@ -15666,7 +15722,35 @@ export class StashpadView extends ItemView {
    *  Second part becomes a new sibling with no children. */
   /** 0.170.0: also the entry for the in-app EDIT surface — `surface: "edit"` opens
    *  the same modal on the Edit tab (edits + Save), which can toggle to Split. */
-  cmdEdit(node?: TreeNode): Promise<void> { return this.cmdSplit(node, "edit"); }
+  cmdEdit(node?: TreeNode, onClosed?: () => void): Promise<void> { return this.cmdSplit(node, "edit", onClosed); }
+
+  /** 0.276.8: edit a MULTI-selection one note at a time — a slot queue. Opens the
+   *  edit modal for note 1; when it closes (saved OR dismissed), the next opens,
+   *  until the queue drains. A persistent notice shows progress + a "Stop rest"
+   *  control so you can bail without stepping through the remainder. */
+  cmdEditQueue(): void {
+    const targets = this.getActionTargets().filter((t) => t.file);
+    if (targets.length === 0) { const f = this.tree.get(this.focusId); if (f?.file) targets.push(f); }
+    if (targets.length === 0) { new Notice("Pick a note (or notes) to edit."); return; }
+    if (targets.length === 1) { void this.cmdEdit(targets[0]); return; }
+    const total = targets.length;
+    let i = 0, stopped = false;
+    let notice: Notice; let labelEl: HTMLSpanElement | null = null;
+    const frag = createFragment((f) => {
+      labelEl = f.createSpan();
+      const stop = f.createSpan({ text: "   ·   Stop rest", cls: "stashpad-editqueue-stop" });
+      stop.onclick = () => { stopped = true; notice?.hide(); };
+    });
+    notice = new Notice(frag, 0);
+    const openNext = (): void => {
+      if (stopped || i >= total) { notice.hide(); return; }
+      const node = targets[i];
+      labelEl?.setText(`Editing ${i + 1} of ${total}: “${this.titleForNode(node)}”`);
+      i++;
+      void this.cmdEdit(node, () => window.setTimeout(openNext, 80));
+    };
+    openNext();
+  }
 
   /** 0.179.0: open the COMPOSER's current text in the full in-app editor. Save
    *  creates the note(s) under the current focus (a split creates several) and
@@ -15717,9 +15801,9 @@ export class StashpadView extends ItemView {
     return this.cmdEdit(focused);
   }
 
-  async cmdSplit(node?: TreeNode, surface: "edit" | "split" = "split"): Promise<void> {
+  async cmdSplit(node?: TreeNode, surface: "edit" | "split" = "split", onClosed?: () => void): Promise<void> {
     const target = node ?? this.resolveActionTarget();
-    if (!target?.file) { new Notice(surface === "edit" ? "Pick a note to edit." : "Pick a note to split."); return; }
+    if (!target?.file) { new Notice(surface === "edit" ? "Pick a note to edit." : "Pick a note to split."); onClosed?.(); return; }
     const file = target.file;
     const md = await this.app.vault.read(file);
     const body = this.stripFrontmatter(md).replace(/\s+$/, "");
@@ -16013,7 +16097,7 @@ export class StashpadView extends ItemView {
     new NoteWorkbenchModal(this.app, body, {
       ...splitCore,
       popOut: (state) => { void this.plugin.openWorkbench(body, splitCore, state); },
-    }, { surface }).open();
+    }, { surface }, onClosed).open();
   }
 
   cmdOpenInNewStashpadTab(node?: TreeNode): void {

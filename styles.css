@@ -8491,6 +8491,34 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   border-radius: 4px; cursor: pointer;
 }
 .stashpad-index-row:hover { background: var(--background-modifier-hover); }
+/* Multi-select + bulk actions (0.276.6) */
+.stashpad-index-row.is-selected { background: var(--background-modifier-hover); box-shadow: inset 2px 0 0 var(--interactive-accent); }
+.stashpad-index-check { flex: 0 0 auto; margin: 0; cursor: pointer; }
+.stashpad-index-bulkbar { display: none; }
+.stashpad-index-bulkbar.is-active {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 6px 8px; margin: 4px 0; border-radius: 8px;
+  background: var(--background-secondary); border: 1px solid var(--background-modifier-border);
+}
+.stashpad-index-bulkcount { font-size: var(--font-ui-smaller); color: var(--text-muted); font-weight: 600; margin-right: 2px; }
+.stashpad-index-bulkbtn {
+  display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px;
+  border-radius: 6px; font-size: var(--font-ui-smaller); cursor: pointer;
+  background: var(--background-modifier-hover); border: none; color: var(--text-normal);
+}
+.stashpad-index-bulkbtn:hover { background: var(--background-modifier-active-hover); }
+.stashpad-index-bulkbtn.mod-warning { color: var(--text-error); }
+.stashpad-index-bulkic { display: inline-flex; }
+.stashpad-index-bulkic .svg-icon { width: 13px; height: 13px; }
+.stashpad-editqueue-stop { cursor: pointer; text-decoration: underline; opacity: 0.85; }
+.stashpad-editqueue-stop:hover { opacity: 1; }
+/* Optimistic bulk delete/merge — the row collapses out immediately (0.276.9). */
+.stashpad-note.is-vanishing {
+  opacity: 0; max-height: 0 !important; min-height: 0 !important;
+  padding-top: 0 !important; padding-bottom: 0 !important; margin: 0 !important;
+  border-width: 0 !important; overflow: hidden !important; pointer-events: none;
+  transition: opacity 0.13s ease, max-height 0.16s ease, padding 0.16s ease;
+}
 .stashpad-index-main { min-width: 0; flex: 1 1 auto; }
 .stashpad-index-title {
   color: var(--text-normal); font-size: var(--font-ui-small);

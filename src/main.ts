@@ -3078,6 +3078,11 @@ export default class StashpadPlugin extends Plugin {
       callback: () => call("cmdMerge"),
     });
     this.addCommand({
+      id: "stashpad-merge-with",
+      name: "Merge with… (search for a note to merge the selection into)",
+      callback: () => call("cmdMergeWith"),
+    });
+    this.addCommand({
       id: "stashpad-copy",
       name: "Copy selection",
       callback: () => call("cmdCopy"),
@@ -3283,8 +3288,8 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({
       // 0.170.0: Stashpad's own editor (Edit ⇄ Split surface), not a full Obsidian tab.
       id: "stashpad-edit-inapp",
-      name: "Edit note in Stashpad…",
-      callback: () => call("cmdEdit"),
+      name: "Edit note in Stashpad… (multi-select edits one at a time)",
+      callback: () => call("cmdEditQueue"),
     });
     this.addCommand({
       id: "stashpad-edit-parent-inapp",

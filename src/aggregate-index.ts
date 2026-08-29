@@ -1,7 +1,8 @@
-import { App, TFile, moment, setIcon } from "obsidian";
+import { App, Notice, TFile, moment, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
-import { ROOT_ID, siftMatch, parseAuthorRef } from "./types";
+import { ROOT_ID, siftMatch, parseAuthorRef, writeCompletedFm } from "./types";
 import { stripInlineMarkdown } from "./slug-service";
+import { ConfirmModal } from "./modals";
 
 /** 0.273.0: the "All notes" master index — one flat, vault-wide table of every
  *  Stashpad note, with facet filters that fold most of the long-logged
@@ -76,12 +77,16 @@ export interface IndexState {
   sort: "modified" | "created" | "title" | "folder";
   /** Obscured rows the user tapped open in THIS view. Viewing state only. */
   revealed: Set<string>;
+  /** 0.276.6: multi-select mode + the selected note file paths, for bulk acts. */
+  selectMode: boolean;
+  selected: Set<string>;
 }
 export function defaultIndexState(): IndexState {
   return {
     query: "", folder: "all", author: "", tag: "", color: "",
     attachmentsOnly: false, importedOnly: false, internalOnly: false, externalOnly: false,
     orphansOnly: false, brokenOnly: false, staleOnly: false, includeHome: false, sort: "modified", revealed: new Set(),
+    selectMode: false, selected: new Set(),
   };
 }
 
@@ -249,8 +254,57 @@ export async function renderMasterIndex(
   chip("Stale", state.staleOnly, () => { state.staleOnly = !state.staleOnly; }, "Only notes untouched for more than ~6 months (sort by Recent first to see the oldest at the bottom).");
   chip("Home notes", state.includeHome, () => { state.includeHome = !state.includeHome; }, "Include each folder's home note");
 
+  // 0.276.6: multi-select + bulk actions.
+  const selToggle = bar.createEl("button", { cls: "stashpad-index-chip" + (state.selectMode ? " is-active" : ""), text: state.selectMode ? "Done" : "Select" });
+  selToggle.title = "Select multiple notes to act on them";
+  selToggle.onclick = () => { state.selectMode = !state.selectMode; if (!state.selectMode) state.selected.clear(); rerender(); };
+
+  const bulkBar = host.createDiv({ cls: "stashpad-index-bulkbar" });
   const countEl = host.createDiv({ cls: "stashpad-index-count" });
   const listEl = host.createDiv({ cls: "stashpad-index-list" });
+
+  const selectedRows = (): IndexRow[] => rows.filter((r) => state.selected.has(r.file.path));
+  const applyToSelected = async (fn: (r: IndexRow) => Promise<void>, label: string): Promise<void> => {
+    const targets = selectedRows();
+    let ok = 0, failed = 0;
+    for (const r of targets) { try { await fn(r); ok++; } catch (e) { failed++; console.warn(`[Stashpad] bulk ${label} failed`, r.file.path, e); } }
+    new Notice(`${label}: ${ok} done${failed ? `, ${failed} failed` : ""}.`);
+    rerender();
+  };
+  const repaintBulk = (): void => {
+    bulkBar.empty();
+    if (!state.selectMode) { bulkBar.toggleClass("is-active", false); return; }
+    bulkBar.toggleClass("is-active", true);
+    const n = state.selected.size;
+    bulkBar.createSpan({ cls: "stashpad-index-bulkcount", text: n === 0 ? "Select notes…" : `${n} selected` });
+    const shown = rows.filter(matches);
+    const allSel = shown.length > 0 && shown.every((r) => state.selected.has(r.file.path));
+    const selAll = bulkBar.createEl("button", { cls: "stashpad-index-bulkbtn", text: allSel ? "Clear" : "Select all" });
+    selAll.onclick = () => { if (allSel) state.selected.clear(); else for (const r of shown) state.selected.add(r.file.path); paintRows(); };
+    if (n === 0) return;
+    const act = (text: string, icon: string, run: () => void, warn = false): void => {
+      const b = bulkBar.createEl("button", { cls: "stashpad-index-bulkbtn" + (warn ? " mod-warning" : "") });
+      setIcon(b.createSpan({ cls: "stashpad-index-bulkic" }), icon);
+      b.createSpan({ text });
+      b.onclick = run;
+    };
+    act("Open", "external-link", () => { for (const r of selectedRows()) opts.onOpen(r.folder, r.id); });
+    act("Complete", "check", () => void applyToSelected((r) => app.fileManager.processFrontMatter(r.file, (m) => writeCompletedFm(m as Record<string, unknown>, true)), "Complete"));
+    act("Reopen", "rotate-ccw", () => void applyToSelected((r) => app.fileManager.processFrontMatter(r.file, (m) => writeCompletedFm(m as Record<string, unknown>, false)), "Reopen"));
+    act("Copy links", "copy", () => {
+      const md = selectedRows().map((r) => `[[${r.file.path.replace(/\.md$/, "")}|${r.title}]]`).join("\n");
+      void navigator.clipboard.writeText(md); new Notice(`Copied ${state.selected.size} link${state.selected.size === 1 ? "" : "s"}.`);
+    });
+    act("Delete", "trash-2", () => {
+      const targets = selectedRows();
+      new ConfirmModal(app, `Delete ${targets.length} note${targets.length === 1 ? "" : "s"}?`,
+        `This moves the selected note file${targets.length === 1 ? "" : "s"} to trash. Child notes are NOT moved (they'd be orphaned) — delete a whole subtree from its folder view instead. Attachments are left in place.`,
+        "Delete to trash",
+        (confirmed: boolean) => { if (!confirmed) return; void applyToSelected(async (r) => { await app.fileManager.trashFile(r.file); state.selected.delete(r.file.path); }, "Delete"); },
+        "Cancel",
+      ).open();
+    }, true);
+  };
 
   const matches = (r: IndexRow): boolean => {
     if (!state.includeHome && r.isHome) return false;
@@ -288,8 +342,13 @@ export async function renderMasterIndex(
     countEl.setText(`${shown.length} of ${rows.length} note${rows.length === 1 ? "" : "s"}`);
     listEl.empty();
     for (const r of shown) {
-      const row = listEl.createDiv({ cls: "stashpad-index-row" });
+      const row = listEl.createDiv({ cls: "stashpad-index-row" + (state.selectMode && state.selected.has(r.file.path) ? " is-selected" : "") });
       const blurred = r.obscured && !state.revealed.has(r.file.path);
+      if (state.selectMode) {
+        const cb = row.createEl("input", { type: "checkbox", cls: "stashpad-index-check" });
+        cb.checked = state.selected.has(r.file.path);
+        cb.onclick = (e) => { e.stopPropagation(); if (cb.checked) state.selected.add(r.file.path); else state.selected.delete(r.file.path); paintRows(); };
+      }
       const main = row.createDiv({ cls: "stashpad-index-main" });
       const titleEl = main.createDiv({ cls: "stashpad-index-title" + (blurred ? " is-blurred" : ""), text: r.title });
       if (r.isHome) titleEl.createSpan({ cls: "stashpad-index-home-badge", text: "home" });
@@ -311,12 +370,18 @@ export async function renderMasterIndex(
       if (r.obscured) ic("eye-off", blurred ? "Obscured — tap the row to reveal its title here" : "Obscured (revealed in this view)");
 
       row.onclick = () => {
+        // In select mode a row click toggles selection instead of opening.
+        if (state.selectMode) {
+          if (state.selected.has(r.file.path)) state.selected.delete(r.file.path); else state.selected.add(r.file.path);
+          paintRows(); return;
+        }
         // Same contract as a list row: the first tap on an obscured row only
         // reveals; opening takes a second, deliberate tap.
         if (blurred) { state.revealed.add(r.file.path); paintRows(); return; }
         opts.onOpen(r.folder, r.id);
       };
     }
+    repaintBulk();
   };
   paintRows();
 }
