@@ -37,6 +37,11 @@ export interface IndexRow {
   hasAttachments: boolean;
   internalLinks: number;
   hasExternalLinks: boolean;
+  /** 0.275.2: the note contains at least one internal [[wikilink]] whose target
+   *  resolves to no existing file (Obsidian's unresolvedLinks). Sibling of
+   *  `orphan` — an orphan has a missing PARENT; a broken link POINTS at
+   *  something missing. */
+  hasBrokenLinks: boolean;
   isHome: boolean;
   obscured: boolean;
   /** 0.274.0 (due calendar): the note's `due` frontmatter as a local calendar
@@ -65,6 +70,8 @@ export interface IndexState {
   internalOnly: boolean;
   externalOnly: boolean;
   orphansOnly: boolean;
+  brokenOnly: boolean;
+  staleOnly: boolean;
   includeHome: boolean;
   sort: "modified" | "created" | "title" | "folder";
   /** Obscured rows the user tapped open in THIS view. Viewing state only. */
@@ -74,7 +81,7 @@ export function defaultIndexState(): IndexState {
   return {
     query: "", folder: "all", author: "", tag: "", color: "",
     attachmentsOnly: false, importedOnly: false, internalOnly: false, externalOnly: false,
-    orphansOnly: false, includeHome: false, sort: "modified", revealed: new Set(),
+    orphansOnly: false, brokenOnly: false, staleOnly: false, includeHome: false, sort: "modified", revealed: new Set(),
   };
 }
 
@@ -83,6 +90,8 @@ export interface IndexOpts {
 }
 
 const EXTERNAL_URL_RE = /https?:\/\/[^\s)\]>"']+/;
+/** 0.275.2: "stale" = last modified more than ~6 months ago. */
+const STALE_MS = 183 * 86400000;
 
 /** Collect one row per Stashpad note (direct children of each Stashpad folder,
  *  frontmatter `id` required — the same shape the tree indexes). Bodies are
@@ -165,6 +174,7 @@ export async function collectIndexRows(app: App, plugin: StashpadPlugin): Promis
       hasAttachments,
       internalLinks,
       hasExternalLinks: EXTERNAL_URL_RE.test(body),
+      hasBrokenLinks: Object.keys((app.metadataCache as unknown as { unresolvedLinks?: Record<string, Record<string, number>> }).unresolvedLinks?.[f.path] ?? {}).length > 0,
       isHome: id === ROOT_ID,
       obscured: plugin.isFileObscured(f),
       dueDay: dayStr(fm.due),
@@ -235,6 +245,8 @@ export async function renderMasterIndex(
   chip("[[links]]", state.internalOnly, () => { state.internalOnly = !state.internalOnly; }, "Only notes linking to other notes");
   chip("http", state.externalOnly, () => { state.externalOnly = !state.externalOnly; }, "Only notes containing an external link");
   chip("Orphans", state.orphansOnly, () => { state.orphansOnly = !state.orphansOnly; }, "Only notes whose parent is missing — they exist on disk but no list shows them. Repair with the fix-orphans command.");
+  chip("Broken links", state.brokenOnly, () => { state.brokenOnly = !state.brokenOnly; }, "Only notes with a [[wikilink]] pointing at a note/file that doesn't exist.");
+  chip("Stale", state.staleOnly, () => { state.staleOnly = !state.staleOnly; }, "Only notes untouched for more than ~6 months (sort by Recent first to see the oldest at the bottom).");
   chip("Home notes", state.includeHome, () => { state.includeHome = !state.includeHome; }, "Include each folder's home note");
 
   const countEl = host.createDiv({ cls: "stashpad-index-count" });
@@ -251,6 +263,8 @@ export async function renderMasterIndex(
     if (state.internalOnly && r.internalLinks === 0) return false;
     if (state.externalOnly && !r.hasExternalLinks) return false;
     if (state.orphansOnly && !r.orphan) return false;
+    if (state.brokenOnly && !r.hasBrokenLinks) return false;
+    if (state.staleOnly && !(r.modified > 0 && Date.now() - r.modified > STALE_MS)) return false;
     // An OBSCURED note must not leak its title/tags through search: an
     // unrevealed one matches only on its folder (chrome, not content).
     const hay = r.obscured && !state.revealed.has(r.file.path)
@@ -293,6 +307,7 @@ export async function renderMasterIndex(
       if (r.hasExternalLinks) ic("globe", "Contains an external link");
       if (r.imported) ic("download", "Imported");
       if (r.orphan) ic("unlink", "Orphan: its parent id resolves nowhere in this folder, so no list shows it. The fix-orphans command re-homes it.");
+      if (r.hasBrokenLinks) ic("link-2-off", "Has a broken link — a [[wikilink]] pointing at something that doesn't exist.");
       if (r.obscured) ic("eye-off", blurred ? "Obscured — tap the row to reveal its title here" : "Obscured (revealed in this view)");
 
       row.onclick = () => {

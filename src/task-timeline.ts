@@ -16,6 +16,7 @@ import { writeCompletedFm } from "./types";
 
 export interface TimelineState {
   folder: string;                       // "all" | folder path
+  tag: string;                          // "" = any; a tag name without the "#"
   status: "all" | "open" | "done";
   range: "all" | "90" | "30" | "custom"; // window, in days back from now
   /** 0.275.0: when range === "custom", the window size in days. */
@@ -25,7 +26,7 @@ export interface TimelineState {
   sort: "recent" | "longest";
 }
 export function defaultTimelineState(): TimelineState {
-  return { folder: "all", status: "all", range: "90", customDays: 180, sort: "recent" };
+  return { folder: "all", tag: "", status: "all", range: "90", customDays: 180, sort: "recent" };
 }
 
 export interface TimelineOpts { onOpen: (folder: string, id: string) => void; }
@@ -67,6 +68,7 @@ export function renderTaskTimeline(
   }
 
   const folders = [...new Set(spans.map((s) => s.t.folder))].sort((a, b) => a.localeCompare(b));
+  const tags = [...new Set(spans.flatMap((s) => s.t.tags))].sort((a, b) => a.localeCompare(b));
 
   // ---- controls ----
   const bar = host.createDiv({ cls: "stashpad-timeline-bar" });
@@ -76,6 +78,14 @@ export function renderTaskTimeline(
     s.onchange = () => { set(s.value); rerender(); };
   };
   select([{ v: "all", label: "All folders" }, ...folders.map((f) => ({ v: f, label: f.split("/").pop() || f }))], state.folder, (v) => { state.folder = v; });
+  // 0.275.2: tag filter — check on "events" / "sagas" / product outages, etc.
+  // Only shown when tasks actually carry tags. A tag that no longer exists in
+  // the data (state.tag stale) still appears so the filter isn't silently reset.
+  if (tags.length || state.tag) {
+    const tagOpts = [{ v: "", label: "All tags" }, ...tags.map((t) => ({ v: t, label: `#${t}` }))];
+    if (state.tag && !tags.includes(state.tag)) tagOpts.push({ v: state.tag, label: `#${state.tag}` });
+    select(tagOpts, state.tag, (v) => { state.tag = v; });
+  }
   select([{ v: "all", label: "Open + done" }, { v: "open", label: "Open" }, { v: "done", label: "Done" }], state.status, (v) => { state.status = v as TimelineState["status"]; });
   select([{ v: "30", label: "Last 30 days" }, { v: "90", label: "Last 90 days" }, { v: "custom", label: "Custom…" }, { v: "all", label: "All time" }], state.range, (v) => { state.range = v as TimelineState["range"]; });
   // 0.275.0: custom window in days (shown only when "Custom…" is picked).
@@ -93,6 +103,7 @@ export function renderTaskTimeline(
   const windowStart = state.range === "all" ? 0 : now - windowDays * 86400000;
   const shown = spans.filter((s) => {
     if (state.folder !== "all" && s.t.folder !== state.folder) return false;
+    if (state.tag && !s.t.tags.includes(state.tag)) return false;
     if (state.status === "open" && s.done) return false;
     if (state.status === "done" && !s.done) return false;
     return s.end >= windowStart;   // any part of the span inside the window

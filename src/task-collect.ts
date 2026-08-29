@@ -11,6 +11,9 @@ export interface TaskItem {
   title: string;
   task: boolean;
   completed: boolean;
+  /** 0.275.2: frontmatter `tags:` + inline #tags (minus the "task" marker), for
+   *  filtering the timeline to "events" / "sagas" / outages / etc. */
+  tags: string[];
   due: number | null;
   dueRaw: string | null;
   color: string | null;
@@ -52,7 +55,8 @@ export function collectTasks(app: App, plugin: StashpadPlugin): TaskItem[] {
   for (const f of app.vault.getMarkdownFiles()) {
     const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
     if (!folderSet.has(dir)) continue;
-    const fm = (app.metadataCache.getFileCache(f)?.frontmatter ?? {}) as any;
+    const cache = app.metadataCache.getFileCache(f);
+    const fm = (cache?.frontmatter ?? {}) as any;
     const id = typeof fm.id === "string" ? fm.id : null;
     if (!id || id === ROOT_ID) continue;
     const completed = fm.completed === true;
@@ -70,11 +74,20 @@ export function collectTasks(app: App, plugin: StashpadPlugin): TaskItem[] {
       if (!Number.isNaN(t)) due = t;
     }
     if (!task && !completed && due == null && !dueRaw) continue;
+    // Tags from frontmatter `tags:` + inline #tags — lets the timeline filter to
+    // "events" / "sagas" / product-outage tags, etc. Excludes the "task" marker
+    // tag itself (it's on every task, so useless as a filter).
+    const tagSet = new Set<string>();
+    if (Array.isArray(fm.tags)) for (const t of fm.tags) if (typeof t === "string") tagSet.add(t.replace(/^#/, ""));
+    else if (typeof fm.tags === "string") for (const t of fm.tags.split(/[,\s]+/)) if (t) tagSet.add(t.replace(/^#/, ""));
+    for (const t of cache?.tags ?? []) tagSet.add(t.tag.replace(/^#/, ""));
+    tagSet.delete("task");
     out.push({
       file: f,
       folder: dir,
       id,
       title: titleFromTaskFile(f, id),
+      tags: [...tagSet],
       task,
       completed,
       due,
