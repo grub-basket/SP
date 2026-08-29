@@ -15,15 +15,17 @@ import { collectIndexRows, type IndexRow } from "./aggregate-index";
 type Reason = "created" | "due" | "link";
 
 export interface DueCalendarState {
-  /** Epoch ms of any instant in the displayed month. */
+  /** Epoch ms of any instant in the displayed period (month/week/day). */
   monthAnchor: number;
   folder: string;                 // "all" | folder path
   reasons: Record<Reason, boolean>;
   /** Day the user expanded (full list below the grid), "YYYY-MM-DD" or null. */
   openDay: string | null;
+  /** 0.275.0: month grid, week strip, or single-day agenda (like other calendar apps). */
+  view: "month" | "week" | "day";
 }
 export function defaultDueCalendarState(): DueCalendarState {
-  return { monthAnchor: Date.now(), folder: "all", reasons: { created: true, due: true, link: true }, openDay: null };
+  return { monthAnchor: Date.now(), folder: "all", reasons: { created: true, due: true, link: true }, openDay: null, view: "month" };
 }
 
 export interface DueCalendarOpts { onOpen: (folder: string, id: string) => void; }
@@ -88,15 +90,29 @@ export async function renderDueCalendar(
   const bar = host.createDiv({ cls: "stashpad-cal-bar" });
   const nav = bar.createDiv({ cls: "stashpad-cal-nav" });
   const anchor = M(state.monthAnchor);
-  const prev = nav.createEl("button", { cls: "stashpad-cal-navbtn", attr: { "aria-label": "Previous month" } });
+  const unit = state.view; // "month" | "week" | "day" — the step + the period shown
+  const periodLabel = (): string => {
+    if (state.view === "month") return anchor.format("MMMM YYYY");
+    if (state.view === "day") return anchor.format("ddd, D MMM YYYY");
+    const ws = weekStart(anchor); const we = ws.clone().add(6, "day");
+    return `${ws.format("D MMM")} – ${we.format("D MMM")}`;
+  };
+  const prev = nav.createEl("button", { cls: "stashpad-cal-navbtn", attr: { "aria-label": `Previous ${unit}` } });
   setIcon(prev, "chevron-left");
-  prev.onclick = () => { state.monthAnchor = M(state.monthAnchor).subtract(1, "month").valueOf(); state.openDay = null; rerender(); };
-  nav.createSpan({ cls: "stashpad-cal-month", text: anchor.format("MMMM YYYY") });
-  const next = nav.createEl("button", { cls: "stashpad-cal-navbtn", attr: { "aria-label": "Next month" } });
+  prev.onclick = () => { state.monthAnchor = M(state.monthAnchor).subtract(1, unit).valueOf(); state.openDay = null; rerender(); };
+  nav.createSpan({ cls: "stashpad-cal-month", text: periodLabel() });
+  const next = nav.createEl("button", { cls: "stashpad-cal-navbtn", attr: { "aria-label": `Next ${unit}` } });
   setIcon(next, "chevron-right");
-  next.onclick = () => { state.monthAnchor = M(state.monthAnchor).add(1, "month").valueOf(); state.openDay = null; rerender(); };
+  next.onclick = () => { state.monthAnchor = M(state.monthAnchor).add(1, unit).valueOf(); state.openDay = null; rerender(); };
   const today = nav.createEl("button", { cls: "stashpad-cal-today", text: "Today" });
   today.onclick = () => { state.monthAnchor = Date.now(); state.openDay = null; rerender(); };
+
+  // 0.275.0: Month / Week / Day switcher (like other calendar apps).
+  const seg = nav.createDiv({ cls: "stashpad-cal-seg" });
+  ([["month", "Month"], ["week", "Week"], ["day", "Day"]] as Array<[DueCalendarState["view"], string]>).forEach(([v, label]) => {
+    const b = seg.createEl("button", { cls: "stashpad-cal-segbtn" + (state.view === v ? " is-active" : ""), text: label });
+    b.onclick = () => { if (state.view !== v) { state.view = v; state.openDay = null; rerender(); } };
+  });
 
   const folderSel = bar.createEl("select", { cls: "stashpad-index-select", attr: { "aria-label": "Folder" } });
   for (const o of [{ v: "all", label: "All folders" }, ...folders.map((f) => ({ v: f, label: f.split("/").pop() || f }))]) {
@@ -114,13 +130,35 @@ export async function renderDueCalendar(
     c.onclick = () => { state.reasons[k] = !state.reasons[k]; state.openDay = null; rerender(); };
   });
 
+  const todayStr = M(Date.now()).format("YYYY-MM-DD");
+
+  // ---- week / day agenda (0.275.0) ----
+  if (state.view === "week" || state.view === "day") {
+    const container = host.createDiv({ cls: "stashpad-cal-agenda" + (state.view === "day" ? " is-day" : "") });
+    const days: MomentLike[] = state.view === "day"
+      ? [anchor.clone()]
+      : Array.from({ length: 7 }, (_, i) => weekStart(anchor).add(i, "day"));
+    for (const d of days) {
+      const ds = d.format("YYYY-MM-DD");
+      const col = container.createDiv({ cls: "stashpad-cal-aglane" + (ds === todayStr ? " is-today" : "") });
+      const head = col.createDiv({ cls: "stashpad-cal-aghead" });
+      head.createSpan({ cls: "stashpad-cal-agdow", text: d.format(state.view === "day" ? "dddd" : "ddd") });
+      head.createSpan({ cls: "stashpad-cal-agdate", text: d.format(state.view === "day" ? "D MMMM" : "D MMM") });
+      const hits = (byDay.get(ds) ?? []).slice().sort((a, b) => reasonRank(a) - reasonRank(b) || a.row.title.localeCompare(b.row.title));
+      if (hits.length) head.createSpan({ cls: "stashpad-cal-cellcount", text: String(hits.length) });
+      const body = col.createDiv({ cls: "stashpad-cal-agbody" });
+      if (!hits.length) body.createDiv({ cls: "stashpad-cal-agempty", text: "Nothing this day" });
+      for (const h of hits) chipFor(body, h, opts, true);
+    }
+    return;
+  }
+
   // ---- month grid ----
   const firstDow = M.localeData().firstDayOfWeek();
   const monthStart = anchor.clone().startOf("month");
   // Back up to the start of the grid week.
   let cursor = monthStart.clone();
   while (cursor.day() !== firstDow) cursor = cursor.subtract(1, "day");
-  const todayStr = M(Date.now()).format("YYYY-MM-DD");
   const thisMonth = anchor.month();
 
   const grid = host.createDiv({ cls: "stashpad-cal-grid" });
@@ -173,6 +211,14 @@ export async function renderDueCalendar(
 }
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** Start of the calendar week containing `m`, honoring the locale's first day. */
+function weekStart(m: MomentLike): MomentLike {
+  const fdow = M.localeData().firstDayOfWeek();
+  let c = m.clone();
+  while (c.day() !== fdow) c = c.subtract(1, "day");
+  return c;
+}
 
 /** created before due before link — the order chips stack in a cell. */
 function reasonRank(h: DayHit): number {

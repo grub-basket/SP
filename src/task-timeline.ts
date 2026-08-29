@@ -1,6 +1,7 @@
-import { App, moment, setIcon } from "obsidian";
+import { App, moment, setIcon, TFile } from "obsidian";
 import type StashpadPlugin from "./main";
 import { collectTasks, type TaskItem } from "./task-collect";
+import { writeCompletedFm } from "./types";
 
 /** 0.273.1: the task TIMELINE — each task as a horizontal span from its
  *  creation to its completion (or to today, while open), Basecamp-lineup
@@ -16,10 +17,15 @@ import { collectTasks, type TaskItem } from "./task-collect";
 export interface TimelineState {
   folder: string;                       // "all" | folder path
   status: "all" | "open" | "done";
-  range: "all" | "90" | "30";           // window, in days back from now
+  range: "all" | "90" | "30" | "custom"; // window, in days back from now
+  /** 0.275.0: when range === "custom", the window size in days. */
+  customDays: number;
+  /** 0.275.0: row order — newest start first, or longest span first (find the
+   *  tasks/projects that have stretched on the longest). */
+  sort: "recent" | "longest";
 }
 export function defaultTimelineState(): TimelineState {
-  return { folder: "all", status: "all", range: "90" };
+  return { folder: "all", status: "all", range: "90", customDays: 180, sort: "recent" };
 }
 
 export interface TimelineOpts { onOpen: (folder: string, id: string) => void; }
@@ -71,15 +77,26 @@ export function renderTaskTimeline(
   };
   select([{ v: "all", label: "All folders" }, ...folders.map((f) => ({ v: f, label: f.split("/").pop() || f }))], state.folder, (v) => { state.folder = v; });
   select([{ v: "all", label: "Open + done" }, { v: "open", label: "Open" }, { v: "done", label: "Done" }], state.status, (v) => { state.status = v as TimelineState["status"]; });
-  select([{ v: "30", label: "Last 30 days" }, { v: "90", label: "Last 90 days" }, { v: "all", label: "All time" }], state.range, (v) => { state.range = v as TimelineState["range"]; });
+  select([{ v: "30", label: "Last 30 days" }, { v: "90", label: "Last 90 days" }, { v: "custom", label: "Custom…" }, { v: "all", label: "All time" }], state.range, (v) => { state.range = v as TimelineState["range"]; });
+  // 0.275.0: custom window in days (shown only when "Custom…" is picked).
+  if (state.range === "custom") {
+    const wrap = bar.createSpan({ cls: "stashpad-timeline-custom" });
+    const inp = wrap.createEl("input", { type: "number", cls: "stashpad-timeline-daysinput", attr: { min: "1", max: "36500", "aria-label": "Days back" } });
+    inp.value = String(state.customDays);
+    inp.onchange = () => { const n = Math.max(1, Math.floor(Number(inp.value) || 0)); state.customDays = n; rerender(); };
+    wrap.createSpan({ cls: "stashpad-timeline-daysunit", text: "days" });
+  }
+  // 0.275.0: sort — newest first, or longest span first (longest-stretching work).
+  select([{ v: "recent", label: "Newest first" }, { v: "longest", label: "Longest first" }], state.sort, (v) => { state.sort = v as TimelineState["sort"]; });
 
-  const windowStart = state.range === "all" ? 0 : now - Number(state.range) * 86400000;
+  const windowDays = state.range === "custom" ? state.customDays : Number(state.range);
+  const windowStart = state.range === "all" ? 0 : now - windowDays * 86400000;
   const shown = spans.filter((s) => {
     if (state.folder !== "all" && s.t.folder !== state.folder) return false;
     if (state.status === "open" && s.done) return false;
     if (state.status === "done" && !s.done) return false;
     return s.end >= windowStart;   // any part of the span inside the window
-  }).sort((a, b) => b.start - a.start);
+  }).sort((a, b) => state.sort === "longest" ? (b.end - b.start) - (a.end - a.start) : b.start - a.start);
 
   bar.createSpan({ cls: "stashpad-index-count", text: `${shown.length} task${shown.length === 1 ? "" : "s"}` });
 
@@ -111,13 +128,55 @@ export function renderTaskTimeline(
     tick = tick.add(1, unit);
   }
 
+  // 0.275.0: complete/uncomplete a task straight from the timeline. Mirrors the
+  // task-triage toggle (processFrontMatter + writeCompletedFm); an explicit
+  // `atMs` sets a chosen completion date (and marks it complete) for anyone who
+  // wants the bar to end on the real day, not "now".
+  const setComplete = async (t: TaskItem, on: boolean, atMs?: number): Promise<void> => {
+    try {
+      await app.fileManager.processFrontMatter(t.file, (m: Record<string, unknown>) => {
+        writeCompletedFm(m, on);
+        if (on && atMs != null) m.completedAt = new Date(atMs).toISOString();
+      });
+    } catch (e) { console.warn("[Stashpad] timeline completion write failed", e); }
+    // The aggregate view's modify listener refreshes when visible; rerender now
+    // for immediacy (the metadata cache catches up within a tick).
+    window.setTimeout(rerender, 60);
+  };
+  const openDatePicker = (anchor: HTMLElement, t: TaskItem): void => {
+    const doc = anchor.ownerDocument ?? document;
+    doc.querySelectorAll(".stashpad-timeline-datepop").forEach((p) => p.remove());
+    const pop = doc.body.createDiv({ cls: "stashpad-timeline-datepop" });
+    const r = anchor.getBoundingClientRect();
+    pop.style.left = `${Math.min(r.left, (doc.defaultView?.innerWidth ?? 9999) - 240)}px`;
+    pop.style.top = `${r.bottom + 4}px`;
+    pop.createDiv({ cls: "stashpad-timeline-datepop-label", text: "Completed on" });
+    const inp = pop.createEl("input", { type: "date" });
+    inp.value = momentFn(t.completedAt ?? Date.now()).format("YYYY-MM-DD");
+    const rowb = pop.createDiv({ cls: "stashpad-timeline-datepop-row" });
+    const ok = rowb.createEl("button", { cls: "mod-cta", text: "Mark complete" });
+    ok.onclick = () => { const ms = Date.parse(inp.value + "T12:00:00"); pop.remove(); if (Number.isFinite(ms)) void setComplete(t, true, ms); };
+    rowb.createEl("button", { text: "Cancel" }).onclick = () => pop.remove();
+    const off = (e: MouseEvent): void => { if (!pop.contains(e.target as Node)) { pop.remove(); doc.removeEventListener("mousedown", off); } };
+    window.setTimeout(() => doc.addEventListener("mousedown", off), 0);
+  };
+
   // ---- rows ----
   const list = host.createDiv({ cls: "stashpad-timeline-list" });
   for (const s of shown) {
     const row = list.createDiv({ cls: "stashpad-timeline-row" });
     const title = row.createDiv({ cls: "stashpad-timeline-title" });
-    title.createSpan({ text: s.t.title });
-    title.createDiv({ cls: "stashpad-timeline-sub", text: s.t.folder.split("/").pop() || s.t.folder });
+    const check = title.createEl("input", { type: "checkbox", cls: "stashpad-timeline-checkbox", attr: { "aria-label": s.done ? "Mark not done" : "Mark done" } });
+    check.checked = s.done;
+    check.onclick = (e) => { e.stopPropagation(); void setComplete(s.t, !s.done); };
+    // Calendar button sits NEXT TO the checkbox (not after the text) so it never
+    // eats into the note title, which fills the rest of the column.
+    const cal = title.createEl("button", { cls: "stashpad-timeline-calbtn", attr: { "aria-label": "Set completion date (marks complete)" } });
+    setIcon(cal, "calendar");
+    cal.onclick = (e) => { e.stopPropagation(); openDatePicker(cal, s.t); };
+    const ttext = title.createDiv({ cls: "stashpad-timeline-titletext" });
+    ttext.createSpan({ text: s.t.title });
+    ttext.createDiv({ cls: "stashpad-timeline-sub", text: s.t.folder.split("/").pop() || s.t.folder });
 
     const track = row.createDiv({ cls: "stashpad-timeline-track" });
     const barEl = track.createDiv({ cls: "stashpad-timeline-span" + (s.done ? " is-done" : " is-open") + (s.approxEnd ? " is-approx" : "") });

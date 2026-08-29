@@ -8479,7 +8479,7 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-timeline-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .stashpad-timeline-empty { color: var(--text-faint); padding: 16px 4px; }
 .stashpad-timeline-axis { display: flex; align-items: flex-end; }
-.stashpad-timeline-axis-label { flex: 0 0 180px; }
+.stashpad-timeline-axis-label { flex: 0 0 260px; }
 .stashpad-timeline-axis-track {
   position: relative; flex: 1 1 auto; height: 20px;
   border-bottom: 1px solid var(--background-modifier-border);
@@ -8495,11 +8495,31 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 }
 .stashpad-timeline-row:hover { background: var(--background-modifier-hover); }
 .stashpad-timeline-title {
-  flex: 0 0 180px; min-width: 0; padding: 0 8px;
+  flex: 0 0 260px; min-width: 0; padding: 0 8px;
   font-size: var(--font-ui-smaller); color: var(--text-normal);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  display: flex; align-items: center; gap: 5px;
 }
-.stashpad-timeline-sub { color: var(--text-faint); font-size: 9px; }
+.stashpad-timeline-titletext { min-width: 0; flex: 1 1 auto; overflow: hidden; }
+.stashpad-timeline-titletext > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-timeline-sub { color: var(--text-faint); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-timeline-checkbox { flex: 0 0 auto; margin: 0; cursor: pointer; }
+.stashpad-timeline-calbtn {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; border: none; border-radius: 5px;
+  background: transparent; color: var(--text-muted); cursor: pointer;
+}
+.stashpad-timeline-calbtn:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-timeline-calbtn .svg-icon { width: 15px; height: 15px; flex: 0 0 auto; min-width: 15px; stroke: currentColor; }
+.stashpad-timeline-custom { display: inline-flex; align-items: center; gap: 3px; }
+.stashpad-timeline-daysinput { width: 5em; }
+.stashpad-timeline-daysunit { font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.stashpad-timeline-datepop {
+  position: fixed; z-index: var(--layer-menu); background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 10px;
+  box-shadow: var(--shadow-s); display: flex; flex-direction: column; gap: 8px; min-width: 200px;
+}
+.stashpad-timeline-datepop-label { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-timeline-datepop-row { display: flex; gap: 6px; justify-content: flex-end; }
 .stashpad-timeline-track { position: relative; flex: 1 1 auto; height: 14px; }
 .stashpad-timeline-span {
   position: absolute; top: 2px; height: 10px; border-radius: 5px;
@@ -8518,7 +8538,7 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-timeline-check .svg-icon { width: 8px; height: 8px; }
 /* Narrow window: shrink the title column so bars keep room. */
 @media (max-width: 640px) {
-  .stashpad-timeline-title, .stashpad-timeline-axis-label { flex-basis: 110px; }
+  .stashpad-timeline-title, .stashpad-timeline-axis-label { flex-basis: 150px; }
 }
 
 /* ===== Due calendar (0.274.0) ===================================== */
@@ -8630,6 +8650,37 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-cal-daypanel-head { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 2px; }
 .stashpad-cal-daypanel-head .stashpad-trash-iconbtn { margin-left: auto; }
 .stashpad-cal-note.is-full { padding: 4px 8px; }
+
+/* Month/Week/Day switcher */
+.stashpad-cal-seg { display: inline-flex; margin-left: 6px; border: 1px solid var(--background-modifier-border); border-radius: 7px; overflow: hidden; }
+.stashpad-cal-segbtn { padding: 3px 10px; border: none; background: transparent; color: var(--text-muted); cursor: pointer; font-size: var(--font-ui-smaller); }
+.stashpad-cal-segbtn:not(:last-child) { border-right: 1px solid var(--background-modifier-border); }
+.stashpad-cal-segbtn.is-active { background: var(--interactive-accent); color: var(--text-on-accent); }
+
+/* Week / day agenda */
+.stashpad-cal-agenda { display: flex; gap: 6px; align-items: stretch; min-height: 0; }
+.stashpad-cal-agenda.is-day { display: block; }
+.stashpad-cal-aglane {
+  flex: 1 1 0; min-width: 0; display: flex; flex-direction: column;
+  border: 1px solid var(--background-modifier-border); border-radius: 8px; overflow: hidden;
+  background: var(--background-primary);
+}
+.stashpad-cal-agenda.is-day .stashpad-cal-aglane { max-width: 640px; margin: 0 auto; }
+.stashpad-cal-aglane.is-today { border-color: var(--interactive-accent); box-shadow: inset 0 0 0 1px var(--interactive-accent); }
+.stashpad-cal-aghead {
+  display: flex; align-items: baseline; gap: 5px; padding: 6px 8px;
+  border-bottom: 1px solid var(--background-modifier-border); background: var(--background-secondary);
+}
+.stashpad-cal-agdow { font-weight: 600; font-size: var(--font-ui-smaller); text-transform: uppercase; letter-spacing: 0.03em; }
+.stashpad-cal-agdate { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.stashpad-cal-aghead .stashpad-cal-cellcount { margin-left: auto; }
+.stashpad-cal-agbody { display: flex; flex-direction: column; gap: 3px; padding: 6px; overflow-y: auto; }
+.stashpad-cal-agempty { color: var(--text-faint); font-size: var(--font-ui-smaller); padding: 4px 2px; }
+@media (max-width: 640px) {
+  /* On a phone the 7-column week is too tight — let it scroll horizontally. */
+  .stashpad-cal-agenda:not(.is-day) { overflow-x: auto; }
+  .stashpad-cal-agenda:not(.is-day) .stashpad-cal-aglane { flex-basis: 128px; min-width: 128px; }
+}
 
 @media (max-width: 640px) {
   .stashpad-cal-legend { margin-left: 0; }

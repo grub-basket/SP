@@ -4325,14 +4325,15 @@ export class StashpadView extends ItemView {
         this.repaintSelectionClasses();
         this.refreshMobileActionsCluster();
       } else {
-        const node = this.currentChildren[Math.max(0, this.cursorIdx)];
+        // 0.275.0: enter select mode with a CLEAN slate — nothing pre-selected.
+        // Previously the cursor/last-focused row was auto-added, but the user
+        // doesn't always knowingly select what they last tapped, so it acted on
+        // a note they didn't mean. Tap to build the selection from zero (matches
+        // other apps' multi-select UX).
         this.mobileSelectMode = true;
         this.selection.clear();
-        if (node) {
-          this.selection.add(node.id);
-          this.lastSelected = node.id;
-          this.firstSelectedId = node.id;
-        }
+        this.lastSelected = null;
+        this.firstSelectedId = null;
         this.repaintSelectionClasses();
         this.refreshMobileActionsCluster();
         // Unicode bolt ⚡ matches the lightning-bolt icon on the
@@ -15728,6 +15729,10 @@ export class StashpadView extends ItemView {
       const fm = fresh.fm;
       const newContent = fm + (fm ? "\n" : "") + nb + "\n";
       if (newContent === current) return; // no change
+      // 0.275.0: mark this as our own body write so onFileModify doesn't log it
+      // as an external edit. The modify event carries the CURRENT path (rename,
+      // if any, comes after), so mark originalPath.
+      this.markBodySelfWrite(originalPath);
       await this.app.vault.modify(file, newContent);
       // 0.170.2: re-slug the filename to match the new first line (user chose auto-rename).
       const renamedTo = await this.reslugFile(file, nb);
@@ -16668,6 +16673,21 @@ export class StashpadView extends ItemView {
     return { hit: Date.now() - e.at < 2500, repainted: e.repainted };
   }
 
+  /** 0.275.0: paths we just wrote the BODY to from inside Stashpad (edit modal,
+   *  split). Without this, onFileModify classified our own body write as an
+   *  outside-Stashpad edit and logged a spurious `external_edit` — the "edited
+   *  with an external editor when it wasn't" the log showed. Consulted (and
+   *  cleared) in onFileModify to suppress that one log entry; the rest of the
+   *  modify handling (render/slug/attachments/authorship) still runs. */
+  private recentBodySelfWrites = new Map<string, number>();
+  markBodySelfWrite(path: string): void { this.recentBodySelfWrites.set(path, Date.now()); }
+  private wasRecentBodySelfWrite(path: string): boolean {
+    const at = this.recentBodySelfWrites.get(path);
+    if (at == null) return false;
+    this.recentBodySelfWrites.delete(path); // one-shot
+    return Date.now() - at < 2500;
+  }
+
   private onFileModify = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
@@ -16706,8 +16726,11 @@ export class StashpadView extends ItemView {
     // nothing else logs them), and they are what you want to see when a note's
     // frontmatter or filename drifts from its body. Debounced per path so a
     // burst from sync, or a character-by-character edit in another pane, records
-    // once instead of hundreds of times.
-    this.logExternalEdit(file);
+    // once instead of hundreds of times. 0.275.0: but NOT if this was our own
+    // in-app body write (edit modal / split) — that is not an external edit, and
+    // logging it as one is the "edited with an external editor when it wasn't"
+    // the log wrongly showed. The in-app write already logged a proper `edit`.
+    if (!this.wasRecentBodySelfWrite(file.path)) this.logExternalEdit(file);
     // 0.122.6 (#13): drop this file's (possibly stale-content-but-fresh-mtime)
     // render-cache entry so the debounced re-render below recomputes from fresh
     // content — fixes the truncated/attachment-less "earlier version" render
