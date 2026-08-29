@@ -63,8 +63,13 @@ export class StashpadTrashView extends ItemView {
    *  rebuilds `order` shorter, so an index anchor would point at the wrong row
    *  afterward. We re-derive the index from this path at shift-click. (0.140.7) */
   private anchorBlob: string | null = null;
-  /** 0.130.0: shared view mode (same set as the Archive tab). Default per-folder. */
-  private trashMode: AggMode = "byfolder";
+  /** 0.130.0: shared view mode (same set as the Archive tab).
+   *  0.274.2: the Trash tab defaults to "mixed" — one flat list, newest-deleted
+   *  first — because in a trash view "what did I just delete?" is the primary
+   *  question. (The Archive tab keeps its own "byfolder" default; this field is
+   *  per-view, not the shared DEFAULT_AGG_MODE.) The mode bar still switches to
+   *  By folder / Encrypted / etc. */
+  private trashMode: AggMode = "mixed";
 
   async render(): Promise<void> {
     const gen = ++this.renderGen;

@@ -59,7 +59,24 @@ export class StashpadAggregateView extends ItemView {
   async setState(state: AggregateState, result: unknown): Promise<void> {
     if (state?.mode === "archived" || state?.mode === "encrypted" || state?.mode === "tasks" || state?.mode === "watch" || state?.mode === "index" || state?.mode === "timeline" || state?.mode === "calendar" || state?.mode === "heatmap") this.mode = state.mode;
     await super.setState(state, result as ViewStateResult);
+    // 0.274.1: the view is constructed with the default mode ("encrypted"), so
+    // Obsidian reads the tab title as "All encrypted" before setState swaps the
+    // mode in. Nothing re-reads getDisplayText() on a state change, so the tab
+    // + view-header keep the stale title until the leaf next changes. Force a
+    // refresh here (mirrors StashpadView.refreshHeaderTitle).
+    this.refreshHeaderTitle();
     await this.render();
+  }
+
+  /** Force both the tab header and the in-view header title to re-read
+   *  getDisplayText(); updateHeader() alone doesn't always repaint the DOM. */
+  private refreshHeaderTitle(): void {
+    const text = this.getDisplayText();
+    try { (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.(); } catch { /* ignore */ }
+    const headerEl = (this as unknown as { headerEl?: HTMLElement }).headerEl
+      ?? this.containerEl.querySelector(".view-header") as HTMLElement | null;
+    const titleEl = headerEl?.querySelector(".view-header-title") as HTMLElement | null;
+    if (titleEl && titleEl.textContent !== text) titleEl.setText(text);
   }
 
   async onOpen(): Promise<void> {
@@ -89,14 +106,36 @@ export class StashpadAggregateView extends ItemView {
     this.registerEvent(this.app.vault.on("modify", (f) => {
       if ((this.mode === "index" || this.mode === "timeline" || this.mode === "calendar") && f.path.endsWith(".md")) this.scheduleRender();
     }));
+    // 0.274.3 (perf): when this aggregate tab is in the BACKGROUND, a vault
+    // mutation only marks it dirty — it does NOT recompute. The index/calendar/
+    // heatmap each do a vault-wide sweep (cachedRead of every note; the heatmap
+    // also reads the whole log), and running that on every edit/drag while the
+    // user is working in the MAIN view was stealing the main thread and making
+    // the list feel laggy. Recompute once when the tab is next shown.
+    this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
+      if (leaf === this.leaf && this.dirty) { this.dirty = false; void this.render(); }
+    }));
     await this.render();
   }
 
   private renderPending = false;
+  /** A vault change arrived while this tab was hidden; recompute on next show. */
+  private dirty = false;
+
+  /** Cheap check: a background tab's content has no layout box (an ancestor is
+   *  display:none), so offsetParent is null. Avoids a vault-wide recompute for
+   *  a view the user isn't even looking at. */
+  private isVisible(): boolean {
+    return !!this.containerEl.offsetParent;
+  }
+
   private scheduleRender(): void {
+    if (!this.isVisible()) { this.dirty = true; return; }
     if (this.renderPending) return;
     this.renderPending = true;
-    window.setTimeout(() => { this.renderPending = false; void this.render(); }, 150);
+    // 0.274.3: 150 → 400ms so a burst (a drag that reparents several notes, or
+    // a fast run of edits) coalesces into one sweep instead of several.
+    window.setTimeout(() => { this.renderPending = false; void this.render(); }, 400);
   }
 
   private cleanFolder(p: string): string { return (p || "").replace(/\/+$/, ""); }
@@ -116,6 +155,7 @@ export class StashpadAggregateView extends ItemView {
   }
 
   async render(): Promise<void> {
+    this.dirty = false; // a full recompute satisfies any deferred-while-hidden change
     const root = this.contentEl;
     root.empty();
     root.addClass("stashpad-aggregate-body");
