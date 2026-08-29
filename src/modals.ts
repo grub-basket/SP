@@ -16,6 +16,9 @@ export interface AssigneeRef { id: string; name: string }
 export interface DuePickResult {
   iso: string | null;
   assignees: AssigneeRef[];
+  /** 0.276.0: tags to write to the note (`tags:` frontmatter). undefined =
+   *  the picker didn't show the tags section, so the caller must not touch tags. */
+  tags?: string[];
   /** 0.140.0: recurrence + reminder rules (empty string = clear the field).
    *  Present only when the picker showed the "Repeat & reminders" section. */
   repeat?: string;
@@ -34,6 +37,13 @@ export interface DuePickerOptions {
   knownAuthors?: AssigneeRef[];
   /** Assignees already on the note, to pre-fill the chips. */
   currentAssignees?: AssigneeRef[];
+  /** 0.276.0: show a Tags section. `currentTags` pre-fills the note's tags;
+   *  `tagChips` are quick one-tap chips (from settings); `tagSuggestions` feed
+   *  the type-to-add autocomplete. Section shown when any of these is provided. */
+  showTags?: boolean;
+  currentTags?: string[];
+  tagChips?: string[];
+  tagSuggestions?: string[];
   /** Modal title. Defaults to "Set due date". The "Assign to" command
    *  opens this same modal with a different title. */
   title?: string;
@@ -381,6 +391,7 @@ export class LogModal extends Modal {
       case "restore": return `Restored ${ev.id}${p.to ? ` → ${p.to}` : ""} from trash`;
       case "external_edit": return `Edited outside Stashpad — ${p.path ?? ev.id}`;
       case "edit": return `Edited ${p.path ?? ev.id}`;
+      case "open": return `Viewed ${p.path ?? ev.id}`;
       default: return JSON.stringify(p);
     }
   }
@@ -2894,6 +2905,8 @@ export class DueDatePickerModal extends Modal {
   private didChoose = false;
   /** Working set of assignees, mutated by the chips UI. */
   private assignees: AssigneeRef[] = [];
+  /** 0.276.0: working set of tags (without leading #), mutated by the tags UI. */
+  private tags: string[] = [];
   constructor(
     app: App,
     /** Existing due value (ISO) to pre-fill, or null/undefined. */
@@ -2907,7 +2920,15 @@ export class DueDatePickerModal extends Modal {
   ) {
     super(app);
     this.assignees = [...(opts.currentAssignees ?? [])];
+    this.tags = [...(opts.currentTags ?? [])].map((t) => t.replace(/^#/, "")).filter(Boolean);
   }
+
+  /** Whether the tags section is active for this open. */
+  private get showTags(): boolean {
+    return !!(this.opts.showTags || this.opts.currentTags?.length || this.opts.tagChips?.length || this.opts.tagSuggestions?.length);
+  }
+  /** tags result, or undefined when the section wasn't shown (don't touch tags). */
+  private tagsResult(): string[] | undefined { return this.showTags ? [...this.tags] : undefined; }
 
   onOpen(): void {
     this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
@@ -3001,6 +3022,7 @@ export class DueDatePickerModal extends Modal {
     // (mints a new author id). Multiple assignees supported.
     // 0.125.0: Snooze passes hideAssignees — it only reschedules, so omit it.
     if (!this.opts.hideAssignees) this.renderAssignSection(wrap);
+    if (this.showTags) this.renderTagsSection(wrap);
 
     // 0.76.5: presets (top row) + actions (bottom row) share ONE
     // 3-column grid so the six buttons line up in two tidy rows.
@@ -3185,7 +3207,7 @@ export class DueDatePickerModal extends Modal {
       if (!dateInput.value) {
         this.didChoose = true;
         this.close();
-        this.onPick({ iso: null, assignees: this.assignees, ...recur() });
+        this.onPick({ iso: null, assignees: this.assignees, tags: this.tagsResult(), ...recur() });
         return;
       }
       // Default time to 09:00 when only a date was chosen.
@@ -3195,7 +3217,7 @@ export class DueDatePickerModal extends Modal {
       const due = new Date(y, m - 1, d, hh, mm, 0, 0);
       this.didChoose = true;
       this.close();
-      this.onPick({ iso: due.toISOString(), assignees: this.assignees, ...recur() });
+      this.onPick({ iso: due.toISOString(), assignees: this.assignees, tags: this.tagsResult(), ...recur() });
     };
     requestAnimationFrame(() => dateInput.focus());
   }
@@ -3214,6 +3236,70 @@ export class DueDatePickerModal extends Modal {
       initial: this.assignees,
       onChange: (list) => { this.assignees = list; },
     });
+  }
+
+  /** 0.276.0: Tags block — selected tags as removable chips, quick one-tap chips
+   *  from settings, and a type-to-add input (Sift over the configured
+   *  suggestions + chips). Free entry is allowed (any typed tag is accepted). */
+  private renderTagsSection(wrap: HTMLElement): void {
+    const norm = (t: string): string => t.trim().replace(/^#+/, "").replace(/\s+/g, "-");
+    const sec = wrap.createDiv({ cls: "stashpad-tagsec" });
+    sec.createDiv({ cls: "stashpad-tagsec-label", text: "Tags" });
+    const chipsRow = sec.createDiv({ cls: "stashpad-tagsec-chips" });
+    const quick = (this.opts.tagChips ?? []).map(norm).filter(Boolean);
+    const suggestPool = [...new Set([...quick, ...(this.opts.tagSuggestions ?? []).map(norm)])].filter(Boolean);
+
+    const add = (t: string): void => { const v = norm(t); if (v && !this.tags.includes(v)) { this.tags.push(v); repaint(); } };
+    const remove = (t: string): void => { this.tags = this.tags.filter((x) => x !== t); repaint(); };
+
+    const quickRow = sec.createDiv({ cls: "stashpad-tagsec-quick" });
+    const inputWrap = sec.createDiv({ cls: "stashpad-tagsec-input-wrap" });
+    const input = inputWrap.createEl("input", { type: "text", cls: "stashpad-tagsec-input", attr: { placeholder: "Add a tag…" } });
+    const sugg = inputWrap.createDiv({ cls: "stashpad-tagsec-suggest" });
+
+    const repaintChips = (): void => {
+      chipsRow.empty();
+      if (this.tags.length === 0) chipsRow.createSpan({ cls: "stashpad-tagsec-empty", text: "No tags yet" });
+      for (const t of this.tags) {
+        const chip = chipsRow.createSpan({ cls: "stashpad-tagsec-chip" });
+        chip.createSpan({ text: `#${t}` });
+        const x = chip.createSpan({ cls: "stashpad-tagsec-chip-x", text: "×" });
+        x.onclick = () => remove(t);
+      }
+    };
+    const repaintQuick = (): void => {
+      quickRow.empty();
+      for (const t of quick) {
+        if (this.tags.includes(t)) continue;
+        const b = quickRow.createEl("button", { cls: "stashpad-tagsec-quickchip", text: `#${t}`, attr: { type: "button" } });
+        b.onmousedown = (e) => e.preventDefault();
+        b.onclick = () => add(t);
+      }
+    };
+    const repaintSuggest = (): void => {
+      const q = input.value.trim();
+      sugg.empty();
+      if (!q) { sugg.toggleClass("is-open", false); return; }
+      const matches = suggestPool.filter((t) => !this.tags.includes(t) && siftMatch(q, t)).slice(0, 8);
+      const rows: Array<{ label: string; pick: () => void }> = matches.map((t) => ({ label: `#${t}`, pick: () => { add(t); input.value = ""; repaintSuggest(); input.focus(); } }));
+      const exact = norm(q);
+      if (exact && !suggestPool.includes(exact) && !this.tags.includes(exact)) rows.push({ label: `Add “#${exact}”`, pick: () => { add(exact); input.value = ""; repaintSuggest(); input.focus(); } });
+      if (rows.length === 0) { sugg.toggleClass("is-open", false); return; }
+      sugg.toggleClass("is-open", true);
+      for (const r of rows) {
+        const item = sugg.createDiv({ cls: "stashpad-tagsec-suggest-item", text: r.label });
+        item.onmousedown = (e) => { e.preventDefault(); r.pick(); };
+      }
+    };
+    const repaint = (): void => { repaintChips(); repaintQuick(); };
+
+    input.oninput = repaintSuggest;
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") { e.preventDefault(); if (input.value.trim()) { add(input.value); input.value = ""; repaintSuggest(); } }
+      else if (e.key === "Escape" && sugg.hasClass("is-open")) { e.stopPropagation(); input.value = ""; repaintSuggest(); }
+    };
+    input.onblur = () => window.setTimeout(() => sugg.toggleClass("is-open", false), 120);
+    repaint();
   }
 
   /** 0.76.23: open the shared numpad time picker anchored under the

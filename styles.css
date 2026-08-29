@@ -2291,6 +2291,24 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle { grid-area: toggle; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-quick { grid-area: quick; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more { grid-area: more; }
+/* 0.276.4: the FOCUSED heading-note header crammed its title (in
+   .stashpad-focused-body) onto the same row as the timestamp + action buttons
+   on mobile. Mirror the body-note layout: timestamp + buttons on top, the
+   title/body on its own full-width row below. */
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-focused.is-heading-row {
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "meta actions"
+    "line line"
+    "body body";
+  align-items: center;
+  row-gap: 2px;
+  column-gap: 8px;
+}
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-focused.is-heading-row > .stashpad-focused-meta { grid-area: meta; }
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-focused.is-heading-row > .stashpad-focused-actions { grid-area: actions; justify-self: end; }
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-focused.is-heading-row > .stashpad-heading-stuck-line { grid-area: line; }
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-focused.is-heading-row > .stashpad-focused-body { grid-area: body; }
 /* Timestamp reads horizontally (one line) on mobile so it "spreads out"
    across the top row instead of stacking date over time. */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note-meta-top .stashpad-note-time {
@@ -4272,6 +4290,28 @@ body.is-mobile .stashpad-okf-cta {
 }
 .stashpad-assign-suggest-item { padding: 6px 10px; cursor: pointer; font-size: 0.9em; }
 .stashpad-assign-suggest-item:hover { background: var(--background-modifier-hover); }
+
+/* Tags section in the due/assign picker (0.276.0) */
+.stashpad-tagsec { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.stashpad-tagsec-label { font-size: var(--font-ui-smaller); color: var(--text-muted); font-weight: 600; }
+.stashpad-tagsec-chips { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; min-height: 22px; }
+.stashpad-tagsec-empty { color: var(--text-faint); font-size: var(--font-ui-smaller); }
+.stashpad-tagsec-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border-radius: 999px; background: var(--background-modifier-hover); font-size: var(--font-ui-smaller); }
+.stashpad-tagsec-chip-x { cursor: pointer; color: var(--text-faint); padding: 0 4px; border-radius: 999px; }
+.stashpad-tagsec-chip-x:hover { color: var(--text-normal); background: var(--background-modifier-border); }
+.stashpad-tagsec-quick { display: flex; flex-wrap: wrap; gap: 5px; }
+.stashpad-tagsec-quickchip { padding: 2px 9px; border-radius: 999px; border: 1px dashed var(--background-modifier-border); background: transparent; color: var(--text-muted); cursor: pointer; font-size: var(--font-ui-smaller); }
+.stashpad-tagsec-quickchip:hover { border-style: solid; color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-tagsec-input-wrap { position: relative; }
+.stashpad-tagsec-input { width: 100%; }
+.stashpad-tagsec-suggest {
+  display: none; position: absolute; left: 0; right: 0; top: calc(100% + 2px); z-index: var(--layer-menu);
+  background: var(--background-primary); border: 1px solid var(--background-modifier-border);
+  border-radius: 8px; box-shadow: var(--shadow-s); overflow: hidden; max-height: 200px; overflow-y: auto;
+}
+.stashpad-tagsec-suggest.is-open { display: block; }
+.stashpad-tagsec-suggest-item { padding: 6px 10px; cursor: pointer; font-size: 0.9em; }
+.stashpad-tagsec-suggest-item:hover { background: var(--background-modifier-hover); }
 .stashpad-due-fields { display: flex; flex-direction: column; gap: 8px; }
 .stashpad-due-field {
   display: flex;

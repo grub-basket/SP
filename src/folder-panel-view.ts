@@ -771,6 +771,19 @@ export class StashpadFolderPanelView extends ItemView {
     // 0.98.37: reveal-in-file-explorer moved to the context menu only; keep the
     // open-in-new-tab quick button.
     const actions = row.createDiv({ cls: "stashpad-folderpanel-actions" });
+    // 0.276.3: on mobile, a long-press to open the folder menu collides with
+    // long-press-to-drag (reorder). So on mobile we DISABLE the long-press menu
+    // (see below) and give each folder a gear button that opens the same menu —
+    // keeping drag-to-reorder unambiguous.
+    if (Platform.isMobile) {
+      const gearBtn = actions.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-gear" });
+      setIcon(gearBtn, "settings-2");
+      gearBtn.setAttr("aria-label", "Folder menu");
+      gearBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this.openFolderMenu(e, folder); };
+      // Don't let a press on the gear start a row drag / navigate.
+      gearBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+      gearBtn.addEventListener("touchstart", (e) => e.stopPropagation(), { passive: true });
+    }
     // 0.199.0: when "Folders always open in a new tab" is on, a per-row
     // new-tab button is redundant (the row click already opens a new tab).
     if (!this.plugin.settings.foldersAlwaysNewTab) {
@@ -797,7 +810,10 @@ export class StashpadFolderPanelView extends ItemView {
       if ((e.target as HTMLElement)?.closest?.(".stashpad-folderpanel-actions")) return;
       this.onNavigateAway(); this.jumpToFolder(folder);
     });
-    row.oncontextmenu = (e) => { e.preventDefault(); this.openFolderMenu(e, folder); };
+    // 0.276.3: desktop keeps right-click → menu. On mobile the long-press that
+    // triggers `contextmenu` conflicts with long-press-to-drag, so we skip it
+    // there and rely on the gear button above instead.
+    if (!Platform.isMobile) row.oncontextmenu = (e) => { e.preventDefault(); this.openFolderMenu(e, folder); };
 
     // 0.105.1: when expanded, list the folder's Home list-pinned notes as a
     // sub-list below the folder row. Clicking one reveals it in its Stashpad.

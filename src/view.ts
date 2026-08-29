@@ -2884,8 +2884,23 @@ export class StashpadView extends ItemView {
     // "none" - no special treatment.
     // Covers BOTH pin kinds (list pin + sidebar pin) per "pinned notes of any kind".
     const pinMode = this.plugin.settings.pinnedFilterMode;
+    // 0.276.2: optionally treat a descendant of a pinned note as pinned too, so
+    // a surviving pin isn't shown with its subtree filtered away. Only matters
+    // where filterChildren sees descendants (flat / everything mode flatten the
+    // whole subtree into this list); nested mode passes only top-level here.
+    const keepChildren = pinMode !== "none" && this.plugin.settings.pinnedChildrenPersist;
+    const hasPinnedAncestor = (n: TreeNode): boolean => {
+      const seen = new Set<StashpadId>();
+      let pid = n.parent;
+      while (pid && pid !== ROOT_ID && !seen.has(pid)) {
+        seen.add(pid);
+        if (this.isPinnedAnyKind(pid)) return true;
+        pid = this.tree.get(pid)?.parent ?? null;
+      }
+      return false;
+    };
     return children.filter((n) => {
-      const pinned = pinMode !== "none" && this.isPinnedAnyKind(n.id);
+      const pinned = pinMode !== "none" && (this.isPinnedAnyKind(n.id) || (keepChildren && hasPinnedAncestor(n)));
       if (pinned && pinMode === "all") return true;
       // 0.88.1: imported-only + by-author filters (node-level, like tag/color).
       if (importedOnly) {
@@ -14045,11 +14060,26 @@ export class StashpadView extends ItemView {
     // and pre-fill any assignees already on the first target.
     const knownAuthors = this.plugin.collectKnownAuthors();
     const currentAssignees = parseAssignees(curFm ?? {});
+    // 0.276.0: prefill the note's AUTHOR as an assignee when an author profile
+    // exists and matches (by id, else by name) — only if not already assigned.
+    // Single-target only: a bulk assign shouldn't inherit #1's author onto all.
+    if (targets.length === 1) {
+      const auth = parseAuthorRef((curFm ?? {}).author);
+      if (auth) {
+        const profile = knownAuthors.find((k) => k.id === auth.id) ?? knownAuthors.find((k) => k.name.toLowerCase() === auth.name.toLowerCase());
+        if (profile && !currentAssignees.some((a) => a.id === profile.id)) currentAssignees.push({ id: profile.id, name: profile.name });
+      }
+    }
+    // 0.276.0: current tags (frontmatter list or a comma/space string).
+    const rawTags = (curFm ?? {}).tags;
+    const currentTags = Array.isArray(rawTags) ? rawTags.map(String)
+      : typeof rawTags === "string" ? rawTags.split(/[,\s]+/).filter(Boolean) : [];
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees, false, {
         repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode,
-      });
+      }, result.tags);
     }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts,
+      showTags: true, currentTags, tagChips: this.plugin.settings.taskTagChips, tagSuggestions: this.plugin.settings.taskTagSuggestions,
       // 0.140.1: recurrence is a per-note concept — only show/write it for a
       // single target, else a multi-select would clobber 2..n's rules with #1's.
       showRecurrence: targets.length === 1,
@@ -14083,8 +14113,11 @@ export class StashpadView extends ItemView {
   /** Write the chosen due value (or clear it) across `targets`, with
    *  undo. Setting a date also flips `task: true`; clearing leaves the
    *  task flag intact (clearing a due ≠ "no longer a task"). */
-  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string; repeatMode?: string }): Promise<void> {
-    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown; repeatMode: unknown }[] = [];
+  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string; repeatMode?: string }, tags?: string[]): Promise<void> {
+    // 0.276.0: `tags` undefined = picker didn't show the tags section → leave
+    // tags untouched. An array (possibly empty) REPLACES the note's tag list.
+    const normTags = tags === undefined ? undefined : [...new Set(tags.map((t) => t.trim().replace(/^#+/, "")).filter(Boolean))];
+    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown; repeatMode: unknown; tags: unknown }[] = [];
     const changedIds: StashpadId[] = [];
     // 0.78.1: who is doing the assigning (the local user) — stamped as
     // assignedBy so the "assigned by me" filter works. Null if the user
@@ -14100,7 +14133,7 @@ export class StashpadView extends ItemView {
       if (!t.file) continue;
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
       const wasTagged = this.isTaskTagged(t);
-      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery, repeatMode: fm?.repeatMode });
+      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery, repeatMode: fm?.repeatMode, tags: fm?.tags });
       this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
@@ -14131,6 +14164,11 @@ export class StashpadView extends ItemView {
         } else {
           delete m.assignedTo;
           delete m.assignedBy;
+        }
+        // 0.276.0: write the chosen tags (replace the list). Empty → clear.
+        if (normTags !== undefined) {
+          if (normTags.length > 0) m.tags = normTags;
+          else delete m.tags;
         }
       });
       // 0.85.1: a due date or an assignment makes it a task; clearing leaves
@@ -14170,6 +14208,8 @@ export class StashpadView extends ItemView {
             if (p.repeatMode === undefined) delete m.repeatMode; else m.repeatMode = p.repeatMode;
             if (p.autoDoneAfter === undefined) delete m.autoDoneAfter; else m.autoDoneAfter = p.autoDoneAfter;
             if (p.remindEvery === undefined) delete m.remindEvery; else m.remindEvery = p.remindEvery;
+            // 0.276.0: restore tags only if we changed them (normTags set).
+            if (normTags !== undefined) { if (p.tags === undefined) delete m.tags; else m.tags = p.tags; }
           });
           this.taskTaggedState.set(p.path, p.wasTagged); // 0.85.1
         }
@@ -14197,11 +14237,22 @@ export class StashpadView extends ItemView {
     const current = curFm && (typeof curFm.due === "string" || typeof curFm.due === "number") ? String(curFm.due) : null;
     const knownAuthors = this.plugin.collectKnownAuthors();
     const currentAssignees = parseAssignees(curFm ?? {});
+    if (targets.length === 1) {
+      const auth = parseAuthorRef((curFm ?? {}).author);
+      if (auth) {
+        const profile = knownAuthors.find((k) => k.id === auth.id) ?? knownAuthors.find((k) => k.name.toLowerCase() === auth.name.toLowerCase());
+        if (profile && !currentAssignees.some((a) => a.id === profile.id)) currentAssignees.push({ id: profile.id, name: profile.name });
+      }
+    }
+    const rawTags = (curFm ?? {}).tags;
+    const currentTags = Array.isArray(rawTags) ? rawTags.map(String)
+      : typeof rawTags === "string" ? rawTags.split(/[,\s]+/).filter(Boolean) : [];
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees, false, {
         repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode,
-      });
+      }, result.tags);
     }, { knownAuthors, currentAssignees, title: "Assign / schedule task",
+      showTags: true, currentTags, tagChips: this.plugin.settings.taskTagChips, tagSuggestions: this.plugin.settings.taskTagSuggestions,
       // 0.155.0: Assign opens the SAME picker as "Set due date" with the full
       // control set — the quick +/- adjust row (was silently missing here) plus
       // recurrence (single-target only; see cmdSetDue). Unifies the two entry
@@ -17116,11 +17167,13 @@ export class StashpadView extends ItemView {
    *  selection to the clicked note first (same invariant as openNoteMenu), so
    *  the selection-based cmd* helpers act on the note the user tapped. */
   private runQuickAction(id: string, node: TreeNode, evt?: MouseEvent | KeyboardEvent): void {
-    // "More commands…" opens the full ⋮ menu; it needs a position, so it does
-    // NOT normalise the selection here (openNoteMenu does that itself).
+    // 0.276.4: "More commands…" now opens Stashpad's command palette (Sift
+    // search over the note actions) instead of a longer context menu — if the
+    // user wanted the long menu they'd have opened it. Normalise the selection
+    // to this note first so the palette's commands act on it.
     if (id === "more") {
-      const mouse = evt instanceof MouseEvent ? evt : this.lastQuickMenuEvt;
-      if (mouse) this.openNoteMenu(mouse, node);
+      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      this.openStashpadCommandPalette();
       return;
     }
     if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }

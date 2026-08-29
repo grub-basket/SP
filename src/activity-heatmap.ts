@@ -14,11 +14,12 @@ import { collectIndexRows } from "./aggregate-index";
  *  chores, palette tweaks) are shown by default but one click hides them, so
  *  the map can show just real authoring work. */
 
-type Bucket = "created" | "edited" | "tasks" | "moved" | "files" | "vault" | "deleted";
+type Bucket = "created" | "edited" | "tasks" | "moved" | "files" | "vault" | "deleted" | "viewed";
 
 const BUCKET_OF: Record<LogEventType, Bucket> = {
   create: "created",
   edit: "edited", external_edit: "edited",
+  open: "viewed",
   complete: "tasks", uncomplete: "tasks",
   parent_change: "moved", reorder: "moved", rename: "moved",
   attachment_add: "files", attachment_remove: "files",
@@ -31,6 +32,7 @@ const BUCKET_OF: Record<LogEventType, Bucket> = {
 const BUCKET_META: Record<Bucket, { label: string; icon: string; house: boolean }> = {
   created: { label: "Created", icon: "sparkles", house: false },
   edited:  { label: "Edited",  icon: "pencil", house: false },
+  viewed:  { label: "Viewed",  icon: "eye", house: true },
   tasks:   { label: "Tasks",   icon: "check-square", house: false },
   files:   { label: "Attachments", icon: "paperclip", house: false },
   moved:   { label: "Moves & renames", icon: "move", house: true },
@@ -46,7 +48,7 @@ export interface HeatmapState {
 export function defaultHeatmapState(): HeatmapState {
   return {
     weeks: 26,
-    buckets: { created: true, edited: true, tasks: true, files: true, moved: true, vault: true, deleted: true },
+    buckets: { created: true, edited: true, tasks: true, files: true, moved: true, vault: true, deleted: true, viewed: true },
     // 0.275.3: pre-select TODAY so the detail panel isn't blank on open (and
     // today's cell reads as selected). Once open, the user's clicks / closing
     // the panel take over normally.
@@ -251,6 +253,7 @@ function describeEvent(ev: LogEvent, title?: string): string {
     case "create": return `Created ${who}`;
     case "edit": return `Edited ${who}`;
     case "external_edit": return `Edited ${who} (outside Stashpad)`;
+    case "open": return `Viewed ${who}`;
     case "complete": return `Completed ${who}`;
     case "uncomplete": return `Reopened ${who}`;
     case "parent_change": return `Moved ${who}`;

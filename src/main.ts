@@ -86,6 +86,8 @@ class AttachmentParentPicker extends FuzzySuggestModal<TFile> {
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
+  /** 0.276.0: per-file timestamp of the last logged "open", for 60s dedupe. */
+  private lastOpenLogged = new Map<string, number>();
   private reEncryptScheduler: ReEncryptScheduler | null = null;
   /** Dedup-at-creation index: every note id currently in the vault. Built lazily
    *  on the first mintNoteId(), then kept current by the metadataCache `changed`
@@ -2371,6 +2373,17 @@ export default class StashpadPlugin extends Plugin {
     //
     // Terminates on its own: the swapped leaf is a Stashpad view, which fails
     // the markdown test on the re-entrant event.
+    // 0.276.0: opt-in "note opened" logging for the activity heatmap's Viewed
+    // bucket. Per-file 60s dedupe so re-focusing a tab doesn't spam the log.
+    this.registerEvent(this.app.workspace.on("file-open", (file) => {
+      if (!this.settings.logNoteOpens) return;
+      if (!(file instanceof TFile) || file.extension !== "md" || !this.isStashpadNoteFile(file)) return;
+      const now = Date.now();
+      if (now - (this.lastOpenLogged.get(file.path) ?? 0) < 60000) return;
+      this.lastOpenLogged.set(file.path, now);
+      const fmId = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+      void this.newLog().append({ type: "open", id: typeof fmId === "string" ? fmId : ROOT_ID, payload: { path: file.path } });
+    }));
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
       if (!leaf) return;
       const file = (leaf.view as unknown as { file?: TFile }).file;

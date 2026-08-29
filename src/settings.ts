@@ -450,6 +450,15 @@ export interface StashpadSettings {
   /** 0.125.1: quick relative time-adjust presets shown in the due-date / snooze
    *  picker (e.g. ["5m","15m","1h","1d"]). A +/- flip toggles add vs subtract. */
   dueQuickAdjusts: string[];
+  /** 0.276.0: tags offered in the due/assign picker. `taskTagChips` are shown as
+   *  one-tap quick chips; `taskTagSuggestions` (plus the chips) feed the
+   *  type-to-add autocomplete. Both are plain tag names (no leading #). */
+  taskTagChips: string[];
+  taskTagSuggestions: string[];
+  /** 0.276.0: log when a Stashpad note is opened, so the activity heatmap can
+   *  show a "Viewed" bucket. Off by default — opens are frequent and would grow
+   *  the action log noticeably; only turn on if you want view tracking. */
+  logNoteOpens: boolean;
   /** 0.98.25 (Phase 4): archive folders — notes MOVED into one of these Stashpad
    *  folders are automatically encrypted (locked). Opt-in per folder via the
    *  folder panel; requires an explicit confirm when marking (lock permanently
@@ -755,6 +764,10 @@ export interface StashpadSettings {
    *  Replaced the 0.270.1 boolean `pinnedIgnoreFilters` (true -> "all",
    *  false -> "none"); that key is migrated on load. */
   pinnedFilterMode: "all" | "time" | "none";
+  /** 0.276.2: when a pinned note survives a filter, also keep its whole subtree
+   *  (all descendants) visible, so the pinned note isn't shown empty. Off by
+   *  default. No effect when pinnedFilterMode is "none". */
+  pinnedChildrenPersist: boolean;
   /** Notification history buffer cap. 0 or negative = unlimited.
    *  Default 5000. Persisted alongside the live history in
    *  `<pluginDir>/notifications.json`. */
@@ -878,6 +891,9 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   reEncryptNudge: false,
   reEncryptAfterMin: 0,
   dueQuickAdjusts: ["5m", "15m", "30m", "1h", "1d", "1w"],
+  taskTagChips: [],
+  taskTagSuggestions: [],
+  logNoteOpens: false,
   archiveFolders: [],
   folderEncPrefs: {},
   folderIcons: {},
@@ -946,6 +962,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   showEditorLineNumbers: true,
   autoNavOnMoveOut: false,
   pinnedFilterMode: "all",
+  pinnedChildrenPersist: false,
   autoExpandCursorRow: false,
   expandBodiesByDefault: false,
   autoOpenDetailPanel: false,
@@ -1419,6 +1436,12 @@ export class StashpadSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           if (!v) await this.plugin.removeTraceFiles();
         })), ["debug", "trace", "disk", "persist", "crash", "force-quit"]),
+
+      this.renderDef("Log note opens (activity heatmap)", "Record when you open a Stashpad note so the activity heatmap can show a “Viewed” bucket. Off by default — opens are frequent and grow the action log; turn on only if you want to track what you looked at. Local only; nothing leaves your vault.", (s) =>
+        s.addToggle((t) => t.setValue(this.plugin.settings.logNoteOpens).onChange(async (v) => {
+          this.plugin.settings.logNoteOpens = v;
+          await this.plugin.saveSettings();
+        })), ["log", "open", "opens", "viewed", "heatmap", "activity", "track"]),
 
       this.renderDef("Copy / clear debug trace", "Copy the captured debug lines to the clipboard (paste them back to share), or clear the buffer to start a fresh capture.", (s) => {
         s.addButton((b) => b.setButtonText("Copy").onClick(async () => {
@@ -2120,6 +2143,21 @@ export class StashpadSettingTab extends PluginSettingTab {
           });
         });
       }, ["quick", "adjust", "snooze", "due", "preset", "increment", "decrement"]));
+      const parseTags = (v: string): string[] => [...new Set(v.split(",").map((x) => x.trim().replace(/^#+/, "").replace(/\s+/g, "-")).filter(Boolean))];
+      cats.datesTime.push(this.renderDef("Task tag chips", "Comma-separated tags shown as one-tap chips in the due-date / assign picker, so you can label a task (e.g. events, saga, outage) without typing. Plain names, no # needed.", (s) => {
+        s.addText((t) => {
+          t.setPlaceholder("events, saga, outage");
+          t.setValue((this.plugin.settings.taskTagChips ?? []).join(", "));
+          t.onChange(async (v) => { this.plugin.settings.taskTagChips = parseTags(v); await set(); });
+        });
+      }, ["tag", "tags", "chip", "task", "due", "assign", "event", "saga"]));
+      cats.datesTime.push(this.renderDef("Task tag suggestions", "Extra tags offered in the type-to-add autocomplete in the due-date / assign picker (the chips above are always suggested too). You can still type any tag not listed here.", (s) => {
+        s.addText((t) => {
+          t.setPlaceholder("incident, review, blocked");
+          t.setValue((this.plugin.settings.taskTagSuggestions ?? []).join(", "));
+          t.onChange(async (v) => { this.plugin.settings.taskTagSuggestions = parseTags(v); await set(); });
+        });
+      }, ["tag", "tags", "suggest", "autocomplete", "task", "due", "assign"]));
       cats.datesTime.push({
         name: "Date sample", searchable: false,
         render: (s: Setting) => {
@@ -2228,6 +2266,8 @@ export class StashpadSettingTab extends PluginSettingTab {
         d.onChange(async (v) => { this.plugin.settings.pinnedFilterMode = v as "all" | "time" | "none"; await set(); });
       });
     }, ["pin", "pinned", "filter", "time", "hide", "tag", "colour", "color"]));
+    cats.listDisplay.push(toggle("Keep a pinned note's children too", "When a pin keeps a note visible through a filter, also keep its whole subtree (all descendants) visible — so the pinned note isn't left showing with its contents filtered away. Off by default; no effect when the setting above is \"Filter like any note\".",
+      () => this.plugin.settings.pinnedChildrenPersist, (v) => { this.plugin.settings.pinnedChildrenPersist = v; }, ["pin", "pinned", "children", "subtree", "descendants", "filter"]));
     cats.listDisplay.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",
       () => this.plugin.settings.doubleClickToFocus, (v) => { this.plugin.settings.doubleClickToFocus = v; }, ["double", "click", "open", "focus"]));
     cats.misc.push(toggle("Sheet versions (alternate drafts)", "Treat notes that share a 'sheet-group' frontmatter id as alternate versions of one item: only the active version shows as a row, and its siblings collapse into a tab bar at the bottom of that row. Use \"Fork as version\" on a note to start. Off by default — when off, no note is ever hidden by this feature and the commands do nothing.",

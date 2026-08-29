@@ -363,7 +363,11 @@ export type LogEventType =
   // split-save chokepoint). Distinct from `external_edit` (edited elsewhere) so
   // the activity heatmap can count "edited in Stashpad" as first-class work —
   // without it, in-app edits left no trace in the log at all.
-  | "edit";
+  | "edit"
+  // 0.276.0: a Stashpad note was OPENED/viewed. OPT-IN (settings.logNoteOpens,
+  // default off) because opens are frequent and would bloat the log for users
+  // who don't want view tracking. Feeds the activity heatmap's "Viewed" bucket.
+  | "open";
 
 export interface LogEvent {
   ts: string;
