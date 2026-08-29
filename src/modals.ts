@@ -3784,6 +3784,100 @@ export class ReEncryptReviewModal extends Modal {
   onClose(): void { this.contentEl.empty(); }
 }
 
+/** 0.277.0: the one-click Encrypt-all flow as ONE continuous overlay: confirm
+ *  (naming everything it will sweep + the sync-pause suggestion) → a BLOCKING
+ *  running phase (the modal can't be dismissed, so the Stashpad UI stays frozen
+ *  behind it) → an acknowledge phase. Runs the caller's `runner`, which locks the
+ *  full candidate set; progress is reported back via the `onProgress` callback. */
+export class EncryptAllModal extends Modal {
+  private phase: "confirm" | "running" | "done" = "confirm";
+  constructor(
+    app: App,
+    private items: Array<{ label: string; detail: string }>,
+    private companionExts: string[],
+    private runner: (onProgress: (index: number, label: string) => void) => Promise<{ ok: number; failed: number }>,
+  ) { super(app); }
+
+  /** Block dismissal (Escape / background click / the ✕) while the sweep runs —
+   *  this is what "freezes the Stashpad UI" during the operation. */
+  close(): void {
+    if (this.phase === "running") return;
+    super.close();
+  }
+
+  onOpen(): void {
+    this.modalEl?.addClass("stashpad-compact-modal");
+    this.renderConfirm();
+  }
+  onClose(): void { this.contentEl.empty(); }
+
+  private renderConfirm(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    this.titleEl.setText("Encrypt everything now?");
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: `This locks ${this.items.length} item${this.items.length === 1 ? "" : "s"} that should be encrypted but ${this.items.length === 1 ? "is" : "are"} currently plaintext — the watchlist (unlocked/restored notes) and any folder set to encrypt its notes or archive. Stashpad's UI is frozen while it runs.`,
+    });
+    const list = contentEl.createDiv({ cls: "stashpad-reenc-list" });
+    this.items.forEach((it) => {
+      const row = list.createDiv({ cls: "stashpad-reenc-row" });
+      const body = row.createDiv({ cls: "stashpad-reenc-body" });
+      body.createDiv({ cls: "stashpad-reenc-label", text: it.label });
+      body.createDiv({ cls: "stashpad-reenc-detail", text: it.detail });
+    });
+    if (this.companionExts.length) {
+      contentEl.createEl("p", {
+        cls: "setting-item-description",
+        text: `Companion sidecars (${this.companionExts.join(", ")}) next to each note — e.g. Edit History — are encrypted inside the same bundle and removed from plaintext, then restored when you unlock.`,
+      });
+    }
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "Tip: if a sync/cloud service (Obsidian Sync, iCloud, Dropbox…) is running, pause it manually until this finishes — a sync writing mid-operation can create conflict copies. Your data is written safely (each note's encrypted copy is verified before the plaintext is removed).",
+    });
+    const btns = contentEl.createDiv({ cls: "modal-button-container" });
+    const go = btns.createEl("button", { cls: "mod-cta", text: "Encrypt now" });
+    go.onclick = () => void this.renderRunning();
+    btns.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+  }
+
+  private async renderRunning(): Promise<void> {
+    this.phase = "running";
+    const { contentEl } = this;
+    contentEl.empty();
+    this.titleEl.setText("Encrypting…");
+    contentEl.createEl("p", { cls: "setting-item-description", text: "Please don't close Obsidian or edit notes until this finishes." });
+    const status = contentEl.createEl("p", { cls: "stashpad-reenc-label" });
+    const current = contentEl.createEl("p", { cls: "stashpad-reenc-detail" });
+    const total = this.items.length;
+    const onProgress = (index: number, label: string): void => {
+      status.setText(`🔒 Encrypting ${index + 1}/${total}…`);
+      current.setText(label);
+    };
+    onProgress(0, this.items[0]?.label ?? "");
+    let result: { ok: number; failed: number };
+    try { result = await this.runner(onProgress); }
+    catch (e) { console.warn("[Stashpad] encrypt-all runner threw", e); result = { ok: 0, failed: total }; }
+    this.phase = "done";
+    this.renderDone(result);
+  }
+
+  private renderDone(result: { ok: number; failed: number }): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    this.titleEl.setText("Encryption complete");
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: result.failed
+        ? `Locked ${result.ok} item${result.ok === 1 ? "" : "s"}. ${result.failed} FAILED — check the console (some notes are still plaintext).`
+        : `Locked ${result.ok} item${result.ok === 1 ? "" : "s"}. Everything applicable is now encrypted.`,
+    });
+    const btns = contentEl.createDiv({ cls: "modal-button-container" });
+    btns.createEl("button", { cls: "mod-cta", text: "Done" }).onclick = () => this.close();
+  }
+}
+
 /** 0.199.3: a big, explicit dropzone. Opened from the composer's dropzone
  *  button: drag files onto the large dashed area (imports them like a drop on
  *  the composer), or click the area to open the OS file picker. The zone is

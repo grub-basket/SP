@@ -46,13 +46,23 @@ export interface StashManifest {
    *  the destination folder's color aliases on import so the names show in the
    *  plugin's color UI. Keys are lowercase `#rrggbb`. */
   colorAliases?: Record<string, string>;
+  /** 0.277.0: plaintext companion/sidecar files (e.g. Edit History's `.edtz`)
+   *  bundled ALONGSIDE their owning note so encryption doesn't leave them
+   *  readable on disk. Each record maps a stored `companions/<i>` entry to the
+   *  note it belongs to (`noteStem` = the note's zip-entry basename) and carries
+   *  the companion's original filename so unlock can re-pair it by extension.
+   *  Only populated on encryption paths (notes carry a `companions` list); plain
+   *  exports never set it. */
+  companions?: { i: number; noteStem: string; name: string }[];
 }
 
 export interface ExportInput {
-  /** Notes to export. Children of these notes will be auto-included. */
-  rootNotes: { id: StashpadId; file: TFile }[];
+  /** Notes to export. Children of these notes will be auto-included.
+   *  `companions` (0.277.0) are plaintext sidecars for that note (resolved by the
+   *  caller) that ride INSIDE the bundle so encryption protects them too. */
+  rootNotes: { id: StashpadId; file: TFile; companions?: TFile[] }[];
   /** Children-of-roots resolver (recursive walk handled by caller). */
-  allDescendants: { id: StashpadId; file: TFile }[];
+  allDescendants: { id: StashpadId; file: TFile; companions?: TFile[] }[];
   /** Folder the source notes live in (for the manifest). */
   sourceFolder: string;
 }
@@ -106,6 +116,10 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
   };
   const warnings: string[] = [];
   const usedNoteNames = new Set<string>();
+  // 0.277.0: companion sidecars are collected as we walk notes and appended after
+  // the attachments so their `companions/<i>` indices are stable.
+  const companionEntries: ZipEntry[] = [];
+  const companionManifest: { i: number; noteStem: string; name: string }[] = [];
 
   for (const n of allNotes) {
     const md = await app.vault.read(n.file);
@@ -152,11 +166,22 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
     while (usedNoteNames.has(entryName)) entryName = `${n.file.basename}-${newId(4)}.md`;
     usedNoteNames.add(entryName);
     entries.push({ name: `notes/${entryName}`, data: rewritten });
+
+    // 0.277.0: bundle this note's plaintext companions (resolved by the caller —
+    // encryption paths only). Each rides as an opaque `companions/<i>` binary; the
+    // manifest keeps the note-entry stem + original filename so unlock can re-pair
+    // it to the (possibly renamed) note and restore it by extension.
+    for (const cf of n.companions ?? []) {
+      const idx = companionEntries.length;
+      companionEntries.push({ name: `companions/${idx}`, data: await app.vault.readBinary(cf) });
+      companionManifest.push({ i: idx, noteStem: entryName.replace(/\.md$/, ""), name: cf.name });
+    }
   }
 
   for (const [name, buf] of collectedAtts) {
     entries.push({ name: `attachments/${name}`, data: buf });
   }
+  for (const e of companionEntries) entries.push(e);
 
   const manifest: StashManifest = {
     stashSchema: SCHEMA_VERSION,
@@ -164,6 +189,7 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
     sourceFolder: input.sourceFolder,
     noteCount: allNotes.length,
     rootIds: input.rootNotes.map((n) => n.id),
+    ...(companionManifest.length ? { companions: companionManifest } : {}),
   };
   entries.push({ name: "manifest.json", data: JSON.stringify(manifest, null, 2) });
 
@@ -365,6 +391,27 @@ export async function importStashZip(
     attachmentsWritten++;
   }
 
+  // 0.277.0: index companion sidecars by their owning note's entry stem, so each
+  // note can restore its companions after it lands (and follow the note's new
+  // basename if the note was renamed on a collision). `ext` is the companion
+  // filename minus the note stem (e.g. `.edtz`); a malformed record that doesn't
+  // start with the stem falls back to the file's own extension.
+  const companionsByStem = new Map<string, { ext: string; data: Uint8Array }[]>();
+  if (Array.isArray(manifest.companions)) {
+    for (const c of manifest.companions) {
+      const data = zip[`companions/${c.i}`];
+      if (!data) continue;
+      const stem = String(c.noteStem ?? "");
+      const fullName = String(c.name ?? "");
+      if (!stem || !fullName) continue;
+      const ext = fullName.startsWith(stem) ? fullName.slice(stem.length) : fullName.slice(fullName.lastIndexOf("."));
+      if (!ext) continue;
+      const arr = companionsByStem.get(stem) ?? [];
+      arr.push({ ext, data });
+      companionsByStem.set(stem, arr);
+    }
+  }
+
   // Write notes with remapped ids/parents and import_date.
   let notesWritten = 0;
   const notePathsWritten: string[] = [];
@@ -452,6 +499,24 @@ export async function importStashZip(
       await app.vault.create(outPath, finalContent);
       notePathsWritten.push(outPath);
       notesWritten++;
+
+      // 0.277.0: restore this note's companion sidecars next to it, named after
+      // the note's FINAL basename (so Edit History etc. re-pair by basename even
+      // if the note was renamed on a collision). Never clobber an existing file;
+      // sanitize the final name for zip-slip. A companion failure is a warning —
+      // the note is already safely on disk.
+      const outStem = outName.replace(/\.md$/, "");
+      const noteStem = p.originalName.replace(/\.md$/, "");
+      for (const comp of companionsByStem.get(noteStem) ?? []) {
+        let compName = safeZipEntryName(`${outStem}${comp.ext}`) || `${newId(6)}${comp.ext}`;
+        let compPath = `${destFolder}/${compName}`;
+        for (let n = 1; await app.vault.adapter.exists(compPath); n++) {
+          compName = safeZipEntryName(`${outStem}-${n}${comp.ext}`) || `${newId(6)}${comp.ext}`;
+          compPath = `${destFolder}/${compName}`;
+        }
+        try { await app.vault.createBinary(compPath, comp.data.slice().buffer as ArrayBuffer); }
+        catch (e) { warnings.push(`Couldn't restore companion ${compName} — ${(e as Error).message}`); }
+      }
     } catch (e) {
       warnings.push(`Couldn't write ${p.originalName} — ${(e as Error).message}`);
     }

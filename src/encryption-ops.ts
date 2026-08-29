@@ -86,6 +86,30 @@ export async function collectSubtree(app: App, folder: string, rootId: StashpadI
   return { rootNote: root, descendants, parentId: root.parent };
 }
 
+/** 0.277.0: resolve a note's plaintext companion/sidecar files — a third-party
+ *  plugin writes `<basename><ext>` next to the note (e.g. Edit History's
+ *  `.edtz`). Matched by exact basename in the SAME folder, for each configured
+ *  extension. These ride inside the encrypted bundle and are purged alongside the
+ *  note so encryption doesn't leave the note's history readable on disk. */
+export function companionFilesFor(app: App, file: TFile, exts: string[]): TFile[] {
+  if (!exts?.length) return [];
+  const parent = file.parent?.path ?? "";
+  const dir = parent === "/" ? "" : parent;
+  const out: TFile[] = [];
+  const seen = new Set<string>();
+  for (const raw of exts) {
+    const ext = (raw ?? "").trim();
+    if (!ext) continue;
+    const withDot = ext.startsWith(".") ? ext : `.${ext}`;
+    const path = dir ? `${dir}/${file.basename}${withDot}` : `${file.basename}${withDot}`;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const af = app.vault.getAbstractFileByPath(path);
+    if (af instanceof TFile) out.push(af);
+  }
+  return out;
+}
+
 /** Reject a sidecar/dest folder that could escape the vault (sidecars are
  *  plaintext JSON anyone can edit — a tampered `originalFolder` of `../..` or
  *  an absolute/drive path must never become a write destination). Returns the
@@ -140,6 +164,12 @@ function safeBlobBase(title: string): string {
  *  as "locked" but couldn't remove is still readable plaintext on disk. */
 async function purgeSubtreePlaintext(
   app: App, all: { file: TFile }[], mtimes?: Map<string, number>,
+  /** 0.277.0: plaintext companion sidecars (already bundled into the blob) to
+   *  delete alongside the notes. Companions are exclusive to their note by
+   *  construction (basename-matched), so no shared-attachment check applies —
+   *  but the same mid-op edit guard does (skip a companion changed since it was
+   *  bundled; its newer bytes aren't in the blob). */
+  companions: TFile[] = [],
 ): Promise<{ unpurged: string[] }> {
   const subtreePaths = new Set(all.map((n) => n.file.path));
   const subtreeAtts = new Map<string, TFile>();
@@ -189,6 +219,24 @@ async function purgeSubtreePlaintext(
     try { await app.vault.delete(af); }
     catch (e) { console.warn("[Stashpad] couldn't delete exclusive attachment", path, e); unpurged.push(path); }
   }
+  // Companion sidecars: same mid-op edit guard, then permanent delete (the blob
+  // holds the recoverable copy). A companion we can't remove is still readable
+  // plaintext, so it's reported as unpurged like any other.
+  for (const cf of companions) {
+    const baseline = mtimes?.get(cf.path);
+    if (baseline != null) {
+      try {
+        const st = await app.vault.adapter.stat(cf.path);
+        if (st && st.mtime !== baseline) {
+          console.warn("[Stashpad] companion changed since it was bundled — keeping plaintext", cf.path);
+          unpurged.push(cf.path);
+          continue;
+        }
+      } catch { /* stat failed — fall through and let delete try */ }
+    }
+    try { await app.vault.delete(cf); }
+    catch (e) { console.warn("[Stashpad] couldn't delete companion sidecar", cf.path, e); unpurged.push(cf.path); }
+  }
   return { unpurged };
 }
 
@@ -197,7 +245,7 @@ async function purgeSubtreePlaintext(
  *  THEN trash the plaintext note files. Returns info for a placeholder. */
 export async function lockSubtree(
   app: App, folder: string, rootId: StashpadId, dek: Uint8Array, prevSibling: StashpadId | null = null,
-  hideTitle = false, blobFolder?: string,
+  hideTitle = false, blobFolder?: string, companionExts: string[] = [],
 ): Promise<LockResult> {
   const sub = await collectSubtree(app, folder, rootId);
   if (!sub) throw new Error("Couldn't find that note to lock.");
@@ -206,6 +254,11 @@ export async function lockSubtree(
   // Baseline mtimes BEFORE bundling — purge skips any file edited after this
   // point (its newer content isn't in the blob and must not be destroyed).
   const allNodes = [rootNote, ...descendants];
+  // 0.277.0: resolve each note's companions ONCE so the bundle set === the purge
+  // set (a companion bundled but not purged would leave the leak; one purged but
+  // not bundled would lose the history).
+  const companionsByPath = new Map<string, TFile[]>();
+  const allCompanions: TFile[] = [];
   const mtimes = new Map<string, number>();
   for (const n of allNodes) {
     try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline → delete proceeds unguarded */ }
@@ -214,11 +267,17 @@ export async function lockSubtree(
     for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
       try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
     }
+    const comps = companionFilesFor(app, n.file, companionExts);
+    companionsByPath.set(n.file.path, comps);
+    for (const cf of comps) {
+      allCompanions.push(cf);
+      try { const st = await app.vault.adapter.stat(cf.path); if (st) mtimes.set(cf.path, st.mtime); } catch { /* no baseline */ }
+    }
   }
 
   const zip = await buildStashZip(app, {
-    rootNotes: [{ id: rootNote.id, file: rootNote.file }],
-    allDescendants: descendants.map((d) => ({ id: d.id, file: d.file })),
+    rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
+    allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
   });
   const blob = await encryptWithKey(zip, dek);
@@ -259,7 +318,7 @@ export async function lockSubtree(
   // now PERMANENTLY delete the plaintext originals (notes + subtree-exclusive
   // attachments). The blob is the recoverable copy. See purgeSubtreePlaintext
   // for the why-not-trash rationale.
-  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes);
+  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions);
 
   return { blobPath, noteCount: all.length, rootId, parentId, title: meta.title, created: rootNote.created, unpurged };
 }
@@ -382,23 +441,33 @@ export async function deleteEncryptSubtree(
   /** 0.137.0: where the blob lands. Defaults to the legacy vault-level
    *  `_deleted/`; per-folder trash passes `<folder>/trash`. */
   destDir: string = DELETED_DIR,
+  /** 0.277.0: companion sidecar extensions to bundle + purge with each note. */
+  companionExts: string[] = [],
 ): Promise<{ blobPath: string; noteCount: number; rootId: StashpadId; originalFolder: string; title: string; unpurged: string[] }> {
   const sub = await collectSubtree(app, folder, rootId);
   if (!sub) throw new Error("Couldn't find that note to delete.");
   const { rootNote, descendants, parentId } = sub;
 
   const allNodes = [rootNote, ...descendants];
+  const companionsByPath = new Map<string, TFile[]>();
+  const allCompanions: TFile[] = [];
   const mtimes = new Map<string, number>();
   for (const n of allNodes) {
     try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline */ }
     for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
       try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
     }
+    const comps = companionFilesFor(app, n.file, companionExts);
+    companionsByPath.set(n.file.path, comps);
+    for (const cf of comps) {
+      allCompanions.push(cf);
+      try { const st = await app.vault.adapter.stat(cf.path); if (st) mtimes.set(cf.path, st.mtime); } catch { /* no baseline */ }
+    }
   }
 
   const zip = await buildStashZip(app, {
-    rootNotes: [{ id: rootNote.id, file: rootNote.file }],
-    allDescendants: descendants.map((d) => ({ id: d.id, file: d.file })),
+    rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
+    allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
   });
   const blob = await encryptWithKey(zip, dek);
@@ -444,7 +513,7 @@ export async function deleteEncryptSubtree(
     throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
   }
 
-  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes);
+  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions);
   return { blobPath, noteCount: all.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
 }
 
@@ -481,23 +550,35 @@ export async function readDeletedMeta(app: App, blobPath: string): Promise<Delet
  *  nothing to hide — it's plaintext). */
 export async function deletePlaintextSubtree(
   app: App, folder: string, rootId: StashpadId, deletedAt: string, destDir: string,
+  /** 0.277.0: companion sidecars ride into the plaintext bundle + are removed with
+   *  the note, so a deleted note never strands its `.edtz` (and restore brings it
+   *  back). Plaintext bundle, so this is about correctness/cleanup, not secrecy. */
+  companionExts: string[] = [],
 ): Promise<{ blobPath: string; noteCount: number; rootId: StashpadId; originalFolder: string; title: string; unpurged: string[] }> {
   const sub = await collectSubtree(app, folder, rootId);
   if (!sub) throw new Error("Couldn't find that note to delete.");
   const { rootNote, descendants, parentId } = sub;
 
   const allNodes = [rootNote, ...descendants];
+  const companionsByPath = new Map<string, TFile[]>();
+  const allCompanions: TFile[] = [];
   const mtimes = new Map<string, number>();
   for (const n of allNodes) {
     try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline */ }
     for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
       try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
     }
+    const comps = companionFilesFor(app, n.file, companionExts);
+    companionsByPath.set(n.file.path, comps);
+    for (const cf of comps) {
+      allCompanions.push(cf);
+      try { const st = await app.vault.adapter.stat(cf.path); if (st) mtimes.set(cf.path, st.mtime); } catch { /* no baseline */ }
+    }
   }
 
   const zip = await buildStashZip(app, {
-    rootNotes: [{ id: rootNote.id, file: rootNote.file }],
-    allDescendants: descendants.map((d) => ({ id: d.id, file: d.file })),
+    rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
+    allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
   });
 
@@ -531,7 +612,7 @@ export async function deletePlaintextSubtree(
     throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
   }
 
-  const { unpurged } = await purgeSubtreePlaintext(app, allNodes, mtimes);
+  const { unpurged } = await purgeSubtreePlaintext(app, allNodes, mtimes, allCompanions);
   return { blobPath, noteCount: allNodes.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
 }
 
@@ -785,6 +866,57 @@ export async function lockRawFolder(app: App, folder: string, dek: Uint8Array, k
     }
   }
   return { blobPath, fileCount: files.length, unpurged };
+}
+
+/** 0.277.1: encrypt a SINGLE loose file in place into a standalone `.stashenc`
+ *  (kind:"rawfolder", so the existing `unlockRawFolder` + "Decrypt a folder
+ *  bundle…" picker restore it), then delete the plaintext. Used by the orphaned-
+ *  companion sweep for the rare case where a plaintext companion's owning note is
+ *  gone entirely (no blob to fold it into) — it still gets protected rather than
+ *  left readable or deleted. RAM-first + verify-before-purge, like every lock. */
+export async function lockLooseFile(
+  app: App, filePath: string, dek: Uint8Array, keyId: string | undefined, stamp: string,
+): Promise<{ blobPath: string }> {
+  const folder = filePath.replace(/\/[^/]*$/, "").replace(/\/+$/, "");
+  const name = filePath.slice(filePath.lastIndexOf("/") + 1);
+  if (!name) throw new Error("Bad companion path.");
+  let baseline: number | null = null;
+  try { const st = await app.vault.adapter.stat(filePath); if (st) baseline = st.mtime; } catch { /* no baseline */ }
+  const entries = [{ name: `files/${name}`, data: await app.vault.adapter.readBinary(filePath) }];
+  const zipBytes = await zipFiles(entries);
+  const blob = await encryptWithKey(zipBytes, dek);
+  const back = await decryptWithKey(blob, dek);
+  if (back.length !== zipBytes.length) throw new Error("Encryption self-check failed (size).");
+  for (let i = 0; i < zipBytes.length; i++) if (back[i] !== zipBytes[i]) throw new Error("Encryption self-check failed (content).");
+  const base = safeBlobBase(name.replace(/\.[^./]*$/, "") || "companion");
+  let blobPath = `${folder}/${base}.${STASHENC_EXT}`;
+  for (let n = 1; await app.vault.adapter.exists(blobPath); n++) blobPath = `${folder}/${base} (${n}).${STASHENC_EXT}`;
+  await writeBlobVerified(app, blobPath, blob);
+  const meta: DeletedMeta = { v: 1, kind: "rawfolder", originalFolder: folder, parentId: null, title: name, count: 1, created: stamp, rootId: "", deletedAt: stamp, ...(keyId ? { keyId } : {}) };
+  try { await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta)); }
+  catch (e) {
+    console.warn("[Stashpad] couldn't write loose-companion sidecar — aborting, keeping plaintext", e);
+    try { await app.vault.adapter.remove(blobPath); } catch { /* leave orphan blob; plaintext safe */ }
+    throw new Error("Couldn't write companion metadata — nothing was deleted.");
+  }
+  // Mid-op edit guard: don't destroy a newer copy than the one we bundled.
+  if (baseline != null) {
+    try { const st = await app.vault.adapter.stat(filePath); if (st && st.mtime !== baseline) throw new Error("changed"); }
+    catch (e) {
+      if ((e as Error).message === "changed") {
+        console.warn("[Stashpad] companion changed mid-lock — keeping plaintext", filePath);
+        try { await app.vault.adapter.remove(blobPath); await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* */ }
+        throw new Error("The companion changed during encryption — nothing was deleted.");
+      }
+    }
+  }
+  try { await app.vault.adapter.remove(filePath); }
+  catch (e) {
+    // Blob is good but plaintext couldn't be removed — surface, don't silently claim success.
+    console.warn("[Stashpad] couldn't delete plaintext companion after locking", filePath, e);
+    throw new Error(`Encrypted the companion but couldn't remove its plaintext (${(e as Error).message}).`);
+  }
+  return { blobPath };
 }
 
 /** Decrypt a kind:"rawfolder" bundle back into its folder, then remove the blob +

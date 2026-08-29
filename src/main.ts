@@ -13,8 +13,8 @@ import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelI
 import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup} from "./modals";
+import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
+import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
 import { writeClipboardText } from "./cross-vault-clipboard";
@@ -3020,6 +3020,11 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-encrypt-applicable",
       name: "Encrypt (lock) everything applicable (re-encrypt sweep)",
       callback: () => void this.encryptEverythingApplicable(),
+    });
+    this.addCommand({
+      id: "stashpad-encrypt-all-now",
+      name: "Encrypt everything now (one-click, blocking)",
+      callback: () => void this.encryptAllNow(),
     });
     // (0.143.0: the "Encrypt existing Obsidian trash" command is gone with the
     // vault-DEK trash sweep — encryption is per-folder now.)
@@ -6054,8 +6059,12 @@ export default class StashpadPlugin extends Plugin {
    *  currently plaintext (watchlist entries ∪ prefs-derived candidates), show
    *  ONE review modal (per-subtree rows, pre-ticked), and lock what's confirmed.
    *  Nothing encrypts without this explicit confirmation. */
-  async encryptEverythingApplicable(): Promise<void> {
-    if (this.pruneReEncryptWatch()) await this.saveSettings(); // no ghosts in the sweep
+  /** 0.277.0: the full set of "should be encrypted but is currently plaintext"
+   *  candidates — the watchlist (unlocked/restored), folders set to encrypt their
+   *  notes, and folders that encrypt their archive. Shared by the review sweep
+   *  (`encryptEverythingApplicable`, deselectable) and the one-click blocking
+   *  Encrypt-all button (`encryptAllNow`, runs them all). */
+  collectEncryptAllCandidates(): { label: string; detail: string; run: () => Promise<boolean> }[] {
     type Cand = { label: string; detail: string; run: () => Promise<boolean> };
     const cands: Cand[] = [];
     // (a) watchlist: previously-encrypted subtrees now plaintext.
@@ -6091,6 +6100,120 @@ export default class StashpadPlugin extends Plugin {
         run: async () => { await this.encryptExistingArchiveNotes(folder); return true; },
       });
     }
+    // (d) 0.277.1: orphaned plaintext companion sidecars — a `.edtz` (etc.) left
+    // next to a note that was locked BEFORE companion encryption existed, so its
+    // plaintext history still sits readable on disk. Fold each back into its note's
+    // blob (unlock+relock) where recoverable, else encrypt it standalone.
+    const exts = (this.settings.encryptCompanionExts ?? []).map((e) => e?.trim()).filter(Boolean);
+    for (const { folder, orphans } of this.findOrphanedCompanions()) {
+      const n = orphans.length;
+      cands.push({
+        label: `${n} orphaned companion sidecar${n === 1 ? "" : "s"} in “${folder.split("/").pop() || folder}”`,
+        detail: `${folder} — plaintext ${exts.join(", ")} left next to an already-locked note`,
+        run: async () => { const r = await this.foldOrphanedCompanions(folder); return r.failed === 0; },
+      });
+    }
+    return cands;
+  }
+
+  /** 0.277.1: survey plaintext companion sidecars whose owning note is NOT present
+   *  as plaintext in the same folder — i.e. left behind when the note was locked
+   *  (or deleted) before companion encryption. One pass over the vault; returns the
+   *  orphan file paths grouped by folder (the counts feed the sweep confirm). Scope
+   *  is Stashpad-managed folders only (in `folderEncPrefs`, or holding a `.stashenc`)
+   *  so unrelated `.edtz` elsewhere in the vault are never touched. */
+  findOrphanedCompanions(): { folder: string; orphans: string[] }[] {
+    const exts = (this.settings.encryptCompanionExts ?? [])
+      .map((e) => e?.trim()).filter((e): e is string => !!e)
+      .map((e) => (e.startsWith(".") ? e : `.${e}`));
+    if (!exts.length) return [];
+    const managed = new Set<string>(Object.keys(this.settings.folderEncPrefs ?? {}).map((f) => f.replace(/\/+$/, "")));
+    const byFolder = new Map<string, string[]>(); // folder -> companion file paths
+    const extFor = (name: string): string | null => {
+      const lower = name.toLowerCase();
+      return exts.find((e) => lower.endsWith(e.toLowerCase())) ?? null;
+    };
+    for (const f of this.app.vault.getFiles()) {
+      const folder = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (f.extension === "stashenc") managed.add(folder);
+      if (extFor(f.name)) { const arr = byFolder.get(folder) ?? []; arr.push(f.path); byFolder.set(folder, arr); }
+    }
+    const out: { folder: string; orphans: string[] }[] = [];
+    for (const [folder, paths] of byFolder) {
+      if (!managed.has(folder)) continue;
+      const orphans = paths.filter((p) => {
+        const name = p.slice(p.lastIndexOf("/") + 1);
+        const ext = extFor(name)!;
+        const base = name.slice(0, name.length - ext.length);
+        const notePath = folder ? `${folder}/${base}.md` : `${base}.md`;
+        return !this.app.vault.getAbstractFileByPath(notePath);
+      });
+      if (orphans.length) out.push({ folder, orphans });
+    }
+    return out;
+  }
+
+  /** 0.277.1: re-protect a folder's orphaned companion sidecars. For each locked
+   *  blob in the folder: unlock it (the note comes back plaintext, its companion
+   *  re-matches by basename) then re-lock the same subtree (which now bundles the
+   *  companion inside the blob and purges the plaintext) — folding it back where it
+   *  belongs. Any companion still note-less after cycling every blob (its note was
+   *  truly deleted) is encrypted standalone so it isn't left readable. Cheap: the
+   *  folder key is unlocked once, and re-locks are AES-only (no re-KDF). Stops as
+   *  soon as no orphans remain, so a single stray companion doesn't re-cycle a
+   *  whole folder needlessly. */
+  async foldOrphanedCompanions(folder: string): Promise<{ folded: number; standalone: number; failed: number }> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const dek = await this.ensureFolderUnlocked(cleaned);
+    if (!dek) return { folded: 0, standalone: 0, failed: 0 };
+    const exts = (this.settings.encryptCompanionExts ?? [])
+      .map((e) => e?.trim()).filter((e): e is string => !!e)
+      .map((e) => (e.startsWith(".") ? e : `.${e}`));
+    const orphanFilesNow = (): string[] => {
+      const out: string[] = [];
+      for (const f of this.app.vault.getFiles()) {
+        if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
+        const lower = f.name.toLowerCase();
+        const ext = exts.find((e) => lower.endsWith(e.toLowerCase()));
+        if (!ext) continue;
+        const base = f.name.slice(0, f.name.length - ext.length);
+        if (!this.app.vault.getAbstractFileByPath(`${cleaned}/${base}.md`)) out.push(f.path);
+      }
+      return out;
+    };
+    const beforeCount = orphanFilesNow().length;
+    let failed = 0;
+    // Fold: cycle each blob (unlock -> relock the subtree) until no orphans remain.
+    const blobs = this.app.vault.getFiles()
+      .filter((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned)
+      .map((f) => f.path);
+    for (const blob of blobs) {
+      if (orphanFilesNow().length === 0) break;
+      let rootId: StashpadId | undefined;
+      try { rootId = (await readLockedMeta(this.app, blob))?.rootId as StashpadId | undefined; } catch { /* unreadable meta */ }
+      if (!rootId) continue; // not a note-subtree blob (e.g. a rawfolder bundle) — skip
+      try {
+        if (await this.unlockBundleAt(blob, { silent: true })) {
+          await this.lockNoteSubtree(cleaned, rootId, null, { silent: true });
+        }
+      } catch (e) { console.warn("[Stashpad] orphan-fold cycle failed", blob, e); failed++; }
+    }
+    const afterFold = orphanFilesNow();
+    const folded = beforeCount - afterFold.length;
+    // Standalone: any companion whose note is gone entirely → encrypt in place.
+    let standalone = 0;
+    const keyId = this.encryption.folderKeyEntry(cleaned)?.keyId;
+    const stamp = new Date().toISOString();
+    for (const path of afterFold) {
+      try { await lockLooseFile(this.app, path, dek, keyId, stamp); standalone++; }
+      catch (e) { console.warn("[Stashpad] standalone companion lock failed", path, e); failed++; }
+    }
+    return { folded, standalone, failed };
+  }
+
+  async encryptEverythingApplicable(): Promise<void> {
+    if (this.pruneReEncryptWatch()) await this.saveSettings(); // no ghosts in the sweep
+    const cands = this.collectEncryptAllCandidates();
     if (cands.length === 0) { new Notice("Nothing needs re-encrypting — everything applicable is already locked."); return; }
     new ReEncryptReviewModal(this.app, cands.map(({ label, detail }) => ({ label, detail })), async (chosen) => {
       let ok = 0, failed = 0;
@@ -6103,6 +6226,37 @@ export default class StashpadPlugin extends Plugin {
       prog?.hide();
       this.notifications.show({ message: `Re-encrypt sweep: ${ok} done${failed ? `, ${failed} FAILED (see console)` : ""}, ${cands.length - chosen.length} skipped.`, kind: failed ? "warning" : "success", category: "system", folder: "" });
     }).open();
+  }
+
+  /** 0.277.0: the one-click Encrypt-all button. Confirm (naming what it sweeps +
+   *  the sync-pause suggestion) → a BLOCKING overlay that freezes the Stashpad UI
+   *  → run the FULL candidate set (no deselect) → acknowledge. Atomic-safe writes
+   *  (each lock writes+verifies the blob before trashing plaintext) mean an
+   *  interruption never loses data. Does NOT touch Obsidian's sync API. */
+  async encryptAllNow(): Promise<void> {
+    if (!this.encryption.isConfigured() && !this.encryption.hasAnyFolderKey()) {
+      new Notice("Set up encryption first — give a folder a password (Settings → Stashpad → Encryption).");
+      return;
+    }
+    if (this.pruneReEncryptWatch()) await this.saveSettings(); // no ghosts in the sweep
+    const cands = this.collectEncryptAllCandidates();
+    if (cands.length === 0) { new Notice("Nothing needs encrypting — everything applicable is already locked."); return; }
+    const exts = (this.settings.encryptCompanionExts ?? []).filter((e) => !!e?.trim());
+    new EncryptAllModal(
+      this.app,
+      cands.map(({ label, detail }) => ({ label, detail })),
+      exts,
+      async (onProgress) => {
+        let ok = 0, failed = 0;
+        for (let i = 0; i < cands.length; i++) {
+          onProgress(i, cands[i].label);
+          try { (await cands[i].run()) ? ok++ : failed++; }
+          catch (e) { failed++; console.warn("[Stashpad] encrypt-all item failed", cands[i].label, e); }
+        }
+        this.notifications.show({ message: `Encrypt-all: ${ok} done${failed ? `, ${failed} FAILED (see console)` : ""}.`, kind: failed ? "warning" : "success", category: "system", folder: "" });
+        return { ok, failed };
+      },
+    ).open();
   }
 
   async lockNoteSubtree(folder: string, rootId: StashpadId, prevSibling: StashpadId | null = null, opts: { silent?: boolean; blobFolder?: string; hideTitle?: boolean } = {}): Promise<LockResult | null> {
@@ -6129,7 +6283,7 @@ export default class StashpadPlugin extends Plugin {
         const v = leaf.view as { flushFrontmatterSync?: () => Promise<void> };
         if (typeof v.flushFrontmatterSync === "function") await v.flushFrontmatterSync();
       }
-      const r = await lockSubtree(this.app, folder, rootId, dek, prevSibling, hideTitle, opts.blobFolder);
+      const r = await lockSubtree(this.app, folder, rootId, dek, prevSibling, hideTitle, opts.blobFolder, this.settings.encryptCompanionExts ?? []);
       this.pendingEncBlobs.add(r.blobPath); // fast-state index: cover the pre-vault-index window
       // 0.211.6 (L7): a hide-title lock removes the plaintext file, but a structure
       // snapshot written moments earlier still holds that note's title — and the
@@ -6542,7 +6696,7 @@ export default class StashpadPlugin extends Plugin {
       // 0.137.0 (per-folder trash): the blob lands in THIS folder's own trash/
       // subfolder instead of the vault-level _deleted/ (which stays readable
       // for legacy blobs until they're restored or migrated).
-      const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle, keyId, trashSubfolderOf(folder));
+      const r = await deleteEncryptSubtree(this.app, folder, rootId, dek, deletedAt, hideTitle, keyId, trashSubfolderOf(folder), this.settings.encryptCompanionExts ?? []);
       this.pendingEncBlobs.add(r.blobPath); // fast-state index
       // 0.138.0: secure-deleted → no longer plaintext, so off the watchlist.
       this.unwatchReEncrypt(folder, rootId);
@@ -6564,7 +6718,7 @@ export default class StashpadPlugin extends Plugin {
   async plaintextDeleteSubtree(folder: string, rootId: StashpadId): Promise<string | null> {
     try {
       const deletedAt = new Date().toISOString();
-      const r = await deletePlaintextSubtree(this.app, folder, rootId, deletedAt, trashSubfolderOf(folder));
+      const r = await deletePlaintextSubtree(this.app, folder, rootId, deletedAt, trashSubfolderOf(folder), this.settings.encryptCompanionExts ?? []);
       this.unwatchReEncrypt(folder, rootId); // no longer in the folder
       if (r.unpurged.length > 0) {
         new Notice(`⚠️ Sent to trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in place (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);

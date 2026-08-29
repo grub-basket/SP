@@ -459,6 +459,12 @@ export interface StashpadSettings {
    *  show a "Viewed" bucket. Off by default — opens are frequent and would grow
    *  the action log noticeably; only turn on if you want view tracking. */
   logNoteOpens: boolean;
+  /** 0.276.10: companion/sidecar file extensions (leading dot) that Stashpad
+   *  should encrypt ALONGSIDE a note when locking it, so plaintext history left
+   *  by other plugins doesn't linger. Default [".edtz"] (Edit History plugin).
+   *  See docs/security-findings.md (2026-08-29). The packaging/restore change
+   *  that consumes this is the focused next step; the setting is groundwork. */
+  encryptCompanionExts: string[];
   /** 0.98.25 (Phase 4): archive folders — notes MOVED into one of these Stashpad
    *  folders are automatically encrypted (locked). Opt-in per folder via the
    *  folder panel; requires an explicit confirm when marking (lock permanently
@@ -894,6 +900,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   taskTagChips: [],
   taskTagSuggestions: [],
   logNoteOpens: false,
+  encryptCompanionExts: [".edtz"],
   archiveFolders: [],
   folderEncPrefs: {},
   folderIcons: {},
@@ -1396,6 +1403,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         "Recurring tasks are EXPERIMENTAL. Repeat rules work, but they are not thoroughly tested across time zones, missed occurrences, or multi-device sync. Don't rely on them for anything with real consequences — keep a reminder you trust for deadlines that matter. A one-off due date and reminder is the well-trodden path.",
         "Very large folders (many thousands of notes in one Stashpad) can be slow to first paint; the render cache warms after the first visit.",
         "Encryption protects note contents at rest in your vault — it is not a substitute for full-disk encryption or a password manager.",
+        "Encryption locks a note's FILE on disk (into a .stashenc bundle); it is NOT a “decrypted-in-RAM-only” model. So while a note is plaintext — before you lock it, or after you unlock it — other software may keep plaintext copies that Stashpad can't reach: Obsidian's File Recovery snapshots and Sync version history, other plugins' sidecar files (e.g. the Edit History plugin's .edtz), and OS-level backups (Time Machine, etc.). Encrypting a note does not retroactively purge those. Treat encryption as protecting a locked note going forward, not as guaranteeing no plaintext trace ever existed.",
         "Mobile supports the core outliner, but some desktop-only affordances (drag-to-reorder, pop-out windows) differ or are unavailable.",
       ]) ul.createEl("li", { text: line });
     }, ["limitations", "known issues", "bugs", "caveats"]));
@@ -2485,6 +2493,48 @@ export class StashpadSettingTab extends PluginSettingTab {
         "Deleting a note normally sends it to that folder's own “trash” subfolder — encrypted if the folder encrypts its trash — and it's recoverable from the Trash view. Set a folder's “Trash handling” to “Obsidian native trash” to use Obsidian's plain deleted-files behavior instead (Stashpad can't encrypt or recover those).");
       infoItem("No recovery",
         "There is no backdoor and no reset. If a password is lost, everything encrypted under it is gone — so keep your own unencrypted backups of anything you can't afford to lose.");
+
+      // 0.277.2: which companion/sidecar extensions get encrypted alongside a note
+      // (default `.edtz` = the Edit History plugin). Comma/space-separated; each is
+      // normalized to a leading dot. `.md` is rejected — a companion is matched as
+      // `<noteBasename><ext>`, so `.md` would resolve to the note file itself.
+      new Setting(host).setName("Companion files to encrypt")
+        .setDesc("Sidecar files other plugins keep next to a note (matched as “<note><ext>” in the same folder) that should be locked inside the note's encrypted bundle and restored on unlock. Default “.edtz” covers the Edit History plugin. Comma-separated; leave blank to encrypt none.")
+        .addText((t) => {
+          t.setPlaceholder(".edtz, .vhistory")
+            .setValue((this.plugin.settings.encryptCompanionExts ?? []).join(", "));
+          const commit = async (): Promise<void> => {
+            const raw = t.getValue();
+            const seen = new Set<string>();
+            const cleaned: string[] = [];
+            const rejected: string[] = [];
+            for (const tok of raw.split(/[\s,]+/)) {
+              const s = tok.trim();
+              if (!s) continue;
+              const ext = (s.startsWith(".") ? s : `.${s}`).toLowerCase();
+              if (ext === ".md") { rejected.push(ext); continue; } // would match the note itself
+              if (!/^\.[a-z0-9][a-z0-9._-]*$/.test(ext)) { rejected.push(s); continue; }
+              if (seen.has(ext)) continue;
+              seen.add(ext); cleaned.push(ext);
+            }
+            this.plugin.settings.encryptCompanionExts = cleaned;
+            await this.plugin.saveSettings();
+            t.setValue(cleaned.join(", ")); // reflect the normalized value
+            if (rejected.length) new Notice(`Ignored invalid companion extension${rejected.length === 1 ? "" : "s"}: ${rejected.join(", ")}${rejected.includes(".md") ? " (a note can't be its own companion)" : ""}.`);
+          };
+          t.inputEl.addEventListener("blur", () => void commit());
+          t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
+        });
+
+      // 0.277.0: one-click Encrypt-all — confirm (naming what it sweeps) → a
+      // blocking overlay that freezes the Stashpad UI → lock the full applicable
+      // set (watchlist + folders set to encrypt notes/archive) → acknowledge.
+      // Shown once any folder is keyed (nothing to sweep otherwise).
+      if (enc.hasAnyFolderKey()) {
+        new Setting(host).setName("Encrypt everything now")
+          .setDesc("Locks everything that should be encrypted but is currently plaintext — notes you unlocked or restored, and any folder set to encrypt its notes or archive — in one pass. You confirm what it will sweep first; the UI is frozen while it runs. Companion sidecars (e.g. Edit History .edtz) are encrypted alongside their notes.")
+          .addButton((b) => b.setButtonText("Encrypt everything now").setCta().onClick(() => void this.plugin.encryptAllNow()));
+      }
 
       // 0.143.0: encryption is strictly per-folder now — set / unlock / change /
       // recover passwords per folder under "Per-Folder Passwords" below. This
