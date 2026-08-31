@@ -16,6 +16,7 @@ import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
 import { DEFAULT_STOPWORDS } from "./slug-service";
 import { newId } from "./id-service";
+import { COPY_TS_MODIFIER_ORDER, type CopyTsModifier, parseModifierTokens, serializeModifierTokens, copyTimestampStatus, humanCombo } from "./view-keys";
 import { formatDateTime } from "./format";
 import { type EncryptionConfig, defaultEncryptionConfig } from "./encryption-service";
 import { getActiveView } from "./active-view";
@@ -339,7 +340,11 @@ export interface StashpadSettings {
    *  demand, and the canonical id/parent is unaffected. */
   writeRecoveryLinks: boolean;
   useTemplatesFormat: boolean;
-  prefixTimestampsOnCopy: boolean;
+  /** 0.278.0 — modifier gesture that adds each note's timestamp when copying.
+   *  Stored as a canonical `+`-joined subset of "mod"/"ctrl"/"alt"/"shift"
+   *  (see COPY_TS_MODIFIER_ORDER); empty string = off (copies never include
+   *  timestamps). Replaces the old boolean `prefixTimestampsOnCopy` toggle. */
+  copyTimestampModifiers: string;
   splitOnLines: boolean;
   /** Delimiter used when split-on-submit is on (and the Split modal's default
    *  preset): each line, blank-line paragraphs, or Markdown headings. */
@@ -873,7 +878,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   linkPreviewAuto: false,
   linkPreviewCollapsed: false,
   useTemplatesFormat: false,
-  prefixTimestampsOnCopy: true,
+  copyTimestampModifiers: "",
   splitOnLines: false,
   splitMode: "lines",
   confirmCrossParentDrag: true,
@@ -1594,6 +1599,42 @@ export class StashpadSettingTab extends PluginSettingTab {
         }
       },
       ["quick", "menu", "star", "actions", "shortcut", "copy", "move", "blur", "large text"],
+    );
+  }
+
+  /** 0.278.0: timestamps-when-copying as a MODIFIER gesture instead of a plain
+   *  toggle. Copies never include timestamps by default; holding the configured
+   *  modifier(s) while copying (keyboard shortcut, or while clicking the menu's
+   *  "Copy"/"Copy tree" items) adds each note's timestamp. No modifiers picked =
+   *  off. A live status line reports whether the keyboard path will actually fire
+   *  given the current Copy shortcut (adding a modifier already in that shortcut
+   *  can't form a distinct chord). See view-keys.ts copyTimestampStatus. */
+  private copyTimestampModifiersSection(): SettingDefinitionItem {
+    return this.sectionDef(
+      "Timestamps when copying",
+      "Copies don't include each note's timestamp unless you hold a modifier while copying. Pick which modifier(s) below — none = off. Works with the Copy / Copy tree keyboard shortcuts and with holding the modifier while clicking those items in the ⋮ menu.",
+      (host) => {
+        const chosen = new Set<CopyTsModifier>(parseModifierTokens(this.plugin.settings.copyTimestampModifiers));
+        for (const mod of COPY_TS_MODIFIER_ORDER) {
+          const label = humanCombo(mod);
+          const row = new Setting(host).setName(label);
+          row.addToggle((t) => t.setValue(chosen.has(mod)).onChange(async (on) => {
+            if (on) chosen.add(mod); else chosen.delete(mod);
+            this.plugin.settings.copyTimestampModifiers = serializeModifierTokens(chosen);
+            await this.plugin.saveSettings();
+            refreshStatus();
+          }));
+        }
+        // Below the toggles: whether the chosen combo will actually fire (keyboard
+        // path collapses if the modifier is already part of the Copy shortcut).
+        const statusEl = host.createEl("p", { cls: "stashpad-copy-ts-status" });
+        const refreshStatus = () => {
+          const mods = COPY_TS_MODIFIER_ORDER.filter((m) => chosen.has(m));
+          statusEl.setText(copyTimestampStatus(mods, this.plugin.settings.bindings?.copy));
+        };
+        refreshStatus();
+      },
+      ["copy", "timestamp", "prefix", "modifier", "shift", "alt", "ctrl", "cmd", "meta"],
     );
   }
 
@@ -2411,8 +2452,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.showEditorLineNumbers, (v) => { this.plugin.settings.showEditorLineNumbers = v; }, ["line", "number", "gutter", "editor", "count"]));
     cats.composerCopy.push(toggle("Auto-pair Markdown syntax", "Brackets, parentheses, quotes (double + single, at word starts only — apostrophes are safe), inline code, **bold**, ~~strikethrough~~ and ==highlight== markers auto-close with the caret between them. Select text first and the character WRAPS it instead of replacing it (press again to nest: [note] → [[note]], *word* → **word**). Typing the closing character steps over an existing one, and Backspace on an empty pair removes both. Applies to the composer and the edit/split textareas. On by default.",
       () => this.plugin.settings.autoPairBrackets, (v) => { this.plugin.settings.autoPairBrackets = v; }, ["bracket", "autopair", "wikilink", "close", "complete"]));
-    cats.composerCopy.push(toggle("Prefix timestamps when copying", "Include each note's timestamp before its body when copying with C or Y.",
-      () => this.plugin.settings.prefixTimestampsOnCopy, (v) => { this.plugin.settings.prefixTimestampsOnCopy = v; }, ["copy", "timestamp", "prefix"]));
+    cats.composerCopy.push(this.copyTimestampModifiersSection());
 
     return cats;
   }

@@ -3921,6 +3921,14 @@ body.is-mobile .stashpad-jd-actions .setting-item-control {
   padding-left: 14px;
   padding-right: 14px;
 }
+/* 0.278.0: live status line under the copy-timestamp modifier checkboxes. Muted,
+   sits below the toggles; inherits the section's 14px inset from the rule above. */
+.stashpad-copy-ts-status {
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+}
 /* 0.121.7 (#2): the live date sample read under-indented vs the rest — bump it
    a touch past the standard 14px. (Approximate — verify against live settings.) */
 .stashpad-settings-section .stashpad-date-sample {

@@ -3706,7 +3706,9 @@ export default class StashpadPlugin extends Plugin {
     // the new state. Booleans only — text/textarea/dropdown settings
     // stay in the Settings UI where they belong.
     const TOGGLES: Array<{ key: keyof StashpadSettings; label: string }> = [
-      { key: "prefixTimestampsOnCopy",    label: "Prefix timestamps when copying" },
+      // 0.278.0: "Prefix timestamps when copying" was a boolean; it's now the
+      // string-valued `copyTimestampModifiers` gesture, so it no longer mirrors
+      // as a palette toggle (booleans only).
       { key: "useTemplatesFormat",        label: "Use Templates plugin date/time formats" },
       { key: "splitCheckboxLines",        label: "Split a pasted checklist into tasks" },
       { key: "autoNavOnMoveIn",           label: "Auto-navigate into parent on move IN" },
@@ -9231,6 +9233,16 @@ export default class StashpadPlugin extends Plugin {
     if (typeof (data)?.pinnedIgnoreFilters === "boolean" && typeof (data)?.pinnedFilterMode !== "string") {
       (data).pinnedFilterMode = (data).pinnedIgnoreFilters ? "all" : "none";
       delete (data).pinnedIgnoreFilters;
+    }
+    // 0.278.0: the boolean `prefixTimestampsOnCopy` became the modifier gesture
+    // `copyTimestampModifiers`. There is no "always on" equivalent under the new
+    // model, so preserve the *capability* for someone who had timestamps on:
+    // seed the Shift modifier (hold Shift while copying to still get timestamps).
+    // A user who had it off maps to "" (off). Idempotent — only fires when the
+    // new key is absent.
+    if (typeof (data)?.prefixTimestampsOnCopy === "boolean" && typeof (data)?.copyTimestampModifiers !== "string") {
+      (data).copyTimestampModifiers = (data).prefixTimestampsOnCopy ? "shift" : "";
+      delete (data).prefixTimestampsOnCopy;
     }
     if (data?.shortcuts && data.shortcuts.openEditor === "E") data.shortcuts.openEditor = "Mod+Shift+E";
     if (data?.bindings?.openEditor && data.bindings.openEditor.primary === "E") data.bindings.openEditor.primary = "Mod+Shift+E";

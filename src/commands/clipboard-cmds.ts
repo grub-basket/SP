@@ -1,6 +1,5 @@
 import { Notice, SuggestModal } from "obsidian";
 import type { TreeNode } from "../types";
-import { getSettings } from "../settings";
 import { extractCodeBlocks } from "../view-helpers";
 import type { StashpadView } from "../view";
 
@@ -10,10 +9,10 @@ import type { StashpadView } from "../view";
  *  formatTimeInline, notifications, tree). Behavior is identical to when these
  *  lived inline as `cmd*` methods. */
 
-export async function cmdCopy(view: StashpadView): Promise<void> {
+export async function cmdCopy(view: StashpadView, withTimestamps = false): Promise<void> {
   const targets = view.getActionTargets();
   if (!targets.length) return;
-  const prefix = getSettings().prefixTimestampsOnCopy;
+  const prefix = withTimestamps;
   const out: string[] = [];
   for (const t of targets) {
     if (!t.file) continue;
@@ -38,7 +37,7 @@ export async function cmdCopy(view: StashpadView): Promise<void> {
   }
   await navigator.clipboard.writeText(joined);
   view.plugin.notifications.show({
-    message: `Copied ${view.titleListForCopy(targets)} to clipboard`,
+    message: `Copied ${view.titleListForCopy(targets, 3, withTimestamps)} to clipboard`,
     kind: "success",
     category: "system",
     affectedIds: targets.map((t) => t.id),
@@ -129,10 +128,10 @@ export async function cmdCopyCodeBlock(view: StashpadView): Promise<void> {
  *  the fallback could not fire. "Copy the focused subtree" now has its own
  *  entry point (`cmdCopyFocusedSubtree`) that means it, rather than being an
  *  unreachable branch of this one. */
-export async function cmdCopyTree(view: StashpadView): Promise<void> {
+export async function cmdCopyTree(view: StashpadView, withTimestamps = false): Promise<void> {
   const roots = view.getActionTargets();
   if (roots.length === 0) { new Notice("Nothing to copy."); return; }
-  await copyTreeFromRoots(view, roots);
+  await copyTreeFromRoots(view, roots, withTimestamps);
 }
 
 /** Copy the note you are currently INSIDE plus its whole subtree, regardless of
@@ -143,17 +142,17 @@ export async function cmdCopyTree(view: StashpadView): Promise<void> {
  *  but both ran the selection-based copy above — so it copied whichever child
  *  row was selected, which (since one always is) meant it never once did what
  *  its own name said. */
-export async function cmdCopyFocusedSubtree(view: StashpadView): Promise<void> {
+export async function cmdCopyFocusedSubtree(view: StashpadView, withTimestamps = false): Promise<void> {
   const focused = view.tree.get(view.focusId);
   if (!focused?.file) {
     new Notice("No focused note to copy — open a note first.");
     return;
   }
-  await copyTreeFromRoots(view, [focused]);
+  await copyTreeFromRoots(view, [focused], withTimestamps);
 }
 
-async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[]): Promise<void> {
-  const prefix = getSettings().prefixTimestampsOnCopy;
+async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[], withTimestamps = false): Promise<void> {
+  const prefix = withTimestamps;
   const lines: string[] = [];
   const walk = async (node: TreeNode, depth: number): Promise<void> => {
     if (node.file) {
@@ -178,7 +177,7 @@ async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[]): Promise
   view.plugin.noteClipboard = { mode: "copy", folder: view.noteFolder, ids: roots.map((r) => r.id), text: outline };
   view.render(); // paint the copy-pending tint
   view.plugin.notifications.show({
-    message: `Copied tree of ${view.titleListForCopy(roots)} (${lines.length} entries) — paste in the list to clone, in a note to drop the outline in`,
+    message: `Copied tree of ${view.titleListForCopy(roots, 3, withTimestamps)} (${lines.length} entries) — paste in the list to clone, in a note to drop the outline in`,
     kind: "success",
     category: "system",
     affectedIds: roots.map((r) => r.id),

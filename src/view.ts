@@ -38,7 +38,7 @@ import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
 import type { ImportNote } from "./text-importer";
 import { isAllCheckboxLines } from "./text-importer";
 import { ComposerAutocomplete } from "./composer-autocomplete";
-import { matchBinding, humanCombo } from "./view-keys";
+import { matchBinding, matchBindingWithMods, humanCombo, parseModifierTokens, eventHasMods } from "./view-keys";
 import { openAggregateView } from "./aggregate-view";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
@@ -4420,12 +4420,13 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Set due date…").setIcon("calendar-clock").setDisabled(!hasTargets).onClick(() => this.cmdSetDue()));
     menu.addItem((it: any) => it.setTitle("Assign to…").setIcon("user-plus").setDisabled(!hasTargets).onClick(() => this.cmdAssign()));
     menu.addSeparator();
-    // 0.246.0: say what the command will ACTUALLY do. "Prefix timestamps when
-    // copying" silently changes the output of these three, so a menu that
-    // always reads "Copy" misdescribes itself whenever the setting is on.
-    const tsSuffix = getSettings().prefixTimestampsOnCopy ? " with timestamps" : "";
-    menu.addItem((it: any) => it.setTitle(`Copy${tsSuffix}`).setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopy()));
-    menu.addItem((it: any) => it.setTitle(`Copy tree${tsSuffix}`).setIcon("copy-plus").setDisabled(!hasTargets).onClick(() => void this.cmdCopyTree()));
+    // 0.278.0: timestamps are a modifier gesture now (copyTimestampModifiers).
+    // Hint the modifier in the label, and read it off the click so holding it
+    // while picking the item includes timestamps.
+    const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
+    const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
+    menu.addItem((it: any) => it.setTitle(`Copy${tsHint}`).setIcon("copy").setDisabled(!hasTargets).onClick((evt: MouseEvent | KeyboardEvent) => void this.cmdCopy(eventHasMods(evt, tsMods))));
+    menu.addItem((it: any) => it.setTitle(`Copy tree${tsHint}`).setIcon("copy-plus").setDisabled(!hasTargets).onClick((evt: MouseEvent | KeyboardEvent) => void this.cmdCopyTree(eventHasMods(evt, tsMods))));
     // 0.214.0: plain Copy/Cut no longer build the cross-vault payload, so these
     // are the way notes travel between vaults — they need to be findable here,
     // not only in the command palette.
@@ -6436,8 +6437,8 @@ export class StashpadView extends ItemView {
    *  copying" on, the toast previewed something different from what was
    *  actually copied. A preview that does not match the clipboard is worse
    *  than no preview — it is a quiet lie about what you now have. */
-  titleListForCopy(nodes: TreeNode[], max = 3): string {
-    if (!getSettings().prefixTimestampsOnCopy) return this.titleList(nodes, max);
+  titleListForCopy(nodes: TreeNode[], max = 3, withTimestamps = false): string {
+    if (!withTimestamps) return this.titleList(nodes, max);
     const titles = nodes.map((n) => {
       const t = this.titleForNode(n).trim() || "(untitled)";
       return `"${this.formatTimeInline(n.created)} ${t}"`;
@@ -9065,6 +9066,10 @@ export class StashpadView extends ItemView {
     }
 
     const sb = getSettings().bindings;
+    // 0.278.0: modifiers that, when also held with Copy / Copy tree, include each
+    // note's timestamp. Empty = off. The base copy handlers below match first;
+    // holding these forms a distinct (augmented) chord that the base can't match.
+    const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
     // 0.99.12: PASTE fires regardless of selection/cursor — you can paste into
     // an empty parent, or right after navigating in with no cursor row. (Copy
     // and cut need a target, so they stay in the selection/cursor-gated block
@@ -9081,6 +9086,11 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.move)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdMovePicker(); return; }
       if (matchBinding(e, sb.pickMove)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInListPicker(); return; }
       if (matchBinding(e, sb.merge)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdMerge(); return; }
+      // Mods-augmented chord FIRST: a bare-key Copy binding (e.g. "C") matches
+      // via matchKey, which ignores Shift — so "Shift+C" would otherwise be
+      // swallowed by the base check before the timestamp variant is reached.
+      // Strict matchMod means the plain chord never matches this, so order is safe.
+      if (matchBindingWithMods(e, sb.copy, tsMods)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopy(true); return; }
       if (matchBinding(e, sb.copy)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopy(); return; }
       // 0.99.0 note clipboard. Copy/cut defer to the native clipboard when
       // text is highlighted (Mod+C on a text selection must stay normal copy);
@@ -9092,6 +9102,7 @@ export class StashpadView extends ItemView {
       // deliberate, occasional actions) — bindable in settings if wanted.
       if (matchBinding(e, sb.copyForOtherVault)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyForOtherVault(); return; }
       if (matchBinding(e, sb.cutForOtherVault)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCutForOtherVault(); return; }
+      if (matchBindingWithMods(e, sb.copyTree, tsMods)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyTree(true); return; }
       if (matchBinding(e, sb.copyTree)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyTree(); return; }
       if (matchBinding(e, sb.copyLink)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyStashpadLink(); return; }
       if (matchBinding(e, sb.copyOutline)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyOutline(); return; }
@@ -11244,10 +11255,10 @@ export class StashpadView extends ItemView {
   // Clipboard commands — implementations live in commands/clipboard-cmds.ts.
   // These thin delegators keep the public method names stable for the keydown
   // dispatcher + main.ts's call("<method>") palette wiring.
-  cmdCopy(): Promise<void> { return clipboardCmds.cmdCopy(this); }
+  cmdCopy(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopy(this, withTimestamps); }
   cmdCopyCodeBlock(): Promise<void> { return clipboardCmds.cmdCopyCodeBlock(this); }
-  cmdCopyTree(): Promise<void> { return clipboardCmds.cmdCopyTree(this); }
-  cmdCopyFocusedSubtree(): Promise<void> { return clipboardCmds.cmdCopyFocusedSubtree(this); }
+  cmdCopyTree(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyTree(this, withTimestamps); }
+  cmdCopyFocusedSubtree(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyFocusedSubtree(this, withTimestamps); }
   cmdCopyOutline(): Promise<void> { return clipboardCmds.cmdCopyOutline(this); }
 
   /** 0.193.0: reverse color-alias lookup — friendly name → hex for THIS folder.
@@ -12762,7 +12773,11 @@ export class StashpadView extends ItemView {
       // all children, 2-space indent per depth, optional time prefix), reading
       // the source subtree from disk since it isn't in this view's tree.
       const ordered = await this.plugin.orderedSubtreeNodes(srcFolder, rootIds);
-      const prefixTs = getSettings().prefixTimestampsOnCopy;
+      // 0.278.0: the copy MODIFIER gesture (copyTimestampModifiers) only governs
+      // clipboard copies. A pasted-outline artifact is permanent text, so it keeps
+      // a fixed timestamp prefix for provenance (restores pre-0.278 behavior, when
+      // this followed the default-on toggle). Revisit if a suppress option is wanted.
+      const prefixTs = true;
       const outline: string[] = [];
       for (const { file, created, depth } of ordered) {
         try {
@@ -12808,7 +12823,10 @@ export class StashpadView extends ItemView {
     // same format as the "Copy tree" command (2-space indent per depth, "- "
     // bullet, body flattened to one line, optional time prefix) — then delete
     // the originals (children-first = reverse pre-order).
-    const prefixTs = getSettings().prefixTimestampsOnCopy;
+    // 0.278.0: the copy MODIFIER gesture governs clipboard copies only. This
+    // drops a permanent outline artifact into the composer, so it keeps a fixed
+    // timestamp prefix for provenance (restores pre-0.278 default-on behavior).
+    const prefixTs = true;
     const lines: string[] = [];
     for (const { node, depth } of pre) {
       if (!node.file) continue;
@@ -17033,7 +17051,8 @@ export class StashpadView extends ItemView {
   }
   /** public: read by extracted command modules (commands/*.ts). */
   formatTimeInline(iso: string): string {
-    // Used by Copy / Copy tree when prefixTimestampsOnCopy is on. Includes
+    // Used by Copy / Copy tree when the timestamp modifier gesture is held
+    // (copyTimestampModifiers). Includes
     // seconds (display formatTime stops at minutes) so paste targets like
     // logs / chat threads keep ordering even within the same minute.
     if (!iso) return "";
@@ -17351,7 +17370,12 @@ export class StashpadView extends ItemView {
     // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
     // normalises selection to the right-clicked row.
     // 0.122.10: ordered above Clone so the plain "Copy text" reads first.
-    menu.addItem((it: any) => it.setTitle(`Copy text${getSettings().prefixTimestampsOnCopy ? " with timestamps" : ""}`).setIcon("copy").onClick(() => { focusClicked(); void this.cmdCopy(); }));
+    {
+      // 0.278.0: timestamps via modifier gesture — hint it and read it off the click.
+      const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
+      const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
+      menu.addItem((it: any) => it.setTitle(`Copy text${tsHint}`).setIcon("copy").onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopy(eventHasMods(evt, tsMods)); }));
+    }
     menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       focusClicked();
