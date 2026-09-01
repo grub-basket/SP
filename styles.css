@@ -5682,6 +5682,22 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 }
 .stashpad-triage-reset:hover, .stashpad-agg-reset:hover { background: var(--interactive-hover); color: var(--text-normal); }
 .stashpad-triage-reset .svg-icon, .stashpad-agg-reset .svg-icon { width: 14px; height: 14px; }
+/* Obsidian's mobile stylesheet re-pads every <button> (padding: 4px 20px).
+   With box-sizing: border-box that padding consumed this icon button's whole
+   content box, so the icon rendered at its full height and width 0 — present,
+   correctly coloured, invisible. Restate the geometry above `.is-mobile button`
+   and pin the icon so it can never be shrunk to nothing again. */
+.is-mobile .stashpad-triage-reset,
+.is-mobile .stashpad-agg-reset {
+  width: 28px; min-width: 28px; height: 26px;
+  padding: 0;
+  flex: 0 0 auto;
+}
+.is-mobile .stashpad-triage-reset .svg-icon,
+.is-mobile .stashpad-agg-reset .svg-icon {
+  width: 14px; min-width: 14px; height: 14px;
+  flex: 0 0 auto;
+}
 .stashpad-triage-authorwrap { position: relative; display: inline-flex; align-items: center; flex: 1 1 auto; min-width: 120px; max-width: 200px; }
 .stashpad-triage-authorwrap .stashpad-triage-authorsearch { flex: 1 1 auto; max-width: none; padding-right: 24px; }
 .stashpad-triage-authorclear {

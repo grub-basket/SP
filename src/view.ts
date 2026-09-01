@@ -398,6 +398,9 @@ export class StashpadView extends ItemView {
   /** public: read by ViewDnD (the host interface). */
   listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
+  /** Mobile only (0.278.2): watches for overlays (modals/menus) that the composer
+   *  textarea's native caret would paint over, so we can blur the composer. */
+  private caretGuardObserver: MutationObserver | null = null;
   // Composer controls whose appearance depends on split/enter mode. Held so a
   // mode toggle can update them IN PLACE instead of a full render() (which
   // rebuilds the list — scroll jump + collapses the button group).
@@ -1113,6 +1116,13 @@ export class StashpadView extends ItemView {
     // hasn't fired.
     this.registerDomEvent(window, "beforeunload", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
     this.registerDomEvent(window, "blur", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
+    // 0.278.2: mobile — the focused composer <textarea>'s NATIVE caret paints
+    // above overlays (the webview draws it on the top layer regardless of z-index),
+    // so it flashes over the sidebar drawers and over our custom modals (edit,
+    // conflict, etc.) that don't move focus to an input of their own. The only
+    // reliable fix is to drop focus — CSS can't hide a native caret on iOS. Blur
+    // the composer the moment an obscuring surface appears.
+    if (Platform.isMobile) this.setupComposerCaretGuard();
     // 0.132.0: on open, focus the composer only when opted in; otherwise focus
     // the LIST so arrow-key navigation works right away (composer no longer
     // grabs focus every time). focusComposer() self-gates on the same setting.
@@ -1465,6 +1475,10 @@ export class StashpadView extends ItemView {
       this.initialRenderTimer = null;
     }
     clearActiveView(this);
+    // 0.278.2: stop the mobile caret-guard overlay observer (touchstart is
+    // registerDomEvent, auto-cleaned).
+    this.caretGuardObserver?.disconnect();
+    this.caretGuardObserver = null;
     // Cancel any pending debounced render so it can't fire post-close (the
     // render() isConnected guard also catches it — belt and suspenders). 0.140.9
     (this.debouncedRender as any)?.cancel?.();
@@ -7433,6 +7447,49 @@ export class StashpadView extends ItemView {
     ].join("\u0000");
   }
 
+  /** Blur the composer if it currently holds focus — kills the native caret so
+   *  it can't paint above an overlay. Cheap no-op when the composer isn't focused. */
+  private blurComposerCaret(): void {
+    const ta = this.composerInputEl;
+    if (ta && ta.ownerDocument.activeElement === ta) ta.blur();
+  }
+
+  /** 0.278.2 (mobile): set up the two triggers that make the composer's native
+   *  caret stop painting over overlays. Registered once from onOpen; cleaned up
+   *  in onClose. See the onOpen call site for why blur (not CSS) is the fix. */
+  private setupComposerCaretGuard(): void {
+    // (1) Modals + menus: they mount as `.modal-container` / `.menu` appended to
+    //     <body>. Our custom modals (edit, conflict, …) often don't move focus to
+    //     an input, so the composer stays focused and its caret bleeds through.
+    const body = this.containerEl?.ownerDocument?.body ?? document.body;
+    this.caretGuardObserver?.disconnect();
+    this.caretGuardObserver = new MutationObserver((records) => {
+      for (const rec of records) {
+        for (const node of Array.from(rec.addedNodes)) {
+          if (!(node instanceof HTMLElement)) continue;
+          if (node.matches(".modal-container, .menu") || node.querySelector?.(".modal-container, .menu")) {
+            this.blurComposerCaret();
+            return;
+          }
+        }
+      }
+    });
+    this.caretGuardObserver.observe(body, { childList: true });
+    // (2) Sidebar drawer swipe: the drawer slides in from a screen edge while the
+    //     composer is still focused, so the caret flashes over it DURING the drag.
+    //     A drawer swipe begins in the edge gutter — blur pre-emptively when a
+    //     touch starts there, before the drawer moves. Edge-scoped so ordinary
+    //     in-content taps (which the toolbar already handles) aren't affected.
+    const EDGE = 28;
+    this.registerDomEvent(document, "touchstart", (e: TouchEvent) => {
+      if (!this.composerInputEl || document.activeElement !== this.composerInputEl) return;
+      const t = e.touches[0];
+      if (!t) return;
+      const w = window.innerWidth;
+      if (t.clientX <= EDGE || t.clientX >= w - EDGE) this.blurComposerCaret();
+    }, { capture: true, passive: true });
+  }
+
   private renderComposer(parent: HTMLElement): void {
     const settings = getSettings();
     const enterSubmits = this.modeEnterSubmits;
@@ -8062,6 +8119,11 @@ export class StashpadView extends ItemView {
       // broken" bug). dest covers explicit/remote destinations; otherwise it's
       // the level we're submitting from.
       const parent = dest ?? this.focusId;
+      // 0.279.0: sending a fresh note from the composer ends any prior
+      // multi-selection — leaving N unrelated rows selected after creating a new
+      // note is stale context (createNoteUnder's render below paints the cleared
+      // state). (User: "select multiple notes and create a new note → deselect".)
+      if (this.selection.size) this.selection.clear();
       if (split) {
         const lines = splitIntoChunks(sendText, getSettings().splitMode);
         if (lines.length === 1) {
@@ -16708,8 +16770,13 @@ export class StashpadView extends ItemView {
       // blank in the list, and its filename comes from the path rather than
       // from anything the user chose. A space rather than a newline keeps it
       // one line, so the note still reads as a single item.
+      // 0.279.0: link by BASENAME, not the full vault path. Attachment names are
+      // stamp-unique (buildAttachmentName), so a bare `![[leaf.png]]` resolves
+      // unambiguously the way Obsidian's own shortest-path links do — and the note
+      // reads clean instead of carrying a `_attachments/…` path. (User: "why is the
+      // whole path pasted in the internal link when an image is pasted?")
       const s = getSettings();
-      const ref = s.attachmentsEmbedded ? `![[${path}]]` : `[[${path}]]`;
+      const ref = s.attachmentsEmbedded ? `![[${leaf}]]` : `[[${leaf}]]`;
       return s.attachmentNamePrefix ? `${file.name} ${ref}` : ref;
     } catch (e) {
       new Notice(`Stashpad: attachment failed (${(e as Error).message})`);

@@ -961,7 +961,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureFolders: {},
   obscureAllScope: "device",
   obscureStyle: "blur",
-  attachmentNamePrefix: true,
+  attachmentNamePrefix: false, // 0.279.1: default OFF — undoes the 0.268.2 filename prefix (user: "we'll survive without the clutter")
   attachmentsEmbedded: true,
   railShowOutgoing: false,
   railShowBacklinks: false,
@@ -1614,6 +1614,14 @@ export class StashpadSettingTab extends PluginSettingTab {
       "Timestamps when copying",
       "Copies don't include each note's timestamp unless you hold a modifier while copying. Pick which modifier(s) below — none = off. Works with the Copy / Copy tree keyboard shortcuts and with holding the modifier while clicking those items in the ⋮ menu.",
       (host) => {
+        // sectionDef renders no chrome of its own (name/desc feed native search
+        // only), so draw this section's own heading + intro — matching how the
+        // toggle rows around it each carry a name + description. 0.278.2
+        new Setting(host).setName("Timestamps when copying").setHeading();
+        host.createEl("p", {
+          cls: "setting-item-description",
+          text: "Copies don't include each note's timestamp unless you hold a modifier while copying. Pick which modifier(s) below — none = off. Works with the Copy / Copy tree keyboard shortcuts, and with holding the modifier while choosing those items in the ⋮ menu.",
+        });
         const chosen = new Set<CopyTsModifier>(parseModifierTokens(this.plugin.settings.copyTimestampModifiers));
         for (const mod of COPY_TS_MODIFIER_ORDER) {
           const label = humanCombo(mod);
