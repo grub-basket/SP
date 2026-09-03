@@ -178,7 +178,10 @@ export async function renderActivityHeatmap(
     const c = bar.createEl("button", { cls: "stashpad-index-chip" + (state.buckets[b] ? " is-active" : "") + (meta.house ? " is-house" : ""), title: meta.house ? `${meta.label} — house-cleaning; click to hide` : meta.label });
     const ic = c.createSpan({ cls: "stashpad-heat-chipic" }); setIcon(ic, meta.icon);
     c.createSpan({ text: meta.label });
-    c.onclick = () => { state.buckets[b] = !state.buckets[b]; state.openDay = null; rerender(); };
+    // 0.279.28: keep the selected day when toggling a bucket — clearing openDay
+    // here unfocused the date the user was looking at. The detail panel just
+    // re-renders that same day filtered by the new bucket set.
+    c.onclick = () => { state.buckets[b] = !state.buckets[b]; rerender(); };
   });
 
   // ---- grid geometry ----

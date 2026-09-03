@@ -117,6 +117,13 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   "id", "parent", "created", "modified", "attachments", "position",
   "author", "contributors",
   "parentLink", "children",
+  // 0.280.0 (teams): emoji reactions — `{ "👍": ["<authorId>", ...] }`.
+  // Stashpad-managed multiplayer state; a clone/template must not carry someone
+  // else's reactions.
+  "reactions",
+  // 0.281.0 (teams): quoted replies — the id of the note this one replies to.
+  // Stashpad-managed; a clone/template must not inherit someone else's reply link.
+  "replyTo",
   // 0.78.1: task scheduling/assignment — Stashpad-managed, so clones /
   // templates must not carry someone else's due date or assignees.
   "due", "assignedTo", "assignedBy",

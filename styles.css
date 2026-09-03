@@ -1566,6 +1566,17 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   transition: opacity 0.1s ease, background 0.1s ease;
   border-radius: 3px;
   position: relative;
+  /* 0.279.31: bigger grab/drag target without moving the 14px icon — padding
+     enlarges the hit area, the matching negative margin keeps the meta-row layout
+     put. Extends mostly UP into the row's top padding (empty) and a little down,
+     staying clear of the child-count link below.
+     0.283.1: MUST be content-box — the app's border-box default folded this
+     padding INTO the 14px width/height, so the hit box stayed 14px and
+     grab-from-anywhere never actually grew. content-box makes the padding add
+     to the 14px icon, so the real target is ~28×31px. */
+  box-sizing: content-box;
+  padding: 12px 7px 5px;
+  margin: -12px -7px -5px;
 }
 .stashpad-note:hover .stashpad-note-grip { opacity: 0.8; }
 .stashpad-note-grip:hover { color: var(--text-muted); opacity: 1 !important; }
@@ -1772,6 +1783,15 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .is-mobile .stashpad-note-meta-top .stashpad-note-task-checkbox svg { width: 18px; height: 18px; }
 
 .stashpad-note-body { min-width: 0; word-wrap: break-word; }
+/* 0.279.30/0.279.31: note body text is selectable when the row carries
+   `is-text-selectable` (desktop + the "Select text in notes" setting on). Off = no
+   class, whole-row drag, no selection. Guarded so an ancestor user-select can't
+   disable it. */
+.stashpad-note.is-text-selectable .stashpad-note-body,
+.stashpad-note.is-text-selectable .stashpad-note-text {
+  -webkit-user-select: text;
+  user-select: text;
+}
 .stashpad-note-body > :first-child { margin-top: 0; }
 .stashpad-note-body > :last-child { margin-bottom: 0; }
 .stashpad-note-text > :first-child { margin-top: 0; }
@@ -4867,6 +4887,14 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
   color: var(--text-normal);
 }
 .stashpad-compact-exit-btn svg { width: 13px; height: 13px; }
+
+/* 0.283.1: center the tab-header title for Stashpad's own tabs. The title box
+   is `flex:1 1 auto`, so it fills the tab and the app's default left text-align
+   made the (now longer, note-title-first) name read as left-aligned. Scoped by
+   data-type so no other plugin's tabs are touched. */
+.workspace-tab-header[data-type="stashpad-view"] .workspace-tab-header-inner-title {
+  text-align: center;
+}
 
 /* Hide Obsidian's view-header + tab-header strip when the leaf hosts a
    compact-mode or tiny-mode Stashpad view. Uses :has() so we don't
@@ -8906,3 +8934,215 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-heat-eventic .svg-icon { width: 14px; height: 14px; }
 .stashpad-heat-eventlabel { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stashpad-heat-eventmeta { color: var(--text-faint); font-size: var(--font-ui-smaller); flex: 0 0 auto; }
+
+/* ============================================================
+   Emoji reactions (teams, 0.280.0)
+   ============================================================ */
+.stashpad-reaction-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+}
+/* No reactions yet: the whole row collapses; the add-button appears on row hover. */
+.stashpad-reaction-row.is-empty { margin-top: 0; }
+.stashpad-reaction-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 11px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background 0.08s ease, border-color 0.08s ease;
+}
+.stashpad-reaction-chip:hover { background: var(--background-modifier-hover); }
+.stashpad-reaction-chip.is-mine {
+  border-color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
+}
+.stashpad-reaction-emoji { font-size: 0.95em; }
+.stashpad-reaction-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.stashpad-reaction-chip.is-mine .stashpad-reaction-count { color: var(--text-normal); }
+.stashpad-reaction-add {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-faint);
+  border-radius: 11px;
+  padding: 1px 7px;
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.08s ease, color 0.08s ease, background 0.08s ease;
+}
+.stashpad-note:hover .stashpad-reaction-add,
+.stashpad-focused:hover .stashpad-reaction-add { opacity: 0.7; }
+.stashpad-reaction-row:not(.is-empty) .stashpad-reaction-add { opacity: 0.5; }
+.stashpad-reaction-add:hover { opacity: 1 !important; color: var(--text-muted); background: var(--background-modifier-hover); }
+
+/* Quick-pick popover */
+.stashpad-reaction-picker {
+  z-index: var(--layer-menu, 60);
+  display: flex;
+  gap: 2px;
+  padding: 5px 6px;
+  border-radius: 10px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+.stashpad-reaction-pick {
+  border: none;
+  background: transparent;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 5px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.06s ease, transform 0.06s ease;
+}
+.stashpad-reaction-pick:hover { background: var(--background-modifier-hover); transform: scale(1.15); }
+.stashpad-reaction-pick.is-mine { background: var(--background-modifier-hover); box-shadow: 0 0 0 1px var(--interactive-accent) inset; }
+
+/* 0.280.0: reactions as a compact cluster in the meta column (below timestamp),
+   not a full-width row — no empty space by default. */
+.stashpad-reaction-cluster { margin-top: 3px; gap: 3px; }
+/* 0.283.1: an EMPTY reaction cluster must take NO room in the meta column. It
+   was rendering the always-present "＋" add-button (~30px) even with no
+   reactions, and the meta column is `flex-direction:column; gap:4px`, so that
+   empty block pushed the timestamp and note-start apart (the "crammed" look)
+   AND sat over the drag-grip's enlarged hit area, blocking grab-from-anywhere.
+   Collapse it entirely (display:none removes it from the flex flow, gap and
+   all); row hover brings the add-button back so you can still react. */
+.stashpad-reaction-cluster.is-empty { display: none; margin-top: 0; }
+.stashpad-note:hover .stashpad-reaction-cluster.is-empty,
+.stashpad-focused:hover .stashpad-reaction-cluster.is-empty { display: flex; }
+.stashpad-reaction-cluster .stashpad-reaction-chip { padding: 0 5px; }
+.stashpad-reaction-more {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border-radius: 11px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+.stashpad-reaction-more:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-reaction-overflow {
+  z-index: var(--layer-menu, 60);
+  display: flex;
+  flex-wrap: wrap;
+  max-width: 280px;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+}
+.stashpad-reaction-picker { flex-direction: column; align-items: stretch; gap: 6px; }
+.stashpad-reaction-pickgrid { display: flex; flex-wrap: wrap; gap: 2px; max-width: 260px; }
+.stashpad-reaction-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 3px 7px;
+  border-radius: 7px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+}
+
+/* ============================================================
+   Quoted replies (teams, 0.281.0)
+   ============================================================ */
+.stashpad-reply-chip-host { display: none; }
+.stashpad-reply-chip-host.is-active { display: block; padding: 2px 2px 6px; }
+.stashpad-reply-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 6px 3px 8px;
+  border-radius: 8px;
+  border-left: 3px solid var(--interactive-accent);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-reply-chip-icon { display: inline-flex; color: var(--interactive-accent); }
+.stashpad-reply-chip-icon .svg-icon { width: 13px; height: 13px; }
+.stashpad-reply-chip-title { color: var(--text-normal); cursor: pointer; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+.stashpad-reply-chip-title:hover { text-decoration: underline; }
+.stashpad-reply-chip-x {
+  border: none; background: transparent; color: var(--text-faint);
+  cursor: pointer; padding: 0 2px; font-size: 12px; line-height: 1;
+}
+.stashpad-reply-chip-x:hover { color: var(--text-normal); }
+
+/* The "in reply to …" jump block above a reply's body */
+.stashpad-reply-quote {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 5px;
+  padding: 3px 8px;
+  border-left: 3px solid var(--interactive-accent);
+  border-radius: 4px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  max-width: fit-content;
+}
+.stashpad-reply-quote.is-clickable { cursor: pointer; }
+.stashpad-reply-quote.is-clickable:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-reply-quote-icon { display: inline-flex; color: var(--interactive-accent); }
+.stashpad-reply-quote-icon .svg-icon { width: 13px; height: 13px; }
+.stashpad-reply-quote-text { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+.stashpad-reply-quote.is-missing { border-left-color: var(--text-faint); opacity: 0.8; }
+
+/* ============================================================
+   Duplicate-note hints (teams, 0.282.0)
+   ============================================================ */
+.stashpad-dup-panel { display: none; }
+.stashpad-dup-panel.is-active {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0 2px 6px;
+  padding: 5px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.stashpad-dup-label {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  padding: 0 4px 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.stashpad-dup-hit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 5px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-normal);
+}
+.stashpad-dup-hit:hover { background: var(--background-modifier-hover); }
+.stashpad-dup-hit-icon { display: inline-flex; color: var(--text-faint); }
+.stashpad-dup-hit-icon .svg-icon { width: 13px; height: 13px; }
+.stashpad-dup-hit-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-composer-dup-toggle.is-on { color: var(--interactive-accent); }

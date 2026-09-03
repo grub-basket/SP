@@ -2365,6 +2365,13 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (f) => {
       if (f instanceof TFile && f.extension === "md") this.queueAutoPreview(f);
     }));
+    // 0.283.0 (teams): a note arriving from another teammate (via sync) fires
+    // `create`. Notify — desktop + in-app — when it's someone ELSE's note and
+    // the folder is one the user follows. Frontmatter isn't parsed synchronously
+    // on `create`, so the handler defers + reads the metadata cache.
+    this.registerEvent(this.app.vault.on("create", (f) => {
+      if (f instanceof TFile && f.extension === "md") this.queueTeamNotify(f);
+    }));
     // 0.266.1: a shortcut stub swaps itself for the Stashpad it names.
     // 0.266.1: `active-leaf-change`, NOT `file-open`. Measured with listeners
     // on all three: opening a file raises active-leaf-change and layout-change
@@ -2469,6 +2476,7 @@ export default class StashpadPlugin extends Plugin {
       // load). Until armed, enqueue() ignores events — so opening the vault
       // never looks like a mass "drop".
       window.setTimeout(() => this.importService.setArmed(true), 2500);
+      window.setTimeout(() => { this.teamNotifyArmed = true; }, 3000);
       // 0.84.11: retroactive auto-import — a startup sweep (after arming) so
       // items added while Obsidian was closed get imported, plus a 5-min
       // interval so external Finder copies that never fired a vault event are
@@ -3245,6 +3253,18 @@ export default class StashpadPlugin extends Plugin {
       name: "Copy tree with level markers (indent-safe)",
       callback: () => call("cmdCopyTreeLevelMarkers"),
     });
+    // 0.280.0 (teams): emoji reactions
+    this.addCommand({
+      id: "stashpad-react",
+      name: "React to note (emoji)",
+      callback: () => call("cmdReact"),
+    });
+    // 0.281.0 (teams): reply to a note
+    this.addCommand({
+      id: "stashpad-reply",
+      name: "Reply to note",
+      callback: () => call("cmdReply"),
+    });
     // 0.184.0: dismiss every visible notification toast at once (handy when a batch
     // of due reminders / messages stacks up).
     this.addCommand({
@@ -3787,10 +3807,13 @@ export default class StashpadPlugin extends Plugin {
         id: `stashpad-open-settings-${t.id}`,
         name: `Open Stashpad settings: ${t.label}`,
         callback: () => {
+          // 0.283.1: actually deep-link to the requested sub-page. The settings
+          // tab's openSettingsPage opens the modal, lands on the Stashpad page
+          // list, then polls for and clicks the matching page row (the old code
+          // here only opened the page list, so the section never opened).
+          if (this.settingTab) { this.settingTab.openSettingsPage(t.label); return; }
           const setting = (this.app as any).setting;
           if (!setting?.open || !setting?.openTabById) return;
-          // 0.94.4: native settings own page navigation; we can't deep-link to
-          // a specific sub-page, so this lands on Stashpad's settings page list.
           setting.open();
           setting.openTabById(this.manifest.id);
         },
@@ -8057,6 +8080,89 @@ export default class StashpadPlugin extends Plugin {
 
   /** 0.76.19: true when `file` is a Stashpad note — lives in a known
    *  Stashpad folder AND has an `id` in frontmatter. */
+  // 0.283.0 (teams): incoming-teammate-note notifications. `teamNotifyArmed`
+  // gates out the startup sync storm; `teamNotifySeen` dedupes create+modify
+  // double-fires (path -> last-notified ms).
+  private teamNotifyArmed = false;
+  private teamNotifySeen = new Map<string, number>();
+
+  private queueTeamNotify(file: TFile): void {
+    if (!this.teamNotifyArmed || !this.settings.teamNotifications) return;
+    // Frontmatter isn't in the cache yet on `create`; defer a beat, then read it.
+    window.setTimeout(() => this.handleTeamNotify(file, 0), 400);
+  }
+
+  private handleTeamNotify(file: TFile, attempt: number): void {
+    if (!this.settings.teamNotifications) return;
+    const cur = this.app.vault.getAbstractFileByPath(file.path);
+    if (!(cur instanceof TFile)) return; // already gone / renamed
+    const dir = cur.parent?.path?.replace(/\/+$/, "") ?? "";
+    const folders = this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, ""));
+    if (!folders.includes(dir)) return; // not a Stashpad note folder
+
+    const fm = this.app.metadataCache.getFileCache(cur)?.frontmatter as Record<string, unknown> | undefined;
+    if (!fm || typeof fm.id !== "string" || !fm.id) {
+      // The cache may still be parsing — one retry, then give up.
+      if (attempt < 1) window.setTimeout(() => this.handleTeamNotify(file, attempt + 1), 1200);
+      return;
+    }
+
+    const now = Date.now();
+    if (now - (this.teamNotifySeen.get(cur.path) ?? 0) < 60000) return; // recent dupe
+    // Keep the dedupe map from growing without bound over a long session: once
+    // it's large, drop entries older than the 60s dedupe window (they can't
+    // suppress anything anymore).
+    if (this.teamNotifySeen.size > 500) {
+      for (const [k, ts] of this.teamNotifySeen) if (now - ts > 60000) this.teamNotifySeen.delete(k);
+    }
+
+    // Someone ELSE authored it.
+    const author = parseAuthorRef(fm.author);
+    const myId = (this.settings.authorId ?? "").trim();
+    if (!author || !author.id || author.id === myId) return;
+
+    // Recency guard: a bulk sync can replay old notes as `create`. Only notify
+    // for notes created within the last 30 minutes.
+    const created = typeof fm.created === "string" ? Date.parse(fm.created) : NaN;
+    if (Number.isFinite(created) && now - created > 30 * 60 * 1000) return;
+
+    // Watch / mute scope.
+    const s = this.settings;
+    if ((s.mutedAuthors ?? []).includes(author.id)) return;
+    const mutedFolders = (s.mutedFolders ?? []).map((f) => f.replace(/\/+$/, ""));
+    if (mutedFolders.includes(dir)) return;
+    const watched = (s.watchedFolders ?? []).map((f) => f.replace(/\/+$/, "")).filter(Boolean);
+    if (watched.length && !watched.includes(dir)) return;
+
+    this.teamNotifySeen.set(cur.path, now);
+    const known = this.authorRegistry.get(author.id);
+    const who = (known?.name || author.name || "A teammate").trim();
+    const title = this.deriveNoteTitle(cur, fm);
+    const leaf = dir.slice(dir.lastIndexOf("/") + 1) || dir;
+    this.notifications.show({
+      message: `${who} added a note\n“${title}” in ${leaf}`,
+      kind: "info",
+      category: "team",
+      duration: 8000,
+      folder: dir,
+      desktop: !!s.teamNotificationsDesktop,
+      authorId: author.id,
+      affectedIds: [fm.id],
+      affectedAuthorIds: [author.id],
+      onBodyClick: () => { void this.revealNoteInStashpad(cur); },
+      actions: [{ label: "Open note", onClick: () => { void this.revealNoteInStashpad(cur); } }],
+    });
+  }
+
+  /** Best-effort human title for a teammate's note: the first heading if the
+   *  note has one, else the de-slugged filename. Cheap + cache-only. */
+  private deriveNoteTitle(file: TFile, _fm: Record<string, unknown>): string {
+    const h = this.app.metadataCache.getFileCache(file)?.headings?.[0]?.heading?.trim();
+    if (h) return h;
+    const base = file.basename.replace(/-[a-z0-9]{6,}$/i, "").replace(/[-_]+/g, " ").trim();
+    return base || file.basename;
+  }
+
   private isStashpadNoteFile(file: TFile): boolean {
     const dir = file.parent?.path?.replace(/\/+$/, "") ?? "";
     if (!this.discoverStashpadFolders().includes(dir)) return false;

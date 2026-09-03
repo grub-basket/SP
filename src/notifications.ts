@@ -69,6 +69,7 @@ export type NotificationCategory =
   | "color" | "reorder"
   | "multiplayer"
   | "reminder"
+  | "team"
   | "system";
 
 /** Human-readable labels for each category, used by the settings UI
@@ -91,6 +92,7 @@ export const CATEGORY_LABELS: Record<NotificationCategory, { label: string; desc
   reorder:     { label: "Reorder",       desc: "Drag-reorder and keyboard moveUp/Down/Top/Bottom." },
   multiplayer: { label: "Multiplayer",   desc: "Cross-author activity (someone else touched your notes or vice versa)." },
   reminder:    { label: "Reminder",      desc: "Task due-date reminders — surfaced when a task comes due (fired at launch / periodically)." },
+  team:        { label: "Team activity",  desc: "When a teammate creates a note in a Stashpad folder you follow." },
   system:      { label: "System",        desc: "Plumbing toasts: backfill progress, integrity warnings, errors not tied to a verb." },
 };
 
@@ -157,6 +159,12 @@ export interface NotifyOptions {
   /** Folder this notification belongs to (for filtering history by
    *  Stashpad folder later on). Optional. */
   folder?: string;
+  /** 0.283.0 (teams): ALSO raise an OS-level desktop notification (the
+   *  Notification API), so activity reaches the user when Obsidian is in the
+   *  background. Falls back silently to the in-app toast when permission is
+   *  denied or the API is unavailable. Its click focuses the window and runs
+   *  `onBodyClick` (or the first action). */
+  desktop?: boolean;
 }
 
 export interface NotificationRecord extends Required<Pick<NotifyOptions, "message">> {
@@ -285,7 +293,46 @@ export class NotificationService {
         });
       }
     }
+
+    // 0.283.0 (teams): mirror to an OS desktop notification when asked. The
+    // in-app toast still shows (it drives history + the click affordances); the
+    // desktop one is the background-reach copy. Best-effort — any failure (no
+    // API, permission denied) leaves the toast as the sole surface.
+    if (opts.desktop) this.maybeDesktop(opts);
+
     return notice;
+  }
+
+  /** OS-level notification (background reach). Fires only with granted
+   *  permission; requests it once on the first eligible call. Clicking it
+   *  focuses the Obsidian window and runs the toast's body click (or its first
+   *  action) so the desktop copy jumps to the same place the toast would. */
+  private desktopPermissionAsked = false;
+  private maybeDesktop(opts: NotifyOptions): void {
+    try {
+      const N = (window as unknown as { Notification?: typeof Notification }).Notification;
+      if (!N) return;
+      const fire = (): void => {
+        if (N.permission !== "granted") return;
+        // First line only — OS toasts are single-line-ish; the body carries detail.
+        const [title, ...rest] = opts.message.split("\n");
+        const n = new N("Stashpad — " + title.trim(), {
+          body: rest.join(" ").trim() || undefined,
+          silent: false,
+        });
+        const run = opts.onBodyClick ?? opts.actions?.[0]?.onClick;
+        n.onclick = () => {
+          try { (window as unknown as { focus?: () => void }).focus?.(); } catch { /* noop */ }
+          if (run) void Promise.resolve().then(run).catch(() => { /* noop */ });
+          n.close();
+        };
+      };
+      if (N.permission === "granted") { fire(); return; }
+      if (N.permission === "denied") return;
+      if (this.desktopPermissionAsked) return;
+      this.desktopPermissionAsked = true;
+      void N.requestPermission().then((p) => { if (p === "granted") fire(); }).catch(() => { /* noop */ });
+    } catch { /* desktop notifications are best-effort */ }
   }
 
   /** Subscribe to history changes. The history panel uses this to

@@ -351,6 +351,10 @@ export interface StashpadSettings {
    *  indentation, which many apps strip on paste. See docs/public/level-markers.md
    *  — the "Stashpad level-marker copy" convention. */
   copyTreeLevelMarkers: boolean;
+  /** 0.282.0 (teams): show "similar notes" as you type in the composer (Sift over
+   *  titles), so you notice a possible duplicate before creating one. Desktop is
+   *  live; mobile gates it behind a per-session composer toggle (off by default). */
+  duplicateHints: boolean;
   splitOnLines: boolean;
   /** Delimiter used when split-on-submit is on (and the Split modal's default
    *  preset): each line, blank-line paragraphs, or Markdown headings. */
@@ -581,6 +585,18 @@ export interface StashpadSettings {
   authorRole: string;
   /** Optional department / team. Same treatment as authorRole. */
   authorDepartment: string;
+  /** 0.283.0 (teams): desktop/in-app notifications when SOMEONE ELSE creates a
+   *  note (their author id != yours). Default on. */
+  teamNotifications: boolean;
+  /** Use OS desktop notifications (Notification API) in addition to the in-app
+   *  toast. Default on; falls back to the toast if permission is denied. */
+  teamNotificationsDesktop: boolean;
+  /** Only notify for these folders (empty = every Stashpad folder). The "watch"
+   *  list — livestream someone working in a specific place. */
+  watchedFolders: string[];
+  /** Never notify for these author ids / folder names — the mute list. */
+  mutedAuthors: string[];
+  mutedFolders: string[];
   showAuthor: boolean;
   showContributors: boolean;
   showLastEdit: boolean;
@@ -715,6 +731,10 @@ export interface StashpadSettings {
    *  Also accrues zones the device has actually been in (the schedule timer
    *  records a new one on a tz change). */
   obscureScheduleTimezoneHistory: string[];
+  /** 0.279.31 — desktop: select text inside note bodies. ON makes the body
+   *  selectable and moves row dragging to the grip handle; OFF restores
+   *  drag-from-anywhere-on-the-row (no text selection). Desktop only. */
+  selectableNoteText: boolean;
   /** 0.268.2: put the file's name in front of the link when you attach one.
    *
    *  On by default. An attachment on its own is a link and nothing else, so the
@@ -912,6 +932,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   useTemplatesFormat: false,
   copyTimestampModifiers: "",
   copyTreeLevelMarkers: false,
+  duplicateHints: true,
   splitOnLines: false,
   splitMode: "lines",
   confirmCrossParentDrag: true,
@@ -971,6 +992,11 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   authorId: "",
   authorRole: "",
   authorDepartment: "",
+  teamNotifications: true,
+  teamNotificationsDesktop: true,
+  watchedFolders: [],
+  mutedAuthors: [],
+  mutedFolders: [],
   showAuthor: true,
   showContributors: true,
   showLastEdit: true,
@@ -1000,6 +1026,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureScheduleEnd: 17,
   obscureScheduleTimezone: "",
   obscureScheduleTimezoneHistory: [],
+  selectableNoteText: true,
   attachmentNamePrefix: false, // 0.279.1: default OFF — undoes the 0.268.2 filename prefix (user: "we'll survive without the clutter")
   attachmentsEmbedded: true,
   railShowOutgoing: false,
@@ -1557,7 +1584,58 @@ export class StashpadSettingTab extends PluginSettingTab {
       (this.plugin.settings.mutedNotificationCategories ?? []) as NotificationCategory[],
     );
     const categories = Object.keys(CATEGORY_LABELS) as NotificationCategory[];
+    const s0 = this.plugin.settings;
+    const parseCsv = (v: string): string[] => v.split(",").map((x) => x.trim().replace(/\/+$/, "")).filter(Boolean);
+    const mutedA = new Set<string>(s0.mutedAuthors ?? []);
+    const people = this.plugin.collectKnownAuthors().filter((a) => a.id !== (s0.authorId ?? "").trim());
+    const teamGroup: SettingDefinitionItem[] = [
+      {
+        type: "group",
+        heading: "Team activity",
+        items: [
+          this.renderDef("Notify me about teammates’ notes",
+            "When a teammate creates a note in a Stashpad folder, show a notification. Detected from the note’s author, so your own notes never notify.",
+            (s) => s.addToggle((t) => t.setValue(s0.teamNotifications).onChange(async (v) => { s0.teamNotifications = v; await this.plugin.saveSettings(); })),
+            ["team", "notify", "teammate", "activity", "multiplayer"]),
+          this.renderDef("Also send desktop notifications",
+            "In addition to the in-app toast, raise an operating-system notification so activity reaches you when Obsidian is in the background. Asks for permission the first time.",
+            (s) => s.addToggle((t) => t.setValue(s0.teamNotificationsDesktop).onChange(async (v) => { s0.teamNotificationsDesktop = v; await this.plugin.saveSettings(); })),
+            ["team", "desktop", "os", "notification", "background"]),
+          this.renderDef("Watch only these folders",
+            "Comma-separated folder paths. When set, only these folders notify and the rest go quiet — livestream one place a teammate is working. Leave empty to watch every Stashpad folder.",
+            (s) => s.addText((t) => {
+              t.setValue((s0.watchedFolders ?? []).join(", ")).setPlaceholder("Team, Projects/Q3");
+              const commit = async () => { s0.watchedFolders = parseCsv(t.getValue()); await this.plugin.saveSettings(); };
+              t.inputEl.addEventListener("blur", () => void commit());
+              t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
+            }),
+            ["team", "watch", "folder", "livestream", "follow"]),
+          this.renderDef("Mute these folders",
+            "Comma-separated folder paths that should never notify, even when watched.",
+            (s) => s.addText((t) => {
+              t.setValue((s0.mutedFolders ?? []).join(", ")).setPlaceholder("Scratch, Archive");
+              const commit = async () => { s0.mutedFolders = parseCsv(t.getValue()); await this.plugin.saveSettings(); };
+              t.inputEl.addEventListener("blur", () => void commit());
+              t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
+            }),
+            ["team", "mute", "folder", "silence"]),
+          ...(people.length ? [{
+            type: "group" as const,
+            heading: "Per-person notifications",
+            items: people.map((pn) => this.renderDef(pn.name || pn.id,
+              "Turn off to silence notifications for this teammate’s notes.",
+              (s) => s.addToggle((t) => t.setValue(!mutedA.has(pn.id)).onChange(async (on) => {
+                if (on) mutedA.delete(pn.id); else mutedA.add(pn.id);
+                s0.mutedAuthors = [...mutedA];
+                await this.plugin.saveSettings();
+              })),
+              ["team", "mute", "person", "author", pn.name])),
+          } as SettingDefinitionItem] : []),
+        ],
+      } as SettingDefinitionItem,
+    ];
     return [
+      ...teamGroup,
       this.renderDef("Notification history limit", "Maximum number of notifications kept in the persistent history. Set to 0 for unlimited (the file size grows with usage; expect a few hundred KB per ~5000 entries). Default: 5000.", (s) =>
         s.addText((t) => {
           t.setValue(String(this.plugin.settings.notificationHistoryLimit ?? 5000)).setPlaceholder("5000");
@@ -1592,7 +1670,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         }),
       } as SettingDefinitionItem,
 
-      this.renderDef("Notification history", "Browse the last 200 toasts. Filter by category. Live-updates as new notifications arrive. Muted categories still appear here so you can review what was suppressed.", (s) =>
+      this.renderDef("Notification history", `Browse recorded notifications (${((this.plugin.settings.notificationHistoryLimit ?? 5000) > 0) ? "up to " + (this.plugin.settings.notificationHistoryLimit ?? 5000) + ", per the limit above" : "unlimited, per the limit above"}). Filter by category. Live-updates as new notifications arrive. Muted categories still appear here so you can review what was suppressed.`, (s) =>
         s.addButton((b) => b.setButtonText("View notification history").onClick(() => {
           new NotificationHistoryModal(
             this.app,
@@ -2313,6 +2391,10 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.railShowOutgoing, (v) => { this.plugin.settings.railShowOutgoing = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "links", "outgoing", "backlinks"]));
     cats.listDisplay.push(toggle("Show backlinks in the rail", "List the notes that link TO this one, in a row under its files. Off by default. Kept separate from outgoing links because \"what does this point at\" and \"who refers to this\" are different questions.",
       () => this.plugin.settings.railShowBacklinks, (v) => { this.plugin.settings.railShowBacklinks = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "backlinks", "incoming", "links"]));
+    cats.listDisplay.push(toggle("Similar-note hints in the composer", "As you type a note, show existing notes with a similar title so you can spot a duplicate before creating one — Discourse-style. Desktop searches live; on mobile it is off until you tap the ⌕ toggle in the composer (so the keyboard isn't crowded). On by default. Click a hint to open that note.",
+      () => this.plugin.settings.duplicateHints, (v) => { this.plugin.settings.duplicateHints = v; this.plugin.refreshAllStashpadViews(); }, ["duplicate", "similar", "hint", "composer", "search", "discourse"]));
+    cats.listDisplay.push(toggle("Select text in notes (desktop)", "Let you select and copy text inside a note in the list. On by default. With it on, you drag a note to reorder by its grip handle (a draggable row can't have selectable text); turn it off to drag a note from anywhere on the row again, with no text selection. Desktop only — mobile is always tap-first.",
+      () => this.plugin.settings.selectableNoteText, (v) => { this.plugin.settings.selectableNoteText = v; this.plugin.refreshAllStashpadViews(); }, ["select", "text", "copy", "drag", "grip", "reorder"]));
 
     cats.listDisplay.push(this.renderDef("How covered notes look", "\"Blur\" keeps the shape of the text. \"Solid bar\" paints over it — faster on a phone, because a blur has to be computed for every glyph every time the text is drawn, and it hides more, since a blur still leaks word shapes and lengths. Either way the text is untouched in the file.", (st) => {
       st.addDropdown((d) => {
@@ -3516,7 +3598,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** Best-effort jump to another Stashpad settings sub-page by its visible name.
    *  Obsidian exposes no public sub-page nav, so we reset to the Stashpad page
    *  list (openTabById) then click the matching entry; falls back to a hint. */
-  private openSettingsPage(pageName: string): void {
+  openSettingsPage(pageName: string): void {
     // Obsidian has no public API to open a plugin's own settings SUB-PAGE (see
     // docs/obsidian-limitations.md). Best-effort: reset to the Stashpad page list,
     // then click the matching entry — but ONLY inside the active tab's CONTENT
@@ -3525,17 +3607,28 @@ export class StashpadSettingTab extends PluginSettingTab {
     // can't find it in-content, we DON'T guess — we just point the way.
     const hint = () => new Notice(`Open Settings → Stashpad → ${pageName}.`);
     try {
-      const setting = (this.app as App & { setting?: { openTabById?: (id: string) => void; modalEl?: HTMLElement } }).setting;
+      const setting = (this.app as App & { open?: () => void; setting?: { openTabById?: (id: string) => void; modalEl?: HTMLElement } } & { setting?: { open?: () => void } }).setting as
+        { open?: () => void; openTabById?: (id: string) => void; modalEl?: HTMLElement } | undefined;
       if (!setting?.openTabById) { hint(); return; }
+      // 0.283.1: the modal may not be open yet (a command fired it), and the page
+      // list renders async — the old single 60ms probe raced the first open, so
+      // the very first invocation "opened Stashpad but not the section". Open the
+      // modal, land on the Stashpad page list, then POLL for the row.
+      setting.open?.();
       setting.openTabById("stashpad");
-      window.setTimeout(() => {
+      const deadline = Date.now() + 1500;
+      const tryClick = (): void => {
         const content = setting.modalEl?.querySelector<HTMLElement>(".vertical-tab-content");
-        if (!content) { hint(); return; }
-        const hit = Array.from(content.querySelectorAll<HTMLElement>("*"))
-          .find((e) => e.childElementCount === 0 && e.textContent?.trim() === pageName && !e.closest(".vertical-tab-header"));
+        const hit = content
+          ? Array.from(content.querySelectorAll<HTMLElement>(".setting-item-name, *"))
+              .find((e) => e.childElementCount === 0 && e.textContent?.trim() === pageName && !e.closest(".vertical-tab-header"))
+          : undefined;
         const link = hit?.closest<HTMLElement>("[class*='nav'], .setting-item, button, a");
-        if (link && !link.closest(".vertical-tab-header")) link.click(); else hint();
-      }, 60);
+        if (link && !link.closest(".vertical-tab-header")) { link.click(); return; }
+        if (Date.now() < deadline) { window.setTimeout(tryClick, 50); return; }
+        hint();
+      };
+      window.setTimeout(tryClick, 50);
     } catch { hint(); }
   }
 

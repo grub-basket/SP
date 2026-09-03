@@ -9,7 +9,7 @@ import {
   isReservedSubfolderName,
   isInReservedSubfolder, writeCompletedFm,
   type StashpadId, type TimeFilter, type TimeUnit, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
-  type ListPinEdge,
+  type ListPinEdge, siftMatch,
 } from "./types";
 import { TreeIndex } from "./tree-index";
 import { perf } from "./perf";
@@ -39,6 +39,7 @@ import type { ImportNote } from "./text-importer";
 import { isAllCheckboxLines } from "./text-importer";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, matchBindingWithMods, humanCombo, parseModifierTokens, eventHasMods } from "./view-keys";
+import { renderReactionChips, openReactionPicker, type ReactionMap } from "./reactions";
 import { openAggregateView } from "./aggregate-view";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
@@ -363,6 +364,9 @@ export class StashpadView extends ItemView {
    *  instead of creating a note. Cleared after one send (see the note on
    *  openAppendPicker for why it is deliberately not sticky). */
   private appendTarget: AppendTarget | null = null;
+  /** 0.281.0 (teams): the note the composer is currently replying to (one-shot). */
+  private replyTarget: { id: StashpadId; title: string } | null = null;
+  private replyChipHost: HTMLElement | null = null;
   /** 0.237.0: obscured notes the user has revealed in THIS view. Deliberately
    *  in-memory and per-view — "revealed" is a viewing state, not a property of
    *  the note, so it must never be written to the file or shared with another
@@ -402,6 +406,9 @@ export class StashpadView extends ItemView {
   /** public: read by ViewDnD (the host interface). */
   listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
+  /** 0.282.0 (teams): duplicate-hint panel host + mobile per-session toggle. */
+  private dupPanelHost: HTMLElement | null = null;
+  private dupHintsMobileOn = false;
   /** Mobile only (0.278.2): watches for overlays (modals/menus) that the composer
    *  textarea's native caret would paint over, so we can blur the composer. */
   private caretGuardObserver: MutationObserver | null = null;
@@ -555,6 +562,7 @@ export class StashpadView extends ItemView {
   /** Debounced wrapper around saveDraft for the input event. Lazily
    *  initialized on first composer render. */
   private debouncedSaveDraft?: (v: string) => void;
+  private debouncedDupSearch?: (v: string) => void;
   /** Composer autocomplete instance — recreated whenever the composer
    *  textarea is rebuilt (i.e. on each render). */
   private composerAutocomplete: ComposerAutocomplete | null = null;
@@ -6122,6 +6130,8 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").onClick(() => { onAction?.(); this.cmdOpenInNewStashpadTab(node); }));
     menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => { onAction?.(); this.navigateTo(id); }));
     if (node.file) {
+      menu.addItem((it: any) => it.setTitle("React…").setIcon("smile-plus").onClick(() => { onAction?.(); this.cmdReact(node); }));
+      menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => { onAction?.(); this.cmdReply(node); }));
       menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => { onAction?.(); void this.cmdEdit(node); }));
       menu.addItem((it: any) => it.setTitle("Open in Obsidian editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
     }
@@ -6317,6 +6327,10 @@ export class StashpadView extends ItemView {
     // the header too — the drilled-in parent's task state was invisible (and
     // untoggleable) unless you climbed back out to its list row.
     if (this.isTask(node)) this.addTaskCheckbox(metaTop, node);
+    // 0.280.0 (teams): reactions in the header's meta column, below the timestamp.
+    const headReact = meta.createDiv({ cls: "stashpad-reaction-cluster stashpad-reaction-row" });
+    headReact.dataset.id = node.id;
+    renderReactionChips(this, headReact, node);
 
     // 0.266.6: the pinned heading's collapsed state shows a PLAIN one-line
     // preview rather than a clamped copy of the rendered body.
@@ -6336,6 +6350,7 @@ export class StashpadView extends ItemView {
       const stuck = wrap.createDiv({ cls: "stashpad-heading-stuck-line" });
       stuck.textContent = this.stuckPreviewText(node);
     }
+    this.renderReplyQuote(wrap, node); // 0.281.0 (teams)
     const body = wrap.createDiv({ cls: "stashpad-focused-body" });
     // Markdown rendered inside the focused header includes #tags and
     // [[wikilinks]] — without explicit click delegation those elements
@@ -6644,7 +6659,14 @@ export class StashpadView extends ItemView {
     // among its siblings is synthesized from a sort, not stored — dragging
     // would have nothing well-defined to mutate.
     const draggable = this.currentViewMode() === "nested";
-    row.draggable = draggable;
+    // 0.279.30/0.279.31: on desktop, when "Select text in notes" is on, the row is
+    // NOT draggable (a draggable element swallows text selection) — the body stays
+    // selectable and drag is armed only while the GRIP handle is pressed (below).
+    // When the setting is off (or on mobile), the whole row drags from anywhere as
+    // before. The dragstart listener lives on the row either way.
+    const selectableText = !Platform.isMobile && getSettings().selectableNoteText;
+    row.draggable = draggable && !selectableText;
+    if (selectableText) row.addClass("is-text-selectable");
     if (draggable) this.dnd.attachRowDnD(row, node, idx);
 
     row.addEventListener("click", (e) => this.handleRowClick(e, idx, node));
@@ -6727,6 +6749,15 @@ export class StashpadView extends ItemView {
     grip.title = color ? "Drag to reorder · right-click to change color" : "Drag to reorder";
     grip.draggable = draggable;
     if (!draggable) grip.title = color ? "Right-click to change color · drag disabled in this view mode" : "Drag disabled in this view mode";
+    if (draggable && selectableText) {
+      // 0.279.30: with selectable text the row isn't draggable, so arm row-drag on
+      // grip press (drag then uses the ROW: row drag image + the row's dragstart
+      // handler) while a body drag stays a text selection. Disarm after the gesture.
+      const disarm = (): void => { row.draggable = false; };
+      grip.addEventListener("mousedown", () => { row.draggable = true; });
+      grip.addEventListener("mouseup", disarm);
+      row.addEventListener("dragend", disarm);
+    }
     if (color) grip.style.setProperty("--stashpad-note-color", color);
     // 0.267.6: the hide/reveal chip sits AFTER the timestamp and the grip, so
     // the meta column keeps reading time-first and the chip does not displace
@@ -6734,6 +6765,13 @@ export class StashpadView extends ItemView {
     if (this.isObscured(node)) this.addObscureBadge(metaTop, node);
     // 0.87.1: the children-count arrow + (on mobile) the task checkbox share one
     // horizontal line below the timestamp — the mobile checkbox sits just to the
+    // 0.280.0 (teams): emoji reactions sit in the meta column, below the
+    // timestamp — compact, no full-width empty row. Only takes space when the note
+    // has reactions (the "＋" add button appears on row hover). data-id lets
+    // repaintReactions find + refresh it in place after a toggle.
+    const reactCluster = meta.createDiv({ cls: "stashpad-reaction-cluster stashpad-reaction-row" });
+    reactCluster.dataset.id = node.id;
+    renderReactionChips(this, reactCluster, node);
     // LEFT of the arrow (see the desktop addTaskCheckbox call above).
     const isPinnedRow = this.isListPinned(node.id);
     if (childCount > 0 || isPinnedRow) {
@@ -6785,6 +6823,7 @@ export class StashpadView extends ItemView {
     // The actual note body content (text + attachment rail + authorship
     // footer) lives in its own wrapper so renderNoteBody's container.empty()
     // doesn't wipe the breadcrumb above.
+    this.renderReplyQuote(body, node); // 0.281.0 (teams): jump-to-source above the body
     const bodyContent = body.createDiv({ cls: "stashpad-note-body-content" });
     // Build the actions cluster first so we can pass it (and the pencil)
     // to renderNoteBody as the host/anchor for the Show More toggle —
@@ -7524,6 +7563,106 @@ export class StashpadView extends ItemView {
     }, { capture: true, passive: true });
   }
 
+  /** 0.281.0 (teams): start a reply to `node` — the next composer send becomes a
+   *  new note linked back to it (replyTo). Shows a chip; one-shot (cleared on send
+   *  or via the chip's ✕). */
+  /** 0.281.0 (teams): render the "in reply to <source>" jump block for a note that
+   *  has `replyTo` frontmatter. Clickable — navigates to the source note. Renders
+   *  nothing when the note isn't a reply. */
+  private renderReplyQuote(host: HTMLElement, node: TreeNode): void {
+    if (!node.file) return;
+    const raw = this.app.metadataCache.getFileCache(node.file)?.frontmatter?.replyTo;
+    const id = typeof raw === "string" ? raw : "";
+    if (!id) return;
+    const src = this.tree.get(id);
+    const box = host.createDiv({ cls: "stashpad-reply-quote" + (src ? "" : " is-missing") });
+    setIcon(box.createSpan({ cls: "stashpad-reply-quote-icon" }), "reply");
+    const snippet = src?.file
+      ? (this.titleForNode(src).trim() || "(untitled)")
+      : "a note that isn't in this folder";
+    box.createSpan({ cls: "stashpad-reply-quote-text", text: snippet.length > 90 ? snippet.slice(0, 90) + "\u2026" : snippet });
+    if (src) {
+      box.addClass("is-clickable");
+      box.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); this.navigateTo(id); });
+    }
+  }
+
+  cmdReply(node?: TreeNode): void {
+    const target = node ?? this.getActionTargets()[0] ?? (this.headingNode() ?? undefined);
+    if (!target?.file) { new Notice("Pick a note to reply to."); return; }
+    this.replyTarget = { id: target.id, title: this.titleForNode(target).trim() || "(untitled)" };
+    this.refreshReplyChip();
+    this.focusComposer();
+  }
+
+  /** Render (or clear) the composer's reply chip from replyTarget. */
+  private refreshReplyChip(): void {
+    const host = this.replyChipHost;
+    if (!host) return;
+    host.empty();
+    const t = this.replyTarget;
+    host.toggleClass("is-active", !!t);
+    if (!t) return;
+    const chip = host.createDiv({ cls: "stashpad-reply-chip" });
+    setIcon(chip.createSpan({ cls: "stashpad-reply-chip-icon" }), "reply");
+    chip.createSpan({ cls: "stashpad-reply-chip-label", text: "Replying to " });
+    const title = chip.createSpan({ cls: "stashpad-reply-chip-title", text: t.title.length > 60 ? t.title.slice(0, 60) + "\u2026" : t.title });
+    title.onclick = () => this.revealReplySource(t.id);
+    const x = chip.createEl("button", { cls: "stashpad-reply-chip-x", text: "\u2715" });
+    x.title = "Cancel reply";
+    x.onclick = () => { this.replyTarget = null; this.refreshReplyChip(); };
+  }
+
+  /** Navigate to a reply's source note (by id, within this folder's tree). */
+  private revealReplySource(id: StashpadId): void {
+    if (this.tree.get(id)) this.navigateTo(id);
+    else new Notice("The note this replies to isn't in this folder.");
+  }
+
+  /** 0.282.0 (teams): whether duplicate hints should run right now. */
+  private dupHintsActive(): boolean {
+    if (!getSettings().duplicateHints) return false;
+    return Platform.isMobile ? this.dupHintsMobileOn : true;
+  }
+
+  /** Find notes in THIS folder whose title matches the composer text (Sift). Cheap
+   *  (in-memory titles) so it can run live; body search is a follow-up. */
+  private dupSearch(text: string): TreeNode[] {
+    const q = text.trim();
+    if (q.length < 3) return [];
+    const out: Array<{ n: TreeNode; score: number }> = [];
+    const ql = q.toLowerCase();
+    for (const n of this.tree.all()) {
+      if (!n.file || n.id === ROOT_ID) continue;
+      const title = this.titleForNode(n).trim();
+      if (!title || !siftMatch(q, title)) continue;
+      const tl = title.toLowerCase();
+      const score = tl === ql ? 0 : tl.startsWith(ql) ? 1 : tl.includes(ql) ? 2 : 3;
+      out.push({ n, score });
+    }
+    out.sort((a, b) => a.score - b.score || this.titleForNode(a.n).length - this.titleForNode(b.n).length);
+    return out.slice(0, 5).map((e) => e.n);
+  }
+
+  /** Render (or clear) the duplicate-hint panel from the current composer text. */
+  private refreshDupPanel(text: string): void {
+    const host = this.dupPanelHost;
+    if (!host) return;
+    host.empty();
+    if (!this.dupHintsActive()) { host.toggleClass("is-active", false); return; }
+    const matches = this.dupSearch(text);
+    host.toggleClass("is-active", matches.length > 0);
+    if (!matches.length) return;
+    host.createSpan({ cls: "stashpad-dup-label", text: "Similar notes" });
+    for (const n of matches) {
+      const row = host.createDiv({ cls: "stashpad-dup-hit" });
+      setIcon(row.createSpan({ cls: "stashpad-dup-hit-icon" }), "corner-down-right");
+      row.createSpan({ cls: "stashpad-dup-hit-title", text: this.titleForNode(n).trim() || "(untitled)" });
+      row.title = "Open this note";
+      row.onclick = () => { if (this.tree.get(n.id)) this.navigateTo(n.id); };
+    }
+  }
+
   private renderComposer(parent: HTMLElement): void {
     const settings = getSettings();
     const enterSubmits = this.modeEnterSubmits;
@@ -7538,6 +7677,11 @@ export class StashpadView extends ItemView {
     // post-restore "clear-X" button went with it — 0.97.x removed the dead code.)
 
     const composer = parent.createDiv({ cls: "stashpad-composer" });
+    // 0.281.0 (teams): reply chip lives just above the input.
+    this.replyChipHost = composer.createDiv({ cls: "stashpad-reply-chip-host" });
+    // 0.282.0 (teams): duplicate-hint panel sits just above the input.
+    this.dupPanelHost = composer.createDiv({ cls: "stashpad-dup-panel" });
+    if (this.composerDraft) this.refreshDupPanel(this.composerDraft);
     this.composerRootEl = composer;
     this.composerSignature = this.composerSig();
 
@@ -7594,9 +7738,14 @@ export class StashpadView extends ItemView {
     if (!this.debouncedSaveDraft) {
       this.debouncedSaveDraft = debounce((v: string) => { void this.saveDraft(v); }, 250);
     }
+    if (!this.debouncedDupSearch) {
+      this.debouncedDupSearch = debounce((v: string) => this.refreshDupPanel(v), 300);
+    }
     ta.addEventListener("input", () => {
       this.composerDraft = ta.value;
       this.debouncedSaveDraft!(ta.value);
+      this.debouncedDupSearch!(ta.value); // 0.282.0 (teams): live similar-notes
+
       // 0.222.0: `+` ALONE in the composer means "append to an existing note".
       // Requiring it to be the whole value is what makes this safe to put on a
       // single character: it can only fire as the first keystroke into an empty
@@ -7829,6 +7978,21 @@ export class StashpadView extends ItemView {
     // the DropzoneModal, whose zone hosts its own picker.)
 
     const btnRail = composer.createDiv({ cls: "stashpad-composer-btn-rail" });
+    // 0.282.0 (teams): on mobile, a toggle to turn the live similar-note search
+    // on/off (off by default so the keyboard isn't crowded). Desktop is always live.
+    if (Platform.isMobile && getSettings().duplicateHints) {
+      const dupToggle = btnRail.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-dup-toggle" + (this.dupHintsMobileOn ? " is-on" : "") });
+      // 0.283.1: "copy" (a stacked-pages glyph), NOT "search" — the nav cluster
+      // right beside this already shows a search icon, and two adjacent magnifiers
+      // were indistinguishable. "copy" reads as "find similar/duplicate notes".
+      setIcon(dupToggle, "copy");
+      dupToggle.title = "Similar-note hints (find possible duplicates as you type)";
+      dupToggle.onclick = () => {
+        this.dupHintsMobileOn = !this.dupHintsMobileOn;
+        dupToggle.toggleClass("is-on", this.dupHintsMobileOn);
+        this.refreshDupPanel(this.composerInputEl?.value ?? this.composerDraft ?? "");
+      };
+    }
     // 0.119.0 (mobile-ui-changes-2): on mobile, the folder picker + search +
     // jump-to-level (route) controls live here at the bottom-left of the
     // composer (moved out of the top toolbar / breadcrumb).
@@ -8131,7 +8295,12 @@ export class StashpadView extends ItemView {
       // row is in this view). Remote sends leave the local list alone.
       this.autoSelectNewest = !remote;
       this.scrollToBottomOnNextRender = !remote;
-      const createOpts = remote ? { targetFolder: destFolder } : undefined;
+      // 0.281.0 (teams): carry a reply link onto the new note when composing a reply.
+      const replyId = this.replyTarget?.id;
+      const createOpts: { targetFolder?: string; replyTo?: string } | undefined =
+        (remote || replyId)
+          ? { ...(remote ? { targetFolder: destFolder } : {}), ...(replyId ? { replyTo: replyId } : {}) }
+          : undefined;
       // 0.213.0: an attachment added from THIS folder's composer was already
       // written to <this.noteFolder>/_attachments by importAttachment — that
       // happens at drop/paste time, before the destination is known. If the
@@ -8168,11 +8337,14 @@ export class StashpadView extends ItemView {
       } else {
         await this.createNoteUnder(sendText, parent, createOpts);
       }
+      // 0.281.0 (teams): a reply is a one-shot — clear the reply target and its chip.
+      if (this.replyTarget) { this.replyTarget = null; this.refreshReplyChip(); }
       // 0.213.0: this compose is over — whatever it staged now belongs to the
       // note that was just created. Not clearing would let a stale path be
       // treated as "staged by this composer" on a later send and get moved out
       // from under the note now using it.
       this.composerCreatedAttachments.clear();
+      this.refreshDupPanel(""); // 0.282.0 (teams): the composer emptied
       // Keep focus in the composer so the user can keep typing without
       // re-clicking — unless the user disabled this in settings.
       if (getSettings().autofocusComposerAfterSend) {
@@ -8494,6 +8666,14 @@ export class StashpadView extends ItemView {
   }
 
   private handleRowClick(e: MouseEvent, idx: number, node: TreeNode): void {
+    // 0.279.30: if the user just drag-selected TEXT inside a row (now possible on
+    // desktop), the mouseup fires a click — don't let it navigate/select the row
+    // and wipe the selection. A collapsed (empty) selection is a normal click.
+    const sel = (e.currentTarget as HTMLElement | null)?.ownerDocument?.getSelection?.();
+    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
+      const row = e.currentTarget as HTMLElement | null;
+      if (row && sel.anchorNode && row.contains(sel.anchorNode)) return;
+    }
     // Mobile: a tap during the keyboard-dismiss reflow only dismisses the
     // keyboard — acting on it would select whatever row slid under the finger.
     const absorbed = this.shouldAbsorbDismissTap();
@@ -9467,6 +9647,45 @@ export class StashpadView extends ItemView {
    *  making a note a task CREATES the checkbox and is therefore structural.
    *  Returns false when the fast path does not apply, so the caller can fall
    *  back to a full render rather than silently leaving a stale row. */
+  /** 0.280.0 (teams): re-render a note's reaction chips in place after a toggle,
+   *  in every rendered spot (list row + pinned heading share the class). */
+  repaintReactions(id: StashpadId, override?: ReactionMap): void {
+    const node = this.tree.get(id);
+    const scope = this.listEl ?? this.containerEl;
+    if (!node || !scope) return;
+    scope.querySelectorAll<HTMLElement>(`.stashpad-reaction-row[data-id="${CSS.escape(id)}"]`)
+      .forEach((h) => renderReactionChips(this, h, node, override));
+  }
+
+  /** 0.280.0 (teams): best-effort display name for a reaction author id. Resolves
+   *  the current user from settings; others fall back to a short id until a full
+   *  _authors lookup is wired. */
+  private _reactionAuthorsWarmed = false;
+  reactionAuthorName(id: string): string {
+    const s = this.plugin.settings;
+    if (id === s.authorId || id === "local") return (s.authorName || "You");
+    const reg = (this.plugin as any).authorRegistry;
+    let rec = reg?.get?.(id);
+    if (!rec?.name && !this._reactionAuthorsWarmed) {
+      // Warm the in-memory registry from the _authors stubs ONCE (cheap after),
+      // so other people's reactions resolve to their display names.
+      this._reactionAuthorsWarmed = true;
+      try { (this.plugin as any).collectKnownAuthors?.(); } catch { /* ignore */ }
+      rec = reg?.get?.(id);
+    }
+    return rec?.name || (id.length > 8 ? id.slice(0, 8) + "\u2026" : id);
+  }
+
+  /** 0.280.0 (teams): open the emoji reaction quick-pick for a note. */
+  cmdReact(node?: TreeNode): void {
+    const target = node ?? this.getActionTargets()[0] ?? (this.headingNode() ?? undefined);
+    if (!target?.file) { new Notice("Pick a note to react to."); return; }
+    const anchor = (this.listEl ?? this.containerEl)?.querySelector<HTMLElement>(
+      `.stashpad-reaction-row[data-id="${CSS.escape(target.id)}"] .stashpad-reaction-add`,
+    ) ?? this.viewRoot;
+    openReactionPicker(this, target, anchor);
+  }
+
   private repaintCompletedState(ids: StashpadId[]): boolean {
     const list = this.listEl;
     if (!list) return false;
@@ -16045,6 +16264,7 @@ export class StashpadView extends ItemView {
     // 0.170.0: Edit-surface Save — write the edited body back to the note (frontmatter
     // preserved), as one undo entry.
     const performEdit = async (newBody: string): Promise<void> => {
+      const _editT0 = performance.now(); // 0.279.29 diag (perf flag)
       const nb = newBody.replace(/\s+$/, "");
       if (!nb.trim()) { new Notice("Can't save an empty note."); return; }
 
@@ -16103,6 +16323,7 @@ export class StashpadView extends ItemView {
       void this.log.append({ type: "edit", id: target.id, payload: { path: finalPath } });
       this.tree.rebuild(this.noteFolder);
       this.render();
+      perf.record("edit.save.total", performance.now() - _editT0); // 0.279.29 diag (perf flag)
       this.plugin.notifications.show({
         message: `Saved "${this.titleForNode(target)}"`, kind: "success", category: "split",
         affectedIds: [target.id], folder: this.noteFolder,
@@ -16358,7 +16579,7 @@ export class StashpadView extends ItemView {
 
   // --- Note creation ---
 
-  private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string; deferRender?: boolean; deferUndo?: boolean; collectInto?: Array<{ path: string; content: string }> } = { record: true }): Promise<StashpadId | null> {
+  private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string; deferRender?: boolean; deferUndo?: boolean; replyTo?: string; collectInto?: Array<{ path: string; content: string }> } = { record: true }): Promise<StashpadId | null> {
     // 0.76.15: targetFolder lets the destination picker SHIP a note to
     // another Stashpad folder without switching this view there. When
     // it differs from the current folder we skip the synthetic insert
@@ -16447,6 +16668,7 @@ export class StashpadView extends ItemView {
       `modified: ${created}`,
     ];
     if (author) fmLines.push(`author: "${author.link.replace(/"/g, '\\"')}"`);
+    if (opts.replyTo) fmLines.push(`replyTo: "${opts.replyTo}"`); // 0.281.0 (teams)
     if (attachments.length > 0) {
       fmLines.push("attachments:");
       for (const a of attachments) fmLines.push(`  - "${a.replace(/"/g, '\\"')}"`);
@@ -17161,7 +17383,10 @@ export class StashpadView extends ItemView {
     if (this.app.vault.getAbstractFileByPath(newPath)) return null;
     const oldPath = file.path;
     try {
-      await this.app.fileManager.renameFile(file, newPath);
+      // 0.279.29 diag: the rename makes Obsidian rewrite every link pointing at
+      // this note across the whole vault — the suspected multi-second cost on a
+      // big vault when the edit-modal save re-slugs. Behind the perf flag.
+      await perf.timeAsync("write.reslug", () => this.app.fileManager.renameFile(file, newPath));
       await this.log.append({ type: "rename", id, payload: { from: oldPath, to: newPath } });
       return newPath;
     } catch { return null; }
@@ -17581,6 +17806,8 @@ export class StashpadView extends ItemView {
     }));
     menu.addItem((it: any) => it.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => this.navigateTo(node.id)));
     menu.addSeparator();
+    menu.addItem((it: any) => it.setTitle("React…").setIcon("smile-plus").onClick(() => this.cmdReact(node)));
+    menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => this.cmdReply(node)));
     menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => void this.cmdEdit(node)));
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
     // Only meaningful on a repeating task; hidden otherwise so the menu stays short.

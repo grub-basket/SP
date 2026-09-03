@@ -207,6 +207,12 @@ export class TreeIndex {
     this.emit();
   }
 
+  /** 0.282.0: all nodes (incl. ROOT). Cheap in-memory snapshot for e.g. the
+   *  composer's duplicate-note search. */
+  all(): TreeNode[] {
+    return [...this.nodes.values()];
+  }
+
   get(id: StashpadId): TreeNode | undefined {
     return this.nodes.get(id);
   }

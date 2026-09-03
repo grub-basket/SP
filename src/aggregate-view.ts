@@ -1,5 +1,6 @@
 import { ItemView, Menu, Notice, Platform, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
 import type StashpadPlugin from "./main";
+import { perf } from "./perf";
 import { populateLockedMenu } from "./locked-menu";
 import { STASHPAD_AGGREGATE_VIEW_TYPE, archiveSubfolderOf } from "./types";
 
@@ -155,6 +156,10 @@ export class StashpadAggregateView extends ItemView {
   }
 
   async render(): Promise<void> {
+    // 0.279.29 diag (perf flag): count how often each aggregate view recomputes.
+    // A high count during an edit session = it's doing its vault-wide sweep on
+    // every save and stealing the main thread — the suspected list-lag cause.
+    perf.record(`aggregate.render.${this.mode}`, 0);
     this.dirty = false; // a full recompute satisfies any deferred-while-hidden change
     const root = this.contentEl;
     root.empty();
