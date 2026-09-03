@@ -8988,6 +8988,7 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 /* Quick-pick popover */
 .stashpad-reaction-picker {
   z-index: var(--layer-menu, 60);
+  position: fixed; /* 0.283.2: was set in JS (store-lint blocker); left/top stay computed in positionPopover */
   display: flex;
   gap: 2px;
   padding: 5px 6px;
@@ -9037,6 +9038,7 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-reaction-more:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
 .stashpad-reaction-overflow {
   z-index: var(--layer-menu, 60);
+  position: fixed; /* 0.283.2: was set in JS (store-lint blocker); left/top stay computed in positionPopover */
   display: flex;
   flex-wrap: wrap;
   max-width: 280px;

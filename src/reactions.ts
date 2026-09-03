@@ -202,15 +202,19 @@ function normalizeEmojiInput(raw: string): string {
 }
 
 function positionPopover(pop: HTMLElement, anchor: HTMLElement): void {
+  // `position: fixed` lives on the popover CSS classes (store lint forbids a
+  // literal `el.style.position = "fixed"`); here we only set the COMPUTED
+  // left/top, which the rule allows.
   const doc = anchor.ownerDocument;
   const r = anchor.getBoundingClientRect();
-  pop.style.position = "fixed";
-  pop.style.left = `${Math.round(r.left)}px`;
   pop.style.top = `${Math.round(r.bottom + 4)}px`;
   const pr = pop.getBoundingClientRect();
   const vw = doc.defaultView?.innerWidth ?? pr.right;
-  if (pr.right > vw) pop.style.left = `${Math.round(vw - pr.width - 8)}px`;
-  if (Number(pop.style.left.replace("px", "")) < 4) pop.style.left = "4px";
+  // Anchor to the trigger, flip in from the right edge if it would overflow,
+  // then clamp to a 4px gutter — all in one computed value (no literal "4px").
+  let left = Math.round(r.left);
+  if (left + pr.width > vw) left = Math.round(vw - pr.width - 8);
+  pop.style.left = `${Math.max(4, left)}px`;
 }
 
 function installDismiss(pop: HTMLElement, anchor: HTMLElement, cls: string): () => void {
