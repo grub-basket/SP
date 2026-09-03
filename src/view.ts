@@ -496,6 +496,32 @@ export class StashpadView extends ItemView {
   private aimedTapTargetId: string | null = null;
   private aimedTapAt = 0;
   private static readonly AIMED_TAP_WINDOW_MS = 600;
+  /** 0.285.0: WHOLE-ROW GRAB AREA — the single source of truth for which parts
+   *  of a note row are NOT a drag handle. A press on any element matching this
+   *  selector selects text or clicks the control; a press on anything ELSE
+   *  (dead space, meta-column whitespace, the timestamp, the grip) drags the
+   *  row. Documented in docs/drag-reserved-zones.md — keep the two in sync.
+   *  If drag/select/click ever "breaks", this list is what was accommodated:
+   *   - .stashpad-note-text : the rendered body (selectable text) AND every
+   *       inline link/tag/embed inside it (title is the body's first line).
+   *   - a, .internal-link, .tag : links anywhere (author link, body links, tags).
+   *   - button : every control button (edit / more / duplicate / mobile actions /
+   *       the reaction "＋" add button / nav-cluster buttons).
+   *   - .stashpad-note-task-checkbox : the task checkbox.
+   *   - .stashpad-reaction-cluster : reaction chips (clickable spans) + add button.
+   *   - .stashpad-note-enter : the children-count / expand arrow.
+   *   - .stashpad-note-authorship : the author footer (its link is also `a`).
+   *   - input, textarea, select, [contenteditable] : any real form field. */
+  static readonly DRAG_RESERVED_SELECTOR = [
+    ".stashpad-note-text",
+    "a", ".internal-link", ".tag",
+    "button",
+    ".stashpad-note-task-checkbox",
+    ".stashpad-reaction-cluster",
+    ".stashpad-note-enter",
+    ".stashpad-note-authorship",
+    "input", "textarea", "select", "[contenteditable]",
+  ].join(", ");
   /** Per-row ResizeObserver attached during scrollListToBottom — re-pins
    *  the list to the bottom whenever a row's height changes. Survives
    *  past the initial paint so cold-cache markdown / late font loads
@@ -6747,15 +6773,23 @@ export class StashpadView extends ItemView {
     if (color) grip.addClass("has-color");
     setIcon(grip, "grip-vertical");
     grip.title = color ? "Drag to reorder · right-click to change color" : "Drag to reorder";
-    grip.draggable = draggable;
+    grip.draggable = draggable && !selectableText;
     if (!draggable) grip.title = color ? "Right-click to change color · drag disabled in this view mode" : "Drag disabled in this view mode";
+    else if (selectableText) grip.title = color ? "Drag anywhere to reorder · right-click to change color" : "Drag anywhere to reorder";
     if (draggable && selectableText) {
-      // 0.279.30: with selectable text the row isn't draggable, so arm row-drag on
-      // grip press (drag then uses the ROW: row drag image + the row's dragstart
-      // handler) while a body drag stays a text selection. Disarm after the gesture.
+      // 0.285.0: WHOLE-ROW grab area (supersedes the 0.279.30 grip-only arming).
+      // With selectable text the row starts non-draggable so the body stays
+      // selectable; on mousedown we arm the drag ONLY when the press landed on
+      // dead space — anything NOT matching DRAG_RESERVED_SELECTOR (buttons, links,
+      // the body text, checkbox, reactions…). So the timestamp, the grip, and all
+      // meta-column whitespace drag the row, while text selects and controls click.
+      // Disarm after the gesture so a later plain click on the body isn't a drag.
       const disarm = (): void => { row.draggable = false; };
-      grip.addEventListener("mousedown", () => { row.draggable = true; });
-      grip.addEventListener("mouseup", disarm);
+      row.addEventListener("mousedown", (e) => {
+        const t = e.target as HTMLElement | null;
+        row.draggable = !(t && t.closest(StashpadView.DRAG_RESERVED_SELECTOR));
+      });
+      row.addEventListener("mouseup", disarm);
       row.addEventListener("dragend", disarm);
     }
     if (color) grip.style.setProperty("--stashpad-note-color", color);
@@ -6851,6 +6885,13 @@ export class StashpadView extends ItemView {
       setIcon(enterBtn, "arrow-right");
       enterBtn.title = "Open in Stashpad view";
       enterBtn.onclick = (e) => { e.stopPropagation(); this.navigateTo(node.id); };
+      // 0.286.0 (teams): a dedicated per-item Reply button (was menu/palette only).
+      // "reply" is the left-curving arrow the user asked for; starts a quoted
+      // reply to this note (the composer's next send links back to it).
+      const replyBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-reply" });
+      setIcon(replyBtn, "reply");
+      replyBtn.title = "Reply to this note";
+      replyBtn.onclick = (e) => { e.stopPropagation(); this.cmdReply(node); };
       // "More actions" button — opens the same context menu as right-click
       // (Copy Stashpad link, Delete, Split, Move, …). One menu button keeps the
       // row uncluttered as the action set grows, instead of a button per action.
@@ -7655,11 +7696,28 @@ export class StashpadView extends ItemView {
     if (!matches.length) return;
     host.createSpan({ cls: "stashpad-dup-label", text: "Similar notes" });
     for (const n of matches) {
+      const title = this.titleForNode(n).trim() || "(untitled)";
       const row = host.createDiv({ cls: "stashpad-dup-hit" });
+      // 0.286.0: keyboard-navigable. The panel is above the composer, so
+      // Shift+Tab from the input lands on the last hit; ArrowUp/Down move between
+      // hits (ArrowUp past the first returns to the composer), Enter/Space opens,
+      // Escape returns focus to the composer.
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-label", `Open similar note: ${title}`);
       setIcon(row.createSpan({ cls: "stashpad-dup-hit-icon" }), "corner-down-right");
-      row.createSpan({ cls: "stashpad-dup-hit-title", text: this.titleForNode(n).trim() || "(untitled)" });
+      row.createSpan({ cls: "stashpad-dup-hit-title", text: title });
       row.title = "Open this note";
-      row.onclick = () => { if (this.tree.get(n.id)) this.navigateTo(n.id); };
+      const open = (): void => { if (this.tree.get(n.id)) this.navigateTo(n.id); };
+      row.onclick = open;
+      row.addEventListener("keydown", (e) => {
+        const hits = Array.from(host.querySelectorAll<HTMLElement>(".stashpad-dup-hit"));
+        const idx = hits.indexOf(row);
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
+        else if (e.key === "ArrowDown") { e.preventDefault(); (hits[idx + 1] ?? hits[0]).focus(); }
+        else if (e.key === "ArrowUp") { e.preventDefault(); if (idx <= 0) this.composerInputEl?.focus(); else hits[idx - 1].focus(); }
+        else if (e.key === "Escape") { e.preventDefault(); this.composerInputEl?.focus(); }
+      });
     }
   }
 
@@ -7677,16 +7735,19 @@ export class StashpadView extends ItemView {
     // post-restore "clear-X" button went with it — 0.97.x removed the dead code.)
 
     const composer = parent.createDiv({ cls: "stashpad-composer" });
-    // 0.281.0 (teams): reply chip lives just above the input.
+    // 0.286.0: the composer is a COLUMN — the reply quote + duplicate-hints
+    // panel stack full-width ABOVE the input row (they used to be flex items in
+    // the same row as the textarea, which halved the composer width). The
+    // textarea + button rail live in an inner `.stashpad-composer-row`.
     this.replyChipHost = composer.createDiv({ cls: "stashpad-reply-chip-host" });
-    // 0.282.0 (teams): duplicate-hint panel sits just above the input.
     this.dupPanelHost = composer.createDiv({ cls: "stashpad-dup-panel" });
     if (this.composerDraft) this.refreshDupPanel(this.composerDraft);
     this.composerRootEl = composer;
     this.composerSignature = this.composerSig();
 
+    const composerRow = composer.createDiv({ cls: "stashpad-composer-row" });
     // Wrap the textarea so we can absolutely-position the clear-X over it.
-    const taWrap = composer.createDiv({ cls: "stashpad-composer-input-wrap" });
+    const taWrap = composerRow.createDiv({ cls: "stashpad-composer-input-wrap" });
     const ta = taWrap.createEl("textarea", {
       cls: "stashpad-composer-input",
       attr: { rows: "2", placeholder: this.composerPlaceholder(enterSubmits, splitMode) },
@@ -7977,7 +8038,7 @@ export class StashpadView extends ItemView {
     // (0.201.2: the hidden composer file input is gone — the paperclip opens
     // the DropzoneModal, whose zone hosts its own picker.)
 
-    const btnRail = composer.createDiv({ cls: "stashpad-composer-btn-rail" });
+    const btnRail = composerRow.createDiv({ cls: "stashpad-composer-btn-rail" });
     // 0.282.0 (teams): on mobile, a toggle to turn the live similar-note search
     // on/off (off by default so the keyboard isn't crowded). Desktop is always live.
     if (Platform.isMobile && getSettings().duplicateHints) {
@@ -8223,7 +8284,7 @@ export class StashpadView extends ItemView {
     // NOTE: this deliberately leaves the textarea and its ancestors untouched.
     // The `touchstart`/`touchmove` guard above still sits on the textarea, in
     // the same place in the tree, so the swipe-to-highlight fix is unaffected.
-    const sendBtn = composer.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-send" });
+    const sendBtn = composerRow.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-send" });
     // 0.270.3: the same guard the textarea carries, for the same reason. Send is
     // the rightmost control in the view, and its invisible hit-area extender
     // (`::before`, -8px) reaches into the strip along the screen edge where

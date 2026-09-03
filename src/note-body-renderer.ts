@@ -1,5 +1,6 @@
 import { App, Component, MarkdownRenderer, TFile } from "obsidian";
 import { perf } from "./perf";
+import { takeLeadingColor } from "./highlight-colors";
 import type { RenderCacheLike } from "./render-cache-store";
 
 /** A cached per-file body render. `html` is the rendered MarkdownRenderer
@@ -64,6 +65,7 @@ export class NoteBodyRenderer {
     const { text, attachments } = this.splitAttachments(raw);
     const detached = createDiv({ cls: "stashpad-note-text" });
     await perf.timeAsync("render.row.markdown", () => MarkdownRenderer.render(this.host.app, text, detached, file.path, this.component));
+    this.colorizeHighlights(detached);
     const html = detached.innerHTML;
     const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html };
     this.renderCache.set(file.path, entry);
@@ -84,11 +86,30 @@ export class NoteBodyRenderer {
       const { text, attachments } = this.splitAttachments(this.host.stripFrontmatter(rawBody));
       const detached = createDiv({ cls: "stashpad-note-text" });
       await MarkdownRenderer.render(this.host.app, text, detached, file.path, this.component);
+      this.colorizeHighlights(detached);
       const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html: detached.innerHTML };
       this.renderCache.set(file.path, entry);
     } catch (e) {
       console.warn("[Stashpad] primeRender failed", e);
     }
+  }
+
+  /** 0.284.0: multi-color highlights. Obsidian renders `==🔴text==` as
+   *  `<mark>🔴text</mark>` — the color emoji is just literal text inside the
+   *  mark. Here we lift it out: for each `<mark>` whose leading text is a
+   *  highlight-color emoji, strip that emoji (+ one padding space) and tag the
+   *  mark with `stashpad-hl-<key>` so CSS tints it. Marks without a leading
+   *  color emoji are left as the plain (default) highlight. */
+  private colorizeHighlights(root: HTMLElement): void {
+    root.querySelectorAll("mark").forEach((mark) => {
+      const first = mark.firstChild;
+      if (!first || first.nodeType !== 3 /* TEXT_NODE */) return;
+      const taken = takeLeadingColor(first.textContent ?? "");
+      if (!taken) return;
+      first.textContent = taken.rest;
+      mark.classList.add(`stashpad-hl-${taken.key}`);
+      mark.setAttribute("data-hl", taken.key);
+    });
   }
 
   /** (Re)create the lazy-body IntersectionObserver for the current paint.

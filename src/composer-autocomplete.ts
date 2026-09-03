@@ -1,5 +1,6 @@
 import { App, Scope, TFile, moment } from "obsidian";
 import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore, siftMatch } from "./types";
+import { HIGHLIGHT_COLORS, takeLeadingColor } from "./highlight-colors";
 import { getSettings, getTemplatesFormats } from "./settings";
 import { MarkdownInput, type MarkdownInputOptions } from "./markdown-input";
 
@@ -368,6 +369,24 @@ export class ComposerAutocomplete {
       };
     }
 
+    // 0.284.0: highlight color. An opening `==` (not part of `===`) followed by
+    // a single-token color-name query opens the color menu. The query excludes
+    // spaces/newlines/`=`, so the menu lives only while typing that one word and
+    // closes the moment you type past it (Sift finds no color → empty → closed)
+    // — that's the "dismiss if no match" behavior. Skipped once a color emoji is
+    // already present right after the `==` (the color is chosen; don't reopen).
+    // Only the query is replaced on accept, so the emoji lands right after `==`.
+    const hlMatch = before.match(/(?<!=)==([^=\s\n]{0,24})$/);
+    if (hlMatch && !takeLeadingColor(hlMatch[1])) {
+      const query = hlMatch[1];
+      return {
+        kind: "highlight",
+        query,
+        replaceStart: caret - query.length,
+        replaceEnd: caret,
+      };
+    }
+
     return null;
   }
 
@@ -463,6 +482,20 @@ export class ComposerAutocomplete {
   // ---------- Suggest generation ----------
 
   private buildItems(state: AutocompleteState): SuggestItem[] {
+    // 0.284.0: highlight colors — a fixed, tiny palette; no file index needed.
+    // Sift-match the color NAME so `gr`→Green, `blue`→Blue, empty→all. Accepting
+    // inserts just the emoji (Default inserts nothing — a plain highlight),
+    // right after the `==`, leaving the caret ready to type the highlight text.
+    if (state.kind === "highlight") {
+      const q = state.query.toLowerCase().trim();
+      return HIGHLIGHT_COLORS
+        .filter((c) => siftMatch(q, c.name))
+        .map((c) => ({
+          label: `${c.emoji || "⬜"} ${c.name}`,
+          insert: c.emoji,
+          subtitle: c.emoji ? "" : "plain highlight",
+        }));
+    }
     this.buildIndex();
     const q = state.query.toLowerCase().trim();
     // All-tokens-match: split the query on whitespace; every token must
@@ -796,7 +829,7 @@ interface SuggestItem {
 }
 
 interface AutocompleteState {
-  kind: "tag" | "link" | "at" | "command";
+  kind: "tag" | "link" | "at" | "command" | "highlight";
   /** 0.199.2: the trigger sits inside `[[ ]]` — every insert must be a link. */
   inLink?: boolean;
   query: string;

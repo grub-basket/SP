@@ -2171,9 +2171,17 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-composer {
   flex: 0 0 auto;
   display: flex;
+  /* 0.286.0: column — reply quote + duplicate hints stack full-width above the
+     input row (.stashpad-composer-row) instead of stealing width beside it. */
+  flex-direction: column;
   gap: 6px;
   padding: 8px 0 2px;
   border-top: 1px solid var(--background-modifier-border);
+  align-items: stretch;
+}
+.stashpad-composer-row {
+  display: flex;
+  gap: 6px;
   align-items: stretch;
 }
 /* Desktop: button rail flows in the row alongside the textarea wrap. */
@@ -3117,6 +3125,13 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   flex-direction: column;
   align-items: stretch;
   padding-top: 2px;
+}
+/* 0.286.0: on mobile the input row stacks (textarea above the rail), matching
+   the pre-0.286 direct-child layout now that taWrap + rail live in a row wrapper. */
+.stashpad-view.is-mobile .stashpad-composer-row {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
 }
 .stashpad-view.is-mobile .stashpad-composer-input-wrap {
   width: 100%;
@@ -4887,14 +4902,6 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
   color: var(--text-normal);
 }
 .stashpad-compact-exit-btn svg { width: 13px; height: 13px; }
-
-/* 0.283.1: center the tab-header title for Stashpad's own tabs. The title box
-   is `flex:1 1 auto`, so it fills the tab and the app's default left text-align
-   made the (now longer, note-title-first) name read as left-aligned. Scoped by
-   data-type so no other plugin's tabs are touched. */
-.workspace-tab-header[data-type="stashpad-view"] .workspace-tab-header-inner-title {
-  text-align: center;
-}
 
 /* Hide Obsidian's view-header + tab-header strip when the leaf hosts a
    compact-mode or tiny-mode Stashpad view. Uses :has() so we don't
@@ -9144,7 +9151,63 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   color: var(--text-normal);
 }
 .stashpad-dup-hit:hover { background: var(--background-modifier-hover); }
+/* 0.286.0: keyboard focus (Shift+Tab into the panel, arrows to move). */
+.stashpad-dup-hit:focus,
+.stashpad-dup-hit:focus-visible {
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: -2px;
+  background: var(--background-modifier-hover);
+}
 .stashpad-dup-hit-icon { display: inline-flex; color: var(--text-faint); }
 .stashpad-dup-hit-icon .svg-icon { width: 13px; height: 13px; }
 .stashpad-dup-hit-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .stashpad-composer-dup-toggle.is-on { color: var(--interactive-accent); }
+
+/* ============================================================
+   Multi-color highlights (0.284.0)
+   `==🔴text==` on disk. Two render paths, styled identically here:
+   - Obsidian INSIDER (1.13+) renders it natively as `<mark data-highlight="red">`
+     (it consumes the emoji itself).
+   - STABLE Obsidian renders `<mark>🔴text</mark>`; our note-body-renderer's
+     colorizeHighlights strips the emoji and adds `.stashpad-hl-red` + data-hl.
+   Translucent tints so a value reads on both light and dark themes; the note's
+   text color is left untouched for contrast. Plain highlights (no color) keep
+   Obsidian's own <mark> styling.
+   ============================================================ */
+.stashpad-note-text mark[data-hl],
+.stashpad-note-text mark[data-highlight]:not([data-highlight=""]) {
+  /* match Obsidian's highlight padding/rounding so colored + default agree */
+  border-radius: 3px;
+  padding: 0 1px;
+  color: inherit;
+}
+.stashpad-note-text mark.stashpad-hl-red,
+.stashpad-note-text mark[data-highlight="red"]    { background: rgba(224, 122, 120, 0.38); }
+.stashpad-note-text mark.stashpad-hl-orange,
+.stashpad-note-text mark[data-highlight="orange"] { background: rgba(224, 138,  71, 0.38); }
+.stashpad-note-text mark.stashpad-hl-yellow,
+.stashpad-note-text mark[data-highlight="yellow"] { background: rgba(224, 167,  68, 0.42); }
+.stashpad-note-text mark.stashpad-hl-green,
+.stashpad-note-text mark[data-highlight="green"]  { background: rgba(107, 192, 122, 0.42); }
+.stashpad-note-text mark.stashpad-hl-blue,
+.stashpad-note-text mark[data-highlight="blue"]   { background: rgba( 91, 169, 206, 0.42); }
+.stashpad-note-text mark.stashpad-hl-purple,
+.stashpad-note-text mark[data-highlight="purple"] { background: rgba(155, 130, 201, 0.44); }
+/* Dark theme: nudge alpha up so the tint doesn't wash out over a dark ground. */
+body.theme-dark .stashpad-note-text mark.stashpad-hl-red,
+body.theme-dark .stashpad-note-text mark[data-highlight="red"]    { background: rgba(224, 122, 120, 0.48); }
+body.theme-dark .stashpad-note-text mark.stashpad-hl-orange,
+body.theme-dark .stashpad-note-text mark[data-highlight="orange"] { background: rgba(224, 138,  71, 0.48); }
+body.theme-dark .stashpad-note-text mark.stashpad-hl-yellow,
+body.theme-dark .stashpad-note-text mark[data-highlight="yellow"] { background: rgba(224, 167,  68, 0.50); }
+body.theme-dark .stashpad-note-text mark.stashpad-hl-green,
+body.theme-dark .stashpad-note-text mark[data-highlight="green"]  { background: rgba(107, 192, 122, 0.50); }
+body.theme-dark .stashpad-note-text mark.stashpad-hl-blue,
+body.theme-dark .stashpad-note-text mark[data-highlight="blue"]   { background: rgba( 91, 169, 206, 0.50); }
+body.theme-dark .stashpad-note-text mark.stashpad-hl-purple,
+body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: rgba(155, 130, 201, 0.52); }
+
+/* The color swatch in the composer's `==` menu rows — the leading emoji already
+   provides the dot, so no extra styling needed; this just keeps the row label
+   from wrapping awkwardly on a narrow composer. */
+.stashpad-composer-suggest-label { white-space: nowrap; }
