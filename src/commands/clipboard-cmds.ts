@@ -1,5 +1,6 @@
 import { Notice, SuggestModal } from "obsidian";
 import type { TreeNode } from "../types";
+import { getSettings } from "../settings";
 import { extractCodeBlocks } from "../view-helpers";
 import type { StashpadView } from "../view";
 
@@ -129,9 +130,20 @@ export async function cmdCopyCodeBlock(view: StashpadView): Promise<void> {
  *  entry point (`cmdCopyFocusedSubtree`) that means it, rather than being an
  *  unreachable branch of this one. */
 export async function cmdCopyTree(view: StashpadView, withTimestamps = false): Promise<void> {
-  const roots = view.getActionTargets();
+  // 0.279.15: collapse a nested selection (parent + its descendants, e.g. Mod+A
+  // from the heading) to top-level roots, so each subtree is emitted ONCE with the
+  // real ancestor as its outline root — not a child mistaken for the parent.
+  const roots = view.collapseNestedTargets(view.getActionTargets());
   if (roots.length === 0) { new Notice("Nothing to copy."); return; }
   await copyTreeFromRoots(view, roots, withTimestamps);
+}
+
+/** 0.279.9: Copy tree, forcing the `[L<n>]` level-marker format regardless of the
+ *  setting — an on-demand indent-safe copy the user can bind to a hotkey. */
+export async function cmdCopyTreeLevelMarkers(view: StashpadView, withTimestamps = false): Promise<void> {
+  const roots = view.collapseNestedTargets(view.getActionTargets());
+  if (roots.length === 0) { new Notice("Nothing to copy."); return; }
+  await copyTreeFromRoots(view, roots, withTimestamps, true);
 }
 
 /** Copy the note you are currently INSIDE plus its whole subtree, regardless of
@@ -151,8 +163,14 @@ export async function cmdCopyFocusedSubtree(view: StashpadView, withTimestamps =
   await copyTreeFromRoots(view, [focused], withTimestamps);
 }
 
-async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[], withTimestamps = false): Promise<void> {
+async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[], withTimestamps = false, forceLevelMarkers = false): Promise<void> {
   const prefix = withTimestamps;
+  // 0.279.4: level-marker mode — prefix each line with `[L<n>]` (root = L1) INSTEAD
+  // of leading indentation, so depth survives paste into apps that strip whitespace.
+  // Relative to the copied root: what's L1 here is the parent of the selection, not
+  // its absolute depth in the folder. See docs/public/level-markers.md.
+  // 0.279.9: the dedicated command forces it on; otherwise follow the setting.
+  const levelMarkers = forceLevelMarkers || getSettings().copyTreeLevelMarkers;
   const lines: string[] = [];
   const walk = async (node: TreeNode, depth: number): Promise<void> => {
     if (node.file) {
@@ -162,7 +180,14 @@ async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[], withTime
       // 0.188.0: checkbox + colour metadata go AFTER the bullet dash this format
       // already emits (needsDash ignored — the "- " is always present here).
       const { checkbox, meta } = view.copyMetaPrefix(node);
-      lines.push(`${"  ".repeat(depth)}- ${checkbox}${meta}${ts}${body}`);
+      // 0.279.13: level-marker mode KEEPS the indentation + bullet and inserts the
+      // `[L<n>]` marker after the dash. The marker is the robust depth signal for
+      // apps that strip whitespace; keeping the real indentation means it still
+      // reads as a normal outline where whitespace survives, and the markers can be
+      // stripped later with a regex (`\[L\d+\]\s`) to recover a plain indented list.
+      lines.push(levelMarkers
+        ? `${"  ".repeat(depth)}- [L${depth + 1}] ${checkbox}${meta}${ts}${body}`
+        : `${"  ".repeat(depth)}- ${checkbox}${meta}${ts}${body}`);
     }
     for (const c of view.tree.getChildren(node.id)) await walk(c, depth + 1);
   };

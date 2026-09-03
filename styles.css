@@ -1321,8 +1321,13 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    background-color directly made the pinned row see-through — it is an
    overlay colour with alpha, meant to sit on top of something, and the rows
    scrolling underneath showed straight through it. */
+/* 0.279.8: the heading is ALWAYS in the selection while you're on it (that's how
+   its hotkey commands target it — see selectHeadingCursor), so a filled "selected"
+   tint made the pinned header look permanently selected just from navigating in.
+   Paint no tint here; the is-cursor ring below is the cursor affordance. The base
+   stays fully opaque so rows can't show through the sticky header. */
 .stashpad-focused.is-heading-row.is-selected {
-  background-image: linear-gradient(var(--background-modifier-hover), var(--background-modifier-hover));
+  background-image: none;
   background-color: var(--background-primary);
 }
 /* Same full inset ring the note rows use (.stashpad-note.is-cursor), not a
@@ -3928,6 +3933,29 @@ body.is-mobile .stashpad-jd-actions .setting-item-control {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   line-height: 1.4;
+}
+/* 0.279.24: recent-timezone chips under the Home timezone setting. */
+.stashpad-tz-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 14px 0;
+}
+.stashpad-tz-chip {
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 12px;
+  padding: 2px 10px;
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+.stashpad-tz-chip:hover:not(:disabled) { background: var(--interactive-hover); }
+.stashpad-tz-chip.is-active {
+  border-color: var(--interactive-accent);
+  color: var(--text-muted);
+  cursor: default;
 }
 /* 0.121.7 (#2): the live date sample read under-indented vs the rest — bump it
    a touch past the standard 14px. (Approximate — verify against live settings.) */
@@ -7900,6 +7928,16 @@ button.stashpad-btn-loading::after {
   color: transparent;
   text-shadow: 0 0 7px var(--text-normal);
 }
+/* 0.279.12: obscure the AUTHOR / contributor NAME in the footer — it leaks who
+   authored the note. The "by" / "edited" labels and the timestamp stay readable
+   (chrome, like the row timestamp). Small text, so the cheap shadow trick is
+   enough in both the row and heading footers. Stays hidden through the two-step
+   text-reveal (it isn't in the reveal override) and clears on the full reveal. */
+.stashpad-note.is-obscured .stashpad-note-authorship :is(.stashpad-authorship-name, a.internal-link),
+.stashpad-focused.is-obscured .stashpad-note-authorship :is(.stashpad-authorship-name, a.internal-link) {
+  color: transparent;
+  text-shadow: 0 0 6px var(--text-normal);
+}
 .stashpad-note.is-obscured { cursor: pointer; }
 .stashpad-note.is-obscured .stashpad-note-body::selection { background: transparent; }
 
@@ -7915,6 +7953,9 @@ button.stashpad-btn-loading::after {
 .stashpad-focused.is-obscured.is-text-revealed .stashpad-link-rail {
   color: var(--text-normal);
   text-shadow: none;
+  /* 0.279.6: the heading now blurs with filter (not the shadow trick), so the
+     reveal step must clear that too. No-op for the rows, which use no filter. */
+  filter: none;
   opacity: 1;
   -webkit-user-select: text;
   user-select: text;
@@ -8318,15 +8359,22 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
    chrome (timestamp, actions) readable so the header stays operable without
    revealing it. Without this a global or per-folder blur left the pinned
    heading — the largest text on screen — perfectly legible. */
+/* 0.279.6 — the heading uses a REAL blur, not the transparent-text + text-shadow
+   trick the list rows use. That trick avoids one compositing layer PER ROW (89
+   rows = 89 layers = jank), but the heading is a single element, so one layer is
+   free — and the trick's fixed 7px shadow radius was far too weak for the
+   heading's large title glyphs, which stayed readable (the reported bug).
+   filter: blur scales with the text and actually hides it. */
 .stashpad-focused.is-obscured .stashpad-focused-body,
-.stashpad-focused.is-obscured .stashpad-heading-stuck-line,
-.stashpad-focused.is-obscured .stashpad-focused-body :is(a, code, mark, strong, em, .tag) {
-  color: transparent;
-  text-shadow: 0 0 7px var(--text-normal);
-  opacity: 0.75;
+.stashpad-focused.is-obscured .stashpad-heading-stuck-line {
+  /* 0.279.10: stronger — a bigger blur radius PLUS a second filter type (contrast
+     collapse) that washes the large title glyphs toward a flat block, killing the
+     residual silhouette a pure blur leaves. Lower opacity finishes it. */
+  filter: blur(18px) contrast(0.4) brightness(1.1);
+  opacity: 0.6;
   -webkit-user-select: none;
   user-select: none;
-  transition: opacity 120ms ease;
+  transition: filter 120ms ease, opacity 120ms ease;
 }
 .stashpad-focused.is-obscured .stashpad-focused-body :is(img, svg, video, canvas, iframe, .internal-embed) {
   filter: blur(10px);
@@ -8349,6 +8397,9 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   position: relative;
   color: inherit;
   text-shadow: none;
+  /* 0.279.6: cancel the heading's blur here — solid mode draws a crisp ::after
+     bar, and a parent filter would blur its edges. */
+  filter: none;
   opacity: 1;
 }
 .stashpad-view.obscure-solid .stashpad-note.is-obscured .stashpad-note-body::after,
@@ -8534,8 +8585,9 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-index-bulkbtn.mod-warning { color: var(--text-error); }
 .stashpad-index-bulkic { display: inline-flex; }
 .stashpad-index-bulkic .svg-icon { width: 13px; height: 13px; }
-.stashpad-editqueue-stop { cursor: pointer; text-decoration: underline; opacity: 0.85; }
-.stashpad-editqueue-stop:hover { opacity: 1; }
+/* 0.279.5: edit-queue notice — live label above a dedicated action button on its
+   own line (button styling reused from .stashpad-notice-action). */
+.stashpad-editqueue-notice { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 /* Optimistic bulk delete/merge — the row collapses out immediately (0.276.9). */
 .stashpad-note.is-vanishing {
   opacity: 0; max-height: 0 !important; min-height: 0 !important;

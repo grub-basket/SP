@@ -20,7 +20,7 @@ import { seedDemoContent } from "./demo-content";
 import { writeClipboardText } from "./cross-vault-clipboard";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
-  buildDefaultBindings, COMMAND_META, type CommandBindingMap,
+  buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
 import { getActiveView, onActiveViewChange } from "./active-view";
@@ -2452,6 +2452,13 @@ export default class StashpadPlugin extends Plugin {
       // interval so tasks coming due while it's open also surface.
       window.setTimeout(() => void this.checkDueReminders(), 6000);
       this.registerInterval(window.setInterval(() => void this.checkDueReminders(), 5 * 60 * 1000));
+      // 0.279.17: scheduled obscuring — refresh views when the daily blur window
+      // opens/closes or the timezone changes (travel), so a folder set to obscure
+      // during set hours actually clears/covers as the hour passes without needing
+      // a manual reload. isObscured() reads the schedule live, so this only needs
+      // to TRIGGER a re-render at the boundary. Cheap: no work unless it flips.
+      this.checkObscureSchedule(); // seed baseline
+      this.registerInterval(window.setInterval(() => this.checkObscureSchedule(), 60 * 1000));
       window.setTimeout(() => { void this.seedLocalAuthorStubsEverywhere(); }, 4000);
       // 0.79.12: register each Stashpad folder's _archive in Obsidian's
       // "Excluded files" so native search / quick switcher / graph / link
@@ -3229,6 +3236,14 @@ export default class StashpadPlugin extends Plugin {
       // 0.259.0: was wired to cmdCopyTree, which copies the SELECTION — so this
       // command never did what its name said.
       callback: () => call("cmdCopyFocusedSubtree"),
+    });
+    // 0.279.9: on-demand indent-safe copy — always uses the [L1]/[L2] level-marker
+    // format regardless of the "Indent-safe copy" setting. Bindable via Obsidian's
+    // Hotkeys page. Copies the SELECTION's subtree(s), like Copy tree.
+    this.addCommand({
+      id: "stashpad-copy-tree-level-markers",
+      name: "Copy tree with level markers (indent-safe)",
+      callback: () => call("cmdCopyTreeLevelMarkers"),
     });
     // 0.184.0: dismiss every visible notification toast at once (handy when a batch
     // of due reminders / messages stacks up).
@@ -5291,6 +5306,37 @@ export default class StashpadPlugin extends Plugin {
       v?.clearObscureReveals?.();
       if (typeof v?.render === "function") v.render();
     }
+  }
+
+  private lastObscureInWindow: boolean | null = null;
+  private lastObscureTzOffset: number | null = null;
+  /** 0.279.17: refresh views when the scheduled-obscure window flips or the
+   *  timezone changes. isObscured() already reads the schedule live; this just
+   *  triggers a re-render at the boundary so an idle open view updates on its own.
+   *  A no-op while the schedule is off, or when neither the window state nor the
+   *  tz offset changed since the last tick. */
+  private checkObscureSchedule(): void {
+    if (!this.settings.obscureScheduleEnabled) { this.lastObscureInWindow = null; this.lastObscureTzOffset = null; return; }
+    const inWindow = isWithinObscureSchedule(this.settings);
+    const tz = new Date().getTimezoneOffset();
+    const flipped = this.lastObscureInWindow !== null && inWindow !== this.lastObscureInWindow;
+    const tzChanged = this.lastObscureTzOffset !== null && tz !== this.lastObscureTzOffset;
+    this.lastObscureInWindow = inWindow;
+    this.lastObscureTzOffset = tz;
+    if (tzChanged) {
+      // 0.279.24: remember a zone the device has actually been in, so it shows as
+      // a chip you can pick as home later (and so an accidental "Use current" here
+      // is undoable). Keep the list short + unique, most-recent first.
+      try {
+        const cur = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        if (cur) {
+          const hist = this.settings.obscureScheduleTimezoneHistory ?? [];
+          this.settings.obscureScheduleTimezoneHistory = [...new Set([cur, ...hist])].filter((z) => !!z).slice(0, 6);
+          void this.saveSettings();
+        }
+      } catch { /* Intl unavailable — skip */ }
+    }
+    if (flipped || tzChanged) this.reHideAndRefreshAllViews();
   }
 
   /** Repaint open folder panels — e.g. after a settings change flips a folder's

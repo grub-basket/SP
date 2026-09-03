@@ -521,7 +521,7 @@ export class StashpadDetailView extends ItemView {
     const isTask = fmHasTag(fm, "task") || fm.task === true || fm.completed !== undefined;
     if (isTask) {
       const cb = row.createSpan({ cls: "stashpad-detail-child-checkbox" });
-      setIcon(cb, completed ? "check-square" : "square");
+      setIcon(cb, completed ? "square-check-big" : "square");
       cb.title = completed ? "Mark not done" : "Mark done";
       // 0.76.12: checkbox owns its pointer events — never selects or
       // navigates the row.

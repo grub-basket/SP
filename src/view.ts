@@ -25,7 +25,7 @@ import { seedDemoContent } from "./demo-content";
 import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, stripInlineMarkdown, DEFAULT_STOPWORDS } from "./slug-service";
 import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
-import { getSettings, getTemplatesFormats, onSettingsChange } from "./settings";
+import { getSettings, getTemplatesFormats, onSettingsChange, isWithinObscureSchedule } from "./settings";
 import { StashpadSuggest } from "./note-picker";
 import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
@@ -105,6 +105,10 @@ const STICK_OFF_PX = 2;
 /** Below this the list is too short to position anything inside — see the
  *  scroll-to-id re-assert chain, which otherwise churns forever trying. */
 const MIN_SCROLLABLE_PX = 48;
+/** 0.279.3: max entries kept in each nav history stack (back / forward). The
+ *  stacks are persisted, so an uncapped one grew without bound over a session and
+ *  across reloads. 100 is far more than anyone back-steps through in practice. */
+const NAV_HISTORY_MAX = 100;
 
 /** Re-assert schedule for a positional scroll policy (restore / scroll-to-id).
  *  Same wall-clock coverage the fixed chain always had — what changed (0.270.1)
@@ -710,17 +714,20 @@ export class StashpadView extends ItemView {
   getDisplayText(): string {
     const folder = (this.noteFolder || "").trim();
     const name = folder.split("/").pop() || folder || "Stashpad";
-    // When focused INTO a note, append its title so the tab/header reads
-    // "FolderName — Note Title". Root focus shows just the folder name.
+    // 0.279.11: when focused INTO a note, lead with the NOTE TITLE, then the
+    // folder — "Note Title — FolderName". Every Stashpad tab used to start with the
+    // folder name, so multiple tabs looked like duplicates in the tab bar; leading
+    // with the note title makes each one discernible at a glance. Root focus still
+    // shows just the folder name.
     if (this.focusId && this.focusId !== ROOT_ID) {
       const node = this.tree.get(this.focusId);
       if (node) {
         const title = this.titleForNode(node).trim();
         const truncated = title.length > 40 ? title.slice(0, 40) + "…" : title;
-        // Append the note id so two tabs on notes with the SAME title (or same
-        // folder) stay distinguishable in the tab bar — and the title is unique
-        // enough to tell duplicates apart at a glance. 0.99.3.
-        if (truncated) return `${name} — ${truncated} · ${this.focusId}`;
+        // 0.279.25: dropped the trailing note-id (was there since 0.99.3 to tell
+        // apart two tabs on same-titled notes). Leading with the note title already
+        // makes tabs discernible, and the raw id read as clutter.
+        if (truncated) return `${truncated} — ${name}`;
       }
     }
     return name;
@@ -853,6 +860,16 @@ export class StashpadView extends ItemView {
           sel?.addRange(range);
         }
         return false; // consumed — a document-level listener elsewhere never runs
+      });
+      // 0.279.25: reserve Mod+Shift+F while a Stashpad tab is focused. Registered
+      // in the keymap SCOPE (not a DOM listener) because Obsidian dispatches its
+      // own hotkeys through the keymap before bubble-phase DOM handlers — a
+      // capture-phase swallow lost to Obsidian's global "Search in all files" (the
+      // 0.279.20 attempt didn't work). No action bound yet; bind a command via
+      // Hotkeys when a use is decided.
+      viewScope.register(["Mod", "Shift"], "f", (evt: KeyboardEvent) => {
+        evt.preventDefault();
+        return false; // consumed — Obsidian's global search never fires
       });
       (this.app as any).keymap?.pushScope(viewScope);
     };
@@ -1602,11 +1619,14 @@ export class StashpadView extends ItemView {
       // shape so a malformed entry doesn't crash navigation later.
       const isSnap = (x: any): x is NavSnapshot =>
         x && typeof x.folder === "string" && typeof x.focusId === "string";
+      // 0.279.3: trim to the cap on load, so a state saved before the cap
+      // existed (or by an older build) doesn't restore an unbounded stack. Keep
+      // the NEWEST entries (the tail) — those are the most recent nav targets.
       if (Array.isArray(s.navBackStack)) {
-        this.navBackStack = s.navBackStack.filter(isSnap);
+        this.navBackStack = s.navBackStack.filter(isSnap).slice(-NAV_HISTORY_MAX);
       }
       if (Array.isArray(s.navForwardSnapshots)) {
-        this.navForwardSnapshots = s.navForwardSnapshots.filter(isSnap);
+        this.navForwardSnapshots = s.navForwardSnapshots.filter(isSnap).slice(-NAV_HISTORY_MAX);
       }
     }
     // Resolve noteFolder immediately so getDisplayText() reflects the right folder
@@ -1758,6 +1778,13 @@ export class StashpadView extends ItemView {
     const last = this.navBackStack[this.navBackStack.length - 1];
     if (last && last.folder === snap.folder && last.focusId === snap.focusId) return;
     this.navBackStack.push(snap);
+    // 0.279.3: cap the back stack. It was unbounded AND persisted, so a long
+    // session (or many reloads) grew it without limit — "infinite back" plus a
+    // steadily bloating saved state. Trim the OLDEST entries past the cap, the
+    // way a browser bounds its history.
+    if (this.navBackStack.length > NAV_HISTORY_MAX) {
+      this.navBackStack.splice(0, this.navBackStack.length - NAV_HISTORY_MAX);
+    }
     if (!opts.keepForward) this.navForwardSnapshots = [];
   }
 
@@ -4322,7 +4349,7 @@ export class StashpadView extends ItemView {
 
     const selectBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
     const inSelect = this.mobileSelectMode;
-    setIconSafe(selectBtn, inSelect ? "check-square" : "square", inSelect ? "☑" : "☐");
+    setIconSafe(selectBtn, inSelect ? "square-check-big" : "square", inSelect ? "☑" : "☐");
     selectBtn.title = inSelect
       ? `${this.selection.size} selected — tap to exit (keeps the first selection)`
       : "Enter select mode (tap notes to add)";
@@ -4429,7 +4456,7 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Outdent").setIcon("outdent").setDisabled(!hasTargets).onClick(() => void this.cmdOutdent()));
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").setDisabled(!hasTargets).onClick(() => this.cmdSetColor()));
     menu.addItem((it: any) => it.setTitle("Toggle complete").setIcon("check-circle").setDisabled(!hasTargets).onClick(() => void this.cmdToggleComplete()));
-    menu.addItem((it: any) => it.setTitle("Toggle task (todo)").setIcon("check-square").setDisabled(!hasTargets).onClick(() => void this.cmdToggleTask()));
+    menu.addItem((it: any) => it.setTitle("Toggle task (todo)").setIcon("square-check-big").setDisabled(!hasTargets).onClick(() => void this.cmdToggleTask()));
     menu.addItem((it: any) => it.setTitle("Obscure / reveal (visual only)").setIcon("eye-off").setDisabled(!hasTargets).onClick(() => void this.cmdToggleObscured()));
     menu.addItem((it: any) => it.setTitle("Set due date…").setIcon("calendar-clock").setDisabled(!hasTargets).onClick(() => this.cmdSetDue()));
     menu.addItem((it: any) => it.setTitle("Assign to…").setIcon("user-plus").setDisabled(!hasTargets).onClick(() => this.cmdAssign()));
@@ -6858,7 +6885,14 @@ export class StashpadView extends ItemView {
   private addTaskCheckbox(parent: HTMLElement, node: TreeNode): void {
     const cb = parent.createSpan({ cls: "stashpad-note-task-checkbox" });
     const done = this.isCompleted(node);
-    setIcon(cb, done ? "check-square" : "square");
+    // 0.279.22: the completed box was INVISIBLE (most obviously on the pinned
+    // heading, where the checkbox IS the whole content) — "check-square" was
+    // renamed in Lucide and this Obsidian injects an empty, non-drawing <svg> for
+    // it, while "square" still renders. Use the current name AND setIconSafe, which
+    // detects an empty svg and falls back to a glyph — so it can never render
+    // nothing. (The incomplete "square" worked, which is why only the checked
+    // state vanished.)
+    setIconSafe(cb, done ? "square-check-big" : "square", done ? "☑" : "☐");
     cb.title = done ? "Mark not done" : "Mark done";
     // The checkbox owns its pointer events so toggling never selects/focuses or
     // navigates the row (mousedown = selection, click = handleRowClick,
@@ -8494,7 +8528,12 @@ export class StashpadView extends ItemView {
     // Consuming the click matters: otherwise the same tap that unblurs also
     // selects or drills in, so you cannot look at a hidden note without acting
     // on it. Revealing is per-view and in-memory only.
-    if (!absorbed && this.isObscured(node) && !this.isFullyRevealed(node.id)) {
+    // 0.279.15: a SELECTION-modifier click (Shift = range-extend, Mod/Ctrl =
+    // toggle) is a select gesture, not a "reveal this" tap — let it fall through to
+    // the normal selection logic instead of spending the click on unblurring. The
+    // row stays obscured; it just joins the selection.
+    const selectModifier = e.shiftKey || e.metaKey || e.ctrlKey;
+    if (!absorbed && !selectModifier && this.isObscured(node) && !this.isFullyRevealed(node.id)) {
       const t = e.target as HTMLElement | null;
       // Let the row's real controls through — tapping the checkbox or the ⋯
       // menu on a blurred row should still work.
@@ -8871,6 +8910,8 @@ export class StashpadView extends ItemView {
     // .modal-container is always present (with .mod-show toggled), other
     // times it's added/removed wholesale. Cover the common shapes.
     if (isAnyModalOpen(e.target)) return;
+    // (Mod+Shift+F is reserved in the keymap SCOPE — see pushViewScope — because a
+    // DOM swallow here loses to Obsidian's own keymap dispatch. 0.279.25)
 
     const b = getSettings().bindings;
     // VIEW-LEVEL global shortcuts (fire even from within the composer textarea):
@@ -9049,7 +9090,13 @@ export class StashpadView extends ItemView {
     // own children is not a coherent target for move/delete/clone, so the
     // heading is a single-select stop (see 0.258.0 design decision).
     const heading = this.headingNode();
-    if (e.key === "ArrowDown") {
+    // 0.279.20: plain cursor nav only for UNMODIFIED arrows (Shift allowed, for
+    // range-select). A modified arrow (Alt / Mod / Ctrl) is a chord — e.g. a user
+    // who bound jump-to-top/bottom to Option+Arrow — and must fall through to its
+    // matchBinding below instead of being swallowed as a one-row move. Chorded
+    // move bindings (moveUp/moveDown) are already matched earlier, so they're
+    // unaffected.
+    if (e.key === "ArrowDown" && !e.altKey && !e.metaKey && !e.ctrlKey) {
       e.preventDefault();
       if (this.cursorOnHeading) {
         this.cursorOnHeading = false;
@@ -9061,7 +9108,7 @@ export class StashpadView extends ItemView {
       } else this.cursorIdx++;
       this.selectCursor(e.shiftKey); return;
     }
-    if (e.key === "ArrowUp") {
+    if (e.key === "ArrowUp" && !e.altKey && !e.metaKey && !e.ctrlKey) {
       e.preventDefault();
       if (this.cursorOnHeading) {
         // Off the top of the heading wraps to the last child.
@@ -9238,6 +9285,13 @@ export class StashpadView extends ItemView {
     if (!h) { this.cursorOnHeading = false; return; }
     this.cursorHasMoved = true;
     this.cursorIdx = -1;
+    // The heading IS put in the selection — that's how getActionTargets() targets
+    // it ROBUSTLY (selection survives renders; cursorOnHeading alone drifts false
+    // and then hotkeys like toggle-complete/toggle-task silently no-op on the
+    // focused note). 0.279.8 reverted a 0.279.3 attempt to keep it out of the set:
+    // that broke the heading's hotkey commands and Shift-extend. The visual "looks
+    // selected" complaint that motivated 0.279.3 is fixed in CSS instead — the
+    // heading's is-selected paints no filled tint, only the is-cursor ring shows.
     this.selection.clear();
     this.selection.add(h.id);
     this.firstSelectedId = h.id;
@@ -9354,7 +9408,7 @@ export class StashpadView extends ItemView {
       if (cb) {
         const done = this.isCompleted(node);
         cb.empty();
-        setIcon(cb, done ? "check-square" : "square");
+        setIconSafe(cb, done ? "square-check-big" : "square", done ? "☑" : "☐"); // 0.279.22: glyph fallback — an unknown Lucide name injects an empty svg
         cb.title = done ? "Mark not done" : "Mark done";
         row.classList.toggle("is-completed", done);
       }
@@ -9418,17 +9472,27 @@ export class StashpadView extends ItemView {
     if (!list) return false;
     const targets: { row: HTMLElement; node: TreeNode; cb: HTMLElement }[] = [];
     for (const id of ids) {
-      const row = list.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(id)}"]`);
       const node = this.tree.get(id);
+      // 0.279.5: the FOCUSED note is the pinned heading (.stashpad-focused), not a
+      // .stashpad-note row — its children are the rows. Toggling its task from the
+      // heading checkbox found no row here and returned false, and the full-render
+      // fallback didn't reliably restore the completed checkbox (it vanished until
+      // you re-entered the note). Update the heading in place too, the way
+      // repaintSelectionClasses already handles it.
+      let row = list.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(id)}"]`);
+      if (!row) {
+        const heading = list.querySelector<HTMLElement>(".stashpad-focused.is-heading-row");
+        if (heading && heading.dataset.headingId === id) row = heading;
+      }
       const cb = row?.querySelector<HTMLElement>(".stashpad-note-task-checkbox");
-      // Row off-screen / not rendered, or no checkbox to update → not our case.
+      // Off-screen / not rendered, or no checkbox to update → not our case.
       if (!row || !node || !cb) return false;
       targets.push({ row, node, cb });
     }
     for (const { row, node, cb } of targets) {
       const done = this.isCompleted(node);
       cb.empty();
-      setIcon(cb, done ? "check-square" : "square");
+      setIconSafe(cb, done ? "square-check-big" : "square", done ? "☑" : "☐"); // 0.279.22: glyph fallback — an unknown Lucide name injects an empty svg
       cb.title = done ? "Mark not done" : "Mark done";
       row.classList.toggle("is-completed", done);
     }
@@ -9514,6 +9578,20 @@ export class StashpadView extends ItemView {
     return focused?.file ? focused : null;
   }
 
+  /** 0.279.15: drop any target that sits UNDER another target — its subtree is
+   *  already covered by the ancestor. Used by the tree copies so a Mod+A (heading
+   *  + all descendants) collapses to just the heading, instead of emitting each
+   *  child again as its own outline root. Cycle-guarded like cmdLockSelection. */
+  collapseNestedTargets(targets: TreeNode[]): TreeNode[] {
+    const ids = new Set(targets.map((t) => t.id));
+    return targets.filter((t) => {
+      let p = t.parent;
+      const seen = new Set<StashpadId>();
+      while (p) { if (ids.has(p)) return false; if (seen.has(p)) return false; seen.add(p); p = this.tree.get(p)?.parent ?? null; }
+      return true;
+    });
+  }
+
   /** public: called by AuthorshipTracker (the host interface). */
   getActionTargets(): TreeNode[] {
     // 0.258.0: cursor-on-heading resolves to the heading note. Checked before
@@ -9536,7 +9614,13 @@ export class StashpadView extends ItemView {
         for (const c of this.tree.getChildren(n.id)) walk(c);
       };
       for (const top of this.currentChildren) walk(top);
-      const pos = (id: string): number => order.get(id) ?? Number.MAX_SAFE_INTEGER;
+      // 0.279.15: the pinned HEADING (the focused note) is the parent of
+      // currentChildren, so the DFS above never reaches it — it would sort LAST,
+      // which made a Mod+A copy emit a child before the heading and treat that
+      // child as the outline root. It's the ancestor of everything shown, so rank
+      // it first.
+      const pos = (id: string): number =>
+        id === this.focusId ? -1 : (order.get(id) ?? Number.MAX_SAFE_INTEGER);
       return targets.sort((a, b) => pos(a.id) - pos(b.id));
     }
     if (this.cursorOnHeading) {
@@ -11320,6 +11404,7 @@ export class StashpadView extends ItemView {
   cmdCopy(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopy(this, withTimestamps); }
   cmdCopyCodeBlock(): Promise<void> { return clipboardCmds.cmdCopyCodeBlock(this); }
   cmdCopyTree(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyTree(this, withTimestamps); }
+  cmdCopyTreeLevelMarkers(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyTreeLevelMarkers(this, withTimestamps); }
   cmdCopyFocusedSubtree(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyFocusedSubtree(this, withTimestamps); }
   cmdCopyOutline(): Promise<void> { return clipboardCmds.cmdCopyOutline(this); }
 
@@ -13018,6 +13103,26 @@ export class StashpadView extends ItemView {
     this.focusId = id;
     this.persistFocus();
     this.defaultCursorToLast();
+    // 0.279.19: drilling INTO a note lands the cursor ON that note (the pinned
+    // heading), not its last child. defaultCursorToLast parks the cursor +
+    // selection on the last child, so the first hotkey — notably toggle-complete
+    // (X) — silently acted on the child instead of the note you just opened, which
+    // read as "X does nothing on the heading the first time." Now the focused note
+    // is the target immediately, matching the visual focus. (Back/forward via
+    // applyNavSnapshot still restores the last cursor — correct when returning.)
+    let landedOnHeading = false;
+    if (this.focusId !== ROOT_ID) {
+      const h = this.headingNode();
+      if (h) {
+        this.cursorOnHeading = true;
+        this.cursorIdx = -1;
+        this.selection.clear();
+        this.selection.add(h.id);
+        this.firstSelectedId = h.id;
+        this.lastSelected = h.id;
+        landedOnHeading = true;
+      }
+    }
     this.syncComposerDraftForFocus();
     // Clear an active tag/color filter if the new subtree doesn't
     // contain it — otherwise we'd show "All …" in the dropdown while
@@ -13040,7 +13145,15 @@ export class StashpadView extends ItemView {
     // cursor to last child and the user will see something coherent.
     const savedCursorId = this.lastCursorByFocus.get(id);
     let navPolicy: ScrollPolicy;
-    if (savedCursorId && this.tree.get(savedCursorId)) {
+    if (landedOnHeading) {
+      // 0.279.26: we deliberately put the cursor on the heading above — do NOT
+      // let the saved-cursor restore (pendingFocusIds) move it back onto a child,
+      // or the first hotkey targets that child again (the "X does nothing the
+      // first time" bug on REVISITED notes). The heading is sticky at the top, so
+      // there's nothing to scroll to. Clear any stale pending restore too.
+      this.pendingFocusIds = null;
+      navPolicy = { kind: "preserve" };
+    } else if (savedCursorId && this.tree.get(savedCursorId)) {
       this.pendingFocusIds = [savedCursorId];
       navPolicy = { kind: "scroll-to-id", id: savedCursorId, align: "start" };
     } else {
@@ -13068,6 +13181,10 @@ export class StashpadView extends ItemView {
       return;
     }
     this.navForwardSnapshots.push(this.captureNavSnapshot());
+    // 0.279.3: cap the forward stack too (same unbounded-growth concern).
+    if (this.navForwardSnapshots.length > NAV_HISTORY_MAX) {
+      this.navForwardSnapshots.splice(0, this.navForwardSnapshots.length - NAV_HISTORY_MAX);
+    }
     void this.applyNavSnapshot(target);
   }
   /** Browser-style forward: pop forward, push current onto back, apply. */
@@ -14404,6 +14521,16 @@ export class StashpadView extends ItemView {
     // field (panel inclusion) read live — that part still self-corrects via the
     // metadataCache repaint, but it doesn't gate the task toggle.
     if (this.isTaskTagged(node)) return true;
+    // 0.279.27: a just-written `completed: true` (the in-memory override, set before
+    // any repaint) makes this a task NOW — before the metadataCache re-parses the
+    // field. Without this, pressing X on a PLAIN note (no checkbox) wrote
+    // `completed: true` but the render that followed read the stale cache, saw no
+    // `completed` field, decided "not a task", and added no checkbox — so the
+    // first press showed nothing and only the second (cache caught up) drew it.
+    // `=== true` on purpose: the cache-sync sets this map to a boolean for every
+    // touched note, so "defined" is not a task signal, but `true` only ever means
+    // a genuinely completed task.
+    if (this.completedState.get(node.file.path) === true) return true;
     const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter as any;
     return fm?.completed !== undefined;
   }
@@ -14896,7 +15023,14 @@ export class StashpadView extends ItemView {
     if (own === true || own === false) return own;
     const folder = this.noteFolder.replace(/\/+$/, "");
     const perFolder = s.obscureFolders?.[folder];
-    if (typeof perFolder === "boolean") return perFolder;
+    if (typeof perFolder === "boolean") {
+      // 0.279.17: a folder set to obscure-by-default only obscures DURING the
+      // scheduled window when the schedule is on; outside it (at home / off-hours)
+      // it stays clear. The schedule only adds a "when" — it never obscures a
+      // folder set to false, and never overrides a per-note choice (handled above).
+      if (perFolder && s.obscureScheduleEnabled && !isWithinObscureSchedule(s)) return false;
+      return perFolder;
+    }
     return false;
   }
 
@@ -15817,16 +15951,26 @@ export class StashpadView extends ItemView {
     let i = 0, stopped = false;
     let notice: Notice; let labelEl: HTMLSpanElement | null = null;
     const frag = createFragment((f) => {
-      labelEl = f.createSpan();
-      const stop = f.createSpan({ text: "   ·   Stop rest", cls: "stashpad-editqueue-stop" });
+      // 0.279.5: label on its own, then a real BUTTON on its own line styled like
+      // the plugin's other notification actions (was an underlined-text span).
+      const wrap = f.createDiv({ cls: "stashpad-editqueue-notice" });
+      labelEl = wrap.createSpan({ cls: "stashpad-editqueue-label" });
+      const actions = wrap.createDiv({ cls: "stashpad-notice-actions" });
+      const stop = actions.createEl("button", { cls: "stashpad-notice-action", text: "Empty queue" });
       stop.onclick = () => { stopped = true; notice?.hide(); };
     });
     notice = new Notice(frag, 0);
     const openNext = (): void => {
       if (stopped || i >= total) { notice.hide(); return; }
-      const node = targets[i];
-      labelEl?.setText(`Editing ${i + 1} of ${total}: “${this.titleForNode(node)}”`);
+      const captured = targets[i];
       i++;
+      // 0.279.2: re-resolve against the LIVE tree by id each turn. The queue is
+      // opened from a snapshot, so a note deleted or moved by an EARLIER edit in
+      // the same queue would otherwise be opened through a stale TFile — editing a
+      // ghost. If it's gone, skip to the next rather than acting on a dead target.
+      const node = this.tree.get(captured.id);
+      if (!node?.file) { openNext(); return; }
+      labelEl?.setText(`Editing ${i} of ${total}: “${this.titleForNode(node)}”`);
       void this.cmdEdit(node, () => window.setTimeout(openNext, 80));
     };
     openNext();
@@ -16822,12 +16966,21 @@ export class StashpadView extends ItemView {
     // Render a `[[path|alias]]` (or bare `[[name]]`) wikilink as an
     // anchor that handleRenderedClick will route. We render the alias
     // text (or the basename) so the user reads the human-friendly name.
-    const appendLink = (parent: HTMLElement, raw: string): void => {
+    // 0.279.7: names are clickable links only when opted in. Default OFF renders
+    // plain text, so a stray tap on a name can't open the author file — notably
+    // the second tap of a double-tap to enter a just-unblurred note, which tended
+    // to land on the author link.
+    const asLinks = s.authorNamesAsLinks;
+    const appendName = (parent: HTMLElement, raw: string): void => {
       // Strip surrounding [[ ]]
       const inner = raw.replace(/^\[\[/, "").replace(/\]\]$/, "");
       const pipe = inner.indexOf("|");
       const target = pipe >= 0 ? inner.slice(0, pipe) : inner;
       const alias = pipe >= 0 ? inner.slice(pipe + 1) : (inner.split("/").pop() ?? inner);
+      if (!asLinks) {
+        parent.createSpan({ cls: "stashpad-authorship-name", text: alias });
+        return;
+      }
       const a = parent.createEl("a", { cls: "internal-link", text: alias });
       a.setAttribute("data-href", target);
       a.setAttribute("href", target);
@@ -16840,7 +16993,7 @@ export class StashpadView extends ItemView {
     if (showAuthorPart) {
       pieces.push((host) => {
         host.createSpan({ cls: "stashpad-authorship-label", text: "by " });
-        appendLink(host, authorRaw);
+        appendName(host, authorRaw);
       });
     }
     if (showContribPart) {
@@ -16848,7 +17001,7 @@ export class StashpadView extends ItemView {
         host.createSpan({ cls: "stashpad-authorship-label", text: "with " });
         contributorsRaw.forEach((c, i) => {
           if (i > 0) host.createSpan({ text: ", " });
-          appendLink(host, c);
+          appendName(host, c);
         });
       });
     }
@@ -17590,7 +17743,7 @@ export class StashpadView extends ItemView {
         // 0.122.2 (#10): let non-tasks be marked complete too (sets `completed`;
         // the note then counts as a task via the bare-completed field).
         target.addItem((it: any) => it.setTitle("Mark complete").setIcon("check-circle").onClick(() => taskAct(() => this.toggleCompletedForNode(node))));
-        target.addItem((it: any) => it.setTitle("Turn into task").setIcon("check-square").onClick(() => taskAct(() => this.cmdToggleTask())));
+        target.addItem((it: any) => it.setTitle("Turn into task").setIcon("square-check-big").onClick(() => taskAct(() => this.cmdToggleTask())));
       }
       target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => taskAct(() => this.cmdAssign())));
       if (isTaskNote) {
@@ -17600,7 +17753,7 @@ export class StashpadView extends ItemView {
       }
     };
     menu.addItem((it: any) => {
-      it.setTitle("Task").setIcon("check-square");
+      it.setTitle("Task").setIcon("square-check-big");
       const sub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
       if (sub && typeof sub.addItem === "function") { taskSubmenu = sub; addTaskItems(sub); }
       else it.onClick(() => this.openCommandPalette()); // degraded fallback

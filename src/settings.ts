@@ -345,6 +345,12 @@ export interface StashpadSettings {
    *  (see COPY_TS_MODIFIER_ORDER); empty string = off (copies never include
    *  timestamps). Replaces the old boolean `prefixTimestampsOnCopy` toggle. */
   copyTimestampModifiers: string;
+  /** 0.279.4 — when copying a subtree (Copy tree / Copy focused subtree), prefix
+   *  each line with a `[L<n>]` DEPTH MARKER (relative to the copied root: the
+   *  root(s) = L1, their children L2, …) instead of relying on leading
+   *  indentation, which many apps strip on paste. See docs/public/level-markers.md
+   *  — the "Stashpad level-marker copy" convention. */
+  copyTreeLevelMarkers: boolean;
   splitOnLines: boolean;
   /** Delimiter used when split-on-submit is on (and the Split modal's default
    *  preset): each line, blank-line paragraphs, or Markdown headings. */
@@ -578,6 +584,11 @@ export interface StashpadSettings {
   showAuthor: boolean;
   showContributors: boolean;
   showLastEdit: boolean;
+  /** 0.279.7 — render author/contributor names in the note footer as clickable
+   *  links (opening the author file) vs plain text. Default OFF (plain text):
+   *  clickable names steal taps, e.g. the second tap of a double-tap to enter a
+   *  just-unblurred note lands on the author link and opens it instead. */
+  authorNamesAsLinks: boolean;
   /** Per-folder view mode (Nested / Flat / Everything). Keyed by Stashpad
    *  folder path. Absence means the default "nested" mode — the file only
    *  persists folders that have an explicit non-default mode. */
@@ -683,6 +694,27 @@ export interface StashpadSettings {
    *  from those. Blur is the default only because it is what the feature has
    *  always looked like. */
   obscureStyle: "blur" | "solid";
+  /** 0.279.17 — scheduled obscuring. When enabled, a folder set to
+   *  "obscure by default" only obscures DURING the daily window
+   *  [start, end) in LOCAL time; outside it (e.g. at home / off-hours) the folder
+   *  stays clear. The schedule only adds a "when" to folders already set to
+   *  obscure — it never obscures a folder that isn't. Per-note explicit obscure
+   *  and the global "obscure everything" switch are unaffected. Hours are 0–23;
+   *  end < start means an overnight window (e.g. 22→6). Because the window is
+   *  local, it re-evaluates on a timezone change (travel), which is the point. */
+  obscureScheduleEnabled: boolean;
+  obscureScheduleStart: number;
+  obscureScheduleEnd: number;
+  /** 0.279.21 — IANA timezone the schedule's hours are anchored to (your HOME
+   *  zone), e.g. "America/Chicago". Empty = the device's current local zone. Set
+   *  it (with the "Use current" button) to keep the window in home time as you
+   *  travel, instead of drifting with wherever the device is. */
+  obscureScheduleTimezone: string;
+  /** 0.279.24 — recently-used home timezones (most-recent first), shown as chips
+   *  so an accidental "Use current" can be undone by picking a previous zone.
+   *  Also accrues zones the device has actually been in (the schedule timer
+   *  records a new one on a tz change). */
+  obscureScheduleTimezoneHistory: string[];
   /** 0.268.2: put the file's name in front of the link when you attach one.
    *
    *  On by default. An attachment on its own is a link and nothing else, so the
@@ -879,6 +911,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   linkPreviewCollapsed: false,
   useTemplatesFormat: false,
   copyTimestampModifiers: "",
+  copyTreeLevelMarkers: false,
   splitOnLines: false,
   splitMode: "lines",
   confirmCrossParentDrag: true,
@@ -941,6 +974,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   showAuthor: true,
   showContributors: true,
   showLastEdit: true,
+  authorNamesAsLinks: false,
   viewModes: {},
   includeAttachmentsInEverything: {},
   hideChildlessNotes: {},
@@ -961,6 +995,11 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureFolders: {},
   obscureAllScope: "device",
   obscureStyle: "blur",
+  obscureScheduleEnabled: false,
+  obscureScheduleStart: 9,
+  obscureScheduleEnd: 17,
+  obscureScheduleTimezone: "",
+  obscureScheduleTimezoneHistory: [],
   attachmentNamePrefix: false, // 0.279.1: default OFF — undoes the 0.268.2 filename prefix (user: "we'll survive without the clutter")
   attachmentsEmbedded: true,
   railShowOutgoing: false,
@@ -1001,6 +1040,38 @@ let current: StashpadSettings = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
 const listeners = new Set<(sig: string) => void>();
 
 export function getSettings(): StashpadSettings { return current; }
+
+/** 0.279.17: is NOW inside the daily obscure window [start, end) in LOCAL time?
+ *  start === end → never (degenerate/empty window); end < start → overnight
+ *  window (e.g. 22→6). Used by isObscured() to gate per-folder obscure defaults,
+ *  and by the plugin's minute timer to refresh views when the window flips. */
+export function isWithinObscureSchedule(
+  s: Pick<StashpadSettings, "obscureScheduleStart" | "obscureScheduleEnd" | "obscureScheduleTimezone">,
+  now: Date = new Date(),
+): boolean {
+  const h = currentHourInTz(s.obscureScheduleTimezone, now);
+  const start = Math.max(0, Math.min(23, s.obscureScheduleStart));
+  const end = Math.max(0, Math.min(24, s.obscureScheduleEnd));
+  if (start === end) return false;
+  if (start < end) return h >= start && h < end;
+  return h >= start || h < end; // overnight
+}
+
+/** Fractional current hour (0–24) in an IANA timezone; falls back to device local
+ *  time when the tz is empty or invalid. 0.279.21 */
+function currentHourInTz(tz: string | undefined, now: Date): number {
+  const local = now.getHours() + now.getMinutes() / 60;
+  if (!tz) return local;
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now);
+    const hh = Number(parts.find((p) => p.type === "hour")?.value);
+    const mm = Number(parts.find((p) => p.type === "minute")?.value);
+    if (!Number.isFinite(hh) || !Number.isFinite(mm)) return local;
+    return (hh % 24) + mm / 60; // "24:00" midnight → 0
+  } catch {
+    return local; // invalid tz id → device local
+  }
+}
 /** 0.268.13: keys whose change cannot affect how a list RENDERS.
  *
  *  A settings save broadcasts to every open view and each one re-rendered
@@ -2271,6 +2342,73 @@ export class StashpadSettingTab extends PluginSettingTab {
         });
       });
     }, ["obscure", "blur", "sync", "device", "local", "scope", "privacy"]));
+    // 0.279.17: scheduled obscuring — a folder set to obscure-by-default only
+    // covers during set hours; outside them (e.g. at home / off-hours) it's clear.
+    cats.listDisplay.push(this.sectionDef("Only blur folders during set hours", "", (host) => {
+      host.createEl("p", { cls: "setting-item-description", text: "When on, a folder you've set to obscure by default only blurs DURING the daily window below — outside it (say, evenings at home) that folder stays clear. The schedule only adds a \"when\" to folders already set to obscure; it never blurs a folder that isn't, and it doesn't touch a note you've obscured by hand or the global \"obscure everything\" switch." });
+      host.createEl("p", { cls: "setting-item-description", text: "Times are your device's LOCAL time (24-hour). An end earlier than the start means an overnight window (e.g. 22 to 6). Because the window is local, it re-evaluates when your timezone changes as you travel." });
+      const applied = (): void => { void this.plugin.saveSettings().then(() => this.plugin.reHideAndRefreshAllViews()); };
+      new Setting(host)
+        .setName("Blur only during set hours")
+        .addToggle((t) => t.setValue(this.plugin.settings.obscureScheduleEnabled).onChange((v) => { this.plugin.settings.obscureScheduleEnabled = v; applied(); }));
+      const hourDropdown = (setting: Setting, get: () => number, put: (n: number) => void): void => {
+        setting.addDropdown((d) => {
+          for (let h = 0; h < 24; h++) d.addOption(String(h), `${String(h).padStart(2, "0")}:00`);
+          d.setValue(String(Math.max(0, Math.min(23, get()))));
+          d.onChange((v) => { put(parseInt(v, 10) || 0); applied(); });
+        });
+      };
+      hourDropdown(new Setting(host).setName("Start blurring at"), () => this.plugin.settings.obscureScheduleStart, (n) => { this.plugin.settings.obscureScheduleStart = n; });
+      hourDropdown(new Setting(host).setName("Stop blurring at"), () => this.plugin.settings.obscureScheduleEnd, (n) => { this.plugin.settings.obscureScheduleEnd = n; });
+      // Home timezone: the hours are read in this zone. Empty = follow the device.
+      // "Use current" locks in the device's zone so the window stays in home time
+      // as you travel; "Follow device" clears it back to local.
+      const deviceTz = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { return ""; } })();
+      // Set the home zone AND remember the value being replaced, so an accidental
+      // change is one click to undo via the chips below.
+      const setTz = (tz: string): void => {
+        const prev = this.plugin.settings.obscureScheduleTimezone;
+        const hist = this.plugin.settings.obscureScheduleTimezoneHistory ?? [];
+        const next = [prev, tz, ...hist].filter((z) => !!z);
+        this.plugin.settings.obscureScheduleTimezoneHistory = [...new Set(next)].slice(0, 6);
+        this.plugin.settings.obscureScheduleTimezone = tz;
+        applied();
+        this.display();
+      };
+      const tzSetting = new Setting(host)
+        .setName("Home timezone")
+        .setDesc(this.plugin.settings.obscureScheduleTimezone
+          ? `Hours are read in ${this.plugin.settings.obscureScheduleTimezone}.`
+          : `Following this device (${deviceTz || "local"}). Lock it in so the window stays in home time when you travel.`);
+      tzSetting.addButton((b) => b.setButtonText("Use current").onClick(() => setTz(deviceTz)));
+      if (this.plugin.settings.obscureScheduleTimezone) {
+        tzSetting.addButton((b) => b.setButtonText("Follow device").onClick(() => {
+          this.plugin.settings.obscureScheduleTimezone = "";
+          applied();
+          this.display();
+        }));
+      }
+      // Chips: recently-used zones (and ones the device has been in), so hitting
+      // "Use current" by accident is undone by clicking the previous zone. The
+      // active zone is marked and not clickable.
+      const active = this.plugin.settings.obscureScheduleTimezone;
+      const chips = (this.plugin.settings.obscureScheduleTimezoneHistory ?? []).filter((z) => !!z);
+      if (chips.length) {
+        const row = host.createDiv({ cls: "stashpad-tz-chips" });
+        row.createSpan({ cls: "setting-item-description", text: "Recent: " });
+        for (const z of chips) {
+          const chip = row.createEl("button", { cls: "stashpad-tz-chip" + (z === active ? " is-active" : ""), text: z });
+          if (z === active) { chip.disabled = true; chip.title = "Current home zone"; }
+          else chip.onclick = () => setTz(z);
+        }
+      }
+    }, ["obscure", "blur", "schedule", "hours", "time", "timezone", "privacy", "home", "work"]));
+    // 0.279.14: be explicit about the gaps, since obscure is glance-protection and
+    // reads as more than it is otherwise.
+    cats.listDisplay.push(this.sectionDef("What obscuring does NOT cover", "", (host) => {
+      host.createEl("p", { cls: "setting-item-description", text: "Obscuring is glance-protection only — VISUAL, on this screen. It does not encrypt anything (for that, use per-folder encryption), and the text stays readable in the file, in search, in the editor, and to other plugins." });
+      host.createEl("p", { cls: "setting-item-description", text: "A few things stay readable on purpose or by limitation: the tab title (it can lead with the focused note's title — Obsidian's tab bar can't be blurred), the note timestamps, and the \"by …\" / \"edited …\" labels. The author/contributor NAME is blurred; the labels and times around it are not. If a tab title showing a note name is a concern, keep that note's Stashpad in a set-aside folder." });
+    }, ["obscure", "blur", "privacy", "limitation", "tab", "title", "not", "covered", "encryption"]));
     cats.listDisplay.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
       () => this.plugin.settings.spoilerMarkup, (v) => { this.plugin.settings.spoilerMarkup = v; }, ["spoiler", "blur", "hide", "markup", "reveal"]));
     cats.listDisplay.push(toggle("Open every file type in the media viewer", "Open the preview even for files it can't display \u2014 a .docx or a .zip shows a card with its type, size and date, plus a button to open it properly. Off by default, because for those files the real app is usually the better answer. Either way, a file it can't display still opens the viewer when another attachment on the same note can be previewed, so you never lose the row of files.",
@@ -2461,6 +2599,8 @@ export class StashpadSettingTab extends PluginSettingTab {
     cats.composerCopy.push(toggle("Auto-pair Markdown syntax", "Brackets, parentheses, quotes (double + single, at word starts only — apostrophes are safe), inline code, **bold**, ~~strikethrough~~ and ==highlight== markers auto-close with the caret between them. Select text first and the character WRAPS it instead of replacing it (press again to nest: [note] → [[note]], *word* → **word**). Typing the closing character steps over an existing one, and Backspace on an empty pair removes both. Applies to the composer and the edit/split textareas. On by default.",
       () => this.plugin.settings.autoPairBrackets, (v) => { this.plugin.settings.autoPairBrackets = v; }, ["bracket", "autopair", "wikilink", "close", "complete"]));
     cats.composerCopy.push(this.copyTimestampModifiersSection());
+    cats.composerCopy.push(toggle("Indent-safe copy (level markers)", "When copying a subtree (Copy tree / Copy focused subtree), prefix each line with a `[L1]`, `[L2]`, … depth marker instead of leading spaces — relative to what you copied, so the top of the selection is always `[L1]`. Survives pasting into apps that strip indentation. Off by default (normal indented outline).",
+      () => this.plugin.settings.copyTreeLevelMarkers, (v) => { this.plugin.settings.copyTreeLevelMarkers = v; }, ["copy", "indent", "level", "marker", "tree", "depth", "paste"]));
 
     return cats;
   }
@@ -3229,6 +3369,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     items.push(footerToggle("Show author in note footer", () => this.plugin.settings.showAuthor, (v) => { this.plugin.settings.showAuthor = v; }, ["author", "footer", "show"]));
     items.push(footerToggle("Show contributors in note footer", () => this.plugin.settings.showContributors, (v) => { this.plugin.settings.showContributors = v; }, ["contributors", "footer", "show"]));
     items.push(footerToggle("Show last edit time in note footer", () => this.plugin.settings.showLastEdit, (v) => { this.plugin.settings.showLastEdit = v; }, ["last edit", "modified", "footer", "time"]));
+    items.push(footerToggle("Author names are clickable links", () => this.plugin.settings.authorNamesAsLinks, (v) => { this.plugin.settings.authorNamesAsLinks = v; }, ["author", "contributor", "link", "clickable", "footer"]));
     items.push(this.sectionDef("Folders You've Worked In",
       "Folders where you've authored or contributed notes. Click one to open it.",
       (host) => this.renderAuthoredFolders(host),

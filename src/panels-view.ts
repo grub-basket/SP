@@ -951,9 +951,9 @@ export class StashpadPanelsView extends ItemView {
     if (t.color) row.addClass("has-color");
     if (t.completed) row.addClass("is-completed");
     // 0.76.3: clickable checkbox — unfilled (square) when open, filled
-    // (check-square) when done. Click toggles `completed` directly.
+    // (square-check-big) when done. Click toggles `completed` directly.
     const icon = row.createSpan({ cls: "stashpad-pinned-icon stashpad-task-checkbox" });
-    setIcon(icon, t.completed ? "check-square" : "square");
+    setIcon(icon, t.completed ? "square-check-big" : "square");
     if (t.color) icon.style.color = t.color;
     icon.title = t.completed ? "Mark not done" : "Mark done";
     icon.onclick = (e) => {

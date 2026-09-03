@@ -223,7 +223,7 @@ function renderRow(
   if (t.completed) row.addClass("is-completed");
 
   const check = row.createSpan({ cls: "stashpad-review-check" });
-  setIcon(check, t.completed ? "check-square" : "square");
+  setIcon(check, t.completed ? "square-check-big" : "square");
   if (t.color) check.style.color = t.color;
   check.title = t.completed ? "Mark not done" : "Mark done";
   check.onclick = () => acts.toggleCompleted(t);

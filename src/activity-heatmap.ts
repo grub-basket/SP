@@ -33,7 +33,7 @@ const BUCKET_META: Record<Bucket, { label: string; icon: string; house: boolean 
   created: { label: "Created", icon: "sparkles", house: false },
   edited:  { label: "Edited",  icon: "pencil", house: false },
   viewed:  { label: "Viewed",  icon: "eye", house: true },
-  tasks:   { label: "Tasks",   icon: "check-square", house: false },
+  tasks:   { label: "Tasks",   icon: "square-check-big", house: false },
   files:   { label: "Attachments", icon: "paperclip", house: false },
   moved:   { label: "Moves & renames", icon: "move", house: true },
   vault:   { label: "Encrypt / archive / color", icon: "lock", house: true },
@@ -132,6 +132,37 @@ export async function renderActivityHeatmap(
     e.total++; counted++;
     e.byBucket.set(bucket, (e.byBucket.get(bucket) ?? 0) + 1);
     e.events.push(ev);
+  }
+
+  // 0.279.18: UNION each note's own created / modified date with the logged
+  // events. The action log only captures explicit actions, so notes created
+  // before the log existed, edited outside Stashpad, or created through any path
+  // that missed a log line never lit up the heatmap — which read as "activity
+  // from hours ago is missing." Every note carries `created` / `modified` in its
+  // frontmatter (collectIndexRows, across ALL folders), so fold those in too.
+  // Deduped against the log by (id, day, bucket) so a logged create/edit is not
+  // counted twice. This also makes the heatmap a reliable "where did I last leave
+  // off" record: recent `modified` days light up and open to the notes touched.
+  const seenKeys = new Set<string>();
+  for (const [day, e] of days) for (const ev of e.events) {
+    const b = BUCKET_OF[ev.type];
+    if (b === "created" || b === "edited") seenKeys.add(`${ev.id}|${day}|${b}`);
+  }
+  const addNoteDay = (id: string, ms: number, type: LogEventType, bucket: Bucket): void => {
+    if (!state.buckets[bucket] || !Number.isFinite(ms) || ms <= 0) return;
+    const day = M(ms).format("YYYY-MM-DD");
+    const key = `${id}|${day}|${bucket}`;
+    if (seenKeys.has(key)) return;
+    seenKeys.add(key);
+    let e = days.get(day);
+    if (!e) { e = { total: 0, byBucket: new Map(), events: [] }; days.set(day, e); }
+    e.total++; counted++;
+    e.byBucket.set(bucket, (e.byBucket.get(bucket) ?? 0) + 1);
+    e.events.push({ ts: M(ms).format("YYYY-MM-DDTHH:mm:ss"), type, id, payload: {} } as LogEvent);
+  }
+  for (const r of rows) {
+    addNoteDay(r.id, r.created, "create", "created");
+    if (r.modified > r.created) addNoteDay(r.id, r.modified, "edit", "edited");
   }
 
   // ---- controls ----
