@@ -1577,6 +1577,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   box-sizing: content-box;
   padding: 12px 7px 5px;
   margin: -12px -7px -5px;
+  /* 0.287.2: the enlarged (content-box + padding) hit area is ~28×31, but the
+     `has-color` swatch is a BACKGROUND — without this it painted that whole box,
+     making a big color rectangle (it looked like the old reaction box). Clip the
+     background to the 14×14 content box so the swatch stays a small square while
+     the hit area stays large. */
+  background-clip: content-box;
 }
 .stashpad-note:hover .stashpad-note-grip { opacity: 0.8; }
 .stashpad-note-grip:hover { color: var(--text-muted); opacity: 1 !important; }
@@ -1586,12 +1592,17 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    to the grip icon. The icon itself is hidden by default; row-hover reveals
    it (and the swatch fades). */
 .stashpad-note-grip.has-color {
-  background: var(--stashpad-note-color, transparent);
+  /* 0.287.3: `background-color` longhand, NOT the `background` shorthand — the
+     shorthand resets `background-clip` back to border-box, which made the swatch
+     paint the whole enlarged (padded) grab box. Longhand + an explicit clip keeps
+     the swatch a 14×14 square inside the content box. */
+  background-color: var(--stashpad-note-color, transparent);
+  background-clip: content-box;
   opacity: 1;
 }
 .stashpad-note-grip.has-color .svg-icon { opacity: 0; }
 .stashpad-note:hover .stashpad-note-grip.has-color {
-  background: transparent;
+  background-color: transparent;
 }
 .stashpad-note:hover .stashpad-note-grip.has-color .svg-icon { opacity: 1; }
 /* Colored border: per-note tint that wins over is-selected/is-cursor for
@@ -8976,21 +8987,8 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-reaction-emoji { font-size: 0.95em; }
 .stashpad-reaction-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .stashpad-reaction-chip.is-mine .stashpad-reaction-count { color: var(--text-normal); }
-.stashpad-reaction-add {
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--text-faint);
-  border-radius: 11px;
-  padding: 1px 7px;
-  font-size: var(--font-ui-smaller);
-  cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.08s ease, color 0.08s ease, background 0.08s ease;
-}
-.stashpad-note:hover .stashpad-reaction-add,
-.stashpad-focused:hover .stashpad-reaction-add { opacity: 0.7; }
-.stashpad-reaction-row:not(.is-empty) .stashpad-reaction-add { opacity: 0.5; }
-.stashpad-reaction-add:hover { opacity: 1 !important; color: var(--text-muted); background: var(--background-modifier-hover); }
+/* 0.287.0: the in-cluster hover “＋” add button was removed — reactions are
+   added from a stable button in the row action cluster (.stashpad-note-react). */
 
 /* Quick-pick popover */
 .stashpad-reaction-picker {
@@ -9028,8 +9026,8 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
    Collapse it entirely (display:none removes it from the flex flow, gap and
    all); row hover brings the add-button back so you can still react. */
 .stashpad-reaction-cluster.is-empty { display: none; margin-top: 0; }
-.stashpad-note:hover .stashpad-reaction-cluster.is-empty,
-.stashpad-focused:hover .stashpad-reaction-cluster.is-empty { display: flex; }
+/* 0.287.0: no hover reveal — an empty cluster stays hidden, so the row no longer
+   expands/shrinks on hover or tap. */
 .stashpad-reaction-cluster .stashpad-reaction-chip { padding: 0 5px; }
 .stashpad-reaction-more {
   display: inline-flex;
@@ -9097,10 +9095,11 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-reply-chip-x:hover { color: var(--text-normal); }
 
 /* The "in reply to …" jump block above a reply's body */
+/* 0.288.0: two-line quote — a "Reply to" label row, the quoted preview beneath. */
 .stashpad-reply-quote {
   display: flex;
-  align-items: center;
-  gap: 6px;
+  flex-direction: column;
+  gap: 1px;
   margin: 0 0 5px;
   padding: 3px 8px;
   border-left: 3px solid var(--interactive-accent);
@@ -9110,8 +9109,16 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   font-size: var(--font-ui-smaller);
   max-width: fit-content;
 }
+.stashpad-reply-quote-label { display: flex; align-items: center; gap: 5px; }
+.stashpad-reply-quote-labeltext { font-weight: 600; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.03em; font-size: calc(var(--font-ui-smaller) - 1px); }
 .stashpad-reply-quote.is-clickable { cursor: pointer; }
 .stashpad-reply-quote.is-clickable:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+/* 0.288.0: brief highlight when a same-list reply source is scrolled to. */
+.stashpad-note.stashpad-row-flash { animation: stashpad-row-flash 1.2s ease-out; }
+@keyframes stashpad-row-flash {
+  0%, 25% { background: var(--text-highlight-bg, rgba(255, 208, 0, 0.35)); }
+  100% { background: transparent; }
+}
 .stashpad-reply-quote-icon { display: inline-flex; color: var(--interactive-accent); }
 .stashpad-reply-quote-icon .svg-icon { width: 13px; height: 13px; }
 .stashpad-reply-quote-text { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
@@ -9161,7 +9168,16 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-dup-hit-icon { display: inline-flex; color: var(--text-faint); }
 .stashpad-dup-hit-icon .svg-icon { width: 13px; height: 13px; }
 .stashpad-dup-hit-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stashpad-composer-dup-toggle.is-on { color: var(--interactive-accent); }
+/* 0.287.1: clear ON vs OFF state for the mobile duplicate-hints toggle. OFF is
+   muted like the other composer buttons; ON is a filled accent chip so it's
+   obvious the live search is active. Scoped under .is-mobile so it out-specifies
+   the mobile `.stashpad-composer-btn { background: transparent }` base rule. */
+.stashpad-view.is-mobile .stashpad-composer-dup-toggle.is-on {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+}
+.stashpad-view.is-mobile .stashpad-composer-dup-toggle.is-on:hover { color: var(--text-on-accent); }
 
 /* ============================================================
    Multi-color highlights (0.284.0)

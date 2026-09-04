@@ -139,9 +139,11 @@ export function renderReactionChips(view: StashpadView, host: HTMLElement, node:
     more.title = "More reactions";
     more.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openReactionOverflow(view, node, more, entries, me); };
   }
-  const add = host.createEl("button", { cls: "stashpad-reaction-add", text: "＋" });
-  add.title = "Add reaction";
-  add.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openReactionPicker(view, node, add); };
+  // 0.287.0: the "add reaction" affordance is no longer an in-cluster hover "＋"
+  // (that hover-reveal made the row expand/shrink jarringly). It now lives as a
+  // stable button in the row's action cluster — see StashpadView.addReactionButton.
+  // This cluster is display-only: reaction chips + the "+N" overflow, nothing that
+  // appears on hover. When there are no reactions it collapses to nothing (is-empty).
 }
 
 /** Popover listing ALL of a note's reactions (used by the "+N" overflow button). */

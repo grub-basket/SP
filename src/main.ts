@@ -3189,8 +3189,15 @@ export default class StashpadPlugin extends Plugin {
     });
     this.addCommand({
       id: "stashpad-clear-debug-trace",
-      name: "Diagnostics: clear debug trace",
-      callback: () => { this.clearDebugTrace(); new Notice("Debug trace cleared."); },
+      // 0.288.0: this clears BOTH diagnostics collections — the debug trace and
+      // the performance profile — so a fresh reproduction starts from a clean
+      // slate in one command. Name reflects that both are cleared.
+      name: "Diagnostics: clear debug trace + performance profile",
+      callback: () => {
+        this.clearDebugTrace();
+        perf.reset();
+        new Notice("Debug trace and performance profile cleared.");
+      },
     });
     this.addCommand({
       id: "stashpad-toggle-debug-trace",
