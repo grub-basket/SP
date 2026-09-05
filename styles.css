@@ -59,6 +59,14 @@
 .workspace-leaf:has(> .workspace-leaf-content[data-type="stashpad-view"]) .view-header-nav-buttons {
   display: none !important;
 }
+/* 0.290.1: center the in-view header title for Stashpad leaves. Obsidian's
+   default left-aligns it (the title-container justifies to start); the title is
+   `flex:0 0 auto` here (unlike the workspace TAB title, which fills the width and
+   can't be centered), so centering the container actually works. Scoped by
+   data-type so no other view's header is affected. */
+.workspace-leaf-content[data-type="stashpad-view"] .view-header-title-container {
+  justify-content: center;
+}
 /* 0.216.0: wrapper for everything rendered ABOVE the composer. render()
    empties THIS instead of the view root when the composer is being reused, so
    the focused textarea is never detached (detaching it dismisses the mobile
