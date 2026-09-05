@@ -1386,7 +1386,21 @@ export class StashpadView extends ItemView {
         const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
         if (typeof id === "string" && id) onDisk++;
       }
-      if (onDisk === this.tree.fileBackedCount()) return; // in sync — no-op
+      const treeCount = this.tree.fileBackedCount();
+      if (onDisk === treeCount) return; // in sync — no-op
+      // 0.290.0 (perf): reconcile GRACE WINDOW. Right after a create, the tree
+      // holds the new (synthetic) node but the metadata cache hasn't parsed the
+      // new file's `id` yet, so `treeCount` is transiently 1-few AHEAD of onDisk
+      // (the `reconcile:unresolvable {gap:-1}` in the user's trace). Rebuilding
+      // then would DROP the just-created node — making the note vanish and
+      // reappear (the "delete is slow, notes flicker" symptom) — and it churns a
+      // full rebuild per create. When the tree is only slightly ahead and a
+      // create just happened, skip: the next `resolved` event re-runs this once
+      // the cache catches up, and onDisk will match. A genuine tree>disk from a
+      // DELETE is persistent and clears this window, so it still reconciles.
+      if (treeCount > onDisk && treeCount - onDisk <= 3 && Date.now() - this.lastLocalCreateAt < 2500) {
+        return;
+      }
       // 0.219.2: this fires ~400ms after a metadata event and, when the counts
       // disagree, rebuilds + renders — which is a full list rebuild and so an
       // anchor-restore jump. If a vault has a PERSISTENT mismatch (a note the
@@ -17642,11 +17656,49 @@ export class StashpadView extends ItemView {
     // 0.122.8 (F7): during a sync/bulk-write burst, hold the repaint and let
     // deferDuringSyncBurst do one render when it settles.
     if (this.deferDuringSyncBurst()) return;
-    this.debouncedRender();
+    // 0.290.0 (perf): repaint just this row's body if it's on screen — avoids the
+    // full O(N) list render (and the flash) on every body edit / checkbox tick.
+    if (!this.repaintRowBody(file)) this.debouncedRender();
   };
+
+  /** 0.290.0 (perf): repaint just ONE note's body in place after a body change,
+   *  instead of a full list `render()` of every row. Returns true when it handled
+   *  the row (caller skips debouncedRender); false when the row isn't currently
+   *  rendered or isn't repaintable (→ fall back to a full render).
+   *
+   *  Core of the render-storm fix: editing a note (edit modal, an external/synced
+   *  body edit, or ticking a rendered-body checkbox) no longer rebuilds the whole
+   *  list — only the edited row's `.stashpad-note-body-content` re-renders, and
+   *  renderNoteBodyNow keeps the OLD body visible until the fresh one resolves
+   *  (token-guarded), so there is no flash and no list reflow. */
+  private repaintRowBody(file: TFile): boolean {
+    const fmId = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+    const id = typeof fmId === "string" ? fmId : null;
+    if (!id) return false;
+    const node = this.tree.get(id);
+    if (!node?.file) return false;
+    const row = this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(id)}"]`);
+    if (!row) return false; // not on screen — a later full render paints it when it scrolls in
+    const bodyContent = row.querySelector<HTMLElement>(".stashpad-note-body-content");
+    const actions = row.querySelector<HTMLElement>(".stashpad-note-actions");
+    if (!bodyContent || !actions) return false;
+    const toggleAnchor = (Platform.isMobile
+      ? actions.querySelector<HTMLElement>(".stashpad-note-more")
+      : actions.querySelector<HTMLElement>(".stashpad-pencil")) ?? undefined;
+    // immediate: true → renderNoteBodyNow, which reads fresh content (the cache
+    // was evicted just above in onFileModify) and only swaps the DOM once ready.
+    this.renderNoteBody(bodyContent, node, { clamp: true, toggleHost: actions, toggleAnchor, immediate: true });
+    return true;
+  }
+
+  /** 0.290.0 (perf): timestamp of the last create in this folder — feeds the
+   *  reconcile grace window (a just-created note whose id the metadata cache has
+   *  not parsed yet leaves the tree transiently ahead of the on-disk count). */
+  private lastLocalCreateAt = 0;
   private onFileCreate = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     if (!file.path.startsWith(this.noteFolder + "/")) return;
+    this.lastLocalCreateAt = Date.now();
     if (this.deferDuringSyncBurst()) return;
     this.debouncedRender();
   };
