@@ -64,6 +64,9 @@ export class EncryptionService {
   private folderKeystore: FolderKeystore;
   private folderKeyFiles = new Map<string, StashKey>();
   private stashKeysIndexed = false;
+  /** 0.294.0 (perf): the in-flight `.stashkey` walk, so concurrent callers share
+   *  one traversal instead of each starting their own. */
+  private indexPromise: Promise<void> | null = null;
   /** Cached: is there still-recoverable legacy key material on disk — a live
    *  `_keys/` backup OR a parked `.stashpad/retired-keyfile-*` dir from a prior
    *  retire? Refreshed in refresh(); drives the settings "hard-wipe" affordance so
@@ -83,16 +86,49 @@ export class EncryptionService {
 
   /** Load the synced keyfile into the in-memory cache. Call on plugin load and
    *  before any operation that needs a fresh view of collaborators. */
+  /** 0.294.0 (perf): `init()` no longer walks the vault for `.stashkey` files.
+   *  It loads the (single-file) legacy keyfile and the parked-material flag —
+   *  both cheap — and leaves the walk to `startStashKeyIndex()`, which main.ts
+   *  fires at layout-ready (or during onload when a locked subtree is already
+   *  registered, i.e. keys are about to be needed). Anything that must not act
+   *  on a half-built index awaits `whenKeysReady()`. */
   async init(): Promise<void> {
-    await this.refresh();
+    this.kf = await this.keyfiles.load();
     // Detect recoverable legacy key material ONCE on load (not in refresh — that's on
     // the folder-unlock hot path). retire()/wipe() keep the flag current in-session.
     this.parkedKeyMaterial = await this.detectParkedKeyMaterial();
   }
   async refresh(): Promise<void> {
     this.kf = await this.keyfiles.load();
-    if (!this.stashKeysIndexed) await this.indexStashKeys();
+    if (!this.stashKeysIndexed) await this.startStashKeyIndex();
   }
+
+  /** 0.294.0 (perf): start (or join) the `.stashkey` walk. Idempotent — a second
+   *  caller awaits the SAME in-flight walk rather than starting a duplicate one.
+   *  Cleared by `invalidateStashKeyIndex()` so a later refresh re-walks. */
+  startStashKeyIndex(): Promise<void> {
+    if (this.stashKeysIndexed) return Promise.resolve();
+    if (!this.indexPromise) {
+      this.indexPromise = this.indexStashKeys().finally(() => { this.indexPromise = null; });
+    }
+    return this.indexPromise;
+  }
+
+  /** 0.294.0 (perf): resolves once the `.stashkey` index is COMPLETE. Callers that
+   *  would otherwise mistake "not indexed yet" for "this folder has no key" — and
+   *  so silently leave content unencrypted, or claim encryption isn't set up —
+   *  must await this before reading `hasFolderKey` / `isConfigured`. Starts the
+   *  walk if nobody has yet, so it can never wait forever. */
+  async whenKeysReady(): Promise<void> {
+    // A walk that was invalidated mid-flight publishes nothing, so one await is
+    // not proof of completeness — re-walk (bounded, so a pathological
+    // create/remove storm can't spin here forever).
+    for (let i = 0; i < 4 && !this.stashKeysIndexed; i++) await this.startStashKeyIndex();
+  }
+
+  /** True when the `.stashkey` index is complete. A `false` from `hasFolderKey()`
+   *  while this is false means "unknown", not "no key". */
+  keysIndexed(): boolean { return this.stashKeysIndexed; }
 
   /** Cheap disk check: any recoverable legacy key material still on disk —
    *  `_keys/` backups (top-level or a prior remove-encryption `removed-*` dir) or a
@@ -112,7 +148,13 @@ export class EncryptionService {
 
   /** Force a re-scan of `.stashkey` files on the next refresh (after a folder key
    *  is created/removed, or on explicit reload). */
-  invalidateStashKeyIndex(): void { this.stashKeysIndexed = false; }
+  invalidateStashKeyIndex(): void { this.stashKeysIndexed = false; this.indexEpoch++; }
+  /** 0.294.0 (perf): bumped by every invalidation. A walk that finishes on a stale
+   *  epoch publishes nothing and leaves the index dirty, so the next
+   *  `startStashKeyIndex()` re-walks. Matters now that the walk is concurrent
+   *  with the rest of startup: a `.stashkey` created (or removed) mid-walk used
+   *  to be able to land in a result set that then marked itself authoritative. */
+  private indexEpoch = 0;
 
   /** Phase 3 migration: relocate each legacy keyfile `folderKeys` entry's ACTIVE
    *  wrap into a per-folder `.stashkey`. Pure WRAP RELOCATION — the DEK is
@@ -140,6 +182,7 @@ export class EncryptionService {
         const back = await this.folderKeystore.read(f);
         // Verify the primary wrap round-tripped byte-for-byte before trusting it.
         if (!back || back.slots[0]?.wrapped !== sk.slots[0].wrapped) { await this.folderKeystore.remove(f); continue; }
+        this.indexEpoch++;                             // 0.294.0 (perf): see setupFolderKey
         this.folderKeyFiles.set(f, sk); // keyfile entry LEFT IN PLACE (backup)
         migrated++;
       } catch { /* leave the keyfile entry as the working fallback */ }
@@ -148,26 +191,61 @@ export class EncryptionService {
   }
 
   /** Scan the vault for per-folder `.stashkey` files and cache them. Bounded walk
-   *  (skips .git/.obsidian/node_modules). Once per session unless invalidated. */
+   *  (skips .git/.obsidian/node_modules). Once per session unless invalidated.
+   *
+   *  0.294.0 (perf): the traversal is unchanged in WHAT it covers — every
+   *  directory except the three skipped ones is still listed, because
+   *  `.stashkey` is a dotfile and Obsidian's in-memory vault tree does not index
+   *  dotfiles, so there is no cheaper source of truth. Key discovery must stay
+   *  COMPLETE: no folder with a `.stashkey` may be missed, so nothing new is
+   *  pruned here.
+   *
+   *  What changed is the SHAPE: the old walk was a depth-first chain of
+   *  sequential `await adapter.list()` calls — one full round trip per directory,
+   *  strictly one at a time, which on a network share or mobile made this the
+   *  single most expensive item at startup. It is now breadth-first with up to
+   *  `LIST_CONCURRENCY` listings (and the `.stashkey` reads they trigger) in
+   *  flight at once. Same set of directories, ~8x fewer round-trip stalls. */
+  private static readonly LIST_CONCURRENCY = 8;
+
   private async indexStashKeys(): Promise<void> {
+    const epoch = this.indexEpoch;
     const found = new Map<string, StashKey>();
     const SKIP = new Set([".git", ".obsidian", "node_modules"]);
-    const walk = async (dir: string): Promise<void> => {
-      let listing: { files: string[]; folders: string[] };
-      try { listing = await this.app.vault.adapter.list(dir); } catch { return; }
-      for (const f of listing.files ?? []) {
-        if (f === ".stashkey" || f.endsWith("/.stashkey")) {
-          const folder = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : "";
-          const sk = await this.folderKeystore.read(folder);
-          if (sk) found.set(this.cleanFolder(folder), sk);
+    let frontier: string[] = [""];
+    while (frontier.length) {
+      const next: string[] = [];
+      // Bounded-concurrency pass over the current depth: LIST_CONCURRENCY workers
+      // pull from a shared cursor, so a slow directory doesn't idle the others.
+      let cursor = 0;
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= frontier.length) return;
+          const dir = frontier[i];
+          let listing: { files: string[]; folders: string[] };
+          try { listing = await this.app.vault.adapter.list(dir); } catch { continue; }
+          for (const f of listing.files ?? []) {
+            if (f === ".stashkey" || f.endsWith("/.stashkey")) {
+              const folder = f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : "";
+              const sk = await this.folderKeystore.read(folder);
+              if (sk) found.set(this.cleanFolder(folder), sk);
+            }
+          }
+          for (const sub of listing.folders ?? []) {
+            if (SKIP.has(sub.split("/").pop() ?? "")) continue;
+            next.push(sub);
+          }
         }
-      }
-      for (const sub of listing.folders ?? []) {
-        if (SKIP.has(sub.split("/").pop() ?? "")) continue;
-        await walk(sub);
-      }
-    };
-    await walk("");
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(EncryptionService.LIST_CONCURRENCY, frontier.length) }, worker),
+      );
+      frontier = next;
+    }
+    // A `.stashkey` was created/removed while we walked — this result set may
+    // have missed it. Publish nothing and stay dirty so the next caller re-walks.
+    if (epoch !== this.indexEpoch) return;
     this.folderKeyFiles = found;
     this.stashKeysIndexed = true;
   }
@@ -340,6 +418,9 @@ export class EncryptionService {
     void label;
     const { sk, dek } = await this.folderKeystore.create(f, password);
     await this.folderKeystore.write(f, sk);
+    // 0.294.0 (perf): membership change — invalidate any walk in flight so its
+    // (older) result set can't overwrite this brand-new key. See indexEpoch.
+    this.indexEpoch++;
     this.folderKeyFiles.set(f, sk);
     this.folderSessionKeys.set(f, dek);
     if (remember) await this.rememberFolder(this.folderKcId(f, sk.keyId), password);
@@ -588,8 +669,9 @@ export class EncryptionService {
         }
       } catch { /* */ }
       // Remove every per-folder `.stashkey` (meaningless once content is decrypted).
-      if (!this.stashKeysIndexed) await this.indexStashKeys();
+      await this.whenKeysReady();
       for (const folder of this.folderKeyFiles.keys()) { try { await this.folderKeystore.remove(folder); } catch { /* best-effort */ } }
+      this.indexEpoch++;                               // 0.294.0 (perf): see setupFolderKey
       this.folderKeyFiles.clear();
     } catch { /* best-effort */ }
     this.kf = null;
@@ -600,6 +682,7 @@ export class EncryptionService {
   async removeFolderKeyFile(folder: string): Promise<void> {
     const f = this.cleanFolder(folder);
     await this.folderKeystore.remove(f);
+    this.indexEpoch++;                                 // 0.294.0 (perf): see setupFolderKey
     this.folderKeyFiles.delete(f);
     this.folderSessionKeys.get(f)?.fill(0);
     this.folderSessionKeys.delete(f);

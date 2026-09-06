@@ -1536,8 +1536,18 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   border-radius: 8px;
   background: var(--background-secondary);
   cursor: pointer;
-  transition: background 0.1s ease, box-shadow 0.1s ease;
   border: 1px solid transparent;
+  /* 0.293.0 (perf): scope layout/style invalidation to the row so a change in
+     one row can't dirty the whole list. NOT `paint` (hover outlines and inset
+     shadows may paint past the box) and NOT `size` (rows must size to content).
+     The row's only absolutely-positioned descendant is its own
+     `.has-inherited-color::before`, which already resolves against the row
+     (`position: relative`); the reaction picker/overflow popovers are
+     `position: fixed` but are mounted on `document.body` (src/reactions.ts),
+     so `contain: layout` cannot trap them.
+     0.293.0 (perf): the duplicate `transition` for this selector below (~1675)
+     is the one that applies — it now animates `background-color` only. */
+  contain: layout style;
 }
 /* 0.76.10: task rows get a leading checkbox column. */
 .stashpad-note.is-task { grid-template-columns: auto auto 1fr auto; }
@@ -1672,7 +1682,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 /* While being dragged, dim the row. */
 .stashpad-note.is-dragging { opacity: 0.5; }
-.stashpad-note { transition: background 0.08s ease, box-shadow 0.08s ease; }
+/* 0.293.0 (perf): only `background-color` changes on hover; `box-shadow`
+   changes on .is-cursor / .drop-into / .is-pick-target (keypress + drag), which
+   don't need to animate. Animating box-shadow on every hover forced a repaint
+   of the row's shadow each frame. */
+.stashpad-note { transition: background-color 0.08s ease; }
 /* Drop INTO (nest as child): outline the whole row */
 .stashpad-note.drop-into {
   background: var(--background-modifier-success);
@@ -1699,9 +1713,16 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 /* Even when selected, hovering applies a subtle brightness bump so the user
    gets the same affordance as on non-selected rows. */
+/* 0.293.0 (perf): was `filter: brightness(1.1)`, which promoted the row to its
+   own layer and repainted the whole subtree on every mousemove. A stronger
+   background tint gives the same affordance for free. `.is-selected` is already
+   `--background-modifier-active-hover`, so plain `--background-modifier-hover`
+   would read as *less* selected — nudge the selected background toward
+   `--text-normal` instead (darkens in light theme, lightens in dark, same as
+   the old brightness bump). color-mix is used elsewhere in this sheet
+   (.has-inherited-color::before) and is fine on Obsidian's Electron. */
 .stashpad-note.is-selected:hover {
-  filter: brightness(1.1);
-  background: var(--background-modifier-active-hover);
+  background-color: color-mix(in srgb, var(--background-modifier-active-hover) 92%, var(--text-normal));
 }
 .stashpad-note.is-cursor {
   box-shadow: 0 0 0 2px var(--interactive-accent) inset;
@@ -3087,8 +3108,26 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    and lives on `.stashpad-composer` itself, so the `*` descendant selector
    leaves it untouched. (Cheap; may only partly reduce the flicker since some of
    it comes from the deferred body-render reflow, not CSS animation.) */
+/* 0.293.0 (perf): the `.stashpad-note *` universal descendant matched every node
+   of every row (including all rendered markdown), so the style engine had to
+   apply this rule across the whole list. Scoped to the elements that actually
+   declare a transition/animation inside a row: `.stashpad-note-grip .svg-icon`
+   (opacity), `.stashpad-spoiler` (filter), plus the interactive chrome
+   (buttons / reaction chips / pencil) that may gain one. Same intent, same
+   `!important` — kill keyboard-reflow flicker on mobile. */
 .stashpad-view.is-mobile .stashpad-note,
-.stashpad-view.is-mobile .stashpad-note *,
+.stashpad-view.is-mobile .stashpad-note :is(
+  .stashpad-note-grip,
+  .svg-icon,
+  .stashpad-note-body,
+  .stashpad-spoiler,
+  .stashpad-pencil,
+  .stashpad-reaction-chip,
+  .stashpad-reaction-cluster,
+  .stashpad-reaction-more,
+  .stashpad-note-task-checkbox,
+  button
+),
 .stashpad-view.is-mobile .stashpad-composer * {
   transition: none !important;
   animation: none !important;

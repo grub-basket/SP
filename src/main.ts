@@ -2382,13 +2382,15 @@ export default class StashpadPlugin extends Plugin {
     // service's cache. (0.143.0: no vault auto-unlock on load — each folder key
     // auto-unlocks lazily from the keychain the first time its content is accessed,
     // so nothing prompts at startup and it stays seamless.)
-    void this.encryption.init().then(async () => {
-      // keyfile-removal Phase 3: transparently relocate any legacy keyfile folder
-      // keys into per-folder `.stashkey` files (additive; keyfile kept as backup).
-      try {
-        const n = await this.encryption.migrateKeyfileToStashKeys();
-        if (n > 0) new Notice(`Stashpad: moved ${n} folder key${n === 1 ? "" : "s"} to the new per-folder format.`);
-      } catch (e) { console.warn("[Stashpad] folder-key migration failed (keyfile still works)", e); }
+    // 0.294.0 (perf): `init()` is now just the (single-file) keyfile load + the
+    // parked-material probe. The `.stashkey` walk — an `adapter.list` per vault
+    // directory, the priciest startup item on a network share or mobile — is
+    // started separately: EARLY (here) when a locked subtree is already
+    // registered, because a placeholder is about to want its key; otherwise at
+    // layout-ready, off the critical path. Either way it walks every directory,
+    // so a `.stashkey` dropped in by sync is still discovered.
+    void this.encryption.init().then(() => {
+      if ((this.settings.lockedSubtrees ?? []).length) void this.encryption.startStashKeyIndex();
     });
     // 0.139.0: peek auto-re-encrypt scheduler (opt-in; no-ops until a delay is set).
     this.reEncryptScheduler = new ReEncryptScheduler(this);
@@ -2483,7 +2485,16 @@ export default class StashpadPlugin extends Plugin {
     // 0.83.2: load the persisted render cache before views open, so the
     // first cold paint can hit it instead of reading every body over the
     // (possibly slow) drive.
-    await this.renderCacheStore.load();
+    // 0.294.0 (perf): NOT awaited any more. `load()` deserializes one IndexedDB
+    // value holding up to MAX_ENTRIES full note bodies + rendered HTML — tens of
+    // MB on a big vault — and blocking onload on it delayed registerView and the
+    // first paint by exactly that much. It now runs concurrently; the only
+    // consumer that actually needs it (the lazy body render in
+    // NoteBodyRenderer.getOrComputeRender) awaits `renderCacheStore.ready`, and
+    // every synchronous peek treats "not loaded yet" as a plain miss. `load()`
+    // MERGES rather than overwrites, so an entry written while it was in flight
+    // (and a tombstone raised while it was in flight) survives it.
+    void this.renderCacheStore.load();
     // Evict cache rows when their file goes away — an entry holds the full
     // body + HTML, and after an encryption lock/secure-delete it would be the
     // last readable plaintext copy, sitting in render-cache.json.
@@ -2589,6 +2600,29 @@ export default class StashpadPlugin extends Plugin {
       // Vault is fully indexed now — safe to reconcile locked placeholders
       // (drop entries whose blob is truly gone, add cross-device blobs).
       void this.reconcileLockedRegistry();
+      // 0.294.0 (perf): the render cache's existence prune, moved off the load
+      // path. Deferred well past first paint — it's pure housekeeping (bounding
+      // growth), nothing reads its result. It also switches on the lazy
+      // per-`get()` prune, which is why it must not run before the vault index
+      // is populated: a null lookup then would mean "not indexed yet", and the
+      // prune would eat live entries.
+      window.setTimeout(() => this.renderCacheStore.pruneMissing(), 5000);
+      // 0.294.0 (perf): the `.stashkey` walk (an adapter.list per directory) is
+      // deferred to here unless a locked subtree is registered — in which case
+      // keys are needed as soon as a placeholder is touched, so it started
+      // during onload. Starting twice is a no-op (the second call joins the
+      // first). Discovery itself is unchanged: EVERY directory is still walked,
+      // so a key dropped in by sync is still found.
+      void this.encryption.whenKeysReady().then(async () => {
+        // keyfile-removal Phase 3: transparently relocate any legacy keyfile folder
+        // keys into per-folder `.stashkey` files (additive; keyfile kept as backup).
+        // Chained to the index (it needs a complete one to know what's already
+        // migrated); moved here from onload with the walk it depends on.
+        try {
+          const n = await this.encryption.migrateKeyfileToStashKeys();
+          if (n > 0) new Notice(`Stashpad: moved ${n} folder key${n === 1 ? "" : "s"} to the new per-folder format.`);
+        } catch (e) { console.warn("[Stashpad] folder-key migration failed (keyfile still works)", e); }
+      });
       // 0.136.0/0.137.0: one-time migrations to per-folder archive + trash
       // subfolders, then (B5) prune any zombie legacy entries.
       window.setTimeout(async () => {
@@ -4026,6 +4060,7 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-decrypt-folder-bundle",
       name: "Decrypt a folder bundle (encrypted non-Stashpad folder)…",
       callback: async () => {
+        await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
         if (!this.encryption.isConfigured()) { new Notice("Stashpad encryption isn't set up."); return; }
         const bundles = await listRawFolderBlobs(this.app);
         if (!bundles.length) { new Notice("No encrypted folder bundles found in this vault."); return; }
@@ -6069,31 +6104,53 @@ export default class StashpadPlugin extends Plugin {
    *  parent/title/count. A blob with no registry entry shows under the folder root
    *  with its filename as the title, so it's never stranded/unreachable. */
   lockedSubtreesFor(folder: string, parentId: StashpadId): Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }> {
+    // 0.293.0 (perf): thin wrapper over the one-pass index below, so the vault
+    // scan happens once per call instead of once per call AND once per row.
+    return this.lockedSubtreesIndex(folder).get(parentId) ?? [];
+  }
+
+  /** 0.293.0 (perf): build the WHOLE parentId → placeholders map for `folder` in a
+   *  single pass. `populateListBody` used to call `lockedSubtreesFor` once per
+   *  rendered row in flat/everything mode, and each of those calls walked
+   *  `vault.getFiles()` — O(rows × vaultFiles) per render. One index build is
+   *  O(registry + vaultFiles) regardless of row count, and callers do O(1) lookups.
+   *  Per-call compute (no caching): the result can never go stale mid-render, and
+   *  a lock/unlock between renders is picked up automatically. Output per parent is
+   *  byte-for-byte what `lockedSubtreesFor` returned: same order (registry first,
+   *  then unregistered on-disk blobs at ROOT), same dedupe scope (a blob registered
+   *  under another parent is still ALSO listed at ROOT, exactly as before). */
+  lockedSubtreesIndex(folder: string): Map<StashpadId, Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }>> {
     const cleaned = folder.replace(/\/+$/, "");
-    const out: Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }> = [];
-    const seen = new Set<string>();
+    const index = new Map<StashpadId, Array<{ blob: string; title: string; count: number; created: string; rootId?: StashpadId; parentId?: StashpadId | null; prevSibling?: StashpadId | null }>>();
+    const bucket = (id: StashpadId) => {
+      let b = index.get(id);
+      if (!b) { b = []; index.set(id, b); }
+      return b;
+    };
     // REGISTRY FIRST — the registry (settings) loads synchronously at startup, so
     // locked placeholders render immediately on app restart, BEFORE the vault
     // finishes indexing the `.stashenc` blobs (vault.getFiles() lags there, which
     // is what made encrypted notes "disappear" on restart until 0.99.14).
+    const seenAtRoot = new Set<string>();
     for (const e of this.settings.lockedSubtrees ?? []) {
       if ((e.folder ?? "").replace(/\/+$/, "") !== cleaned) continue;
-      if ((e.parentId ?? ROOT_ID) !== parentId) continue;
-      out.push({ blob: e.blob, title: e.title ?? "", count: e.count ?? 0, created: e.created ?? "", rootId: e.rootId, parentId: e.parentId ?? ROOT_ID, prevSibling: e.prevSibling ?? null });
-      seen.add(e.blob);
+      const pid = (e.parentId ?? ROOT_ID) as StashpadId;
+      bucket(pid).push({ blob: e.blob, title: e.title ?? "", count: e.count ?? 0, created: e.created ?? "", rootId: e.rootId, parentId: e.parentId ?? ROOT_ID, prevSibling: e.prevSibling ?? null });
+      // Only ROOT's `seen` set ever suppressed a disk blob, because the disk pass
+      // only ever attached at ROOT — so that's the only set we need to carry.
+      if (pid === ROOT_ID) seenAtRoot.add(e.blob);
     }
     // Then any `.stashenc` blob on disk with NO registry entry (e.g. synced in
     // from another device) — shown at ROOT with the filename as title so it's
     // never stranded. Skips the `_deleted/` encrypted-trash store.
     for (const f of this.app.vault.getFiles()) {
       if (f.extension !== "stashenc") continue;
-      if (seen.has(f.path)) continue;
+      if (seenAtRoot.has(f.path)) continue;
       const fdir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (fdir !== cleaned || fdir === "_deleted" || fdir.startsWith("_deleted/")) continue;
-      if (parentId !== ROOT_ID) continue; // unregistered → attach at root only
-      out.push({ blob: f.path, title: f.basename, count: 0, created: "", rootId: undefined, parentId: ROOT_ID, prevSibling: null });
+      bucket(ROOT_ID).push({ blob: f.path, title: f.basename, count: 0, created: "", rootId: undefined, parentId: ROOT_ID, prevSibling: null });
     }
-    return out;
+    return index;
   }
 
   /** 0.124.0: ALL locked-subtree stubs in `folder` (every parent), for search.
@@ -6124,6 +6181,13 @@ export default class StashpadPlugin extends Plugin {
    *  with no key of its own (or an inherited one) is not encrypted, so this returns
    *  null and tells the user to give it a password.) Caller may zero the DEK. */
   async ensureFolderUnlocked(folder: string): Promise<Uint8Array | null> {
+    // 0.294.0 (perf): the `.stashkey` index is built off the onload critical path
+    // now, so `hasFolderKey()` can read false simply because the walk hasn't
+    // finished. That would tell the user an encrypted folder "isn't encrypted".
+    // This is THE funnel for every unlock, so waiting for a complete index here
+    // is what makes empty-because-not-ready distinguishable from
+    // empty-because-no-keys for the whole unlock path.
+    await this.encryption.whenKeysReady();
     if (!this.encryption.hasFolderKey(folder)) {
       new Notice("This folder isn't encrypted. Give it a password in Settings → Stashpad → Encryption → Per-Folder Passwords.");
       return null;
@@ -6464,6 +6528,7 @@ export default class StashpadPlugin extends Plugin {
    *  (each lock writes+verifies the blob before trashing plaintext) mean an
    *  interruption never loses data. Does NOT touch Obsidian's sync API. */
   async encryptAllNow(): Promise<void> {
+    await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
     if (!this.encryption.isConfigured() && !this.encryption.hasAnyFolderKey()) {
       new Notice("Set up encryption first — give a folder a password (Settings → Stashpad → Encryption).");
       return;
@@ -6676,6 +6741,7 @@ export default class StashpadPlugin extends Plugin {
    *  into place. Non-destructive (unlock only reverses a lock) — a "decrypt
    *  everything" safety valve. Each blob is independent + skip-on-error. */
   async unlockAllInVault(): Promise<number> {
+    await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
     if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return 0; }
     // Exclude ALL trash stores (`_deleted/` + per-folder `<folder>/trash/`) —
     // those are DELETED notes, not locked ones; "unlocking" them would restore
@@ -7249,6 +7315,7 @@ export default class StashpadPlugin extends Plugin {
 
   /** Open a picker over the encrypted trash; restore the chosen note in place. */
   async openRestoreTrashPicker(): Promise<void> {
+    await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
     if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return; }
     const items = await this.listDeletedTrash();
     if (items.length === 0) { new Notice("Encrypted trash is empty."); return; }
@@ -7958,7 +8025,13 @@ export default class StashpadPlugin extends Plugin {
     const oldDir = (slash >= 0 ? oldPath.slice(0, slash) : "").replace(/\/+$/, "");
     if (newDir === oldDir) return;                      // in-folder rename, not a move-in
     if (!this.isArchiveFolder(newDir)) return;
-    if (!this.encryption.isConfigured()) return;
+    // 0.294.0 (perf): only trust a NEGATIVE answer once the `.stashkey` index is
+    // complete. Before that "not configured" means "don't know yet", and
+    // dropping the move-in here would silently leave an arriving note plaintext
+    // in an encrypted archive folder. The deferred flush below re-checks
+    // `hasFolderKey` after awaiting the index, so a false positive just queues
+    // work that then no-ops.
+    if (this.encryption.keysIndexed() && !this.encryption.isConfigured()) return;
     let pending = this.archivePending.get(newDir);
     if (!pending) { pending = { paths: new Set(), timer: 0 }; this.archivePending.set(newDir, pending); }
     pending.paths.add(file.path);
@@ -8022,6 +8095,7 @@ export default class StashpadPlugin extends Plugin {
     if (roots.length === 0) return;
     // 0.143.0: per-folder only — encrypt arriving notes ONLY if this archive folder
     // has its own password. A keyless archive folder just stays plaintext (boring).
+    await this.encryption.whenKeysReady();   // 0.294.0 (perf): see maybeArchiveOnMoveIn
     if (!this.encryption.hasFolderKey(cleaned)) return;
     if (!(await this.ensureFolderUnlocked(cleaned))) {
       new Notice(`⚠️ Archive folder "${cleaned.split("/").pop()}": ${roots.length} arriving note${roots.length === 1 ? "" : "s"} NOT encrypted (couldn't unlock the folder password). Unlock it and lock them manually.`, 0);

@@ -77,7 +77,13 @@ export interface StructureSnapshot {
 
 export class StructureSnapshotStore {
   private timers = new Map<string, number>();
-  private pending = new Map<string, StructureSnapshot>();
+  /** 0.294.0 (perf): pending holds a BUILDER, not a built snapshot. The caller
+   *  used to walk the whole tree and allocate a ~400-entry Record before every
+   *  schedule() call — so a burst of 20 metadata events built the object 20
+   *  times and threw 19 away. The thunk is evaluated in flush(), which is also
+   *  exactly when we want it: the write then reflects the FINAL tree state
+   *  rather than the state at the first event of the burst. */
+  private pending = new Map<string, () => Record<string, StructureEntry>>();
   private writeChain: Promise<void> = Promise.resolve();
   /** Debounce: structure changes arrive in bursts (a drag, a multi-move, an
    *  import). One write per quiet period, not one per mutation. */
@@ -145,16 +151,12 @@ export class StructureSnapshotStore {
     await scrub(this.prevPathFor(cleaned));
   }
 
-  /** Queue a write of `notes` for `folder` (debounced + coalesced). */
-  schedule(folder: string, notes: Record<string, StructureEntry>): void {
+  /** Queue a write for `folder` (debounced + coalesced). `build` is called once,
+   *  when the debounce fires — see the note on `pending`. */
+  schedule(folder: string, build: () => Record<string, StructureEntry>): void {
     const cleaned = folder.replace(/\/+$/, "");
     if (!cleaned) return;
-    this.pending.set(cleaned, {
-      schema: SCHEMA,
-      folder: cleaned,
-      updated: new Date().toISOString(),
-      notes,
-    });
+    this.pending.set(cleaned, build);
     if (this.timers.has(cleaned)) return;
     const t = window.setTimeout(() => {
       this.timers.delete(cleaned);
@@ -170,9 +172,21 @@ export class StructureSnapshotStore {
     for (const key of keys) {
       const timer = this.timers.get(key);
       if (timer != null) { window.clearTimeout(timer); this.timers.delete(key); }
-      const snap = this.pending.get(key);
-      if (!snap) continue;
+      const build = this.pending.get(key);
+      if (!build) continue;
       this.pending.delete(key);
+      // 0.294.0 (perf): build here, once per debounce window. `updated` is
+      // stamped at build time too, so it describes the shape being written.
+      let snap: StructureSnapshot;
+      try {
+        snap = { schema: SCHEMA, folder: key, updated: new Date().toISOString(), notes: build() };
+      } catch (e) {
+        // A recovery aid must never take down whatever asked it to flush (view
+        // teardown, plugin unload). A failed build just skips this generation;
+        // the previous snapshot on disk is untouched.
+        console.warn("[Stashpad] couldn't build structure snapshot", key, e);
+        continue;
+      }
       this.writeChain = this.writeChain.then(async () => {
         try {
           // An empty folder writes nothing rather than an empty map — a blank

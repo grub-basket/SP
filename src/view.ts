@@ -536,13 +536,11 @@ export class StashpadView extends ItemView {
     ".stashpad-note-authorship",
     "input", "textarea", "select", "[contenteditable]",
   ].join(", ");
-  /** Per-row ResizeObserver attached during scrollListToBottom — re-pins
-   *  the list to the bottom whenever a row's height changes. Survives
-   *  past the initial paint so cold-cache markdown / late font loads
-   *  don't leave the last note tucked behind the composer. Disconnected
-   *  on user scroll-up (via stickToListBottom flipping false) or on view
-   *  teardown. */
-  private stickyRowObserver: ResizeObserver | null = null;
+  /** 0.293.0 (perf): `stickyRowObserver` (a ResizeObserver wired to EVERY
+   *  list row during scrollListToBottom) was removed — see the comment in
+   *  scrollListToBottom. Content growth is caught by that method's rAF
+   *  scrollHeight watchdog (one write per frame), list-box resizes by
+   *  `listResizeObserver` below. */
   private listResizeObserver: ResizeObserver | null = null;
   /** 0.61.4: observes the composer's width so the secondary-button
    *  rail can collapse behind a chevron when the composer is narrow
@@ -606,6 +604,24 @@ export class StashpadView extends ItemView {
   // the moment any authoritative saveDraft runs (submit clears, blur, restore).
   private debouncedSaveDraft?: Debouncer<[string], void>;
   private debouncedDupSearch?: (v: string) => void;
+  /** 0.294.0 (perf): memoized titleForNode results, keyed by `path::mtime`.
+   *
+   *  titleForNode costs a metadataCache lookup + a render-cache lookup +
+   *  stripInlineMarkdown + two regex replaces, and the hot callers run it over
+   *  EVERY node (dup-search on each composer keystroke, the structure snapshot
+   *  on each metadata event). Its inputs are the file's headings, its cached
+   *  body text and its basename — all of which change only when the file
+   *  changes (mtime) or is renamed (path), so those two make a sound key. No
+   *  setting feeds the derivation, so nothing to invalidate on config change.
+   *
+   *  The one input that ISN'T covered by the key is render-cache WARM-UP: a
+   *  cold cache makes titleForNode fall back to the filename slug at the same
+   *  mtime the real body line would later produce. So fallback results are
+   *  never memoized (see titleForNode) — only titles derived from a heading or
+   *  real body text go in the map, and a cold node just recomputes until the
+   *  cache fills. Bounded at MAX entries; cleared wholesale on overflow. */
+  private titleMemo = new Map<string, string>();
+  private static TITLE_MEMO_MAX = 2000;
   /** Composer autocomplete instance — recreated whenever the composer
    *  textarea is rebuilt (i.e. on each render). */
   private composerAutocomplete: ComposerAutocomplete | null = null;
@@ -1613,17 +1629,24 @@ export class StashpadView extends ItemView {
     try {
       const folder = this.noteFolder;
       if (!folder) return;
-      const notes: Record<string, { parent: string | null; path: string; created?: string; title?: string }> = {};
-      for (const node of this.tree.allNodes()) {
-        if (node.id === ROOT_ID || !node.file) continue;
-        notes[node.id] = {
-          parent: node.parent && node.parent !== ROOT_ID ? node.parent : null,
-          path: node.file.path,
-          created: node.created || undefined,
-          title: this.titleForNode(node).trim().slice(0, 80) || undefined,
-        };
-      }
-      this.plugin.structureStore.schedule(folder, notes);
+      // 0.294.0 (perf): hand the store a BUILDER. This runs on every metadata
+      // event; building the ~400-entry Record (a titleForNode per node) here
+      // meant a burst of 20 events did that work 20 times for one write. The
+      // store now calls this once, when its 4s debounce fires — which also
+      // makes the written snapshot the final post-burst shape.
+      this.plugin.structureStore.schedule(folder, () => {
+        const notes: Record<string, { parent: string | null; path: string; created?: string; title?: string }> = {};
+        for (const node of this.tree.allNodes()) {
+          if (node.id === ROOT_ID || !node.file) continue;
+          notes[node.id] = {
+            parent: node.parent && node.parent !== ROOT_ID ? node.parent : null,
+            path: node.file.path,
+            created: node.created || undefined,
+            title: this.titleForNode(node).trim().slice(0, 80) || undefined,
+          };
+        }
+        return notes;
+      });
     } catch (e) {
       console.warn("[Stashpad] structure snapshot schedule failed", e);
     }
@@ -1652,8 +1675,6 @@ export class StashpadView extends ItemView {
     this.keydownWindow.removeEventListener("keydown", this.onDocKeyDown, true);
     this.listResizeObserver?.disconnect();
     this.listResizeObserver = null;
-    this.stickyRowObserver?.disconnect();
-    this.stickyRowObserver = null;
     this.bodyRenderer.dispose();
     this.barOverflowRO?.disconnect();
     this.barOverflowRO = null;
@@ -2734,11 +2755,16 @@ export class StashpadView extends ItemView {
     } else if (mode === "nested") {
       lockSource = this.plugin.lockedSubtreesFor(this.noteFolder, focused.id);
     } else {
+      // 0.293.0 (perf): ONE index build (one vault pass) for the whole render,
+      // then an O(1) map lookup per row. This loop used to call
+      // `lockedSubtreesFor` per row, and each call walked every file in the vault
+      // — O(rows × vaultFiles) on every flat/everything render.
       const ids = new Set<StashpadId>([focused.id, ...this.currentChildren.map((n) => n.id)]);
+      const lockIndex = this.plugin.lockedSubtreesIndex(this.noteFolder);
       const seen = new Set<string>();
       lockSource = [];
       for (const id of ids) {
-        for (const lk of this.plugin.lockedSubtreesFor(this.noteFolder, id)) {
+        for (const lk of lockIndex.get(id) ?? []) {
           if (!seen.has(lk.blob)) { seen.add(lk.blob); lockSource.push(lk); }
         }
       }
@@ -3897,9 +3923,10 @@ export class StashpadView extends ItemView {
       this.scrollToBottomOnNextRender = false;
       this.scrollListToBottom();
     } else if (this.listEl && prevAtBottom) {
-      // Was at bottom — re-pin to the *new* bottom and attach the
-      // per-row ResizeObserver scrollListToBottom uses, so async
-      // markdown / font / image growth keeps pinning. Covers the
+      // Was at bottom — re-pin to the *new* bottom and arm the
+      // scrollHeight watchdog scrollListToBottom uses (0.293.0: was a
+      // per-row ResizeObserver), so async markdown / font / image
+      // growth keeps pinning. Covers the
       // cold-cache reload case where a second render fires while
       // markdown is still parsing.
       this.scrollListToBottom();
@@ -6713,6 +6740,18 @@ export class StashpadView extends ItemView {
 
   titleForNode(node: TreeNode): string {
     if (!node.file) return "Untitled";
+    // 0.294.0 (perf): memo keyed by path + mtime. A rename changes the path, an
+    // edit changes the mtime — either way the key misses and the title is
+    // recomputed. Only DERIVED titles are stored (see the fallback branches
+    // below), so a cold render cache can't freeze a filename slug in place.
+    const memoKey = `${node.file.path}::${node.file.stat.mtime}`;
+    const memoized = this.titleMemo.get(memoKey);
+    if (memoized !== undefined) return memoized;
+    const remember = (title: string): string => {
+      if (this.titleMemo.size >= StashpadView.TITLE_MEMO_MAX) this.titleMemo.clear();
+      this.titleMemo.set(memoKey, title);
+      return title;
+    };
     const cache = this.app.metadataCache.getFileCache(node.file);
     const firstHeading = cache?.headings?.[0]?.heading;
     // 0.208.4: titles are raw Markdown (a heading or the first body line), and
@@ -6720,7 +6759,7 @@ export class StashpadView extends ItemView {
     // title — so the syntax characters showed through verbatim
     // ("**Atomic Habits**"). Strip at this single choke point rather than at each
     // call site; the tooltip/tab-title consumers can't render HTML anyway.
-    if (firstHeading) return stripInlineMarkdown(firstHeading);
+    if (firstHeading) return remember(stripInlineMarkdown(firstHeading));
     // Prefer the note's first body line (what the row / focused header shows)
     // over the filename: a filename can be a short slug that doesn't match its
     // content (e.g. `grand.md` whose body is "Grandchild under child A of
@@ -6731,8 +6770,20 @@ export class StashpadView extends ItemView {
     const firstLine = bodyText?.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
     // Strip AFTER picking the line: a line that is only syntax (e.g. "**") would
     // otherwise strip to empty and silently win over the filename fallback.
-    if (firstLine) return stripInlineMarkdown(firstLine) || node.file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
-    return node.file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
+    const slug = (): string => node.file!.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
+    // 0.294.0 (perf): a title derived from real body text is stable for this
+    // mtime, so it memoizes. A line that strips to empty falls through to the
+    // slug and does NOT — same reason as the cold-cache case below.
+    if (firstLine) {
+      const stripped = stripInlineMarkdown(firstLine);
+      if (stripped) return remember(stripped);
+      return slug();
+    }
+    // Cold render cache AND cold metadata cache both land here, and both fill in
+    // later WITHOUT touching the file — so this fallback is deliberately not
+    // memoized. Only a file with no heading and a genuinely blank body recomputes
+    // forever, and that path is a couple of string ops.
+    return slug();
   }
 
   /** Warm the render cache for breadcrumb nodes that have no heading and no
@@ -7927,7 +7978,10 @@ export class StashpadView extends ItemView {
   private dupSearch(text: string): TreeNode[] {
     const q = text.trim();
     if (q.length < 3) return [];
-    const out: Array<{ n: TreeNode; score: number }> = [];
+    // 0.294.0 (perf): carry the title (and its length) on the candidate. The
+    // comparator used to call titleForNode TWICE per comparison — O(N log N)
+    // extra title derivations on top of the O(N) scan, on every run.
+    const out: Array<{ n: TreeNode; score: number; len: number }> = [];
     const ql = q.toLowerCase();
     for (const n of this.tree.all()) {
       if (!n.file || n.id === ROOT_ID) continue;
@@ -7935,9 +7989,9 @@ export class StashpadView extends ItemView {
       if (!title || !siftMatch(q, title)) continue;
       const tl = title.toLowerCase();
       const score = tl === ql ? 0 : tl.startsWith(ql) ? 1 : tl.includes(ql) ? 2 : 3;
-      out.push({ n, score });
+      out.push({ n, score, len: title.length });
     }
-    out.sort((a, b) => a.score - b.score || this.titleForNode(a.n).length - this.titleForNode(b.n).length);
+    out.sort((a, b) => a.score - b.score || a.len - b.len);
     return out.slice(0, 5).map((e) => e.n);
   }
 
@@ -8063,7 +8117,15 @@ export class StashpadView extends ItemView {
       this.debouncedSaveDraft = debounce((v: string) => { void this.saveDraft(v); }, 800, true);
     }
     if (!this.debouncedDupSearch) {
-      this.debouncedDupSearch = debounce((v: string) => this.refreshDupPanel(v), 300);
+      // 0.294.0 (perf): RESETTING (trailing) at 350ms. The old 300ms
+      // non-resetting timer fired ~3x/second through continuous typing, and each
+      // fire scanned every node in the folder. The panel is an advisory "you may
+      // already have this note" hint, not a live search field — showing it once
+      // the user pauses is when it's actually readable, and it stops the
+      // mid-word flicker as hits appear and vanish. Nothing depends on a
+      // mid-typing fire: the panel is also refreshed directly on composer
+      // render, on submit-clear, and on the dup-hints toggle.
+      this.debouncedDupSearch = debounce((v: string) => this.refreshDupPanel(v), 350, true);
     }
     ta.addEventListener("input", () => {
       this.composerDraft = ta.value;
@@ -17212,7 +17274,9 @@ export class StashpadView extends ItemView {
             // Batched splits defer the render to a single pass at the end
             // (see createNotesBatch) so a long paste doesn't repaint per note.
             if (!opts.deferRender) {
-              this.render();
+              // 0.294.0 (perf): append just the new row when it lands at the end
+              // of the current view; the full render is the fallback.
+              if (!this.tryIncrementalAppend()) this.render();
               // 0.267.14: that render already shows the finished row, so every
               // render the create sets in motion after it is redundant — and
               // visible, as 3-4 brief flickers.
@@ -17883,6 +17947,78 @@ export class StashpadView extends ItemView {
    *  list — only the edited row's `.stashpad-note-body-content` re-renders, and
    *  renderNoteBodyNow keeps the OLD body visible until the fresh one resolves
    *  (token-guarded), so there is no flash and no list reflow. */
+  /** 0.294.0 (perf): append-only list patch for a local create.
+   *
+   *  A create in a 400-note folder used to cost one full render (~1s: empty
+   *  the list, rebuild every row). The common case — the new note lands at the
+   *  END of the current view (created-asc, manual, or flat order) — only needs
+   *  its own row built. So: recompute the target list, and if the rendered note
+   *  rows are exactly a PREFIX of it, build just the tail rows in place.
+   *
+   *  Anything else (mid-list insert under created-desc / title sort, locked
+   *  placeholders or loose files interleaved, hidden view, filter that moved
+   *  rows) returns false and the caller does the full render it always did.
+   *
+   *  Deliberately does NOT re-arm the lazy-body observer (populateListBody
+   *  does per paint): arm() disconnects + forgets every row still waiting for
+   *  its body. The new row uses the observer that is already live — or, for
+   *  the composer path, paints straight from the primed render cache.
+   *
+   *  Returns true when the list is already in sync (a later same-tick call
+   *  must not clobber the row that was just appended). */
+  private tryIncrementalAppend(): boolean {
+    const list = this.listEl;
+    if (!this.viewRoot?.isConnected || !list) return false;
+    if (this.isHiddenLeaf()) return false;               // the full render defers itself
+    const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
+    const target = this.filterChildren(this.collectViewItems(focused.id));
+    // Note rows only. The sticky heading row lives in the list but is not part
+    // of the note sequence; anything else (locked placeholder, loose file) is
+    // ordered by timestamp against the notes and is not append-safe.
+    const rows: HTMLElement[] = [];
+    for (const el of Array.from(list.children) as HTMLElement[]) {
+      if (el.classList.contains("stashpad-note") && el.dataset.id) rows.push(el);
+      else if (!el.classList.contains("stashpad-focused")) return false;
+    }
+    if (rows.length > target.length) return false;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].dataset.id !== target[i].id || rows[i].dataset.idx !== String(i)) return false;
+    }
+    this.currentChildren = target;
+    if (rows.length === target.length) return true;     // already in sync — no-op
+    if (this.pendingFocusIds) return false;              // a focus request wants the full path
+
+    // Mirror renderInner's auto-select of the just-created note, and clear the
+    // cursor/selection marks the old rows still carry (a full render would
+    // have rebuilt them without).
+    let selectionMoved = false;
+    if (this.autoSelectNewest) {
+      const last = target[target.length - 1];
+      for (const r of rows) { r.removeClass("is-cursor"); r.removeClass("is-selected"); r.removeClass("is-cursor-expanded"); }
+      this.cursorIdx = target.length - 1;
+      this.selection.clear();
+      this.selection.add(last.id);
+      this.lastSelected = last.id;
+      this.autoSelectNewest = false;
+      selectionMoved = true;
+    }
+    const t0 = perf.enabled ? performance.now() : 0;
+    for (let i = rows.length; i < target.length; i++) this.renderNote(list, target[i], i);
+    if (perf.enabled) perf.record("render.append", performance.now() - t0);
+    this.plugin.trace("render:append", { folder: this.noteFolder, added: target.length - rows.length });
+
+    // Composer submit sets the legacy pin-bottom flag; honour and clear it the
+    // way the preserve branch of renderInner does.
+    if (this.scrollToBottomOnNextRender) {
+      this.scrollToBottomOnNextRender = false;
+      this.scrollListToBottom();
+    }
+    if (selectionMoved) this.stampSelectedCursor();
+    this.plugin.notifyStashpadContentChanged();
+    if (selectionMoved) this.plugin.notifyStashpadSelectionChanged();
+    return true;
+  }
+
   private repaintRowBody(file: TFile): boolean {
     const fmId = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
     const id = typeof fmId === "string" ? fmId : null;
@@ -18173,24 +18309,31 @@ export class StashpadView extends ItemView {
       return;
     }
 
-    // Per-row ResizeObserver: re-pin to bottom whenever any row's height
-    // changes. Catches direct size changes (block re-layout, expand
-    // toggles, etc.).
-    this.stickyRowObserver?.disconnect();
-    const pinOrStop = (): void => {
-      if (!this.stickToListBottom) {
-        this.stickyRowObserver?.disconnect();
-        this.stickyRowObserver = null;
-        return;
-      }
-      list.scrollTop = list.scrollHeight;
-    };
-    const ro = new ResizeObserver(pinOrStop);
-    for (const child of Array.from(list.children)) {
-      if (child instanceof HTMLElement) ro.observe(child);
-    }
-    this.stickyRowObserver = ro;
-
+    // 0.293.0 (perf): the per-row ResizeObserver that used to live here is
+    // gone. It called `ro.observe(child)` for EVERY row (~400 on a busy
+    // list) and each delivered entry wrote `scrollTop = scrollHeight` — a
+    // forced sync layout, N times per layout pass, precisely while lazy
+    // markdown bodies were streaming in after a composer submit. Its two
+    // jobs are already covered, with the same lifetime and stop
+    // conditions, by observers that cost O(1):
+    //
+    //   - CONTENT growth/shrink (late markdown, image decode, font swap,
+    //     expand toggles, clamp) changes `list.scrollHeight`, which the
+    //     rAF watchdog below reads once per frame and re-pins on — at
+    //     most ONE write per frame no matter how many rows changed. The
+    //     rows flow directly in the scroller (populateListBody appends
+    //     them to `.stashpad-list`), so there is no wrapper element whose
+    //     box tracks total content height, and a bottom sentinel would
+    //     not help: a ResizeObserver fires on the observed element's own
+    //     size, not on its offsetTop. Polling scrollHeight IS the
+    //     one-observation-point equivalent here.
+    //   - The LIST BOX itself resizing (window resize, composer growing
+    //     to multiple lines) does not move scrollHeight — that case is
+    //     handled by `listResizeObserver` in renderInner, which observes
+    //     the list element and, while `stickToListBottom` is set, pins to
+    //     the bottom (and otherwise holds `settleTop`). So the two
+    //     observers are not duplicated: one element, one observer.
+    //
     // Watchdog rAF poll for 30 seconds. Some scrollHeight changes
     // don't manifest as a ResizeObserver fire on any direct child —
     // image embeds finishing decode inside an attachment rail, async
@@ -18216,12 +18359,10 @@ export class StashpadView extends ItemView {
         // flag here prevents the regression where every subsequent
         // mutation (color change, reparent, move, etc.) bounces the
         // view back to the bottom even though the user had navigated
-        // away. Disconnect the row observer too — it'd otherwise
-        // remain wired to the now-stale list children, doing nothing
-        // useful but holding references.
+        // away. (0.293.0: nothing to disconnect here any more — the
+        // per-row observer this used to tear down is gone; dropping the
+        // sticky flag is what stops the pinning.)
         this.stickToListBottom = false;
-        this.stickyRowObserver?.disconnect();
-        this.stickyRowObserver = null;
       }
     };
     requestAnimationFrame(watchdog);

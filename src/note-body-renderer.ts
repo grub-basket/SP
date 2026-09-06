@@ -54,6 +54,13 @@ export class NoteBodyRenderer {
   }
 
   async getOrComputeRender(file: TFile): Promise<RenderEntry> {
+    // 0.294.0 (perf): the persisted store now loads OFF the onload critical path,
+    // so it may still be materializing when the first lazy body render fires.
+    // This path is already async (it's about to `cachedRead`), so waiting for the
+    // store costs nothing it wasn't going to spend — and it keeps the cold-open
+    // cache HIT that the whole persisted cache exists for. Synchronous consumers
+    // (peekCache, the view's pre-paint peeks) just see a miss until then.
+    if (this.renderCache.ready) await this.renderCache.ready;
     const cached = this.renderCache.get(file.path);
     if (cached && cached.mtime === file.stat.mtime) { perf.record("render.row.cacheHit", 0); return cached; }
     // Cache miss / stale entry. Read + parse + render into a detached div

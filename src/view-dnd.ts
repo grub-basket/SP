@@ -19,12 +19,167 @@ export interface DnDHost {
  *  the per-drag source/placeholder state, the dragstart/over/leave/drop
  *  wiring, the animated drop placeholder, and the three-zone hit test.
  *  Behavior is identical to when this lived inline in the view. */
+/** 0.294.0 (perf): one cached row's geometry, in LIST coordinates
+ *  (`offsetTop`-based, so the numbers survive scrolling the list). */
+interface RowGeom { el: HTMLElement; top: number; bottom: number }
+
+/** 0.294.0 (perf): the latest dragover, deferred to the next animation frame. */
+type PendingOver =
+  | { kind: "row"; row: HTMLElement; clientY: number }
+  | { kind: "list"; clientY: number };
+
 export class ViewDnD {
   private dragSourceIds: StashpadId[] | null = null;
   private dragPlaceholder: HTMLElement | null = null;
   private dragRowHeight = 0;
 
+  // 0.294.0 (perf): drag-over used to do `querySelectorAll(".stashpad-note")` +
+  // one `getBoundingClientRect()` per row on EVERY dragover event (~60/s, up to
+  // ~400 forced layout reads per event on a big list), plus a whole-list query
+  // in `clearDropIndicators()`. Now: the row geometry is cached once per drag in
+  // list coordinates, the hit test is a binary search, the indicator element is
+  // tracked in a field, and the work runs at most once per animation frame.
+  private rowCache: RowGeom[] | null = null;
+  /** Element → geometry, so the row-level hit test is O(1) rather than a scan. */
+  private rowCacheByEl = new Map<HTMLElement, RowGeom>();
+  /** Constant offset between the list's border-box top and the origin
+   *  `offsetTop` is measured from (border/padding, or a positioned ancestor). */
+  private cacheOrigin = 0;
+  /** Cheap staleness signature: child count + first child identity. */
+  private cacheChildCount = -1;
+  private cacheFirstChild: Element | null = null;
+  /** Total content height when the cache was built — catches a row growing or
+   *  shrinking mid-drag (late markdown / image decode / an expand toggle)
+   *  without any child-count change. */
+  private cacheScrollHeight = -1;
+  /** The single element currently carrying `.drop-into` (if any). */
+  private dropIntoEl: HTMLElement | null = null;
+  /** Latest un-processed dragover, drained in a rAF. */
+  private pendingOver: PendingOver | null = null;
+  private overRaf = 0;
+
   constructor(private host: DnDHost) {}
+
+  /** Build (or rebuild) the row-geometry cache from the live DOM. One pass of
+   *  `offsetTop`/`offsetHeight` reads + two rects, done at most once per frame. */
+  private buildRowCache(list: HTMLElement): void {
+    const rows: RowGeom[] = [];
+    this.rowCacheByEl.clear();
+    for (const child of Array.from(list.children)) {
+      if (!child.classList.contains("stashpad-note")) continue;
+      const el = child as HTMLElement;
+      const top = el.offsetTop;
+      const geom = { el, top, bottom: top + el.offsetHeight };
+      rows.push(geom);
+      this.rowCacheByEl.set(el, geom);
+    }
+    this.rowCache = rows;
+    this.cacheChildCount = list.childElementCount;
+    this.cacheFirstChild = list.firstElementChild;
+    this.cacheScrollHeight = list.scrollHeight;
+    if (rows.length > 0) {
+      // rect.top === listRect.top + origin - scrollTop + offsetTop  →  solve for origin.
+      const first = rows[0];
+      this.cacheOrigin = first.el.getBoundingClientRect().top
+        - list.getBoundingClientRect().top + list.scrollTop - first.top;
+    } else {
+      this.cacheOrigin = 0;
+    }
+  }
+
+  /** Rebuild the cache if the list changed under us: a re-render (different
+   *  child count / first child), the placeholder being inserted or moved (which
+   *  also changes the child count / order), or the placeholder still animating
+   *  its height open (rows below it are still shifting). */
+  private ensureRowCache(list: HTMLElement): RowGeom[] {
+    let stale = this.rowCache === null
+      || list.childElementCount !== this.cacheChildCount
+      || list.firstElementChild !== this.cacheFirstChild
+      || list.scrollHeight !== this.cacheScrollHeight;
+    if (!stale) {
+      const ph = this.dragPlaceholder;
+      if (ph?.parentElement === list && ph.offsetHeight !== this.dragRowHeight) stale = true;
+    }
+    if (stale) this.buildRowCache(list);
+    return this.rowCache ?? [];
+  }
+
+  /** Convert a viewport `clientY` into the cache's list coordinate space.
+   *  One `getBoundingClientRect()` per processed event (not per row). */
+  private toListY(list: HTMLElement, clientY: number): number {
+    return clientY - list.getBoundingClientRect().top - this.cacheOrigin + list.scrollTop;
+  }
+
+  /** Binary search for the first row whose vertical midpoint is below `y`.
+   *  Returns `rows.length` when the cursor is past every row. Same predicate as
+   *  the old linear scan (`clientY < rect.top + rect.height / 2`), just in list
+   *  coordinates and O(log N). */
+  private firstRowBelow(rows: RowGeom[], y: number): number {
+    let lo = 0, hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const r = rows[mid];
+      if (y < r.top + (r.bottom - r.top) / 2) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo;
+  }
+
+  /** Queue a dragover for processing on the next animation frame. */
+  private scheduleOver(pending: PendingOver): void {
+    this.pendingOver = pending;
+    if (this.overRaf) return;
+    this.overRaf = requestAnimationFrame(() => {
+      this.overRaf = 0;
+      const p = this.pendingOver;
+      this.pendingOver = null;
+      if (!p || !this.dragSourceIds) return;
+      if (p.kind === "row") this.processRowOver(p.row, p.clientY);
+      else this.processListOver(p.clientY);
+    });
+  }
+
+  /** Process a queued dragover NOW. The gap-drop paths resolve their target
+   *  from the placeholder's neighbours, so the placeholder must reflect the
+   *  final cursor position rather than lag it by up to one frame. */
+  private flushPendingOver(): void {
+    const p = this.pendingOver;
+    this.cancelPendingOver();
+    if (!p || !this.dragSourceIds) return;
+    if (p.kind === "row") this.processRowOver(p.row, p.clientY);
+    else this.processListOver(p.clientY);
+  }
+
+  private cancelPendingOver(): void {
+    if (this.overRaf) cancelAnimationFrame(this.overRaf);
+    this.overRaf = 0;
+    this.pendingOver = null;
+  }
+
+  private processRowOver(row: HTMLElement, clientY: number): void {
+    if (!row.isConnected) return;
+    const zone = this.dropZoneAtY(row, clientY);
+    this.clearDropIndicators();
+    if (zone === "drop-into") {
+      this.removeDragPlaceholder();
+      row.addClass("drop-into");
+      this.dropIntoEl = row;
+    } else {
+      row.removeClass("drop-into");
+      this.placePlaceholder(row, zone === "drop-above" ? "before" : "after");
+    }
+  }
+
+  private processListOver(clientY: number): void {
+    const list = this.host.listEl;
+    if (!list) return;
+    const rows = this.ensureRowCache(list);
+    if (rows.length === 0) return;
+    const y = this.toListY(list, clientY);
+    const i = this.firstRowBelow(rows, y);
+    if (i < rows.length) this.placePlaceholder(rows[i].el, "before");
+    else this.placePlaceholder(rows[rows.length - 1].el, "after");
+  }
 
   attachRowDnD(row: HTMLElement, node: TreeNode, _idx: number): void {
     row.addEventListener("dragstart", (e: DragEvent) => {
@@ -34,6 +189,13 @@ export class ViewDnD {
       this.dragSourceIds = ids;
       this.dragRowHeight = row.offsetHeight;
       row.addClass("is-dragging");
+      // 0.294.0 (perf): fresh drag → drop any state from a previous one. The
+      // one full-query clear happens here (see clearDropIndicators), so a stale
+      // `.drop-into` left by an interrupted drag can't survive into this one.
+      this.cancelPendingOver();
+      this.rowCache = null;
+      this.dropIntoEl = null;
+      this.clearAllDropIndicators();
       // Pre-create the placeholder once per drag (kept detached until first dragover).
       if (this.host.listEl) {
         this.dragPlaceholder = this.host.listEl.createDiv({ cls: "stashpad-drop-placeholder" });
@@ -49,6 +211,7 @@ export class ViewDnD {
           if (!this.dragSourceIds || !this.dragPlaceholder) return;
           de.preventDefault();
           de.stopPropagation();
+          this.flushPendingOver();
           const sources = this.dragSourceIds.slice();
           this.dragSourceIds = null;
           // Determine the target by looking at the row that comes AFTER the placeholder
@@ -81,35 +244,36 @@ export class ViewDnD {
     });
     row.addEventListener("dragend", () => {
       row.removeClass("is-dragging");
+      // 0.294.0 (perf): a cancelled drag (Escape) lands here too — drop the
+      // cache and any queued frame along with the indicator/placeholder.
+      this.cancelPendingOver();
       this.clearDropIndicators();
       this.removeDragPlaceholder();
+      this.rowCache = null;
+      this.rowCacheByEl.clear();
       this.dragSourceIds = null;
     });
     row.addEventListener("dragover", (e: DragEvent) => {
       if (!this.dragSourceIds) return;
+      // preventDefault/dropEffect MUST stay synchronous on every event or the
+      // browser rejects the drop; only the hit test + DOM work is throttled.
       e.preventDefault();
       if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-      const zone = this.dropZone(e, row);
-      this.clearDropIndicators();
-      if (zone === "drop-into") {
-        this.removeDragPlaceholder();
-        row.addClass("drop-into");
-      } else {
-        row.removeClass("drop-into");
-        this.placePlaceholder(row, zone === "drop-above" ? "before" : "after");
-      }
+      this.scheduleOver({ kind: "row", row, clientY: e.clientY });
     });
     row.addEventListener("dragleave", (e: DragEvent) => {
       // Only clear if we've actually left the row (not just moved over a child).
       const r = row.getBoundingClientRect();
       if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) {
         row.removeClass("drop-into");
+        if (this.dropIntoEl === row) this.dropIntoEl = null;
       }
     });
     row.addEventListener("drop", (e: DragEvent) => {
       if (!this.dragSourceIds) return;
       e.preventDefault();
       e.stopPropagation();
+      this.cancelPendingOver();
       const sources = this.dragSourceIds.slice();
       this.dragSourceIds = null;
       const zone = this.dropZone(e, row);
@@ -138,23 +302,16 @@ export class ViewDnD {
       if (t && t.closest && t.closest(".stashpad-note")) return;
       e.preventDefault();
       if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-      const rows = Array.from(list.querySelectorAll(".stashpad-note")) as HTMLElement[];
-      if (rows.length === 0) return;
-      // Find the first row whose vertical midpoint is below the cursor → drop before it.
-      for (const r of rows) {
-        const rect = r.getBoundingClientRect();
-        if (e.clientY < rect.top + rect.height / 2) {
-          this.placePlaceholder(r, "before");
-          return;
-        }
-      }
-      // Cursor is below all rows → drop after the last row.
-      this.placePlaceholder(rows[rows.length - 1], "after");
+      // 0.294.0 (perf): the hit test (first row whose vertical midpoint is below
+      // the cursor → drop before it; past every row → after the last) now runs
+      // in processListOver, once per frame, off the cached geometry.
+      this.scheduleOver({ kind: "list", clientY: e.clientY });
     });
     list.addEventListener("drop", (e: DragEvent) => {
       // Only handle if no nested target consumed it.
       if (!this.dragSourceIds) return;
       e.preventDefault();
+      this.flushPendingOver();
       const sources = this.dragSourceIds.slice();
       this.dragSourceIds = null;
       if (!this.dragPlaceholder) return;
@@ -179,6 +336,9 @@ export class ViewDnD {
     if (where === "after" && this.dragPlaceholder.previousSibling === row) return;
     const wasMounted = !!this.dragPlaceholder.parentElement;
     this.host.listEl.insertBefore(this.dragPlaceholder, sibling);
+    // 0.294.0 (perf): the insert/move shifts every row below it — the cached
+    // geometry is now stale, so drop it and let the next event rebuild once.
+    this.rowCache = null;
     // Always restore visibility — drop-into → drop-above transitions had been
     // leaving the placeholder at opacity 0 / height 0 from a previous animated remove.
     this.dragPlaceholder.setCssStyles({ opacity: "1" });
@@ -212,7 +372,41 @@ export class ViewDnD {
     return "drop-into";
   }
 
+  /** Same three-zone thresholds as `dropZone`, but resolved from the cached row
+   *  geometry (falling back to a live rect if this row isn't in the cache). */
+  private dropZoneAtY(row: HTMLElement, clientY: number): "drop-above" | "drop-into" | "drop-below" {
+    const list = this.host.listEl;
+    let top: number, height: number, y: number;
+    if (list) {
+      this.ensureRowCache(list);
+      const hit = this.rowCacheByEl.get(row);
+      if (hit) {
+        top = hit.top;
+        height = hit.bottom - hit.top;
+        y = this.toListY(list, clientY) - top;
+        if (y < height * 0.3) return "drop-above";
+        if (y > height * 0.7) return "drop-below";
+        return "drop-into";
+      }
+    }
+    const rect = row.getBoundingClientRect();
+    y = clientY - rect.top;
+    if (y < rect.height * 0.3) return "drop-above";
+    if (y > rect.height * 0.7) return "drop-below";
+    return "drop-into";
+  }
+
+  /** 0.294.0 (perf): only the one element we actually marked gets cleared —
+   *  no whole-list `querySelectorAll` per dragover. The full sweep is
+   *  `clearAllDropIndicators`, run once at dragstart. */
   private clearDropIndicators(): void {
+    if (this.dropIntoEl) {
+      this.dropIntoEl.removeClass("drop-into");
+      this.dropIntoEl = null;
+    }
+  }
+
+  private clearAllDropIndicators(): void {
     if (!this.host.listEl) return;
     for (const el of Array.from(this.host.listEl.querySelectorAll(".drop-into"))) {
       (el as HTMLElement).removeClass("drop-into");

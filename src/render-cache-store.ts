@@ -26,6 +26,11 @@ export interface RenderCacheLike {
   get(path: string): RenderEntry | undefined;
   set(path: string, entry: RenderEntry): void;
   has(path: string): boolean;
+  /** 0.294.0 (perf): resolves once the persisted store has been materialized.
+   *  Absent on a plain Map (nothing to wait for). A consumer that is ALREADY
+   *  async (a lazy body render) awaits it so it still gets a cache hit; every
+   *  synchronous consumer just sees a miss until then. */
+  ready?: Promise<void>;
 }
 
 /** 0.83.2: persisted render cache — one bulk load on startup repopulates the
@@ -47,6 +52,16 @@ export class RenderCacheStore implements RenderCacheLike {
   /** LRU clock: path -> last-touched ms. Persisted alongside entries. */
   private used = new Map<string, number>();
   private loaded = false;
+  /** 0.294.0 (perf): the in-flight (or settled) load. `load()` returns it, so a
+   *  second call is a no-op that still awaits the FIRST load's completion —
+   *  the old `if (this.loaded) return` returned immediately while the first
+   *  call was still deserializing. */
+  private loadPromise: Promise<void> | null = null;
+  /** 0.294.0 (perf): true once the deferred existence sweep has run. Until then
+   *  the lazy per-get prune is DISABLED — during startup Obsidian's file index
+   *  is still filling, so `getAbstractFileByPath` returns null for files that
+   *  do exist and a prune would delete perfectly good entries. */
+  private prunable = false;
   private dirty = false;
   private saveTimer: number | null = null;
   private dirOk = false;
@@ -110,9 +125,23 @@ export class RenderCacheStore implements RenderCacheLike {
 
   // ---- load / save --------------------------------------------------------
 
-  async load(): Promise<void> {
-    if (this.loaded) return;
-    this.loaded = true;
+  /** 0.294.0 (perf): resolves when `load()` has finished materializing the store.
+   *  Never rejects (load() swallows its own errors). If nobody has started a load
+   *  this is an already-resolved promise — a caller that never loads simply has
+   *  an empty (but usable) cache. */
+  get ready(): Promise<void> { return this.loadPromise ?? Promise.resolve(); }
+
+  /** True once the persisted entries are in the map. A `get()` miss before this
+   *  is "not loaded yet", not "not cached". */
+  isLoaded(): boolean { return this.loaded; }
+
+  load(): Promise<void> {
+    if (this.loadPromise) return this.loadPromise;
+    this.loadPromise = this.loadInner();
+    return this.loadPromise;
+  }
+
+  private async loadInner(): Promise<void> {
     let parsed: { schema?: number; entries?: Record<string, RenderEntry>; used?: Record<string, number> } | null = null;
     try {
       parsed = (await this.idbGet()) as typeof parsed;
@@ -148,20 +177,48 @@ export class RenderCacheStore implements RenderCacheLike {
         }
       }
       if (parsed?.schema === CACHE_SCHEMA && parsed.entries) {
-        for (const [k, v] of Object.entries(parsed.entries)) this.map.set(k, v);
+        // 0.294.0 (perf): load no longer blocks onload, so the map can already
+        // hold entries by the time we get here — a lazy render that missed
+        // (because we hadn't loaded yet) recomputed and `set()` it, or a
+        // `primeRender` seeded a just-created note. MERGE rather than overwrite:
+        //   - an entry set DURING the load is fresher than the persisted one and
+        //     must win (otherwise the disk copy silently clobbers it), and
+        //   - a path tombstoned during the load (a lock / secure-delete evict —
+        //     see 0.211.5 below) must NOT be re-admitted from disk, or the
+        //     plaintext we just purged comes straight back.
+        for (const [k, v] of Object.entries(parsed.entries)) {
+          if (this.map.has(k) || this.tombstoned(k)) continue;
+          this.map.set(k, v);
+        }
         for (const [k, t] of Object.entries(parsed.used ?? {})) {
-          if (this.map.has(k) && typeof t === "number") this.used.set(k, t);
+          if (this.map.has(k) && !this.used.has(k) && typeof t === "number") this.used.set(k, t);
         }
-        // Drop entries for files that no longer exist — bounds growth.
-        for (const k of [...this.map.keys()]) {
-          if (!this.app.vault.getAbstractFileByPath(k)) { this.map.delete(k); this.used.delete(k); this.dirty = true; }
-        }
+        // 0.294.0 (perf): the existence prune (one `getAbstractFileByPath` per
+        // key — up to MAX_ENTRIES of them) used to run right here, on the load
+        // path. It's pure housekeeping, so it moved off startup entirely:
+        // `pruneMissing()` is called from a deferred sweep after layout-ready,
+        // and `get()` drops a stale key lazily once sweeping is enabled.
       }
     } catch (e) {
       console.warn("[Stashpad] render cache load failed; starting empty", e);
       this.map.clear();
       this.used.clear();
+    } finally {
+      this.loaded = true;
     }
+  }
+
+  /** 0.294.0 (perf): drop entries whose file no longer exists — bounds growth.
+   *  Call AFTER the workspace is ready (Obsidian's file index must be populated,
+   *  or every lookup misses and this deletes the whole cache). Enables the lazy
+   *  per-`get()` prune from here on. Safe to call more than once. */
+  pruneMissing(): void {
+    if (!this.loaded) { void this.ready.then(() => this.pruneMissing()); return; }
+    for (const k of [...this.map.keys()]) {
+      if (!this.app.vault.getAbstractFileByPath(k)) { this.map.delete(k); this.used.delete(k); this.dirty = true; }
+    }
+    this.prunable = true;
+    if (this.dirty) this.scheduleSave();
   }
 
   /** Drop a path's entry (persisted per `opts.flush`). Wired to vault delete/rename:
@@ -200,11 +257,29 @@ export class RenderCacheStore implements RenderCacheLike {
    *  WHOLE cache (up to 4000 entries of body text + rendered HTML) into
    *  IndexedDB. Callers with a security motive (the plaintext must not outlive
    *  the write) pass `{ flush: true }` to keep the old eager behavior. */
-  evict(path: string, opts: { flush?: boolean } = {}): void {
-    this.tombstones.set(path, Date.now() + RenderCacheStore.TOMBSTONE_MS);
+  /** 0.293.0 (perf): the tombstone is a SECURITY device (0.211.5, above) and now
+   *  fires only for security evicts. It was applied to EVERY evict — including the
+   *  ordinary body-modify ones (external edit, sync, editor autosave, the 0.291.0
+   *  edit-modal save, checkbox toggle/undo) — so for a full minute after any edit
+   *  the freshly rendered body could not be re-admitted and every subsequent paint
+   *  of that note re-rendered it from markdown. Exactly backwards for a cache.
+   *
+   *  `tombstone` defaults to `flush`: the only security caller is the vault
+   *  `delete` event (src/main.ts), which is how lock / secure-delete purge
+   *  plaintext (encryption-ops uses `vault.delete`, never trash), and it already
+   *  passes `{ flush: true }`. A future security caller that wants a debounced
+   *  save can still ask for the tombstone explicitly.
+   *
+   *  Safe for the perf callers: entries are mtime-validated on EVERY read
+   *  (`getOrComputeRender` / `hasFreshRenderCache` in note-body-renderer.ts compare
+   *  `entry.mtime === file.stat.mtime`), so a stale entry is never served — it just
+   *  misses. Dropping the entry + its LRU slot is the whole job there; the next
+   *  `set()` re-warms immediately. */
+  evict(path: string, opts: { flush?: boolean; tombstone?: boolean } = {}): void {
+    if (opts.tombstone ?? opts.flush) this.tombstones.set(path, Date.now() + RenderCacheStore.TOMBSTONE_MS);
     const had = this.map.delete(path);
     this.used.delete(path);
-    if (!had) return; // nothing persisted to rewrite, but the tombstone above stands
+    if (!had) return; // nothing persisted to rewrite; any tombstone set above stands
     this.dirty = true;
     if (opts.flush) void this.save(); // save() also clears any pending debounce timer
     else this.scheduleSave();
@@ -212,7 +287,15 @@ export class RenderCacheStore implements RenderCacheLike {
 
   get(path: string): RenderEntry | undefined {
     const e = this.map.get(path);
-    if (e) this.used.set(path, Date.now()); // LRU touch (in-memory; persisted on next save)
+    if (!e) return undefined;
+    // 0.294.0 (perf): lazy half of the existence prune the load path used to do
+    // eagerly. Only once `pruneMissing()` has enabled it — before that a null
+    // lookup means "the vault index hasn't got there yet", not "file gone".
+    if (this.prunable && !this.app.vault.getAbstractFileByPath(path)) {
+      this.map.delete(path); this.used.delete(path); this.dirty = true; this.scheduleSave();
+      return undefined;
+    }
+    this.used.set(path, Date.now()); // LRU touch (in-memory; persisted on next save)
     return e;
   }
   has(path: string): boolean { return this.map.has(path); }
@@ -249,6 +332,14 @@ export class RenderCacheStore implements RenderCacheLike {
     this.dirty = false;
     this.writeChain = this.writeChain.then(async () => {
       try {
+        // 0.294.0 (perf): load() is no longer awaited in onload, so a save can be
+        // reached (a first render's debounce, or the unload flush) while the map
+        // is still EMPTY — and this serializes the whole map, which would write
+        // that empty map over the entire persisted cache. Wait for the load to
+        // merge in first. Resolves immediately if no load was ever started, and
+        // load()'s merge already refuses to re-admit anything tombstoned, so a
+        // security flush still can't be undone by the entries it waits for.
+        await this.ready;
         this.pruneLru();
         const obj = {
           schema: CACHE_SCHEMA,

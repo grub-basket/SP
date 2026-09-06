@@ -144,7 +144,9 @@ export class FrontmatterSyncQueue {
       this.timer = null;
     }
     while (this.pending.size > 0) {
-      const next = this.pending.values().next().value;
+      // 0.294.0 (perf): same leaves-before-parents order as the paced drain, so
+      // a teardown flush writes each parent once with its final state too.
+      const next = this.pickNext();
       if (next === undefined) break;
       this.pending.delete(next);
       this.emitActivity();
@@ -188,6 +190,48 @@ export class FrontmatterSyncQueue {
     this.pending.clear();
   }
 
+  /** 0.294.0 (perf): choose which pending id to drain next, preferring one
+   *  that is NOT the parent of another still-pending id.
+   *
+   *  The pending SET already collapses N creates under the same parent into a
+   *  single entry for that parent — but insertion order drained it FIRST (the
+   *  parent is enqueued alongside the very first child), so a burst that keeps
+   *  arriving after the 100ms tick re-enqueued and rewrote the parent again and
+   *  again. In a flat folder the parent is ROOT and its `children` array is one
+   *  entry per note, so each of those rewrites is an O(N) YAML write that fires
+   *  `modify` + metadataCache events on the home note.
+   *
+   *  Draining leaves first lets the parent settle to the END of the burst, so
+   *  it is written once, with the final state. Correctness is unaffected:
+   *  `syncOne` re-derives everything from the TREE at drain time, never from
+   *  the arguments captured when the id was scheduled — so a note created and
+   *  then deleted inside the window is simply absent from the parent's list.
+   *
+   *  Deliberate trade-off: under a NEVER-ending stream of creates the parent's
+   *  write is deferred until the stream pauses. That is acceptable here — these
+   *  fields are the recovery sidecar, explicitly non-correctness-critical and
+   *  deferrable (see the class doc) — and `flush()` drains everything on
+   *  teardown regardless. */
+  private pickNext(): StashpadId | undefined {
+    const first = this.pending.values().next().value as StashpadId | undefined;
+    if (first === undefined || this.pending.size === 1) return first;
+    const tree = this.getTree();
+    const deferred = new Set<StashpadId>();
+    for (const id of this.pending) {
+      const parent = tree.get(id)?.parent ?? ROOT_ID;
+      // The home note is its own parent by id — it must not defer itself, or a
+      // pending set of {ROOT} alone would fall through to the `first` fallback
+      // on every tick (harmless, but the intent is clearer stated).
+      if (parent === id) continue;
+      if (this.pending.has(parent)) deferred.add(parent);
+    }
+    for (const id of this.pending) if (!deferred.has(id)) return id;
+    // Everything is somebody's parent (a pending chain covering the whole
+    // path to ROOT). Fall back to insertion order so the queue always makes
+    // progress rather than spinning.
+    return first;
+  }
+
   private kick(): void {
     if (this.timer != null || this.pending.size === 0) return;
     this.timer = window.setTimeout(() => this.tick(), FrontmatterSyncQueue.PACING_MS);
@@ -195,7 +239,7 @@ export class FrontmatterSyncQueue {
 
   private async tick(): Promise<void> {
     this.timer = null;
-    const next = this.pending.values().next().value;
+    const next = this.pickNext();
     if (next === undefined) return;
     this.pending.delete(next);
     this.emitActivity();
@@ -216,8 +260,26 @@ export class FrontmatterSyncQueue {
     const tree = this.getTree();
     const node = tree.get(id);
     if (!node || !node.file) return false;
-    const parentLink = this.computeParentLink(node);
-    const childrenLinks = this.computeChildrenLinks(node);
+    return this.differsFromDisk(
+      node,
+      this.computeParentLink(node),
+      this.computeChildrenLinks(node),
+    );
+  }
+
+  /** 0.294.0 (perf): the comparison half of `wouldWrite`, taking the
+   *  already-computed links. `syncOne` used to call `wouldWrite` (which
+   *  computed parentLink + children) and then compute BOTH again for the
+   *  write itself — so `computeChildrenLinks` ran twice per sync, and in a
+   *  flat folder that is an O(children) walk + wikilink build over every
+   *  sibling. Now the links are computed once and threaded through here.
+   *  Reads cached metadata only — no file IO. */
+  private differsFromDisk(
+    node: TreeNode,
+    parentLink: string | null,
+    childrenLinks: string[],
+  ): boolean {
+    if (!node.file) return false;
     const currentFm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
     const currentParent = (currentFm && typeof currentFm[PARENT_LINK_FIELD] === "string")
       ? currentFm[PARENT_LINK_FIELD] : null;
@@ -237,12 +299,15 @@ export class FrontmatterSyncQueue {
     const tree = this.getTree();
     const node = tree.get(id);
     if (!node || !node.file) return;
-    // Skip-if-equal: a write that wouldn't change anything would still
-    // cascade through metadata events + view rerenders ("composer
-    // flashing"). wouldWrite reads cached frontmatter, no disk IO.
-    if (!this.wouldWrite(id)) return;
+    // 0.294.0 (perf): compute the links ONCE and reuse them for both the
+    // skip-if-equal check and the write (was: wouldWrite computed them, then
+    // syncOne computed them again).
     const parentLink = this.computeParentLink(node);
     const childrenLinks = this.computeChildrenLinks(node);
+    // Skip-if-equal: a write that wouldn't change anything would still
+    // cascade through metadata events + view rerenders ("composer
+    // flashing"). Reads cached frontmatter, no disk IO.
+    if (!this.differsFromDisk(node, parentLink, childrenLinks)) return;
     try {
       // 0.160.0: mark this as our own frontmatter-only write so the view's modify
       // handler can skip the render-cache evict/re-read it would otherwise trigger
