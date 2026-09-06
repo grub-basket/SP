@@ -272,11 +272,16 @@ export class SettingsStore {
    *  moved — so a reminder firing no longer rewrites your hotkeys. `settingsRev` is
    *  excluded because it's bookkeeping we bump *because* of a write, not a reason
    *  to write. */
-  coreDirty(settings: Bag): boolean {
+  /** 0.292.0 (perf): `cur` is an optional cache of already-computed
+   *  JSON.stringify(settings[k]) for the NON-MOVED keys, so a caller that has
+   *  just stringified every key (guardedSave) doesn't pay for it twice. A miss
+   *  falls back to stringifying, so the result is identical either way. */
+  coreDirty(settings: Bag, cur?: Map<string, string>): boolean {
     const moved = new Set(MOVED_KEYS);
     for (const k of Object.keys(settings)) {
       if (moved.has(k) || k === "settingsRev") continue;
-      if (JSON.stringify(settings[k]) !== this.baseline[k]) return true;
+      const s = cur?.get(k) ?? JSON.stringify(settings[k]);
+      if (s !== this.baseline[k]) return true;
     }
     return false;
   }

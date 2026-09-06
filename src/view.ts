@@ -1,6 +1,6 @@
 import {
   App, ItemView, Keymap, MarkdownRenderer, Menu, Notice, Platform,
-  Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce,
+  Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce, type Debouncer,
   moment, sanitizeHTMLToDom, setIcon,
 } from "obsidian";
 import {
@@ -601,7 +601,10 @@ export class StashpadView extends ItemView {
   private suppressComposerFocusUntil = 0;
   /** Debounced wrapper around saveDraft for the input event. Lazily
    *  initialized on first composer render. */
-  private debouncedSaveDraft?: (v: string) => void;
+  // 0.292.0 (perf): typed as a Debouncer so saveDraft can cancel() a pending
+  // trailing save. With a RESETTING debounce the pending value is always stale
+  // the moment any authoritative saveDraft runs (submit clears, blur, restore).
+  private debouncedSaveDraft?: Debouncer<[string], void>;
   private debouncedDupSearch?: (v: string) => void;
   /** Composer autocomplete instance — recreated whenever the composer
    *  textarea is rebuilt (i.e. on each render). */
@@ -2293,6 +2296,15 @@ export class StashpadView extends ItemView {
   }
 
   private async saveDraft(text: string): Promise<void> {
+    // 0.292.0 (perf): every caller of saveDraft is authoritative about what the
+    // draft should now be (submit clears it, blur/flush passes the live value,
+    // undo restores the original), so a debounced trailing save still in flight
+    // is stale by definition — drop it. Without this, the resetting debounce
+    // could fire AFTER `saveDraft("")` on submit and resurrect the sent text.
+    // Cancelling BEFORE the `existing === text` early return matters: that is
+    // exactly the submit case (slot already empty, pending value not).
+    // Calling cancel() from inside the debouncer's own callback is a no-op.
+    this.debouncedSaveDraft?.cancel();
     try {
       // Snapshot the folder we're saving for, in case noteFolder changes mid-await.
       const folder = this.noteFolder;
@@ -2447,6 +2459,24 @@ export class StashpadView extends ItemView {
     return `Last ${n} ${noun}`;
   }
   private allowedByBases(): Set<string> | null { return null; }
+
+  /** 0.292.0 (perf): repaint OTHER Stashpad views on this same folder.
+   *
+   *  The per-folder filter/mode keys (viewModes, hideCompletedNotes, …) are
+   *  excluded from the settings render signature, so a save no longer
+   *  full-renders every open leaf. Their call sites already repaint the view
+   *  that made the change; this covers the remaining case — a second tab on the
+   *  SAME folder, which does read the key and must follow. `this` is skipped
+   *  precisely because the caller has already handled it. */
+  private refreshFolderPeers(): void {
+    const mine = this.noteFolder;
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const v = leaf.view;
+      if (v === this || !(v instanceof StashpadView)) continue;
+      if (v.noteFolder !== mine) continue;
+      try { v.debouncedRender(); } catch { /* a closing leaf is not our problem */ }
+    }
+  }
   /** Per-folder view mode lookup. Absent entry = "nested" (the default). */
   private currentViewMode(): ViewMode {
     return this.plugin.settings.viewModes?.[this.noteFolder] ?? "nested";
@@ -2464,6 +2494,7 @@ export class StashpadView extends ItemView {
     else map[this.noteFolder] = true;
     this.plugin.settings.includeAttachmentsInEverything = map;
     await this.plugin.saveSettings();
+    this.refreshFolderPeers(); // 0.292.0 (perf): key no longer in the render signature
   }
 
   /** Per-folder filter: when true, hide top-level notes that have no
@@ -2480,6 +2511,7 @@ export class StashpadView extends ItemView {
     else map[this.noteFolder] = v;
     this.plugin.settings.encryptionFilter = map;
     await this.plugin.saveSettings();
+    this.refreshFolderPeers(); // 0.292.0 (perf): key no longer in the render signature
   }
 
   private currentHideChildless(): boolean {
@@ -2491,6 +2523,7 @@ export class StashpadView extends ItemView {
     else map[this.noteFolder] = true;
     this.plugin.settings.hideChildlessNotes = map;
     await this.plugin.saveSettings();
+    this.refreshFolderPeers(); // 0.292.0 (perf): key no longer in the render signature
   }
 
   /** Per-folder filter: hide completed notes, unless they still have any
@@ -2504,6 +2537,7 @@ export class StashpadView extends ItemView {
     else map[this.noteFolder] = true;
     this.plugin.settings.hideCompletedNotes = map;
     await this.plugin.saveSettings();
+    this.refreshFolderPeers(); // 0.292.0 (perf): key no longer in the render signature
   }
 
   /** 0.79.8: per-folder "hide notes without attachments" filter. */
@@ -2516,6 +2550,7 @@ export class StashpadView extends ItemView {
     else map[this.noteFolder] = true;
     this.plugin.settings.attachmentsOnlyNotes = map;
     await this.plugin.saveSettings();
+    this.refreshFolderPeers(); // 0.292.0 (perf): key no longer in the render signature
   }
   /** True if `node`'s own frontmatter `attachments` array is non-empty. */
   private nodeHasAttachment(node: TreeNode): boolean {
@@ -2955,6 +2990,7 @@ export class StashpadView extends ItemView {
     else map[this.noteFolder] = mode;
     this.plugin.settings.viewModes = map;
     await this.plugin.saveSettings();
+    this.refreshFolderPeers(); // 0.292.0 (perf): key no longer in the render signature
   }
 
   /** Resolve the set of TreeNodes that should populate the list under
@@ -8016,8 +8052,15 @@ export class StashpadView extends ItemView {
     // Debounce non-empty saves so fast typing doesn't queue a disk write
     // per keystroke (a real issue on slow / network drives). Empty/clear
     // saves still go through immediately on submit/blur for promptness.
+    // 0.292.0 (perf): RESETTING (3rd arg true) + 800ms. The old
+    // non-resetting 250ms fired every 250ms for as long as the user kept
+    // typing — ~4 full settings writes per second, each a data.json
+    // read + ~190 JSON.stringify + a write. Resetting means one write per
+    // typing PAUSE instead. Nothing is at risk from the longer window:
+    // blur, window blur, beforeunload and onClose all call flushDrafts(),
+    // which persists the LIVE textarea value immediately.
     if (!this.debouncedSaveDraft) {
-      this.debouncedSaveDraft = debounce((v: string) => { void this.saveDraft(v); }, 250);
+      this.debouncedSaveDraft = debounce((v: string) => { void this.saveDraft(v); }, 800, true);
     }
     if (!this.debouncedDupSearch) {
       this.debouncedDupSearch = debounce((v: string) => this.refreshDupPanel(v), 300);

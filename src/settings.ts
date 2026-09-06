@@ -1113,23 +1113,69 @@ function currentHourInTz(tz: string | undefined, now: Date): number {
 const RENDER_IRRELEVANT_KEYS: ReadonlySet<string> = new Set([
   "drafts", "lastSubmitted", "draftAppendTargets",
   "notifiedDueKeys", "persistReminderLog", "settingsRev",
+  // 0.292.0 (perf): device-local MRU state. Neither key is read by any render
+  // path — the only consumers are main.ts `recordFolderUsed` (the writer),
+  // `quickDestinationFolders` (built on demand when the quick-destination menu
+  // OPENS, never during a list render) and the launch-folder lookup at
+  // main.ts:5639. `recordFolderUsed` fires on the active-leaf-change firehose,
+  // so before this every tab switch full-rendered every open leaf.
+  "lastUsedFolder", "recentFolders",
+  // 0.292.0 (perf): per-folder Record<folder, …> filter/mode state. Each is read
+  // during render, but ONLY by views on that same folder — a leaf on another
+  // folder cannot be affected, and previously every one of them repainted.
+  // Every setter lives in view.ts (setViewMode / setIncludeAttachments /
+  // setEncryptionFilter / setHideChildless / setHideCompleted /
+  // setAttachmentsOnly); each call site already repaints ITS OWN view
+  // (render() / refreshList()), and each setter now also calls
+  // `refreshFolderPeers()` so a second tab on the SAME folder still updates.
+  // None of these has a settings-tab control, so no settings-tab toggle relies
+  // on the broadcast to repaint a list.
+  "viewModes", "includeAttachmentsInEverything", "encryptionFilter",
+  "hideChildlessNotes", "hideCompletedNotes", "attachmentsOnlyNotes",
+  // DELIBERATELY NOT EXCLUDED: `pinnedFilterMode`. It is a single GLOBAL scalar
+  // read by every view's render, and it has a settings-tab dropdown that relies
+  // on the broadcast to repaint open lists. It also changes rarely (an explicit
+  // user toggle), so it is not part of the churn this is fixing.
 ]);
+
+/** 0.292.0 (perf): the render-relevant key list, cached across calls. The keys
+ *  of the settings object are fixed once loaded, so re-sorting ~94 strings on
+ *  every save was pure waste. Guarded on key COUNT so a shape change (a
+ *  migration adding a key mid-session) still rebuilds — an unknown key must
+ *  never be silently dropped from the signature. */
+let sigKeysCache: string[] | null = null;
+let sigKeysShape = "";
 
 function renderSignature(s: StashpadSettings): string {
   const bag = s as unknown as Record<string, unknown>;
+  const all = Object.keys(bag);
+  // Keyed on the joined key list, not just its length: a same-size shape change
+  // (one key dropped, another added) must rebuild too. Still one cheap join vs
+  // the sort + ~94 stringifies it replaces.
+  const shape = all.join(" ");
+  if (!sigKeysCache || sigKeysShape !== shape) {
+    sigKeysCache = all.filter((k) => !RENDER_IRRELEVANT_KEYS.has(k)).sort();
+    sigKeysShape = shape;
+  }
   const parts: string[] = [];
-  for (const k of Object.keys(bag).sort()) {
-    if (RENDER_IRRELEVANT_KEYS.has(k)) continue;
+  for (const k of sigKeysCache) {
     try { parts.push(`${k}=${JSON.stringify(bag[k])}`); } catch { parts.push(`${k}=?`); }
   }
   return parts.join("|");
 }
 
-export function setSettings(next: StashpadSettings): void {
+/** 0.292.0 (perf): monotonic counter used to make a forced signature unique. */
+let forceTick = 0;
+
+/** @param force  Bypass the signature comparison and repaint every open view.
+ *  Needed on the SYNC adoption path (`onExternalDataJsonChange`): another device
+ *  can change an excluded per-folder key, and no local setter runs to repaint
+ *  it, so the signature alone would leave the list stale. */
+export function setSettings(next: StashpadSettings, force = false): void {
   current = next;
   // Computed ONCE per save and handed to every listener. Per-view computation
   // would repeat this work for each open view, which is the cost being removed.
-  const sig = renderSignature(next);
+  const sig = force ? `${renderSignature(next)}|force=${++forceTick}` : renderSignature(next);
   for (const fn of listeners) fn(sig);
 }
 export function onSettingsChange(fn: (sig: string) => void): () => void {

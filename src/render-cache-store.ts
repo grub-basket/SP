@@ -164,7 +164,7 @@ export class RenderCacheStore implements RenderCacheLike {
     }
   }
 
-  /** Drop a path's entry and flush promptly. Wired to vault delete/rename:
+  /** Drop a path's entry (persisted per `opts.flush`). Wired to vault delete/rename:
    *  entries hold the FULL note body + rendered HTML, so a deleted file's
    *  cache row is leftover plaintext — for encryption's lock / secure-delete
    *  (which permanently remove the readable note) it would silently defeat
@@ -192,13 +192,22 @@ export class RenderCacheStore implements RenderCacheLike {
     return true;
   }
 
-  evict(path: string): void {
+  /** 0.292.0 (perf): the in-memory delete + tombstone stay IMMEDIATE (a later
+   *  get() misses at once and set() still refuses to re-admit), but persistence
+   *  is now debounced through the same scheduleSave() path set() uses. evict()
+   *  fires on every ordinary body modify — Obsidian's ~2s editor autosave, each
+   *  file of a sync burst, the edit modal — and each eager save() serialized the
+   *  WHOLE cache (up to 4000 entries of body text + rendered HTML) into
+   *  IndexedDB. Callers with a security motive (the plaintext must not outlive
+   *  the write) pass `{ flush: true }` to keep the old eager behavior. */
+  evict(path: string, opts: { flush?: boolean } = {}): void {
     this.tombstones.set(path, Date.now() + RenderCacheStore.TOMBSTONE_MS);
     const had = this.map.delete(path);
     this.used.delete(path);
     if (!had) return; // nothing persisted to rewrite, but the tombstone above stands
     this.dirty = true;
-    void this.save();
+    if (opts.flush) void this.save(); // save() also clears any pending debounce timer
+    else this.scheduleSave();
   }
 
   get(path: string): RenderEntry | undefined {

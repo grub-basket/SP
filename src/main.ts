@@ -84,6 +84,15 @@ class AttachmentParentPicker extends FuzzySuggestModal<TFile> {
   onChooseItem(f: TFile): void { this.onChoose(f); }
 }
 
+/** 0.292.0 (perf): per-folder keys excluded from the render signature (their
+ *  local setters repaint + `refreshFolderPeers`). When one is ADOPTED from
+ *  another device no setter runs, so `onExternalDataJsonChange` forces a repaint
+ *  — but only for these. */
+const PEER_RENDER_KEYS = new Set([
+  "viewModes", "includeAttachmentsInEverything", "encryptionFilter",
+  "hideChildlessNotes", "hideCompletedNotes", "attachmentsOnlyNotes",
+]);
+
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
   /** 0.276.0: per-file timestamp of the last logged "open", for 60s dedupe. */
@@ -766,6 +775,11 @@ export default class StashpadPlugin extends Plugin {
       if (this.traceFlushTimer !== null) { clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
       await this.flushTraceToDisk();
     } catch { /* best-effort */ }
+    // 0.292.0 (perf): land a pending folder-MRU write. The write is debounced
+    // 1.5s, so quitting right after switching folders would otherwise drop
+    // `lastUsedFolder` — the key that decides which folder we open into next
+    // launch. `run()` is a no-op when nothing is pending.
+    try { await this.mruPersistDebounced.run(); } catch { /* best-effort */ }
   }
 
   /** Vault-relative path to a file/dir inside the plugin's private
@@ -2173,8 +2187,24 @@ export default class StashpadPlugin extends Plugin {
     if (!mruChanged && !lastChanged) return;
     if (opened) this.settings.lastUsedFolder = cleaned;
     this.settings.recentFolders = next;
-    void this.saveSettings();
+    // 0.292.0 (perf): QUIET + DEBOUNCED. This is hooked on the
+    // `active-leaf-change` firehose, and the MRU-diff guard above doesn't help
+    // when you alternate between two Stashpad tabs — both keys change on EVERY
+    // switch, so every switch used to pay a LOUD saveSettings (full data.json
+    // re-read + ~94-key baseline stringify + an onSettingsChange broadcast that
+    // re-renders every open leaf). Nothing needs the broadcast: the only readers
+    // of these two keys (`quickDestinationFolders`, the folder switcher's
+    // lastUsed ranking) read `this.settings` at call time, and the in-memory
+    // update above is already synchronous. So persist quietly, and coalesce a
+    // burst of tab flips into one write.
+    this.mruPersistDebounced();
   }
+
+  /** 0.292.0 (perf): trailing, resetting 1.5s debounce for the folder-MRU
+   *  write. `run()` on unload lands a pending write so quitting inside the
+   *  window can't lose `lastUsedFolder` (which decides where we open next
+   *  launch) — same shape as the render-cache/trace flushes in onunload. */
+  private mruPersistDebounced = debounce(() => this.persistSettingsQuiet(), 1500, true);
 
   /** 0.224.0: re-rank a folder list so pinned folders lead, in the SAME order
    *  the folders panel shows them (`folderPanelPinnedAt`, ascending), and
@@ -2457,7 +2487,13 @@ export default class StashpadPlugin extends Plugin {
     // Evict cache rows when their file goes away — an entry holds the full
     // body + HTML, and after an encryption lock/secure-delete it would be the
     // last readable plaintext copy, sitting in render-cache.json.
-    this.registerEvent(this.app.vault.on("delete", (f) => this.renderCacheStore.evict(f.path)));
+    // 0.292.0 (perf): evict() is debounced now, but THIS caller keeps the eager
+    // flush — a lock / secure-delete removes the readable file, so the persisted
+    // cache row must not survive it even for the debounce window (or a crash /
+    // force-quit inside that window). The rename caller below is ordinary
+    // invalidation (the file still exists, readable, at its new path), so it
+    // rides the debounce.
+    this.registerEvent(this.app.vault.on("delete", (f) => this.renderCacheStore.evict(f.path, { flush: true })));
     this.registerEvent(this.app.vault.on("rename", (_f, oldPath) => this.renderCacheStore.evict(oldPath)));
     // Fork siblings: when a family member is deleted (single / subtree / multi /
     // fork-undo), drop it from every other member's `fork-siblings`. Debounced
@@ -9836,7 +9872,7 @@ export default class StashpadPlugin extends Plugin {
    *  via the settingsRev guard (our writes never raise diskRev above lastSeen). */
   private async onExternalDataJsonChange(): Promise<void> {
     const s = this.settings as unknown as Record<string, unknown>;
-    let panelChanged = false, anyChanged = false;
+    let panelChanged = false, anyChanged = false, forceRender = false;
 
     // 0.189.0: adopt the SPLIT files first. They carry their own per-file revs, so a
     // history.json write from another window must be picked up even when data.json
@@ -9868,6 +9904,7 @@ export default class StashpadPlugin extends Plugin {
         if (baseline !== undefined && JSON.stringify(s[k]) !== baseline) continue; // ours is dirty — keep it
         s[k] = disk[k];
         anyChanged = true;
+        if (PEER_RENDER_KEYS.has(k)) forceRender = true;
         if (k === "bindings") this.healAdoptedBindings();
         if (k.startsWith("folderPanel")) panelChanged = true;
       }
@@ -9875,7 +9912,16 @@ export default class StashpadPlugin extends Plugin {
     }
 
     if (anyChanged) {
-      setSettings(this.settings);
+      // 0.292.0 (perf): FORCE the repaint here. The per-folder filter keys
+      // (viewModes, hideCompletedNotes, …) are excluded from the render
+      // signature because their local setters repaint the affected views
+      // themselves — but on this path the change came from ANOTHER DEVICE, so
+      // no setter ran and the signature would compare equal, leaving the list
+      // showing a filter state that is no longer the stored one. This path is
+      // 600ms-debounced and only runs when something actually changed. Forced
+      // ONLY when one of those per-folder keys was adopted — a synced MRU or
+      // other render-irrelevant key must not repaint every leaf.
+      setSettings(this.settings, forceRender);
       this.snapshotSettingsBaseline();
       if (panelChanged) this.refreshFolderPanels();
     }
@@ -9907,12 +9953,19 @@ export default class StashpadPlugin extends Plugin {
     try { s.bindings = mergeBindings(s.bindings, undefined, undefined); } catch { /* keep what we have */ }
   }
 
-  private snapshotSettingsBaseline(): void {
+  /** 0.292.0 (perf): `cur` is an optional cache of already-computed
+   *  JSON.stringify(all[k]), valid ONLY for keys not owned by a split file —
+   *  saveSplit can adopt a moved key from disk after the cache was built, so
+   *  those are always re-stringified here. Any miss falls back to stringifying,
+   *  so the baseline is byte-identical to the uncached version. */
+  private snapshotSettingsBaseline(cur?: Map<string, string>): void {
     const all = this.settings as unknown as Record<string, unknown>;
+    const moved = cur ? new Set<string>(MOVED_KEYS) : null;
     this.settingsBaseline = {};
     for (const k of Object.keys(all)) {
       if (k === "settingsRev") continue; // bookkeeping, never adopted
-      this.settingsBaseline[k] = JSON.stringify(all[k]);
+      const cached = moved && !moved.has(k) ? cur?.get(k) : undefined;
+      this.settingsBaseline[k] = cached ?? JSON.stringify(all[k]);
     }
   }
 
@@ -9936,7 +9989,24 @@ export default class StashpadPlugin extends Plugin {
     /** Set when the collision guard adopted a disk value — forces the data.json
      *  write even if none of OUR core keys changed, so the merged result lands. */
     let adoptedAny = false;
+    // 0.292.0 (perf): stringify each of OUR ~94 values ONCE per save and reuse
+    // that string for all three consumers below — the baseline diff,
+    // store.coreDirty(), and the closing snapshotSettingsBaseline(). Previously
+    // each of those stringified every key independently (3x). The cache is kept
+    // exact: every mutation of `ours[k]` in this method writes the new string
+    // back (or deletes the entry), and split-file keys are excluded because
+    // saveSplit can adopt them from disk after this point.
+    // Built AFTER the loadData await, so a settings mutation landing during that
+    // read can't leave the cache stale.
     try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { /* first write / unreadable */ }
+    const ours0 = this.settings as unknown as Record<string, unknown>;
+    const movedSet = new Set<string>(MOVED_KEYS);
+    const curStr = new Map<string, string>();
+    for (const k of Object.keys(ours0)) {
+      if (k === "settingsRev" || movedSet.has(k)) continue;
+      const s = JSON.stringify(ours0[k]);
+      if (s !== undefined) curStr.set(k, s);
+    }
     const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
     // 0.140.2: adopt on CONTENT change, not just a higher rev. Two instances
     // that both loaded rev N and write near-simultaneously both stamp N+1, so a
@@ -9968,11 +10038,18 @@ export default class StashpadPlugin extends Plugin {
         if (disk[k] === undefined) continue;
         const baseline = this.settingsBaseline[k];
         if (baseline === undefined) continue;                // never seen it — don't guess
-        const oursChanged = JSON.stringify(ours[k]) !== baseline;
-        const diskChanged = JSON.stringify(disk[k]) !== baseline;
+        // 0.292.0 (perf): reuse the per-key string computed above (churn keys are
+        // already skipped, so every key reaching here is in the cache unless it
+        // stringifies to undefined — in which case the fallback matches the old
+        // behavior exactly).
+        const oursStr = curStr.has(k) ? curStr.get(k) : JSON.stringify(ours[k]);
+        const diskStr = JSON.stringify(disk[k]);
+        const oursChanged = oursStr !== baseline;
+        const diskChanged = diskStr !== baseline;
         if (!diskChanged) continue;
         if (!oursChanged) {
           ours[k] = disk[k];
+          if (diskStr !== undefined) curStr.set(k, diskStr); else curStr.delete(k);
           adopted.push(k);
           continue;
         }
@@ -9983,8 +10060,10 @@ export default class StashpadPlugin extends Plugin {
           && disk[k] && ours[k] && typeof disk[k] === "object" && typeof ours[k] === "object"
           && !Array.isArray(disk[k]) && !Array.isArray(ours[k])) {
           const merged = { ...(disk[k] as Record<string, unknown>), ...(ours[k] as Record<string, unknown>) };
-          if (JSON.stringify(merged) !== JSON.stringify(ours[k])) {
+          const mergedStr = JSON.stringify(merged);
+          if (mergedStr !== oursStr) {
             ours[k] = merged;
+            if (mergedStr !== undefined) curStr.set(k, mergedStr); else curStr.delete(k);
             adopted.push(`${k} (merged)`);
           }
         }
@@ -9993,7 +10072,10 @@ export default class StashpadPlugin extends Plugin {
       const critical = adopted.filter((k) => protectedSet.has(k.replace(" (merged)", "")));
       if (adopted.length) {
         adoptedAny = true;
-        if (adopted.some((k) => k.startsWith("bindings"))) this.healAdoptedBindings();
+        if (adopted.some((k) => k.startsWith("bindings"))) {
+          this.healAdoptedBindings();
+          curStr.delete("bindings"); // 0.292.0 (perf): re-merged in place — cached string is stale.
+        }
         console.warn(`[Stashpad] settings collision: on-disk keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
         if (critical.length) new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${critical.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
         setSettings(this.settings);
@@ -10005,7 +10087,7 @@ export default class StashpadPlugin extends Plugin {
     const all0 = this.settings as unknown as Record<string, unknown>;
     // Skip the data.json write entirely when only per-device churn changed — that's
     // the other half of the split: a reminder firing must not rewrite your hotkeys.
-    const coreDirty = this.store.coreDirty(all0) || adoptedAny;
+    const coreDirty = this.store.coreDirty(all0, curStr) || adoptedAny;
     const rev = Math.max(diskRev, this.lastSeenSettingsRev) + 1;
     if (coreDirty) (this.settings as unknown as Record<string, unknown>).settingsRev = rev;
     // 0.189.0: the per-device churn keys go to history.json (written only when they
@@ -10027,7 +10109,7 @@ export default class StashpadPlugin extends Plugin {
       this.lastSeenSettingsRev = rev;
       this.store.markCoreSaved(all);
     }
-    this.snapshotSettingsBaseline();
+    this.snapshotSettingsBaseline(curStr);
   }
 
   async saveSettings(): Promise<void> {
