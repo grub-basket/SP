@@ -40,10 +40,13 @@ import { isAllCheckboxLines } from "./text-importer";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, matchBindingWithMods, humanCombo, parseModifierTokens, eventHasMods } from "./view-keys";
 import { renderReactionChips, openReactionPicker, type ReactionMap } from "./reactions";
+// 0.296.0 (perf): per-document SVG sprite for the repeated note-row icons.
+import { rowIcon, refreshIconSprite, ensureIconSprite } from "./icon-sprite";
 import { openAggregateView } from "./aggregate-view";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
 import { NoteBodyRenderer } from "./note-body-renderer";
+import type { RenderEntry } from "./note-body-renderer";
 import { returnToOriginOnClose } from "./leaf-return";
 import { computeSortedIds } from "./view-sort";
 import {
@@ -483,6 +486,10 @@ export class StashpadView extends ItemView {
   /** When true, the listResizeObserver re-pins scroll to the bottom each time
    *  the list grows. Set after scrollListToBottom; cleared on user scroll. */
   private stickToListBottom = false;
+  /** 0.295.2: rAF id of scrollListToBottom's pin watchdog, so onClose can cancel
+   *  it. Without this the loop keeps a reference to the (detached) list element
+   *  for up to 30s after the view closes. */
+  private pinWatchdogRaf: number | null = null;
   /** 0.219.4: an on-disk note count the reconcile has already PROVEN it cannot
    *  resolve — a rebuild at this count changed nothing, so retrying only costs a
    *  full list rebuild + re-render. Cleared implicitly by the count changing
@@ -840,6 +847,18 @@ export class StashpadView extends ItemView {
     });
 
     setActiveView(this);
+    // 0.296.0 (perf): the row-icon sprite caches glyphs taken from Obsidian's
+    // icon registry, so a theme (or plugin) that re-registers icons via
+    // `addIcon()` on a CSS/theme change would otherwise leave stale shapes
+    // cached. Rebuild this document's sprite — same `<symbol>` ids, so `<use>`
+    // elements already in the DOM update in place; rows also re-render on the
+    // next paint. Cheap: ~9 `setIcon` calls, only when the theme actually
+    // changes. Build it once up front too so the first render never pays for it
+    // mid-loop.
+    ensureIconSprite(this.containerEl.ownerDocument);
+    this.registerEvent(this.app.workspace.on("css-change", () => {
+      refreshIconSprite(this.containerEl.ownerDocument);
+    }));
     // 0.77.12: periodically bound the multiplayer-tracking maps so a
     // long-lived session doesn't accumulate dead per-file entries.
     // registerInterval auto-clears on view unload.
@@ -1675,7 +1694,18 @@ export class StashpadView extends ItemView {
     this.keydownWindow.removeEventListener("keydown", this.onDocKeyDown, true);
     this.listResizeObserver?.disconnect();
     this.listResizeObserver = null;
+    // 0.295.2: stop scrollListToBottom's pin watchdog — it polls scrollHeight
+    // every frame for up to 30s and holds the list element alive until then.
+    if (this.pinWatchdogRaf != null) {
+      cancelAnimationFrame(this.pinWatchdogRaf);
+      this.pinWatchdogRaf = null;
+    }
+    this.stickToListBottom = false;
     this.bodyRenderer.dispose();
+    // 0.295.2 (perf): drop any clamp measurement queued for a frame that will
+    // never usefully run — the rows are about to be detached.
+    if (this.clampRaf !== null) { cancelAnimationFrame(this.clampRaf); this.clampRaf = null; }
+    this.clampBatch = [];
     this.barOverflowRO?.disconnect();
     this.barOverflowRO = null;
     this.composerNarrowObserver?.disconnect();
@@ -3744,6 +3774,12 @@ export class StashpadView extends ItemView {
 
     const list = chrome.createDiv({ cls: "stashpad-list" });
     this.listEl = list;
+    // 0.296.0 (perf): row click / dblclick / grab-arm listeners, delegated to
+    // the list. Attached HERE (list creation) rather than in populateListBody,
+    // which also runs on the reuse path (`listEl.empty()` + repopulate) — empty()
+    // drops the children, not the list's own listeners, so attaching there would
+    // stack a duplicate set on every partial repaint.
+    this.attachDelegatedRowListeners(list);
     // List-level dragover: handles the case where the cursor is in the *gap* between
     // rows (no row's dragover fires there). Picks the nearest row + position.
     // 0.56.10: keep scrollByFocus fresh while the user scrolls within the
@@ -6907,38 +6943,15 @@ export class StashpadView extends ItemView {
     if (selectableText) row.addClass("is-text-selectable");
     if (draggable) this.dnd.attachRowDnD(row, node, idx);
 
-    row.addEventListener("click", (e) => this.handleRowClick(e, idx, node));
-    // 0.75.0: double-click / double-tap focuses (navigates into) the
-    // note — same as ArrowRight or the enter arrow. Settings-gated,
-    // on by default. Skip when the dblclick lands on a link / tag so
-    // those keep their own behavior, and clear the word-selection the
-    // browser makes on double-click so it doesn't flash before nav.
-    row.addEventListener("dblclick", (e) => {
-      if (!this.plugin.settings.doubleClickToFocus) return;
-      // Mobile: if this double-tap began during the keyboard-dismiss reflow,
-      // open the note that was under the finger when it STARTED (recorded on
-      // the first, dismissing tap) — not the row that slid under the reflowed
-      // second tap. One fluid double-tap on the note above the composer.
-      const absorbed = this.shouldAbsorbDismissTap();
-      if (absorbed && this.aimedTapTargetId && Date.now() - this.aimedTapAt <= StashpadView.AIMED_TAP_WINDOW_MS) {
-        const aimed = this.aimedTapTargetId;
-        this.aimedTapTargetId = null;
-        this.traceTap("dblclick", e, idx, false);
-        e.preventDefault();
-        window.getSelection()?.removeAllRanges();
-        this.navigateTo(aimed);
-        return;
-      }
-      this.traceTap("dblclick", e, idx, absorbed);
-      if (absorbed) { e.preventDefault(); return; }
-      const t = e.target as HTMLElement | null;
-      // 0.76.12: also skip the task checkbox — double-clicking it
-      // should toggle, never navigate.
-      if (t?.closest?.(".internal-link, .tag, a, .stashpad-note-task-checkbox")) return;
-      e.preventDefault();
-      window.getSelection()?.removeAllRanges();
-      this.navigateTo(node.id);
-    });
+    // 0.296.0 (perf): the row's `click` and `dblclick` listeners moved to ONE
+    // delegated pair on the list element (attachDelegatedRowListeners). Above
+    // VIRT_MIN_ROWS the list is virtualized, so rows are built and thrown away
+    // on every window move — per-row closures were being allocated and wired
+    // continuously while scrolling. The handler bodies are unchanged; they now
+    // live in handleRowClick / handleRowDblClick and resolve the row from the
+    // event target. Ordering is preserved: a child control that calls
+    // stopPropagation still runs first (target/inner-bubble phase) and still
+    // prevents the list-level handler from seeing the event.
 
     // 0.76.10: task checkbox at the leftmost edge of the row when the
     // note is a task. Reflects `completed`; click toggles it in place
@@ -6983,7 +6996,7 @@ export class StashpadView extends ItemView {
     const color = this.colorForNode(node);
     const grip = metaTop.createDiv({ cls: "stashpad-note-grip" });
     if (color) grip.addClass("has-color");
-    setIcon(grip, "grip-vertical");
+    rowIcon(grip, "grip-vertical");   // 0.296.0 (perf): sprite <use>, not a fresh <svg>
     grip.title = color ? "Drag to reorder · right-click to change color" : "Drag to reorder";
     grip.draggable = draggable && !selectableText;
     if (!draggable) grip.title = color ? "Right-click to change color · drag disabled in this view mode" : "Drag disabled in this view mode";
@@ -6996,13 +7009,12 @@ export class StashpadView extends ItemView {
       // the body text, checkbox, reactions…). So the timestamp, the grip, and all
       // meta-column whitespace drag the row, while text selects and controls click.
       // Disarm after the gesture so a later plain click on the body isn't a drag.
-      const disarm = (): void => { row.draggable = false; };
-      row.addEventListener("mousedown", (e) => {
-        const t = e.target as HTMLElement | null;
-        row.draggable = !(t && t.closest(StashpadView.DRAG_RESERVED_SELECTOR));
-      });
-      row.addEventListener("mouseup", disarm);
-      row.addEventListener("dragend", disarm);
+      // 0.296.0 (perf): the three listeners this used to attach per row are now
+      // one delegated set on the list. The flag marks the rows that opt in —
+      // exactly the rows that used to get the listeners (draggable view mode
+      // AND selectable text), so a row in Flat/Everything mode (which also
+      // carries `is-text-selectable`) is never armed.
+      row.dataset.grab = "1";
     }
     if (color) grip.style.setProperty("--stashpad-note-color", color);
     // 0.267.6: the hide/reveal chip sits AFTER the timestamp and the grip, so
@@ -7028,13 +7040,13 @@ export class StashpadView extends ItemView {
         const edge = this.listPinEdge(node.id) ?? "top";
         const pin = metaBottom.createSpan({ cls: "stashpad-note-listpin" });
         pin.addClass(edge === "bottom" ? "is-pinned-bottom" : "is-pinned-top");
-        setIcon(pin, "pin");
+        rowIcon(pin, "pin");   // 0.296.0 (perf)
         pin.setAttr("aria-label", `Pinned to ${edge} of list`);
       }
       if (childCount > 0) {
         const enter = metaBottom.createSpan({ cls: "stashpad-note-enter" });
         if (color) enter.style.color = color;
-        setIcon(enter.createSpan({ cls: "stashpad-btn-icon" }), "corner-down-right");
+        rowIcon(enter.createSpan({ cls: "stashpad-btn-icon" }), "corner-down-right");   // 0.296.0 (perf)
         enter.createSpan({ text: ` ${childCount}` });
         enter.onclick = (e) => { e.stopPropagation(); this.navigateTo(node.id); };
       }
@@ -7084,25 +7096,25 @@ export class StashpadView extends ItemView {
       this.addReactionButton(actions, node); // 0.287.0 (teams)
       this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
-      setIcon(moreBtn, "ellipsis-vertical");
+      rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "Actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = moreBtn;
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil" });
-      setIcon(pencil, "pencil");
+      rowIcon(pencil, "pencil");   // 0.296.0 (perf)
       // 0.187.0: pencil opens Stashpad's own editor (default edit action).
       pencil.title = "Edit in Stashpad";
       pencil.onclick = (e) => { e.stopPropagation(); void this.cmdEdit(node); };
       const enterBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-enter-btn" });
-      setIcon(enterBtn, "arrow-right");
+      rowIcon(enterBtn, "arrow-right");   // 0.296.0 (perf)
       enterBtn.title = "Open in Stashpad view";
       enterBtn.onclick = (e) => { e.stopPropagation(); this.navigateTo(node.id); };
       // 0.286.0 (teams): a dedicated per-item Reply button (was menu/palette only).
       // "reply" is the left-curving arrow the user asked for; starts a quoted
       // reply to this note (the composer's next send links back to it).
       const replyBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-reply" });
-      setIcon(replyBtn, "reply");
+      rowIcon(replyBtn, "reply");   // 0.296.0 (perf)
       replyBtn.title = "Reply to this note";
       replyBtn.onclick = (e) => { e.stopPropagation(); this.cmdReply(node); };
       // 0.287.0 (teams): reaction button next to the quick/more menu buttons.
@@ -7112,7 +7124,7 @@ export class StashpadView extends ItemView {
       // row uncluttered as the action set grows, instead of a button per action.
       this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
-      setIcon(moreBtn, "ellipsis-vertical");
+      rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "More actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = pencil;
@@ -7204,6 +7216,71 @@ export class StashpadView extends ItemView {
    *  memo above. Captured once per populateListBody (one read), not
    *  per row. */
   private lastListWidth = 0;
+  /** 0.295.2 (perf): pending clamp (overflow) measurements. Each newly rendered
+   *  body used to schedule its OWN rAF that removed `.is-cursor-expanded`, read
+   *  scrollHeight/clientHeight, then re-added the class — a write→read→write per
+   *  row, i.e. a forced layout per row, all landing in the same frame on a cold
+   *  pass. These now batch: one rAF for the whole slice, all class removals
+   *  first, then all reads, then all restores — 1 layout invalidation instead of
+   *  N. The per-row overflow decision and the ovW/ovV memo are unchanged. */
+  private clampBatch: {
+    opts: { clamp?: boolean; toggleHost?: HTMLElement; toggleAnchor?: HTMLElement };
+    container: HTMLElement;
+    node: TreeNode;
+    textEl: HTMLElement;
+    entry: RenderEntry;
+    memoW: number;
+    expanded: boolean;
+  }[] = [];
+  private clampRaf: number | null = null;
+
+  /** 0.295.2 (perf): queue one row's clamp measurement into the shared batch. */
+  private queueClampMeasure(item: StashpadView["clampBatch"][number]): void {
+    this.clampBatch.push(item);
+    if (this.clampRaf !== null) return;
+    this.clampRaf = requestAnimationFrame(() => {
+      this.clampRaf = null;
+      const batch = this.clampBatch;
+      this.clampBatch = [];
+      // A row can be torn down (virtualization, re-render, folder switch)
+      // between schedule and frame — never measure a detached node.
+      const live = batch.filter((b) => b.container.isConnected && b.textEl.isConnected);
+      // An EXPANDED note isn't clamped (0.118.11): measuring it would read
+      // "fits" and cache a stale ovV=false, killing the toggle on collapse. It
+      // always gets a (collapse) toggle and never enters the measure phase.
+      const measured = live.filter((b) => {
+        if (!b.expanded) return true;
+        this.attachExpandToggle(b.opts, b.container, b.node, b.expanded);
+        return false;
+      });
+      if (measured.length === 0) return;
+      // Phase 1 (writes): the cursor row is transiently unclamped by
+      // `.is-cursor-expanded`; drop it so `.is-clamped` defines clientHeight.
+      const cursorRows = new Set<HTMLElement>();
+      for (const b of measured) {
+        const r = b.container.closest?.(".stashpad-note.is-cursor-expanded") as HTMLElement | null;
+        if (r) cursorRows.add(r);
+      }
+      for (const r of cursorRows) r.removeClass("is-cursor-expanded");
+      // Phase 2 (reads): one layout for the whole batch. 0.118.7 — measure
+      // overflow against the ACTUAL clamped height, not a line-height heuristic.
+      const overflow = measured.map((b) => b.textEl.scrollHeight > b.textEl.clientHeight + 4);
+      // Phase 3 (writes): restore, then apply each row's decision.
+      for (const r of cursorRows) r.addClass("is-cursor-expanded");
+      measured.forEach((b, i) => {
+        const overflowing = overflow[i];
+        // Memoize for subsequent re-renders at this width (clamped read only).
+        b.entry.ovW = b.memoW;
+        b.entry.ovV = overflowing;
+        if (!overflowing) {
+          // Short note that fits — drop the clamp so the fade gradient doesn't apply.
+          b.textEl.removeClass("is-clamped");
+          return;
+        }
+        this.attachExpandToggle(b.opts, b.container, b.node, b.expanded);
+      });
+    });
+  }
 
   /** Public entry: render the body NOW if it's already cached (cheap), or
    *  show a title placeholder and defer the expensive read+render until the
@@ -7341,41 +7418,10 @@ export class StashpadView extends ItemView {
         }
         return;
       }
-      // After layout, decide whether to keep the clamp + show the toggle.
-      requestAnimationFrame(() => {
-        // 0.118.11: an EXPANDED note isn't clamped, so its scrollHeight ==
-        // clientHeight — measuring it would (wrongly) read "fits" and cache
-        // ovV=false. That stale false then suppressed the toggle the moment you
-        // collapsed the note (fast-path stripped the clamp, no button — the
-        // "body shows but the button is gone, permanently" bug). So: never
-        // measure an unclamped note. An expanded note ALWAYS gets a (collapse)
-        // toggle; only measure/cache when the body is actually clamped.
-        if (expanded) {
-          this.attachExpandToggle(opts, container, node, expanded);
-          return;
-        }
-        // 0.118.7: measure overflow against the ACTUAL clamped height
-        // (scrollHeight vs clientHeight) — rendered markdown lines aren't a
-        // fixed multiple of the base line-height, so the 0.118.5 "line-height ×
-        // 2" heuristic over-triggered (a toggle on nearly every note). The only
-        // wrinkle is that the cursor row is transiently unclamped by
-        // `.is-cursor-expanded`; so for the read we momentarily drop that class
-        // (synchronous — no repaint between the remove, the measure, and the
-        // re-add), letting `.is-clamped` define clientHeight.
-        const cursorRow = container.closest?.(".stashpad-note.is-cursor-expanded") as HTMLElement | null;
-        if (cursorRow) cursorRow.removeClass("is-cursor-expanded");
-        const overflowing = textEl.scrollHeight > textEl.clientHeight + 4;
-        if (cursorRow) cursorRow.addClass("is-cursor-expanded");
-        // Memoize for subsequent re-renders at this width (clamped read only).
-        entry.ovW = memoW;
-        entry.ovV = overflowing;
-        if (!overflowing) {
-          // Short note that fits — drop the clamp so the fade gradient doesn't apply.
-          textEl.removeClass("is-clamped");
-          return;
-        }
-        this.attachExpandToggle(opts, container, node, expanded);
-      });
+      // 0.295.2 (perf): after layout, decide whether to keep the clamp + show
+      // the toggle — batched with every other row measured this frame (see
+      // queueClampMeasure), instead of one rAF + one forced layout per row.
+      this.queueClampMeasure({ opts, container, node, textEl, entry, memoW, expanded });
     });
   }
 
@@ -9164,14 +9210,112 @@ export class StashpadView extends ItemView {
     });
   }
 
-  private handleRowClick(e: MouseEvent, idx: number, node: TreeNode): void {
+  /** 0.296.0 (perf): resolve the list row an event landed in — the delegation
+   *  counterpart of the per-row closures that used to capture `row`, `node`
+   *  and `idx` directly.
+   *
+   *  Bails (returns null) on everything a row listener would never have seen:
+   *   - the sticky heading row, which is `.stashpad-focused` and carries no
+   *     `.stashpad-note` class (and no `data-id`);
+   *   - a row that is not a DIRECT child of THIS list (renderNote only ever
+   *     appends to the list, so anything deeper is not one of our rows);
+   *   - a row virtualization already detached mid-gesture (`isConnected`) —
+   *     closest() happily walks a detached tree;
+   *   - a stale id/idx whose node is gone from the tree.
+   *  The node is taken from `currentChildren[idx]` when its id matches the
+   *  row's, so node and idx stay consistent for the shift-range branch; the
+   *  tree lookup is the fallback. */
+  private rowFromEvent(list: HTMLElement, e: Event): { row: HTMLElement; node: TreeNode; idx: number } | null {
+    const t = e.target as HTMLElement | null;
+    const row = t?.closest?.(".stashpad-note[data-id]") as HTMLElement | null;
+    if (!row || !row.isConnected || row.parentElement !== list) return null;
+    const id = row.dataset.id;
+    if (!id) return null;
+    const idx = Number(row.dataset.idx);
+    if (!Number.isInteger(idx) || idx < 0) return null;
+    const byIdx = this.currentChildren[idx];
+    const node = (byIdx && byIdx.id === id) ? byIdx : this.tree.get(id);
+    if (!node) return null;
+    return { row, node, idx };
+  }
+
+  /** 0.296.0 (perf): ONE set of row listeners per list element, replacing the
+   *  five that renderNote attached to every row (click, dblclick, and the
+   *  0.285.0 whole-row grab trio). Called where the list is created, so it
+   *  runs once per list — `renderInner` builds a fresh `.stashpad-list` each
+   *  full render, and the reuse path (`list.empty()` + populateListBody) keeps
+   *  the same element, and with it these listeners.
+   *
+   *  Row DnD (`dnd.attachRowDnD`) stays per-row: it has its own 0.294.0 cache
+   *  logic and dragstart needs the row as its target. */
+  private attachDelegatedRowListeners(list: HTMLElement): void {
+    list.addEventListener("click", (e) => {
+      const hit = this.rowFromEvent(list, e);
+      if (hit) this.handleRowClick(e, hit.idx, hit.node, hit.row);
+    });
+    list.addEventListener("dblclick", (e) => {
+      const hit = this.rowFromEvent(list, e);
+      if (hit) this.handleRowDblClick(e, hit.idx, hit.node);
+    });
+    // 0.285.0 whole-row grab area, delegated. `data-grab` marks the rows that
+    // used to carry these three listeners (nested mode + selectable text).
+    const disarm = (e: Event): void => {
+      const row = (e.target as HTMLElement | null)?.closest?.(".stashpad-note[data-id]") as HTMLElement | null;
+      if (row && row.parentElement === list && row.dataset.grab === "1") row.draggable = false;
+    };
+    list.addEventListener("mousedown", (e) => {
+      const hit = this.rowFromEvent(list, e);
+      if (!hit || hit.row.dataset.grab !== "1") return;
+      const t = e.target as HTMLElement | null;
+      hit.row.draggable = !(t && t.closest(StashpadView.DRAG_RESERVED_SELECTOR));
+    });
+    list.addEventListener("mouseup", disarm);
+    list.addEventListener("dragend", disarm);
+  }
+
+  /** 0.75.0: double-click / double-tap focuses (navigates into) the note —
+   *  same as ArrowRight or the enter arrow. Settings-gated, on by default.
+   *  Skip when the dblclick lands on a link / tag so those keep their own
+   *  behavior, and clear the word-selection the browser makes on double-click
+   *  so it doesn't flash before nav.
+   *  0.296.0 (perf): lifted out of the per-row closure in renderNote; the body
+   *  is unchanged (it only ever read `this` state, no per-row captures). */
+  private handleRowDblClick(e: MouseEvent, idx: number, node: TreeNode): void {
+    if (!this.plugin.settings.doubleClickToFocus) return;
+    // Mobile: if this double-tap began during the keyboard-dismiss reflow,
+    // open the note that was under the finger when it STARTED (recorded on
+    // the first, dismissing tap) — not the row that slid under the reflowed
+    // second tap. One fluid double-tap on the note above the composer.
+    const absorbed = this.shouldAbsorbDismissTap();
+    if (absorbed && this.aimedTapTargetId && Date.now() - this.aimedTapAt <= StashpadView.AIMED_TAP_WINDOW_MS) {
+      const aimed = this.aimedTapTargetId;
+      this.aimedTapTargetId = null;
+      this.traceTap("dblclick", e, idx, false);
+      e.preventDefault();
+      window.getSelection()?.removeAllRanges();
+      this.navigateTo(aimed);
+      return;
+    }
+    this.traceTap("dblclick", e, idx, absorbed);
+    if (absorbed) { e.preventDefault(); return; }
+    const t = e.target as HTMLElement | null;
+    // 0.76.12: also skip the task checkbox — double-clicking it
+    // should toggle, never navigate.
+    if (t?.closest?.(".internal-link, .tag, a, .stashpad-note-task-checkbox")) return;
+    e.preventDefault();
+    window.getSelection()?.removeAllRanges();
+    this.navigateTo(node.id);
+  }
+
+  /** 0.296.0 (perf): `rowEl` is passed in — this used to be a per-row closure,
+   *  so `e.currentTarget` WAS the row. Delegated, currentTarget is the list. */
+  private handleRowClick(e: MouseEvent, idx: number, node: TreeNode, rowEl: HTMLElement): void {
     // 0.279.30: if the user just drag-selected TEXT inside a row (now possible on
     // desktop), the mouseup fires a click — don't let it navigate/select the row
     // and wipe the selection. A collapsed (empty) selection is a normal click.
-    const sel = (e.currentTarget as HTMLElement | null)?.ownerDocument?.getSelection?.();
+    const sel = rowEl.ownerDocument?.getSelection?.();
     if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) {
-      const row = e.currentTarget as HTMLElement | null;
-      if (row && sel.anchorNode && row.contains(sel.anchorNode)) return;
+      if (sel.anchorNode && rowEl.contains(sel.anchorNode)) return;
     }
     // Mobile: a tap during the keyboard-dismiss reflow only dismisses the
     // keyboard — acting on it would select whatever row slid under the finger.
@@ -9220,9 +9364,7 @@ export class StashpadView extends ItemView {
       if (!t?.closest?.(".stashpad-note-task-checkbox, .stashpad-note-more, .stashpad-expand-toggle, button, a")) {
         e.preventDefault();
         e.stopPropagation();
-        const rowEl = (e.currentTarget as HTMLElement | null)
-          ?? this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${node.id}"]`) ?? null;
-        if (rowEl) this.advanceObscureReveal(node, rowEl);   // two-step: text, then media
+        this.advanceObscureReveal(node, rowEl);   // two-step: text, then media
         return;
       }
     }
@@ -10196,7 +10338,7 @@ export class StashpadView extends ItemView {
   private addReactionButton(actions: HTMLElement, node: TreeNode): void {
     const btn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-react" });
     btn.dataset.id = node.id;
-    setIcon(btn, "smile-plus");
+    rowIcon(btn, "smile-plus");   // 0.296.0 (perf): per-row slot → sprite <use>
     btn.title = "Add reaction";
     btn.onclick = (e) => { e.stopPropagation(); openReactionPicker(this, node, btn); };
   }
@@ -18565,17 +18707,28 @@ export class StashpadView extends ItemView {
     // Polling scrollHeight every frame guarantees we catch any growth.
     // 30s is well past any plausible late paint; the loop is a no-op
     // once user scrolls away (stickToListBottom flips false).
+    //
+    // 0.295.2: the loop is now cancellable. Its rAF id lives on the view so
+    // onClose can stop it (it captured `list` and kept the detached element
+    // alive for the rest of the 30s), and a fresh scrollListToBottom cancels
+    // the previous loop instead of leaving two pollers racing on one list.
     const startedAt = performance.now();
     let lastH = list.scrollHeight;
+    if (this.pinWatchdogRaf != null) cancelAnimationFrame(this.pinWatchdogRaf);
     const watchdog = (): void => {
+      this.pinWatchdogRaf = null;
       if (!this.stickToListBottom) return;
+      // 0.295.2: a re-render swapped in a new list element — this loop is
+      // pinning a detached node. Stop; the re-render's own scroll policy
+      // (and its own scrollListToBottom call) owns the new list.
+      if (!list.isConnected) return;
       const h = list.scrollHeight;
       if (h !== lastH) {
         list.scrollTop = h;
         lastH = h;
       }
       if (performance.now() - startedAt < 30000) {
-        requestAnimationFrame(watchdog);
+        this.pinWatchdogRaf = requestAnimationFrame(watchdog);
       } else {
         // Initial paint has long since settled. Releasing the sticky
         // flag here prevents the regression where every subsequent
@@ -18587,7 +18740,7 @@ export class StashpadView extends ItemView {
         this.stickToListBottom = false;
       }
     };
-    requestAnimationFrame(watchdog);
+    this.pinWatchdogRaf = requestAnimationFrame(watchdog);
   }
 
   /** 0.155.1: shared "Share & export ▸" submenu — used by BOTH the desktop note
@@ -18679,7 +18832,7 @@ export class StashpadView extends ItemView {
   private maybeAddQuickButton(container: HTMLElement, node: TreeNode, before?: HTMLElement): void {
     if ((getSettings().quickMenuActions ?? []).length === 0) return;
     const btn = container.createEl("button", { cls: "stashpad-pencil stashpad-note-quick" });
-    setIcon(btn, "star");
+    rowIcon(btn, "star");   // 0.296.0 (perf): per-row slot → sprite <use>
     btn.title = "Quick actions";
     btn.onclick = (e) => { e.stopPropagation(); this.openQuickMenu(e, node); };
     if (before) container.insertBefore(btn, before);

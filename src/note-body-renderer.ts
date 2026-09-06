@@ -48,6 +48,17 @@ export class NoteBodyRenderer {
    *  `lazyBodies`, keyed by the body container) runs once. */
   private bodyObserver: IntersectionObserver | null = null;
   private lazyBodies = new WeakMap<HTMLElement, () => void>();
+  // 0.295.2 (perf): body renders are drained a few per frame instead of all in
+  // the observer callback's own task. `renderQueue` holds the rows whose bodies
+  // are due (nearest-to-viewport-centre first); `queued` dedupes re-entries
+  // (a row stays observed until its fn actually runs, so it can be reported
+  // intersecting more than once). `drainHandle` is the in-flight rAF/timeout.
+  private renderQueue: HTMLElement[] = [];
+  private queued = new Set<HTMLElement>();
+  private drainHandle: number | null = null;
+  private drainViaTimeout = false;
+  /** How many deferred bodies to render per frame. */
+  private static readonly DRAIN_PER_FRAME = 6;
 
   constructor(private host: NoteBodyHost, private component: Component, cache?: RenderCacheLike) {
     this.renderCache = cache ?? new Map<string, RenderEntry>();
@@ -125,22 +136,98 @@ export class NoteBodyRenderer {
   arm(): void {
     this.bodyObserver?.disconnect();
     this.lazyBodies = new WeakMap();
+    // 0.295.2 (perf): a fresh paint forgets every row queued for the old one.
+    this.clearQueue();
     this.bodyObserver = new IntersectionObserver((entries) => {
+      // 0.295.2 (perf): the callback no longer RENDERS — it only queues. With
+      // row virtualization a window update builds ~25-40 rows at once and, since
+      // rootMargin (1400px) is wider than the overscan (700px), essentially all
+      // of them report intersecting in ONE callback. Running each fn() there
+      // kicked off dozens of MarkdownRenderer passes in a single task (the
+      // scroll-stutter). Instead: collect, order by distance from the viewport
+      // centre (what the user is actually looking at renders first), drain a few
+      // per frame.
+      const rootRect = this.host.contentEl.getBoundingClientRect();
+      const centre = rootRect.top + rootRect.height / 2;
+      const due: { el: HTMLElement; dist: number }[] = [];
       for (const e of entries) {
-        if (!e.isIntersecting) continue;
         const el = e.target as HTMLElement;
+        if (!e.isIntersecting) {
+          // Scrolled back out before its turn — drop it. It stays observed, so
+          // it re-queues if it comes back.
+          this.dequeue(el);
+          continue;
+        }
+        if (this.queued.has(el) || !this.lazyBodies.has(el)) continue;
+        const r = e.boundingClientRect;
+        due.push({ el, dist: Math.abs(r.top + r.height / 2 - centre) });
+      }
+      if (due.length === 0) return;
+      due.sort((a, b) => a.dist - b.dist);
+      for (const d of due) { this.queued.add(d.el); this.renderQueue.push(d.el); }
+      this.scheduleDrain();
+    }, { root: this.host.contentEl, rootMargin: "1400px 0px" });
+  }
+
+  /** 0.295.2 (perf): render the next slice of queued bodies, then reschedule if
+   *  any remain. rAF is throttled/paused in a hidden window, so fall back to a
+   *  timeout there (an Obsidian window can be backgrounded mid-scroll and we
+   *  don't want the queue to stall until it's looked at again). */
+  private scheduleDrain(): void {
+    if (this.drainHandle !== null || this.renderQueue.length === 0) return;
+    const run = () => {
+      this.drainHandle = null;
+      let budget = NoteBodyRenderer.DRAIN_PER_FRAME;
+      while (budget > 0 && this.renderQueue.length > 0) {
+        const el = this.renderQueue.shift() as HTMLElement;
+        this.queued.delete(el);
+        // The row may have been removed from the DOM by virtualization while it
+        // waited. Never render into a detached node — and leave its bookkeeping
+        // (WeakMap entry + observation) INTACT: if the row is re-attached the
+        // observer fires again and it re-queues. A detached node gets no
+        // intersection callbacks, so this can't loop; if it's never re-attached
+        // the whole subtree (and its WeakMap entry) is collected.
+        if (!el.isConnected) continue;
         const fn = this.lazyBodies.get(el);
+        if (!fn) continue;
         this.bodyObserver?.unobserve(el);
         this.lazyBodies.delete(el);
-        if (fn) fn();
+        budget--;
+        fn();
       }
-    }, { root: this.host.contentEl, rootMargin: "1400px 0px" });
+      this.scheduleDrain();
+    };
+    if (document.visibilityState === "hidden") {
+      this.drainViaTimeout = true;
+      this.drainHandle = window.setTimeout(run, 16);
+    } else {
+      this.drainViaTimeout = false;
+      this.drainHandle = requestAnimationFrame(run);
+    }
+  }
+
+  /** Remove a row from the pending render queue (it scrolled out / was dropped). */
+  private dequeue(el: HTMLElement): void {
+    if (!this.queued.delete(el)) return;
+    const i = this.renderQueue.indexOf(el);
+    if (i >= 0) this.renderQueue.splice(i, 1);
+  }
+
+  private clearQueue(): void {
+    this.renderQueue = [];
+    this.queued.clear();
+    if (this.drainHandle !== null) {
+      if (this.drainViaTimeout) window.clearTimeout(this.drainHandle);
+      else cancelAnimationFrame(this.drainHandle);
+      this.drainHandle = null;
+    }
   }
 
   /** Disconnect the observer (onClose). A missed disconnect leaks observers. */
   dispose(): void {
     this.bodyObserver?.disconnect();
     this.bodyObserver = null;
+    this.clearQueue();
   }
 
   /** True when the observer is live (armed for the current paint). */

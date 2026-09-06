@@ -37,7 +37,12 @@ export interface IndexRow {
   imported: boolean;
   hasAttachments: boolean;
   internalLinks: number;
-  hasExternalLinks: boolean;
+  /** 0.296.0 (perf): `undefined` = NOT COMPUTED YET. Deciding this needs the
+   *  note's BODY, so it is only computed at collect time when the "http" facet
+   *  is already on. Turning the chip on later triggers a one-off fill pass
+   *  (fillExternalLinks) that reads just the unknown rows. Treat undefined as
+   *  "unknown", never as false — the filter and the globe icon both do. */
+  hasExternalLinks: boolean | undefined;
   /** 0.275.2: the note contains at least one internal [[wikilink]] whose target
    *  resolves to no existing file (Obsidian's unresolvedLinks). Sibling of
    *  `orphan` — an orphan has a missing PARENT; a broken link POINTS at
@@ -80,6 +85,12 @@ export interface IndexState {
   /** 0.276.6: multi-select mode + the selected note file paths, for bulk acts. */
   selectMode: boolean;
   selected: Set<string>;
+  /** 0.295.2 (perf): the last collected row set, reused by every UI-only
+   *  repaint (facet dropdowns, chips, sort, select-mode, search). Collection is
+   *  a vault-wide sweep with a cachedRead per note, so it must happen once per
+   *  DATA change — not once per CLICK. null = stale, collect on next render.
+   *  Invalidated by invalidateIndexRows() from the view's vault-event path. */
+  rowsCache: IndexRow[] | null;
 }
 export function defaultIndexState(): IndexState {
   return {
@@ -87,7 +98,16 @@ export function defaultIndexState(): IndexState {
     attachmentsOnly: false, importedOnly: false, internalOnly: false, externalOnly: false,
     orphansOnly: false, brokenOnly: false, staleOnly: false, includeHome: false, sort: "modified", revealed: new Set(),
     selectMode: false, selected: new Set(),
+    rowsCache: null,
   };
+}
+
+/** 0.295.2 (perf): mark the cached rows stale so the next render re-collects.
+ *  Call this from anything that changes the underlying NOTES (vault events, the
+ *  manual refresh button, a bulk action) — never from a facet/sort/select
+ *  toggle, which is exactly the cost this cache exists to remove. */
+export function invalidateIndexRows(state: IndexState): void {
+  state.rowsCache = null;
 }
 
 export interface IndexOpts {
@@ -95,6 +115,9 @@ export interface IndexOpts {
 }
 
 const EXTERNAL_URL_RE = /https?:\/\/[^\s)\]>"']+/;
+/** Strip a leading YAML frontmatter block — the body is what both the first-line
+ *  title and the external-link test care about. */
+const FRONTMATTER_RE = /^---\n[\s\S]*?\n---\n?/;
 /** 0.275.2: "stale" = last modified more than ~6 months ago. */
 const STALE_MS = 183 * 86400000;
 
@@ -102,23 +125,29 @@ const STALE_MS = 183 * 86400000;
  *  frontmatter `id` required — the same shape the tree indexes). Bodies are
  *  read via cachedRead: needed for the external-link facet and first-line
  *  titles, and Obsidian keeps contents memory-cached so a re-render is cheap.
- *  The one-shot cost on open is accepted for an on-demand tab. */
-export async function collectIndexRows(app: App, plugin: StashpadPlugin): Promise<IndexRow[]> {
+ *  The one-shot cost on open is accepted for an on-demand tab.
+ *
+ *  0.296.0 (perf): the body read is now CONDITIONAL. It is needed for (a) the
+ *  first-line title, only when the note has no heading in the metadata cache,
+ *  and (b) the external-link facet, only when that chip is already on
+ *  (`needExternal`). Most Stashpad notes are plain text with no heading, so in
+ *  practice the title still pulls most bodies in — the real saving is that an
+ *  index opened with the "http" chip OFF (the default) no longer pays for the
+ *  facet, and a heading-led note is skipped entirely. */
+export async function collectIndexRows(
+  app: App, plugin: StashpadPlugin, opts?: { needExternal?: boolean },
+): Promise<IndexRow[]> {
+  const needExternal = opts?.needExternal === true;
   const folders = new Set(plugin.discoverStashpadFolders().map((f) => f.replace(/\/+$/, "")));
   // Pre-pass: every folder's id set, so the main pass can tell an orphan (a
   // parent id that resolves nowhere in its folder) from a normal child. Cache
   // reads only — no file IO.
+  // 0.295.2 (perf): ONE getMarkdownFiles sweep + ONE getFileCache per file,
+  // building the candidate list and the id sets together. The old code swept
+  // the whole vault twice and read every file's cache twice.
   const idsByFolder = new Map<string, Set<string>>();
-  for (const f of app.vault.getMarkdownFiles()) {
-    const dir = (f.parent?.path ?? "").replace(/\/+$/, "");
-    if (!folders.has(dir)) continue;
-    const fid = (app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined)?.id;
-    if (typeof fid !== "string") continue;
-    let set = idsByFolder.get(dir);
-    if (!set) { set = new Set(); idsByFolder.set(dir, set); }
-    set.add(fid);
-  }
-  const rows: IndexRow[] = [];
+  type Candidate = { f: TFile; dir: string; cache: ReturnType<App["metadataCache"]["getFileCache"]>; fm: Record<string, unknown>; id: string };
+  const candidates: Candidate[] = [];
   for (const f of app.vault.getMarkdownFiles()) {
     const dir = (f.parent?.path ?? "").replace(/\/+$/, "");
     if (!folders.has(dir)) continue;
@@ -126,11 +155,21 @@ export async function collectIndexRows(app: App, plugin: StashpadPlugin): Promis
     const fm = (cache?.frontmatter ?? {}) as Record<string, unknown>;
     const id = typeof fm.id === "string" ? fm.id : null;
     if (!id) continue;
+    let set = idsByFolder.get(dir);
+    if (!set) { set = new Set(); idsByFolder.set(dir, set); }
+    set.add(id);
+    candidates.push({ f, dir, cache, fm, id });
+  }
+  const rows: IndexRow[] = [];
+  for (const { f, dir, cache, fm, id } of candidates) {
 
-    let body = "";
-    try { body = (await app.vault.cachedRead(f)).replace(/^---\n[\s\S]*?\n---\n?/, ""); } catch { /* unreadable → sparse row */ }
-
+    // 0.296.0 (perf): read the body ONLY if something still needs it.
     const heading = cache?.headings?.[0]?.heading;
+    let body = "";
+    if (needExternal || !heading) {
+      try { body = (await app.vault.cachedRead(f)).replace(FRONTMATTER_RE, ""); } catch { /* unreadable → sparse row */ }
+    }
+
     const firstLine = body.slice(0, 400).split(/\r?\n/).map((s) => s.trim()).find(Boolean) ?? "";
     const title = stripInlineMarkdown(heading ?? firstLine).trim()
       || f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ")
@@ -178,7 +217,8 @@ export async function collectIndexRows(app: App, plugin: StashpadPlugin): Promis
       imported: fm.imported === true,
       hasAttachments,
       internalLinks,
-      hasExternalLinks: EXTERNAL_URL_RE.test(body),
+      // 0.296.0 (perf): undefined until the facet actually asks for it.
+      hasExternalLinks: needExternal ? EXTERNAL_URL_RE.test(body) : undefined,
       hasBrokenLinks: Object.keys((app.metadataCache as unknown as { unresolvedLinks?: Record<string, Record<string, number>> }).unresolvedLinks?.[f.path] ?? {}).length > 0,
       isHome: id === ROOT_ID,
       obscured: plugin.isFileObscured(f),
@@ -197,17 +237,37 @@ export async function collectIndexRows(app: App, plugin: StashpadPlugin): Promis
 
 const momentFn = moment as unknown as (ms: number) => { fromNow: () => string; format: (f: string) => string };
 
-/** Render the index into `host`. Owns `host`; re-renders itself on any facet
- *  change (rows are re-collected — cachedRead makes that cheap after the first
- *  pass, and stale rows after an edit would be worse than the cost). */
+/** Render the index into `host`. Owns `host`.
+ *
+ *  0.295.2 (perf): rows are collected ONCE per data change and cached on the
+ *  caller-owned state. A facet change (dropdown, chip, sort, select-mode) only
+ *  rebuilds the bar + repaints from the cached rows — it no longer re-sweeps
+ *  the vault and cachedReads every note. Staleness is driven by the view's
+ *  existing vault/metadata event plumbing, which calls invalidateIndexRows()
+ *  before each full render(), so an edit still lands on the next paint. */
 export async function renderMasterIndex(
   host: HTMLElement, app: App, plugin: StashpadPlugin, state: IndexState, opts: IndexOpts,
 ): Promise<void> {
   const token = ((host as unknown as { __sIdxToken?: number }).__sIdxToken ?? 0) + 1;
   (host as unknown as { __sIdxToken?: number }).__sIdxToken = token;
-  const rows = await collectIndexRows(app, plugin);
-  if ((host as unknown as { __sIdxToken?: number }).__sIdxToken !== token) return; // superseded
+  let collected = state.rowsCache;
+  if (!collected) {
+    // 0.296.0 (perf): only pay for the external-link scan if the chip is already
+    // on; otherwise rows carry `hasExternalLinks: undefined` and the chip's own
+    // toggle fills them in once, on demand.
+    collected = await collectIndexRows(app, plugin, { needExternal: state.externalOnly });
+    // Token guard kept: a slower, superseded collect must not paint over (or
+    // cache) a newer one.
+    if ((host as unknown as { __sIdxToken?: number }).__sIdxToken !== token) return;
+    state.rowsCache = collected;
+  }
+  const rows: IndexRow[] = collected;
+  /** Repaint the whole surface (bar + rows) from the CACHED rows. */
   const rerender = (): void => { void renderMasterIndex(host, app, plugin, state, opts); };
+  /** 0.295.2 (perf): the rows themselves changed (a bulk action wrote/deleted
+   *  notes) — drop the cache so this render re-collects rather than painting
+   *  files that no longer exist. */
+  const recollect = (): void => { state.rowsCache = null; rerender(); };
   host.empty();
   host.addClass("stashpad-index");
 
@@ -229,7 +289,11 @@ export async function renderMasterIndex(
       opt.value = o.v;
       if (o.v === cur) opt.selected = true;
     }
-    s.onchange = () => { set(s.value); rerender(); };
+    // 0.295.2 (perf): a facet change is a FILTER change, not a data change, and
+    // the option lists are derived from ALL rows (not the filtered set), so
+    // they can't go stale here. Repaint the rows only — no bar rebuild, so the
+    // search box keeps its focus and caret too.
+    s.onchange = () => { set(s.value); paintRows(); };
   };
   select("Folder", [{ v: "all", label: "All folders" }, ...folders.map((f) => ({ v: f, label: f.split("/").pop() || f }))], state.folder, (v) => { state.folder = v; });
   if (authors.length) select("Author", [{ v: "", label: "Any author" }, ...authors.map((a) => ({ v: a, label: a }))], state.author, (v) => { state.author = v; });
@@ -240,24 +304,68 @@ export async function renderMasterIndex(
     { v: "title", label: "Title A→Z" }, { v: "folder", label: "By folder" },
   ], state.sort, (v) => { state.sort = v as IndexState["sort"]; });
 
-  const chip = (label: string, active: boolean, toggle: () => void, title?: string): void => {
-    const c = bar.createEl("button", { cls: "stashpad-index-chip" + (active ? " is-active" : ""), text: label });
+  // 0.295.2 (perf): `isActive` is a GETTER (was a snapshot boolean) so the chip
+  // can restyle itself in place after a toggle without a full re-render.
+  const chip = (label: string, isActive: () => boolean, toggle: () => void, title?: string, before?: () => Promise<void>): void => {
+    const c = bar.createEl("button", { cls: "stashpad-index-chip" + (isActive() ? " is-active" : ""), text: label });
     if (title) c.title = title;
-    c.onclick = () => { toggle(); rerender(); };
+    // 0.295.2 (perf): toggle the chip's own active class and repaint the rows
+    // instead of re-rendering (which used to re-collect the whole vault).
+    // 0.296.0 (perf): `before` is an optional one-off "this facet needs data the
+    // collect pass deliberately skipped" hook (see the http chip). It runs
+    // BEFORE the repaint, and its result is cached on the rows, so a second
+    // toggle of the same chip is free.
+    c.onclick = () => {
+      toggle();
+      c.toggleClass("is-active", isActive());
+      if (!before) { paintRows(); return; }
+      c.disabled = true;
+      void before().finally(() => {
+        c.disabled = false;
+        // A newer render (or a re-collect) superseded us — its own paint owns
+        // the DOM now, so don't paint over it from this closure's stale rows.
+        if ((host as unknown as { __sIdxToken?: number }).__sIdxToken !== token) return;
+        paintRows();
+      });
+    };
   };
-  chip("Files", state.attachmentsOnly, () => { state.attachmentsOnly = !state.attachmentsOnly; }, "Only notes with attachments");
-  chip("Imported", state.importedOnly, () => { state.importedOnly = !state.importedOnly; }, "Only notes brought in by an import");
-  chip("[[links]]", state.internalOnly, () => { state.internalOnly = !state.internalOnly; }, "Only notes linking to other notes");
-  chip("http", state.externalOnly, () => { state.externalOnly = !state.externalOnly; }, "Only notes containing an external link");
-  chip("Orphans", state.orphansOnly, () => { state.orphansOnly = !state.orphansOnly; }, "Only notes whose parent is missing — they exist on disk but no list shows them. Repair with the fix-orphans command.");
-  chip("Broken links", state.brokenOnly, () => { state.brokenOnly = !state.brokenOnly; }, "Only notes with a [[wikilink]] pointing at a note/file that doesn't exist.");
-  chip("Stale", state.staleOnly, () => { state.staleOnly = !state.staleOnly; }, "Only notes untouched for more than ~6 months (sort by Recent first to see the oldest at the bottom).");
-  chip("Home notes", state.includeHome, () => { state.includeHome = !state.includeHome; }, "Include each folder's home note");
+  /** 0.296.0 (perf): fill in `hasExternalLinks` for rows collected without it.
+   *  One pass over just the unknown rows, mutating the CACHED row objects, so
+   *  the cost is paid once per data change no matter how often the chip is
+   *  toggled. A vault event still drops the whole cache, which is correct: the
+   *  edited note's body may have gained or lost a URL. */
+  const fillExternalLinks = async (): Promise<void> => {
+    if (!state.externalOnly) return; // turning the chip OFF needs no data
+    const missing = rows.filter((r) => r.hasExternalLinks === undefined);
+    if (!missing.length) return;
+    for (const r of missing) {
+      try {
+        const body = (await app.vault.cachedRead(r.file)).replace(FRONTMATTER_RE, "");
+        r.hasExternalLinks = EXTERNAL_URL_RE.test(body);
+      } catch { r.hasExternalLinks = false; /* unreadable → treated as "no link" */ }
+    }
+  };
+  chip("Files", () => state.attachmentsOnly, () => { state.attachmentsOnly = !state.attachmentsOnly; }, "Only notes with attachments");
+  chip("Imported", () => state.importedOnly, () => { state.importedOnly = !state.importedOnly; }, "Only notes brought in by an import");
+  chip("[[links]]", () => state.internalOnly, () => { state.internalOnly = !state.internalOnly; }, "Only notes linking to other notes");
+  chip("http", () => state.externalOnly, () => { state.externalOnly = !state.externalOnly; }, "Only notes containing an external link", fillExternalLinks);
+  chip("Orphans", () => state.orphansOnly, () => { state.orphansOnly = !state.orphansOnly; }, "Only notes whose parent is missing — they exist on disk but no list shows them. Repair with the fix-orphans command.");
+  chip("Broken links", () => state.brokenOnly, () => { state.brokenOnly = !state.brokenOnly; }, "Only notes with a [[wikilink]] pointing at a note/file that doesn't exist.");
+  chip("Stale", () => state.staleOnly, () => { state.staleOnly = !state.staleOnly; }, "Only notes untouched for more than ~6 months (sort by Recent first to see the oldest at the bottom).");
+  chip("Home notes", () => state.includeHome, () => { state.includeHome = !state.includeHome; }, "Include each folder's home note");
 
   // 0.276.6: multi-select + bulk actions.
   const selToggle = bar.createEl("button", { cls: "stashpad-index-chip" + (state.selectMode ? " is-active" : ""), text: state.selectMode ? "Done" : "Select" });
   selToggle.title = "Select multiple notes to act on them";
-  selToggle.onclick = () => { state.selectMode = !state.selectMode; if (!state.selectMode) state.selected.clear(); rerender(); };
+  // 0.295.2 (perf): select-mode only adds/removes the per-row checkbox, which
+  // paintRows() draws from `state.selectMode` — no re-collect needed.
+  selToggle.onclick = () => {
+    state.selectMode = !state.selectMode;
+    if (!state.selectMode) state.selected.clear();
+    selToggle.toggleClass("is-active", state.selectMode);
+    selToggle.setText(state.selectMode ? "Done" : "Select");
+    paintRows(); // also calls repaintBulk(), which shows/hides the bulk bar
+  };
 
   const bulkBar = host.createDiv({ cls: "stashpad-index-bulkbar" });
   const countEl = host.createDiv({ cls: "stashpad-index-count" });
@@ -269,7 +377,9 @@ export async function renderMasterIndex(
     let ok = 0, failed = 0;
     for (const r of targets) { try { await fn(r); ok++; } catch (e) { failed++; console.warn(`[Stashpad] bulk ${label} failed`, r.file.path, e); } }
     new Notice(`${label}: ${ok} done${failed ? `, ${failed} failed` : ""}.`);
-    rerender();
+    // 0.295.2 (perf): a bulk action MUTATED notes — this is the one in-view
+    // path that must re-collect rather than repaint the cache.
+    recollect();
   };
   const repaintBulk = (): void => {
     bulkBar.empty();
@@ -336,7 +446,8 @@ export async function renderMasterIndex(
   };
 
   /** Rows repaint on SEARCH keystrokes without rebuilding the facet bar, so the
-   *  input keeps focus. Facet changes re-collect + full re-render. */
+   *  input keeps focus. 0.295.2 (perf): facet changes rebuild the bar too, but
+   *  both paths now run over the same CACHED rows — no vault sweep either way. */
   const paintRows = (): void => {
     const shown = rows.filter(matches).sort(cmp);
     countEl.setText(`${shown.length} of ${rows.length} note${rows.length === 1 ? "" : "s"}`);
@@ -363,7 +474,10 @@ export async function renderMasterIndex(
       if (r.color) { const sw = icons.createSpan({ cls: "stashpad-index-swatch" }); sw.style.background = r.color; sw.title = r.color; }
       if (r.hasAttachments) ic("paperclip", "Has attachments");
       if (r.internalLinks > 0) ic("link", `${r.internalLinks} internal link${r.internalLinks === 1 ? "" : "s"}`);
-      if (r.hasExternalLinks) ic("globe", "Contains an external link");
+      // 0.296.0 (perf): `undefined` = not computed (the "http" chip was never
+      // on, so no body was read). The globe is omitted rather than guessed;
+      // turning the chip on fills the flag and the icons appear.
+      if (r.hasExternalLinks === true) ic("globe", "Contains an external link");
       if (r.imported) ic("download", "Imported");
       if (r.orphan) ic("unlink", "Orphan: its parent id resolves nowhere in this folder, so no list shows it. The fix-orphans command re-homes it.");
       if (r.hasBrokenLinks) ic("link-2-off", "Has a broken link — a [[wikilink]] pointing at something that doesn't exist.");

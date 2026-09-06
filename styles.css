@@ -1611,6 +1611,16 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   background-clip: content-box;
 }
 .stashpad-note:hover .stashpad-note-grip { opacity: 0.8; }
+/* 0.296.0 (perf): hidden per-document `<symbol>` sprite for the note-row icons
+   (see src/icon-sprite.ts). It must never paint or take layout. `display: none`
+   is safe with `<use>`: a `<symbol>` is never rendered in place anyway, and the
+   reference is resolved by id and cloned into the `<use>` shadow tree, so the
+   host being undisplayed does not break it (the standard SVG-sprite technique;
+   Obsidian is Chromium-only, which implements it this way). Class-only — no
+   inline `style=` — to stay within the Obsidian store lint. The per-row icons
+   themselves carry `.svg-icon .sp-icon` and are sized/coloured by the existing
+   `.svg-icon` rules (Obsidian's `--icon-size` / `--icon-stroke` and ours). */
+.sp-icon-sprite { display: none; }
 .stashpad-note-grip:hover { color: var(--text-muted); opacity: 1 !important; }
 .stashpad-note-grip:active { cursor: grabbing; }
 .stashpad-note-grip .svg-icon { width: 14px; height: 14px; transition: opacity 0.1s ease; }
@@ -8446,8 +8456,42 @@ button.stashpad-btn-loading::after {
 
    Scoped to text controls inside Stashpad surfaces. `styles.css` is loaded
    globally, so a bare `textarea` rule would reach into core and other plugins. */
-[class*="stashpad-"] textarea,
-[class*="stashpad-"] input:not([type="checkbox"]):not([type="radio"]),
+/* 0.296.0 (perf): the ancestor test was `[class*="stashpad-"]` — an UNANCHORED
+   substring attribute match with no class/tag key, so the style engine had to
+   consider it for every element in the document and re-run it on any class
+   mutation anywhere (Obsidian toggles classes constantly). Replaced with the
+   explicit list of Stashpad ROOTS, each a real class the engine can bucket.
+
+   Coverage: the old selector matched a control whose ANCESTOR carried any
+   `stashpad-*` class. Every such ancestor lives under one of the roots below —
+   leaf views (main/aggregate/detail/folder-panel/panels/trash/import), the
+   index/calendar/heatmap hosts, our modals (each stamps a `stashpad-*` class on
+   modalEl/contentEl), the settings sections, and the popovers/suggests we mount
+   on `document.body` (which is why those are listed explicitly: they are NOT
+   inside any leaf view). Controls in a core SuggestModal that carries no
+   `stashpad-*` class were never matched before and still aren't — parity.
+   The element-anchored halves are kept: their rightmost key is a TAG, so they
+   were already cheap, and they catch a stashpad-classed control whose host
+   isn't one of the roots. */
+:is(
+  .stashpad-view, .stashpad-aggregate-view, .stashpad-detail-root,
+  .stashpad-folderpanel-root, .stashpad-panels-root, .stashpad-trash-view,
+  .stashpad-import-host, .stashpad-index, .stashpad-cal, .stashpad-heat,
+  .stashpad-settings-section, .stashpad-welcome,
+  .stashpad-compact-modal, .stashpad-log-modal, .stashpad-split-modal,
+  .stashpad-export-modal, .stashpad-encryption-modal, .stashpad-color-modal,
+  .stashpad-custom-color-modal, .stashpad-breadcrumb-modal,
+  .stashpad-notif-history-modal, .stashpad-dropzone-modal,
+  .stashpad-dupes-modal, .stashpad-largetext-modal, .stashpad-media-modal,
+  .stashpad-task-review-modal, .stashpad-import-modal,
+  .stashpad-view-popover, .stashpad-sort-popover, .stashpad-tag-filter-popover,
+  .stashpad-color-filter-popover, .stashpad-mobile-filters-popover,
+  .stashpad-day-filter-pop, .stashpad-timeline-datepop, .stashpad-when-popover,
+  .stashpad-composer-suggest, .stashpad-assign-suggest, .stashpad-tagsec-suggest,
+  .stashpad-note-template-suggest, .stashpad-due-picker,
+  .stashpad-reaction-picker, .stashpad-reaction-overflow,
+  .stashpad-instant-tip, .stashpad-progress-notice
+) :is(textarea, input:not([type="checkbox"]):not([type="radio"])),
 textarea[class*="stashpad-"],
 input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   -webkit-user-select: text;

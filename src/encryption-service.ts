@@ -107,6 +107,7 @@ export class EncryptionService {
    *  caller awaits the SAME in-flight walk rather than starting a duplicate one.
    *  Cleared by `invalidateStashKeyIndex()` so a later refresh re-walks. */
   startStashKeyIndex(): Promise<void> {
+    if (this.unloaded) return Promise.resolve();        // 0.295.2: no walks after dispose()
     if (this.stashKeysIndexed) return Promise.resolve();
     if (!this.indexPromise) {
       this.indexPromise = this.indexStashKeys().finally(() => { this.indexPromise = null; });
@@ -124,6 +125,23 @@ export class EncryptionService {
     // not proof of completeness — re-walk (bounded, so a pathological
     // create/remove storm can't spin here forever).
     for (let i = 0; i < 4 && !this.stashKeysIndexed; i++) await this.startStashKeyIndex();
+  }
+
+  /** 0.295.2: re-walk the vault for `.stashkey` files, discarding the "already
+   *  indexed" flag but NOT the current key map — `hasFolderKey()` keeps answering
+   *  from the previous (complete) result set for the duration, and the new set is
+   *  published atomically on completion (epoch-guarded), so a caller that lands
+   *  mid-walk never sees an empty index. A key REMOVED on another device stops
+   *  being trusted here, when the replacement set lands. Driven from main.ts on a
+   *  10-minute interval and after a sync burst settles. */
+  refreshStashKeyIndex(): Promise<void> {
+    if (this.unloaded) return Promise.resolve();
+    // Join any walk already in flight FIRST: invalidating bumps the epoch, so that
+    // walk will publish nothing, and `startStashKeyIndex()` would otherwise just
+    // hand back that doomed promise instead of starting a fresh one.
+    const inFlight = this.indexPromise;
+    this.invalidateStashKeyIndex();
+    return inFlight ? inFlight.then(() => this.startStashKeyIndex()) : this.startStashKeyIndex();
   }
 
   /** True when the `.stashkey` index is complete. A `false` from `hasFolderKey()`
@@ -148,7 +166,91 @@ export class EncryptionService {
 
   /** Force a re-scan of `.stashkey` files on the next refresh (after a folder key
    *  is created/removed, or on explicit reload). */
-  invalidateStashKeyIndex(): void { this.stashKeysIndexed = false; this.indexEpoch++; }
+  invalidateStashKeyIndex(): void {
+    this.stashKeysIndexed = false; this.indexEpoch++;
+    this.negativeProbes.clear();                       // 0.295.2: don't carry stale "no key here" past a re-walk
+  }
+
+  // ---- 0.295.2: rediscovering `.stashkey` files that arrive AFTER the walk ----
+  // `.stashkey` is a dotfile, so Obsidian's vault fires NO create/modify/delete
+  // event for it: a key synced in from another device (Obsidian Sync, iCloud, a
+  // git pull) was invisible until the plugin reloaded, and `invalidateStashKeyIndex()`
+  // had zero callers. Two cheap mechanisms close that, both on the NEGATIVE side
+  // only (a positive is never re-probed — that would cost an adapter round trip
+  // on every render-time key lookup):
+  //   1. `recheckFolderKeyOnDisk()` — before a user-facing path trusts "this
+  //      folder has no key", probe the folder + its ancestors on disk. Memoized
+  //      for RECHECK_TTL_MS per exact folder so a burst can't hammer the adapter.
+  //   2. a periodic + sync-burst-triggered re-walk, driven from main.ts.
+  private static readonly RECHECK_TTL_MS = 5000;
+  /** Memo key for the vault-wide probe. Leading "/" — a cleaned vault-relative
+   *  folder path never starts with one, so this can't collide with a real folder. */
+  private static readonly VAULT_PROBE_KEY = "/vault";
+  /** folder path → timestamp of the last probe that found NOTHING. */
+  private negativeProbes = new Map<string, number>();
+  private probeInFlight = new Map<string, Promise<boolean>>();
+
+  /** 0.295.2: true if we probed this exact folder on disk within the TTL and it
+   *  (and its ancestors) genuinely had no `.stashkey`. Lets a sync call site skip
+   *  a redundant async probe without ever trusting an unverified negative. */
+  folderKeyNegativeIsFresh(folder: string): boolean {
+    const t = this.negativeProbes.get(this.cleanFolder(folder));
+    return t !== undefined && Date.now() - t < EncryptionService.RECHECK_TTL_MS;
+  }
+
+  /** 0.295.2: `hasFolderKey()`, but a NEGATIVE is verified against disk before it
+   *  is believed. Mirrors `owningFolder()` exactly — the folder itself, then each
+   *  ancestor, since a subfolder inherits its nearest keyed ancestor's key — and
+   *  loads any key it finds through the same `folderKeystore.read()` path the walk
+   *  uses, so the index converges instead of just answering once. */
+  async recheckFolderKeyOnDisk(folder: string): Promise<boolean> {
+    if (this.hasFolderKey(folder)) return true;         // positives are never re-probed
+    if (this.unloaded) return false;
+    const f = this.cleanFolder(folder);
+    if (this.folderKeyNegativeIsFresh(f)) return false;
+    let p = this.probeInFlight.get(f);
+    if (!p) {
+      p = this.probeFolderChain(f).finally(() => { this.probeInFlight.delete(f); });
+      this.probeInFlight.set(f, p);
+    }
+    return p;
+  }
+
+  private async probeFolderChain(f: string): Promise<boolean> {
+    let p = f;
+    while (p) {
+      if (this.folderKeyFiles.has(p)) return true;      // landed via another path mid-probe
+      const sk = await this.folderKeystore.read(p);
+      if (sk) {
+        // Same publish discipline as setupFolderKey: bump the epoch so an
+        // in-flight walk (which started without this key) can't publish a result
+        // set that drops it again.
+        this.indexEpoch++;
+        this.folderKeyFiles.set(p, sk);
+        this.negativeProbes.delete(f);
+        return true;
+      }
+      const i = p.lastIndexOf("/");
+      if (i < 0) break;
+      p = p.slice(0, i);
+    }
+    this.negativeProbes.set(f, Date.now());
+    return false;
+  }
+
+  /** 0.295.2: `isConfigured()`, but a NEGATIVE forces one full re-walk before it
+   *  is believed — the vault-wide question has no single folder to probe. Only
+   *  reached on a path that is about to tell the user "encryption isn't set up",
+   *  and rate-limited by the same TTL, so the walk cost lands on the error path. */
+  async isConfiguredRechecked(): Promise<boolean> {
+    if (this.isConfigured()) return true;
+    if (this.folderKeyNegativeIsFresh(EncryptionService.VAULT_PROBE_KEY)) return false;
+    await this.refreshStashKeyIndex();
+    await this.whenKeysReady();
+    const ok = this.isConfigured();
+    if (!ok) this.negativeProbes.set(EncryptionService.VAULT_PROBE_KEY, Date.now());
+    return ok;
+  }
   /** 0.294.0 (perf): bumped by every invalidation. A walk that finishes on a stale
    *  epoch publishes nothing and leaves the index dirty, so the next
    *  `startStashKeyIndex()` re-walks. Matters now that the walk is concurrent
@@ -246,6 +348,9 @@ export class EncryptionService {
     // A `.stashkey` was created/removed while we walked — this result set may
     // have missed it. Publish nothing and stay dirty so the next caller re-walks.
     if (epoch !== this.indexEpoch) return;
+    // 0.295.2: a re-walk can now be in flight when the plugin unloads. Publishing
+    // into a disposed service would resurrect key material after dispose() wiped it.
+    if (this.unloaded) return;
     this.folderKeyFiles = found;
     this.stashKeysIndexed = true;
   }
@@ -784,5 +889,8 @@ export class EncryptionService {
     return removed;
   }
 
-  dispose(): void { this.lock(); }
+  /** 0.295.2: set by dispose(). An in-flight re-walk that finishes after unload
+   *  publishes nothing, and no new walk is started. */
+  private unloaded = false;
+  dispose(): void { this.unloaded = true; this.indexEpoch++; this.negativeProbes.clear(); this.lock(); }
 }

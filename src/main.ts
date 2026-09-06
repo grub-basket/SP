@@ -33,6 +33,7 @@ import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
 import { ROOT_ID, parseAssignees, writeCompletedFm } from "./types";
+import { removeIconSprites } from "./icon-sprite";
 import { parseRecurrence, nextDueOnComplete, parseDuration, parseRepeatMode } from "./recurrence";
 import { spawnNextOccurrence, claimOccurrenceMissed } from "./recurrence-spawn";
 import { OrderStore } from "./order-store";
@@ -757,6 +758,12 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    // 0.296.0: row-icon sprites live on each window's <body>; sweep them.
+    try {
+      const docs = new Set<Document>([document]);
+      this.app.workspace.iterateAllLeaves((l) => { docs.add(l.view.containerEl.ownerDocument); });
+      removeIconSprites(docs);
+    } catch { /* best-effort */ }
     // 0.97.0: wipe the in-memory encryption key on unload.
     try { this.encryption?.dispose(); } catch { /* best-effort */ }
     // Cancel pending archive-sweep timers — firing after unload would run
@@ -2643,8 +2650,20 @@ export default class StashpadPlugin extends Plugin {
       // 0.99.19: fire reminders for tasks that came due while Obsidian was
       // closed (delay so the metadata cache is populated), then re-check on an
       // interval so tasks coming due while it's open also surface.
-      window.setTimeout(() => void this.checkDueReminders(), 6000);
+      // 0.295.2 (perf): checkDueReminders used to walk EVERY markdown file and
+      // pull its metadata cache on every 5-minute tick. It now scans a
+      // maintained `path → dueMs` index instead; the events are attached here
+      // (before the first check) and the index is built once, right before that
+      // first check, so tasks that came due while Obsidian was closed still fire.
+      this.registerDueIndexEvents();
+      window.setTimeout(() => { this.rebuildDueIndex(); void this.checkDueReminders(); }, 6000);
       this.registerInterval(window.setInterval(() => void this.checkDueReminders(), 5 * 60 * 1000));
+      // 0.295.2: hourly full rebuild as a safety net — it catches anything the
+      // incremental events can't see (files indexed before the listener
+      // attached, a FOLDER rename that fires one event for the folder rather
+      // than one per child, any cache event we don't observe). One walk an hour
+      // is a rounding error next to one every five minutes.
+      this.registerInterval(window.setInterval(() => this.rebuildDueIndex(), 60 * 60 * 1000));
       // 0.279.17: scheduled obscuring — refresh views when the daily blur window
       // opens/closes or the timezone changes (travel), so a folder set to obscure
       // during set hours actually clears/covers as the hour passes without needing
@@ -2652,6 +2671,26 @@ export default class StashpadPlugin extends Plugin {
       // to TRIGGER a re-render at the boundary. Cheap: no work unless it flips.
       this.checkObscureSchedule(); // seed baseline
       this.registerInterval(window.setInterval(() => this.checkObscureSchedule(), 60 * 1000));
+      // 0.295.2: rediscover `.stashkey` files that arrive AFTER the startup walk.
+      // They're dotfiles, so Obsidian's vault fires no create/delete event for
+      // them — a folder password set on device A was invisible on device B until
+      // a plugin reload. Two triggers, both off the critical path:
+      //   • a 10-minute interval (registerInterval → cleaned up on unload);
+      //   • the END of a sync burst — metadataCache "resolved" fires continuously
+      //     while Sync lands files, so debounce it by 60s and re-walk once after
+      //     it settles, which is exactly when a batch of synced keys has landed.
+      // The walk is the parallel one from 0.294.0 and publishes on completion
+      // (epoch-guarded), so the index is never blanked mid-walk. It also drops a
+      // `.stashkey` DELETED on another device, since the new set REPLACES the old.
+      this.registerInterval(window.setInterval(() => void this.encryption.refreshStashKeyIndex(), 10 * 60 * 1000));
+      let stashKeyRewalkTimer = 0;
+      this.register(() => window.clearTimeout(stashKeyRewalkTimer));
+      this.registerEvent(
+        this.app.metadataCache.on("resolved", () => {
+          window.clearTimeout(stashKeyRewalkTimer);
+          stashKeyRewalkTimer = window.setTimeout(() => void this.encryption.refreshStashKeyIndex(), 60 * 1000);
+        }),
+      );
       window.setTimeout(() => { void this.seedLocalAuthorStubsEverywhere(); }, 4000);
       // 0.79.12: register each Stashpad folder's _archive in Obsidian's
       // "Excluded files" so native search / quick switcher / graph / link
@@ -4061,7 +4100,8 @@ export default class StashpadPlugin extends Plugin {
       name: "Decrypt a folder bundle (encrypted non-Stashpad folder)…",
       callback: async () => {
         await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
-        if (!this.encryption.isConfigured()) { new Notice("Stashpad encryption isn't set up."); return; }
+        // 0.295.2: one re-walk before believing "no keys at all" (see isConfiguredRechecked).
+        if (!(await this.encryption.isConfiguredRechecked())) { new Notice("Stashpad encryption isn't set up."); return; }
         const bundles = await listRawFolderBlobs(this.app);
         if (!bundles.length) { new Notice("No encrypted folder bundles found in this vault."); return; }
         new FolderBundleSuggest(this.app, bundles, (b) => void this.decryptFolderFromExplorer(b.folder)).open();
@@ -6188,7 +6228,11 @@ export default class StashpadPlugin extends Plugin {
     // is what makes empty-because-not-ready distinguishable from
     // empty-because-no-keys for the whole unlock path.
     await this.encryption.whenKeysReady();
-    if (!this.encryption.hasFolderKey(folder)) {
+    // 0.295.2: `.stashkey` is a dotfile, so a key synced in from another device
+    // fires no vault event and is invisible to a completed index. Verify a
+    // NEGATIVE against disk (folder + ancestors, memoized ~5s) before telling the
+    // user their encrypted folder "isn't encrypted".
+    if (!(await this.encryption.recheckFolderKeyOnDisk(folder))) {
       new Notice("This folder isn't encrypted. Give it a password in Settings → Stashpad → Encryption → Per-Folder Passwords.");
       return null;
     }
@@ -6529,7 +6573,8 @@ export default class StashpadPlugin extends Plugin {
    *  interruption never loses data. Does NOT touch Obsidian's sync API. */
   async encryptAllNow(): Promise<void> {
     await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
-    if (!this.encryption.isConfigured() && !this.encryption.hasAnyFolderKey()) {
+    // 0.295.2: re-walk once before believing "no keys at all".
+    if (!(await this.encryption.isConfiguredRechecked()) && !this.encryption.hasAnyFolderKey()) {
       new Notice("Set up encryption first — give a folder a password (Settings → Stashpad → Encryption).");
       return;
     }
@@ -6742,7 +6787,8 @@ export default class StashpadPlugin extends Plugin {
    *  everything" safety valve. Each blob is independent + skip-on-error. */
   async unlockAllInVault(): Promise<number> {
     await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
-    if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return 0; }
+    // 0.295.2: re-walk once before believing "no keys at all".
+    if (!(await this.encryption.isConfiguredRechecked())) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return 0; }
     // Exclude ALL trash stores (`_deleted/` + per-folder `<folder>/trash/`) —
     // those are DELETED notes, not locked ones; "unlocking" them would restore
     // them INTO the reserved trash dir (invisible to every view). Use the
@@ -6765,7 +6811,9 @@ export default class StashpadPlugin extends Plugin {
     const keyFor = async (resident: string): Promise<Uint8Array | null> => {
       if (keyCache.has(resident)) return keyCache.get(resident)!;
       let dek: Uint8Array | null = null;
-      if (this.encryption.hasFolderKey(resident)) {
+      // 0.295.2: verify the negative on disk (memoized per folder, so the loop
+      // costs at most one probe chain per resident folder).
+      if (await this.encryption.recheckFolderKeyOnDisk(resident)) {
         if (this.encryption.isFolderUnlocked(resident) || await this.encryption.tryAutoUnlockFolder(resident)) dek = this.encryption.getFolderKey(resident);
       }
       keyCache.set(resident, dek);
@@ -7316,7 +7364,8 @@ export default class StashpadPlugin extends Plugin {
   /** Open a picker over the encrypted trash; restore the chosen note in place. */
   async openRestoreTrashPicker(): Promise<void> {
     await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
-    if (!this.encryption.isConfigured()) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return; }
+    // 0.295.2: re-walk once before believing "no keys at all".
+    if (!(await this.encryption.isConfiguredRechecked())) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return; }
     const items = await this.listDeletedTrash();
     if (items.length === 0) { new Notice("Encrypted trash is empty."); return; }
     const entries = items.map(({ blob, meta }) => ({
@@ -8031,7 +8080,16 @@ export default class StashpadPlugin extends Plugin {
     // in an encrypted archive folder. The deferred flush below re-checks
     // `hasFolderKey` after awaiting the index, so a false positive just queues
     // work that then no-ops.
-    if (this.encryption.keysIndexed() && !this.encryption.isConfigured()) return;
+    // 0.295.2: and only trust that negative if we have VERIFIED this folder has no
+    // `.stashkey` on disk within the last few seconds — a key synced in from
+    // another device fires no vault event, so a complete index can still be
+    // stale. When the probe is stale we fall through (the safe direction: the
+    // deferred sweep re-checks and no-ops) and kick the probe off so the next
+    // move-in — and the sweep 1.8s from now — decide against the truth.
+    if (this.encryption.keysIndexed() && !this.encryption.isConfigured()) {
+      if (this.encryption.folderKeyNegativeIsFresh(newDir)) return;
+      void this.encryption.recheckFolderKeyOnDisk(newDir);
+    }
     let pending = this.archivePending.get(newDir);
     if (!pending) { pending = { paths: new Set(), timer: 0 }; this.archivePending.set(newDir, pending); }
     pending.paths.add(file.path);
@@ -8096,7 +8154,10 @@ export default class StashpadPlugin extends Plugin {
     // 0.143.0: per-folder only — encrypt arriving notes ONLY if this archive folder
     // has its own password. A keyless archive folder just stays plaintext (boring).
     await this.encryption.whenKeysReady();   // 0.294.0 (perf): see maybeArchiveOnMoveIn
-    if (!this.encryption.hasFolderKey(cleaned)) return;
+    // 0.295.2: verify the negative on disk — a folder password set on another
+    // device (its `.stashkey` synced in, no vault event) must not leave arriving
+    // notes plaintext in an encrypted archive folder.
+    if (!(await this.encryption.recheckFolderKeyOnDisk(cleaned))) return;
     if (!(await this.ensureFolderUnlocked(cleaned))) {
       new Notice(`⚠️ Archive folder "${cleaned.split("/").pop()}": ${roots.length} arriving note${roots.length === 1 ? "" : "s"} NOT encrypted (couldn't unlock the folder password). Unlock it and lock them manually.`, 0);
       return;
@@ -8928,8 +8989,76 @@ export default class StashpadPlugin extends Plugin {
     } catch (e) { console.warn("[Stashpad] auto-resolve failed", f.path, e); }
   }
 
+  /** 0.295.2 (perf): `path → dueMs` for every markdown file that is a reminder
+   *  CANDIDATE — same predicate the sweep's own loop used: not under
+   *  `/_authors/`, frontmatter present with a non-null `due` that parses, and a
+   *  non-empty string `id`. `due` is the only reminder key read here; every
+   *  other field the sweep consults (`completed`, `repeat`, `repeatMode`,
+   *  `autoDoneAfter`, `remindEvery`, assignees) is still read live from the
+   *  metadata cache per candidate, so behaviour is unchanged — the index only
+   *  narrows WHICH files get looked at. null = not built yet. */
+  private dueIndex: Map<string, number> | null = null;
+
+  /** The candidate test, shared by the full rebuild and the incremental updates
+   *  so the two can't drift. Returns the due timestamp, or null for "not a
+   *  reminder candidate". */
+  private dueMsForCandidate(path: string, fm: { id?: unknown; due?: unknown } | undefined): number | null {
+    if (path.includes("/_authors/")) return null;
+    if (!fm || fm.due == null) return null;
+    if (typeof fm.id !== "string" || !fm.id) return null;
+    const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(String(fm.due));
+    return Number.isFinite(dueMs) ? dueMs : null;
+  }
+
+  /** 0.295.2: full walk — the old per-tick cost, now paid once at startup and
+   *  once an hour. */
+  private rebuildDueIndex(): void {
+    const idx = new Map<string, number>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown } | undefined;
+      const dueMs = this.dueMsForCandidate(f.path, fm);
+      if (dueMs != null) idx.set(f.path, dueMs);
+    }
+    this.dueIndex = idx;
+  }
+
+  /** 0.295.2: keep the index current. "changed" covers edits from THIS device
+   *  and files arriving/changing via Sync (the cache re-indexes them and fires),
+   *  so a `due` set on another device is picked up without a rebuild. */
+  private registerDueIndexEvents(): void {
+    this.registerEvent(this.app.metadataCache.on("changed", (f, _data, cache) => {
+      if (this.dueIndex == null || f.extension !== "md") return;
+      const dueMs = this.dueMsForCandidate(f.path, cache?.frontmatter as { id?: unknown; due?: unknown } | undefined);
+      if (dueMs == null) this.dueIndex.delete(f.path);
+      else this.dueIndex.set(f.path, dueMs);
+    }));
+    this.registerEvent(this.app.vault.on("delete", (f) => { this.dueIndex?.delete(f.path); }));
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+      const idx = this.dueIndex;
+      if (!idx) return;
+      if (f instanceof TFile) {
+        const dueMs = idx.get(oldPath);
+        idx.delete(oldPath);
+        if (dueMs != null) idx.set(f.path, dueMs);
+        return;
+      }
+      // A FOLDER rename fires once for the folder: re-key every entry under the
+      // old prefix so a reminder in a just-renamed folder is not delayed until
+      // the hourly rebuild (and a persistent one isn't pruned + re-fired early).
+      const oldPrefix = oldPath + "/", newPrefix = f.path + "/";
+      for (const [path, dueMs] of Array.from(idx)) {
+        if (!path.startsWith(oldPrefix)) continue;
+        idx.delete(path);
+        idx.set(newPrefix + path.slice(oldPrefix.length), dueMs);
+      }
+    }));
+  }
+
   async checkDueReminders(): Promise<void> {
     const now = Date.now();
+    // 0.295.2: lazy build, in case a check somehow runs before the deferred
+    // startup build (e.g. the manual command path landing first).
+    if (this.dueIndex == null) this.rebuildDueIndex();
     const notified = new Set(this.settings.notifiedDueKeys ?? []);
     const myId = (this.settings.authorId ?? "").trim();
     const due: Array<{ id: string; folder: string; file: TFile; dueMs: number; key: string }> = [];
@@ -8938,7 +9067,15 @@ export default class StashpadPlugin extends Plugin {
     let persistDirty = false;
     const activePersistIds = new Set<string>(); // 0.140.1: for pruning the log
     let missedRolled = 0; // 0.197.0: interval-mode occurrences closed out as missed
-    for (const f of this.app.vault.getMarkdownFiles()) {
+    // 0.295.2: scan the index, not the vault. Snapshot the entries first — the
+    // body awaits (auto-resolve / occurrence spawn), and those writes fire
+    // "changed", which would mutate the map mid-iteration. The per-file
+    // predicate below is unchanged and re-runs against the LIVE cache, so a
+    // stale index entry (file gone, `due` cleared since) is simply skipped.
+    for (const [path, indexedDueMs] of [...(this.dueIndex ?? new Map<string, number>())]) {
+      if (indexedDueMs > now) continue; // not due yet — cheapest possible reject
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (!(f instanceof TFile)) { this.dueIndex?.delete(path); continue; }
       if (f.path.includes("/_authors/")) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown; completed?: unknown; repeat?: unknown; autoDoneAfter?: unknown; remindEvery?: unknown } | undefined;
       if (!fm || fm.due == null) continue;
@@ -9076,7 +9213,20 @@ export default class StashpadPlugin extends Plugin {
     const now = Date.now();
     const myId = (this.settings.authorId ?? "").trim();
     const due: Array<{ id: string; folder: string; file: TFile; dueMs: number }> = [];
-    for (const f of this.app.vault.getMarkdownFiles()) {
+    // 0.296.0 (perf): scan the due index instead of sweeping every markdown file
+    // and reading its cache. The index's candidate predicate (not under
+    // `/_authors/`, `due` present and parseable, non-empty string `id`) is a
+    // SUPERSET-free match for this loop's own first three rejections, so the
+    // candidate set is identical — `completed`, the assignee scoping and the
+    // due-vs-now test still run live below, unchanged.
+    // Rebuilt unconditionally, not just when null: this is a MANUAL command
+    // fired once by the user, so a full walk is affordable and correctness beats
+    // speed — it can't miss a note whose `due` arrived while the index was
+    // unbuilt, or one the incremental events somehow didn't see.
+    this.rebuildDueIndex();
+    for (const path of [...(this.dueIndex ?? new Map<string, number>()).keys()]) {
+      const f = this.app.vault.getAbstractFileByPath(path);
+      if (!(f instanceof TFile)) continue;
       if (f.path.includes("/_authors/")) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: unknown; due?: unknown; completed?: unknown } | undefined;
       if (!fm || fm.due == null) continue;

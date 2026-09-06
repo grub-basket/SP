@@ -7,7 +7,7 @@ import { STASHPAD_AGGREGATE_VIEW_TYPE, archiveSubfolderOf } from "./types";
 /** One row of the locked-subtree registry (`settings.lockedSubtrees`). */
 type LockedEntry = { folder: string; blob: string; parentId?: string | null; title?: string; count?: number; created?: string; rootId?: string; prevSibling?: string | null };
 import { renderTaskTriage, defaultTaskTriageState, type TaskTriageState } from "./task-render";
-import { renderMasterIndex, defaultIndexState, type IndexState } from "./aggregate-index";
+import { renderMasterIndex, defaultIndexState, invalidateIndexRows, type IndexState } from "./aggregate-index";
 import { renderTaskTimeline, defaultTimelineState, type TimelineState } from "./task-timeline";
 import { renderDueCalendar, defaultDueCalendarState, type DueCalendarState } from "./due-calendar";
 import { renderActivityHeatmap, defaultHeatmapState, type HeatmapState } from "./activity-heatmap";
@@ -131,6 +131,13 @@ export class StashpadAggregateView extends ItemView {
   }
 
   private scheduleRender(): void {
+    // 0.295.2 (perf): invalidate IMMEDIATELY, not at the debounced render.
+    // Otherwise a facet toggle landing inside the 400ms window would repaint
+    // from rows collected BEFORE the edit — visibly stale until the pending
+    // render fired. Nulling here costs nothing during a burst (no paint happens
+    // between events, so it's still one collect at the end) and makes any paint
+    // in the window re-collect, exactly as it did before this cache existed.
+    invalidateIndexRows(this.indexState);
     if (!this.isVisible()) { this.dirty = true; return; }
     if (this.renderPending) return;
     this.renderPending = true;
@@ -161,6 +168,14 @@ export class StashpadAggregateView extends ItemView {
     // every save and stealing the main thread — the suspected list-lag cause.
     perf.record(`aggregate.render.${this.mode}`, 0);
     this.dirty = false; // a full recompute satisfies any deferred-while-hidden change
+    // 0.295.2 (perf): render() is the ONE funnel every data-change path goes
+    // through — initial open, the debounced vault/metadata events (via
+    // scheduleRender), the deferred-while-hidden `dirty` catch-up, the manual
+    // refresh button, and a setState mode switch. So invalidating the master
+    // index's row cache here is exactly "collect once per data change": the
+    // index's own facet/sort/select/search toggles repaint from the cache
+    // WITHOUT coming back through render(), and so no longer re-sweep the vault.
+    invalidateIndexRows(this.indexState);
     const root = this.contentEl;
     root.empty();
     root.addClass("stashpad-aggregate-body");

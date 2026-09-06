@@ -2051,7 +2051,9 @@ export class StashpadSettingTab extends PluginSettingTab {
           if (v && requireKey) {
             // 0.143.0: per-folder only — this option needs the folder's OWN key.
             // If it has none, tell the user to set a folder password first.
-            if (!this.plugin.encryption.hasFolderKey(folder)) {
+            // 0.295.2: verify the negative on disk — a `.stashkey` synced in from
+            // another device fires no vault event, so the index can be stale.
+            if (!(await this.plugin.encryption.recheckFolderKeyOnDisk(folder))) {
               new Notice("Give this folder a password first (the “Set folder password…” button above), then enable this.");
               this.pfeRerender?.(); return;
             }
