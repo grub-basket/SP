@@ -786,6 +786,11 @@ export interface StashpadSettings {
    *  effect that vanishes the moment the cursor moves. Off by
    *  default. */
   autoExpandCursorRow: boolean;
+  /** 0.295.1 (perf): windowed rendering for big lists — only the rows near
+   *  the viewport are built (spacers stand in for the rest). On by default;
+   *  the off switch exists so a folder that scrolls oddly can fall back to
+   *  building every row. Applies above ~120 notes. */
+  virtualizeLargeLists: boolean;
   /** When on, note bodies render fully expanded by default; the
    *  per-note "Show more / show less" toggle and the expand/collapse-all
    *  commands then act as a *collapse* opt-out (the expandedNotes Set is
@@ -1042,6 +1047,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   pinnedFilterMode: "all",
   pinnedChildrenPersist: false,
   autoExpandCursorRow: false,
+  virtualizeLargeLists: true,
   expandBodiesByDefault: false,
   autoOpenDetailPanel: false,
   doubleClickToFocus: true,
@@ -2599,6 +2605,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.autoOpenDetailPanel, (v) => { this.plugin.settings.autoOpenDetailPanel = v; }, ["detail", "panel", "sidebar"]));
     cats.listDisplay.push(toggle("Expand the cursor row's body automatically", "As you arrow-key through the list, the row under the cursor temporarily un-clamps to show its full body. Moving away re-collapses it. Doesn't affect the persistent 'Show more' state — this is a transient view-only effect.",
       () => this.plugin.settings.autoExpandCursorRow, (v) => { this.plugin.settings.autoExpandCursorRow = v; }, ["expand", "cursor", "body"]));
+    cats.listDisplay.push(toggle("Windowed rendering for large folders", "In folders with more than ~120 notes, build only the rows near the viewport and stand spacers in for the rest, so opening, filtering and scrolling a big folder stays fast. Turn off if a large folder scrolls oddly on your device — every row is then built up front, as before 0.295.",
+      () => this.plugin.settings.virtualizeLargeLists !== false, (v) => { this.plugin.settings.virtualizeLargeLists = v; }, ["virtual", "window", "large", "performance", "scroll", "rows"]));
     cats.listDisplay.push(toggle("Expand note bodies by default", "Show every note's full body by default instead of clamping long notes. The per-note 'Show more / show less' toggle and the Expand-all / Collapse-all commands then work in reverse — they let you collapse individual notes back down. Off = bodies clamp by default (expand is opt-in).",
       () => this.plugin.settings.expandBodiesByDefault, (v) => { this.plugin.settings.expandBodiesByDefault = v; }, ["expand", "collapse", "default", "body", "clamp"]));
     cats.movingNotes.push(toggle("Confirm cross-parent drag-and-drop", "When dragging notes onto a note that has a different parent, ask before re-parenting (turn off to allow direct moves).",

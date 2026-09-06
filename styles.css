@@ -1494,6 +1494,14 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   gap: 4px;
 }
 
+/* 0.295.0 (perf): row-virtualization spacers stand in for the rows outside
+   the rendered window. Height is set per paint from measured row heights;
+   `hidden` when zero so an empty spacer doesn't contribute a flex gap. */
+.stashpad-list > .stashpad-virt-spacer {
+  flex: 0 0 auto;
+  width: 100%;
+  pointer-events: none;
+}
 .stashpad-list {
   flex: 1 1 auto;
   min-height: 0;

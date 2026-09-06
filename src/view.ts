@@ -2773,6 +2773,15 @@ export class StashpadView extends ItemView {
       .map((lk) => ({ lk, ts: lockTs(lk) }))
       .sort((a, b) => a.ts - b.ts);
 
+    // 0.295.0 (perf): big pure-note lists render a WINDOW of rows, not all of
+    // them — see the virtualization block near tryIncrementalAppend.
+    if (this.virtEligible(fileItems.length, lockItems.length)) {
+      this.virtMount(list);
+      if (this.headingNode() && !this.tinyMode) this.installHeadingStuckObserver(list);
+      return;
+    }
+    this.virtTeardown();
+
     // 0.98.9: in MANUAL sort, a locked placeholder keeps the exact slot its note
     // occupied — anchored after its `prevSibling` (the left-neighbor captured at
     // lock), NOT by `created`. Otherwise locking a reordered note would jump the
@@ -3436,6 +3445,7 @@ export class StashpadView extends ItemView {
     const list = this.listEl;
     if (!list) return;
     if (anchor) {
+      this.virtEnsureId(anchor.id); // 0.295.0: the anchor row may sit outside the first window
       const row = list.querySelector(`[data-id="${anchor.id}"]`);
       if (row) {
         const listTop = list.getBoundingClientRect().top;
@@ -3748,6 +3758,11 @@ export class StashpadView extends ItemView {
     // (anchor restoration during preserve renders), but the save itself
     // happens on selection mutations (see stampSelectedCursor).
     this.dnd.attachListDnD(list);
+    // 0.295.0 (perf): tell the virtualized list where this paint will scroll
+    // to, so its first window is built there instead of at the top.
+    this.virtScrollHint = (policy?.kind === "pin-bottom" || this.scrollToBottomOnNextRender)
+      ? Infinity
+      : (policy?.kind === "restore" ? policy.scrollTop : prevScroll);
     this.populateListBody(list, focused);
 
     if (reuseComposer) {
@@ -3904,6 +3919,7 @@ export class StashpadView extends ItemView {
             // Below that floor the honest thing is to leave the scroll alone.
             if (listForScroll.clientHeight < MIN_SCROLLABLE_PX) return;
             this.suppressScrollSave = true;
+            this.virtEnsureId(targetId); // 0.295.0: the row may not be built yet
             const row = listForScroll.querySelector(`[data-id="${targetId}"]`);
             if (row) row.scrollIntoView({ block: align, behavior: "auto" });
             Promise.resolve().then(() => { this.suppressScrollSave = false; });
@@ -7921,6 +7937,7 @@ export class StashpadView extends ItemView {
   private async revealReplySource(node: TreeNode): Promise<void> {
     const resolved = this.resolveReplySourceFile(node);
     if (!resolved) { new Notice("Couldn't find the note this replies to."); return; }
+    if (resolved.folder === this.noteFolder) this.virtEnsureId(resolved.id); // 0.295.0
     const row = resolved.folder === this.noteFolder
       ? this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(resolved.id)}"]`)
       : null;
@@ -9485,6 +9502,7 @@ export class StashpadView extends ItemView {
   private revealCursorRow(): void {
     const doReveal = () => {
       if (this.cursorIdx < 0) return;
+      this.virtEnsureIndex(this.cursorIdx); // 0.295.0: the row may not be built yet
       const row = this.listEl?.querySelector(`[data-idx="${this.cursorIdx}"]`) as HTMLElement | null;
       if (!row || !this.listEl) return;
       const list = this.listEl;
@@ -10255,6 +10273,7 @@ export class StashpadView extends ItemView {
    *  picker target. */
   private revealRowAt(idx: number): void {
     if (!this.listEl) return;
+    this.virtEnsureIndex(idx); // 0.295.0: the row may not be built yet
     const row = this.listEl.querySelector<HTMLElement>(`.stashpad-note[data-idx="${idx}"]`);
     if (!row) return;
     const rowRect = row.getBoundingClientRect();
@@ -17947,6 +17966,176 @@ export class StashpadView extends ItemView {
    *  list — only the edited row's `.stashpad-note-body-content` re-renders, and
    *  renderNoteBodyNow keeps the OLD body visible until the fresh one resolves
    *  (token-guarded), so there is no flash and no list reflow. */
+  // ---- 0.295.0 (perf): row virtualization ---------------------------------
+  //
+  // Above VIRT_MIN_ROWS notes, populateListBody builds DOM rows only for the
+  // rows near the viewport (± VIRT_OVERSCAN_PX) and stands two spacer divs in
+  // for the rest, sized from measured row heights (average for rows never
+  // measured). A scroll moves the window: rows that left it are removed, rows
+  // that entered it are built with the same renderNote as a full paint, so a
+  // rendered row is indistinguishable from one in an unvirtualized list —
+  // `data-idx` / `data-id` stay the ABSOLUTE index and id.
+  //
+  // Only the pure note list is virtualized (no locked placeholders, no loose
+  // files): those are interleaved by timestamp and are rare in big folders.
+  //
+  // Everything that looks a row up by id/idx must accept "not rendered":
+  // the reveal/scroll helpers call virtEnsureIndex/virtEnsureId first, which
+  // moves the window so the row exists before it is measured or scrolled to.
+  private static readonly VIRT_MIN_ROWS = 120;
+  private static readonly VIRT_OVERSCAN_PX = 700;
+  /** `.stashpad-list` flex gap — a hidden row's slot is its height plus one gap. */
+  private static readonly VIRT_GAP_PX = 6;
+  private virt: {
+    list: HTMLElement; start: number; end: number;
+    top: HTMLElement; bottom: HTMLElement; raf: number | null; onScroll: () => void;
+  } | null = null;
+  private virtHeights = new Map<StashpadId, number>();
+  private virtAvg = 56;
+  /** Set by renderInner before populateListBody: the scrollTop the paint is
+   *  about to restore (or Infinity for pin-bottom), so the FIRST window is
+   *  built where the list is going to be, not at the top. */
+  private virtScrollHint: number | null = null;
+
+  private virtEligible(fileRows: number, lockRows: number): boolean {
+    return fileRows === 0 && lockRows === 0
+      && this.currentChildren.length >= StashpadView.VIRT_MIN_ROWS
+      && this.plugin.settings.virtualizeLargeLists !== false
+      && !(window as unknown as { __spNoVirt?: boolean }).__spNoVirt;
+  }
+
+  private virtMount(list: HTMLElement): void {
+    this.virtTeardown();
+    const top = list.createDiv({ cls: "stashpad-virt-spacer" });
+    const bottom = list.createDiv({ cls: "stashpad-virt-spacer" });
+    top.hidden = true; bottom.hidden = true;
+    const v = { list, start: 0, end: 0, top, bottom, raf: null as number | null, onScroll: () => {} };
+    v.onScroll = () => {
+      if (v.raf != null) return;
+      const tick = () => { v.raf = null; this.virtUpdate(); };
+      // rAF is paused in a hidden window (popouts, automated runs); a timer
+      // keeps the window honest there without costing the visible case.
+      v.raf = document.visibilityState === "hidden"
+        ? window.setTimeout(tick, 16)
+        : requestAnimationFrame(tick);
+    };
+    this.virt = v;
+    list.addEventListener("scroll", v.onScroll, { passive: true });
+    const hint = this.virtScrollHint;
+    this.virtScrollHint = null;
+    this.virtUpdate(hint ?? undefined);
+  }
+
+  private virtTeardown(): void {
+    const v = this.virt;
+    if (!v) return;
+    if (v.raf != null) cancelAnimationFrame(v.raf);
+    v.list.removeEventListener("scroll", v.onScroll);
+    this.virt = null;
+  }
+
+  private virtH(n: TreeNode): number { return this.virtHeights.get(n.id) ?? this.virtAvg; }
+
+  private virtHeadingH(list: HTMLElement): number {
+    const first = list.firstElementChild as HTMLElement | null;
+    return first && first.classList.contains("stashpad-focused") ? first.offsetHeight + StashpadView.VIRT_GAP_PX : 0;
+  }
+
+  /** Rebuild the rendered window for the current (or hinted) scroll position.
+   *  Reads first (row heights), then writes (remove / build rows, spacers). */
+  private virtUpdate(scrollTopHint?: number): void {
+    const v = this.virt;
+    if (!v || !v.list.isConnected) return;
+    const list = v.list, kids = this.currentChildren, N = kids.length;
+    const gap = StashpadView.VIRT_GAP_PX, over = StashpadView.VIRT_OVERSCAN_PX;
+    // 1. Measure what is rendered. Bodies arrive lazily, so heights drift
+    //    after the row is built; every tick re-reads the window (≈40 reads).
+    for (const el of Array.from(list.children) as HTMLElement[]) {
+      if (!el.classList.contains("stashpad-note") || !el.dataset.id) continue;
+      const h = el.offsetHeight;
+      if (h > 0) this.virtHeights.set(el.dataset.id, h);
+    }
+    if (this.virtHeights.size > 0) {
+      let s = 0;
+      for (const h of this.virtHeights.values()) s += h;
+      this.virtAvg = s / this.virtHeights.size;
+    }
+    const headingH = this.virtHeadingH(list);
+    const viewH = list.clientHeight || 600;
+    // 2. Pick the window.
+    let start = 0, end = 0, topPx = 0;
+    if (scrollTopHint === Infinity) {
+      end = N;
+      const want = Math.ceil((viewH + 2 * over) / (this.virtAvg + gap));
+      start = Math.max(0, N - want);
+      for (let i = 0; i < start; i++) topPx += this.virtH(kids[i]) + gap;
+    } else {
+      const scrollTop = scrollTopHint ?? list.scrollTop;
+      const lo = Math.max(0, scrollTop - headingH - over);
+      const hi = scrollTop - headingH + viewH + over;
+      let y = 0;
+      while (start < N && y + this.virtH(kids[start]) + gap <= lo) { y += this.virtH(kids[start]) + gap; start++; }
+      topPx = y;
+      end = start;
+      while (end < N && y <= hi) { y += this.virtH(kids[end]) + gap; end++; }
+    }
+    let bottomPx = 0;
+    for (let i = end; i < N; i++) bottomPx += this.virtH(kids[i]) + gap;
+    // 3. Diff the DOM: drop rows outside the window, build the missing ones.
+    const rendered = new Map<number, HTMLElement>();
+    for (const el of Array.from(list.children) as HTMLElement[]) {
+      if (!el.classList.contains("stashpad-note") || el.dataset.idx == null) continue;
+      const i = Number(el.dataset.idx);
+      if (i < start || i >= end || kids[i]?.id !== el.dataset.id) el.remove();
+      else rendered.set(i, el);
+    }
+    if (list.lastElementChild !== v.bottom) list.appendChild(v.bottom);
+    let ref: HTMLElement = v.bottom;
+    for (let i = end - 1; i >= start; i--) {
+      let el = rendered.get(i);
+      if (!el) {
+        this.renderNote(list, kids[i], i);           // appends after `bottom`…
+        el = list.lastElementChild as HTMLElement;   // …so move it into place
+      }
+      if (el.nextElementSibling !== ref) list.insertBefore(el, ref);
+      ref = el;
+    }
+    if (v.top.nextElementSibling !== ref) list.insertBefore(v.top, ref);
+    // 4. Spacers. Each hidden row's slot is h+gap; the spacer itself is a flex
+    //    item that gets one gap after it, so drop one gap from the sum.
+    const topH = start > 0 ? topPx - gap : 0;
+    const botH = end < N ? bottomPx - gap : 0;
+    v.top.hidden = topH <= 0;
+    v.top.style.height = `${Math.max(0, topH)}px`;
+    v.bottom.hidden = botH <= 0;
+    v.bottom.style.height = `${Math.max(0, botH)}px`;
+    v.start = start; v.end = end;
+    if (scrollTopHint != null) {
+      list.scrollTop = scrollTopHint === Infinity ? list.scrollHeight : scrollTopHint;
+    }
+    if (perf.enabled) perf.record("render.virt.window", end - start);
+  }
+
+  /** Make sure the row at `idx` is rendered, moving the window (and the
+   *  scroll) if it is not. Returns false when idx is out of range. */
+  private virtEnsureIndex(idx: number): boolean {
+    const v = this.virt;
+    if (!v) return true;
+    if (idx < 0 || idx >= this.currentChildren.length) return false;
+    if (idx >= v.start && idx < v.end) return true;
+    let y = 0;
+    for (let i = 0; i < idx; i++) y += this.virtH(this.currentChildren[i]) + StashpadView.VIRT_GAP_PX;
+    const target = Math.max(0, y + this.virtHeadingH(v.list) - v.list.clientHeight / 2);
+    this.virtUpdate(target);
+    return !!this.virt && idx >= this.virt.start && idx < this.virt.end;
+  }
+
+  private virtEnsureId(id: StashpadId | null | undefined): void {
+    if (!this.virt || !id) return;
+    const idx = this.currentChildren.findIndex((n) => n.id === id);
+    if (idx >= 0) this.virtEnsureIndex(idx);
+  }
+
   /** 0.294.0 (perf): append-only list patch for a local create.
    *
    *  A create in a 400-note folder used to cost one full render (~1s: empty
@@ -17978,7 +18167,37 @@ export class StashpadView extends ItemView {
     const rows: HTMLElement[] = [];
     for (const el of Array.from(list.children) as HTMLElement[]) {
       if (el.classList.contains("stashpad-note") && el.dataset.id) rows.push(el);
-      else if (!el.classList.contains("stashpad-focused")) return false;
+      else if (!el.classList.contains("stashpad-focused") && !el.classList.contains("stashpad-virt-spacer")) return false;
+    }
+    if (this.virt) {
+      // 0.295.0: the rendered rows are a WINDOW, not a prefix. Append-safe iff
+      // the old child list is a prefix of the new one and every rendered row
+      // still sits at its index; the window update then builds whatever the
+      // (possibly pinned-to-bottom) viewport needs.
+      const old = this.currentChildren;
+      if (target.length < old.length) return false;
+      for (let i = 0; i < old.length; i++) if (old[i].id !== target[i].id) return false;
+      for (const r of rows) { const i = Number(r.dataset.idx); if (target[i]?.id !== r.dataset.id) return false; }
+      this.currentChildren = target;
+      if (old.length === target.length) return true;
+      if (this.pendingFocusIds) return false;
+      let moved = false;
+      if (this.autoSelectNewest) {
+        const last = target[target.length - 1];
+        for (const r of rows) { r.removeClass("is-cursor"); r.removeClass("is-selected"); r.removeClass("is-cursor-expanded"); }
+        this.cursorIdx = target.length - 1;
+        this.selection.clear(); this.selection.add(last.id); this.lastSelected = last.id;
+        this.autoSelectNewest = false; moved = true;
+      }
+      const pin = this.scrollToBottomOnNextRender;
+      this.scrollToBottomOnNextRender = false;
+      this.virtUpdate(pin ? Infinity : undefined);
+      if (pin) this.scrollListToBottom();
+      this.plugin.trace("render:append", { folder: this.noteFolder, added: target.length - old.length, virt: 1 });
+      if (moved) this.stampSelectedCursor();
+      this.plugin.notifyStashpadContentChanged();
+      if (moved) this.plugin.notifyStashpadSelectionChanged();
+      return true;
     }
     if (rows.length > target.length) return false;
     for (let i = 0; i < rows.length; i++) {
@@ -18026,7 +18245,10 @@ export class StashpadView extends ItemView {
     const node = this.tree.get(id);
     if (!node?.file) return false;
     const row = this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(id)}"]`);
-    if (!row) return false; // not on screen — a later full render paints it when it scrolls in
+    // Not on screen. Unvirtualized: a full render paints it (legacy path).
+    // 0.295.0 virtualized: the row will be BUILT fresh when it scrolls in (the
+    // cache was already evicted by the caller), so there is nothing to repaint.
+    if (!row) return !!this.virt;
     const bodyContent = row.querySelector<HTMLElement>(".stashpad-note-body-content");
     const actions = row.querySelector<HTMLElement>(".stashpad-note-actions");
     if (!bodyContent || !actions) return false;
