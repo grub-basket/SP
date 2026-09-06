@@ -11,7 +11,7 @@ import {
   type StashpadId, type TimeFilter, type TimeUnit, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
   type ListPinEdge, siftMatch,
 } from "./types";
-import { TreeIndex } from "./tree-index";
+import { TreeIndex, collectMarkdown } from "./tree-index";
 import { perf } from "./perf";
 import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
 import { parseRecurrence, nextDueOnComplete, parseRepeatMode } from "./recurrence";
@@ -325,6 +325,11 @@ export class StashpadView extends ItemView {
   // render happens after the writes settle (endBulkRender / forceReconcileRender).
   private bulkRenderDepth = 0;
   private bulkSettleTimer: number | null = null;
+  // 0.291.0 (perf): how many renders renderSuppressed() actually DROPPED during
+  // the current bulk window (incl. its settle tail). If none were dropped and
+  // the settle rebuild changes nothing, the settle render is a pure no-op and
+  // the list (which rebuilds every row — no virtualization) must not repaint.
+  private bulkSuppressedRenders = 0;
   private bootstrappedFolders = new Set<string>();
 
   /** public: read by ViewDnD (the host interface). */
@@ -1214,6 +1219,10 @@ export class StashpadView extends ItemView {
    *  post-sync burst) self-heals without a manual reload. No-op when
    *  the counts already match. */
   private treeReconcileTimer: number | null = null;
+  /** 0.291.0 (perf): a reconcile that was skipped because this leaf is not
+   *  visible. Deferred, never dropped — flushPendingVisibleRender() runs it
+   *  when the leaf is laid out again. */
+  private reconcilePending = false;
   /** True while a bulk op (long split paste, rebootstrap) is writing, so
    *  metadata-driven re-renders are dropped to avoid per-note flicker. */
   /** Obsidian calls this when the view is laid out, which includes becoming
@@ -1226,14 +1235,33 @@ export class StashpadView extends ItemView {
    *  actually laid out again. Safe to call from anywhere: it no-ops when
    *  nothing is owed or the view is still hidden. */
   private flushPendingVisibleRender(): void {
-    if (!this.pendingVisibleRender) return;
+    // 0.291.0 (perf): a reconcile deferred while hidden is owed here too.
+    if (!this.pendingVisibleRender && !this.reconcilePending) return;
     if (!this.listEl || this.listEl.clientHeight === 0) return;   // still hidden
+    const owedReconcile = this.reconcilePending;
+    this.reconcilePending = false;
+    if (!this.pendingVisibleRender) {
+      // Only a reconcile was owed (no render deferred). Re-enter the normal
+      // debounced path so the grace window + unresolvable guard still apply;
+      // it is now visible, so it will not bounce straight back to pending.
+      if (owedReconcile) this.scheduleTreeReconcile();
+      return;
+    }
     this.pendingVisibleRender = false;
     this.plugin.trace("render:flush-deferred", { folder: this.noteFolder });
     // The tree may have moved on while this view was not rendering, so rebuild
     // rather than repainting a stale model — the deferral is longer now.
     this.tree.rebuild(this.noteFolder);
     this.render();
+  }
+
+  /** 0.291.0 (perf): the "nobody can see this leaf" test, lifted out of
+   *  renderSuppressed() so other deferrable work (the tree reconcile) can ask
+   *  the same question without renderSuppressed's pendingVisibleRender side
+   *  effect and without a second, subtly different predicate. Pure. */
+  private isHiddenLeaf(): boolean {
+    return !!this.listEl && this.containerEl.isConnected && this.listEl.clientHeight === 0
+      && this.leaf.view === this;
   }
 
   private renderSuppressed(): boolean {
@@ -1259,21 +1287,45 @@ export class StashpadView extends ItemView {
     // 714-row and two 342-row lists reporting height 0 because they are not on
     // screen, and the main thread stalled 407ms. The flag records that a render
     // is owed, so it must not also decide whether one is suppressed.
-    if (this.listEl && this.containerEl.isConnected && this.listEl.clientHeight === 0
-        && this.leaf.view === this) {
+    if (this.isHiddenLeaf()) {
       this.pendingVisibleRender = true;
+      this.noteBulkSuppression();
       return true;
     }
-    return this.bulkRenderDepth > 0
+    const suppressed = this.bulkRenderDepth > 0
       || this.bulkSettleTimer != null
       || this.autoSyncDeferActive
       || this.plugin.rebootstrapInProgress
       || this.plugin.okfRebuildingFolders.has(this.noteFolder);
+    if (suppressed) this.noteBulkSuppression();
+    return suppressed;
+  }
+
+  /** 0.291.0 (perf): record that a render was dropped while a bulk window is
+   *  open (or still settling), so endBulkRender knows a repaint is genuinely
+   *  owed. Counted only for bulk windows — a drop for any other reason (hidden
+   *  view, rebootstrap) has its own flush path and must not force a settle
+   *  render on top of it. */
+  private noteBulkSuppression(): void {
+    if (this.bulkRenderDepth > 0 || this.bulkSettleTimer != null) this.bulkSuppressedRenders++;
+  }
+
+  /** 0.291.0 (perf): cheap structural signature of the node set — file-backed
+   *  node count plus the ordered child ids of the current focus (the rows this
+   *  view actually paints). Compared across `tree.rebuild` to tell a self-heal
+   *  that changed something from one that changed nothing. */
+  private treeSignature(): string {
+    const kids = this.tree.getChildren(this.focusId).map((n) => n.id).join(",");
+    return `${this.tree.fileBackedCount()}|${kids}`;
   }
 
   /** Open a bulk-render window: metadata-driven renders are suppressed until the
    *  matching endBulkRender (+ settle). Nestable. */
   private beginBulkRender(): void {
+    // 0.291.0 (perf): reset the suppression tally only for a genuinely FRESH
+    // window. Opening one while a previous settle is still pending absorbs that
+    // window (the timer below is cleared), so its owed render must carry over.
+    if (this.bulkRenderDepth === 0 && this.bulkSettleTimer == null) this.bulkSuppressedRenders = 0;
     this.bulkRenderDepth++;
     if (this.bulkSettleTimer != null) { window.clearTimeout(this.bulkSettleTimer); this.bulkSettleTimer = null; }
   }
@@ -1288,8 +1340,23 @@ export class StashpadView extends ItemView {
     this.bulkSettleTimer = window.setTimeout(() => {
       this.bulkSettleTimer = null;
       if (!this.viewRoot?.isConnected) return;
+      // 0.291.0 (perf): the rebuild STAYS — it is the self-heal that reconciles
+      // synthetic inserts against what the metadata cache finally parsed. Only
+      // the render becomes conditional. A single create renders its finished row
+      // directly (createNoteUnder) and then opens this window purely to swallow
+      // the trailing metadata/fmSync events; if none of them was actually
+      // dropped AND the rebuild moved nothing, repainting every row again is a
+      // pure no-op costing ~1s at 400 notes.
+      const owed = this.bulkSuppressedRenders;
+      const sigBefore = this.treeSignature();
       this.tree.rebuild(this.noteFolder);
-      this.render();
+      const sigAfter = this.treeSignature();
+      this.bulkSuppressedRenders = 0;
+      if (owed > 0 || sigBefore !== sigAfter) {
+        this.render();
+      } else {
+        this.plugin.trace("render:settle-skipped", { folder: this.noteFolder });
+      }
     }, settleMs);
   }
 
@@ -1351,38 +1418,55 @@ export class StashpadView extends ItemView {
   }
 
   private scheduleTreeReconcile(): void {
-    if (this.renderSuppressed()) return;
+    // 0.291.0 (perf): `resolved` fires after every metadata reparse, for every
+    // open Stashpad leaf including hidden tabs. Defer (don't drop) the ones
+    // nobody can see: flushPendingVisibleRender() re-runs this on show.
+    if (this.isHiddenLeaf()) { this.reconcilePending = true; return; }
+    // 0.291.0 (perf): a PURE check here — renderSuppressed() also tallies an
+    // "owed" render for endBulkRender, and a reconcile is not a render. Counting
+    // it made every create whose `resolved` landed inside the settle window
+    // repaint the whole list a second time (measured on PerfLab). A reconcile
+    // dropped during a bulk window is covered by endBulkRender's own rebuild.
+    if (this.bulkRenderDepth > 0 || this.bulkSettleTimer != null || this.autoSyncDeferActive
+        || this.plugin.rebootstrapInProgress || this.plugin.okfRebuildingFolders.has(this.noteFolder)) return;
     if (this.treeReconcileTimer != null) return;
     this.treeReconcileTimer = window.setTimeout(() => {
       this.treeReconcileTimer = null;
       if (!this.viewRoot?.isConnected) return;
+      // 0.291.0 (perf): the leaf can have been hidden during the 400ms debounce.
+      if (this.isHiddenLeaf()) { this.reconcilePending = true; return; }
       const folder = this.noteFolder;
-      const prefix = folder + "/";
       // Count actual Stashpad NOTES on disk (markdown files under this
       // folder whose frontmatter carries an id) — matching what the
       // tree tracks. Counting all markdown would over-count _authors
       // stubs / templates and trigger perpetual no-op rebuilds.
+      // 0.291.0 (perf): enumerate the FOLDER's TFolder subtree instead of the
+      // whole vault. The old loop walked vault.getMarkdownFiles() and, per file,
+      // normalized the parent path, split it and ran isReservedSubfolderName per
+      // segment — O(vault) per `resolved` event per open leaf, where O(folder)
+      // is all this count needs. collectMarkdown() is the very helper
+      // TreeIndex.rebuild uses, including the `folder ? … : getMarkdownFiles()`
+      // fallback and the missing-folder → [] behaviour, so onDisk and
+      // fileBackedCount() are now counted over the identical file set.
+      //
+      // 0.219.3: RESERVED subfolders stay excluded — _archive / _attachments /
+      // _authors / _imports / _exports / _processed and the per-folder
+      // archive/ + trash/. The tree deliberately never descends into them
+      // (TreeIndex.collectMarkdown), so counting their files here compared a
+      // number that includes them against one that never can.
+      //
+      // Archived notes keep their Stashpad `id`, so the `id` test below does
+      // NOT filter them out — which made the mismatch PERMANENT for any
+      // folder that has ever archived a note. A permanent mismatch means this
+      // reconcile rebuilds the tree and re-renders the whole list ~400ms
+      // after EVERY metadata event, including our own frontmatter writes. On
+      // a real vault that is what made the list jump on every color change,
+      // to-do toggle and completed toggle. Measured on the user's device:
+      // onDisk 417 vs tree 368 — 49 archived notes — firing before every
+      // single reported jump.
+      const files = folder ? collectMarkdown(this.app, folder) : this.app.vault.getMarkdownFiles();
       let onDisk = 0;
-      for (const f of this.app.vault.getMarkdownFiles()) {
-        const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
-        if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
-        // 0.219.3: skip RESERVED subfolders — _archive / _attachments /
-        // _authors / _imports / _exports / _processed and the per-folder
-        // archive/ + trash/. The tree deliberately never descends into them
-        // (TreeIndex.collectMarkdown), so counting their files here compared a
-        // number that includes them against one that never can.
-        //
-        // Archived notes keep their Stashpad `id`, so the `id` test below does
-        // NOT filter them out — which made the mismatch PERMANENT for any
-        // folder that has ever archived a note. A permanent mismatch means this
-        // reconcile rebuilds the tree and re-renders the whole list ~400ms
-        // after EVERY metadata event, including our own frontmatter writes. On
-        // a real vault that is what made the list jump on every color change,
-        // to-do toggle and completed toggle. Measured on the user's device:
-        // onDisk 417 vs tree 368 — 49 archived notes — firing before every
-        // single reported jump.
-        const relDirs = dir === folder ? [] : dir.slice(prefix.length).split("/");
-        if (relDirs.some((seg) => isReservedSubfolderName(seg))) continue;
+      for (const f of files) {
         const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
         if (typeof id === "string" && id) onDisk++;
       }
@@ -16619,18 +16703,64 @@ export class StashpadView extends ItemView {
       // 0.275.0: mark this as our own body write so onFileModify doesn't log it
       // as an external edit. The modify event carries the CURRENT path (rename,
       // if any, comes after), so mark originalPath.
-      this.markBodySelfWrite(originalPath);
+      // 0.291.0 (perf): `owned` — this save does its OWN evict + slug decision +
+      // repaint below, so onFileModify must not repeat any of them. Before this,
+      // one save cost a full render HERE plus a second slug rename, a second
+      // evict and a second repaint from the modify handler.
+      this.markBodySelfWrite(originalPath, true);
       await this.app.vault.modify(file, newContent);
+      // 0.291.0 (perf): evict here (not in onFileModify) so the repaint below
+      // reads fresh content whichever order the modify event lands in.
+      this.bodyRenderer.evict(file);
       // 0.170.2: re-slug the filename to match the new first line (user chose auto-rename).
+      // 0.291.0 (perf): still called unconditionally — reslugFile is a pure function
+      // of the first non-empty line (bodyToSlug reads only that) and returns early
+      // when `file.name` already matches, so an unchanged first line costs a cache
+      // lookup and no vault I/O. Gating it on `firstLineChanged` instead would drop
+      // the drift-healing case (stop-word setting changed, an earlier rename failed)
+      // now that onFileModify no longer schedules a second slug rename for our write.
       const renamedTo = await this.reslugFile(file, nb);
       const finalPath = renamedTo ?? originalPath;
+      // 0.291.1: the marker was keyed on the PRE-rename path. If the modify
+      // event lands after the rename, onFileModify looks up the new path, misses,
+      // and treats our own save as an external edit (spurious log + the full
+      // cascade). Move the marker along — but only while it is still unconsumed,
+      // so a modify that already landed under the old path can't leave a stale
+      // "owned" entry that would swallow a genuine external edit seconds later.
+      if (renamedTo) {
+        const pending = this.recentBodySelfWrites.get(originalPath);
+        if (pending) { this.recentBodySelfWrites.delete(originalPath); this.recentBodySelfWrites.set(renamedTo, pending); }
+      }
       // 0.274.0: record the in-app edit so the activity heatmap can count it.
       // `external_edit` covers writes from elsewhere; this is the matching entry
       // for edits made through Stashpad's own editor (which are self-writes and
       // otherwise leave no log trace).
       void this.log.append({ type: "edit", id: target.id, payload: { path: finalPath } });
-      this.tree.rebuild(this.noteFolder);
-      this.render();
+      // 0.291.0 (perf): a body edit changes no structure, so the O(N) tree rebuild +
+      // full render only earn their cost when the row's ORDER (or its path) can move.
+      // The row renders its title and body as one `.stashpad-note-body-content`
+      // block — there is no separate title element — so repaintRowBody already
+      // refreshes the visible title. What it cannot fix is the row's POSITION, hence
+      // the fall-backs below. Note `performEdit` never creates a note (the split
+      // paths are performSplit / createNoteUnder, which keep rebuild + render), and
+      // it preserves frontmatter verbatim, so completion/task state — and therefore
+      // `hideCompletedNotes` visibility — cannot change here.
+      const firstLine = (s: string): string => (s.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
+      const firstLineChanged = firstLine(freshBody) !== firstLine(nb);
+      const sortMode = this.sortStore.getMode(this.noteFolder, target.parent ?? ROOT_ID);
+      const orderMayChange = renamedTo !== null
+        // title sort reads titleForNode → the first heading/first body line.
+        || (firstLineChanged && (sortMode === "title-az" || sortMode === "title-za"))
+        // modified sort reads the `modified` frontmatter, which the fmSync pass
+        // stamps after this write — position can move on ANY edit.
+        || sortMode === "modified-asc" || sortMode === "modified-desc";
+      if (orderMayChange) {
+        this.tree.rebuild(this.noteFolder);
+        this.render();
+      } else if (!this.repaintRowBody(file)) {
+        // off-screen, or the row isn't repaintable → full render, debounced.
+        this.debouncedRender();
+      }
       perf.record("edit.save.total", performance.now() - _editT0); // 0.279.29 diag (perf flag)
       this.plugin.notifications.show({
         message: `Saved "${this.titleForNode(target)}"`, kind: "success", category: "split",
@@ -17007,7 +17137,18 @@ export class StashpadView extends ItemView {
       // they coalesce into one settle render — stamped BEFORE the write,
       // because the create event fires inside it.
       this.postCreateSettleUntil = Date.now() + 2000;
-      await perf.timeAsync("write.createNote.file", () => this.app.vault.create(path, fullContent));
+      // 0.291.0 (perf): the vault `create` event for OUR OWN file must not
+      // schedule a list render — the synthetic node is already in the tree and
+      // the direct render below paints it. Left alone, onFileCreate's
+      // debouncedRender fired inside the settle window, counted as an owed
+      // render, and endBulkRender repainted the whole list a second time.
+      this.selfCreatedPaths.add(path);
+      try {
+        await perf.timeAsync("write.createNote.file", () => this.app.vault.create(path, fullContent));
+      } catch (e) {
+        this.selfCreatedPaths.delete(path); // no event is coming to consume it
+        throw e;
+      }
       opts.collectInto?.push({ path, content: fullContent });
       try {
         const f = this.app.vault.getAbstractFileByPath(path);
@@ -17047,6 +17188,14 @@ export class StashpadView extends ItemView {
               // the synthetic insert above and must not regress.
               this.beginBulkRender();
               this.endBulkRender(1200);
+            } else {
+              // 0.291.0 (perf): a deferred create IS a render the enclosing bulk
+              // window owes — the synthetic row above exists in the tree but has
+              // never been painted, and the settle render is the only thing that
+              // will paint it. Without this the batch paths (multi-split, text
+              // import, composer batch) would settle into a skipped render and
+              // the new rows would not appear until something else repainted.
+              this.noteBulkSuppression();
             }
             this.fmSync.scheduleParentChange(id, null, parentId);
           } else {
@@ -17055,7 +17204,9 @@ export class StashpadView extends ItemView {
             // view (clears the destination badge) and tell the user
             // where it went, with a Jump action. (Batched splits defer
             // both: createNotesBatch renders once + shows one summary.)
-            if (!opts.deferRender) this.render();
+            // 0.291.0 (perf): as above — a deferred remote send still owes the
+            // enclosing bulk window its one repaint (it clears the badge).
+            if (!opts.deferRender) this.render(); else this.noteBulkSuppression();
             const folderName = folder.split("/").pop() || folder;
             const noteTitle = (body.split("\n").find((s) => s.trim()) ?? "note").trim().slice(0, 60);
             if (!opts.deferUndo) this.plugin.notifications.show({
@@ -17587,13 +17738,19 @@ export class StashpadView extends ItemView {
    *  with an external editor when it wasn't" the log showed. Consulted (and
    *  cleared) in onFileModify to suppress that one log entry; the rest of the
    *  modify handling (render/slug/attachments/authorship) still runs. */
-  private recentBodySelfWrites = new Map<string, number>();
-  markBodySelfWrite(path: string): void { this.recentBodySelfWrites.set(path, Date.now()); }
-  private wasRecentBodySelfWrite(path: string): boolean {
-    const at = this.recentBodySelfWrites.get(path);
-    if (at == null) return false;
+  private recentBodySelfWrites = new Map<string, { at: number; owned: boolean }>();
+  /** 0.291.0 (perf): `owned` means the caller already evicted the render cache,
+   *  already made the slug decision and already repainted (or fully rendered) the
+   *  row — onFileModify then skips all three instead of doing them a second time.
+   *  Callers that only mark the write (e.g. the checkbox toggle) leave it false and
+   *  keep the previous behaviour. */
+  markBodySelfWrite(path: string, owned = false): void { this.recentBodySelfWrites.set(path, { at: Date.now(), owned }); }
+  private wasRecentBodySelfWrite(path: string): { hit: boolean; owned: boolean } {
+    const e = this.recentBodySelfWrites.get(path);
+    if (!e) return { hit: false, owned: false };
     this.recentBodySelfWrites.delete(path); // one-shot
-    return Date.now() - at < 2500;
+    const hit = Date.now() - e.at < 2500;
+    return { hit, owned: hit && e.owned };
   }
 
   private onFileModify = (file: TFile): void => {
@@ -17638,16 +17795,28 @@ export class StashpadView extends ItemView {
     // in-app body write (edit modal / split) — that is not an external edit, and
     // logging it as one is the "edited with an external editor when it wasn't"
     // the log wrongly showed. The in-app write already logged a proper `edit`.
-    if (!this.wasRecentBodySelfWrite(file.path)) this.logExternalEdit(file);
+    const bodySelf = this.wasRecentBodySelfWrite(file.path);
+    if (!bodySelf.hit) this.logExternalEdit(file);
     // 0.122.6 (#13): drop this file's (possibly stale-content-but-fresh-mtime)
     // render-cache entry so the debounced re-render below recomputes from fresh
     // content — fixes the truncated/attachment-less "earlier version" render
     // that stuck until reload (network drive / external edits).
-    this.bodyRenderer.evict(file);
-    this.scheduleSlugRename(file);
+    // 0.291.0 (perf): an `owned` self-write already evicted before it repainted;
+    // evicting again here would throw away the entry that repaint just warmed.
+    if (!bodySelf.owned) this.bodyRenderer.evict(file);
+    // 0.291.0 (perf): an `owned` self-write already ran reslugFile — which is the
+    // same slug decision this would make 30s later — so scheduling it again is
+    // pure redundant work (a second vault-wide link rewrite in the worst case).
+    if (!bodySelf.owned) this.scheduleSlugRename(file);
+    // Kept for owned writes too: the edit may have added an embed, and it is
+    // debounced (1.5s) so it costs nothing at save time.
     this.scheduleAttachmentSync(file);
     // 0.72.4: classify self vs external and queue the contributor stamp.
     this.authorship.noteModify(file);
+    // 0.291.0 (perf): the caller owns the paint for its own write (it repainted the
+    // row, or fully rendered when the row could move). Painting again here is what
+    // made an edit-modal save cost TWO renders.
+    if (bodySelf.owned) return;
     // Re-render so any visible row of this file picks up new body
     // content (and re-evaluates the "Show more" overflow check). The
     // metadataCache hook only fires for metadata-affecting edits — pure
@@ -17695,8 +17864,14 @@ export class StashpadView extends ItemView {
    *  reconcile grace window (a just-created note whose id the metadata cache has
    *  not parsed yet leaves the tree transiently ahead of the on-disk count). */
   private lastLocalCreateAt = 0;
+  /** 0.291.0 (perf): paths this view is creating itself (see createNoteUnder).
+   *  Consumed by onFileCreate so the vault event doesn't double-render. */
+  private selfCreatedPaths = new Set<string>();
   private onFileCreate = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
+    // Consume the marker BEFORE the folder test: a composer create routed to
+    // another folder still fires here, and must not leave a stale entry.
+    if (this.selfCreatedPaths.delete(file.path)) { this.lastLocalCreateAt = Date.now(); return; }
     if (!file.path.startsWith(this.noteFolder + "/")) return;
     this.lastLocalCreateAt = Date.now();
     if (this.deferDuringSyncBurst()) return;

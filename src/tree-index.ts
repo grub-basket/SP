@@ -6,7 +6,10 @@ import { ROOT_ID, isReservedSubfolderName, isInReservedSubfolder, type StashpadI
  *  if someone makes a pathological folder structure. Returns [] when the
  *  folder doesn't exist yet (first run, or the user just renamed the
  *  folder root). */
-function collectMarkdown(app: App, folderPath: string): TFile[] {
+// 0.291.0 (perf): exported so the view's tree reconcile can count on-disk notes
+// with EXACTLY the enumeration the tree itself uses (same folder scope, same
+// reserved-subfolder exclusion) instead of walking the whole vault.
+export function collectMarkdown(app: App, folderPath: string): TFile[] {
   const root = app.vault.getAbstractFileByPath(folderPath);
   if (!(root instanceof TFolder)) return [];
   const out: TFile[] = [];

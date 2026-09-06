@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId } from "./id-service";
 import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
@@ -1158,6 +1158,13 @@ export default class StashpadPlugin extends Plugin {
   /** Rebuild the cached setting definitions when the set of discovered
    *  Stashpads has changed since they were last built. Cheap no-op otherwise. */
   refreshSettingsIfStashpadsChanged(): void {
+    // 0.291.0 (perf): the hot case is "resolved" fired but nothing that could
+    // change the folder set happened. If the discovery memo is still warm AND
+    // we have already built a signature against it, the answer is provably
+    // unchanged — return without touching the vault at all. Any event that
+    // could alter the result invalidates the memo first (see
+    // invalidateStashpadFoldersMemo wiring in onload).
+    if (this.stashpadFoldersMemoWarm && this.settingsFolderSignature !== null) return;
     const scanT0 = performance.now();
     const sig = this.discoverStashpadFolders().join("\u0000");
     const scanMs = performance.now() - scanT0;
@@ -1182,7 +1189,55 @@ export default class StashpadPlugin extends Plugin {
     this.settingTab?.update?.();
   }
 
+  // 0.291.0 (perf): memo for discoverStashpadFolders(). The walk is O(all
+  // markdown files) with a metadataCache lookup each, and it ran on EVERY
+  // metadataCache "resolved" (continuously while Sync lands files) and nine
+  // times per settings render. `null` = dirty / never computed. Only ever
+  // populated once `workspace.layoutReady` is true, so a cold-cache partial
+  // result can't be frozen in permanently.
+  private stashpadFoldersMemo: string[] | null = null;
+  /** 0.291.0 (perf): last-seen `importExcludePrefixes`, so saveSettings only
+   *  drops the memo when the one setting discovery reads actually changed. */
+  private memoPrefixSig = "";
+  /** 0.291.0 (perf): true when `dir` is already a discovered folder — used by
+   *  the invalidation listeners to keep the memo warm across events that
+   *  cannot change the set. False while the memo is cold (forces recompute). */
+  private memoListsDir(dir: string | undefined): boolean {
+    if (!this.stashpadFoldersMemo || !dir) return false;
+    return this.stashpadFoldersMemo.includes(dir.replace(/\/+$/, ""));
+  }
+  /** 0.291.0 (perf): a reserved subfolder (_authors / _attachments / archive /
+   *  …) can never be a discovered folder, so a file event inside one cannot
+   *  change the set — author stubs are written on an author's first note. */
+  private memoIgnoresDir(dir: string | undefined): boolean {
+    return !!this.stashpadFoldersMemo && !!dir && isInReservedSubfolder(dir.replace(/\/+$/, ""));
+  }
+
+  /** 0.291.0 (perf): drop the discovery memo; the next call recomputes. */
+  invalidateStashpadFoldersMemo(): void {
+    this.stashpadFoldersMemo = null;
+  }
+
+  /** 0.291.0 (perf): true when the memo is warm — lets the "resolved" handler
+   *  take an O(1) no-op path instead of re-walking the vault. */
+  private get stashpadFoldersMemoWarm(): boolean {
+    return this.stashpadFoldersMemo !== null;
+  }
+
   discoverStashpadFolders(): string[] {
+    // 0.291.0 (perf): callers treat the result as their own (`.sort()`,
+    // `.filter()` chains, `folders[0]` reassignment), so hand out a copy —
+    // it's a handful of strings, and it keeps the memo immutable.
+    if (this.stashpadFoldersMemo) return this.stashpadFoldersMemo.slice();
+    const sorted = this.computeStashpadFolders();
+    // Don't memoize before layout-ready: the metadata cache is still filling,
+    // so the result would be partial and there is no guarantee an invalidating
+    // event follows for files that were already indexed.
+    if (this.app.workspace.layoutReady) this.stashpadFoldersMemo = sorted;
+    return sorted.slice();
+  }
+
+  private computeStashpadFolders(): string[] {
     const folders = new Set<string>();
     const foreign = this.foreignClaimedFolders();
     // 0.206.1: the claim covers the folder AND everything under it. Trynalist's
@@ -2327,10 +2382,71 @@ export default class StashpadPlugin extends Plugin {
     // refresh once the cache is warm is all this needs. Signature-gated so a
     // chatty "resolved" event doesn't rebuild the whole settings tree on every
     // fire, and so a Stashpad created or deleted later is also picked up.
+    // 0.291.0 (perf): invalidation for the discoverStashpadFolders() memo.
+    // The result is a pure function of (a) the set of vault files — markdown
+    // files supply the id/parent/attachments signature, any `.trynalist` file
+    // supplies a foreign claim — (b) each markdown file's frontmatter, and
+    // (c) `settings.importExcludePrefixes` (handled in saveSettings).
+    // Files can only appear/disappear/move via create/delete/rename (a folder
+    // rename fires for the folder itself, so a subtree move is covered), and
+    // frontmatter can only change via metadataCache "changed". Registered with
+    // registerEvent so unload detaches them.
+    const dropFolderMemo = () => this.invalidateStashpadFoldersMemo();
+    // 0.291.0 (perf): a NEW note in an already-listed folder cannot change the
+    // set (the folder is claimed regardless of how many claimants it has), so
+    // the hottest event of all — Stashpad creating its own note — keeps the memo
+    // warm. Anything else (unknown parent, non-md, .trynalist) drops it.
+    this.registerEvent(this.app.vault.on("create", (f) => {
+      if (f instanceof TFile && f.extension === "md"
+          && (this.memoListsDir(f.parent?.path) || this.memoIgnoresDir(f.parent?.path))) return;
+      if (irrelevantFile(f)) return;
+      dropFolderMemo();
+    }));
+    // Only markdown files and `.trynalist` markers feed discovery; sidecars,
+    // logs and attachments cannot change it. Folders always invalidate.
+    const irrelevantFile = (f: TAbstractFile): boolean =>
+      f instanceof TFile && f.extension !== "md" && f.extension !== "trynalist";
+    this.registerEvent(this.app.vault.on("delete", (f) => { if (!irrelevantFile(f)) dropFolderMemo(); }));
+    // A rename that keeps the file in the same already-listed folder (the slug
+    // rename after every create/edit) cannot change the set either.
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+      if (irrelevantFile(f)) return;
+      if (f instanceof TFile && f.extension === "md") {
+        const oldDir = oldPath.slice(0, Math.max(0, oldPath.lastIndexOf("/")));
+        const newDir = f.parent?.path ?? "";
+        if (oldDir === newDir && this.memoListsDir(newDir)) return;
+      }
+      dropFolderMemo();
+    }));
+    // A frontmatter change in a listed folder is a no-op ONLY while the file
+    // still carries a claiming signature (it might otherwise have been the last
+    // claimant, so losing the signature must recompute).
+    this.registerEvent(this.app.metadataCache.on("changed", (f, _data, cache) => {
+      if (f.extension === "md" && this.memoIgnoresDir(f.parent?.path)) return;
+      if (f.extension === "md" && this.memoListsDir(f.parent?.path)) {
+        const fm = cache?.frontmatter as { id?: unknown; parent?: unknown; attachments?: unknown } | undefined;
+        const claims = typeof fm?.id === "string" && !!fm.id.trim() && "parent" in fm
+          && (fm.id === ROOT_ID || "attachments" in fm);
+        if (claims) return;
+      }
+      dropFolderMemo();
+    }));
     this.app.workspace.onLayoutReady(() => {
+      // Anything discovered while the cache was cold was deliberately not
+      // memoized; this is the first call that is allowed to memoize.
+      this.invalidateStashpadFoldersMemo();
       this.refreshSettingsIfStashpadsChanged();
+      // 0.291.0 (perf): layoutReady does NOT mean the metadata cache has
+      // finished indexing, so the FIRST "resolved" after it drops the memo once
+      // — that guarantees at least one recompute against a fully-resolved
+      // cache, even for files indexed without a "changed" event. Every later
+      // "resolved" takes the O(1) no-op path.
+      let firstResolved = true;
       this.registerEvent(
-        this.app.metadataCache.on("resolved", () => this.refreshSettingsIfStashpadsChanged()),
+        this.app.metadataCache.on("resolved", () => {
+          if (firstResolved) { firstResolved = false; this.invalidateStashpadFoldersMemo(); }
+          this.refreshSettingsIfStashpadsChanged();
+        }),
       );
     });
 
@@ -9917,6 +10033,16 @@ export default class StashpadPlugin extends Plugin {
   async saveSettings(): Promise<void> {
     await this.queueWrite();
     setSettings(this.settings);
+    // 0.291.0 (perf): discovery filters on `importExcludePrefixes` — the third
+    // input, alongside the vault file set and frontmatter. Drop the memo only
+    // when THAT changed; a loud save happens on every toggle and tab switch,
+    // and cooling the memo each time would hand the next `resolved` a full
+    // vault walk again.
+    const prefixSig = JSON.stringify(this.settings.importExcludePrefixes ?? null);
+    if (prefixSig !== this.memoPrefixSig) {
+      this.memoPrefixSig = prefixSig;
+      this.invalidateStashpadFoldersMemo();
+    }
     perf.enabled = !!this.settings.enablePerfProfiling;
     // 0.77.1: keep the registry's record of the local user current. The
     // registry is a recovery cache — recording here means a name/role/
