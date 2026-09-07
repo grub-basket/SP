@@ -2595,6 +2595,31 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   color: var(--text-muted);
 }
 .stashpad-split-orig .stashpad-split-panel-body { color: var(--text-faint); }
+/* 0.302.0: 2-line clamp + Show more/less toggle for the Original / Changes panes
+   (long notes made these a wall of text). Clamped beats the edit-surface (8-line)
+   and split-view (10-line) overrides via !important; expanded lifts the cap for
+   these two panes to a generous, modal-safe height that then scrolls. */
+.stashpad-pane-clampable.is-clamped {
+  max-height: calc(1.5em * 2 + 0.8em) !important;
+  overflow: hidden;
+}
+.stashpad-pane-clampable:not(.is-clamped) {
+  max-height: calc(1.5em * 14 + 0.8em);
+  overflow-y: auto;
+}
+.stashpad-pane-clamp-toggle {
+  display: block;
+  margin: 2px 0 4px;
+  padding: 1px 4px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  color: var(--text-accent);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+.stashpad-pane-clamp-toggle:hover { color: var(--text-accent-hover); text-decoration: underline; }
+.stashpad-pane-clamp-toggle.is-hidden { display: none; }
 /* 0.169.1: read-only previews are selectable/copyable. */
 .stashpad-split-panel-body,
 .stashpad-split-part-body {
@@ -4068,6 +4093,34 @@ body.is-mobile .stashpad-jd-actions .setting-item-control {
   color: var(--text-muted);
   cursor: default;
 }
+/* 0.300.0: per-weekday switches for the obscure schedule. Filled accent = this
+   day auto-blurs; muted = day off. Dimmed/non-interactive when the schedule is
+   off, mirroring the times above. */
+.stashpad-weekday-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 14px 0;
+}
+.stashpad-weekday-chip {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--interactive-normal);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  cursor: pointer;
+}
+.stashpad-weekday-chip.is-on {
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.stashpad-weekday-chip:hover:not(:disabled) { border-color: var(--interactive-accent); }
+.stashpad-weekday-chips.is-disabled { opacity: 0.5; }
+.stashpad-weekday-chip:disabled { cursor: default; }
 /* 0.121.7 (#2): the live date sample read under-indented vs the rest — bump it
    a touch past the standard 14px. (Approximate — verify against live settings.) */
 .stashpad-settings-section .stashpad-date-sample {
@@ -4372,6 +4425,14 @@ body.is-mobile .stashpad-okf-cta {
      box hugged content exactly. */
   overflow: visible !important;
 }
+/* 0.302.0: the due/schedule picker is wider than the other compact modals so
+   the 7 weekday chips (S M T W T F S) sit on ONE row and the assign/tags rows
+   have breathing room. Scoped via :has so only the due picker widens; stays
+   within the viewport on mobile (min(…, 92vw)). */
+.modal.stashpad-compact-modal:has(.stashpad-due-picker) {
+  width: min(520px, 92vw) !important;
+  max-width: 92vw !important;
+}
 .modal.stashpad-compact-modal .modal-content {
   height: auto;
   min-height: 0;
@@ -4513,6 +4574,13 @@ body.is-mobile .stashpad-okf-cta {
 input[type="date"].stashpad-due-date, input[type="time"].stashpad-due-time {
   flex: 1 1 auto;
   min-width: 0;
+  /* 0.302.0: box-sizing + explicit line-height/min-height so the value
+     ("YYYY.MM.DD" / "--:-- --") isn't cropped at the top. Without a
+     line-height the webkit datetime-edit rendered taller than the tight
+     content box and the top of the digits got clipped. */
+  box-sizing: border-box;
+  line-height: 1.5;
+  min-height: 34px;
   padding: 6px 8px !important;
   border-radius: 6px;
   border: 1px solid var(--background-modifier-border);
@@ -4522,6 +4590,9 @@ input[type="date"].stashpad-due-date, input[type="time"].stashpad-due-time {
   /* 0.76.17: uppercase any letters (month abbreviation / AM·PM). */
   text-transform: uppercase;
 }
+/* 0.302.0: give the value editor room so nothing is clipped vertically. */
+.stashpad-due-date::-webkit-datetime-edit,
+.stashpad-due-time::-webkit-datetime-edit { line-height: normal; }
 /* 0.76.17 / 0.76.22: kill the leading gap webkit reserves inside the
    value editor so the date sits flush-left in its box (no stray
    space where the picker indicator used to be). */
@@ -6981,6 +7052,21 @@ button.stashpad-btn-loading::after {
   line-height: 1.4;
 }
 
+/* 0.302.0 — live validity feedback on the Repeat / Auto-complete / Remind
+   inputs. The parser runs as you type: an unparseable non-empty value gets a
+   red border + red hint; a parseable one gets a subtle green echo of what was
+   understood. Empty = neutral (no border, no hint). */
+.stashpad-recur-validity.is-hidden { display: none; }
+.stashpad-recur-validity.is-invalid { color: var(--text-error); }
+.stashpad-recur-validity.is-valid { color: var(--text-success, var(--text-accent)); }
+.stashpad-due-recur-row input.is-invalid {
+  border-color: var(--text-error) !important;
+  box-shadow: 0 0 0 1px var(--text-error);
+}
+.stashpad-due-recur-row input.is-valid {
+  border-color: var(--text-success, var(--interactive-accent));
+}
+
 /* 0.197.0 — a MISSED recurring occurrence. It's marked completed (so it drops out
    of the active list) but it wasn't done, so it must not read as an accomplishment:
    warning-tinted strike instead of the neutral completed grey, plus a marker. */
@@ -7058,6 +7144,16 @@ button.stashpad-btn-loading::after {
 
 /* 0.203.0: weekday picker in the due/repeat modal. */
 .stashpad-weekday-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+/* 0.302.0: in the due/repeat picker keep all 7 weekday chips on ONE row
+   (they used to wrap 6 + 1). Scoped to .stashpad-due-recur so the settings
+   weekday selector (shares the container class) is untouched. nowrap +
+   tighter gap/size; the wider modal (above) gives the room. */
+.stashpad-due-recur .stashpad-weekday-chips { flex-wrap: nowrap; gap: 3px; }
+.stashpad-due-recur .stashpad-weekday-chips button { width: 28px; height: 28px; }
+/* Narrow screens: shrink the row's label reservation + chips so 7 still fit
+   without overflowing the ≤92vw modal. */
+body.is-mobile .stashpad-due-recur-row label { flex-basis: 96px; }
+body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px; height: 26px; }
 .stashpad-weekday-chips button {
   width: 30px; height: 30px; padding: 0;
   border-radius: 999px;
@@ -9171,25 +9267,34 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
    ============================================================ */
 .stashpad-reply-chip-host { display: none; }
 .stashpad-reply-chip-host.is-active { display: block; padding: 2px 2px 6px; }
+/* 0.298.0: two-line reply chip — "Reply to" label row + cancel, title beneath. */
 .stashpad-reply-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   max-width: 100%;
-  padding: 3px 6px 3px 8px;
+  padding: 4px 6px 5px 8px;
   border-radius: 8px;
   border-left: 3px solid var(--interactive-accent);
   background: var(--background-secondary);
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
 }
+.stashpad-reply-chip-top { display: flex; align-items: center; gap: 5px; }
 .stashpad-reply-chip-icon { display: inline-flex; color: var(--interactive-accent); }
 .stashpad-reply-chip-icon .svg-icon { width: 13px; height: 13px; }
-.stashpad-reply-chip-title { color: var(--text-normal); cursor: pointer; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+.stashpad-reply-chip-label {
+  font-weight: 600; color: var(--text-faint); text-transform: uppercase;
+  letter-spacing: 0.03em; font-size: calc(var(--font-ui-smaller) - 1px);
+}
+.stashpad-reply-chip-title {
+  color: var(--text-normal); cursor: pointer;
+  text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
+}
 .stashpad-reply-chip-title:hover { text-decoration: underline; }
 .stashpad-reply-chip-x {
   border: none; background: transparent; color: var(--text-faint);
-  cursor: pointer; padding: 0 2px; font-size: 12px; line-height: 1;
+  cursor: pointer; padding: 0 2px; margin-left: auto; font-size: 12px; line-height: 1;
 }
 .stashpad-reply-chip-x:hover { color: var(--text-normal); }
 
@@ -9267,6 +9372,18 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-dup-hit-icon { display: inline-flex; color: var(--text-faint); }
 .stashpad-dup-hit-icon .svg-icon { width: 13px; height: 13px; }
 .stashpad-dup-hit-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 0.299.0: cross-folder match — the title flexes, the folder chip stays pinned
+   at the right so it's always visible ("this note lives in <folder>"). */
+.stashpad-dup-hit-title { flex: 1 1 auto; min-width: 0; }
+.stashpad-dup-hit-folder {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-size: calc(var(--font-ui-smaller) - 1px);
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--background-modifier-border);
+  white-space: nowrap;
+}
 /* 0.287.1: clear ON vs OFF state for the mobile duplicate-hints toggle. OFF is
    muted like the other composer buttons; ON is a filled accent chip so it's
    obvious the live search is active. Scoped under .is-mobile so it out-specifies
@@ -9326,3 +9443,9 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
    provides the dot, so no extra styling needed; this just keeps the row label
    from wrapping awkwardly on a narrow composer. */
 .stashpad-composer-suggest-label { white-space: nowrap; }
+
+/* 0.301.0: view launcher modal — a muted one-line hint under each view name. */
+.stashpad-launcher-hint {
+  font-size: var(--font-smaller);
+  color: var(--text-muted);
+}

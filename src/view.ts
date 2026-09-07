@@ -100,12 +100,6 @@ const RENDER_STORM_DELAY_MS = 700;
  *  normal render is already snappy, so we don't alter single/small deletes. */
 const OPTIMISTIC_ROWS = 4;
 
-/** Hysteresis band for the pinned heading's `is-stuck` collapse. Two thresholds
- *  rather than one because the class changes the very height it is measured
- *  from — see installHeadingStuckObserver for the oscillation this prevents. */
-const STICK_ON_PX = 8;
-const STICK_OFF_PX = 2;
-
 /** Below this the list is too short to position anything inside — see the
  *  scroll-to-id re-assert chain, which otherwise churns forever trying. */
 const MIN_SCROLLABLE_PX = 48;
@@ -210,6 +204,11 @@ const PROGRESS_EVERY = 25;
 /** 0.272.3: combined link-rail count above which the outgoing / backlinks rows
  *  split onto their own lines by type. Below it, a mixed row stays on one line. */
 const LINK_RAIL_SPLIT_AT = 5;
+
+/** 0.299.0: one duplicate-hint result. Same-folder hits carry the tree node's
+ *  id; cross-folder hits carry the other folder + file so a click can open it
+ *  in a new tab (the reply-jump reveal pattern). */
+type DupHit = { id: string; title: string; folder: string; crossFolder: boolean; file?: TFile };
 
 export class StashpadView extends ItemView {
   /** public: read by AuthorshipTracker (the host interface). */
@@ -610,7 +609,7 @@ export class StashpadView extends ItemView {
   // trailing save. With a RESETTING debounce the pending value is always stale
   // the moment any authoritative saveDraft runs (submit clears, blur, restore).
   private debouncedSaveDraft?: Debouncer<[string], void>;
-  private debouncedDupSearch?: (v: string) => void;
+  private debouncedDupSearch?: Debouncer<[string], void>;
   /** 0.294.0 (perf): memoized titleForNode results, keyed by `path::mtime`.
    *
    *  titleForNode costs a metadataCache lookup + a render-cache lookup +
@@ -833,6 +832,13 @@ export class StashpadView extends ItemView {
     this.viewRoot = host.createDiv({ cls: "stashpad-view" });
     this.viewRoot.setAttribute("tabindex", "0");
     this.installKeyboardTrace();
+    // 0.299.0: drop the cross-folder dup-search cache when any note appears,
+    // disappears, or is renamed anywhere in the vault (a rename changes a
+    // filename-derived title). Cheap — just nulls a field; rebuilt on next use.
+    const dropDupCross = (): void => { this.dupCross = null; };
+    this.registerEvent(this.app.vault.on("create", dropDupCross));
+    this.registerEvent(this.app.vault.on("delete", dropDupCross));
+    this.registerEvent(this.app.vault.on("rename", dropDupCross));
     this.viewRoot.addEventListener("focusin", () => setActiveView(this));
     this.viewRoot.addEventListener("click", () => setActiveView(this));
     // Mouse side-buttons: button 3 = back, button 4 = forward.
@@ -2032,11 +2038,31 @@ export class StashpadView extends ItemView {
       this.app.workspace.requestSaveLayout();
     }
     this.refreshHeaderTitle();
-    this.render();
+    // 0.300.0: a folder switch is a FRESH view of a different folder — it reset
+    // the focus to ROOT and cleared the cursor memory above, so pin to the
+    // bottom (newest notes) like a fresh mount. A bare render() defaulted to
+    // "preserve", which chased the OLD folder's scroll anchor: it landed several
+    // notes above the bottom, and with row virtualization the window rebuilt at
+    // the stale scrollTop and then settled, producing the up/down jitter on
+    // mobile. Pin-bottom is one deterministic scroll. (Within-folder navigation
+    // is a different path — scrollByFocus memory — so this doesn't force bottom
+    // where a saved position should win.)
+    this.scrollToBottomOnNextRender = true;
+    this.render({ kind: "pin-bottom", until: "next-user-input" });
   }
 
   /** Public so main.ts can dispatch a command to it. */
   cmdOpenFolderPicker(): void { this.openFolderPicker(); }
+
+  /** 0.302.0: pin this view to the bottom (newest) now. Public so the folder
+   *  PANEL's open/reveal path can land at the bottom the same way the folder
+   *  SWITCHER (setFolderOverride) does — unifying every folder-access method to
+   *  the same "lands at the newest note" behaviour the user expects. */
+  pinToBottomNow(): void {
+    if (!this.viewRoot?.isConnected) return;
+    this.scrollToBottomOnNextRender = true;
+    this.render({ kind: "pin-bottom", until: "next-user-input" });
+  }
 
   /** 0.65.0: delegate to the plugin's unified folder picker. The old
    *  view-local SuggestModal had its own (less polished) layout and
@@ -2044,6 +2070,55 @@ export class StashpadView extends ItemView {
    *  switch-current / create with icons and full token matching. */
   private openFolderPicker(): void {
     this.plugin.openFolderPicker();
+  }
+
+  /** 0.301.0: quick folder-switcher menu — mirrors `openQuickDestinationMenu`.
+   *  A small Obsidian Menu of the current folder (checkmarked) + the quick
+   *  folders (pinned/recent, via the SAME `quickDestinationFolders` list the
+   *  destination menu uses, which already filters to existing folders and
+   *  drops the active one), each switching this tab on click via the identical
+   *  switch path the full picker's "switch-current" item uses
+   *  (`setFolderOverride`). A "Search all folders…" item opens the full modal
+   *  (`openFolderPicker`), which also stays reachable from the command/hotkey.
+   *  Empty quick list → the menu still shows current + the search/new-folder
+   *  actions, never an empty menu. */
+  private openQuickFolderMenu(e: MouseEvent): void {
+    const current = (this.noteFolder || "").trim().replace(/^\/+|\/+$/g, "");
+    // Reuses the destination picker's ranking + existence filter, so a recent
+    // folder that no longer exists is already dropped and never offered.
+    const folders = this.plugin.quickDestinationFolders(current);
+    const menu = new Menu();
+    const currentName = current.split("/").pop() || current || "Stashpad";
+    menu.addItem((i: any) => i
+      .setTitle(currentName)
+      .setIcon(this.plugin.getFolderIcon(current) ?? "folder")
+      .setChecked(true)
+      // Already in this folder — selecting it just closes the menu.
+      // setFolderOverride would no-op on an unchanged folder anyway.
+      .onClick(() => { /* no-op: current folder */ }));
+    if (folders.length) {
+      menu.addSeparator();
+      for (const folder of folders) {
+        const name = folder.split("/").pop() || folder;
+        menu.addItem((i: any) => i
+          .setTitle(name)
+          .setIcon(this.plugin.getFolderIcon(folder) ?? "folder")
+          // Same switch path as the full picker's "switch-current" item.
+          .onClick(() => { void this.setFolderOverride(folder); }));
+      }
+    }
+    menu.addSeparator();
+    menu.addItem((i: any) => i
+      .setTitle("Search all folders…")
+      .setIcon("search")
+      .onClick(() => this.openFolderPicker()));
+    // The full picker creates a folder when you type a name that doesn't
+    // exist yet — surface that intent here too. Same modal, create-by-typing.
+    menu.addItem((i: any) => i
+      .setTitle("New folder…")
+      .setIcon("folder-plus")
+      .onClick(() => this.openFolderPicker()));
+    menu.showAtMouseEvent(e);
   }
 
   private listVaultFolders(): string[] {
@@ -4119,7 +4194,9 @@ export class StashpadView extends ItemView {
         ? `Folder (override): ${this.noteFolder}\nClick to change or revert to default.`
         : `Folder: ${this.noteFolder}\nClick to override for this tab.`;
       if (isOverride) { folderBtn.addClass("is-override"); this.applyOnAccentText(folderBtn); }
-      folderBtn.onclick = (e) => { e.preventDefault(); this.openFolderPicker(); };
+      // 0.301.0: quick menu (recent/pinned + "search all") instead of the full
+      // modal directly — the full picker stays reachable via the menu.
+      folderBtn.onclick = (e) => { e.preventDefault(); this.openQuickFolderMenu(e); };
 
       // 0.68.4: icon-only Search button between the folder switcher and
       // the tags dropdown. Mirrors the Mod+F binding for mouse users.
@@ -6410,79 +6487,27 @@ export class StashpadView extends ItemView {
    *  stickiness for a header that lived outside the list, and `position:
    *  sticky` on a real row does that natively. */
   private installHeadingStuckObserver(list: HTMLElement): void {
+    // 0.302.0 (F6a): the scroll-driven collapse is REMOVED. The heading now
+    // renders in one fixed form always — its non-stuck, collapsed-by-default
+    // body (a fixed-height scroll window, capped in CSS) plus the manual
+    // Show more / Show less toggle (wired in renderFocusedHeader). `.is-stuck`
+    // is never applied, so the heading's HEIGHT no longer changes with
+    // scrollTop.
+    //
+    // Why: on a short list ("height just right") the old scroll observer's
+    // height feedback misbehaved. Collapsing shortened the content, which made
+    // the list non-scrollable, which clamped scrollTop — you couldn't scroll to
+    // the last note, and the heading wouldn't expand because the list was too
+    // short to scroll back to the top and release `.is-stuck`. Removing the
+    // scroll-driven height change removes that whole failure mode.
+    //
+    // Sticky/pinned is UNAFFECTED: `position: sticky` lives on
+    // `.stashpad-focused.is-heading-row` in styles.css, independent of
+    // `.is-stuck`, so the heading still pins to the top. This method now only
+    // tears down any listener a prior install left attached (defensive — earlier
+    // builds installed a scroll handler here) and installs nothing.
+    void list;
     if (this.headingStuckCleanup) { this.headingStuckCleanup(); this.headingStuckCleanup = null; }
-    const apply = (): void => {
-      // Re-query each time: render() rebuilds the row, and a handler holding a
-      // stale element would toggle a class on a detached node — which is
-      // exactly how the IntersectionObserver version failed silently.
-      const heading = list.querySelector(".stashpad-focused.is-heading-row");
-      if (!heading) return;
-      const stuck = heading.hasClass("is-stuck");
-
-      // 0.266.3: hysteresis, because `is-stuck` CHANGES THE HEIGHT it is
-      // measured from.
-      //
-      // Sticking collapses the heading to one line, which shortens the content.
-      // On a short note that removes the overflow entirely, so the browser
-      // clamps scrollTop to 0 — which reads as "not stuck", so the heading
-      // expands, which restores the overflow, which allows the scroll again.
-      // That is a self-sustaining oscillation: measured on the phone as
-      // scrollHeight flipping 625 ↔ 394 indefinitely, and felt as the heading
-      // flickering and swallowing taps meant for the row below it.
-      //
-      // Two guards break the loop. Once stuck, only a decisive scroll back to
-      // the very top releases it, so the 0-or-2px region can't flip state on
-      // its own; and a list that cannot scroll WHILE COLLAPSED never unsticks
-      // on that basis, since expanding is precisely what would make it
-      // scrollable again.
-      // The two thresholds ARE the whole fix. Sticking needs a decisive scroll;
-      // releasing needs a return to the very top. Nothing in between moves it,
-      // so the collapse shortening the content — which clamps scrollTop to 0 —
-      // releases once and then cannot re-stick, because 0 is not past the
-      // sticking threshold.
-      //
-      // 0.266.7: an earlier third guard here ALSO refused to release whenever
-      // the collapsed list wasn't scrollable. That was aimed at the same
-      // oscillation the hysteresis already handles, and it broke the ordinary
-      // case: a note short enough that collapsing removes the overflow stayed
-      // stuck at the top of the list forever, so the heading never expanded and
-      // its Show-more toggle stayed hidden. Modelled both rules against the
-      // height feedback — hysteresis alone gives zero flips in the oscillation
-      // case AND releases correctly at the top, so the guard bought nothing.
-      if (!stuck) {
-        if (list.scrollTop > STICK_ON_PX) heading.addClass("is-stuck");
-        return;
-      }
-      if (list.scrollTop > STICK_OFF_PX) return;
-      // 0.271.1: do NOT unstick while the list is auto-pinning to the bottom.
-      //
-      // The hysteresis above assumes scrollTop only moves when the USER scrolls.
-      // That holds until a note is added: scrollListToBottom sets
-      // stickToListBottom, and the listResizeObserver then FORCES scrollTop to
-      // scrollHeight on every height change — turning a height change back into
-      // a scroll change, the one thing the hysteresis relies on not happening.
-      //
-      // With a long focused header the loop is: pinned to bottom → scrollTop
-      // past STICK_ON → stick → collapse to one line → content now fits → list
-      // non-scrollable → scrollTop clamps to 0 → (here) unstick → expand →
-      // overflow returns → re-pin to bottom → stick → … forever. Reported on a
-      // phone as the header rubber-banding the instant a note was added while
-      // two long notes filled the viewport.
-      //
-      // 0.266.7 removed an earlier "don't unstick while non-scrollable" guard as
-      // redundant with the hysteresis — correct for USER scrolling, which is the
-      // only case where the guard fired then. Scoping it to stickToListBottom
-      // restores the loop protection for the auto-pin case WITHOUT the
-      // regression 0.266.7 fixed (a short note staying stuck forever): once the
-      // user touches the list, stickToListBottom clears and normal hysteresis
-      // resumes, so the ordinary case is untouched. While pinned the header is
-      // scrolled out of view at the top anyway, so staying stuck is invisible.
-      if (this.stickToListBottom) return;
-      heading.removeClass("is-stuck");
-    };
-    list.addEventListener("scroll", apply, { passive: true });
-    this.headingStuckCleanup = () => list.removeEventListener("scroll", apply);
-    apply();
   }
 
   /** Focused-header layout mirrors a list row: [meta | body | actions].
@@ -6613,6 +6638,16 @@ export class StashpadView extends ItemView {
     // mobile action — replacing the cramped edit + open-in-new-tab pair. The
     // menu already carries Focus / Open in editor / Copy / everything.
     const actions = wrap.createDiv({ cls: "stashpad-focused-actions" });
+    // 0.300.0: exit/defocus button — leave the focused note back to its parent.
+    // Only shown when actually focused INTO a note (not at the folder home).
+    // The list-row focus-IN control is an arrow-right; this is its opposite.
+    if (node.id !== ROOT_ID) {
+      const exitBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-exit" });
+      setIcon(exitBtn, "arrow-left");
+      exitBtn.title = "Exit this note (back to parent)";
+      exitBtn.setAttr("aria-label", "Exit focused note, back to parent");
+      exitBtn.onclick = (e) => { e.stopPropagation(); this.navigateUp(); };
+    }
     let toggleAnchor: HTMLElement;
     if (Platform.isMobile) {
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more stashpad-focused-more" });
@@ -7782,34 +7817,37 @@ export class StashpadView extends ItemView {
    *  folder picker + search + jump-to-level (route). Mobile only; these moved
    *  out of the top toolbar / breadcrumb. Always visible (no collapse, per the
    *  request that always-visible is fine). */
-  private renderComposerNavCluster(rail: HTMLElement): void {
-    const nav = rail.createDiv({ cls: "stashpad-composer-nav" });
-    // 0.287.1: duplicate-hints toggle, immediately LEFT of the folder/destination
-    // picker. Off by default so the on-screen keyboard isn't crowded; state is
-    // PER-DEVICE (localStorage via the dupHintsMobileOn accessor), so it survives
-    // reloads but doesn't sync. `.is-on` gives it a distinct on-state (filled
-    // accent) vs off (muted).
-    if (getSettings().duplicateHints) {
-      const dupToggle = nav.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-dup-toggle" + (this.dupHintsMobileOn ? " is-on" : "") });
-      // "copy" (stacked pages) reads as "find similar/duplicate notes" and doesn't
-      // collide with the search magnifier next to it.
-      setIcon(dupToggle, "copy");
+  /** 0.298.1: the mobile duplicate-hints toggle. Rendered immediately LEFT of
+   *  the MAP-PIN destination button (0.287.1 wrongly put it by the folder
+   *  picker in the nav cluster — the user meant the destination picker). Off by
+   *  default so the on-screen keyboard isn't crowded; state is PER-DEVICE
+   *  (localStorage via `dupHintsMobileOn`), surviving reloads but not syncing.
+   *  `.is-on` = filled accent, off = muted. */
+  private buildComposerDupToggle(parent: HTMLElement): void {
+    const dupToggle = parent.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-dup-toggle" + (this.dupHintsMobileOn ? " is-on" : "") });
+    // 0.298.1: "radar" (sweeping for nearby matches) reads as "find similar
+    // notes" — the old "copy" (stacked pages) looked like a duplicate-document
+    // action and got confused with actual copy controls.
+    setIcon(dupToggle, "radar");
+    const setState = (): void => {
+      dupToggle.toggleClass("is-on", this.dupHintsMobileOn);
       dupToggle.setAttribute("aria-pressed", this.dupHintsMobileOn ? "true" : "false");
       dupToggle.title = this.dupHintsMobileOn
         ? "Similar-note hints: ON — tap to turn off"
         : "Similar-note hints: OFF — tap to find possible duplicates as you type";
-      dupToggle.onmousedown = (e) => e.preventDefault();
-      dupToggle.onclick = (e) => {
-        e.preventDefault();
-        this.dupHintsMobileOn = !this.dupHintsMobileOn;
-        dupToggle.toggleClass("is-on", this.dupHintsMobileOn);
-        dupToggle.setAttribute("aria-pressed", this.dupHintsMobileOn ? "true" : "false");
-        dupToggle.title = this.dupHintsMobileOn
-          ? "Similar-note hints: ON — tap to turn off"
-          : "Similar-note hints: OFF — tap to find possible duplicates as you type";
-        this.refreshDupPanel(this.composerInputEl?.value ?? this.composerDraft ?? "");
-      };
-    }
+    };
+    setState();
+    dupToggle.onmousedown = (e) => e.preventDefault();
+    dupToggle.onclick = (e) => {
+      e.preventDefault();
+      this.dupHintsMobileOn = !this.dupHintsMobileOn;
+      setState();
+      this.refreshDupPanel(this.composerInputEl?.value ?? this.composerDraft ?? "");
+    };
+  }
+
+  private renderComposerNavCluster(rail: HTMLElement): void {
+    const nav = rail.createDiv({ cls: "stashpad-composer-nav" });
     // Folder picker (shows the per-folder icon if set, else the folder glyph).
     const folderBtn = nav.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-nav-folder" });
     setIcon(folderBtn, this.plugin.getFolderIcon(this.noteFolder) ?? "folder");
@@ -7820,7 +7858,9 @@ export class StashpadView extends ItemView {
     folderBtn.title = `Folder: ${this.noteFolder}\nTap to switch / create.`;
     if (this.folderOverride) folderBtn.addClass("is-active");
     folderBtn.onmousedown = (e) => e.preventDefault();
-    folderBtn.onclick = (e) => { e.preventDefault(); this.openFolderPicker(); };
+    // 0.301.0: quick menu (recent/pinned + "search all") — mobile-relevant
+    // composer button; the full picker opens from the menu's "Search all…".
+    folderBtn.onclick = (e) => { e.preventDefault(); this.openQuickFolderMenu(e); };
     // Search.
     const searchBtn = nav.createEl("button", { cls: "stashpad-composer-btn" });
     setIconSafe(searchBtn, "search", "🔍");
@@ -8003,7 +8043,11 @@ export class StashpadView extends ItemView {
     if (!target?.file) { new Notice("Pick a note to reply to."); return; }
     this.replyTarget = { id: target.id, title: this.titleForNode(target).trim() || "(untitled)", path: target.file.path };
     this.refreshReplyChip();
-    this.focusComposer();
+    // 0.302.0: reply is an EXPLICIT action (button or R key) — always focus the
+    // composer so the user can type the reply immediately, regardless of the
+    // "focus composer on open" preference (focusComposer() self-gates on it).
+    this.focusComposerOnNextRender = true;
+    this.composerInputEl?.focus({ preventScroll: true });
   }
 
   /** Render (or clear) the composer's reply chip from replyTarget. */
@@ -8014,19 +8058,23 @@ export class StashpadView extends ItemView {
     const t = this.replyTarget;
     host.toggleClass("is-active", !!t);
     if (!t) return;
+    // 0.298.0: two lines, matching the rendered reply quote (0.288.0) \u2014 a
+    // "Reply to" label row with the cancel button, the target title beneath.
     const chip = host.createDiv({ cls: "stashpad-reply-chip" });
-    setIcon(chip.createSpan({ cls: "stashpad-reply-chip-icon" }), "reply");
-    chip.createSpan({ cls: "stashpad-reply-chip-label", text: "Replying to " });
-    const title = chip.createSpan({ cls: "stashpad-reply-chip-title", text: t.title.length > 60 ? t.title.slice(0, 60) + "\u2026" : t.title });
+    const top = chip.createDiv({ cls: "stashpad-reply-chip-top" });
+    setIcon(top.createSpan({ cls: "stashpad-reply-chip-icon" }), "reply");
+    top.createSpan({ cls: "stashpad-reply-chip-label", text: "Reply to" });
+    const x = top.createEl("button", { cls: "stashpad-reply-chip-x", text: "\u2715" });
+    x.title = "Cancel reply";
+    x.onclick = () => { this.replyTarget = null; this.refreshReplyChip(); };
+    const title = chip.createSpan({ cls: "stashpad-reply-chip-title", text: t.title.length > 80 ? t.title.slice(0, 80) + "\u2026" : t.title });
+    title.title = "Open this note";
     title.onclick = () => {
       // The pending reply target is a note in THIS folder (you just picked it) \u2014
       // flash its row if rendered, else drill to it.
       const row = this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(t.id)}"]`);
       if (row) this.flashRowIntoView(row); else this.navigateTo(t.id);
     };
-    const x = chip.createEl("button", { cls: "stashpad-reply-chip-x", text: "\u2715" });
-    x.title = "Cancel reply";
-    x.onclick = () => { this.replyTarget = null; this.refreshReplyChip(); };
   }
 
 
@@ -8038,24 +8086,45 @@ export class StashpadView extends ItemView {
 
   /** Find notes in THIS folder whose title matches the composer text (Sift). Cheap
    *  (in-memory titles) so it can run live; body search is a follow-up. */
-  private dupSearch(text: string): TreeNode[] {
+  /** 0.299.0: cross-folder note list for dup search, cached (rebuilt when the
+   *  view's folder changes or a vault create/delete/rename invalidates it in
+   *  onOpen). `collectCrossFolderNotes` is O(vault), so it must not run per
+   *  keystroke-pause. Titles come from the filename slug — no body reads. */
+  private dupCross: { folder: string; notes: import("./note-picker").CrossFolderNote[] } | null = null;
+  private dupCrossNotes(): import("./note-picker").CrossFolderNote[] {
+    if (!this.dupCross || this.dupCross.folder !== this.noteFolder) {
+      this.dupCross = { folder: this.noteFolder, notes: this.collectCrossFolderNotes() };
+    }
+    return this.dupCross.notes;
+  }
+
+  private dupSearch(text: string): DupHit[] {
     const q = text.trim();
     if (q.length < 3) return [];
-    // 0.294.0 (perf): carry the title (and its length) on the candidate. The
-    // comparator used to call titleForNode TWICE per comparison — O(N log N)
-    // extra title derivations on top of the O(N) scan, on every run.
-    const out: Array<{ n: TreeNode; score: number; len: number }> = [];
     const ql = q.toLowerCase();
+    const rank = (title: string): number => {
+      const tl = title.toLowerCase();
+      return tl === ql ? 0 : tl.startsWith(ql) ? 1 : tl.includes(ql) ? 2 : 3;
+    };
+    // 0.294.0 (perf): carry the title (and its length) so the comparator never
+    // re-derives it. THIS folder — titles from the live render cache (memoized).
+    const out: Array<DupHit & { score: number; len: number }> = [];
     for (const n of this.tree.all()) {
       if (!n.file || n.id === ROOT_ID) continue;
       const title = this.titleForNode(n).trim();
       if (!title || !siftMatch(q, title)) continue;
-      const tl = title.toLowerCase();
-      const score = tl === ql ? 0 : tl.startsWith(ql) ? 1 : tl.includes(ql) ? 2 : 3;
-      out.push({ n, score, len: title.length });
+      out.push({ id: n.id, title, folder: this.noteFolder, crossFolder: false, file: n.file, score: rank(title), len: title.length });
+    }
+    // 0.299.0: OTHER Stashpad folders (searchableFolders honours muted/excluded
+    // ones). +0.5 to the score so a same-folder match wins a tie — "you may
+    // already have this HERE" is the more useful warning than one elsewhere.
+    for (const cf of this.dupCrossNotes()) {
+      const title = cf.title.trim();
+      if (!title || !siftMatch(q, title)) continue;
+      out.push({ id: cf.id, title, folder: cf.folder, crossFolder: true, file: cf.file, score: rank(title) + 0.5, len: title.length });
     }
     out.sort((a, b) => a.score - b.score || a.len - b.len);
-    return out.slice(0, 5).map((e) => e.n);
+    return out.slice(0, 5).map(({ score: _s, len: _l, ...h }) => h);
   }
 
   /** Render (or clear) the duplicate-hint panel from the current composer text. */
@@ -8068,8 +8137,8 @@ export class StashpadView extends ItemView {
     host.toggleClass("is-active", matches.length > 0);
     if (!matches.length) return;
     host.createSpan({ cls: "stashpad-dup-label", text: "Similar notes" });
-    for (const n of matches) {
-      const title = this.titleForNode(n).trim() || "(untitled)";
+    for (const hit of matches) {
+      const title = hit.title.trim() || "(untitled)";
       const row = host.createDiv({ cls: "stashpad-dup-hit" });
       // 0.286.0: keyboard-navigable. The panel is above the composer, so
       // Shift+Tab from the input lands on the last hit; ArrowUp/Down move between
@@ -8077,11 +8146,25 @@ export class StashpadView extends ItemView {
       // Escape returns focus to the composer.
       row.tabIndex = 0;
       row.setAttribute("role", "button");
-      row.setAttribute("aria-label", `Open similar note: ${title}`);
       setIcon(row.createSpan({ cls: "stashpad-dup-hit-icon" }), "corner-down-right");
       row.createSpan({ cls: "stashpad-dup-hit-title", text: title });
-      row.title = "Open this note";
-      const open = (): void => { if (this.tree.get(n.id)) this.navigateTo(n.id); };
+      // 0.299.0: a cross-folder match is labelled with its folder — otherwise
+      // "you may already have this" is confusing when the note lives elsewhere.
+      if (hit.crossFolder) {
+        const folderName = hit.folder.split("/").pop() || hit.folder;
+        row.createSpan({ cls: "stashpad-dup-hit-folder", text: `in ${folderName}` });
+        row.setAttribute("aria-label", `Open similar note: ${title}, in folder ${folderName} (new tab)`);
+        row.title = `Open this note in ${folderName} (new tab)`;
+      } else {
+        row.setAttribute("aria-label", `Open similar note: ${title}`);
+        row.title = "Open this note";
+      }
+      // Same-folder → navigate here; cross-folder → open in a new tab, which
+      // refocuses this tab on close (the reply-jump reveal pattern, 0.289.0).
+      const open = (): void => {
+        if (hit.crossFolder) void this.openNoteInNewTab(hit.folder, hit.id);
+        else if (this.tree.get(hit.id)) this.navigateTo(hit.id);
+      };
       row.onclick = open;
       row.addEventListener("keydown", (e) => {
         const hits = Array.from(host.querySelectorAll<HTMLElement>(".stashpad-dup-hit"));
@@ -8113,6 +8196,12 @@ export class StashpadView extends ItemView {
     // the same row as the textarea, which halved the composer width). The
     // textarea + button rail live in an inner `.stashpad-composer-row`.
     this.replyChipHost = composer.createDiv({ cls: "stashpad-reply-chip-host" });
+    // 0.302.0: restore the reply chip on a composer (re)build — like the dup
+    // panel below. Without this, a composer rebuild (folder switch, any
+    // composerSig change) created a fresh empty host and dropped the chip even
+    // though replyTarget was still set, so a reply set before the rebuild
+    // stopped showing its quote (F4b: "subsequent replies don't render").
+    if (this.replyTarget) this.refreshReplyChip();
     this.dupPanelHost = composer.createDiv({ cls: "stashpad-dup-panel" });
     if (this.composerDraft) this.refreshDupPanel(this.composerDraft);
     this.composerRootEl = composer;
@@ -8427,8 +8516,9 @@ export class StashpadView extends ItemView {
     // the DropzoneModal, whose zone hosts its own picker.)
 
     const btnRail = composerRow.createDiv({ cls: "stashpad-composer-btn-rail" });
-    // 0.287.1: the mobile duplicate-hints toggle now lives INSIDE the nav cluster,
-    // immediately left of the folder/destination picker (see renderComposerNavCluster).
+    // 0.298.1: the mobile duplicate-hints toggle lives in the collapsible group,
+    // immediately left of the MAP-PIN destination button (see buildComposerDupToggle,
+    // called just before destBtn). 0.287.1 had it by the folder picker by mistake.
     // 0.119.0 (mobile-ui-changes-2): on mobile, the folder picker + search +
     // jump-to-level (route) controls live here at the bottom-left of the
     // composer (moved out of the top toolbar / breadcrumb).
@@ -8467,6 +8557,10 @@ export class StashpadView extends ItemView {
     };
 
     // (0.201.2: the 0.199.3 dropzone button merged into the paperclip below.)
+
+    // 0.298.1: duplicate-hints toggle sits immediately LEFT of the map-pin
+    // destination button (mobile only — it's a per-device mobile toggle).
+    if (Platform.isMobile && getSettings().duplicateHints) this.buildComposerDupToggle(expandedGroup);
 
     const destBtn = expandedGroup.createEl("button", { cls: "stashpad-composer-btn stashpad-composer-dest" });
     this.composerDestBtn = destBtn;
@@ -8686,6 +8780,11 @@ export class StashpadView extends ItemView {
       if (!text) return;
       ta.value = "";
       this.composerDraft = "";
+      // 0.298.0: a trailing dup-search debounce armed by the last keystroke
+      // would otherwise fire ~350ms AFTER send and re-show the "Similar notes"
+      // panel for the note you just created. Cancel it and clear the panel now.
+      this.debouncedDupSearch?.cancel();
+      this.refreshDupPanel("");
       // Clear the persisted draft IMMEDIATELY and AWAIT both writes so a
       // reload (or beforeunload race) right after Enter can't see a stale
       // draft on disk. Earlier this was fire-and-forget, which let the
@@ -10068,6 +10167,8 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.listPinBottom)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin("bottom"); return; }
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
+      // 0.300.0: R replies to the cursor row; pressing R on another note switches the target.
+      if (matchBinding(e, sb.reply)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdReply(); return; }
     }
     // Jump to top/bottom: no selection required — only a non-empty list.
     if (this.currentChildren.length > 0) {
@@ -10221,6 +10322,16 @@ export class StashpadView extends ItemView {
       if (!node) return false;
       const wantsCheckbox = this.isTask(node) || this.compactMode;
       if (wantsCheckbox !== !!row.querySelector(".stashpad-note-task-checkbox")) return false;
+      // 0.302.0 (F4a): a freshly-sent reply's row is appended before the
+      // metadata cache parses its `replyTo`, so the reply-quote block is absent
+      // until the frontmatter resolves. When it does, the quote's presence no
+      // longer matches the row — treat that as structural so a full render adds
+      // it (the attribute repaint can't synthesize the quote). Rare (once per
+      // reply send), so it doesn't cost the perf path in normal use.
+      if (node.file) {
+        const hasReplyTo = typeof this.app.metadataCache.getFileCache(node.file)?.frontmatter?.replyTo === "string";
+        if (hasReplyTo !== !!row.querySelector(".stashpad-reply-quote")) return false;
+      }
     }
     this.repaintRowColors();
     this.repaintSelectionClasses();

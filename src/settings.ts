@@ -67,7 +67,7 @@ export type CommandId =
   | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
   | "swapWithParent"
   | "togglePin" | "listPin" | "listPinBottom"
-  | "toggleTask" | "setDue" | "openAllTasks"
+  | "toggleTask" | "setDue" | "openAllTasks" | "reply"
   | "jumpToTop" | "jumpToBottom"
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
   | "copyNotes" | "cutNotes" | "pasteNotes"
@@ -135,7 +135,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "clone",           label: "Clone (duplicate / copy) selection", desc: "Default: Mod+Shift+D — clone selected notes (with their subtrees) as siblings.",   defaultPrimary: "Mod+Shift+D" },
   { id: "forkNote",        label: "Fork into a separate note (under a chosen parent)", desc: "Duplicate the cursor row (with its subtree) as a separate note and pick which parent it nests under. Distinct from \"Fork as a version\" (a draft within a sheet group). No default chord.", defaultPrimary: "" },
   { id: "insertTemplate",  label: "Insert template (clone an existing note)", desc: "Pick any note in this Stashpad; clone it (with subtree + attachments) into the current view, retimestamped.", defaultPrimary: "" },
-  { id: "toggleExpand",    label: "Show more / show less (expand toggle)", desc: "Default: Shift+? — toggle the clamp on the cursor row (or every selected row).", defaultPrimary: "Shift+?" },
+  { id: "toggleExpand",    label: "Show more / show less — expand / collapse note body", desc: "Default: Shift+? or Alt+E — expand / collapse the body of the cursor row, the focused heading note, or every selected row (both chords active).", defaultPrimary: "Shift+?", defaultSecondary: "Alt+E", defaultUseBoth: true },
   { id: "expandAll",       label: "Expand all (show every note's full body)", desc: "Un-clamp every note in the current list at once.", defaultPrimary: "" },
   { id: "collapseAll",     label: "Collapse all (clamp every note's body)", desc: "Re-clamp every note in the current list at once.", defaultPrimary: "" },
   { id: "exportStash",     label: "Export selection…",             desc: "Open the export dialog for the selected subtree(s) — pick .stash / OKF / plain .zip and full/frontmatter/body content.", defaultPrimary: "" },
@@ -149,6 +149,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
   { id: "listPinBottom",   label: "Pin / unpin to bottom of list", desc: "Float the cursor row (or selection) to the BOTTOM of its list. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: G — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "G" },
+  { id: "reply",           label: "Reply to selection",            desc: "Default: R — start a reply to the cursor row (or selection): the composer's next send links back to it and shows a quote. Press R on another note to switch the reply target.", defaultPrimary: "R" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
   { id: "openAllTasks",    label: "Open all tasks (aggregate view)", desc: "Default: Shift+T — open the aggregate “All tasks” view collecting tasks across every Stashpad folder.", defaultPrimary: "Shift+T" },
   { id: "jumpToTop",       label: "Jump to top of list",           desc: "Default: Home — move the cursor to the first note in the current list.", defaultPrimary: "Home" },
@@ -324,6 +325,9 @@ export interface StashpadSettings {
    *  ordinary action does, so it has to be chosen. */
   openNotesInStashpad: boolean;
   debugTrace: boolean;
+  /** 0.297.0: capture uncaught errors from THIS plugin to a local log (always
+   *  on, independent of the debug trace). Never sent anywhere. */
+  captureErrors: boolean;
   /** 0.268.18: mirror the trace to disk so it survives a crash or force-quit.
    *  OFF by default — see the comment on the default below. */
   debugTracePersist: boolean;
@@ -731,6 +735,13 @@ export interface StashpadSettings {
    *  Also accrues zones the device has actually been in (the schedule timer
    *  records a new one on a tz change). */
   obscureScheduleTimezoneHistory: string[];
+  /** 0.300.0 — per-weekday switch for the obscure schedule. Length 7, index 0 =
+   *  Sunday … 6 = Saturday (matches JS Date.getDay()). A day set to false means
+   *  the schedule does NOT engage that day (e.g. weekends off). Default all true =
+   *  blur every day (original behaviour). Read defensively: a missing/short array
+   *  entry is treated as true. The day is read in the schedule's home timezone so
+   *  it agrees with the hour window. */
+  obscureScheduleWeekdays: boolean[];
   /** 0.279.31 — desktop: select text inside note bodies. ON makes the body
    *  selectable and moves row dragging to the grip handle; OFF restores
    *  drag-from-anywhere-on-the-row (no text selection). Desktop only. */
@@ -921,6 +932,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   quickMenuIncludeMore: true,
   openNotesInStashpad: false,
   debugTrace: false,
+  captureErrors: true,
   // 0.268.18: OFF. Persistence was added for a bug thought to hang the app,
   // where a force-quit would take the only copy of the trace with it. That
   // turned out not to be the fault, and meanwhile leaving the trace on meant a
@@ -1031,6 +1043,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureScheduleEnd: 17,
   obscureScheduleTimezone: "",
   obscureScheduleTimezoneHistory: [],
+  obscureScheduleWeekdays: [true, true, true, true, true, true, true],
   selectableNoteText: true,
   attachmentNamePrefix: false, // 0.279.1: default OFF — undoes the 0.268.2 filename prefix (user: "we'll survive without the clutter")
   attachmentsEmbedded: true,
@@ -1079,15 +1092,36 @@ export function getSettings(): StashpadSettings { return current; }
  *  window (e.g. 22→6). Used by isObscured() to gate per-folder obscure defaults,
  *  and by the plugin's minute timer to refresh views when the window flips. */
 export function isWithinObscureSchedule(
-  s: Pick<StashpadSettings, "obscureScheduleStart" | "obscureScheduleEnd" | "obscureScheduleTimezone">,
+  s: Pick<StashpadSettings, "obscureScheduleStart" | "obscureScheduleEnd" | "obscureScheduleTimezone" | "obscureScheduleWeekdays">,
   now: Date = new Date(),
 ): boolean {
+  // 0.300.0: a weekday switched off means the schedule never engages that day.
+  // Derive the day in the SAME zone the hours are read in (home tz), so a night
+  // window near midnight doesn't disagree about which day it is. A missing/short
+  // array entry defaults to true (blur), preserving pre-0.300.0 behaviour.
+  const wd = (s as Partial<StashpadSettings>).obscureScheduleWeekdays;
+  if (Array.isArray(wd) && wd[currentWeekdayInTz(s.obscureScheduleTimezone, now)] === false) return false;
   const h = currentHourInTz(s.obscureScheduleTimezone, now);
   const start = Math.max(0, Math.min(23, s.obscureScheduleStart));
   const end = Math.max(0, Math.min(24, s.obscureScheduleEnd));
   if (start === end) return false;
   if (start < end) return h >= start && h < end;
   return h >= start || h < end; // overnight
+}
+
+/** 0.300.0: day-of-week (0 = Sunday … 6 = Saturday) in an IANA timezone; falls
+ *  back to device local day when the tz is empty or invalid. Kept consistent with
+ *  currentHourInTz so the weekday gate and the hour window agree on "which day". */
+const WEEKDAY_ABBR = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function currentWeekdayInTz(tz: string | undefined, now: Date): number {
+  if (!tz) return now.getDay();
+  try {
+    const name = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(now);
+    const i = WEEKDAY_ABBR.indexOf(name);
+    return i >= 0 ? i : now.getDay();
+  } catch {
+    return now.getDay(); // invalid tz id → device local day
+  }
 }
 
 /** Fractional current hour (0–24) in an IANA timezone; falls back to device local
@@ -1584,6 +1618,13 @@ export class StashpadSettingTab extends PluginSettingTab {
           this.plugin.stampDiagnostic("perf", v);
           await this.plugin.saveSettings();
         })), ["perf", "profiling", "timing", "slow"]),
+
+      this.renderDef("Capture errors", "Keep a local log of any unexpected error that comes from Stashpad itself — an uncaught exception or a failed background promise. Unlike the debug trace, this is always on, because a crash you didn't see coming can't be traced after the fact. Only Stashpad's own errors are logged, and only to a file in Stashpad's plugin folder — nothing is ever sent anywhere. Copy or clear the log from the command palette (\"Diagnostics: copy captured errors\"). Costs nothing until something actually throws.", (s) =>
+        s.addToggle((t) => t.setValue(this.plugin.settings.captureErrors !== false).onChange(async (v) => {
+          this.plugin.settings.captureErrors = v;
+          await this.plugin.saveSettings();
+          this.plugin.setErrorCapture(v);
+        })), ["error", "crash", "exception", "capture", "log", "diagnostics"]),
 
       this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. Kept in memory only, so nothing is written to disk unless you also turn on the setting below. Local only — no network; zero overhead when off.", (s) =>
         s.addToggle((t) => t.setValue(this.plugin.settings.debugTrace).onChange(async (v) => {
@@ -2538,7 +2579,55 @@ export class StashpadSettingTab extends PluginSettingTab {
           else chip.onclick = () => setTz(z);
         }
       }
-    }, ["obscure", "blur", "schedule", "hours", "time", "timezone", "privacy", "home", "work"]));
+      // 0.300.0: per-weekday switches. A day toggled off means the schedule does
+      // not engage that day (e.g. weekends). Only meaningful while the schedule is
+      // on, so dim + disable the row when it's off, mirroring the times above.
+      const scheduleOn = this.plugin.settings.obscureScheduleEnabled;
+      host.createEl("p", { cls: "setting-item-description", text: "Days the schedule is active — turn off days you don't want auto-blur, e.g. weekends. (Read in your home timezone.)" });
+      const dayRow = host.createDiv({ cls: "stashpad-weekday-chips" + (scheduleOn ? "" : " is-disabled") });
+      const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
+      const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+      const days = this.plugin.settings.obscureScheduleWeekdays;
+      for (let i = 0; i < 7; i++) {
+        // Default-true when the stored array is missing/short.
+        const chip = dayRow.createEl("button", { cls: "stashpad-weekday-chip", text: DAY_LABELS[i] });
+        // 0.302.0: toggle the chip IN PLACE on click instead of leaning on a
+        // settings re-render (which didn't repaint the chip, so clicks looked
+        // dead). Mirrors the composer dup-toggle's setState() pattern: read the
+        // live setting, restyle the button. `on` is derived each call so the
+        // chip is robust to a missing/short stored array and stays correct
+        // across a settings reopen (reads obscureScheduleWeekdays[i]).
+        const setState = (): void => {
+          const arr = this.plugin.settings.obscureScheduleWeekdays;
+          const on = !Array.isArray(arr) || arr[i] !== false;
+          chip.toggleClass("is-on", on);
+          chip.title = `${DAY_NAMES[i]}: auto-blur ${on ? "ON" : "OFF"}`;
+          chip.setAttr("aria-label", chip.title);
+          chip.setAttr("aria-pressed", String(on));
+        };
+        setState();
+        if (!scheduleOn) chip.disabled = true;
+        else chip.onclick = (): void => {
+          // Normalise to a full length-7 boolean array before mutating, so a
+          // legacy short/missing array can't drop days when we write it back.
+          const cur = this.plugin.settings.obscureScheduleWeekdays;
+          const next = Array.from({ length: 7 }, (_, k) => (!Array.isArray(cur) || cur[k] !== false));
+          next[i] = !next[i];
+          this.plugin.settings.obscureScheduleWeekdays = next;
+          applied();
+          setState();
+        };
+      }
+      // 0.302.0: the schedule only gates folders set to "obscure by default"
+      // (obscureFolders[f] === true) — see the section intro. If NO folder is
+      // set that way, the whole schedule is inert, so say so plainly. Reliable
+      // to detect from settings: it's exactly the map the schedule keys off.
+      const anyFolderBlurred = Object.values(this.plugin.settings.obscureFolders ?? {}).some((v) => v === true);
+      if (!anyFolderBlurred) {
+        host.createEl("p", { cls: "setting-item-description stashpad-schedule-noblur-note",
+          text: "No folder is set to blur yet — this schedule has no effect until you turn on “obscure by default” for a folder (see “Obscure notes by default, per folder” above)." });
+      }
+    }, ["obscure", "blur", "schedule", "hours", "time", "timezone", "privacy", "home", "work", "weekday", "weekend", "day", "saturday", "sunday"]));
     // 0.279.14: be explicit about the gaps, since obscure is glance-protection and
     // reads as more than it is otherwise.
     cats.listDisplay.push(this.sectionDef("What obscuring does NOT cover", "", (host) => {

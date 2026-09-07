@@ -5,7 +5,7 @@ import { buildTimePickerInto } from "./time-picker";
 import { siftMatch, ROOT_ID } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
-import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL } from "./recurrence";
+import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL, parseRecurrence, parseDuration } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { readClipboardText } from "./cross-vault-clipboard";
 import { getSettings } from "./settings";
@@ -541,6 +541,10 @@ export class NoteWorkbench {
   private autocomplete: ComposerAutocomplete | null = null;
   private cursorText: string;
   private collapsed: { orig: boolean; changes: boolean; edit: boolean };
+  /** 0.302.0: per-render "re-measure a clamped pane" callbacks — run when a
+   *  pane becomes visible or its content (the diff) is re-rendered, so the
+   *  Show more/less toggle appears only when the content actually overflows. */
+  private clampSyncs: Array<() => void> = [];
 
   constructor(
     private app: App,
@@ -1146,6 +1150,34 @@ export class NoteWorkbench {
     return { section, body };
   }
 
+  /** 0.302.0: cap a read-only pane (Original / Changes) to ~2 lines by default,
+   *  with a "Show more / Show less" toggle that expands it to full height. Long
+   *  notes made these panes wall-of-text; this keeps them glanceable. The toggle
+   *  hides itself when the content already fits in 2 lines (so a short note gets
+   *  no pointless control). `sync()` is pushed onto this.clampSyncs so callers
+   *  can re-measure after the pane becomes visible or its content re-renders. */
+  private addPaneClamp(section: HTMLElement, paneBody: HTMLElement): void {
+    let expanded = false;
+    paneBody.addClass("stashpad-pane-clampable", "is-clamped");
+    const toggle = section.createEl("button", { cls: "stashpad-pane-clamp-toggle", attr: { type: "button" } });
+    const applyState = (): void => {
+      paneBody.toggleClass("is-clamped", !expanded);
+      toggle.setText(expanded ? "Show less" : "Show more");
+      toggle.setAttr("aria-expanded", String(expanded));
+    };
+    const sync = (): void => {
+      // Overflow can only be measured while clamped; when expanded we keep the
+      // toggle so the user can collapse again.
+      const overflows = expanded || (paneBody.scrollHeight - paneBody.clientHeight > 2);
+      toggle.toggleClass("is-hidden", !overflows);
+    };
+    toggle.onmousedown = (e) => e.preventDefault(); // don't blur the textarea
+    toggle.onclick = (e) => { e.preventDefault(); e.stopPropagation(); expanded = !expanded; applyState(); sync(); };
+    applyState();
+    this.clampSyncs.push(sync);
+    requestAnimationFrame(sync);
+  }
+
   /** 0.169.1: a copy-to-clipboard icon button. `onmousedown`/`stopPropagation` keep
    *  it from toggling a collapse header or blurring the textarea. */
   private makeCopyButton(getText: () => string, label: string, cls = "stashpad-split-copy-btn"): HTMLButtonElement {
@@ -1170,17 +1202,22 @@ export class NoteWorkbench {
     // panels share one space (one visible at a time) so they don't stack and blow
     // the modal past the keyboard. Desktop keeps the stacked collapsible sections.
     if (Platform.isMobile) { this.renderEditorTabbed(); return; }
+    this.clampSyncs = []; // fresh set per render (this method re-runs on mode toggles)
     // 0.168.1/0.168.2: when the text has been edited, a read-only ORIGINAL section
     // and a read-only word-level DIFF section appear above the editor. All three are
     // consistent collapsible framed sections (whole header = the toggle button).
     const orig = this.buildSplitSection(this.host, "orig", "Original — will be replaced");
-    orig.body.createDiv({ cls: "stashpad-split-panel-body", text: this.body });
+    const origPane = orig.body.createDiv({ cls: "stashpad-split-panel-body", text: this.body });
+    // 0.302.0: cap Original to ~2 lines by default with a Show more/less toggle.
+    this.addPaneClamp(orig.section, origPane);
     // 0.169.1: copy the original text (the header is a full-width collapse button,
     // so the copy button overlays its right edge as a section sibling).
     orig.section.appendChild(this.makeCopyButton(() => this.body, "Copy the original text", "stashpad-split-copy-btn stashpad-split-section-copy"));
 
     const changes = this.buildSplitSection(this.host, "changes", "Changes");
     const diffBody = changes.body.createDiv({ cls: "stashpad-split-panel-body stashpad-split-diff-body" });
+    // 0.302.0: same 2-line clamp on the diff pane.
+    this.addPaneClamp(changes.section, diffBody);
 
     const edit = this.buildSplitSection(this.host, "edit", this.surface === "edit" ? "Your edit" : "Your edit — the split uses this");
     const editWrap = edit.body.createDiv({ cls: "stashpad-edit-wrap" });
@@ -1204,7 +1241,12 @@ export class NoteWorkbench {
       const edited = ta.value !== this.body;
       orig.section.setCssStyles({ display: edited ? "" : "none" });
       changes.section.setCssStyles({ display: edited ? "" : "none" });
-      if (edited) renderDiff();
+      if (edited) {
+        renderDiff();
+        // 0.302.0: panes just became visible / the diff changed — re-measure so the
+        // clamp toggles reflect the real overflow (a hidden pane measures as 0).
+        requestAnimationFrame(() => this.clampSyncs.forEach((s) => s()));
+      }
     };
 
     // Auto-size the textarea to fit content. Cap at 3 lines on mobile,
@@ -2988,9 +3030,21 @@ export class DueDatePickerModal extends Modal {
     // configured preset. Clicking nudges the entered date+time by ±amount; if no
     // date/time is entered yet, it bases off "now" so a single tap schedules
     // e.g. "+1h from now". Reschedule-friendly for Snooze.
-    const adjusts = (this.opts.quickAdjusts ?? DEFAULT_QUICK_ADJUSTS)
+    const parsedAdjusts = (this.opts.quickAdjusts ?? DEFAULT_QUICK_ADJUSTS)
       .map((s) => ({ raw: s, min: parseAdjustMinutes(s) }))
       .filter((a): a is { raw: string; min: number } => a.min != null);
+    // 0.300.0: render the DAY/WEEK increment buttons (d/w) immediately AFTER the
+    // TIME increment buttons (m/h), so the day nudges always sit right next to
+    // the time nudges instead of drifting to the end of the row when the
+    // settings string happens to list them out of order. Stable-partition by
+    // unit — this only reorders the rendered buttons; the settings string and
+    // every button's ±amount wiring are untouched. (Empty setting → empty array
+    // → row still hidden; time-only or day-only → a single group, unchanged.)
+    const isDayUnit = (raw: string): boolean => /[dw]\s*$/i.test(raw);
+    const adjusts = [
+      ...parsedAdjusts.filter((a) => !isDayUnit(a.raw)),
+      ...parsedAdjusts.filter((a) => isDayUnit(a.raw)),
+    ];
     if (adjusts.length > 0) {
       let sign = 1; // +1 add, -1 subtract
       const row = wrap.createDiv({ cls: "stashpad-due-quickadjust" });
@@ -3077,16 +3131,61 @@ export class DueDatePickerModal extends Modal {
         + "repeat for anything with real consequences; keep a reminder you trust for "
         + "deadlines that matter. A one-off due date and reminder is the well-tested path.",
       );
-      const mkRow = (label: string, ph: string, val?: string): HTMLInputElement => {
+      // 0.302.0: live syntax/validity feedback as you type. Each field runs the
+      // EXACT parser the feature uses at save time (parseRecurrence for Repeat,
+      // parseDuration for the two durations) — so "valid" here means "valid when
+      // saved", not a second grammar. Empty = neutral (no error). Debounced 200ms.
+      type ValidState = { state: "neutral" | "valid" | "invalid"; msg: string };
+      const humanizeMs = (ms: number): string => {
+        const units: Array<[number, string]> = [[604800000, "week"], [86400000, "day"], [3600000, "hour"], [60000, "minute"]];
+        for (const [u, name] of units) {
+          if (ms >= u) { const n = Math.round((ms / u) * 100) / 100; return `${n} ${name}${n === 1 ? "" : "s"}`; }
+        }
+        const s = Math.round(ms / 1000); return `${s} second${s === 1 ? "" : "s"}`;
+      };
+      const validateRecurrence = (v: string): ValidState => {
+        const t = v.trim();
+        if (!t) return { state: "neutral", msg: "" };
+        const rec = parseRecurrence(t);
+        return rec
+          ? { state: "valid", msg: `→ repeats ${rec.label}` }
+          : { state: "invalid", msg: "Couldn't parse — try “every weekday”, “every 30 days”, “mon, wed, fri”." };
+      };
+      const validateDuration = (v: string): ValidState => {
+        const t = v.trim();
+        if (!t) return { state: "neutral", msg: "" };
+        const ms = parseDuration(t);
+        return ms ? { state: "valid", msg: `→ ${humanizeMs(ms)}` } : { state: "invalid", msg: "Use a duration like 2h, 1d, 30m." };
+      };
+      const mkRow = (label: string, ph: string, val?: string, validate?: (v: string) => ValidState): HTMLInputElement => {
         const r = det.createDiv({ cls: "stashpad-due-recur-row" });
         r.createEl("label", { text: label });
         const inp = r.createEl("input", { type: "text", attr: { placeholder: ph } });
         if (val) inp.value = val;
+        if (validate) {
+          const hint = det.createDiv({ cls: "stashpad-due-recur-help stashpad-recur-validity" });
+          const run = (): void => {
+            const res = validate(inp.value);
+            inp.toggleClass("is-invalid", res.state === "invalid");
+            inp.toggleClass("is-valid", res.state === "valid");
+            hint.toggleClass("is-invalid", res.state === "invalid");
+            hint.toggleClass("is-valid", res.state === "valid");
+            hint.setText(res.msg);
+            hint.toggleClass("is-hidden", !res.msg);
+          };
+          let timer = 0;
+          inp.addEventListener("input", () => { window.clearTimeout(timer); timer = window.setTimeout(run, 200); });
+          (inp as unknown as { _runValidity?: () => void })._runValidity = run;
+          run(); // initial state for the pre-filled value (synchronous, neutral when empty)
+        }
         return inp;
       };
-      repeatIn = mkRow("Repeat", 'e.g. "every weekday", "every 30 days when done"', this.opts.currentRepeat);
-      autoIn = mkRow("Auto-complete after", 'e.g. "1d" — mark done once this overdue', this.opts.currentAutoDoneAfter);
-      remindIn = mkRow("Remind every", 'e.g. "2h" — re-notify until done', this.opts.currentRemindEvery);
+      repeatIn = mkRow("Repeat", 'e.g. "every weekday", "every 30 days when done"', this.opts.currentRepeat, validateRecurrence);
+      autoIn = mkRow("Auto-complete after", 'e.g. "1d" — mark done once this overdue', this.opts.currentAutoDoneAfter, validateDuration);
+      remindIn = mkRow("Remind every", 'e.g. "2h" — re-notify until done', this.opts.currentRemindEvery, validateDuration);
+      // The chips/anchor toggles rewrite repeatIn.value directly, so re-run its
+      // validity from repaint() (below) too, not just on keystrokes.
+      const runRepeatValidity = (repeatIn as unknown as { _runValidity?: () => void })._runValidity;
 
       // 0.203.0: pick the DAYS a weekly repeat lands on. Created here so it sits
       // directly under the Repeat field; wired further down (needs paintAnchor).
@@ -3180,7 +3279,7 @@ export class DueDatePickerModal extends Modal {
         mdEls.push(b);
       }
 
-      const repaint = (): void => { paintAnchor(); paintDays(); paintMonthDays(); };
+      const repaint = (): void => { paintAnchor(); paintDays(); paintMonthDays(); runRepeatValidity?.(); };
       repeatIn.addEventListener("input", repaint);
       repaint();
 

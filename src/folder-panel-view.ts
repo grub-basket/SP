@@ -86,6 +86,11 @@ export class StashpadFolderPanelView extends ItemView {
     const he:HTMLElement = head.createSpan({ cls: "stashpad-folderpanel-heading-title stashpad-folderpanel-heading-switch", text: "Folders" });
     he.setAttr("aria-label", "Open folder switcher");
     he.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); this.plugin.openFolderPicker(); } };
+    // 0.302.0: view launcher — to the LEFT of the new-folder button.
+    const launchBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-launcher" });
+    setIcon(launchBtn, "layout-grid");
+    launchBtn.setAttr("aria-label", "Switch view (launcher)");
+    launchBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); (this.app as any).commands.executeCommandById("stashpad:stashpad-open-view-launcher"); } };
     const newBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-newfolder" });
     setIcon(newBtn, "folder-plus");
     newBtn.setAttr("aria-label", "New Stashpad folder (folder switcher)");
@@ -794,7 +799,7 @@ export class StashpadFolderPanelView extends ItemView {
     // the NEXT click on the (now-unfocused) sidebar button was getting swallowed by
     // Obsidian re-focusing the panel — only every other click registered. mousedown
     // fires regardless of focus, so you can spam it and get a tab per click.
-    newTabBtn.onmousedown = (e) => {
+    newTabBtn.onpointerdown = (e) => {   // 0.302.0: touch-safe (see row handler)
       if (e.button !== 0) return;
       e.preventDefault(); e.stopPropagation();
       this.onNavigateAway(); void this.plugin.activateViewForFolder(folder);
@@ -805,7 +810,11 @@ export class StashpadFolderPanelView extends ItemView {
     // when the sidebar panel wasn't focused yet — Obsidian's "first click focuses
     // the sidebar, second click acts" behavior was forcing a double-click. Ignore
     // non-left buttons and clicks landing on the action buttons.
-    row.addEventListener("mousedown", (e) => {
+    // 0.302.0: pointerdown, not mousedown. mousedown is a MOUSE event — on a
+    // touch device the FIRST tap on an unfocused sidebar is consumed focusing
+    // the pane and no synthesized mousedown fires, so it took a second tap.
+    // pointerdown fires on the first touch contact regardless of focus.
+    row.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
       if ((e.target as HTMLElement)?.closest?.(".stashpad-folderpanel-actions")) return;
       this.onNavigateAway(); this.jumpToFolder(folder);

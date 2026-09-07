@@ -129,6 +129,16 @@ export class StashpadPanelsView extends ItemView {
     folderBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Folder Switcher" });
     folderBtn.onclick = () => this.plugin.openFolderPicker();
 
+    // 0.302.0: View launcher — full-width global button that opens the
+    // view-launcher modal (added 0.301.0). Runs the registered command
+    // so it stays in sync with the palette / hotkey entry point.
+    const launcherBtn = globals.createEl("button", { cls: "stashpad-panels-global-btn" });
+    setIcon(launcherBtn.createSpan({ cls: "stashpad-panels-global-btn-icon" }), "layout-grid");
+    launcherBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Switch view (launcher)" });
+    launcherBtn.onclick = () => {
+      (this.app as any).commands?.executeCommandById?.("stashpad:stashpad-open-view-launcher");
+    };
+
     // 0.71.31: Log + Notifications share a row underneath Search —
     // they're sibling diagnostic shortcuts so they live side-by-side.
     const diagRow = globals.createDiv({ cls: "stashpad-panels-globals-row" });
@@ -223,9 +233,15 @@ export class StashpadPanelsView extends ItemView {
     // 0.71.26: group pins by folder so the user can scan by Stashpad
     // instead of a single flat list. Groups are ordered by first
     // appearance in `pinnedNotes` (so manual reorders within a folder
-    // still survive), EXCEPT the MRU Stashpad's folder is floated to
-    // the top — switching tabs reorders the groups so the relevant
-    // pins are always at the top.
+    // still survive), and within a group pins keep their stable
+    // pinnedAt order from listPinnedNotes().
+    // 0.302.0: the MRU Stashpad's folder is NO LONGER floated to the
+    // top. Floating keyed the group order off last-accessed, so simply
+    // clicking a pinned note (which makes its folder the MRU and fires
+    // active-leaf-change → re-render) yanked that group to the top and
+    // reordered the whole list on every click. The group order is now
+    // stable by first appearance; the MRU folder is still highlighted
+    // via `is-active-folder` below, but its position never changes.
     const groups = new Map<string, { pin: PinnedNoteRef; idx: number }[]>();
     pins.forEach((pin, idx) => {
       let bucket = groups.get(pin.folder);
@@ -234,10 +250,6 @@ export class StashpadPanelsView extends ItemView {
     });
     const mruFolder = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
     const order = Array.from(groups.keys());
-    if (mruFolder && groups.has(mruFolder)) {
-      order.splice(order.indexOf(mruFolder), 1);
-      order.unshift(mruFolder);
-    }
 
     for (const folder of order) {
       const folderName = folder.split("/").pop() || folder;

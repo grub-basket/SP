@@ -12,6 +12,8 @@ import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, RESERVED_FRONTM
 import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
+// 0.301.0: searchable modal to jump to any Stashpad view.
+import { ViewLauncherModal } from "./view-launcher";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
 import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup} from "./modals";
@@ -212,6 +214,120 @@ export default class StashpadPlugin extends Plugin {
    *  watched paths, so writing it cannot trigger the external-settings reload. */
   private static readonly TRACE_FILE = "debug-trace.log";
   private static readonly TRACE_PREV_FILE = "debug-trace.prev.log";
+
+  // ---- Error capture (0.297.0) --------------------------------------------
+  //
+  // Always-on (unlike the debug trace, which you must switch on BEFORE the
+  // bug): catch an uncaught exception or unhandled rejection the moment it
+  // happens, so a crash you didn't notice leaves a record instead of nothing.
+  // Purely local — appended to a file in the plugin's own folder, never sent
+  // anywhere. Zero cost until something actually throws. Scoped to errors
+  // whose stack points at THIS plugin (other plugins' throws aren't ours to
+  // log); a stack-less error is kept, tagged, because we can't rule it out.
+  private static readonly ERROR_FILE = "errors.log";
+  private static readonly ERROR_BUFFER_MAX = 50;
+  private errorBuffer: string[] = [];
+  private detachErrorCapture: (() => void) | null = null;
+
+  private errorLogPath(): string | null {
+    const dir = this.manifest?.dir;
+    return dir ? `${dir}/${StashpadPlugin.ERROR_FILE}` : null;
+  }
+
+  /** True when a stack string references this plugin's own bundle. The plugin
+   *  folder is `<configDir>/plugins/<id>/main.js`, so the id path is the
+   *  reliable needle across desktop and mobile. */
+  private stackIsOurs(stack: string): boolean {
+    const id = this.manifest?.id;
+    return !!id && (stack.includes(`/plugins/${id}/`) || stack.includes(`plugin:${id}`));
+  }
+
+  private installErrorCapture(): void {
+    if (this.settings && this.settings.captureErrors === false) return;
+    const onError = (e: ErrorEvent) => {
+      try {
+        const stack = e.error?.stack ? String(e.error.stack) : "";
+        // Only ours, or an error with no stack to attribute (kept, tagged).
+        if (stack && !this.stackIsOurs(stack)) return;
+        this.recordError(stack ? "error" : "error?", e.message || String(e.error ?? "?"), stack);
+      } catch { /* a logger must never throw */ }
+    };
+    const onRejection = (e: PromiseRejectionEvent) => {
+      try {
+        const reason = e.reason as { stack?: unknown; message?: unknown } | undefined;
+        const stack = typeof reason?.stack === "string" ? reason.stack : "";
+        if (stack && !this.stackIsOurs(stack)) return;
+        if (!stack) return; // an unattributable rejection is almost always another plugin's
+        this.recordError("rejection", typeof reason?.message === "string" ? reason.message : String(e.reason), stack);
+      } catch { /* never throw */ }
+    };
+    // registerDomEvent auto-detaches on unload; keep an explicit handle too so
+    // the Diagnostics toggle can turn capture off without a reload.
+    this.registerDomEvent(window, "error", onError);
+    this.registerDomEvent(window, "unhandledrejection", onRejection);
+    this.detachErrorCapture = () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+      this.detachErrorCapture = null;
+    };
+  }
+
+  /** Record one captured error into the ring buffer, collapse an identical
+   *  consecutive repeat into a count (a throwing render loop fires every
+   *  frame), and append it to the on-disk log. */
+  private recordError(kind: string, message: string, stack: string): void {
+    const when = new Date().toISOString();
+    const os = Platform.isMobileApp ? (Platform.isIosApp ? "iOS" : "Android") : "desktop";
+    // First plugin frame from the stack, so the buffer summary points at code
+    // without unfolding the whole trace.
+    const id = this.manifest?.id;
+    // First real stack FRAME in our bundle — match the path, not the id
+    // substring (the message itself may contain the word "stashpad").
+    const frame = !id ? "" : (stack.split("\n").map((l) => l.trim())
+      .find((l) => l.startsWith("at ") && (l.includes(`/plugins/${id}/`) || l.includes(`plugin:${id}`))) ?? "");
+    const head = `[${kind}] ${message}`.slice(0, 300);
+    const prev = this.errorBuffer[this.errorBuffer.length - 1];
+    if (prev && prev.includes(head)) {
+      const seen = /\(x(\d+)\)$/.exec(prev);
+      const n = seen ? Number(seen[1]) + 1 : 2;
+      this.errorBuffer[this.errorBuffer.length - 1] = prev.replace(/ \(x\d+\)$/, "") + ` (x${n})`;
+      return; // don't re-append a repeat to disk; the count in memory is enough
+    }
+    const entry = `${when} · ${os} · Stashpad ${this.manifest?.version ?? "?"}\n${head}${frame ? `\n  ${frame}` : ""}${stack ? `\n${stack}` : ""}`;
+    this.errorBuffer.push(`${when} ${head}${frame ? ` — ${frame}` : ""}`);
+    if (this.errorBuffer.length > StashpadPlugin.ERROR_BUFFER_MAX) {
+      this.errorBuffer.splice(0, this.errorBuffer.length - StashpadPlugin.ERROR_BUFFER_MAX);
+    }
+    // Surface it inline in the perf trace too, when that happens to be on.
+    if (this.settings.debugTrace) this.trace("error", { kind, message: head });
+    const path = this.errorLogPath();
+    if (path) {
+      void (async () => {
+        try {
+          const adapter = this.app.vault.adapter;
+          const sep = (await adapter.exists(path)) ? "\n\n" : "";
+          await adapter.append(path, `${sep}${entry}`);
+        } catch { /* best effort */ }
+      })();
+    }
+  }
+
+  /** The captured-error log (memory buffer summary + the on-disk detail), for
+   *  the Diagnostics copy command. */
+  async getCapturedErrors(): Promise<string> {
+    const path = this.errorLogPath();
+    let disk = "";
+    if (path) { try { const a = this.app.vault.adapter; if (await a.exists(path)) disk = await a.read(path); } catch { /* ignore */ } }
+    if (!disk && !this.errorBuffer.length) return "";
+    const head = `# Stashpad captured errors — ${this.errorBuffer.length} this session`;
+    return disk ? `${head}\n\n${disk}` : `${head}\n\n${this.errorBuffer.join("\n")}`;
+  }
+
+  async clearCapturedErrors(): Promise<void> {
+    this.errorBuffer = [];
+    const path = this.errorLogPath();
+    if (path) { try { const a = this.app.vault.adapter; if (await a.exists(path)) await a.remove(path); } catch { /* ignore */ } }
+  }
   private static readonly TRACE_FLUSH_MS = 1000;
   private traceFlushTimer: ReturnType<typeof setTimeout> | null = null;
   /** False until this session has moved the previous session's file aside.
@@ -595,6 +711,12 @@ export default class StashpadPlugin extends Plugin {
     // next copy command hands back lines the user just asked to be rid of.
     if (this.traceFlushTimer !== null) { clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
     void this.removeTraceFiles();
+  }
+
+  /** Toggle error capture from settings without a reload. */
+  setErrorCapture(on: boolean): void {
+    if (on) { if (!this.detachErrorCapture) this.installErrorCapture(); }
+    else { this.detachErrorCapture?.(); }
   }
 
   /** How long a diagnostic mode may stay on before it switches itself off.
@@ -2347,6 +2469,7 @@ export default class StashpadPlugin extends Plugin {
     // user still wants tracing at all is settled below, once settings are read.
     try { await this.rotateTraceFile(); } catch { /* best-effort */ }
     this.traceRotateDone = true;
+    this.installErrorCapture();
     this.startStallWatchdog();
     this.installSelectAllProbe();
     this.installStashpadNoteRouter();
@@ -3256,6 +3379,16 @@ export default class StashpadPlugin extends Plugin {
       name: "Open aggregated Previously encrypted view",
       callback: () => void openAggregateView(this, "watch"),
     });
+    // 0.301.0: one searchable modal listing every Stashpad view / launcher —
+    // fuzzy-jump to any of them without hunting the ribbon or sidebar. Each row
+    // delegates to that view's existing opener command, so nothing here
+    // reimplements view creation. Plugin-level (no active view required), so a
+    // plain addCommand — the user assigns a hotkey on Obsidian's Hotkeys page.
+    this.addCommand({
+      id: "stashpad-open-view-launcher",
+      name: "Open view launcher / switch Stashpad view",
+      callback: () => new ViewLauncherModal(this.app).open(),
+    });
     this.addCommand({
       id: "stashpad-encrypt-applicable",
       name: "Encrypt (lock) everything applicable (re-encrypt sweep)",
@@ -3411,6 +3544,24 @@ export default class StashpadPlugin extends Plugin {
           );
         });
       },
+    });
+    this.addCommand({
+      id: "stashpad-copy-captured-errors",
+      name: "Diagnostics: copy captured errors to clipboard",
+      callback: () => {
+        void this.getCapturedErrors().then((text) => {
+          if (!text) { new Notice("No captured errors — nothing has thrown. 🎉"); return; }
+          navigator.clipboard.writeText(text).then(
+            () => new Notice(`Captured errors copied (${text.split("\n").length} lines).`),
+            () => new Notice("Couldn't access the clipboard."),
+          );
+        });
+      },
+    });
+    this.addCommand({
+      id: "stashpad-clear-captured-errors",
+      name: "Diagnostics: clear captured errors",
+      callback: () => { void this.clearCapturedErrors().then(() => new Notice("Captured errors cleared.")); },
     });
     this.addCommand({
       id: "stashpad-clear-debug-trace",
@@ -3591,7 +3742,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-clone", name: "Clone selection (duplicate / copy notes)", callback: () => call("cmdClone") });
     this.addCommand({ id: "stashpad-fork-note", name: "Fork into a separate note (copy under a chosen parent)", callback: () => call("cmdForkNote") });
     this.addCommand({ id: "stashpad-insert-template", name: "Insert template (clone an existing note)", callback: () => call("cmdInsertTemplate") });
-    this.addCommand({ id: "stashpad-toggle-expand", name: "Show more / show less (expand toggle)", callback: () => call("cmdToggleExpand") });
+    this.addCommand({ id: "stashpad-toggle-expand", name: "Expand / collapse note body (show more / show less)", callback: () => call("cmdToggleExpand") });
     this.addCommand({ id: "stashpad-expand-all", name: "Expand all (show every note's full body)", callback: () => call("cmdExpandAll") });
     this.addCommand({ id: "stashpad-collapse-all", name: "Collapse all (clamp every note's body)", callback: () => call("cmdCollapseAll") });
     // Three view-level keybinds that previously had no command-palette
@@ -3601,6 +3752,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
     this.addCommand({ id: "stashpad-toggle-task", name: "Toggle task (todo)", callback: () => call("cmdToggleTask") });
     this.addCommand({ id: "stashpad-set-due", name: "Set due date…", callback: () => call("cmdSetDue") });
+    this.addCommand({ id: "stashpad-reply", name: "Reply to selection", callback: () => call("cmdReply") });
     // 0.81.1: performance profiling — dump / reset the timing report.
     this.addCommand({
       id: "stashpad-dump-perf",
@@ -5574,6 +5726,10 @@ export default class StashpadPlugin extends Plugin {
    *  tz offset changed since the last tick. */
   private checkObscureSchedule(): void {
     if (!this.settings.obscureScheduleEnabled) { this.lastObscureInWindow = null; this.lastObscureTzOffset = null; return; }
+    // 0.300.0: isWithinObscureSchedule also honours obscureScheduleWeekdays — a
+    // day switched off reports as OUTSIDE the window, so the out-of-window path
+    // below (and view.ts's per-folder blur) both un-engage on that day; turning a
+    // day off while blurred flips inWindow→false on the next tick and re-renders.
     const inWindow = isWithinObscureSchedule(this.settings);
     const tz = new Date().getTimezoneOffset();
     const flipped = this.lastObscureInWindow !== null && inWindow !== this.lastObscureInWindow;
@@ -8219,6 +8375,13 @@ export default class StashpadPlugin extends Plugin {
     if (existing) {
       this.app.workspace.revealLeaf(existing);
       this.app.workspace.setActiveLeaf(existing, { focus: true });
+      // 0.302.0: unify with the folder switcher — landing on a folder always
+      // shows the newest notes, whether it opens a new tab or reveals an
+      // existing one. Without this, revealing an existing tab kept its stale
+      // scroll (often the top), so the folder panel behaved differently from
+      // the switcher (which pins bottom via setFolderOverride).
+      const ev = (existing.view as unknown as { pinToBottomNow?: () => void });
+      if (typeof ev?.pinToBottomNow === "function") ev.pinToBottomNow();
       return;
     }
     await this.activateViewForFolder(cleaned);
@@ -8437,7 +8600,10 @@ export default class StashpadPlugin extends Plugin {
       message: `${who} added a note\n“${title}” in ${leaf}`,
       kind: "info",
       category: "team",
-      duration: 8000,
+      // 0.300.0: team-collab notifications are persistent (duration: 0) — a
+      // teammate's incoming change stays until the user dismisses it, so it
+      // isn't missed while away from the window.
+      duration: 0,
       folder: dir,
       desktop: !!s.teamNotificationsDesktop,
       authorId: author.id,

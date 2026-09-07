@@ -175,7 +175,14 @@ async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[], withTime
   const walk = async (node: TreeNode, depth: number): Promise<void> => {
     if (node.file) {
       const raw = await view.app.vault.cachedRead(node.file);
-      const body = view.stripFrontmatter(raw).trim().split(/\r?\n/).join(" ");
+      // 0.300.0: PRESERVE intra-note newlines. This used to be
+      // `.split(/\r?\n/).join(" ")`, which collapsed a multi-line body (e.g. a
+      // bulleted list) into one run-on line — pasting a copied tree whose last
+      // note held a list produced a single spaced-out line instead of the list.
+      // Keep the body's own lines; continuation lines are indented to sit under
+      // the note's bullet (indent + 2 cols, the width of the "- " marker) so the
+      // list still reads as a nested list wherever whitespace survives.
+      const body = view.stripFrontmatter(raw).trim();
       const ts = prefix ? `${view.formatTimeInline(node.created)} ` : "";
       // 0.188.0: checkbox + colour metadata go AFTER the bullet dash this format
       // already emits (needsDash ignored — the "- " is always present here).
@@ -185,9 +192,18 @@ async function copyTreeFromRoots(view: StashpadView, roots: TreeNode[], withTime
       // apps that strip whitespace; keeping the real indentation means it still
       // reads as a normal outline where whitespace survives, and the markers can be
       // stripped later with a regex (`\[L\d+\]\s`) to recover a plain indented list.
-      lines.push(levelMarkers
-        ? `${"  ".repeat(depth)}- [L${depth + 1}] ${checkbox}${meta}${ts}${body}`
-        : `${"  ".repeat(depth)}- ${checkbox}${meta}${ts}${body}`);
+      const indent = "  ".repeat(depth);
+      const head = levelMarkers
+        ? `${indent}- [L${depth + 1}] ${checkbox}${meta}${ts}`
+        : `${indent}- ${checkbox}${meta}${ts}`;
+      // 0.300.0: first body line rides the bullet line; the rest align under it.
+      // Blank interior lines stay blank (no stray indent) so we don't inject
+      // trailing whitespace or break fenced code blocks worse than before.
+      const contIndent = indent + "  ";
+      const bodyLines = body.split(/\r?\n/);
+      lines.push(bodyLines
+        .map((ln, i) => (i === 0 ? head + ln : (ln.length ? contIndent + ln : "")))
+        .join("\n"));
     }
     for (const c of view.tree.getChildren(node.id)) await walk(c, depth + 1);
   };
