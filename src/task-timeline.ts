@@ -2,6 +2,7 @@ import { App, moment, setIcon, TFile } from "obsidian";
 import type StashpadPlugin from "./main";
 import { collectTasks, type TaskItem } from "./task-collect";
 import { writeCompletedFm } from "./types";
+import { formatDateOnly } from "./format";
 
 /** 0.273.1: the task TIMELINE — each task as a horizontal span from its
  *  creation to its completion (or to today, while open), Basecamp-lineup
@@ -187,7 +188,18 @@ export function renderTaskTimeline(
     cal.onclick = (e) => { e.stopPropagation(); openDatePicker(cal, s.t); };
     const ttext = title.createDiv({ cls: "stashpad-timeline-titletext" });
     ttext.createSpan({ text: s.t.title });
-    ttext.createDiv({ cls: "stashpad-timeline-sub", text: s.t.folder.split("/").pop() || s.t.folder });
+    // 0.311.0: the sub-line carries Folder + Assignee (or author) + Due, matching
+    // the All-tasks review meta (reuses those classes so the styling is shared).
+    const sub = ttext.createDiv({ cls: "stashpad-timeline-sub" });
+    sub.createSpan({ cls: "stashpad-review-folder", text: s.t.folder.split("/").pop() || s.t.folder });
+    if (s.t.assignedTo.length) sub.createSpan({ cls: "stashpad-review-assignee", text: s.t.assignedTo.map((a) => a.name).join(", ") });
+    else if (s.t.author) sub.createSpan({ cls: "stashpad-review-author", text: `by ${s.t.author.name}` });
+    if (s.t.due != null) {
+      const dueEl = sub.createSpan({ cls: "stashpad-review-due", text: formatDateOnly(s.t.due, plugin.settings) });
+      if (s.t.due < Date.now() && !s.t.completed) dueEl.addClass("is-overdue");
+    } else if (s.t.dueRaw) {
+      sub.createSpan({ cls: "stashpad-review-due", text: s.t.dueRaw });
+    }
 
     const track = row.createDiv({ cls: "stashpad-timeline-track" });
     const barEl = track.createDiv({ cls: "stashpad-timeline-span" + (s.done ? " is-done" : " is-open") + (s.approxEnd ? " is-approx" : "") });

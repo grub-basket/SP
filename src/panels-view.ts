@@ -12,6 +12,7 @@ import {
 } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
 import { collectTasks as collectTasksShared, titleFromTaskFile, type TaskItem } from "./task-collect";
+import { isFailedTask } from "./task-render";
 import { TaskReviewModal } from "./task-review-modal";
 
 /** 0.74.3: render a child-count badge into `host` (replaces the old
@@ -51,9 +52,30 @@ export const PANEL_REGISTRY: Record<PanelId, { label: string; icon: string }> = 
  *  rest is whichever panel is currently active. 0.68.0. */
 export class StashpadPanelsView extends ItemView {
   private activePanel: PanelId = "pinned";
+  /** 0.310.0: when set, this leaf is a STANDALONE view of just this one panel
+   *  (no globals, no switcher) — opened in the main area from the launcher. Null
+   *  = the normal combined sidebar view. Persisted via get/setState. */
+  private singlePanel: PanelId | null = null;
+  setSinglePanel(id: PanelId): void {
+    this.singlePanel = id;
+    this.activePanel = id;
+    if (this.containerEl.isConnected) this.render();
+    (this.leaf as unknown as { updateHeader?: () => void }).updateHeader?.();
+  }
+  getState(): Record<string, unknown> {
+    return { ...super.getState(), singlePanel: this.singlePanel, activePanel: this.activePanel };
+  }
+  async setState(state: unknown, result: unknown): Promise<void> {
+    const s = state as { singlePanel?: PanelId; activePanel?: PanelId } | null;
+    if (s && typeof s.singlePanel === "string") this.singlePanel = s.singlePanel;
+    if (s && typeof s.activePanel === "string") this.activePanel = s.activePanel;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (super.setState as (st: unknown, r: unknown) => Promise<void>)(state, result);
+    if (this.containerEl.isConnected) this.render();
+  }
   /** 0.76.4: active sub-filter within the Tasks panel. "all" stacks
    *  every section; the others show just that bucket. Per-session. */
-  private taskFilter: "all" | "overdue" | "today" | "upcoming" | "nodate" | "completed" = "all";
+  private taskFilter: "all" | "overdue" | "today" | "upcoming" | "nodate" | "completed" | "failed" = "all";
   /** 0.78.2: assignment sub-filter, combined with taskFilter via AND.
    *  Fixed buckets ("all"/"mine"/"others"/"byme"/"unassigned") or a
    *  per-person filter encoded as "person:<authorId>" (0.78.3). */
@@ -78,8 +100,15 @@ export class StashpadPanelsView extends ItemView {
   }
 
   getViewType(): string { return STASHPAD_PANELS_VIEW_TYPE; }
-  getDisplayText(): string { return "Stashpad panels"; }
-  getIcon(): string { return "panel-left"; }
+  getDisplayText(): string {
+    // 0.310.0: a single-panel view names itself after that panel.
+    if (this.singlePanel) return PANEL_REGISTRY[this.singlePanel].label;
+    return "Stashpad panels";
+  }
+  getIcon(): string {
+    if (this.singlePanel) return PANEL_REGISTRY[this.singlePanel].icon;
+    return "panel-left";
+  }
 
   async onOpen(): Promise<void> {
     this.render();
@@ -109,6 +138,20 @@ export class StashpadPanelsView extends ItemView {
     const root = this.contentEl;
     root.empty();
     root.addClass("stashpad-panels-root");
+    // 0.310.0: single-panel mode — a standalone full-tab view of ONE panel
+    // (Pinned / Shared), opened in the main area from the launcher. Skips the
+    // globals row + panel switcher and renders only that panel's body, reusing
+    // the exact same render methods as the combined sidebar view. This is the
+    // path toward deprecating the combined panel: each panel gets its own view.
+    if (this.singlePanel) {
+      root.addClass("stashpad-panels-single");
+      this.activePanel = this.singlePanel;
+      const body = root.createDiv({ cls: "stashpad-panels-body" });
+      if (this.activePanel === "pinned") this.renderPinnedPanel(body);
+      else if (this.activePanel === "shared") this.renderSharedPanel(body);
+      else if (this.activePanel === "tasks") this.renderTasksPanel(body);
+      return;
+    }
     // 0.68.3: panel-independent actions row. Lives ABOVE the master
     // button bar and isn't tied to any panel — Search is the first
     // inhabitant; more global actions land here later. Full-width for
@@ -133,7 +176,7 @@ export class StashpadPanelsView extends ItemView {
     // so it stays in sync with the palette / hotkey entry point.
     const launcherBtn = globals.createEl("button", { cls: "stashpad-panels-global-btn" });
     setIcon(launcherBtn.createSpan({ cls: "stashpad-panels-global-btn-icon" }), "layout-grid");
-    launcherBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Switch view (launcher)" });
+    launcherBtn.createSpan({ cls: "stashpad-panels-global-btn-text", text: "Launch View" });
     launcherBtn.onclick = () => {
       (this.app as any).commands?.executeCommandById?.("stashpad:stashpad-open-view-launcher");
     };
@@ -803,8 +846,42 @@ export class StashpadPanelsView extends ItemView {
    *  Completed. Within each section, sort by due-date ascending
    *  (undated by title). Each row carries a folder chip since tasks
    *  span folders now (v1 grouped by folder; v2 groups by status). */
+  /** 0.306.0 (encrypted-pins P1, read side): render LOCKED tasks as read-only
+   *  rows under a "Locked" header. Reads only the plaintext sidecar (never
+   *  decrypts); click opens the unlock flow. Bundle-level; shows the earliest
+   *  incomplete due + an open-count. */
+  private async appendLockedTasks(list: HTMLElement): Promise<void> {
+    let locked: Awaited<ReturnType<StashpadPlugin["listLockedTasks"]>>;
+    try { locked = await this.plugin.listLockedTasks(); } catch { return; }
+    if (!locked.length || !list.isConnected) return;
+    list.querySelector(".stashpad-tasks-empty")?.remove();
+    const header = list.createDiv({ cls: "stashpad-review-section is-locked" });
+    setIcon(header.createSpan({ cls: "stashpad-review-section-icon" }), "lock");
+    header.createSpan({ cls: "stashpad-review-section-name", text: "Locked" });
+    header.createSpan({ cls: "stashpad-review-section-count", text: String(locked.length) });
+    for (const lt of locked) {
+      const row = list.createDiv({ cls: "stashpad-task-row stashpad-task-locked" });
+      setIcon(row.createSpan({ cls: "stashpad-task-lockicon" }), "lock");
+      const main = row.createDiv({ cls: "stashpad-task-main" });
+      main.createDiv({ cls: "stashpad-task-title", text: lt.title });
+      const meta = main.createDiv({ cls: "stashpad-task-meta" });
+      const bits: string[] = [lt.folder.split("/").pop() || lt.folder];
+      if (lt.due != null) bits.push(`due ${formatDateOnly(lt.due, this.plugin.settings)}`);
+      if (lt.openTasks > 1) bits.push(`${lt.openTasks} open`);
+      meta.setText(bits.join(" · "));
+      row.setAttr("aria-label", `Locked task in ${lt.folder} — click to unlock`);
+      row.setAttr("title", "Locked — click to unlock");
+      row.onclick = () => { void this.plugin.unlockBundleAt(lt.blobPath); };
+    }
+  }
+
   private renderTasksPanel(parent: HTMLElement): void {
     const list = parent.createDiv({ cls: "stashpad-panel-tasks" });
+    // 0.306.0 (encrypted-pins P1): append any LOCKED tasks read-only below the
+    // live tasks, so a due task isn't lost behind the lock. Async + fire-and-
+    // forget (reads plaintext sidecars); clears the empty state if locked tasks
+    // are the only ones.
+    void this.appendLockedTasks(list);
     // 0.126.0: open the roomier Daily-review modal (the panel is cramped).
     const reviewBar = list.createDiv({ cls: "stashpad-task-review-bar" });
     const reviewBtn = reviewBar.createEl("button", { cls: "stashpad-task-review-open" });
@@ -904,11 +981,12 @@ export class StashpadPanelsView extends ItemView {
     const startTodayMs = startToday.getTime();
     const endTodayMs = startTodayMs + 24 * 60 * 60 * 1000;
 
-    type Section = "overdue" | "today" | "upcoming" | "nodate" | "completed";
+    type Section = "overdue" | "today" | "upcoming" | "nodate" | "completed" | "failed";
     const buckets: Record<Section, TaskItem[]> = {
-      overdue: [], today: [], upcoming: [], nodate: [], completed: [],
+      overdue: [], today: [], upcoming: [], nodate: [], completed: [], failed: [],
     };
     for (const t of tasks) {
+      if (isFailedTask(t)) { buckets.failed.push(t); continue; } // 0.308.0
       if (t.completed) { buckets.completed.push(t); continue; }
       if (t.due == null) { buckets.nodate.push(t); continue; }
       if (t.due < startTodayMs) buckets.overdue.push(t);
@@ -929,6 +1007,7 @@ export class StashpadPanelsView extends ItemView {
       { key: "upcoming",  label: "Upcoming",  icon: "calendar" },
       { key: "nodate",    label: "No date",   icon: "inbox" },
       { key: "completed", label: "Completed", icon: "check-circle-2" },
+      { key: "failed",    label: "Failed",    icon: "circle-x" },
     ];
 
     // 0.76.4: filter button bar. "All" stacks every non-empty section;
@@ -1113,5 +1192,22 @@ export async function openStashpadPanelsView(app: App): Promise<void> {
     return;
   }
   await leaf.setViewState({ type: STASHPAD_PANELS_VIEW_TYPE, active: true });
+  app.workspace.revealLeaf(leaf);
+}
+
+/** 0.310.0: open a STANDALONE single-panel view (Pinned / Shared / …) in the
+ *  MAIN editor area — reuses an existing one on the same panel if present, else
+ *  a new tab. Backs the launcher entries; the step toward deprecating the
+ *  combined sidebar panel by giving each panel its own view. */
+export async function openStashpadSinglePanel(app: App, panel: PanelId): Promise<void> {
+  const existing = app.workspace.getLeavesOfType(STASHPAD_PANELS_VIEW_TYPE)
+    .find((l) => (l.view as StashpadPanelsView)?.getState?.()?.singlePanel === panel);
+  if (existing) {
+    app.workspace.revealLeaf(existing);
+    app.workspace.setActiveLeaf(existing, { focus: true });
+    return;
+  }
+  const leaf = app.workspace.getLeaf("tab");
+  await leaf.setViewState({ type: STASHPAD_PANELS_VIEW_TYPE, active: true, state: { singlePanel: panel, activePanel: panel } });
   app.workspace.revealLeaf(leaf);
 }

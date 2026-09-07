@@ -3309,7 +3309,7 @@ export class DueDatePickerModal extends Modal {
       const frow = wrap.createDiv({ cls: "stashpad-due-failrow" });
       const flabel = frow.createEl("label", { cls: "stashpad-due-failrow-label" });
       failChk = flabel.createEl("input", { type: "checkbox" });
-      flabel.createSpan({ text: "Auto-fail if overdue" });
+      flabel.createSpan({ text: "Mark as failed if overdue" });
       failChk.checked = !!this.opts.currentFailIfOverdue;
       frow.createDiv({ cls: "stashpad-due-failrow-help" }).setText(
         "If the task is still open past its due date, mark it done and tag it “failed”. For deadlines that shouldn't sit open indefinitely.",

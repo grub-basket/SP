@@ -11,16 +11,20 @@
 // reimplements view creation. Search uses Sift (all tokens, any order,
 // case-insensitive substring) — the same matcher every other Stashpad search
 // surface uses — over each entry's label + keywords.
-import { App, SuggestModal } from "obsidian";
+import { App, SuggestModal, setIcon } from "obsidian";
 import { siftMatch } from "./types";
 
 /** One row in the view launcher: what it is, extra search words, a one-line
- *  hint, and the Obsidian command id whose opener it delegates to. */
+ *  hint, a Lucide icon, and the Obsidian command id whose opener it delegates
+ *  to. */
 export interface LauncherEntry {
   id: string;
   label: string;
   keywords: string;
   hint: string;
+  /** Lucide icon id shown beside the row. 0.306.0: each view its own icon —
+   *  reuses each view's own tab/ribbon icon so the launcher matches the tabs. */
+  icon: string;
   /** Full `stashpad:<id>` command id of the existing opener to run. */
   command: string;
 }
@@ -28,13 +32,16 @@ export interface LauncherEntry {
 /** Static catalogue of the openable Stashpad views. `command` is the id
  *  Obsidian namespaces each Stashpad command under (`stashpad:<addCommand id>`).
  *  Every one of these targets a plain-`callback` command (not a checkCallback),
- *  so `executeCommandById` fires it unconditionally. */
+ *  so `executeCommandById` fires it unconditionally. Icons mirror each view's
+ *  own `getIcon()` (main list → list-tree; aggregate modes → their per-mode
+ *  icons; sidebar panels → their panel icons) so the picker reads like the tabs. */
 export const LAUNCHER_ENTRIES: LauncherEntry[] = [
   {
     id: "notes",
     label: "Note list",
     keywords: "main list view open reveal notes stashpad home",
     hint: "The main Stashpad list — reveal it if open, else open it",
+    icon: "list-tree",
     command: "stashpad:stashpad-reveal",
   },
   {
@@ -42,6 +49,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "All notes (master index)",
     keywords: "aggregate index database every note facet filter master",
     hint: "Every note across every folder, with facet filters",
+    icon: "table",
     command: "stashpad:stashpad-open-all-notes",
   },
   {
@@ -49,6 +57,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Tasks",
     keywords: "aggregate tasks todo all open due checkbox",
     hint: "Aggregated tasks across all folders",
+    icon: "square-check-big",
     command: "stashpad:stashpad-open-all-tasks",
   },
   {
@@ -56,6 +65,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Task timeline",
     keywords: "aggregate timeline tasks created completed span axis gantt",
     hint: "Each task as a created → completed span on a time axis",
+    icon: "calendar-range",
     command: "stashpad:stashpad-open-task-timeline",
   },
   {
@@ -63,6 +73,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Due calendar",
     keywords: "aggregate calendar month grid due date day",
     hint: "Month grid of notes by created / due / linked day",
+    icon: "calendar",
     command: "stashpad:stashpad-open-due-calendar",
   },
   {
@@ -70,6 +81,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Activity heatmap",
     keywords: "aggregate heatmap activity github per-day action count log",
     hint: "GitHub-style per-day action counts from the log",
+    icon: "activity",
     command: "stashpad:stashpad-open-activity-heatmap",
   },
   {
@@ -77,6 +89,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Encrypted notes",
     keywords: "aggregate encrypted locked secure notes",
     hint: "Aggregated view of every encrypted / locked note",
+    icon: "lock",
     command: "stashpad:stashpad-open-all-encrypted",
   },
   {
@@ -84,6 +97,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Archived notes",
     keywords: "aggregate archive archived notes",
     hint: "Aggregated view of archived notes",
+    icon: "archive",
     command: "stashpad:stashpad-open-all-archived",
   },
   {
@@ -91,6 +105,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Previously encrypted (watchlist)",
     keywords: "aggregate watchlist previously encrypted re-encrypt sweep review",
     hint: "Notes that were encrypted before — the re-encrypt review",
+    icon: "history",
     command: "stashpad:stashpad-open-watchlist",
   },
   {
@@ -98,13 +113,47 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Trash",
     keywords: "aggregate trash deleted restore recover bin",
     hint: "Aggregated Trash view (restore / recover deleted notes)",
+    icon: "trash-2",
     command: "stashpad:stashpad-restore-trash",
+  },
+  {
+    id: "pinned",
+    label: "Pinned notes",
+    keywords: "pinned pins notes bookmarks favourites favorites starred",
+    hint: "Your pinned notes as a standalone view",
+    icon: "pin",
+    command: "stashpad:stashpad-open-pinned-view",
+  },
+  {
+    id: "shared",
+    label: "Shared notes",
+    keywords: "shared contributors authored collaborators multiplayer",
+    hint: "Notes you authored with contributors, and folders you share",
+    icon: "users",
+    command: "stashpad:stashpad-open-shared-view",
+  },
+  {
+    id: "notifications",
+    label: "Notifications",
+    keywords: "notifications history alerts toasts activity feed",
+    hint: "The notification history",
+    icon: "bell",
+    command: "stashpad:stashpad-open-notification-history",
+  },
+  {
+    id: "log",
+    label: "Log",
+    keywords: "log action history audit changes journal",
+    hint: "The Stashpad action log",
+    icon: "scroll-text",
+    command: "stashpad:stashpad-open-log",
   },
   {
     id: "panels",
     label: "Panels (left sidebar)",
     keywords: "sidebar panels pinned shared tasks left",
     hint: "The sidebar panels view (Pinned / Shared / Tasks)",
+    icon: "panel-left",
     command: "stashpad:stashpad-open-panels",
   },
   {
@@ -112,6 +161,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Folder panel (left sidebar)",
     keywords: "sidebar folder panel picker pinned folders left navigation",
     hint: "The left-sidebar folder panel (pinned notes + folders)",
+    icon: "folders",
     command: "stashpad:stashpad-open-folder-panel",
   },
   {
@@ -119,6 +169,7 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     label: "Detail panel (right sidebar)",
     keywords: "sidebar detail panel right inspector metadata",
     hint: "The right-sidebar detail panel",
+    icon: "panel-right",
     command: "stashpad:stashpad-open-detail",
   },
 ];
@@ -138,8 +189,13 @@ export class ViewLauncherModal extends SuggestModal<LauncherEntry> {
   }
 
   renderSuggestion(entry: LauncherEntry, el: HTMLElement): void {
-    el.createDiv({ text: entry.label, cls: "stashpad-launcher-name" });
-    el.createDiv({ text: entry.hint, cls: "stashpad-launcher-hint" });
+    // 0.306.0: each row leads with the view's own icon, then label + hint.
+    el.addClass("stashpad-launcher-row");
+    const icon = el.createDiv({ cls: "stashpad-launcher-icon" });
+    setIcon(icon, entry.icon);
+    const text = el.createDiv({ cls: "stashpad-launcher-text" });
+    text.createDiv({ text: entry.label, cls: "stashpad-launcher-name" });
+    text.createDiv({ text: entry.hint, cls: "stashpad-launcher-hint" });
   }
 
   onChooseSuggestion(entry: LauncherEntry): void {

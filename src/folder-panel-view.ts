@@ -89,7 +89,7 @@ export class StashpadFolderPanelView extends ItemView {
     // 0.302.0: view launcher — to the LEFT of the new-folder button.
     const launchBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-launcher" });
     setIcon(launchBtn, "layout-grid");
-    launchBtn.setAttr("aria-label", "Switch view (launcher)");
+    launchBtn.setAttr("aria-label", "Launch View");
     launchBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); (this.app as any).commands.executeCommandById("stashpad:stashpad-open-view-launcher"); } };
     const newBtn = head.createEl("button", { cls: "stashpad-folderpanel-iconbtn stashpad-folderpanel-heading-newfolder" });
     setIcon(newBtn, "folder-plus");
@@ -234,8 +234,33 @@ export class StashpadFolderPanelView extends ItemView {
     if (changed) void this.plugin.saveSettings();
   }
 
+  /** 0.306.0 (encrypted-pins P1): render LOCKED pinned bundles as read-only rows
+   *  under a "Locked" header. Reads only the plaintext sidecar (never decrypts);
+   *  click opens the unlock flow. Mirrors StashpadPanelsView.appendLockedPins. */
+  private async appendLockedPins(list: HTMLElement): Promise<void> {
+    let locked: Awaited<ReturnType<StashpadPlugin["listLockedPins"]>>;
+    try { locked = await this.plugin.listLockedPins(); } catch { return; }
+    if (!locked.length || !list.isConnected) return;
+    list.querySelector(".stashpad-folderpanel-empty")?.remove();
+    const header = list.createDiv({ cls: "stashpad-pinned-group-header stashpad-folderpanel-locked-header" });
+    header.createSpan({ cls: "stashpad-pinned-group-name", text: "Locked" });
+    for (const lp of locked) {
+      const row = list.createDiv({ cls: "stashpad-folderpanel-row stashpad-folderpanel-locked" });
+      setIcon(row.createSpan({ cls: "stashpad-folderpanel-pinmark" }), "lock");
+      row.createSpan({ cls: "stashpad-folderpanel-row-label", text: lp.title });
+      row.createSpan({ cls: "stashpad-folderpanel-locked-badge", text: lp.folder.split("/").pop() || lp.folder });
+      row.setAttr("aria-label", `Locked pinned note in ${lp.folder} — click to unlock`);
+      row.setAttr("title", "Locked — click to unlock");
+      row.onclick = () => { void this.plugin.unlockBundleAt(lp.blobPath); };
+    }
+  }
+
   private renderPinned(list: HTMLElement): void {
     this.ensureFolderPinOrder();
+    // 0.306.0 (encrypted-pins P1): append LOCKED pinned bundles below the live
+    // pins (async — reads plaintext sidecars; clears the empty state if locked
+    // pins are the only pins). Same pattern as the Panels Pinned list.
+    void this.appendLockedPins(list);
     const items = this.unifiedPinnedItems();
     if (items.length === 0) {
       list.createDiv({ cls: "stashpad-folderpanel-empty", text: "Nothing pinned yet — pin a note or folder from its right-click menu." });

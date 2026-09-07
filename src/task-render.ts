@@ -4,7 +4,7 @@ import { collectTasks, type TaskItem } from "./task-collect";
 import { writeCompletedFm } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
 
-type Section = "overdue" | "today" | "upcoming" | "nodate" | "completed";
+type Section = "overdue" | "today" | "upcoming" | "nodate" | "completed" | "failed";
 
 // Unique <datalist> id per render (avoids id collisions when the modal + tab are
 // both mounted). Grows across re-renders — harmless; old nodes are removed.
@@ -16,7 +16,16 @@ const SECTIONS: Array<{ key: Section; label: string; icon: string }> = [
   { key: "upcoming", label: "Upcoming", icon: "calendar" },
   { key: "nodate", label: "No date", icon: "inbox" },
   { key: "completed", label: "Completed", icon: "check-circle-2" },
+  // 0.308.0: failed = auto-failed on overdue (completed + the "failed" tag). Its
+  // own section/chip so a missed deadline can be seen in isolation.
+  { key: "failed", label: "Failed", icon: "circle-x" },
 ];
+
+/** 0.308.0: a task auto-failed on overdue — completed AND carrying the "failed"
+ *  tag (written by the auto-fail sweep). Shared so every task view agrees. */
+export function isFailedTask(t: TaskItem): boolean {
+  return t.completed && t.tags.some((tag) => tag.replace(/^#/, "").toLowerCase() === "failed");
+}
 
 /** Caller-owned filter state — survives the renderer's own re-renders because the
  *  same object is passed back each time (kept on the modal/view instance). */
@@ -27,9 +36,12 @@ export interface TaskTriageState {
   person: string;          // "" = any; else a person id (author/assignee/assigner)
   folder: string;          // "all" | folder path
   status: "all" | Section; // status chip
+  /** 0.308.0: tag filter. "" = all tags; else a tag (without '#'). ANDs with the
+   *  other filters. Mirrors the timeline's tag filter. */
+  tag: string;
 }
 export function defaultTaskTriageState(): TaskTriageState {
-  return { assign: "all", person: "", folder: "all", status: "all" };
+  return { assign: "all", person: "", folder: "all", status: "all", tag: "" };
 }
 
 export interface TaskTriageOpts {
@@ -43,12 +55,46 @@ export interface TaskTriageOpts {
  *  change or a complete/snooze. Used by the Daily-review MODAL and the full-tab
  *  "All tasks" aggregate so they never diverge. Writes frontmatter directly
  *  (no undo — matches the panel's quick edits). */
+/** 0.306.0 (encrypted-pins P1): append LOCKED tasks read-only under a "Locked"
+ *  header. Reads only the plaintext sidecar (never decrypts); click unlocks the
+ *  bundle. Shared by the aggregate All-tasks view AND the Daily Review modal (both
+ *  render through renderTaskTriage), so both surface locked tasks in one place. */
+async function appendLockedTasksToTriage(host: HTMLElement, app: App, plugin: StashpadPlugin): Promise<void> {
+  let locked: Awaited<ReturnType<StashpadPlugin["listLockedTasks"]>>;
+  try { locked = await plugin.listLockedTasks(); } catch { return; }
+  if (!locked.length || !host.isConnected) return;
+  host.querySelector(".stashpad-tasks-empty")?.remove();
+  const header = host.createDiv({ cls: "stashpad-review-section is-locked" });
+  setIcon(header.createSpan({ cls: "stashpad-review-section-icon" }), "lock");
+  header.createSpan({ cls: "stashpad-review-section-name", text: "Locked" });
+  header.createSpan({ cls: "stashpad-review-section-count", text: String(locked.length) });
+  const body = host.createDiv({ cls: "stashpad-review-list" });
+  for (const lt of locked) {
+    const row = body.createDiv({ cls: "stashpad-task-row stashpad-task-locked" });
+    setIcon(row.createSpan({ cls: "stashpad-task-lockicon" }), "lock");
+    const main = row.createDiv({ cls: "stashpad-task-main" });
+    main.createDiv({ cls: "stashpad-task-title", text: lt.title });
+    const meta = main.createDiv({ cls: "stashpad-task-meta" });
+    const bits: string[] = [lt.folder.split("/").pop() || lt.folder];
+    if (lt.due != null) bits.push(`due ${formatDateOnly(lt.due, plugin.settings)}`);
+    if (lt.openTasks > 1) bits.push(`${lt.openTasks} open`);
+    meta.setText(bits.join(" · "));
+    row.setAttr("aria-label", `Locked task in ${lt.folder} — click to unlock`);
+    row.setAttr("title", "Locked — click to unlock");
+    row.onclick = () => { void plugin.unlockBundleAt(lt.blobPath); };
+  }
+}
+
 export function renderTaskTriage(
   host: HTMLElement, app: App, plugin: StashpadPlugin, state: TaskTriageState, opts: TaskTriageOpts,
 ): void {
   const rerender = (): void => renderTaskTriage(host, app, plugin, state, opts);
   host.empty();
   host.addClass("stashpad-task-triage");
+  // 0.306.0 (encrypted-pins P1): surface LOCKED tasks read-only at the end, so a
+  // due task isn't lost behind the lock. Async + fire-and-forget (plaintext
+  // sidecars); runs regardless of the empty early-return below.
+  void appendLockedTasksToTriage(host, app, plugin);
 
   const allTasks = collectTasks(app, plugin);
 
@@ -85,13 +131,18 @@ export function renderTaskTriage(
   if (state.folder !== "all" && !folders.includes(state.folder)) state.folder = "all";
   const folderMatches = (t: TaskItem): boolean => state.folder === "all" || t.folder === state.folder;
 
+  // 0.308.0: tag filter — every tag present on any task (incl. "failed"). A stale
+  // selection (tag no longer in the data) still shows so it isn't silently reset.
+  const tags = [...new Set(allTasks.flatMap((t) => t.tags))].sort((a, b) => a.localeCompare(b));
+  const tagMatches = (t: TaskItem): boolean => !state.tag || t.tags.includes(state.tag);
+
   // ---- Filter bar ----
   const bar = host.createDiv({ cls: "stashpad-triage-filters" });
   // 0.131.0: reset THIS row's filters (assignment / folder / author) back to
   // "all" — leaves the status chips below untouched.
   const rowReset = bar.createEl("button", { cls: "stashpad-triage-reset", attr: { "aria-label": "Reset filters" } });
   setIcon(rowReset, "rotate-ccw");
-  rowReset.onclick = () => { state.assign = "all"; state.person = ""; state.folder = "all"; rerender(); };
+  rowReset.onclick = () => { state.assign = "all"; state.person = ""; state.folder = "all"; state.tag = ""; rerender(); };
   // Relationship dropdown ONLY (no per-person list — that's the search beside it).
   const assignSel = bar.createEl("select", { cls: "stashpad-triage-select" });
   const relLabel: Record<string, string> = { all: "Everyone", mine: "Assigned to me", others: "Assigned to others", byme: "Assigned by me", unassigned: "Unassigned" };
@@ -109,6 +160,21 @@ export function renderTaskTriage(
     if (state.folder === f) o.selected = true;
   }
   folderSel.onchange = () => { state.folder = folderSel.value; rerender(); };
+
+  // 0.308.0: tag filter dropdown — only shown when tasks actually carry tags (a
+  // stale selection still appears so it isn't silently dropped). Mirrors the
+  // timeline's tag filter.
+  if (tags.length || state.tag) {
+    const tagSel = bar.createEl("select", { cls: "stashpad-triage-select" });
+    const allTags = tagSel.createEl("option", { text: "All tags", value: "" });
+    if (state.tag === "") allTags.selected = true;
+    const shownTags = tags.includes(state.tag) || !state.tag ? tags : [...tags, state.tag];
+    for (const tg of shownTags) {
+      const o = tagSel.createEl("option", { text: `#${tg}`, value: tg });
+      if (state.tag === tg) o.selected = true;
+    }
+    tagSel.onchange = () => { state.tag = tagSel.value; rerender(); };
+  }
 
   // 0.131.2: the person filter — a searchable input (native <datalist> of every
   // person on a task: authors, assignees, assigners). Its OWN dimension, ANDed
@@ -144,9 +210,10 @@ export function renderTaskTriage(
   const start = new Date(); start.setHours(0, 0, 0, 0);
   const startTodayMs = start.getTime();
   const endTodayMs = startTodayMs + 86_400_000;
-  const filtered = allTasks.filter((t) => assignMatches(t) && personMatches(t) && folderMatches(t));
-  const buckets: Record<Section, TaskItem[]> = { overdue: [], today: [], upcoming: [], nodate: [], completed: [] };
+  const filtered = allTasks.filter((t) => assignMatches(t) && personMatches(t) && folderMatches(t) && tagMatches(t));
+  const buckets: Record<Section, TaskItem[]> = { overdue: [], today: [], upcoming: [], nodate: [], completed: [], failed: [] };
   for (const t of filtered) {
+    if (isFailedTask(t)) { buckets.failed.push(t); continue; } // 0.308.0: failed before completed
     if (t.completed) { buckets.completed.push(t); continue; }
     if (t.due == null) { buckets.nodate.push(t); continue; }
     if (t.due < startTodayMs) buckets.overdue.push(t);

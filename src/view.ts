@@ -4744,6 +4744,17 @@ export class StashpadView extends ItemView {
       this.openMobileActionsMenu(moreBtn);
     };
 
+    // 0.306.0: "Launch View" launcher shortcut — sits BETWEEN the ⚡ actions button
+    // and the 🔗 link button (desktop + mobile), opening the view-launcher modal
+    // (jump to any Stashpad view). Same command the palette / sidebar buttons run.
+    const openViewBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn stashpad-open-view-btn" });
+    setIconSafe(openViewBtn, "layout-grid", "▦");
+    openViewBtn.title = "Launch View (jump to a Stashpad view)";
+    openViewBtn.onclick = (e) => {
+      e.preventDefault();
+      (this.app as unknown as { commands?: { executeCommandById?: (id: string) => void } }).commands?.executeCommandById?.("stashpad:stashpad-open-view-launcher");
+    };
+
     // Paste-and-open a Stashpad deep link. Sits next to ⚡; on narrow widths it's
     // hidden by CSS (`@container`) and folds into the ⚡ actions menu instead
     // (which always carries the same "Open Stashpad link…" item).
@@ -4774,6 +4785,7 @@ export class StashpadView extends ItemView {
     // looks reverted to a stale state. Kept here in the top (selection-independent)
     // group so it's visible without scrolling past the selection commands.
     menu.addItem((it: any) => it.setTitle("Reload without saving").setIcon("rotate-ccw").onClick(() => this.plugin.reloadAppForUpdate()));
+    menu.addItem((it: any) => it.setTitle("Launch View…").setIcon("layout-grid").onClick(() => (this.app as unknown as { commands?: { executeCommandById?: (id: string) => void } }).commands?.executeCommandById?.("stashpad:stashpad-open-view-launcher")));
     menu.addItem((it: any) => it.setTitle("Open Stashpad link…").setIcon("link").onClick(() => this.plugin.openDeepLinkModal()));
     menu.addSeparator();
     // List-wide expand/collapse — operate on every note, independent of selection.

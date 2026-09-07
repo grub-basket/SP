@@ -64,7 +64,12 @@
    `flex:0 0 auto` here (unlike the workspace TAB title, which fills the width and
    can't be centered), so centering the container actually works. Scoped by
    data-type so no other view's header is affected. */
-.workspace-leaf-content[data-type="stashpad-view"] .view-header-title-container {
+.workspace-leaf-content[data-type="stashpad-view"] .view-header-title-container,
+.workspace-leaf-content[data-type="stashpad-aggregate"] .view-header-title-container,
+.workspace-leaf-content[data-type="stashpad-trash"] .view-header-title-container,
+.workspace-leaf-content[data-type="stashpad-detail"] .view-header-title-container,
+.workspace-leaf-content[data-type="stashpad-panels"] .view-header-title-container,
+.workspace-leaf-content[data-type="stashpad-folder-panel"] .view-header-title-container {
   justify-content: center;
 }
 /* 0.216.0: wrapper for everything rendered ABOVE the composer. render()
@@ -93,7 +98,12 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 2px 0 4px;
+  /* 0.307.0: was `2px 0 4px` — too tight, so the top/bottom of the focus /
+     selection rings on the inputs + buttons inside got shaved. Give the row
+     vertical breathing room (and keep overflow visible) so the rings draw in
+     full within the bar. */
+  padding: 5px 0 6px;
+  overflow: visible;
   border-bottom: 1px solid var(--background-modifier-border);
 }
 /* Match the breadcrumb: on desktop the filter bar bleeds full-width too, so its
@@ -5693,6 +5703,25 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
   border-radius: 999px;
   white-space: nowrap;
 }
+/* 0.306.0: folder-panel locked pin rows — mirror the Panels look. */
+.stashpad-folderpanel-locked { color: var(--text-muted); cursor: pointer; }
+.stashpad-folderpanel-locked .stashpad-folderpanel-pinmark { color: var(--text-faint); }
+.stashpad-folderpanel-locked:hover { color: var(--text-normal); }
+.stashpad-folderpanel-locked-badge {
+  margin-left: auto;
+  padding: 0 6px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  background: var(--background-modifier-border);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+/* 0.306.0: locked TASK rows in the Tasks panel — read-only, click to unlock. */
+.stashpad-task-locked { display: flex; align-items: flex-start; gap: 8px; padding: 4px 6px; border-radius: 4px; color: var(--text-muted); cursor: pointer; }
+.stashpad-task-locked:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-task-lockicon { display: inline-flex; align-items: center; color: var(--text-faint); flex: 0 0 auto; margin-top: 2px; }
+.stashpad-task-lockicon svg { width: 14px; height: 14px; }
+.stashpad-review-section.is-locked .stashpad-review-section-icon { color: var(--text-faint); }
 .stashpad-pinned-row {
   display: flex;
   align-items: center;
@@ -5876,7 +5905,9 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 .stashpad-review-main { flex: 1 1 auto; min-width: 0; }
 .stashpad-review-title { cursor: pointer; font-weight: 500; }
 .stashpad-review-title:hover { color: var(--text-accent); }
-.stashpad-review-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 3px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+/* 0.311.0: tighter gap between the folder / assignee / due elements (was 8px). */
+.stashpad-review-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; margin-top: 3px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-review-assignee { opacity: 0.8; }
 .stashpad-review-due.is-overdue { color: var(--text-error); }
 .stashpad-review-due.is-none { opacity: 0.6; }
 .stashpad-review-folder { opacity: 0.8; }
@@ -8922,7 +8953,14 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 }
 .stashpad-timeline-titletext { min-width: 0; flex: 1 1 auto; overflow: hidden; }
 .stashpad-timeline-titletext > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stashpad-timeline-sub { color: var(--text-faint); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 0.311.0: the timeline sub-line now carries folder + assignee + due; a tight
+   flex row, still 9px and single-line (ellipsis on overflow). The review span
+   classes provide the colours (folder/author/assignee muted, due error when
+   overdue). */
+.stashpad-timeline-sub { display: flex; align-items: center; gap: 3px; color: var(--text-faint); font-size: 9px; overflow: hidden; white-space: nowrap; }
+.stashpad-timeline-sub > span { overflow: hidden; text-overflow: ellipsis; }
+.stashpad-timeline-sub .stashpad-review-folder { flex: 0 1 auto; }
+.stashpad-timeline-sub .stashpad-review-due.is-overdue { color: var(--text-error); }
 .stashpad-timeline-checkbox { flex: 0 0 auto; margin: 0; cursor: pointer; }
 .stashpad-timeline-calbtn {
   flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
@@ -9479,3 +9517,8 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   font-size: var(--font-smaller);
   color: var(--text-muted);
 }
+/* 0.306.0: each launcher row leads with the view's own icon. */
+.stashpad-launcher-row { display: flex; align-items: center; gap: 10px; }
+.stashpad-launcher-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: var(--text-muted); }
+.stashpad-launcher-icon svg { width: 18px; height: 18px; }
+.stashpad-launcher-text { min-width: 0; }

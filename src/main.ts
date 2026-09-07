@@ -9,7 +9,7 @@ import { ReEncryptScheduler } from "./reencrypt-scheduler";
 import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
 import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
-import { StashpadPanelsView, openStashpadPanelsView, PANEL_REGISTRY, type PanelId } from "./panels-view";
+import { StashpadPanelsView, openStashpadPanelsView, openStashpadSinglePanel, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
 // 0.301.0: searchable modal to jump to any Stashpad view.
@@ -3386,7 +3386,7 @@ export default class StashpadPlugin extends Plugin {
     // plain addCommand — the user assigns a hotkey on Obsidian's Hotkeys page.
     this.addCommand({
       id: "stashpad-open-view-launcher",
-      name: "Open view launcher / switch Stashpad view",
+      name: "Launch view (jump to a Stashpad view)",
       callback: () => new ViewLauncherModal(this.app).open(),
     });
     this.addCommand({
@@ -3846,6 +3846,25 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-open-panels",
       name: "Open Stashpad panels (sidebar)",
       callback: () => void openStashpadPanelsView(this.app),
+    });
+    // 0.310.0: standalone single-panel views (main area) — the panels, each as
+    // its own view, so the combined sidebar panel can eventually be retired.
+    this.addCommand({
+      id: "stashpad-open-pinned-view",
+      name: "Open Pinned notes (view)",
+      callback: () => void openStashpadSinglePanel(this.app, "pinned"),
+    });
+    this.addCommand({
+      id: "stashpad-open-shared-view",
+      name: "Open Shared notes (view)",
+      callback: () => void openStashpadSinglePanel(this.app, "shared"),
+    });
+    // 0.310.0: open the action log from a command (was panel-button only), so it
+    // can live in the launcher too.
+    this.addCommand({
+      id: "stashpad-open-log",
+      name: "Open Stashpad log",
+      callback: () => void this.openActionLog(),
     });
     // 0.86.0: open the left-sidebar folder picker (pinned notes + folders).
     this.addCommand({
@@ -5660,6 +5679,18 @@ export default class StashpadPlugin extends Plugin {
     return out;
   }
 
+  /** 0.310.0: open the per-folder action log (`.stashpad/log.jsonl`) in the
+   *  LogModal — the plugin-level entry so the log is reachable from a command /
+   *  the launcher, not just the panels button. */
+  async openActionLog(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const path = this.pluginPrivatePath("log.jsonl");
+    if (!(await adapter.exists(path))) { new Notice("No log yet — make some changes first."); return; }
+    const data = await adapter.read(path);
+    const { LogModal } = await import("./modals");
+    new LogModal(this.app, data, path).open();
+  }
+
   /** 0.306.0 (encrypted-pins P1, read side): LOCKED bundles that contain a
    *  pinned note, surfaced read-only so a pin isn't silently lost behind the
    *  lock. Reads ONLY the plaintext `.stashmeta` sidecar (never decrypts) — so
@@ -5680,6 +5711,36 @@ export default class StashpadPlugin extends Plugin {
       out.push({ folder: dir, blobPath: f.path, title: meta.title || "Locked note", pinnedAt });
     }
     out.sort((a, b) => a.pinnedAt - b.pinnedAt || a.blobPath.localeCompare(b.blobPath));
+    return out;
+  }
+
+  /** 0.306.0 (encrypted-pins P1, read side): LOCKED bundles that contain a task
+   *  (a `task`/`due` item), surfaced read-only so a due task isn't silently lost
+   *  behind the lock. Reads ONLY the plaintext sidecar (never decrypts) — gated
+   *  the same way as listLockedPins (a hide-titles bundle carries no items).
+   *  Bundle-level; `due` is the EARLIEST incomplete due among the bundle's tasks
+   *  (for sorting/labelling), `openTasks` counts the not-completed ones. Clicking
+   *  unlocks the bundle. */
+  async listLockedTasks(): Promise<Array<{ folder: string; blobPath: string; title: string; due: number | null; openTasks: number }>> {
+    const folders = new Set(this.discoverStashpadFolders());
+    const out: Array<{ folder: string; blobPath: string; title: string; due: number | null; openTasks: number }> = [];
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension !== STASHENC_EXT) continue;
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folders.has(dir)) continue;
+      const meta = await readLockedMeta(this.app, f.path);
+      if (!meta?.items?.length) continue;
+      const tasks = meta.items.filter((it) => it.task || it.due != null);
+      if (!tasks.length) continue;
+      let due: number | null = null;
+      let openTasks = 0;
+      for (const it of tasks) {
+        if (!it.completed) openTasks++;
+        if (it.due && !it.completed) { const t = Date.parse(it.due); if (Number.isFinite(t) && (due == null || t < due)) due = t; }
+      }
+      out.push({ folder: dir, blobPath: f.path, title: meta.title || "Locked note", due, openTasks });
+    }
+    out.sort((a, b) => (a.due ?? Infinity) - (b.due ?? Infinity) || a.blobPath.localeCompare(b.blobPath));
     return out;
   }
 
