@@ -15,8 +15,8 @@ import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-vie
 // 0.301.0: searchable modal to jump to any Stashpad view.
 import { ViewLauncherModal } from "./view-launcher";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup} from "./modals";
+import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
+import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
 import { writeClipboardText } from "./cross-vault-clipboard";
@@ -3666,6 +3666,14 @@ export default class StashpadPlugin extends Plugin {
       name: "Re-show pending notifications (resend / redisplay reminders for incomplete due tasks)",
       callback: () => void this.resendDueReminders(),
     });
+    // 0.305.0: run the full due-task sweep on demand — fires reminders AND the
+    // auto-complete / auto-fail resolutions immediately, instead of waiting for
+    // the 5-minute interval. Handy for verifying an "Auto-fail if overdue" task.
+    this.addCommand({
+      id: "stashpad-run-due-checks",
+      name: "Run due-task checks now (reminders + auto-complete + auto-fail)",
+      callback: () => { this.rebuildDueIndex(); void this.checkDueReminders(); },
+    });
     // 0.192.0: paste-text importer (replaces the standalone Stashpad Importer web app).
     this.addCommand({
       id: "stashpad-import-text",
@@ -5649,6 +5657,29 @@ export default class StashpadPlugin extends Plugin {
       out.push({ folder: dir, id: fm.id, pinnedAt: at, file: f });
     }
     out.sort((a, b) => a.pinnedAt - b.pinnedAt || a.file.path.localeCompare(b.file.path));
+    return out;
+  }
+
+  /** 0.306.0 (encrypted-pins P1, read side): LOCKED bundles that contain a
+   *  pinned note, surfaced read-only so a pin isn't silently lost behind the
+   *  lock. Reads ONLY the plaintext `.stashmeta` sidecar (never decrypts) — so
+   *  it depends on the write-side gate: a bundle locked with titles hidden
+   *  carries no `items`, and simply doesn't appear here. Bundle-level: one entry
+   *  per blob whose sidecar reports a pin, titled by the bundle root (child
+   *  titles are deliberately never in the sidecar). Clicking unlocks the bundle. */
+  async listLockedPins(): Promise<Array<{ folder: string; blobPath: string; title: string; pinnedAt: number }>> {
+    const folders = new Set(this.discoverStashpadFolders());
+    const out: Array<{ folder: string; blobPath: string; title: string; pinnedAt: number }> = [];
+    for (const f of this.app.vault.getFiles()) {
+      if (f.extension !== STASHENC_EXT) continue;
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!folders.has(dir)) continue;                 // not a live Stashpad folder
+      const meta = await readLockedMeta(this.app, f.path);
+      if (!meta?.bundlePinned || !meta.items?.length) continue;
+      const pinnedAt = meta.items.reduce((mx, it) => (it.pinned && typeof it.pinnedAt === "number" && it.pinnedAt > mx ? it.pinnedAt : mx), 0);
+      out.push({ folder: dir, blobPath: f.path, title: meta.title || "Locked note", pinnedAt });
+    }
+    out.sort((a, b) => a.pinnedAt - b.pinnedAt || a.blobPath.localeCompare(b.blobPath));
     return out;
   }
 
@@ -8752,15 +8783,24 @@ export default class StashpadPlugin extends Plugin {
    *  note in its Stashpad view first (so undo + authorship bind to that view
    *  and the user sees the task), then opens the scheduler on that node. */
   async openSchedulerForRef(folder: string, id: StashpadId): Promise<void> {
-    await this.revealNoteByRef(folder, id);
     const clean = folder.replace(/\/+$/, "");
-    const leaf = await this.findStashpadLeafForFolder(clean);
-    const view = leaf?.view;
-    if (view instanceof StashpadView) {
-      view.cmdSetDue(view.tree.get(id));
-    } else {
-      new Notice("Couldn’t open the scheduler for that task.");
-    }
+    // 0.305.0: the snooze control must NEVER hijack the tab the user is looking
+    // at — always open the task in a FRESH tab (deep-link-style), then open the
+    // scheduler on it. `forceNewTab` skips the reuse-existing-tab path entirely.
+    await this.openDeepLinkTarget(clean, id, { forceNewTab: true });
+    // A freshly-opened view loads its tree asynchronously; wait for the node to
+    // exist before opening the scheduler (so cmdSetDue targets it, with undo).
+    // Fall back to the file-based scheduler if the tree never resolves.
+    const deadline = Date.now() + 3000;
+    const trySchedule = (): void => {
+      const view = this.app.workspace.activeLeaf?.view;
+      if (view instanceof StashpadView && view.tree?.get(id)) { view.cmdSetDue(view.tree.get(id)); return; }
+      if (Date.now() < deadline) { window.setTimeout(trySchedule, 80); return; }
+      const file = this.resolveNoteFileInFolder(clean, id);
+      if (file) void this.openFullDuePicker(file, clean);
+      else new Notice("Couldn’t open the scheduler for that task.");
+    };
+    trySchedule();
   }
 
   /** Resolve a note's frontmatter `id` → its TFile within `folder` (direct
@@ -9118,6 +9158,74 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** 0.304.0: open the UNIFIED due/schedule picker for a single file and apply
+   *  the FULL result (due + recurrence + assignees + tags). One picker with every
+   *  feature — Set-due, Assign, and Snooze/reschedule all route here so the
+   *  surfaces no longer diverge (Snooze used to open a stripped date-only variant;
+   *  now it's the same picker, pre-filled, so reschedule keeps existing
+   *  assignees/recurrence by default while making them editable). `opts.title`
+   *  labels the modal; `onDone` fires after a successful write. Writes frontmatter
+   *  directly (no view undo stack — matches the panel snooze path it replaces). */
+  async openFullDuePicker(file: TFile, folder: string, opts: { title?: string } = {}, onDone?: () => void): Promise<void> {
+    const cleaned = folder.replace(/\/+$/, "");
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as any;
+    const current = fm && (typeof fm.due === "string" || typeof fm.due === "number") ? String(fm.due) : null;
+    const knownAuthors = this.collectKnownAuthors();
+    const currentAssignees = parseAssignees(fm ?? {});
+    // Prefill the note's author as an assignee when a matching profile exists
+    // and isn't already assigned (mirrors StashpadView.cmdSetDue).
+    const auth = parseAuthorRef((fm ?? {}).author);
+    if (auth) {
+      const profile = knownAuthors.find((k) => k.id === auth.id) ?? knownAuthors.find((k) => k.name.toLowerCase() === auth.name.toLowerCase());
+      if (profile && !currentAssignees.some((a) => a.id === profile.id)) currentAssignees.push({ id: profile.id, name: profile.name });
+    }
+    const rawTags = (fm ?? {}).tags;
+    const currentTags = Array.isArray(rawTags) ? rawTags.map(String)
+      : typeof rawTags === "string" ? rawTags.split(/[,\s]+/).filter(Boolean) : [];
+    new DueDatePickerModal(this.app, current, (result) => {
+      void this.applyDueResultToFile(file, cleaned, result).then(() => onDone?.())
+        .catch((e: any) => new Notice(`Couldn't update: ${(e as Error).message}`));
+    }, {
+      title: opts.title,
+      knownAuthors, currentAssignees, quickAdjusts: this.settings.dueQuickAdjusts,
+      showTags: true, currentTags, tagChips: this.settings.taskTagChips, tagSuggestions: this.settings.taskTagSuggestions,
+      showRecurrence: true,
+      currentRepeat: typeof fm?.repeat === "string" ? fm.repeat : "",
+      currentRepeatMode: typeof fm?.repeatMode === "string" ? fm.repeatMode : "",
+      currentAutoDoneAfter: typeof fm?.autoDoneAfter === "string" ? fm.autoDoneAfter : "",
+      currentRemindEvery: typeof fm?.remindEvery === "string" ? fm.remindEvery : "",
+      currentFailIfOverdue: fm?.failIfOverdue === true,
+    }).open();
+  }
+
+  /** 0.304.0: standalone writer mirroring StashpadView.applyDue for a SINGLE file
+   *  (no view context / no undo stack). Writes due + recurrence + assignees +
+   *  tags exactly as the view path does, so the unified picker behaves the same
+   *  from a task panel as from the list. */
+  private async applyDueResultToFile(file: TFile, folder: string, result: DuePickResult): Promise<void> {
+    const assignees = result.assignees ?? [];
+    for (const a of assignees) await this.ensureAuthorStubFor(folder, a.id, a.name);
+    const assignLinks = assignees.map((a) => this.authorRefFor(folder, a.id, a.name));
+    const myId = (this.settings.authorId ?? "").trim();
+    const myName = (this.settings.authorName ?? "").trim();
+    const meLink = myId && myName ? this.authorRefFor(folder, myId, myName) : null;
+    const normTags = result.tags === undefined ? undefined
+      : [...new Set(result.tags.map((t) => t.trim().replace(/^#+/, "")).filter(Boolean))];
+    await this.app.fileManager.processFrontMatter(file, (m: any) => {
+      if (result.iso === null) delete m.due; else { m.due = result.iso; m.task = true; }
+      const set3 = (k: string, v?: string) => { const val = (v ?? "").trim(); if (val) { m[k] = val; m.task = true; } else delete m[k]; };
+      set3("repeat", result.repeat);
+      // repeatMode is meaningful only with a repeat rule.
+      set3("repeatMode", result.repeat ? result.repeatMode : "");
+      set3("autoDoneAfter", result.autoDoneAfter);
+      set3("remindEvery", result.remindEvery);
+      if (result.failIfOverdue) { m.failIfOverdue = true; m.task = true; } else delete m.failIfOverdue;
+      if (assignLinks.length > 0) { m.assignedTo = assignLinks; if (meLink) m.assignedBy = meLink; m.task = true; }
+      else { delete m.assignedTo; delete m.assignedBy; }
+      if (normTags !== undefined) { if (normTags.length > 0) m.tags = normTags; else delete m.tags; }
+    });
+  }
+
   /** 0.99.17 (#2): seed EVERY known author (vault-wide) into `folder`'s
    *  `_authors/`, not just the local user — so a new folder auto-populates with
    *  coworkers and assignment works without waiting for them to contribute. Each
@@ -9153,6 +9261,30 @@ export default class StashpadPlugin extends Plugin {
         else writeCompletedFm(fm as Record<string, unknown>, true);
       });
     } catch (e) { console.warn("[Stashpad] auto-resolve failed", f.path, e); }
+  }
+
+  /** 0.305.0: auto-FAIL a one-off task that's overdue and still open — mark it
+   *  complete AND tag it "failed", so a missed deadline is closed out on the
+   *  record instead of resolving silently (autoResolveDueTask) or sitting open
+   *  forever. Also stamps `outcome: failed` + `failedAt`. Re-reads `due` inside
+   *  the callback so a concurrent reschedule cancels the fail. */
+  private async autoFailDueTask(f: TFile, now: number): Promise<void> {
+    try {
+      await this.app.fileManager.processFrontMatter(f, (fm) => {
+        const curDue = fm.due != null ? Date.parse(String(fm.due)) : NaN;
+        if (Number.isFinite(curDue) && curDue > now) return; // rescheduled since — skip
+        if (fm.completed === true) return;                   // already done
+        writeCompletedFm(fm as Record<string, unknown>, true);
+        // Normalize tags to an array and add "failed" if not already present.
+        const raw = (fm as { tags?: unknown }).tags;
+        const list = Array.isArray(raw) ? raw.map((t) => String(t))
+          : typeof raw === "string" ? raw.split(/[,\s]+/).filter(Boolean) : [];
+        if (!list.some((t) => t.replace(/^#/, "").toLowerCase() === "failed")) list.push("failed");
+        (fm as { tags?: unknown }).tags = list;
+        (fm as { outcome?: unknown }).outcome = "failed";
+        (fm as { failedAt?: unknown }).failedAt = new Date(now).toISOString();
+      });
+    } catch (e) { console.warn("[Stashpad] auto-fail failed", f.path, e); }
   }
 
   /** 0.295.2 (perf): `path → dueMs` for every markdown file that is a reminder
@@ -9233,6 +9365,7 @@ export default class StashpadPlugin extends Plugin {
     let persistDirty = false;
     const activePersistIds = new Set<string>(); // 0.140.1: for pruning the log
     let missedRolled = 0; // 0.197.0: interval-mode occurrences closed out as missed
+    let autoFailed = 0;   // 0.305.0: one-off tasks auto-failed on overdue
     // 0.295.2: scan the index, not the vault. Snapshot the entries first — the
     // body awaits (auto-resolve / occurrence spawn), and those writes fire
     // "changed", which would mutate the map mid-iteration. The per-file
@@ -9251,6 +9384,17 @@ export default class StashpadPlugin extends Plugin {
       const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(dueRaw);
       if (!Number.isFinite(dueMs) || dueMs > now) continue; // not due yet
 
+      // 0.305.0: auto-FAIL — a one-off task with `failIfOverdue` that's still
+      // open past its due date is closed out as a miss (complete + "failed" tag)
+      // rather than sitting open. Checked BEFORE auto-complete so an explicit
+      // fail policy wins over a silent resolve if both are set. Repeating tasks
+      // are left to the repeat / interval machinery, which already models misses.
+      if (fm.completed !== true && (fm as { failIfOverdue?: unknown }).failIfOverdue === true
+          && !parseRecurrence(fm.repeat as string | undefined)) {
+        await this.autoFailDueTask(f, now);
+        autoFailed++;
+        continue;
+      }
       // 0.140.0: auto-complete-after ("un-failable" tasks) — once past due by
       // the configured grace, resolve WITHOUT reminding. A repeating task rolls
       // forward; a one-off just gets marked complete. Runs before assignee
@@ -9314,6 +9458,14 @@ export default class StashpadPlugin extends Plugin {
     // unbounded after tasks complete/lose remindEvery.
     for (const kId of Object.keys(persistLog)) if (!activePersistIds.has(kId)) { delete persistLog[kId]; persistDirty = true; }
     if (persistDirty) { this.settings.persistReminderLog = persistLog; await this.saveSettings(); }
+    // 0.305.0: surface auto-fails even when nothing else is due (the early
+    // return below would otherwise swallow the notice).
+    if (autoFailed > 0) {
+      this.notifications.show({
+        message: `⛔ ${autoFailed} task${autoFailed === 1 ? " was" : "s were"} past due and marked failed.`,
+        kind: "warning", category: "reminder", folder: "",
+      });
+    }
     if (due.length === 0) return;
     // Record up front so the interval / a fast re-entry can't double-fire.
     // 0.140.1: EXCLUDE `@persist` keys — they're never read back (the persist

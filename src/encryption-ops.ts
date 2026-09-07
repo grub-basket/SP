@@ -19,7 +19,31 @@ export const STASHMETA_EXT = "stashmeta";
  *  `.stashenc` path, minus the crypto. Distinct ext so the encrypted-only
  *  listing/rotation code never picks these up. 0.145.0 */
 export const STASHPACK_EXT = "stashpack";
-export interface LockedMeta { v: number; parentId: string | null; title: string; count: number; created: string; rootId: string; prevSibling: string | null; }
+export interface LockedMeta {
+  v: number; parentId: string | null; title: string; count: number; created: string; rootId: string; prevSibling: string | null;
+  /** 0.306.0 (encrypted-pins P1): per-note pin/task state surfaced from the
+   *  bundled notes so pins + due tasks aren't silently lost behind the lock.
+   *  Plaintext, so it rides the SAME hide-titles gate as `title`: when titles
+   *  are hidden this is omitted entirely (the state still lives inside the
+   *  encrypted blob). Absent on older bundles — readers treat it as optional. */
+  items?: LockedItemState[];
+  /** Fast filter: at least one surfaced item is pinned. */
+  bundlePinned?: boolean;
+}
+
+/** 0.306.0: the subset of a locked note's frontmatter that is safe (per the
+ *  hide-titles gate) to advertise in the PLAINTEXT sidecar. Never carries body,
+ *  assignees, tags, or child titles. */
+export interface LockedItemState {
+  id: string;
+  pinned?: boolean;
+  pinnedAt?: number;
+  /** "top" | "bottom" (legacy `true` == "top"). */
+  listPinned?: string | boolean;
+  task?: boolean;
+  due?: string;
+  completed?: boolean;
+}
 function sidecarPath(blobPath: string): string { return blobPath.replace(/\.(stashenc|stashpack)$/, `.${STASHMETA_EXT}`); }
 export async function readLockedMeta(app: App, blobPath: string): Promise<LockedMeta | null> {
   try { return JSON.parse(await app.vault.adapter.read(sidecarPath(blobPath))) as LockedMeta; }
@@ -41,7 +65,12 @@ export interface LockResult {
   unpurged: string[];
 }
 
-interface SubtreeNode { id: StashpadId; file: TFile; parent: StashpadId | null; created: string; }
+interface SubtreeNode {
+  id: StashpadId; file: TFile; parent: StashpadId | null; created: string;
+  /** 0.306.0: pin/task state carried out to the sidecar on lock (P1). */
+  pinned?: boolean; pinnedAt?: number; listPinned?: string | boolean;
+  task?: boolean; due?: string; completed?: boolean;
+}
 
 /** Collect a note + all its descendants within `folder` by walking frontmatter
  *  `parent` links. Returns the root note and the rest, plus the root's parent. */
@@ -58,7 +87,18 @@ export async function collectSubtree(app: App, folder: string, rootId: StashpadI
     let fm: Record<string, unknown>;
     try { fm = splitFrontmatter(await app.vault.read(f)).fm; } catch { continue; }
     if (typeof fm.id !== "string") continue;
-    inFolder.push({ id: fm.id, file: f, parent: typeof fm.parent === "string" ? fm.parent : null, created: typeof fm.created === "string" ? fm.created : "" });
+    inFolder.push({
+      id: fm.id, file: f,
+      parent: typeof fm.parent === "string" ? fm.parent : null,
+      created: typeof fm.created === "string" ? fm.created : "",
+      // 0.306.0: capture pin/task state so lockSubtree can surface it (P1).
+      pinned: fm.pinned === true || undefined,
+      pinnedAt: typeof fm.pinnedAt === "number" ? fm.pinnedAt : undefined,
+      listPinned: (typeof fm.listPinned === "string" || fm.listPinned === true) ? (fm.listPinned as string | boolean) : undefined,
+      task: fm.task === true || undefined,
+      due: typeof fm.due === "string" ? fm.due : (typeof fm.due === "number" ? new Date(fm.due).toISOString() : undefined),
+      completed: fm.completed === true || undefined,
+    });
   }
   const root = inFolder.find((n) => n.id === rootId);
   if (!root) return null;
@@ -305,11 +345,34 @@ export async function lockSubtree(
 
   // Write the plaintext sidecar (placeholder metadata) BEFORE trashing originals.
   const all = allNodes;
+  // 0.306.0 (encrypted-pins P1): surface each note's pin/task state to the
+  // plaintext sidecar so pins + due tasks stay visible while locked. Gated by
+  // the SAME hide-titles switch as `title` — when hiding, omit `items` entirely
+  // (the state still lives inside the encrypted blob and round-trips on unlock).
+  let items: LockedItemState[] | undefined;
+  let bundlePinned: boolean | undefined;
+  if (!hideTitle) {
+    const surfaced: LockedItemState[] = [];
+    for (const n of all) {
+      const anyState = n.pinned || n.pinnedAt != null || n.listPinned != null || n.task || n.due != null || n.completed;
+      if (!anyState) continue;
+      const it: LockedItemState = { id: n.id };
+      if (n.pinned) it.pinned = true;
+      if (n.pinnedAt != null) it.pinnedAt = n.pinnedAt;
+      if (n.listPinned != null) it.listPinned = n.listPinned;
+      if (n.task) it.task = true;
+      if (n.due != null) it.due = n.due;
+      if (n.completed) it.completed = true;
+      surfaced.push(it);
+    }
+    if (surfaced.length) { items = surfaced; bundlePinned = surfaced.some((i) => i.pinned) || undefined; }
+  }
   const meta: LockedMeta = {
     // Empty title when hiding — the real title lives ONLY inside the encrypted
     // blob. Placement uses parentId/rootId/prevSibling, so "" doesn't break it.
-    v: 1, parentId, title: hideTitle ? "" : titleFromFile(rootNote.file), count: all.length,
+    v: items ? 2 : 1, parentId, title: hideTitle ? "" : titleFromFile(rootNote.file), count: all.length,
     created: rootNote.created, rootId, prevSibling,
+    ...(items ? { items, bundlePinned } : {}),
   };
   try { await app.vault.adapter.write(sidecarPath(blobPath), JSON.stringify(meta)); }
   catch (e) { console.warn("[Stashpad] couldn't write lock sidecar", e); }

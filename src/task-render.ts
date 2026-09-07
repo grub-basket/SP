@@ -2,7 +2,6 @@ import { App, Notice, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
 import { collectTasks, type TaskItem } from "./task-collect";
 import { writeCompletedFm } from "./types";
-import { DueDatePickerModal } from "./modals";
 import { formatDateOnly, formatTimeOnly } from "./format";
 
 type Section = "overdue" | "today" | "upcoming" | "nodate" | "completed";
@@ -186,13 +185,10 @@ export function renderTaskTriage(
     rerender();
   };
   const snooze = (t: TaskItem): void => {
-    const current = t.dueRaw ?? (t.due != null ? new Date(t.due).toISOString() : null);
-    new DueDatePickerModal(app, current, (result) => {
-      void app.fileManager.processFrontMatter(t.file, (m: any) => {
-        if (result.iso === null) delete m.due;
-        else { m.due = result.iso; m.task = true; }
-      }).then(rerender).catch((e: any) => new Notice(`Couldn't snooze: ${(e as Error).message}`));
-    }, { title: "Snooze — reschedule", hideAssignees: true, quickAdjusts: plugin.settings.dueQuickAdjusts }).open();
+    // 0.304.0: unified full due/schedule picker (see plugin.openFullDuePicker) —
+    // no longer a stripped date-only snooze variant.
+    const folder = t.file.parent?.path ?? "";
+    void plugin.openFullDuePicker(t.file, folder, {}, rerender);
   };
 
   const shown = state.status === "all" ? SECTIONS : SECTIONS.filter((s) => s.key === state.status);

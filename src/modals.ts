@@ -25,6 +25,10 @@ export interface DuePickResult {
   repeatMode?: string;
   autoDoneAfter?: string;
   remindEvery?: string;
+  /** 0.305.0: auto-fail — mark the task complete AND tag it "failed" if it's
+   *  still open past the due date. Present only when the picker showed the
+   *  recurrence section. */
+  failIfOverdue?: boolean;
 }
 export interface DuePickerOptions {
   /** 0.140.0: show the "Repeat & reminders" section, pre-filled from these. */
@@ -33,6 +37,8 @@ export interface DuePickerOptions {
   currentRepeatMode?: string;
   currentAutoDoneAfter?: string;
   currentRemindEvery?: string;
+  /** 0.305.0: pre-fill the auto-fail toggle. */
+  currentFailIfOverdue?: boolean;
   /** Known authors to offer in the assignee picker (from the registry). */
   knownAuthors?: AssigneeRef[];
   /** Assignees already on the note, to pre-fill the chips. */
@@ -3076,18 +3082,16 @@ export class DueDatePickerModal extends Modal {
       }
     }
 
-    // 0.78.1: "Assign to" section — chips for current assignees + an
-    // autocomplete input to add known authors (Sift) or a free-entry name
-    // (mints a new author id). Multiple assignees supported.
-    // 0.125.0: Snooze passes hideAssignees — it only reschedules, so omit it.
-    if (!this.opts.hideAssignees) this.renderAssignSection(wrap);
-    if (this.showTags) this.renderTagsSection(wrap);
-
     // 0.76.5: presets (top row) + actions (bottom row) share ONE
-    // 3-column grid so the six buttons line up in two tidy rows.
-    const grid = wrap.createDiv({ cls: "stashpad-due-grid" });
+    // 3-column grid.
+    // 0.304.0 / 0.305.0: the DATE PRESETS (Today/Tomorrow/Next week) sit directly
+    // under the quick-adjust row (the primary date controls, grouped at top). The
+    // ACTION row (Clear/Cancel/Set) is split off and rendered at the very BOTTOM,
+    // beneath the Assign/Tags/Repeat sections — so the terminal actions are the
+    // last thing in the modal, not stranded in the middle.
+    const presetGrid = wrap.createDiv({ cls: "stashpad-due-grid stashpad-due-presets" });
     const addPreset = (label: string, build: () => Date) => {
-      const b = grid.createEl("button", { cls: "stashpad-due-btn stashpad-due-preset", text: label });
+      const b = presetGrid.createEl("button", { cls: "stashpad-due-btn stashpad-due-preset", text: label });
       b.onclick = () => {
         const d = build();
         dateInput.value = this.toDateValue(d);
@@ -3099,16 +3103,15 @@ export class DueDatePickerModal extends Modal {
     addPreset("Tomorrow", () => { const d = this.startOfTodayLocal(); d.setDate(d.getDate() + 1); return atNine(d); });
     addPreset("Next week", () => { const d = this.startOfTodayLocal(); d.setDate(d.getDate() + 7); return atNine(d); });
 
-    // 0.76.22: "Clear" only empties the fields and stays open — so you
-    // can clear a misapplied date and pick a new one without
-    // re-opening. To actually REMOVE the due, clear then Set (empty
-    // Set commits null). To keep the existing due, Cancel.
-    const clear = grid.createEl("button", { cls: "stashpad-due-btn", text: "Clear" });
-    clear.onclick = () => {
-      dateInput.value = "";
-      timeInput.value = "";
-      dateInput.focus();
-    };
+    // 0.78.1: "Assign to" section — chips for current assignees + an
+    // autocomplete input to add known authors (Sift) or a free-entry name
+    // (mints a new author id). Multiple assignees supported.
+    // 0.125.0: Snooze passes hideAssignees — it only reschedules, so omit it.
+    // 0.304.0: rendered AFTER the button grid so the primary date controls stay
+    // grouped at the top; assign/tags/repeat are the optional extras below.
+    if (!this.opts.hideAssignees) this.renderAssignSection(wrap);
+    if (this.showTags) this.renderTagsSection(wrap);
+
     // 0.140.0: optional "Repeat & reminders" section (collapsible). Three
     // free-text fields; recurrence uses natural language ("every weekday",
     // "every 30 days when done"). Only shown/returned when opts.showRecurrence.
@@ -3116,6 +3119,7 @@ export class DueDatePickerModal extends Modal {
     let autoIn: HTMLInputElement | null = null;
     let remindIn: HTMLInputElement | null = null;
     let modeSel: HTMLSelectElement | null = null;
+    let failChk: HTMLInputElement | null = null;
     if (this.opts.showRecurrence) {
       const det = wrap.createEl("details", { cls: "stashpad-due-recur" });
       if (this.opts.currentRepeat || this.opts.currentAutoDoneAfter || this.opts.currentRemindEvery) det.open = true;
@@ -3297,14 +3301,40 @@ export class DueDatePickerModal extends Modal {
       modeSel.onchange = paintHelp;
       paintHelp();
     }
-    const recur = (): Pick<DuePickResult, "repeat" | "autoDoneAfter" | "remindEvery" | "repeatMode"> =>
+    // 0.305.2: auto-fail is a STANDALONE top-level option — NOT tucked inside the
+    // collapsible "Repeat & reminders" section (it applies to plain one-off
+    // deadlines, which is the common case). Single-target only, same gate as
+    // recurrence. Rendered above the actions so it reads as a primary toggle.
+    if (this.opts.showRecurrence) {
+      const frow = wrap.createDiv({ cls: "stashpad-due-failrow" });
+      const flabel = frow.createEl("label", { cls: "stashpad-due-failrow-label" });
+      failChk = flabel.createEl("input", { type: "checkbox" });
+      flabel.createSpan({ text: "Auto-fail if overdue" });
+      failChk.checked = !!this.opts.currentFailIfOverdue;
+      frow.createDiv({ cls: "stashpad-due-failrow-help" }).setText(
+        "If the task is still open past its due date, mark it done and tag it “failed”. For deadlines that shouldn't sit open indefinitely.",
+      );
+    }
+    const recur = (): Pick<DuePickResult, "repeat" | "autoDoneAfter" | "remindEvery" | "repeatMode" | "failIfOverdue"> =>
       this.opts.showRecurrence
-        ? { repeat: repeatIn!.value.trim(), autoDoneAfter: autoIn!.value.trim(), remindEvery: remindIn!.value.trim(), repeatMode: modeSel?.value ?? "" }
+        ? { repeat: repeatIn!.value.trim(), autoDoneAfter: autoIn!.value.trim(), remindEvery: remindIn!.value.trim(), repeatMode: modeSel?.value ?? "", failIfOverdue: !!failChk?.checked }
         : {};
 
-    const cancel = grid.createEl("button", { cls: "stashpad-due-btn", text: "Cancel" });
+    // 0.305.0: the action row lives at the very bottom, beneath every input
+    // section (presets, assign, tags, repeat). Clear/Cancel/Set on one row.
+    const actionGrid = wrap.createDiv({ cls: "stashpad-due-grid stashpad-due-actions" });
+    // 0.76.22: "Clear" only empties the fields and stays open — so you can clear
+    // a misapplied date and pick a new one without re-opening. To actually REMOVE
+    // the due, clear then Set (empty Set commits null). To keep it, Cancel.
+    const clear = actionGrid.createEl("button", { cls: "stashpad-due-btn", text: "Clear" });
+    clear.onclick = () => {
+      dateInput.value = "";
+      timeInput.value = "";
+      dateInput.focus();
+    };
+    const cancel = actionGrid.createEl("button", { cls: "stashpad-due-btn", text: "Cancel" });
     cancel.onclick = () => { this.didChoose = true; this.close(); };
-    const ok = grid.createEl("button", { cls: "stashpad-due-btn mod-cta", text: "Set" });
+    const ok = actionGrid.createEl("button", { cls: "stashpad-due-btn mod-cta", text: "Set" });
     ok.onclick = () => {
       // Empty Set = remove the due date (assignees still committed, so you
       // can assign someone without a due date).

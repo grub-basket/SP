@@ -11,7 +11,6 @@ import {
   type StashpadId,
 } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
-import { DueDatePickerModal } from "./modals";
 import { collectTasks as collectTasksShared, titleFromTaskFile, type TaskItem } from "./task-collect";
 import { TaskReviewModal } from "./task-review-modal";
 
@@ -196,6 +195,11 @@ export class StashpadPanelsView extends ItemView {
 
   private renderPinnedPanel(parent: HTMLElement): void {
     const list = parent.createDiv({ cls: "stashpad-panel-pinned" });
+    // 0.306.0 (encrypted-pins P1): append any LOCKED pinned bundles below the
+    // live pins. Async (reads the plaintext .stashmeta sidecars) + fire-and-
+    // forget, so it lands after whichever sync path below renders — including
+    // the empty-state early return, which it clears if locked pins exist.
+    void this.appendLockedPins(list);
     // Flat mode wants the per-row folder badge (no headers for context); grouped
     // mode hides it (the group header already names the folder).
     if ((this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order") !== "folder") list.addClass("is-flat");
@@ -258,6 +262,30 @@ export class StashpadPanelsView extends ItemView {
       header.createSpan({ cls: "stashpad-pinned-group-name", text: folderName });
       const bucket = groups.get(folder) ?? [];
       for (const { pin, idx } of bucket) this.renderPinnedRow(list, pin, idx);
+    }
+  }
+
+  /** 0.306.0 (encrypted-pins P1, read side): render LOCKED pinned bundles as
+   *  read-only rows under a "Locked" header. Reads only the plaintext sidecar
+   *  (via plugin.listLockedPins) — never decrypts. Clicking a row opens the
+   *  unlock flow for that bundle. Bundle-level + title from the bundle root
+   *  (child titles are never surfaced), matching the write-side leak gate. */
+  private async appendLockedPins(list: HTMLElement): Promise<void> {
+    let locked: Awaited<ReturnType<StashpadPlugin["listLockedPins"]>>;
+    try { locked = await this.plugin.listLockedPins(); } catch { return; }
+    if (!locked.length || !list.isConnected) return;
+    // If locked pins are the ONLY pins, drop the "no pins yet" empty message.
+    list.querySelector(".stashpad-pinned-empty")?.remove();
+    const header = list.createDiv({ cls: "stashpad-pinned-group-header" });
+    header.createSpan({ cls: "stashpad-pinned-group-name", text: "Locked" });
+    for (const lp of locked) {
+      const row = list.createDiv({ cls: "stashpad-pinned-row stashpad-pinned-locked" });
+      setIcon(row.createSpan({ cls: "stashpad-pinned-icon" }), "lock");
+      row.createSpan({ cls: "stashpad-pinned-label", text: lp.title });
+      row.createSpan({ cls: "stashpad-pinned-locked-badge", text: lp.folder.split("/").pop() || lp.folder });
+      row.setAttr("aria-label", `Locked pinned note in ${lp.folder} — click to unlock`);
+      row.setAttr("title", "Locked — click to unlock");
+      row.onclick = () => { void this.plugin.unlockBundleAt(lp.blobPath); };
     }
   }
 
@@ -1023,14 +1051,11 @@ export class StashpadPanelsView extends ItemView {
    *  current due, and writes the new due directly (mirrors toggleTaskCompleted;
    *  reschedule-only, so assignees are untouched). */
   private snoozeTask(t: TaskItem): void {
-    const current = t.dueRaw ?? (t.due != null ? new Date(t.due).toISOString() : null);
-    new DueDatePickerModal(this.app, current, (result) => {
-      void this.app.fileManager.processFrontMatter(t.file, (m: any) => {
-        if (result.iso === null) delete m.due;
-        else { m.due = result.iso; m.task = true; }
-      }).then(() => this.scheduleRender())
-        .catch((e: any) => new Notice(`Couldn't snooze: ${(e as Error).message}`));
-    }, { title: "Snooze — reschedule", hideAssignees: true, quickAdjusts: this.plugin.settings.dueQuickAdjusts }).open();
+    // 0.304.0: unified picker — same full due/schedule modal as the list, so
+    // rescheduling from a panel can also touch recurrence/assignees/tags (all
+    // pre-filled, so a plain reschedule leaves them intact).
+    const folder = t.file.parent?.path ?? "";
+    void this.plugin.openFullDuePicker(t.file, folder, {}, () => this.scheduleRender());
   }
 
   /** 0.76.6: compact due label honouring the user's display format +

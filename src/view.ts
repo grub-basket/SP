@@ -15308,7 +15308,7 @@ export class StashpadView extends ItemView {
       : typeof rawTags === "string" ? rawTags.split(/[,\s]+/).filter(Boolean) : [];
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees, false, {
-        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode,
+        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode, failIfOverdue: result.failIfOverdue,
       }, result.tags);
     }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts,
       showTags: true, currentTags, tagChips: this.plugin.settings.taskTagChips, tagSuggestions: this.plugin.settings.taskTagSuggestions,
@@ -15319,37 +15319,28 @@ export class StashpadView extends ItemView {
       currentRepeatMode: typeof curFm?.repeatMode === "string" ? curFm.repeatMode : "",
       currentAutoDoneAfter: typeof curFm?.autoDoneAfter === "string" ? curFm.autoDoneAfter : "",
       currentRemindEvery: typeof curFm?.remindEvery === "string" ? curFm.remindEvery : "",
+      currentFailIfOverdue: curFm?.failIfOverdue === true,
     }).open();
   }
 
-  /** 0.125.0: Snooze — reschedule a task's due date. Reuses the due-date picker
-   *  (date-only: the assignee section is hidden) and writes the new due via
-   *  applyDue in dueOnly mode, so existing assignees are preserved. The quick
-   *  "+1h / tomorrow / next week" buttons are future work (task-scheduling). */
+  /** 0.125.0: Snooze — reschedule a task's due date. 0.304.0: unified — this now
+   *  opens the SAME full Assign/schedule picker as cmdSetDue (all controls,
+   *  pre-filled from the note), so the surfaces no longer diverge. Delegating to
+   *  cmdSetDue keeps the view's undo (applyDue records it) for both single- and
+   *  multi-target; the panel snooze sites, which never had undo, use
+   *  plugin.openFullDuePicker instead. */
   cmdSnooze(node?: TreeNode): void {
-    let targets: TreeNode[];
-    if (node) targets = [node];
-    else {
-      targets = this.getActionTargets();
-      if (targets.length === 0) { const f = this.tree.get(this.focusId); if (f?.file) targets = [f]; }
-    }
-    if (targets.length === 0) { new Notice("Nothing to snooze."); return; }
-    const first = targets[0];
-    const curFm = first.file ? this.app.metadataCache.getFileCache(first.file)?.frontmatter as any : null;
-    const current = curFm && (typeof curFm.due === "string" || typeof curFm.due === "number") ? String(curFm.due) : null;
-    new DueDatePickerModal(this.app, current, (result) => {
-      void this.applyDue(targets, result.iso, [], true);
-    }, { title: "Snooze — reschedule", hideAssignees: true, quickAdjusts: this.plugin.settings.dueQuickAdjusts }).open();
+    this.cmdSetDue(node);
   }
 
   /** Write the chosen due value (or clear it) across `targets`, with
    *  undo. Setting a date also flips `task: true`; clearing leaves the
    *  task flag intact (clearing a due ≠ "no longer a task"). */
-  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string; repeatMode?: string }, tags?: string[]): Promise<void> {
+  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string; repeatMode?: string; failIfOverdue?: boolean }, tags?: string[]): Promise<void> {
     // 0.276.0: `tags` undefined = picker didn't show the tags section → leave
     // tags untouched. An array (possibly empty) REPLACES the note's tag list.
     const normTags = tags === undefined ? undefined : [...new Set(tags.map((t) => t.trim().replace(/^#+/, "")).filter(Boolean))];
-    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown; repeatMode: unknown; tags: unknown }[] = [];
+    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown; repeatMode: unknown; failIfOverdue: unknown; tags: unknown }[] = [];
     const changedIds: StashpadId[] = [];
     // 0.78.1: who is doing the assigning (the local user) — stamped as
     // assignedBy so the "assigned by me" filter works. Null if the user
@@ -15365,7 +15356,7 @@ export class StashpadView extends ItemView {
       if (!t.file) continue;
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
       const wasTagged = this.isTaskTagged(t);
-      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery, repeatMode: fm?.repeatMode, tags: fm?.tags });
+      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery, repeatMode: fm?.repeatMode, failIfOverdue: fm?.failIfOverdue, tags: fm?.tags });
       this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
@@ -15382,6 +15373,8 @@ export class StashpadView extends ItemView {
           set3("repeatMode", recur.repeat ? recur.repeatMode : "");
           set3("autoDoneAfter", recur.autoDoneAfter);
           set3("remindEvery", recur.remindEvery);
+          // 0.305.0: auto-fail is a boolean flag (not a string field).
+          if (recur.failIfOverdue) { m.failIfOverdue = true; m.task = true; } else delete m.failIfOverdue;
         }
         // 0.125.0: Snooze passes dueOnly — reschedule the due date WITHOUT
         // touching assignees (the plain applyDue would clear them on an empty
@@ -15440,6 +15433,7 @@ export class StashpadView extends ItemView {
             if (p.repeatMode === undefined) delete m.repeatMode; else m.repeatMode = p.repeatMode;
             if (p.autoDoneAfter === undefined) delete m.autoDoneAfter; else m.autoDoneAfter = p.autoDoneAfter;
             if (p.remindEvery === undefined) delete m.remindEvery; else m.remindEvery = p.remindEvery;
+            if (p.failIfOverdue === undefined) delete m.failIfOverdue; else m.failIfOverdue = p.failIfOverdue;
             // 0.276.0: restore tags only if we changed them (normTags set).
             if (normTags !== undefined) { if (p.tags === undefined) delete m.tags; else m.tags = p.tags; }
           });
@@ -15481,9 +15475,9 @@ export class StashpadView extends ItemView {
       : typeof rawTags === "string" ? rawTags.split(/[,\s]+/).filter(Boolean) : [];
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees, false, {
-        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode,
+        repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode, failIfOverdue: result.failIfOverdue,
       }, result.tags);
-    }, { knownAuthors, currentAssignees, title: "Assign / schedule task",
+    }, { knownAuthors, currentAssignees, title: "Assign / schedule task", currentFailIfOverdue: curFm?.failIfOverdue === true,
       showTags: true, currentTags, tagChips: this.plugin.settings.taskTagChips, tagSuggestions: this.plugin.settings.taskTagSuggestions,
       // 0.155.0: Assign opens the SAME picker as "Set due date" with the full
       // control set — the quick +/- adjust row (was silently missing here) plus
@@ -18308,7 +18302,16 @@ export class StashpadView extends ItemView {
       const h = el.offsetHeight;
       if (h > 0) this.virtHeights.set(el.dataset.id, h);
     }
-    if (this.virtHeights.size > 0) {
+    // 0.303.0 (R1): freeze the row-height average during the bottom-pin SETTLE.
+    // The pin render itself (Infinity hint) always recomputes, so it gets an
+    // accurate baseline. But the settle ticks that follow (non-Infinity scroll
+    // updates fired while stickToListBottom holds) must NOT keep growing
+    // virtAvg from newly-measured bottom rows — that enlarges the estimated
+    // TOP-spacer height under the pinned scroll and leaves the pin landing a
+    // few rows short. Holding the average stable across the settle keeps
+    // scrollHeight from drifting so the watchdog's re-pin stays at true bottom.
+    const pinSettleTick = this.stickToListBottom && scrollTopHint !== Infinity;
+    if (!pinSettleTick && this.virtHeights.size > 0) {
       let s = 0;
       for (const h of this.virtHeights.values()) s += h;
       this.virtAvg = s / this.virtHeights.size;

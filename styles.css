@@ -4449,6 +4449,11 @@ body.is-mobile .stashpad-okf-cta {
   /* Clearance so the Cancel/Delete/Set row clears the modal's
      bottom edge. */
   padding-bottom: 16px;
+  /* 0.304.0: the SAME clip shaves the TOP — the first field (the date input)
+     sits flush against the content's top edge, so its focus / segment-selection
+     highlight lost a couple of px off the top. Top padding pulls it in so the
+     ring draws before the clip, mirroring the horizontal fix above. */
+  padding-top: 6px;
 }
 
 /* 0.76.1 / 0.76.5: due-date picker modal. Native date/time inputs
@@ -5674,6 +5679,20 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 
 .stashpad-panel-pinned { display: flex; flex-direction: column; gap: 1px; }
 
+/* 0.306.0 (encrypted-pins P1): a locked pinned bundle, read-only until unlocked.
+   Muted so it reads as "behind the lock"; the folder badge names its Stashpad. */
+.stashpad-pinned-locked { color: var(--text-muted); }
+.stashpad-pinned-locked .stashpad-pinned-icon { color: var(--text-faint); }
+.stashpad-pinned-locked:hover { color: var(--text-normal); }
+.stashpad-pinned-locked-badge {
+  margin-left: auto;
+  padding: 0 6px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+  background: var(--background-modifier-border);
+  border-radius: 999px;
+  white-space: nowrap;
+}
 .stashpad-pinned-row {
   display: flex;
   align-items: center;
@@ -6974,11 +6993,22 @@ button.stashpad-btn-loading::after {
 /* 0.139.0: per-note peek override input in the "Previously encrypted" view. */
 .stashpad-watch-peek { width: 56px; text-align: center; }
 /* 0.140.0: recurring/reminder fields in the due-date picker. */
-.stashpad-due-recur { margin-top: 10px; border-top: 1px solid var(--background-modifier-border); padding-top: 8px; }
-.stashpad-due-recur > summary { cursor: pointer; font-size: var(--font-ui-smaller); color: var(--text-muted); }
-.stashpad-due-recur-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
-.stashpad-due-recur-row label { flex: 0 0 130px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+/* 0.305.2: facelift — the recurrence + fail sections now match the Assign/Tags
+   sections (bold section headings, readable body text) instead of the old tiny
+   muted fine print that read as an afterthought. */
+.stashpad-due-recur { margin-top: 14px; border-top: 1px solid var(--background-modifier-border); padding-top: 12px; }
+.stashpad-due-recur > summary { cursor: pointer; font-size: var(--font-ui-small); font-weight: 600; color: var(--text-normal); margin-bottom: 6px; }
+.stashpad-due-recur-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+.stashpad-due-recur-row label { flex: 0 0 130px; font-size: var(--font-ui-small); color: var(--text-normal); }
 .stashpad-due-recur-row input { flex: 1; }
+/* 0.305.2: standalone "Auto-fail if overdue" option — a top-level checkbox row,
+   NOT inside the recurrence section, and its label stays on ONE line (the recur
+   rows force a 130px label column that wrapped this text). The label carries the
+   section's heading weight so it matches Assign/Tags. */
+.stashpad-due-failrow { display: flex; flex-direction: column; gap: 5px; margin: 14px 0 2px; padding-top: 12px; border-top: 1px solid var(--background-modifier-border); }
+.stashpad-due-failrow-label { display: flex; align-items: center; gap: 8px; white-space: nowrap; cursor: pointer; font-size: var(--font-ui-small); font-weight: 600; color: var(--text-normal); }
+.stashpad-due-failrow-label input { flex: 0 0 auto; margin: 0; }
+.stashpad-due-failrow-help { font-size: var(--font-ui-smaller); color: var(--text-muted); line-height: 1.4; }
 
 /* ---------------------------------------------------------------------------
    0.192.0 — paste-text importer modal (TextImportModal)
