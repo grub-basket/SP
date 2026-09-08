@@ -3733,7 +3733,14 @@ export class StashpadView extends ItemView {
     // Anchor MUST be captured BEFORE root.empty() destroys the rows it
     // reads, so we read the policy here pre-rebuild.
     const _policyForAnchor = policy ?? { kind: "preserve" as const };
-    const anchor = _policyForAnchor.kind === "preserve"
+    // 0.316.8 (R1 root fix): also capture the anchor whenever the list is big
+    // enough to virtualize, not only on `preserve`. follow-cursor and the
+    // legacy path restore a PIXEL scrollTop, and in a virtualized list a pixel
+    // stops meaning "these rows" the moment the height estimate is recomputed
+    // by the rebuild — the row anchor is the only stable reference. The walk
+    // stops at the first in-viewport row (a handful of rects), so it's cheap.
+    const anchor = (_policyForAnchor.kind === "preserve"
+        || this.currentChildren.length >= StashpadView.VIRT_MIN_ROWS)
       ? this.captureScrollAnchor()
       : null;
     // Preserve composer focus across the rebuild. Without this, every
@@ -3919,7 +3926,17 @@ export class StashpadView extends ItemView {
     this.virtScrollHint = (policy?.kind === "pin-bottom" || this.scrollToBottomOnNextRender)
       ? Infinity
       : (policy?.kind === "restore" ? policy.scrollTop : prevScroll);
+    // 0.316.8: hand virtMount the anchor ROW so it can translate that pixel
+    // under the rebuilt heights (see virtAnchorHint).
+    this.virtAnchorHint = anchor;
+    this.virtAnchoredScrollTop = null;
     this.populateListBody(list, focused);
+    // Consumed by virtMount; clear it if the list didn't virtualize so it can't
+    // leak into a later render.
+    this.virtAnchorHint = null;
+    // The scrollTop every "restore prevScroll" branch below should use: the
+    // anchor-translated value when the virt list produced one, else the pixel.
+    const effPrevScroll = this.virtAnchoredScrollTop ?? prevScroll;
 
     if (reuseComposer) {
       // In-place refresh of everything the rebuild used to provide. These two
@@ -4023,8 +4040,20 @@ export class StashpadView extends ItemView {
             this.plugin.trace("r1:preserve", { branch: "repin", prevAtBottom, stick: this.stickToListBottom });
             this.scrollListToBottom();
           } else {
-            this.plugin.trace("r1:preserve", { branch: "anchor", prevAtBottom, stick: this.stickToListBottom, prevScroll: Math.round(prevScroll) });
-            this.restoreScrollAnchor(anchor, prevScroll);
+            this.plugin.trace("r1:preserve", { branch: "anchor", prevAtBottom, stick: this.stickToListBottom, prevScroll: Math.round(effPrevScroll), translated: this.virtAnchoredScrollTop != null });
+            // 0.316.8 (R1 root fix): re-assert the anchor over the settle steps
+            // instead of once. The first apply is exact, but note bodies in the
+            // rows just above the anchor render lazily AFTER the paint and grow
+            // (measured: +412px within 15ms), and the browser's own scroll
+            // anchoring only partly compensates (it picks its own anchor node)
+            // — leaving the row ~90px lower than it was. scheduleSettleApplies
+            // re-runs the apply on each step where scrollHeight moved, and
+            // restoreScrollAnchor measures the real rect every time, so it
+            // converges on the exact offset. Same machinery the restore /
+            // scroll-to-id policies already use; it stops itself if a newer
+            // render replaces the list.
+            const anchorList = this.listEl;
+            this.scheduleSettleApplies(anchorList, () => this.restoreScrollAnchor(anchor, effPrevScroll));
           }
           break;
         case "pin-bottom":
@@ -4059,7 +4088,10 @@ export class StashpadView extends ItemView {
         case "follow-cursor":
           // Defer to revealCursorRow which already handles the multi-frame
           // settle dance for async row-height changes.
-          if (prevScroll > 0) this.listEl.scrollTop = prevScroll;
+          // 0.316.8: effPrevScroll — the pixel translated through the anchor row
+          // for a virtualized list (a raw pixel strands the view after the
+          // height estimate is recomputed).
+          if (effPrevScroll > 0) this.listEl.scrollTop = effPrevScroll;
           this.revealCursorRow();
           break;
         case "scroll-to-id": {
@@ -4127,14 +4159,14 @@ export class StashpadView extends ItemView {
       // the user hasn't scrolled away", so honour it and re-pin.
       this.plugin.trace("r1:legacy", { branch: "atBottom", stick: this.stickToListBottom, prevAtBottom });
       this.scrollListToBottom();
-    } else if (this.listEl && prevScroll > 0) {
+    } else if (this.listEl && effPrevScroll > 0) {
       // 0.315.1 trace: a policy-less render restoring the PREVIOUS scrollTop is
       // the suspected "midway" culprit when a folder switch is followed by an
       // async re-render (tree rebuild / frontmatter sync) that carries no pin
       // policy — if stickToListBottom is still set, restoring prevScroll fights
       // the pin.
-      this.plugin.trace("r1:legacy", { branch: "prevScroll", prevScroll: Math.round(prevScroll), stick: this.stickToListBottom, prevAtBottom });
-      this.listEl.scrollTop = prevScroll;
+      this.plugin.trace("r1:legacy", { branch: "prevScroll", prevScroll: Math.round(effPrevScroll), stick: this.stickToListBottom, prevAtBottom, translated: this.virtAnchoredScrollTop != null });
+      this.listEl.scrollTop = effPrevScroll;
     }
 
     // 0.56.17: stamp the current cursor row as last-selected (debounced).
@@ -10603,6 +10635,15 @@ export class StashpadView extends ItemView {
     const before = list ? { top: Math.round(list.scrollTop), h: list.scrollHeight, gap: Math.round(list.scrollHeight - list.scrollTop - list.clientHeight) } : null;
     scope.querySelectorAll<HTMLElement>(`.stashpad-reaction-row[data-id="${CSS.escape(id)}"]`)
       .forEach((h) => renderReactionChips(this, h, node, override));
+    // 0.316.8 (R1 root fix): a chip appearing/disappearing changes a row's
+    // height, which is CONTENT growth — it fires no scroll event and the
+    // ResizeObserver only watches the list's own box — so while the view is
+    // pinned to the newest note the bottom would silently move ~25px below
+    // the viewport. Re-pin (and re-window) here, where the growth happens.
+    if (list && this.stickToListBottom && Date.now() >= this.keyboardTransitionUntil) {
+      list.scrollTop = list.scrollHeight;
+      this.virtUpdate();
+    }
     if (this.plugin.settings.debugTrace && list && before) {
       requestAnimationFrame(() => {
         const after = { top: Math.round(list.scrollTop), h: list.scrollHeight, gap: Math.round(list.scrollHeight - list.scrollTop - list.clientHeight) };
@@ -18454,6 +18495,16 @@ export class StashpadView extends ItemView {
    *  about to restore (or Infinity for pin-bottom), so the FIRST window is
    *  built where the list is going to be, not at the top. */
   private virtScrollHint: number | null = null;
+  /** 0.316.8 (R1 root fix): the ROW the paint should keep in place (captured by
+   *  captureScrollAnchor before the rebuild). A pixel scrollTop is meaningless
+   *  once the virtualized estimate (`virtAvg`) changes — the top spacer grows or
+   *  shrinks under it and the same pixel now shows different rows. virtMount
+   *  translates the pixel hint through this row under the NEW heights. */
+  private virtAnchorHint: { id: StashpadId; offsetFromListTop: number } | null = null;
+  /** The translated scrollTop virtMount produced from virtAnchorHint (null when
+   *  no translation happened). renderInner prefers it over the stale pixel for
+   *  every "restore prevScroll" branch. */
+  private virtAnchoredScrollTop: number | null = null;
 
   private virtEligible(fileRows: number, lockRows: number): boolean {
     return fileRows === 0 && lockRows === 0
@@ -18470,18 +18521,50 @@ export class StashpadView extends ItemView {
     const v = { list, start: 0, end: 0, top, bottom, raf: null as number | null, onScroll: () => {} };
     v.onScroll = () => {
       if (v.raf != null) return;
-      const tick = () => { v.raf = null; this.virtUpdate(); };
-      // rAF is paused in a hidden window (popouts, automated runs); a timer
-      // keeps the window honest there without costing the visible case.
-      v.raf = document.visibilityState === "hidden"
-        ? window.setTimeout(tick, 16)
-        : requestAnimationFrame(tick);
+      // 0.316.8: rAF AND a timer, whichever fires first. rAF alone stalls
+      // whenever frames are throttled or paused — a hidden/occluded window,
+      // popouts, automated runs, and iOS mid-transition — and a stalled tick
+      // left the window built for the OLD scroll position: the list pinned to
+      // the bottom while the rendered rows stopped short of the newest note
+      // (bottom spacer on screen). The `visibilityState` check only covered
+      // the fully-hidden case. The timer is the safety net, not the hot path.
+      let done = false;
+      let tmo: number | null = null;
+      const tick = () => {
+        if (done) return;
+        done = true;
+        v.raf = null;
+        if (tmo != null) { window.clearTimeout(tmo); tmo = null; }
+        if (this.virt !== v) return; // list torn down / remounted since
+        this.virtUpdate();
+      };
+      tmo = window.setTimeout(tick, 40);
+      v.raf = requestAnimationFrame(tick);
     };
     this.virt = v;
     list.addEventListener("scroll", v.onScroll, { passive: true });
     const hint = this.virtScrollHint;
     this.virtScrollHint = null;
-    this.virtUpdate(hint ?? undefined);
+    // 0.316.8 (R1 root fix): for a finite hint, hand virtUpdate the anchor ROW
+    // (index + viewport offset) rather than a pixel. The pixel was the OLD
+    // scrollTop under the OLD row-height estimate; a rebuild recomputes the
+    // estimate from more measured rows, the top spacer changes size, and that
+    // pixel then lands on different rows (the trace's render id13: scrollTop
+    // frozen at 24438 while the list grew 26078→34646 under it). virtUpdate
+    // resolves the row to a pixel AFTER the recompute, so the same row keeps
+    // the same viewport offset. Infinity (pin-bottom) is left alone — the
+    // bottom is its own anchor. A row that's not in this list (folder switch,
+    // filtered out) falls back to the pixel.
+    const anchor = this.virtAnchorHint;
+    this.virtAnchorHint = null;
+    this.virtAnchoredScrollTop = null;
+    let arg: number | { idx: number; offset: number } | undefined = hint ?? undefined;
+    if (anchor && hint !== Infinity) {
+      const idx = this.currentChildren.findIndex((n) => n.id === anchor.id);
+      if (idx >= 0) arg = { idx, offset: anchor.offsetFromListTop };
+    }
+    const landed = this.virtUpdate(arg);
+    if (typeof arg === "object" && typeof landed === "number") this.virtAnchoredScrollTop = landed;
   }
 
   private virtTeardown(): void {
@@ -18501,11 +18584,18 @@ export class StashpadView extends ItemView {
 
   /** Rebuild the rendered window for the current (or hinted) scroll position.
    *  Reads first (row heights), then writes (remove / build rows, spacers). */
-  private virtUpdate(scrollTopHint?: number): void {
+  /** 0.316.8: `hintIn` is a pixel scrollTop, `Infinity` (bottom), or an anchor
+   *  `{ idx, offset }` meaning "row idx must sit `offset`px below the list's
+   *  top edge". An anchor is resolved to a pixel HERE, after the height
+   *  estimate is recomputed — the only place that pixel is correct. Returns
+   *  the scrollTop written for an explicit hint (undefined for a scroll tick). */
+  private virtUpdate(hintIn?: number | { idx: number; offset: number }): number | undefined {
     const v = this.virt;
-    if (!v || !v.list.isConnected) return;
+    if (!v || !v.list.isConnected) return undefined;
     const list = v.list, kids = this.currentChildren, N = kids.length;
     const gap = StashpadView.VIRT_GAP_PX, over = StashpadView.VIRT_OVERSCAN_PX;
+    const explicit = hintIn != null;
+    let scrollTopHint: number | undefined = typeof hintIn === "number" ? hintIn : undefined;
     // 1. Measure what is rendered. Bodies arrive lazily, so heights drift
     //    after the row is built; every tick re-reads the window (≈40 reads).
     for (const el of Array.from(list.children) as HTMLElement[]) {
@@ -18521,14 +18611,34 @@ export class StashpadView extends ItemView {
     // TOP-spacer height under the pinned scroll and leaves the pin landing a
     // few rows short. Holding the average stable across the settle keeps
     // scrollHeight from drifting so the watchdog's re-pin stays at true bottom.
-    const pinSettleTick = this.stickToListBottom && scrollTopHint !== Infinity;
-    if (!pinSettleTick && this.virtHeights.size > 0) {
+    // 0.316.8 (R1 root fix): generalize that freeze. Recompute the average ONLY
+    // on an explicit update (mount / pin / ensure-index — a paint that either
+    // owns the scroll or is anchor-translated), never on a scroll-driven tick.
+    // Rows above the window are sized by this estimate, so changing it while
+    // the user is mid-gesture would slide the content under their finger — and
+    // compensating by writing scrollTop on iOS kills the fling. Held steady
+    // during scrolling, the top spacer can't drift at all; measured rows keep
+    // their real heights regardless. The estimate still refines on every full
+    // render, where the anchor translation keeps the view in place.
+    if (explicit && this.virtHeights.size > 0) {
       let s = 0;
       for (const h of this.virtHeights.values()) s += h;
       this.virtAvg = s / this.virtHeights.size;
     }
     const headingH = this.virtHeadingH(list);
     const viewH = list.clientHeight || 600;
+    // 0.316.8 (R1 root fix): resolve a row anchor to a pixel under the heights
+    // as they are NOW (post-recompute). Resolving it any earlier — as the old
+    // `virtScrollHint = prevScroll` pixel effectively did — bakes in the
+    // previous estimate, and once the average moves the same pixel lands on
+    // different rows (the trace's render id13: scrollTop frozen while the list
+    // grew 8,568px under it). Same y-accumulation as the window walk below.
+    if (hintIn != null && typeof hintIn === "object") {
+      const idx = Math.max(0, Math.min(N - 1, hintIn.idx));
+      let y = 0;
+      for (let i = 0; i < idx; i++) y += this.virtH(kids[i]) + gap;
+      scrollTopHint = Math.max(0, Math.round(y + headingH - hintIn.offset));
+    }
     // 2. Pick the window.
     let start = 0, end = 0, topPx = 0;
     if (scrollTopHint === Infinity) {
@@ -18578,8 +18688,26 @@ export class StashpadView extends ItemView {
     v.bottom.style.height = `${Math.max(0, botH)}px`;
     v.start = start; v.end = end;
     if (scrollTopHint != null) {
+      // Explicit placement: the window above was selected from this same
+      // pixel, so window and scroll position agree by construction.
       list.scrollTop = scrollTopHint === Infinity ? list.scrollHeight : scrollTopHint;
+      return list.scrollTop;
     }
+    if (this.stickToListBottom && Date.now() >= this.keyboardTransitionUntil) {
+      // 0.316.8 (R1 root fix): true sticky-bottom. While the view is in
+      // "pinned to the newest note" intent, every scroll-tick update lands on
+      // the bottom — so late body measurement or a reaction chip growing a row
+      // can never leave the list a few rows short. The ResizeObserver only
+      // sees the list's own box, not its CONTENT growing, which is exactly the
+      // gap this closes. A swipe-up clears the flag (touchmove/wheel handlers),
+      // so it never fights someone reading older notes; the keyboard guard
+      // mirrors the ResizeObserver's (0.76.27) so a composer tap doesn't
+      // bounce. Assigning an unchanged value fires no scroll event, so this
+      // can't re-trigger itself. (No drift compensation is needed on a tick:
+      // the estimate only changes on explicit updates, per the gate above.)
+      list.scrollTop = list.scrollHeight;
+    }
+    return undefined;
     if (perf.enabled) perf.record("render.virt.window", end - start);
   }
 
@@ -18590,10 +18718,10 @@ export class StashpadView extends ItemView {
     if (!v) return true;
     if (idx < 0 || idx >= this.currentChildren.length) return false;
     if (idx >= v.start && idx < v.end) return true;
-    let y = 0;
-    for (let i = 0; i < idx; i++) y += this.virtH(this.currentChildren[i]) + StashpadView.VIRT_GAP_PX;
-    const target = Math.max(0, y + this.virtHeadingH(v.list) - v.list.clientHeight / 2);
-    this.virtUpdate(target);
+    // 0.316.8: pass the row as an anchor (centered) and let virtUpdate resolve
+    // the pixel after it recomputes the estimate — a pixel computed here, under
+    // the pre-recompute heights, could land a few rows off.
+    this.virtUpdate({ idx, offset: v.list.clientHeight / 2 });
     return !!this.virt && idx >= this.virt.start && idx < this.virt.end;
   }
 
@@ -19020,7 +19148,14 @@ export class StashpadView extends ItemView {
         tries++;
         const kbd = Date.now() < this.keyboardTransitionUntil;
         // Don't fight the keyboard while it's animating — just wait it out.
-        if (!kbd) list.scrollTop = list.scrollHeight;
+        // 0.316.8: re-window the virtualized list right here rather than
+        // waiting for the scroll event this write will dispatch. That event is
+        // delivered by the browser's rendering step, which can be delayed or
+        // skipped (a throttled frame, an iOS transition, an occluded window),
+        // and until it lands the rendered rows are the ones built for the OLD
+        // scrollTop — pinned to the bottom of the scroll height but showing the
+        // bottom spacer instead of the newest note. No-op for non-virt lists.
+        if (!kbd) { list.scrollTop = list.scrollHeight; this.virtUpdate(); }
         const h = list.scrollHeight;
         const gap = h - list.scrollTop - list.clientHeight;
         this.plugin.trace("r1:settle", {
