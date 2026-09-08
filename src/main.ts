@@ -8,7 +8,8 @@ import { StashpadTrashView, openTrashView } from "./trash-view";
 import { ReEncryptScheduler } from "./reencrypt-scheduler";
 import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
-import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
+import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
+import { StashpadLogView, StashpadNotificationsView, openStashpadLogView, openStashpadNotificationsView } from "./activity-views";
 import { StashpadPanelsView, openStashpadPanelsView, openStashpadSinglePanel, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { TaskReviewModal } from "./task-review-modal";
 import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-view";
@@ -2870,6 +2871,15 @@ export default class StashpadPlugin extends Plugin {
       STASHPAD_FOLDER_PANEL_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadFolderPanelView(leaf, this),
     );
+    // 0.315.0: action log + notification history, promoted from modals to tabs.
+    this.registerView(
+      STASHPAD_LOG_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadLogView(leaf, this),
+    );
+    this.registerView(
+      STASHPAD_NOTIFICATIONS_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadNotificationsView(leaf, this),
+    );
     // 0.169.0: the "pop out" full-tab host for the Split-note UI (long text / mobile).
     this.registerView(
       WORKBENCH_VIEW_TYPE,
@@ -4122,29 +4132,9 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({
       id: "stashpad-open-notification-history",
       name: "Open notification history",
-      callback: () => {
-        // Lazy require to avoid a hard import dependency at plugin
-        // load time — the modal pulls in modals.ts which is fine but
-        // we keep the surface area minimal.
-        void import("./modals").then(({ NotificationHistoryModal, LogModal }) => {
-          new NotificationHistoryModal(
-            this.app,
-            this.notifications,
-            async () => {
-              const adapter = this.app.vault.adapter;
-              const path = this.pluginPrivatePath("log.jsonl");
-              if (!(await adapter.exists(path))) {
-                new Notice("No log yet — make some changes first.");
-                return;
-              }
-              const data = await adapter.read(path);
-              new LogModal(this.app, data, path).open();
-            },
-            this.settings.authorId || null,
-            (id) => this.lookupNoteAuthorIds(id),
-          ).open();
-        });
-      },
+      // 0.315.0: opens the dedicated notifications tab (StashpadNotificationsView)
+      // instead of the modal. The tab's "Open log" button jumps to the log tab.
+      callback: () => void openStashpadNotificationsView(this),
     });
     // 0.73.12: every General-tab settings toggle now mirrors into the
     // command palette as "Toggle: <name>". Lets power users flip
@@ -5679,16 +5669,13 @@ export default class StashpadPlugin extends Plugin {
     return out;
   }
 
-  /** 0.310.0: open the per-folder action log (`.stashpad/log.jsonl`) in the
-   *  LogModal — the plugin-level entry so the log is reachable from a command /
-   *  the launcher, not just the panels button. */
+  /** 0.310.0: open the per-folder action log (`.stashpad/log.jsonl`).
+   *  0.315.0: now a dedicated tab (StashpadLogView) instead of the LogModal, so
+   *  it's reachable from the launcher and sits alongside the other views. The
+   *  tab renders its own "No events yet" empty state, so the old pre-open
+   *  "No log yet" Notice is gone. */
   async openActionLog(): Promise<void> {
-    const adapter = this.app.vault.adapter;
-    const path = this.pluginPrivatePath("log.jsonl");
-    if (!(await adapter.exists(path))) { new Notice("No log yet — make some changes first."); return; }
-    const data = await adapter.read(path);
-    const { LogModal } = await import("./modals");
-    new LogModal(this.app, data, path).open();
+    await openStashpadLogView(this);
   }
 
   /** 0.306.0 (encrypted-pins P1, read side): LOCKED bundles that contain a
@@ -8462,9 +8449,10 @@ export default class StashpadPlugin extends Plugin {
     // 0.174.0: "Folders always open in a new tab" — skip the reuse-existing-tab
     // path entirely and open a fresh tab at the home note. Propagates to every
     // caller of this method (folders-panel row click, file-explorer menu, …).
-    if (this.settings.foldersAlwaysNewTab) { await this.activateViewForFolder(cleaned); return; }
+    if (this.settings.foldersAlwaysNewTab) { this.trace("r1:open", { folder: cleaned, path: "always-new-tab" }); await this.activateViewForFolder(cleaned); return; }
     const existing = await this.findStashpadLeafForFolder(cleaned);
     if (existing) {
+      this.trace("r1:open", { folder: cleaned, path: "reveal-existing", deferred: !(existing.view as { noteFolder?: string })?.noteFolder });
       this.app.workspace.revealLeaf(existing);
       this.app.workspace.setActiveLeaf(existing, { focus: true });
       // 0.302.0: unify with the folder switcher — landing on a folder always
@@ -8476,6 +8464,7 @@ export default class StashpadPlugin extends Plugin {
       if (typeof ev?.pinToBottomNow === "function") ev.pinToBottomNow();
       return;
     }
+    this.trace("r1:open", { folder: cleaned, path: "fresh-tab" });
     await this.activateViewForFolder(cleaned);
   }
 

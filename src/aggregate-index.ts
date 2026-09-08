@@ -3,6 +3,7 @@ import type StashpadPlugin from "./main";
 import { ROOT_ID, siftMatch, parseAuthorRef, writeCompletedFm } from "./types";
 import { stripInlineMarkdown } from "./slug-service";
 import { ConfirmModal } from "./modals";
+import { parseSearchQuery } from "./note-picker";
 
 /** 0.273.0: the "All notes" master index — one flat, vault-wide table of every
  *  Stashpad note, with facet filters that fold most of the long-logged
@@ -61,6 +62,11 @@ export interface IndexRow {
    *  exists on disk but hangs off nothing, so no list ever shows it. Browsable
    *  here; REPAIR stays with the integrity check / fix-orphans commands. */
   orphan: boolean;
+  /** 0.314.0: the note's `parent` frontmatter id (null when absent), so the
+   *  "All notes" `in:` filter can walk a note's subtree the same way the search
+   *  modal does — descendants share a folder, so a per-folder parent→children
+   *  map resolves them. */
+  parentId: string | null;
 }
 
 /** Caller-owned facet state — the same object is passed back on every re-render
@@ -230,12 +236,74 @@ export async function collectIndexRows(
         if (parent === ROOT_ID) return false;         // top-level — fine
         return !(idsByFolder.get(dir)?.has(parent));  // parent id resolves nowhere
       })(),
+      parentId: typeof fm.parent === "string" && fm.parent ? fm.parent : null,
     });
   }
   return rows;
 }
 
 const momentFn = moment as unknown as (ms: number) => { fromNow: () => string; format: (f: string) => string };
+
+/** 0.314.0: the "All notes" `when:` builder. A compact cousin of the search
+ *  modal's builder — same four modes, but it emits the same `before:`/`on:`/
+ *  `after:` tokens (Between → `after: [start] before: [end]`) into the index's
+ *  search box via `appendToken`, so the shared parseSearchQuery drives both.
+ *  Native date inputs keep it small; power users can still type raw tokens. The
+ *  chosen mode persists across opens. */
+let indexWhenMode: "before" | "on" | "after" | "between" = "on";
+function toggleIndexWhenBuilder(
+  filterRow: HTMLElement,
+  appendToken: (key: string, value: string) => void,
+): void {
+  const existing = filterRow.parentElement?.querySelector(".stashpad-index-when");
+  if (existing) { existing.remove(); return; }
+  const panel = document.createElement("div");
+  panel.className = "stashpad-index-when stashpad-when-builder";
+  const tabs = panel.createDiv({ cls: "stashpad-when-tabs" });
+  const modes: Array<{ id: typeof indexWhenMode; label: string }> = [
+    { id: "before", label: "Before" }, { id: "on", label: "On" },
+    { id: "after", label: "After" }, { id: "between", label: "Between" },
+  ];
+  const body = panel.createDiv({ cls: "stashpad-when-body" });
+  const startInput = document.createElement("input");
+  startInput.type = "date"; startInput.className = "stashpad-when-input";
+  const endInput = document.createElement("input");
+  endInput.type = "date"; endInput.className = "stashpad-when-input";
+  const rebuildBody = (): void => {
+    body.empty();
+    if (indexWhenMode === "between") {
+      body.createSpan({ cls: "stashpad-when-lbl", text: "From" });
+      body.appendChild(startInput);
+      body.createSpan({ cls: "stashpad-when-lbl", text: "to" });
+      body.appendChild(endInput);
+    } else {
+      body.appendChild(startInput);
+    }
+    const insert = body.createEl("button", { cls: "stashpad-when-insert", text: "Insert" });
+    insert.onclick = () => {
+      const s = startInput.value.trim();
+      const e = endInput.value.trim();
+      if (indexWhenMode === "between") {
+        if (s) appendToken("after", s);
+        if (e) appendToken("before", e);
+      } else if (s) {
+        appendToken(indexWhenMode, s);
+      }
+      panel.remove();
+    };
+  };
+  for (const m of modes) {
+    const t = tabs.createEl("button", { cls: "stashpad-when-tab" + (indexWhenMode === m.id ? " is-active" : ""), text: m.label });
+    t.onclick = () => {
+      if (indexWhenMode === m.id) return;
+      indexWhenMode = m.id;
+      for (const el of Array.from(tabs.children)) el.toggleClass("is-active", (el as HTMLElement).textContent === m.label);
+      rebuildBody();
+    };
+  }
+  rebuildBody();
+  filterRow.insertAdjacentElement("afterend", panel);
+}
 
 /** Render the index into `host`. Owns `host`.
  *
@@ -304,10 +372,40 @@ export async function renderMasterIndex(
     { v: "title", label: "Title A→Z" }, { v: "folder", label: "By folder" },
   ], state.sort, (v) => { state.sort = v as IndexState["sort"]; });
 
+  // 0.314.0: two dedicated chip rows below the search bar. The FIRST holds the
+  // `in:` / `when:` filter chips (same syntax + verbs as the note-search modal);
+  // the SECOND holds the facet chips (Files / Imported / …), moved off the bar
+  // onto their own line so the bar isn't a single overflowing cluster.
+  const filterRow = host.createDiv({ cls: "stashpad-search-filter-row stashpad-index-filter-row" });
+  filterRow.createSpan({ cls: "stashpad-search-filter-label", text: "Filters:" });
+  const facetRow = host.createDiv({ cls: "stashpad-index-facets" });
+
+  /** Insert an `key: [value]` token into the search box (mirrors the modal's
+   *  appendFilterToInput), then repaint. When `value` is empty the caret lands
+   *  inside the brackets so the user can type the target immediately. */
+  const appendToken = (key: string, value: string): void => {
+    const cur = search.value;
+    const needSpace = cur.length > 0 && !/\s$/.test(cur);
+    const prefix = `${needSpace ? " " : ""}${key}: [`;
+    search.value = `${cur}${prefix}${value}]`;
+    state.query = search.value;
+    search.focus();
+    if (!value) { const open = cur.length + prefix.length; search.setSelectionRange(open, open); }
+    paintRows();
+  };
+
+  const inChip = filterRow.createEl("button", { cls: "stashpad-search-filter-chip", text: "in:[parent note]" });
+  inChip.title = 'Insert "in:" — filter to a note and its subtree.';
+  inChip.onclick = () => appendToken("in", "");
+
+  const whenChip = filterRow.createEl("button", { cls: "stashpad-search-filter-chip stashpad-search-filter-when", text: "when:[date / range]" });
+  whenChip.title = "Filter by last-modified date (Before / On / After / Between).";
+  whenChip.onclick = () => toggleIndexWhenBuilder(filterRow, appendToken);
+
   // 0.295.2 (perf): `isActive` is a GETTER (was a snapshot boolean) so the chip
   // can restyle itself in place after a toggle without a full re-render.
   const chip = (label: string, isActive: () => boolean, toggle: () => void, title?: string, before?: () => Promise<void>): void => {
-    const c = bar.createEl("button", { cls: "stashpad-index-chip" + (isActive() ? " is-active" : ""), text: label });
+    const c = facetRow.createEl("button", { cls: "stashpad-index-chip" + (isActive() ? " is-active" : ""), text: label });
     if (title) c.title = title;
     // 0.295.2 (perf): toggle the chip's own active class and repaint the rows
     // instead of re-rendering (which used to re-collect the whole vault).
@@ -355,7 +453,7 @@ export async function renderMasterIndex(
   chip("Home notes", () => state.includeHome, () => { state.includeHome = !state.includeHome; }, "Include each folder's home note");
 
   // 0.276.6: multi-select + bulk actions.
-  const selToggle = bar.createEl("button", { cls: "stashpad-index-chip" + (state.selectMode ? " is-active" : ""), text: state.selectMode ? "Done" : "Select" });
+  const selToggle = facetRow.createEl("button", { cls: "stashpad-index-chip" + (state.selectMode ? " is-active" : ""), text: state.selectMode ? "Done" : "Select" });
   selToggle.title = "Select multiple notes to act on them";
   // 0.295.2 (perf): select-mode only adds/removes the per-row checkbox, which
   // paintRows() draws from `state.selectMode` — no re-collect needed.
@@ -387,7 +485,8 @@ export async function renderMasterIndex(
     bulkBar.toggleClass("is-active", true);
     const n = state.selected.size;
     bulkBar.createSpan({ cls: "stashpad-index-bulkcount", text: n === 0 ? "Select notes…" : `${n} selected` });
-    const shown = rows.filter(matches);
+    const ctx = buildFilterCtx();
+    const shown = rows.filter((r) => matches(r, ctx));
     const allSel = shown.length > 0 && shown.every((r) => state.selected.has(r.file.path));
     const selAll = bulkBar.createEl("button", { cls: "stashpad-index-bulkbtn", text: allSel ? "Clear" : "Select all" });
     selAll.onclick = () => { if (allSel) state.selected.clear(); else for (const r of shown) state.selected.add(r.file.path); paintRows(); };
@@ -416,7 +515,40 @@ export async function renderMasterIndex(
     }, true);
   };
 
-  const matches = (r: IndexRow): boolean => {
+  // 0.314.0: the `in:` / `when:` filter chips insert their tokens into the
+  // SAME search box, and we parse them with the shared parseSearchQuery so the
+  // syntax matches the note-search modal exactly. `in:` walks a subtree (per
+  // folder), `before:`/`after:`/`on:` bound the note's last-modified date, and
+  // the leftover free text runs the usual sift. Parsing + the subtree walk are
+  // done ONCE per repaint (buildFilterCtx), not per row.
+  type FilterCtx = {
+    parsed: ReturnType<typeof parseSearchQuery>;
+    /** Ids inside an `in:` subtree, keyed by folder. null = no `in:` filter. */
+    inByFolder: Map<string, Set<string>> | null;
+  };
+  const buildFilterCtx = (): FilterCtx => {
+    const parsed = parseSearchQuery(state.query);
+    let inByFolder: Map<string, Set<string>> | null = null;
+    if (parsed.filters.in) {
+      const inTokens = parsed.filters.in.split(/\s+/).filter(Boolean);
+      const titleMatches = (title: string): boolean =>
+        inTokens.every((t) => title.toLowerCase().includes(t));
+      // Per-folder parent→children map (descendants never cross a folder).
+      const byFolder = new Map<string, IndexRow[]>();
+      for (const r of rows) { const b = byFolder.get(r.folder) ?? []; b.push(r); byFolder.set(r.folder, b); }
+      inByFolder = new Map();
+      for (const [folder, group] of byFolder) {
+        const childrenByParent = new Map<string, string[]>();
+        for (const r of group) { if (!r.parentId) continue; const l = childrenByParent.get(r.parentId) ?? []; l.push(r.id); childrenByParent.set(r.parentId, l); }
+        const set = new Set<string>();
+        inByFolder.set(folder, set);
+        const walk = (id: string): void => { if (set.has(id)) return; set.add(id); for (const c of childrenByParent.get(id) ?? []) walk(c); };
+        for (const r of group) if (titleMatches(r.title)) walk(r.id);
+      }
+    }
+    return { parsed, inByFolder };
+  };
+  const matches = (r: IndexRow, ctx: FilterCtx): boolean => {
     if (!state.includeHome && r.isHome) return false;
     if (state.folder !== "all" && r.folder !== state.folder) return false;
     if (state.author && r.authorName !== state.author) return false;
@@ -429,12 +561,25 @@ export async function renderMasterIndex(
     if (state.orphansOnly && !r.orphan) return false;
     if (state.brokenOnly && !r.hasBrokenLinks) return false;
     if (state.staleOnly && !(r.modified > 0 && Date.now() - r.modified > STALE_MS)) return false;
+    // `in:` subtree membership.
+    if (ctx.inByFolder) { const set = ctx.inByFolder.get(r.folder); if (!set || !set.has(r.id)) return false; }
+    // `when:` bounds the last-modified instant (fall back to created when a note
+    // has no modified). before = strictly earlier; after = strictly later; on =
+    // within the resolved day/second window.
+    const f = ctx.parsed.filters;
+    if (f.before != null || f.after != null || f.on != null) {
+      const when = r.modified > 0 ? r.modified : r.created;
+      if (!when) return false; // no timestamp at all can't satisfy a date bound
+      if (f.before != null && !(when < f.before)) return false;
+      if (f.after != null && !(when > f.after)) return false;
+      if (f.on != null && !(when >= f.on.start && when < f.on.end)) return false;
+    }
     // An OBSCURED note must not leak its title/tags through search: an
     // unrevealed one matches only on its folder (chrome, not content).
     const hay = r.obscured && !state.revealed.has(r.file.path)
       ? r.folder
       : `${r.title} ${r.folder} ${r.tags.join(" ")} ${r.authorName}`;
-    return siftMatch(state.query, hay);
+    return siftMatch(ctx.parsed.text.join(" "), hay);
   };
   const cmp = (a: IndexRow, b: IndexRow): number => {
     switch (state.sort) {
@@ -449,7 +594,8 @@ export async function renderMasterIndex(
    *  input keeps focus. 0.295.2 (perf): facet changes rebuild the bar too, but
    *  both paths now run over the same CACHED rows — no vault sweep either way. */
   const paintRows = (): void => {
-    const shown = rows.filter(matches).sort(cmp);
+    const ctx = buildFilterCtx();
+    const shown = rows.filter((r) => matches(r, ctx)).sort(cmp);
     countEl.setText(`${shown.length} of ${rows.length} note${rows.length === 1 ? "" : "s"}`);
     listEl.empty();
     for (const r of shown) {

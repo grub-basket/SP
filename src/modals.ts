@@ -85,7 +85,11 @@ const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
 interface LogEv { ts: string; type: string; id: string; payload?: any; author?: string; }
 
-export class LogModal extends Modal {
+/** 0.315.0: the Stashpad-log UI, host-agnostic. Extracted from LogModal so it
+ *  renders identically into a Modal's contentEl (LogModal, below) or a dedicated
+ *  ItemView's contentEl (StashpadLogView in log-view.ts) — the tab and the modal
+ *  share one implementation. */
+export class LogPanel {
   private events: LogEv[] = [];
   /** Currently-displayed slice of events (events filtered by typeFilter,
    *  if set). Pagination + render counts always go through this. */
@@ -98,12 +102,10 @@ export class LogModal extends Modal {
   private filterSelEl: HTMLSelectElement | null = null;
   private static PAGE = 100;
 
-  constructor(app: App, private text: string, private jsonlPath: string) { super(app); }
+  constructor(private app: App, private host: HTMLElement, private text: string, private jsonlPath: string) {}
 
-  onOpen(): void {
-    this.contentEl.empty();
-    this.titleEl.setText("Stashpad log");
-    this.modalEl.addClass("stashpad-log-modal");
+  mount(): void {
+    this.host.empty();
 
     this.events = [];
     for (const line of this.text.trim().split(/\r?\n/)) {
@@ -112,7 +114,7 @@ export class LogModal extends Modal {
     }
     this.events.reverse();
 
-    const toolbar = this.contentEl.createDiv({ cls: "stashpad-log-toolbar" });
+    const toolbar = this.host.createDiv({ cls: "stashpad-log-toolbar" });
     this.countEl = toolbar.createSpan({ cls: "stashpad-log-count" });
     this.updateCount();
 
@@ -146,10 +148,10 @@ export class LogModal extends Modal {
     const clearBtn = toolbar.createEl("button", { cls: "mod-warning", text: "Clear log" });
     clearBtn.onclick = () => this.clearLog();
 
-    this.listEl = this.contentEl.createDiv({ cls: "stashpad-log-list" });
+    this.listEl = this.host.createDiv({ cls: "stashpad-log-list" });
     this.refreshList();
 
-    this.footerEl = this.contentEl.createDiv({ cls: "stashpad-log-footer" });
+    this.footerEl = this.host.createDiv({ cls: "stashpad-log-footer" });
     this.renderFooter();
   }
 
@@ -170,7 +172,7 @@ export class LogModal extends Modal {
       this.updateCount();
       return;
     }
-    this.appendMore(LogModal.PAGE);
+    this.appendMore(LogPanel.PAGE);
   }
 
   private setTypeFilter(type: string | null): void {
@@ -233,10 +235,10 @@ export class LogModal extends Modal {
     const remaining = this.visible.length - this.shownCount;
     if (remaining <= 0) return;
     const moreBtn = this.footerEl.createEl("button", {
-      text: `Load ${Math.min(LogModal.PAGE, remaining)} more`,
+      text: `Load ${Math.min(LogPanel.PAGE, remaining)} more`,
     });
-    moreBtn.onclick = () => { this.appendMore(LogModal.PAGE); this.renderFooter(); };
-    if (remaining > LogModal.PAGE) {
+    moreBtn.onclick = () => { this.appendMore(LogPanel.PAGE); this.renderFooter(); };
+    if (remaining > LogPanel.PAGE) {
       const allBtn = this.footerEl.createEl("button", { text: `Load all (${remaining})` });
       allBtn.onclick = () => { this.appendMore(remaining); this.renderFooter(); };
     }
@@ -401,7 +403,18 @@ export class LogModal extends Modal {
       default: return JSON.stringify(p);
     }
   }
+}
 
+/** Thin Modal wrapper around LogPanel — kept so any caller that still wants the
+ *  log in a popup gets it, while the dedicated tab (StashpadLogView) mounts the
+ *  same LogPanel into an ItemView. */
+export class LogModal extends Modal {
+  constructor(app: App, private text: string, private jsonlPath: string) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText("Stashpad log");
+    this.modalEl.addClass("stashpad-log-modal"); // modal sizing lives on modalEl
+    new LogPanel(this.app, this.contentEl, this.text, this.jsonlPath).mount();
+  }
   onClose(): void { this.contentEl.empty(); }
 }
 
@@ -3538,7 +3551,11 @@ export class DueDatePickerModal extends Modal {
  *  new notifications appear without re-opening the modal. Mirrors
  *  LogModal's toolbar + filter + paginated list shape so the two
  *  feel cohesive. */
-export class NotificationHistoryModal extends Modal {
+/** 0.315.0: the notification-history UI, host-agnostic. Extracted from
+ *  NotificationHistoryModal so it renders identically into a Modal or the
+ *  dedicated StashpadNotificationsView tab. Owns the service subscription;
+ *  callers MUST call destroy() to unsubscribe. */
+export class NotificationHistoryPanel {
   private records: NotificationRecord[] = [];
   private visible: NotificationRecord[] = [];
   private shownCount = 0;
@@ -3561,7 +3578,8 @@ export class NotificationHistoryModal extends Modal {
   private authorSelEl: HTMLSelectElement | null = null;
 
   constructor(
-    app: App,
+    private app: App,
+    private host: HTMLElement,
     private service: NotificationService,
     private openLog?: (folder: string | undefined) => void,
     /** Local user's authorId. Used by the "Me" filter; if null, the
@@ -3575,19 +3593,14 @@ export class NotificationHistoryModal extends Modal {
      *  — those records pre-stamp `affectedAuthorIds` at the time of
      *  the action instead. */
     private getNoteAuthorIds?: (id: string) => string[],
-  ) {
-    super(app);
-  }
+  ) {}
 
-  onOpen(): void {
-    this.contentEl.empty();
-    this.titleEl.setText("Stashpad notification history");
-    this.modalEl.addClass("stashpad-log-modal"); // Reuse the existing log-modal sizing.
-    this.modalEl.addClass("stashpad-notif-history-modal");
+  mount(): void {
+    this.host.empty();
 
     this.records = this.service.recent();
 
-    const toolbar = this.contentEl.createDiv({ cls: "stashpad-log-toolbar" });
+    const toolbar = this.host.createDiv({ cls: "stashpad-log-toolbar" });
     this.countEl = toolbar.createSpan({ cls: "stashpad-log-count" });
     this.updateCount();
 
@@ -3630,9 +3643,9 @@ export class NotificationHistoryModal extends Modal {
       ).open();
     };
 
-    this.listEl = this.contentEl.createDiv({ cls: "stashpad-log-list" });
+    this.listEl = this.host.createDiv({ cls: "stashpad-log-list" });
     this.refreshList();
-    this.footerEl = this.contentEl.createDiv({ cls: "stashpad-log-footer" });
+    this.footerEl = this.host.createDiv({ cls: "stashpad-log-footer" });
     this.renderFooter();
 
     // Live-update: re-pull records on every service change.
@@ -3714,10 +3727,12 @@ export class NotificationHistoryModal extends Modal {
     return false;
   }
 
-  onClose(): void {
+  /** Unsubscribe from the service and clear the host. Both the modal wrapper
+   *  (onClose) and the ItemView (onClose) call this. */
+  destroy(): void {
     this.unsubscribe?.();
     this.unsubscribe = null;
-    this.contentEl.empty();
+    this.host.empty();
   }
 
   private setCategoryFilter(cat: NotificationCategory | null): void {
@@ -3765,7 +3780,7 @@ export class NotificationHistoryModal extends Modal {
       this.updateCount();
       return;
     }
-    this.appendMore(NotificationHistoryModal.PAGE);
+    this.appendMore(NotificationHistoryPanel.PAGE);
   }
 
   private appendMore(n: number): void {
@@ -3815,13 +3830,35 @@ export class NotificationHistoryModal extends Modal {
     this.footerEl.empty();
     const remaining = this.visible.length - this.shownCount;
     if (remaining <= 0) return;
-    const moreBtn = this.footerEl.createEl("button", { text: `Load ${Math.min(NotificationHistoryModal.PAGE, remaining)} more` });
-    moreBtn.onclick = () => { this.appendMore(NotificationHistoryModal.PAGE); this.renderFooter(); };
-    if (remaining > NotificationHistoryModal.PAGE) {
+    const moreBtn = this.footerEl.createEl("button", { text: `Load ${Math.min(NotificationHistoryPanel.PAGE, remaining)} more` });
+    moreBtn.onclick = () => { this.appendMore(NotificationHistoryPanel.PAGE); this.renderFooter(); };
+    if (remaining > NotificationHistoryPanel.PAGE) {
       const allBtn = this.footerEl.createEl("button", { text: `Load all (${remaining})` });
       allBtn.onclick = () => { this.appendMore(remaining); this.renderFooter(); };
     }
   }
+}
+
+/** Thin Modal wrapper around NotificationHistoryPanel — kept for any caller
+ *  that still wants the popup; the dedicated tab (StashpadNotificationsView)
+ *  mounts the same panel into an ItemView. */
+export class NotificationHistoryModal extends Modal {
+  private panel: NotificationHistoryPanel | null = null;
+  constructor(
+    app: App,
+    private service: NotificationService,
+    private openLog?: (folder: string | undefined) => void,
+    private currentAuthorId: string | null = null,
+    private getNoteAuthorIds?: (id: string) => string[],
+  ) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText("Stashpad notification history");
+    this.modalEl.addClass("stashpad-log-modal"); // reuse log-modal sizing
+    this.modalEl.addClass("stashpad-notif-history-modal");
+    this.panel = new NotificationHistoryPanel(this.app, this.contentEl, this.service, this.openLog, this.currentAuthorId, this.getNoteAuthorIds);
+    this.panel.mount();
+  }
+  onClose(): void { this.panel?.destroy(); this.panel = null; }
 }
 
 /** 0.79.3: read-only viewer for the import log. Lists imports newest-first

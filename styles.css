@@ -1411,7 +1411,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-focused.is-heading-row {
   overflow-anchor: none;
 }
-.stashpad-focused.is-heading-row.is-stuck {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) {
   overflow: hidden;
   border-bottom-color: var(--background-modifier-border-hover);
   align-items: center;
@@ -1437,19 +1437,19 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   font-size: var(--font-ui-small);
   line-height: 1.4;
 }
-.stashpad-focused.is-heading-row.is-stuck .stashpad-focused-body {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-focused-body {
   display: none;
 }
-.stashpad-focused.is-heading-row.is-stuck .stashpad-heading-stuck-line {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-heading-stuck-line {
   display: block;
 }
 /* The attachment rail and anything else the body brought with it go too — the
    collapsed heading is one line of text and nothing else. */
-.stashpad-focused.is-heading-row.is-stuck .stashpad-attachment-rail {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-attachment-rail {
   display: none;
 }
 /* Second lines, by definition — gone while collapsed. */
-.stashpad-focused.is-heading-row.is-stuck .stashpad-note-authorship {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-note-authorship {
   display: none;
 }
 /* The expand/collapse toggle too. While stuck the collapse is FORCED — the
@@ -1457,17 +1457,17 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    was visible and did nothing. A control that can't control anything is worse
    than no control; it comes back the moment you scroll to the top and the
    collapse is yours to choose again. */
-.stashpad-focused.is-heading-row.is-stuck .stashpad-expand-toggle {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-expand-toggle {
   display: none;
 }
 /* The timestamp stacks date over time; side by side while collapsed so the
    meta column is one line too and can't set the row's height on its own. */
-.stashpad-focused.is-heading-row.is-stuck .stashpad-focused-meta-top {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-focused-meta-top {
   flex-direction: row;
   align-items: center;
   gap: 6px;
 }
-.stashpad-focused.is-heading-row.is-stuck .stashpad-focused-time {
+.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-focused-time {
   white-space: nowrap;
 }
 .stashpad-focused-meta {
@@ -2407,11 +2407,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    areas. Scoped to NON-compact mobile (compact has its own dense layout). */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note.is-task {
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: 1fr auto auto auto auto;
   grid-template-areas:
-    "meta toggle quick more"
-    "body body   body  body"
-    "foot foot   foot  foot";
+    "meta toggle react quick more"
+    "body body   body  body  body"
+    "foot foot   foot  foot  foot";
   align-items: center;
   row-gap: 2px;
   column-gap: 8px;
@@ -2426,6 +2426,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle { grid-area: toggle; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-quick { grid-area: quick; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more { grid-area: more; }
+/* 0.316.4: the reaction button (.stashpad-note-react, added 0.287.0) never got a
+   grid-area, so under display:contents it auto-flowed into an implicit row and
+   dropped BELOW the body on long/multi-line notes instead of staying up top with
+   the toggle/quick/more buttons. Give it its own slot on the top row. */
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-react { grid-area: react; }
 /* 0.276.4: the FOCUSED heading-note header crammed its title (in
    .stashpad-focused-body) onto the same row as the timestamp + action buttons
    on mobile. Mirror the body-note layout: timestamp + buttons on top, the
@@ -2454,12 +2459,14 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    14px icon, which looked chunkier than the time). */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-quick,
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-react,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more {
   align-self: center;
   width: 22px;
   height: 22px;
 }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle .svg-icon,
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-react .svg-icon,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more .svg-icon {
   width: 15px;
   height: 15px;
@@ -3093,6 +3100,28 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
 }
+
+/* 0.315.3: Log + Notifications rendered as full tabs (StashpadLogView /
+   StashpadNotificationsView) share LogPanel / NotificationHistoryPanel with the
+   modals, but a tab is not an 860px modal box. Fill the tab's height (the list
+   grows instead of capping at 60vh) and give the content a generous, readable
+   measure centered in the tab rather than the modal's fixed narrow column. */
+.stashpad-activity-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  max-width: 1100px;
+  margin-inline: auto;
+}
+.stashpad-activity-view .stashpad-log-list {
+  max-height: none;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+/* The toolbar stays pinned at the top while the list scrolls under it. */
+.stashpad-activity-view .stashpad-log-toolbar { flex: 0 0 auto; }
+.stashpad-activity-view .stashpad-log-footer { flex: 0 0 auto; }
 .stashpad-log-row {
   display: grid;
   /* Type column is auto so the widest label (e.g. PALETTE_COLOR_REMOVE)
@@ -4799,6 +4828,19 @@ input[type="date"].stashpad-due-date, input[type="time"].stashpad-due-time {
 .stashpad-notice-overlay .svg-icon {
   width: 14px;
   height: 14px;
+}
+/* 0.313.4: on mobile the toast is narrow and the wrapping text ran UNDER the
+   absolutely-positioned corner Snooze. Drop the absolute placement there and
+   make Snooze a full-width button BELOW the message — no overlap, bigger tap
+   target. (Desktop keeps the compact corner pill.) */
+body.is-mobile .stashpad-notice.has-overlay { padding-right: 0; }
+body.is-mobile .stashpad-notice-overlay {
+  position: static;
+  margin-top: 10px;
+  width: 100%;
+  justify-content: center;
+  padding: 9px;
+  font-size: var(--font-ui-small);
 }
 
 /* Notification history modal — extends the existing log-modal layout
@@ -8894,6 +8936,20 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   color: var(--text-on-accent); background: var(--interactive-accent);
   border-color: var(--interactive-accent);
 }
+/* 0.314.0: All-notes `in:` / `when:` filter row + the facet-chip row, each on
+   its own line below the search bar. The filter row reuses the search-modal
+   chip classes but drops that context's full-bleed band styling. */
+.stashpad-index-filter-row.stashpad-search-filter-row {
+  padding: 0; border-bottom: none; background: transparent;
+}
+.stashpad-index-facets {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+}
+.stashpad-index-when.stashpad-when-builder {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px; background: var(--background-secondary);
+}
+.stashpad-when-lbl { flex: 0 0 auto; font-size: var(--font-ui-smaller); color: var(--text-muted); }
 .stashpad-index-count { font-size: var(--font-ui-smaller); color: var(--text-faint); }
 .stashpad-index-list { display: flex; flex-direction: column; min-height: 0; }
 .stashpad-index-row {
@@ -9266,13 +9322,16 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 1px 7px;
+  /* 0.316.4: no vertical padding + tighter line-height so the chip hugs the
+     emoji/count and matches the height of the neighbouring action buttons
+     instead of sitting taller with dead space above/below. */
+  padding: 0 7px;
   border-radius: 11px;
   border: 1px solid var(--background-modifier-border);
   background: var(--background-primary);
   color: var(--text-normal);
   font-size: var(--font-ui-smaller);
-  line-height: 1.4;
+  line-height: 1.25;
   cursor: pointer;
   transition: background 0.08s ease, border-color 0.08s ease;
 }
@@ -9351,8 +9410,18 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   border: 1px solid var(--background-modifier-border);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
 }
-.stashpad-reaction-picker { flex-direction: column; align-items: stretch; gap: 6px; }
-.stashpad-reaction-pickgrid { display: flex; flex-wrap: wrap; gap: 2px; max-width: 260px; }
+/* 0.316.1: min-width so the search placeholder isn't clipped now that the preset
+   row is only 5 wide (the column otherwise shrank to the presets' width). */
+.stashpad-reaction-picker { flex-direction: column; align-items: stretch; gap: 6px; min-width: 240px; }
+/* 0.316.2: spread the presets across the popover width so there's no dead
+   space after the last one (the min-width made the row wider than the buttons). */
+.stashpad-reaction-pickgrid { display: flex; flex-wrap: wrap; gap: 2px; max-width: 260px; justify-content: space-between; }
+
+/* 0.316.3 (R1): a freshly opened/switched folder's list stays invisible (layout
+   intact, so scrollHeight is measurable and the pin can land) until the first
+   settled bottom-pin reveals it — avoids the empty→partial→full paints flashing
+   in at three scroll positions. Always lifted by revealSettlingList(). */
+.stashpad-list.is-settling { opacity: 0; }
 .stashpad-reaction-input {
   width: 100%;
   box-sizing: border-box;
@@ -9363,6 +9432,47 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   color: var(--text-normal);
   font-size: var(--font-ui-smaller);
 }
+/* 0.316.0: live emoji search results grid. */
+.stashpad-reaction-results {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  max-width: 260px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.stashpad-reaction-results.is-empty { display: none; }
+.stashpad-reaction-result {
+  border: none;
+  background: transparent;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 5px;
+  border-radius: 7px;
+  cursor: pointer;
+  transition: background 0.06s ease, transform 0.06s ease;
+}
+.stashpad-reaction-result:hover { background: var(--background-modifier-hover); transform: scale(1.15); }
+.stashpad-reaction-result.is-mine { background: var(--background-modifier-hover); box-shadow: 0 0 0 1px var(--interactive-accent) inset; }
+
+/* 0.316.0: mobile reaction picker as a full modal. Presets big and tappable, a
+   full-width search field, and the results grid grows to fill the sheet so the
+   soft keyboard opens BELOW the field instead of lifting a floating popover. */
+.stashpad-reaction-modal .stashpad-reaction-pickgrid {
+  max-width: none;
+  gap: 6px;
+  justify-content: center;
+  margin-bottom: 4px;
+}
+.stashpad-reaction-modal .stashpad-reaction-pick { font-size: 30px; padding: 8px 10px; }
+.stashpad-reaction-modal .stashpad-reaction-input { font-size: var(--font-ui-medium); padding: 8px 12px; margin: 8px 0; }
+.stashpad-reaction-modal .stashpad-reaction-results {
+  max-width: none;
+  max-height: none;
+  justify-content: flex-start;
+  gap: 4px;
+}
+.stashpad-reaction-modal .stashpad-reaction-result { font-size: 28px; padding: 6px 8px; }
 
 /* ============================================================
    Quoted replies (teams, 0.281.0)

@@ -69,7 +69,6 @@ export class StashpadPanelsView extends ItemView {
     const s = state as { singlePanel?: PanelId; activePanel?: PanelId } | null;
     if (s && typeof s.singlePanel === "string") this.singlePanel = s.singlePanel;
     if (s && typeof s.activePanel === "string") this.activePanel = s.activePanel;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (super.setState as (st: unknown, r: unknown) => Promise<void>)(state, result);
     if (this.containerEl.isConnected) this.render();
   }
@@ -542,18 +541,13 @@ export class StashpadPanelsView extends ItemView {
     }
   }
 
-  /** 0.71.25: Log button → open the plugin-wide log.jsonl in LogModal.
-   *  Folder-independent (log captures actions across every Stashpad). */
-  private async openLogFromPanel(): Promise<void> {
-    const adapter = this.app.vault.adapter;
-    const path = this.plugin.pluginPrivatePath("log.jsonl");
-    if (!(await adapter.exists(path))) {
-      new Notice("No log yet — make some changes first.");
-      return;
-    }
-    const data = await adapter.read(path);
-    const { LogModal } = await import("./modals");
-    new LogModal(this.app, data, path).open();
+  /** 0.71.25: Log button → open the plugin-wide log.
+   *  0.315.0: opens the dedicated log tab (StashpadLogView) via the existing
+   *  command, so the wiring lives in one place and matches the notifications
+   *  button below. Folder-independent (log captures actions across every
+   *  Stashpad). */
+  private openLogFromPanel(): void {
+    (this.app as any).commands?.executeCommandById?.("stashpad:stashpad-open-log");
   }
 
   /** 0.71.25: Notifications button → open the in-memory notification

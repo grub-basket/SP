@@ -17,6 +17,11 @@ export const STASHPAD_TRASH_VIEW_TYPE = "stashpad-trash";
  *  "encrypted" (all locked subtrees) and "archived" (all archive folders). The
  *  "deleted" aggregate is the existing trash view. Read-only: list + navigate. */
 export const STASHPAD_AGGREGATE_VIEW_TYPE = "stashpad-aggregate";
+/** 0.315.0: the per-folder action log and the notification history, promoted
+ *  from modals to dedicated tabs so they're reachable from the launcher and can
+ *  sit alongside the other views. */
+export const STASHPAD_LOG_VIEW_TYPE = "stashpad-log";
+export const STASHPAD_NOTIFICATIONS_VIEW_TYPE = "stashpad-notifications";
 export const ROOT_ID = "__root__";
 
 /** A user's pinned-note record. Cross-folder by design — the panel

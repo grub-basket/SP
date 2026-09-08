@@ -489,6 +489,22 @@ export class StashpadView extends ItemView {
    *  it. Without this the loop keeps a reference to the (detached) list element
    *  for up to 30s after the view closes. */
   private pinWatchdogRaf: number | null = null;
+  /** 0.313.6: monotonically bumped on every scrollListToBottom. The mobile
+   *  settle loop captures its value and bails once a NEWER pin supersedes it —
+   *  otherwise each render during a folder open (empty → partial → full), and
+   *  each rapid folder tap, spawned its own settle chain and they fought,
+   *  producing the flicker + landing a couple rows short (a stale loop pinning
+   *  an old, shorter scrollHeight, or scrolling a now-detached list). */
+  private scrollPinToken = 0;
+  /** 0.316.3 (R1): while true, a freshly opened / switched folder's list is
+   *  rendered HIDDEN (opacity 0, layout intact so scrollHeight is measurable)
+   *  until the first settled bottom-pin — so the empty→partial→full progressive
+   *  paints don't flash into view at three different scroll positions (the
+   *  visible triple-flicker). Mobile only. Cleared exclusively by
+   *  revealSettlingList() — on settle OR a hard safety timeout — so the list can
+   *  never get stuck invisible. */
+  private hideListUntilSettled = false;
+  private settleRevealTimer: number | null = null;
   /** 0.219.4: an on-disk note count the reconcile has already PROVEN it cannot
    *  resolve — a rebuild at this count changed nothing, so retrying only costs a
    *  full list rebuild + re-render. Cleared implicitly by the count changing
@@ -567,6 +583,11 @@ export class StashpadView extends ItemView {
    *  (lazy-loaded) on reload. 0.91.0. */
   private lastSelectionByFocus = new Map<StashpadId, StashpadId[]>();
   private expandedNotes = new Set<StashpadId>();
+  /** 0.313.5: focused-note HEADINGS the user has expanded. The header is always
+   *  collapsed to one plain line BY DEFAULT (independent of expandBodiesByDefault
+   *  and the row expand state) — membership here = expanded to the full body.
+   *  Per-session, keyed by note id. */
+  private headingExpanded = new Set<StashpadId>();
   /** 0.118.10: ids the user has MANUALLY collapsed while their row was
    *  auto-expanded by the cursor (autoExpandCursorRow). Suppresses the transient
    *  `.is-cursor-expanded` so an explicit collapse sticks; cleared when the
@@ -1177,23 +1198,16 @@ export class StashpadView extends ItemView {
     // jumps mid-session.
     // 0.56.14: initial policy is scroll-to-id when we have a saved last
     // cursor for this focus; otherwise pin-bottom (fresh mount, no memory).
+    // 0.313.3: a fresh mount — folder open, folder switch, or app-startup tab
+    // restore — always lands at the BOTTOM (newest notes), matching the
+    // chat-style model. The old behaviour restored a saved scroll position,
+    // which left any folder you'd browsed sitting mid-list on the next open.
+    // The saved cursor is still restored for keyboard selection, but it no
+    // longer drives the initial scroll.
     const savedCursorId = this.lastCursorByFocus.get(this.focusId);
-    let initialPolicy: ScrollPolicy;
-    if (savedCursorId && this.tree.get(savedCursorId)) {
-      // 0.56.16: align "start" (not "center"). captureScrollAnchor returns
-      // the TOPMOST visible row, so if we centered the saved id, the
-      // anchor returned on next save would be some row ABOVE it — and
-      // each reload would drift upward. Aligning to "start" puts the
-      // saved row at the top of the viewport, where captureScrollAnchor
-      // re-picks the same row. Stable across reloads.
-      initialPolicy = { kind: "scroll-to-id", id: savedCursorId, align: "start" };
-      // Also restore cursor + selection to that note so the user picks
-      // up exactly where they left off.
-      this.pendingFocusIds = [savedCursorId];
-    } else {
-      this.scrollToBottomOnNextRender = true;
-      initialPolicy = { kind: "pin-bottom", until: "next-user-input" };
-    }
+    if (savedCursorId && this.tree.get(savedCursorId)) this.pendingFocusIds = [savedCursorId];
+    this.scrollToBottomOnNextRender = true;
+    const initialPolicy: ScrollPolicy = { kind: "pin-bottom", until: "next-user-input" };
     // 0.91.0: restore a persisted multi-selection (app reload / workspace
     // restore). Obsidian may call onOpen BEFORE setState, in which case
     // restoredSelectionIds isn't populated yet and this no-ops — setState's
@@ -1203,6 +1217,7 @@ export class StashpadView extends ItemView {
     if (restoredSel) this.pendingFocusIds = restoredSel;
     // 0.219.2: deferred by a tick — see initialRenderTimer. setState cancels it
     // when it is about to render the real folder itself.
+    this.armListSettleHide();
     this.initialRenderTimer = window.setTimeout(() => {
       this.initialRenderTimer = null;
       if (!this.viewRoot?.isConnected) return;
@@ -1863,14 +1878,13 @@ export class StashpadView extends ItemView {
         // Sheet versions: re-hydrate active versions for the new folder.
         this.activeVersionByGroup = this.plugin.loadActiveVersions(this.noteFolder);
       } catch { /* ignore */ }
+      // 0.313.3: always land at the bottom (newest) on this mount too — this is
+      // the path Obsidian runs on app reload / tab restore, so "load on start"
+      // now lands at the bottom instead of a restored mid-list position. Cursor
+      // still restored for keyboard selection, but not for the scroll.
       const savedCursorId = this.lastCursorByFocus.get(this.focusId);
-      let policy: ScrollPolicy;
-      if (savedCursorId && this.tree.get(savedCursorId)) {
-        this.pendingFocusIds = [savedCursorId];
-        policy = { kind: "scroll-to-id", id: savedCursorId, align: "start" };
-      } else {
-        policy = { kind: "pin-bottom", until: "next-user-input" };
-      }
+      if (savedCursorId && this.tree.get(savedCursorId)) this.pendingFocusIds = [savedCursorId];
+      const policy: ScrollPolicy = { kind: "pin-bottom", until: "next-user-input" };
       // 0.91.0: fold in a persisted multi-selection (overrides the single-id
       // cursor restore above). This is the path that actually runs on a normal
       // app reload, since Obsidian calls setState after onOpen.
@@ -2048,6 +2062,8 @@ export class StashpadView extends ItemView {
     // is a different path — scrollByFocus memory — so this doesn't force bottom
     // where a saved position should win.)
     this.scrollToBottomOnNextRender = true;
+    this.plugin.trace("r1:switch", { via: "folder-override", folder: this.noteFolder, notes: this.currentChildren.length, mobile: Platform.isMobile });
+    this.armListSettleHide();
     this.render({ kind: "pin-bottom", until: "next-user-input" });
   }
 
@@ -2060,8 +2076,32 @@ export class StashpadView extends ItemView {
    *  the same "lands at the newest note" behaviour the user expects. */
   pinToBottomNow(): void {
     if (!this.viewRoot?.isConnected) return;
+    this.plugin.trace("r1:pinNow", { folder: this.noteFolder, notes: this.currentChildren.length, mobile: Platform.isMobile });
     this.scrollToBottomOnNextRender = true;
+    this.armListSettleHide();
     this.render({ kind: "pin-bottom", until: "next-user-input" });
+  }
+
+  /** 0.316.3 (R1): hide the list until the first settled bottom-pin, so a fresh
+   *  open/switch's empty→partial→full paints don't flicker in at three scroll
+   *  positions. Mobile only; a hard timeout guarantees the list is revealed even
+   *  if no settle ever fires. Call BEFORE render() so the new list is created
+   *  already hidden. */
+  private armListSettleHide(): void {
+    if (!Platform.isMobile) return;
+    this.hideListUntilSettled = true;
+    if (this.settleRevealTimer != null) window.clearTimeout(this.settleRevealTimer);
+    // 1.2s: longer than a normal settle-with-growth (~0.5-1s of late row
+    // measurement) so it doesn't reveal above the bottom, but still a hard
+    // backstop so the list can never stay hidden.
+    this.settleRevealTimer = window.setTimeout(() => this.revealSettlingList(), 1200);
+  }
+  /** Clear the settle-hide and reveal the current list. Idempotent; the only way
+   *  the hide is ever lifted. */
+  private revealSettlingList(): void {
+    this.hideListUntilSettled = false;
+    if (this.settleRevealTimer != null) { window.clearTimeout(this.settleRevealTimer); this.settleRevealTimer = null; }
+    this.listEl?.removeClass("is-settling");
   }
 
   /** 0.65.0: delegate to the plugin's unified folder picker. The old
@@ -3850,6 +3890,10 @@ export class StashpadView extends ItemView {
 
     const list = chrome.createDiv({ cls: "stashpad-list" });
     this.listEl = list;
+    // 0.316.3 (R1): keep a fresh open/switch's list hidden across its
+    // empty→partial→full paints; revealSettlingList() (settle or safety timeout)
+    // lifts it. Re-applied here because every full render makes a NEW list el.
+    if (this.hideListUntilSettled) list.addClass("is-settling");
     // 0.296.0 (perf): row click / dblclick / grab-arm listeners, delegated to
     // the list. Attached HERE (list creation) rather than in populateListBody,
     // which also runs on the reuse path (`listEl.empty()` + repopulate) — empty()
@@ -3959,14 +4003,27 @@ export class StashpadView extends ItemView {
           // the anchor row's offset and the view jitters.
           if (legacyPinBottom) {
             this.scrollListToBottom();
-          } else if (prevAtBottom) {
+          } else if (prevAtBottom || this.stickToListBottom) {
             // 0.59.6: use scrollListToBottom (with its multi-frame
             // settle watchdog) instead of a one-shot scrollTop set.
             // The async markdown re-render of the just-mutated row
             // shifts the row height a few hundred ms later; the
             // watchdog keeps re-pinning until layout stabilises.
+            //
+            // 0.316.7 (R1): ALSO re-pin when stickToListBottom holds even if
+            // prevAtBottom is false. The reconcile pass fires a PRESERVE render
+            // ~1.5s after a folder switch that renders the real (much taller)
+            // note bodies — growing scrollHeight by thousands of px. By then the
+            // scroll had drifted a little so prevAtBottom read false, and this
+            // branch anchor-restored mid-list, stranding the view ~10k px above
+            // the bottom (the trace's late `render id13` growing 26078→34646
+            // with scrollTop frozen). stickToListBottom means the view is still
+            // in "pinned to bottom" intent (no genuine user scroll cleared it),
+            // so re-pin to the new bottom instead of anchoring mid-list.
+            this.plugin.trace("r1:preserve", { branch: "repin", prevAtBottom, stick: this.stickToListBottom });
             this.scrollListToBottom();
           } else {
+            this.plugin.trace("r1:preserve", { branch: "anchor", prevAtBottom, stick: this.stickToListBottom, prevScroll: Math.round(prevScroll) });
             this.restoreScrollAnchor(anchor, prevScroll);
           }
           break;
@@ -4049,16 +4106,34 @@ export class StashpadView extends ItemView {
       }
     } else if (this.scrollToBottomOnNextRender) {
       this.scrollToBottomOnNextRender = false;
+      this.plugin.trace("r1:legacy", { branch: "flag", stick: this.stickToListBottom });
       this.scrollListToBottom();
-    } else if (this.listEl && prevAtBottom) {
+    } else if (this.listEl && (prevAtBottom || this.stickToListBottom)) {
       // Was at bottom — re-pin to the *new* bottom and arm the
       // scrollHeight watchdog scrollListToBottom uses (0.293.0: was a
       // per-row ResizeObserver), so async markdown / font / image
       // growth keeps pinning. Covers the
       // cold-cache reload case where a second render fires while
       // markdown is still parsing.
+      //
+      // 0.315.1 (R1 mix fix): also re-pin when `stickToListBottom` is set even
+      // if `prevAtBottom` reads false. After a folder switch (folder panel then
+      // switcher, or vice-versa) an async re-render — tree rebuild / frontmatter
+      // sync finishing — can fire while the settle loop is still climbing to the
+      // new bottom, so prevScroll is mid-list and prevAtBottom is false. Falling
+      // through to the prevScroll branch below then RESTORED that midway scroll,
+      // fighting the pin and leaving the list a few notes short (the reported
+      // flicker). stickToListBottom means "the last intent was pin-to-bottom and
+      // the user hasn't scrolled away", so honour it and re-pin.
+      this.plugin.trace("r1:legacy", { branch: "atBottom", stick: this.stickToListBottom, prevAtBottom });
       this.scrollListToBottom();
     } else if (this.listEl && prevScroll > 0) {
+      // 0.315.1 trace: a policy-less render restoring the PREVIOUS scrollTop is
+      // the suspected "midway" culprit when a folder switch is followed by an
+      // async re-render (tree rebuild / frontmatter sync) that carries no pin
+      // policy — if stickToListBottom is still set, restoring prevScroll fights
+      // the pin.
+      this.plugin.trace("r1:legacy", { branch: "prevScroll", prevScroll: Math.round(prevScroll), stick: this.stickToListBottom, prevAtBottom });
       this.listEl.scrollTop = prevScroll;
     }
 
@@ -6671,6 +6746,9 @@ export class StashpadView extends ItemView {
     }
     if (opts.asRow) {
       wrap.addClass("is-heading-row");
+      // 0.313.5: the header is collapsed to one plain line by default; only the
+      // ids the user expanded show the full body.
+      if (!this.headingExpanded.has(node.id)) wrap.addClass("is-heading-collapsed");
       if (this.cursorOnHeading) wrap.addClass("is-cursor");
       if (this.selection.has(node.id)) wrap.addClass("is-selected");
       wrap.dataset.headingId = node.id;
@@ -6746,6 +6824,17 @@ export class StashpadView extends ItemView {
       exitBtn.title = "Exit this note (back to parent)";
       exitBtn.setAttr("aria-label", "Exit focused note, back to parent");
       exitBtn.onclick = (e) => { e.stopPropagation(); this.navigateUp(); };
+    }
+    // 0.313.5: expand / collapse the header between its one-line preview and the
+    // full body. Collapsed by default; also toggled by Alt+E (cmdToggleExpand on
+    // the heading). Only meaningful as a row (the drilled-in header).
+    if (opts.asRow) {
+      const expanded = this.headingExpanded.has(node.id);
+      const toggleBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-heading-toggle" });
+      setIcon(toggleBtn, expanded ? "chevron-up" : "chevron-down");
+      toggleBtn.title = expanded ? "Collapse the header" : "Expand the header";
+      toggleBtn.setAttr("aria-label", expanded ? "Collapse header" : "Expand header");
+      toggleBtn.onclick = (e) => { e.stopPropagation(); this.toggleHeadingExpanded(node.id); };
     }
     let toggleAnchor: HTMLElement;
     if (Platform.isMobile) {
@@ -10506,8 +10595,20 @@ export class StashpadView extends ItemView {
     const node = this.tree.get(id);
     const scope = this.listEl ?? this.containerEl;
     if (!node || !scope) return;
+    // 0.316.5 trace: reacting must NOT move the scroll. Capture scrollTop right
+    // before the chip swap and again after layout settles — if they differ, the
+    // added/removed chip row changed a row's height and the browser reflowed the
+    // viewport (a scroll-anchoring issue), not a render call.
+    const list = this.listEl;
+    const before = list ? { top: Math.round(list.scrollTop), h: list.scrollHeight, gap: Math.round(list.scrollHeight - list.scrollTop - list.clientHeight) } : null;
     scope.querySelectorAll<HTMLElement>(`.stashpad-reaction-row[data-id="${CSS.escape(id)}"]`)
       .forEach((h) => renderReactionChips(this, h, node, override));
+    if (this.plugin.settings.debugTrace && list && before) {
+      requestAnimationFrame(() => {
+        const after = { top: Math.round(list.scrollTop), h: list.scrollHeight, gap: Math.round(list.scrollHeight - list.scrollTop - list.clientHeight) };
+        this.plugin.trace("r1:react", { id, before, after, moved: before.top !== after.top });
+      });
+    }
   }
 
   /** 0.280.0 (teams): best-effort display name for a reaction author id. Resolves
@@ -13084,10 +13185,21 @@ export class StashpadView extends ItemView {
    *  a mixed selection collapses to a single "expand" gesture). Then a
    *  full re-render picks up the new clamp state. */
   cmdToggleExpand(): void {
+    // 0.313.5: when the cursor is on the drilled-in HEADING, Alt+E toggles the
+    // header's collapse (one line ↔ full body) rather than a list row's body.
+    const headingNode = this.headingNode();
+    if (this.cursorOnHeading && headingNode) { this.toggleHeadingExpanded(headingNode.id); return; }
     const targets = this.getActionTargets();
     if (!targets.length) return;
     const anyCollapsed = targets.some((t) => !this.isNoteExpanded(t.id));
     for (const t of targets) this.setNoteExpanded(t.id, anyCollapsed);
+    this.render();
+  }
+
+  /** 0.313.5: flip a focused header between its one-line preview and full body. */
+  private toggleHeadingExpanded(id: StashpadId): void {
+    if (this.headingExpanded.has(id)) this.headingExpanded.delete(id);
+    else this.headingExpanded.add(id);
     this.render();
   }
 
@@ -18861,8 +18973,19 @@ export class StashpadView extends ItemView {
   private scrollListToBottom(): void {
     const list = this.listEl;
     if (!list) return;
+    // R1 flicker fix (0.313.6): each render during a folder open (empty→partial→full)
+    // and each rapid folder tap can spawn its own mobile settle loop with no
+    // cancellation, so stale loops fight the newest one (some on detached lists,
+    // scrollH:0) and land the list short of the bottom. Token the newest pin and
+    // let every settle loop bail the moment a newer pin supersedes it.
+    const token = ++this.scrollPinToken;
     this.stickToListBottom = true;
     list.scrollTop = list.scrollHeight;
+    this.plugin.trace("r1:scroll", {
+      folder: this.noteFolder, mobile: Platform.isMobile, virt: !!this.virt,
+      scrollH: list.scrollHeight, clientH: list.clientHeight,
+      gap: Math.round(list.scrollHeight - list.scrollTop - list.clientHeight),
+    });
 
     // 0.76.37: on mobile, skip the continuous re-pin entirely. The soft
     // keyboard animating in/out, visualViewport resizes, and late
@@ -18872,14 +18995,53 @@ export class StashpadView extends ItemView {
     // up/down bounce. Instead do a few discrete, transition-aware
     // settle scrolls and then leave the list alone.
     if (Platform.isMobile) {
+      // 0.315.4: STOP as soon as we're stably at the bottom, instead of always
+      // running 8 fixed ticks. The trace showed the old loop firing all 8
+      // ~120ms ticks with an IDENTICAL scrollTop/scrollH every time — gap was
+      // already 0 at tick 1, so the remaining ~1s was pure re-pinning overhead.
+      // That idle second is exactly the window where a late virtualization
+      // repaint (or a stray touch) got yanked back to the bottom, producing the
+      // "random" mid-scroll flicker. Now: keep pinning only while the height is
+      // still CHANGING (late markdown/image/virt growth) or we're not yet at the
+      // bottom; the moment we land at the bottom AND scrollHeight has stopped
+      // changing (and no keyboard transition is in flight), we're settled — stop
+      // scheduling. A higher cap (16) covers genuinely slow growth without the
+      // fixed idle tail.
       let tries = 0;
+      let lastH = -1;
+      let stableStreak = 0;
       const settle = (): void => {
-        if (!this.stickToListBottom || tries >= 8) return;
-        tries++;
-        // Don't fight the keyboard while it's animating — just wait it out.
-        if (Date.now() >= this.keyboardTransitionUntil) {
-          list.scrollTop = list.scrollHeight;
+        if (this.scrollPinToken !== token || !list.isConnected || !this.stickToListBottom || tries >= 16) {
+          // Bailing for any reason (superseded, detached, user scrolled, cap) —
+          // never leave the list stuck hidden.
+          this.revealSettlingList();
+          return;
         }
+        tries++;
+        const kbd = Date.now() < this.keyboardTransitionUntil;
+        // Don't fight the keyboard while it's animating — just wait it out.
+        if (!kbd) list.scrollTop = list.scrollHeight;
+        const h = list.scrollHeight;
+        const gap = h - list.scrollTop - list.clientHeight;
+        this.plugin.trace("r1:settle", {
+          tries, kbd, virt: !!this.virt,
+          scrollTop: Math.round(list.scrollTop), scrollH: h, clientH: list.clientHeight,
+          gap: Math.round(gap),
+          lastIdx: (list.querySelector(".stashpad-note:last-of-type") as HTMLElement | null)?.dataset.idx ?? null,
+        });
+        const atBottom = Math.abs(gap) <= 2;
+        // 0.316.6 (R1): require the height to hold steady for a couple of ticks
+        // before declaring "settled", and keep re-pinning to the growing bottom
+        // until then. The single-tick check (0.315.4) revealed too early: bodies
+        // finish measuring AFTER the first stable tick, scrollHeight grows
+        // ~1000px, and the list — already revealed — was left sitting above the
+        // new bottom (the "doesn't start from the very bottom" on virtualized
+        // folders). The re-pins during growth are invisible because the list is
+        // still hidden (hideListUntilSettled) until revealSettlingList() fires
+        // here, so this fixes the landing WITHOUT any visible bounce.
+        stableStreak = h === lastH ? stableStreak + 1 : 0;
+        lastH = h;
+        if (!kbd && atBottom && stableStreak >= 2) { this.revealSettlingList(); return; }
         window.setTimeout(settle, 120);
       };
       window.setTimeout(settle, 60);

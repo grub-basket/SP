@@ -908,6 +908,7 @@ export class StashpadFolderPanelView extends ItemView {
    *  (Routes through openFolderInStashpad so DEFERRED tabs count as existing —
    *  the local live-view-only check spawned duplicates for backgrounded tabs.) */
   private jumpToFolder(folder: string): void {
+    this.plugin.trace("r1:tap", { via: "folder-panel", folder });
     void this.plugin.openFolderInStashpad(folder);
   }
 

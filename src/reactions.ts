@@ -1,4 +1,4 @@
-import { TFile } from "obsidian";
+import { Modal, Platform, TFile } from "obsidian";
 import type { TreeNode } from "./types";
 import type { StashpadView } from "./view";
 import { EMOJI_SHORTCODES } from "./emoji-shortcodes";
@@ -8,9 +8,12 @@ import { EMOJI_SHORTCODES } from "./emoji-shortcodes";
  *  the people who reacted with it. Toggling adds/removes the current user's id.
  *  Reserved frontmatter (see RESERVED_FRONTMATTER) so clones don't inherit them. */
 
-/** The quick-pick set shown in the reaction popover. */
+/** 0.316.0: the quick-pick presets shown at the top of the reaction picker.
+ *  0.316.3: eight — happy / sad / tada / angry / surprised / looking / thumbs-up /
+ *  green-check — to fill the popover width. Everything else is reachable through
+ *  the live search below them. */
 export const QUICK_REACTIONS: readonly string[] = [
-  "👍", "❤️", "🎉", "😂", "😮", "😢", "🙏", "👀", "✅", "🔥", "💯", "🚀",
+  "😄", "😢", "🎉", "😠", "😮", "👀", "👍", "✅",
 ];
 
 export type ReactionMap = Record<string, string[]>;
@@ -161,46 +164,117 @@ function reactionTooltip(view: StashpadView, ids: string[], me: string): string 
   return names.join(", ");
 }
 
-/** Quick-pick popover anchored to `anchor`: the common emojis, plus a text field
- *  that takes ANY emoji (typed, pasted, or a :shortcode: via the shared map). */
-export function openReactionPicker(view: StashpadView, node: TreeNode, anchor: HTMLElement): void {
-  const doc = anchor.ownerDocument;
-  doc.querySelector(".stashpad-reaction-picker")?.remove();
-  const map = readReactions(view.app.metadataCache.getFileCache(node.file!)?.frontmatter as Record<string, unknown>);
-  const me = myReactionId(view);
-  const pop = doc.body.createDiv({ cls: "stashpad-reaction-picker" });
-  const grid = pop.createDiv({ cls: "stashpad-reaction-pickgrid" });
-  for (const emoji of QUICK_REACTIONS) {
-    const mine = (map[emoji] ?? []).includes(me);
-    const b = grid.createEl("button", { cls: "stashpad-reaction-pick" + (mine ? " is-mine" : ""), text: emoji });
-    b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); void toggleReaction(view, node, emoji); dismiss(); };
+/** Name -> emoji, flattened once for search. Names are the GitHub/Slack
+ *  shortcodes in EMOJI_SHORTCODES. */
+interface EmojiEntry { name: string; emoji: string; }
+const EMOJI_INDEX: readonly EmojiEntry[] =
+  Object.entries(EMOJI_SHORTCODES).map(([name, emoji]) => ({ name, emoji }));
+
+/** Live-search the emoji index by NAME. Colons are optional: `:cat:`, `cat:`
+ *  and `cat` all search "cat", and a partial like "ca" matches cat/cake/…
+ *  Ranked exact > prefix > substring, de-duped by glyph (so thumbsup/+1 don't
+ *  both show), capped so the grid stays light. 0.316.0. */
+function searchEmoji(query: string, limit = 48): EmojiEntry[] {
+  const q = query.trim().replace(/^:+|:+$/g, "").toLowerCase();
+  if (!q) return [];
+  const exact: EmojiEntry[] = [], prefix: EmojiEntry[] = [], sub: EmojiEntry[] = [];
+  for (const e of EMOJI_INDEX) {
+    if (e.name === q) exact.push(e);
+    else if (e.name.startsWith(q)) prefix.push(e);
+    else if (e.name.includes(q)) sub.push(e);
   }
-  // Arbitrary emoji: type/paste one (or a :shortcode:) and press Enter.
-  const input = pop.createEl("input", { cls: "stashpad-reaction-input", attr: { type: "text", placeholder: "any emoji or :name:" } });
-  const commit = (): void => {
-    const chosen = normalizeEmojiInput(input.value);
-    if (chosen) { void toggleReaction(view, node, chosen); dismiss(); }
-  };
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } });
-  positionPopover(pop, anchor);
-  const dismiss = installDismiss(pop, anchor, "stashpad-reaction-picker");
-  setTimeout(() => input.focus(), 0);
+  const out: EmojiEntry[] = [];
+  const seen = new Set<string>();
+  for (const e of [...exact, ...prefix, ...sub]) {
+    if (seen.has(e.emoji)) continue;
+    seen.add(e.emoji);
+    out.push(e);
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
-/** Turn a picker input value into a single emoji: a pasted/typed glyph, or a
- *  `:shortcode:` resolved via the app import map. Returns "" if nothing usable. */
-function normalizeEmojiInput(raw: string): string {
+/** The emoji Enter should insert for the current query: a typed/pasted literal
+ *  glyph wins; otherwise the top search result. "" when nothing matches. */
+function firstEmojiForQuery(raw: string): string {
   const v = raw.trim();
   if (!v) return "";
-  const sc = v.match(/^:?([a-z0-9_+-]+):?$/i);
-  if (sc) {
-    const mapped = EMOJI_SHORTCODES[sc[1].toLowerCase()];
-    if (mapped) return mapped;
-  }
-  // Reject plain latin text (so ":" splitting in storage stays unambiguous) —
-  // accept only if it contains a non-ASCII (emoji) codepoint.
+  // A pasted/typed literal emoji (non-ASCII, no colon) → use it directly.
   if (/[^\x00-\x7F]/.test(v) && !v.includes(":")) return [...v][0] ?? "";
-  return "";
+  return searchEmoji(v, 1)[0]?.emoji ?? "";
+}
+
+/** Shared picker body — presets + live search + results grid — rendered into
+ *  `host`. Used by BOTH the desktop popover and the mobile modal so the two
+ *  can't drift. `close()` dismisses whichever container is hosting it. Search
+ *  focus is caller-controlled: desktop autofocuses (pointer already committed);
+ *  mobile does NOT, so the presets are tappable without the keyboard covering
+ *  them until the user actually taps the field. 0.316.0. */
+function buildReactionPickerBody(
+  view: StashpadView, node: TreeNode, host: HTMLElement, close: () => void, autofocus: boolean,
+): void {
+  const map = readReactions(view.app.metadataCache.getFileCache(node.file!)?.frontmatter as Record<string, unknown>);
+  const me = myReactionId(view);
+  const pick = (emoji: string): void => { if (emoji) { void toggleReaction(view, node, emoji); close(); } };
+
+  const presets = host.createDiv({ cls: "stashpad-reaction-pickgrid" });
+  for (const emoji of QUICK_REACTIONS) {
+    const mine = (map[emoji] ?? []).includes(me);
+    const b = presets.createEl("button", { cls: "stashpad-reaction-pick" + (mine ? " is-mine" : ""), text: emoji });
+    b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); pick(emoji); };
+  }
+
+  const input = host.createEl("input", { cls: "stashpad-reaction-input", attr: { type: "text", placeholder: "Search emoji — name or :code:" } });
+  const results = host.createDiv({ cls: "stashpad-reaction-results" });
+  const renderResults = (): void => {
+    results.empty();
+    const matches = searchEmoji(input.value);
+    results.toggleClass("is-empty", matches.length === 0);
+    for (const { name, emoji } of matches) {
+      const mine = (map[emoji] ?? []).includes(me);
+      const b = results.createEl("button", { cls: "stashpad-reaction-result" + (mine ? " is-mine" : ""), text: emoji });
+      b.title = `:${name}:`;
+      b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); pick(emoji); };
+    }
+  };
+  input.addEventListener("input", renderResults);
+  // Enter inserts the first result (or a typed literal glyph) — desktop + mobile.
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); pick(firstEmojiForQuery(input.value)); }
+  });
+  if (autofocus) setTimeout(() => input.focus(), 0);
+}
+
+/** Reaction picker. Desktop: a small popover anchored to the trigger. Mobile: a
+ *  full modal (Obsidian handles the fullscreen + keyboard), so the search field
+ *  no longer floats mid-screen and get shoved by the soft keyboard as though two
+ *  keyboards were stacked. Both share buildReactionPickerBody. 0.316.0. */
+export function openReactionPicker(view: StashpadView, node: TreeNode, anchor: HTMLElement): void {
+  if (Platform.isMobile) {
+    new ReactionPickerModal(view, node).open();
+    return;
+  }
+  const doc = anchor.ownerDocument;
+  doc.querySelector(".stashpad-reaction-picker")?.remove();
+  const pop = doc.body.createDiv({ cls: "stashpad-reaction-picker" });
+  const dismiss = installDismiss(pop, anchor, "stashpad-reaction-picker");
+  buildReactionPickerBody(view, node, pop, dismiss, /*autofocus*/ true);
+  positionPopover(pop, anchor);
+}
+
+/** Mobile reaction picker: a normal Obsidian modal (fullscreen on phones), so
+ *  the keyboard opens below the search field instead of lifting a floating
+ *  popover. 0.316.0. */
+class ReactionPickerModal extends Modal {
+  constructor(private view: StashpadView, private node: TreeNode) { super(view.app); }
+  onOpen(): void {
+    this.titleEl.setText("Add reaction");
+    this.modalEl.addClass("stashpad-reaction-modal");
+    // No autofocus on mobile: let the presets be tapped without the keyboard
+    // immediately covering them.
+    buildReactionPickerBody(this.view, this.node, this.contentEl, () => this.close(), /*autofocus*/ false);
+  }
+  onClose(): void { this.contentEl.empty(); }
 }
 
 function positionPopover(pop: HTMLElement, anchor: HTMLElement): void {
