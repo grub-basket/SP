@@ -185,6 +185,12 @@
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
+  /* 0.313.2: vertical padding so a focused control's focus / selection ring
+     draws inside the clip box instead of being shaved by `overflow: hidden`
+     (which clips at the padding edge). The negative margin keeps the row's
+     effective height unchanged. */
+  padding-block: 3px;
+  margin-block: -3px;
 }
 .stashpad-time-filter-btn {
   /* Each button shrinks to its label width (e.g. "Today" / "Month")
@@ -1016,6 +1022,34 @@
 }
 .stashpad-time-expr-abs .svg-icon { width: 14px; height: 14px; }
 .stashpad-time-expr-abs.is-disabled { opacity: 0.5; }
+
+/* 0.312.0: reworked desktop number box — reset · value (auto-width, mono) ·
+   +/- steppers, with a confirm ✓ that shows only for a typed edit. */
+.stashpad-time-numwrap { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+.stashpad-numbox { display: inline-flex; align-items: center; height: 28px; border: 1px solid var(--background-modifier-border); border-radius: 6px; background: var(--background-secondary); overflow: hidden; box-sizing: border-box; }
+/* 0.313.2: the input's own outline is suppressed (clipped by the box), so the
+   BOX shows the focus state instead — its ring isn't clipped now the cluster
+   has vertical padding. */
+.stashpad-numbox:focus-within { border-color: var(--interactive-accent); box-shadow: 0 0 0 2px var(--background-modifier-border-focus, var(--interactive-accent)); }
+/* 0.313.1: reset is a standalone bar button now (after the unit select), styled
+   by .stashpad-time-filter-btn; this only carries the disabled state + icon. */
+.stashpad-numbox-reset.is-disabled { opacity: 0.4; pointer-events: none; }
+.stashpad-numbox-reset .svg-icon { width: 14px; height: 14px; }
+/* content-box so the digits get the full `Nch` width and aren't clipped by the
+   horizontal padding; line-height fills the box so they're vertically centered. */
+/* Higher specificity (.stashpad-numbox descendant) so these beat Obsidian's
+   base `input[type=text]` padding/height, which was making the box 40px tall and
+   pushing the digits off-centre. Fixed 24px line height centres them in the box. */
+.stashpad-numbox .stashpad-numbox-input { box-sizing: content-box; height: 24px; min-height: 0; border: none; background: transparent; color: var(--text-normal); text-align: center; font-family: var(--font-monospace); font-size: var(--font-ui-small); line-height: 24px; padding: 0 4px; margin: 0; min-width: 1ch; }
+.stashpad-numbox .stashpad-numbox-input:focus { outline: none; box-shadow: none; }
+.stashpad-numbox-spin { display: flex; flex-direction: column; border-left: 1px solid var(--background-modifier-border); }
+.stashpad-numbox-step { border: none; background: var(--background-secondary); color: var(--text-muted); cursor: pointer; width: 18px; height: 14px; display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+.stashpad-numbox-step:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-numbox-step:first-child { border-bottom: 1px solid var(--background-modifier-border); }
+.stashpad-numbox-step .svg-icon { width: 10px; height: 10px; }
+.stashpad-numbox-confirm { display: none; align-items: center; justify-content: center; width: 26px; height: 28px; border: 1px solid var(--interactive-accent); border-radius: 6px; background: var(--interactive-accent); color: var(--text-on-accent); cursor: pointer; padding: 0; }
+.stashpad-numbox-confirm.show { display: inline-flex; }
+.stashpad-numbox-confirm .svg-icon { width: 14px; height: 14px; }
 
 /* Popover / mobile-accordion variant: full-width row with taller,
    thumb-sized controls. */

@@ -3656,6 +3656,7 @@ export class StashpadView extends ItemView {
 
   private renderInner(policy?: ScrollPolicy): void {
     this.syncLevelScopedState();
+    this.syncTimeFilterFromSettings();
     if (perf.enabled) this._renderT0 = performance.now();
     // 0.140.9: bail if the view was torn down. A debounced/deferred render
     // firing after onClose would rebuild the whole UI on detached DOM AND
@@ -4226,27 +4227,13 @@ export class StashpadView extends ItemView {
 
     // Buttons row (visible by default; hidden via CSS when narrow).
     const btns = bar.createDiv({ cls: "stashpad-time-filter-btns" });
-    // Calendar/rolling toggle — sits before "All". Active = calendar
-    // mode (start of today / week / month / year). Inactive = rolling
-    // N-day windows backward from now (the historical default).
-    const calBtn = btns.createEl("button", {
-      cls: "stashpad-time-filter-btn stashpad-time-filter-cal",
-    });
-    // Icon flips with the mode so a glance tells you which is active:
-    //   calendar = calendar/start-of-period boundaries
-    //   history  = rolling window N units back from now
-    setIcon(calBtn, this.timeFilterCalendar ? "calendar" : "clock");
-    calBtn.title = this.timeFilterCalendar
-      ? "Calendar mode: filters use start-of-day/week/month/year. Click for rolling windows."
-      : "Rolling mode: filters look back N days from now. Click for calendar boundaries.";
-    if (this.timeFilterCalendar) calBtn.addClass("is-active");
-    calBtn.onclick = (e) => {
-      e.preventDefault();
-      this.setTimeFilterCalendar(!this.timeFilterCalendar);
-    };
+    // 0.312.0: the calendar/rolling toggle moved to plugin settings (Time filter),
+    // so the bar no longer carries it. The mode is read from settings instead.
     // 0.272.4: filter to a single DAY — notes created, linked, or due that day.
+    // 0.312.0: `calendar-search` (a magnifier over a calendar) reads clearly as
+    // "find a specific day" and no longer looks like the old mode-calendar icon.
     const dayBtn = btns.createEl("button", { cls: "stashpad-time-filter-btn stashpad-day-filter-btn" });
-    setIcon(dayBtn, "calendar-days");
+    setIcon(dayBtn, "calendar-search");
     const activeDay = this.dateFilter !== null;
     if (activeDay) dayBtn.addClass("is-active");
     dayBtn.title = activeDay
@@ -5626,6 +5613,14 @@ export class StashpadView extends ItemView {
    *  keystroke: a full `render()` rebuilds the bar and would steal focus
    *  mid-typing. Local state is patched in place instead. */
   private buildTimeFilterExpression(host: HTMLElement, variant: "bar" | "popover" = "bar"): void {
+    // 0.312.0: the DESKTOP BAR uses a reworked number box — a reset, the value
+    // (auto-width, monospace), inline +/- steppers, and a ✓ that appears only
+    // when you type a new value (blurring / clicking away also applies). The
+    // mode toggles (calendar/rolling, sliding/frozen) moved to plugin settings,
+    // so the bar carries just the window size + unit. The popover / mobile
+    // accordion keeps its own fuller layout below.
+    if (variant === "bar") { this.buildTimeNumberBox(host); return; }
+
     const wrap = host.createDiv({
       cls: `stashpad-time-expr ${variant === "popover" ? "stashpad-time-expr-popover" : ""}`.trim(),
     });
@@ -5691,6 +5686,75 @@ export class StashpadView extends ItemView {
     };
   }
 
+  /** 0.312.0: the desktop time-filter number box. Reset · value · +/- steppers,
+   *  then the unit select and a confirm ✓ that only shows for a TYPED edit
+   *  (steppers apply immediately; blur / outside-click also applies). The value
+   *  input auto-sizes to its content (monospace, so the width is predictable). */
+  private buildTimeNumberBox(host: HTMLElement): void {
+    const wrap = host.createDiv({ cls: "stashpad-time-expr stashpad-time-numwrap" });
+    const box = wrap.createDiv({ cls: "stashpad-numbox" });
+
+    const num = box.createEl("input", { cls: "stashpad-numbox-input", type: "text" });
+    num.inputMode = "numeric";
+    num.value = String(this.timeFilterCount);
+    num.setAttribute("aria-label", "Time filter amount");
+    // 0.313.1: content-box + a half-char buffer so the digits are never clipped
+    // by the horizontal padding (border-box was eating the value into padding).
+    const fit = (): void => { num.style.width = `calc(${Math.max(1, num.value.length)}ch + 4px)`; };
+    fit();
+
+    const spin = box.createDiv({ cls: "stashpad-numbox-spin" });
+    const up = spin.createEl("button", { cls: "stashpad-numbox-step", attr: { "aria-label": "Increase" } });
+    setIcon(up, "chevron-up");
+    const down = spin.createEl("button", { cls: "stashpad-numbox-step", attr: { "aria-label": "Decrease" } });
+    setIcon(down, "chevron-down");
+
+    const unitSel = wrap.createEl("select", { cls: "stashpad-time-expr-unit" });
+    for (const u of TIME_UNITS) {
+      const o = unitSel.createEl("option", { text: u.plural });
+      o.value = u.key;
+      if (u.key === this.timeFilterUnit) o.selected = true;
+    }
+    unitSel.setAttribute("aria-label", "Time filter unit");
+
+    // 0.313.1: reset now sits AFTER the unit dropdown (its own button), and
+    // clears the day filter too — so it's a single "clear all time filtering".
+    const reset = wrap.createEl("button", { cls: "stashpad-time-filter-btn stashpad-numbox-reset" });
+    setIcon(reset, "rotate-ccw");
+    reset.title = "Clear the time filter and any day filter (show all).";
+    reset.setAttribute("aria-label", "Clear time + day filter");
+
+    const confirm = wrap.createEl("button", { cls: "stashpad-numbox-confirm" });
+    setIcon(confirm, "check");
+    confirm.title = "Apply";
+    confirm.setAttribute("aria-label", "Apply time filter");
+
+    const canReset = (): boolean => this.timeFilterCount > 0 || this.dateFilter !== null;
+    const apply = (count: number, immediate = true): void => {
+      this.setTimeFilterSpec(Math.max(0, count), unitSel.value as TimeUnit, { rerender: false });
+      num.value = String(this.timeFilterCount);
+      fit();
+      confirm.classList.remove("show");
+      reset.toggleClass("is-disabled", !canReset());
+      if (immediate) this.refreshList();
+    };
+    reset.toggleClass("is-disabled", !canReset());
+
+    // Typing shows the ✓ (dirty); steppers apply at once.
+    num.addEventListener("input", () => {
+      num.value = num.value.replace(/\D/g, "");
+      fit();
+      confirm.classList.toggle("show", num.value !== String(this.timeFilterCount));
+    });
+    num.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); apply(Number(num.value) || 0); num.blur(); } });
+    num.addEventListener("blur", () => { if (confirm.classList.contains("show")) apply(Number(num.value) || 0); });
+    confirm.addEventListener("mousedown", (e) => { e.preventDefault(); apply(Number(num.value) || 0); });
+    up.addEventListener("click", () => apply(this.timeFilterCount + 1));
+    down.addEventListener("click", () => apply(this.timeFilterCount - 1));
+    reset.addEventListener("click", () => { this.dateFilter = null; apply(0); });
+    unitSel.addEventListener("change", () => apply(this.timeFilterCount));
+  }
+
   /** Render the time-filter rows into `container`. Used by the mobile
    *  accordion section (desktop renders its own button row + select
    *  fallback in renderListBar). The Calendar / Rolling toggle is
@@ -5716,7 +5780,7 @@ export class StashpadView extends ItemView {
 
     const calRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
     const calCheck = calRow.createEl("input", { type: "checkbox" });
-    calCheck.checked = this.timeFilterCalendar;
+    calCheck.checked = this.plugin.settings.timeFilterMode === "calendar";
     calRow.createDiv({ cls: "stashpad-view-popover-main" })
       .createSpan({ cls: "stashpad-view-popover-label", text: "Calendar mode" });
     calRow.createDiv({
@@ -5725,7 +5789,11 @@ export class StashpadView extends ItemView {
     });
     calRow.onclick = (e) => {
       if (e.target !== calCheck) { e.preventDefault(); calCheck.checked = !calCheck.checked; }
-      this.setTimeFilterCalendar(calCheck.checked, { rerender: false });
+      // 0.313.0: drives the plugin setting now (mode left the per-view state).
+      this.plugin.settings.timeFilterMode = calCheck.checked ? "calendar" : "rolling";
+      void this.plugin.saveSettings();
+      this.syncTimeFilterFromSettings();
+      this.refreshList();
     };
 
     // 0.271.0: absolute/relative toggle. MUST live here, not only on the bar —
@@ -5733,7 +5801,7 @@ export class StashpadView extends ItemView {
     // only through this body.
     const absRow = container.createDiv({ cls: "stashpad-view-popover-row stashpad-view-popover-toggle" });
     const absCheck = absRow.createEl("input", { type: "checkbox" });
-    absCheck.checked = this.timeFilterAnchor !== null;
+    absCheck.checked = this.plugin.settings.timeFilterFreeze;
     absRow.createDiv({ cls: "stashpad-view-popover-main" })
       .createSpan({ cls: "stashpad-view-popover-label", text: "Fixed start date" });
     absRow.createDiv({
@@ -5749,7 +5817,11 @@ export class StashpadView extends ItemView {
         new Notice("Set a time window first.");
         return;
       }
-      this.setTimeFilterAbsolute(absCheck.checked, { rerender: false });
+      // 0.313.0: drives the plugin setting now (freeze left the per-view state).
+      this.plugin.settings.timeFilterFreeze = absCheck.checked;
+      void this.plugin.saveSettings();
+      this.syncTimeFilterFromSettings();
+      this.refreshList();
     };
 
     // Custom "last N <unit>" row — the numeric control. On mobile the native
@@ -5913,6 +5985,21 @@ export class StashpadView extends ItemView {
     // rerender:false keeps an open popover/accordion alive (a full render()
     // rebuilds the bar and detaches it mid-interaction).
     if (opts.rerender === false) this.refreshList(); else this.render();
+  }
+
+  /** 0.313.0: the calendar/rolling mode and the sliding/frozen behaviour now live
+   *  in plugin settings (they left the bar). Mirror them onto this view's state
+   *  each render — sets fields DIRECTLY (no re-render) so it's safe to call from
+   *  renderInner. `timeFilterMode` drives the boundary style; `timeFilterFreeze`
+   *  pins the cutoff (anchor) once a window is set, or releases it when off. */
+  private syncTimeFilterFromSettings(): void {
+    this.timeFilterCalendar = this.plugin.settings.timeFilterMode === "calendar";
+    const freeze = this.plugin.settings.timeFilterFreeze;
+    if (freeze && this.timeFilterCount > 0) {
+      if (this.timeFilterAnchor === null) this.timeFilterAnchor = this.computeRelativeCutoff();
+    } else if (this.timeFilterAnchor !== null) {
+      this.timeFilterAnchor = null;
+    }
   }
 
   /** Flip RELATIVE (sliding window) ↔ ABSOLUTE (cutoff frozen at this instant). */

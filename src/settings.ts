@@ -843,6 +843,16 @@ export interface StashpadSettings {
    *  Replaced the 0.270.1 boolean `pinnedIgnoreFilters` (true -> "all",
    *  false -> "none"); that key is migrated on load. */
   pinnedFilterMode: "all" | "time" | "none";
+  /** 0.313.0: time-window mode — moved off the bar toggle into settings.
+   *  "rolling" = the window is the last N units counted back from right now
+   *  (it slides as time passes). "calendar" = calendar boundaries — the window
+   *  starts at the beginning of the current day / week / month / year. */
+  timeFilterMode: "rolling" | "calendar";
+  /** 0.313.0: freeze the time window — when on, the cutoff is pinned at the
+   *  moment the window was set, so it stops sliding as time passes (a fixed
+   *  "since <date>" instead of a moving "last N days"). Off = the window slides.
+   *  Moved off the bar's sliding/frozen toggle into settings. */
+  timeFilterFreeze: boolean;
   /** 0.276.2: when a pinned note survives a filter, also keep its whole subtree
    *  (all descendants) visible, so the pinned note isn't shown empty. Off by
    *  default. No effect when pinnedFilterMode is "none". */
@@ -1058,6 +1068,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   showEditorLineNumbers: true,
   autoNavOnMoveOut: false,
   pinnedFilterMode: "all",
+  timeFilterMode: "rolling",
+  timeFilterFreeze: false,
   pinnedChildrenPersist: false,
   autoExpandCursorRow: false,
   virtualizeLargeLists: true,
@@ -2686,6 +2698,16 @@ export class StashpadSettingTab extends PluginSettingTab {
         d.onChange(async (v) => { this.plugin.settings.pinnedFilterMode = v as "all" | "time" | "none"; await set(); });
       });
     }, ["pin", "pinned", "filter", "time", "hide", "tag", "colour", "color"]));
+    cats.listDisplay.push(this.renderDef("Time window mode", "How the “last N …” time filter reads its window. “Rolling” = the last N days / weeks / months counted back from right now — it slides forward as time passes (the default). “Calendar” = calendar boundaries, so the window starts at the beginning of the current day, week, month, or year (e.g. “1 week” means this week so far). This replaces the calendar/rolling toggle that used to sit on the filter bar.", (s) => {
+      s.addDropdown((d) => {
+        d.addOption("rolling", "Rolling window (last N, moves with the clock)");
+        d.addOption("calendar", "Calendar period (this day / week / month / year)");
+        d.setValue(this.plugin.settings.timeFilterMode);
+        d.onChange(async (v) => { this.plugin.settings.timeFilterMode = v as "rolling" | "calendar"; await set(); this.plugin.refreshAllStashpadViews(); });
+      });
+    }, ["time", "filter", "window", "rolling", "calendar", "period", "date", "mode"]));
+    cats.listDisplay.push(toggle("Freeze the time window", "When on, the time filter's cutoff is pinned at the moment you set the window, so it stops sliding — a fixed “since <that date>” instead of a moving “last N days”. Set a new window to re-pin it. Off by default (the window slides with the clock). This replaces the sliding/frozen toggle that used to sit on the filter bar.",
+      () => this.plugin.settings.timeFilterFreeze, (v) => { this.plugin.settings.timeFilterFreeze = v; this.plugin.refreshAllStashpadViews(); }, ["time", "filter", "freeze", "fixed", "anchor", "pin", "sliding", "frozen"]));
     cats.listDisplay.push(toggle("Keep a pinned note's children too", "When a pin keeps a note visible through a filter, also keep its whole subtree (all descendants) visible — so the pinned note isn't left showing with its contents filtered away. Off by default; no effect when the setting above is \"Filter like any note\".",
       () => this.plugin.settings.pinnedChildrenPersist, (v) => { this.plugin.settings.pinnedChildrenPersist = v; }, ["pin", "pinned", "children", "subtree", "descendants", "filter"]));
     cats.listDisplay.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",
