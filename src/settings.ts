@@ -1977,7 +1977,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           row.addText((t) => {
             new IconSuggest(this.app, t.inputEl);
             t.setValue(cur).setPlaceholder(def.icon);
-            t.inputEl.style.width = "10em";
+            t.inputEl.addClass("stashpad-cmdicon-input");
             const commit = async () => {
               const v = t.getValue().trim().replace(/^lucide-/, "");
               const map = { ...(this.plugin.settings.commandIcons ?? {}) };

@@ -9976,3 +9976,6 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 /* Cap the pinned tab strip so many folders don't push the list off-screen. */
 .stashpad-pinned-tabs { max-height: 4.6em; overflow-y: auto; }
 .stashpad-pinned-tab-hint { margin-top: 6px; opacity: 0.75; }
+
+/* 0.320.5: icon-registry input width (store lint forbids literal el.style.width). */
+.stashpad-cmdicon-input { width: 10em; }
