@@ -1,3 +1,4 @@
+import { parseNaturalDate, naturalDatePhrases, formatNaturalDate } from "./natural-date";
 import { App, Scope, TFile, moment } from "obsidian";
 import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore, siftMatch } from "./types";
 import { HIGHLIGHT_COLORS, takeLeadingColor } from "./highlight-colors";
@@ -67,42 +68,11 @@ function frontmatterAliases(app: App, file: TFile): string[] {
     .filter((a) => a && !seen.has(a.toLowerCase()) && seen.add(a.toLowerCase()));
 }
 
-/** Relative date phrases offered by the `@` trigger, with the day offset each
- *  one resolves to. The point of the catalogue is PARTIAL matching: typing
- *  `@yest` should show "yesterday" *and the date it resolves to* before the
- *  word is finished. Resolving the partial string directly can't do that —
- *  "yest" is not a date to any parser — so the phrase list is matched on the
- *  prefix and the resolution happens against the full phrase.
- *
- *  Offsets are in days from today. Phrases whose meaning isn't a fixed offset
- *  (weekday names, "in 3 weeks") carry a null offset: they're still listed for
- *  discovery, and resolution is left to the Natural Language Dates plugin,
- *  which handles them properly. */
-const DATE_PHRASES: Array<{ phrase: string; days: number | null }> = [
-  { phrase: "today", days: 0 },
-  { phrase: "tomorrow", days: 1 },
-  { phrase: "yesterday", days: -1 },
-  { phrase: "next week", days: 7 },
-  { phrase: "last week", days: -7 },
-  { phrase: "in 2 days", days: 2 },
-  { phrase: "in 3 days", days: 3 },
-  { phrase: "in a week", days: 7 },
-  { phrase: "in two weeks", days: 14 },
-  { phrase: "next month", days: null },
-  { phrase: "last month", days: null },
-  { phrase: "the day after tomorrow", days: 2 },
-  { phrase: "the day before yesterday", days: -2 },
-  { phrase: "next monday", days: null },
-  { phrase: "next tuesday", days: null },
-  { phrase: "next wednesday", days: null },
-  { phrase: "next thursday", days: null },
-  { phrase: "next friday", days: null },
-  { phrase: "next saturday", days: null },
-  { phrase: "next sunday", days: null },
-  { phrase: "last friday", days: null },
-  { phrase: "end of week", days: null },
-  { phrase: "end of month", days: null },
-];
+/** 0.319.0: the `@` date catalogue now comes from natural-date.ts
+ *  (naturalDatePhrases) and EVERY phrase — and anything the user types — resolves
+ *  through parseNaturalDate, so "@tuesday" / "@last tuesday" / "@in 3 weeks" /
+ *  "@sep 12 at 3pm" work without the Natural Language Dates plugin. NLD is still
+ *  asked first when installed (it honours that plugin's format + link settings). */
 
 /** Commands withheld from the `/` popup.
  *
@@ -434,24 +404,26 @@ export class ComposerAutocomplete {
     return null;
   }
 
-  /** Resolve one of the catalogue's fixed-offset phrases without any plugin.
-   *  Uses the core Templates plugin's date format when the user has set one,
-   *  so a built-in preview reads the same as the rest of their vault, and
-   *  falls back to ISO. Null for phrases whose offset isn't fixed — those need
-   *  a real parser, and NLD is asked first anyway. */
-  private builtinDate(days: number | null): string | null {
-    if (days === null) return null;
-    const fmt = getTemplatesFormats(this.app)?.dateFormat || "YYYY-MM-DD";
-    try { return momentFn().add(days, "days").format(fmt); } catch { return null; }
+  /** 0.319.0: resolve ANY phrase with the built-in parser. Uses the core
+   *  Templates plugin's date (+ time) format when the user has set one, so a
+   *  preview reads the same as the rest of their vault; ISO otherwise. */
+  private builtinDate(phrase: string): string | null {
+    const r = parseNaturalDate(phrase, { prefer: "future" });
+    if (!r) return null;
+    const fmts = getTemplatesFormats(this.app);
+    if (!fmts) return formatNaturalDate(r);
+    try {
+      const m = momentFn(r.ms) as unknown as { format: (f: string) => string };
+      return r.hasTime ? `${m.format(fmts.dateFormat)} ${m.format(fmts.timeFormat || "HH:mm")}` : m.format(fmts.dateFormat);
+    } catch { return formatNaturalDate(r); }
   }
 
-  /** Date preview for a catalogue phrase: NLD if it's installed (it honours
-   *  the user's NLD format + link settings), otherwise the built-in offset. */
-  private resolvePhrase(phrase: string, days: number | null):
-    { formatted: string; asLink: boolean } | null {
+  /** Date preview for a phrase: NLD if it's installed (it honours the user's
+   *  NLD format + link settings), otherwise the built-in parser. */
+  private resolvePhrase(phrase: string): { formatted: string; asLink: boolean } | null {
     const viaNld = this.nldResolve(phrase);
     if (viaNld) return viaNld;
-    const built = this.builtinDate(days);
+    const built = this.builtinDate(phrase);
     return built ? { formatted: built, asLink: false } : null;
   }
 
@@ -571,17 +543,17 @@ export class ComposerAutocomplete {
     // An exact parse of what the user actually typed always ranks first — it
     // covers everything the catalogue can't ("3rd of next month", "in 45 min").
     if (q !== "") {
-      const exact = this.nldResolve(state.query);
+      const exact = this.resolvePhrase(state.query);
       if (exact) pushPhrase(state.query.trim(), exact);
     }
     // Then catalogue phrases the query is a prefix of (bare `@` shows the head
     // of the list). Prefix, not all-tokens: typing `t` should suggest "today"
     // and "tomorrow", not every phrase containing a `t`.
     const phraseLimit = q === "" ? 4 : 8;
-    for (const { phrase, days } of DATE_PHRASES) {
+    for (const phrase of naturalDatePhrases()) {
       if (dateItems.length >= phraseLimit) break;
       if (q !== "" && !phrase.startsWith(q)) continue;
-      const r = this.resolvePhrase(phrase, days);
+      const r = this.resolvePhrase(phrase);
       if (r) pushPhrase(phrase, r);
     }
     // On a bare `@` with date suggestions present, keep the list tight (dates

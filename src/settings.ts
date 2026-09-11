@@ -8,7 +8,7 @@ import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmM
 import { FolderSuggest } from "./folder-suggest";
 import { IconSuggest } from "./icon-suggest";
 import type StashpadPlugin from "./main";
-import { RESERVED_FRONTMATTER, type ViewMode } from "./types";
+import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal } from "./modals";
@@ -802,6 +802,9 @@ export interface StashpadSettings {
    *  the off switch exists so a folder that scrolls oddly can fall back to
    *  building every row. Applies above ~120 notes. */
   virtualizeLargeLists: boolean;
+  /** 0.318.0: user-pinned reaction emoji, shown first in the picker (replaces
+   *  the default presets once non-empty). Edited from the picker itself. */
+  favoriteReactions: string[];
   /** When on, note bodies render fully expanded by default; the
    *  per-note "Show more / show less" toggle and the expand/collapse-all
    *  commands then act as a *collapse* opt-out (the expandedNotes Set is
@@ -908,8 +911,21 @@ export interface StashpadSettings {
   /** Vault path of the auto-created OKF template note (assigned per-folder via the
    *  Templates section). Empty until OKF is first enabled. */
   okfTemplatePath: string;
-  /** Per-folder composer draft text. Stored in the plugin's data.json. */
+  /** Per-folder composer draft text. LEGACY (pre-0.319.0) — migrated into
+   *  `composerDrafts` at load and cleared; kept in the type so old data parses. */
   drafts: Record<string, string>;
+  /** 0.319.1: which surface "Edit" opens, by the note's character count, per
+   *  platform: ≤ composer → the composer (only when `toComposer` is on — it is
+   *  the experimental edit-in-composer flow), ≤ modal → the edit modal,
+   *  ≤ tab → the popped-out workbench tab, above that → Obsidian's editor. */
+  editRouting: {
+    toComposer: boolean;
+    desktop: { composer: number; modal: number; tab: number };
+    mobile: { composer: number; modal: number; tab: number };
+  };
+  /** 0.319.0: composer drafts keyed by draft id (see ComposerDraft). Several
+   *  per folder are allowed (other devices, stashed text, an edit in progress). */
+  composerDrafts: Record<string, ComposerDraft>;
   /** 0.223.0: per-folder append target (frontmatter id) that rides along with
    *  the draft, so binding a target then reloading doesn't silently turn the
    *  append into a new note. Cleared whenever the target is cleared. */
@@ -1073,6 +1089,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   pinnedChildrenPersist: false,
   autoExpandCursorRow: false,
   virtualizeLargeLists: true,
+  favoriteReactions: [],
   expandBodiesByDefault: false,
   autoOpenDetailPanel: false,
   doubleClickToFocus: true,
@@ -1089,6 +1106,12 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   okfEnabled: false,
   okfTemplatePath: "",
   drafts: {},
+  composerDrafts: {},
+  editRouting: {
+    toComposer: false,
+    desktop: { composer: 500, modal: 8000, tab: 60000 },
+    mobile: { composer: 250, modal: 3000, tab: 20000 },
+  },
   draftAppendTargets: {},
   lastSubmitted: {},
   bindings: buildDefaultBindings(),
@@ -1163,7 +1186,7 @@ function currentHourInTz(tz: string | undefined, now: Date): number {
  *  is "no faster", never "stale UI". Drafts are safe to skip because the
  *  listener syncs the composer's text directly and reports whether it did. */
 const RENDER_IRRELEVANT_KEYS: ReadonlySet<string> = new Set([
-  "drafts", "lastSubmitted", "draftAppendTargets",
+  "drafts", "composerDrafts", "lastSubmitted", "draftAppendTargets",
   "notifiedDueKeys", "persistReminderLog", "settingsRev",
   // 0.292.0 (perf): device-local MRU state. Neither key is read by any render
   // path — the only consumers are main.ts `recordFolderUsed` (the writer),
@@ -2534,12 +2557,13 @@ export class StashpadSettingTab extends PluginSettingTab {
     // 0.279.17: scheduled obscuring — a folder set to obscure-by-default only
     // covers during set hours; outside them (e.g. at home / off-hours) it's clear.
     cats.listDisplay.push(this.sectionDef("Only blur folders during set hours", "", (host) => {
-      host.createEl("p", { cls: "setting-item-description", text: "When on, a folder you've set to obscure by default only blurs DURING the daily window below — outside it (say, evenings at home) that folder stays clear. The schedule only adds a \"when\" to folders already set to obscure; it never blurs a folder that isn't, and it doesn't touch a note you've obscured by hand or the global \"obscure everything\" switch." });
-      host.createEl("p", { cls: "setting-item-description", text: "Times are your device's LOCAL time (24-hour). An end earlier than the start means an overnight window (e.g. 22 to 6). Because the window is local, it re-evaluates when your timezone changes as you travel." });
       const applied = (): void => { void this.plugin.saveSettings().then(() => this.plugin.reHideAndRefreshAllViews()); };
+      // 0.319.4 (user): the toggle leads; the explanation follows it.
       new Setting(host)
         .setName("Blur only during set hours")
         .addToggle((t) => t.setValue(this.plugin.settings.obscureScheduleEnabled).onChange((v) => { this.plugin.settings.obscureScheduleEnabled = v; applied(); }));
+      host.createEl("p", { cls: "setting-item-description", text: "When on, a folder you've set to obscure by default only blurs DURING the daily window below — outside it (say, evenings at home) that folder stays clear. The schedule only adds a \"when\" to folders already set to obscure; it never blurs a folder that isn't, and it doesn't touch a note you've obscured by hand or the global \"obscure everything\" switch." });
+      host.createEl("p", { cls: "setting-item-description", text: "Times are your device's LOCAL time (24-hour). An end earlier than the start means an overnight window (e.g. 22 to 6). Because the window is local, it re-evaluates when your timezone changes as you travel." });
       const hourDropdown = (setting: Setting, get: () => number, put: (n: number) => void): void => {
         setting.addDropdown((d) => {
           for (let h = 0; h < 24; h++) d.addOption(String(h), `${String(h).padStart(2, "0")}:00`);
@@ -2712,6 +2736,43 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.pinnedChildrenPersist, (v) => { this.plugin.settings.pinnedChildrenPersist = v; }, ["pin", "pinned", "children", "subtree", "descendants", "filter"]));
     cats.listDisplay.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",
       () => this.plugin.settings.doubleClickToFocus, (v) => { this.plugin.settings.doubleClickToFocus = v; }, ["double", "click", "open", "focus"]));
+    cats.composerCopy.push(toggle("Edit short notes in the composer (experimental)", "When on, \"Edit\" on a note shorter than the composer limit below puts its text in the composer (an \"Editing\" chip shows; Send saves, ✕ keeps your changes as a draft). Longer notes still open the modal / tab / Obsidian editor by the limits below. Off: the command \"Edit note in the composer\" still exists.",
+      () => this.plugin.settings.editRouting.toComposer, (v) => { this.plugin.settings.editRouting.toComposer = v; }, ["edit", "composer", "inline", "routing"]));
+    for (const plat of ["desktop", "mobile"] as const) {
+      const defs = plat === "desktop" ? "500 / 8000 / 60000" : "250 / 3000 / 20000";
+      cats.composerCopy.push(this.renderDef(`Edit surface limits — ${plat}`, `Character counts that decide where "Edit" opens a note on ${plat}. Up to the first number: composer (if enabled). Up to the second: edit modal. Up to the third: workbench tab. Longer: Obsidian's editor. Defaults ${defs}.`, (s) => {
+        // 0.319.4 (user): one line per tier, and each box labelled.
+        s.descEl.empty();
+        const lines = [
+          `Where "Edit" opens a note on ${plat}, by character count:`,
+          "\u2264 composer \u2192 the composer (only when the toggle above is on)",
+          "\u2264 modal \u2192 the edit modal",
+          "\u2264 tab \u2192 the workbench tab",
+          "longer \u2192 Obsidian\u2019s editor",
+          `Defaults ${defs}.`,
+        ];
+        for (const l of lines) s.descEl.createDiv({ text: l });
+        const r = this.plugin.settings.editRouting[plat];
+        s.controlEl.addClass("stashpad-edit-limits");
+        for (const key of ["composer", "modal", "tab"] as const) {
+          const col = s.controlEl.createDiv({ cls: "stashpad-edit-limit" });
+          col.createDiv({ cls: "stashpad-edit-limit-label", text: key });
+          const input = col.createEl("input", { type: "text", attr: { placeholder: key, inputmode: "numeric", "aria-label": `${plat}: max characters for ${key}` } });
+          input.value = String(r[key]);
+          const commit = async () => {
+            const n = parseInt(input.value, 10);
+            if (!Number.isFinite(n) || n < 0) { input.value = String(r[key]); return; }
+            r[key] = n;
+            await this.plugin.saveSettings();
+          };
+          input.addEventListener("blur", () => void commit());
+          input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
+        }
+      }, ["edit", "limit", "characters", "modal", "tab", plat]));
+    }
+    cats.misc.push(this.renderDef("Composer drafts", "Review every unsent composer draft — this device's, other devices' (synced), stashed text and edits in progress — load one into the composer or delete it. 0.319.0.", (s) => {
+      s.addButton((b) => b.setButtonText("Open drafts").onClick(() => this.plugin.openComposerDrafts()));
+    }, ["draft", "drafts", "composer", "unsent", "restore"]));
     cats.misc.push(toggle("Sheet versions (alternate drafts)", "Treat notes that share a 'sheet-group' frontmatter id as alternate versions of one item: only the active version shows as a row, and its siblings collapse into a tab bar at the bottom of that row. Use \"Fork as version\" on a note to start. Off by default — when off, no note is ever hidden by this feature and the commands do nothing.",
       () => this.plugin.settings.enableSheetVersions, (v) => { this.plugin.settings.enableSheetVersions = v; }, ["sheet", "version", "draft", "alternate", "fork"]));
     cats.listDisplay.push(toggle("Auto-open the detail panel", "Open the right-sidebar Stashpad detail panel automatically whenever a Stashpad view becomes active. The panel shows the cursored note's body, metadata, and children. Off = open manually via ribbon or command palette.",

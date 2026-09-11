@@ -8,7 +8,7 @@ import {
   archiveSubfolderOf, isArchiveSubfolderPath,
   isReservedSubfolderName,
   isInReservedSubfolder, writeCompletedFm,
-  type StashpadId, type TimeFilter, type TimeUnit, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy,
+  type StashpadId, type TimeFilter, type TimeUnit, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy, type ComposerDraft,
   type ListPinEdge, siftMatch,
 } from "./types";
 import { TreeIndex, collectMarkdown } from "./tree-index";
@@ -374,6 +374,11 @@ export class StashpadView extends ItemView {
   /** 0.281.0 (teams): the note the composer is currently replying to (one-shot). */
   private replyTarget: { id: StashpadId; title: string; path: string } | null = null;
   private replyChipHost: HTMLElement | null = null;
+  /** 0.319.0: composer drafts — the id of the draft this view's composer is
+   *  bound to (per folder; remembered per device in local storage), and the
+   *  host of the "N drafts" / "Editing: …" chip. */
+  private activeDraftId: string | null = null;
+  private draftsChipHost: HTMLElement | null = null;
   /** 0.237.0: obscured notes the user has revealed in THIS view. Deliberately
    *  in-memory and per-view — "revealed" is a viewing state, not a property of
    *  the note, so it must never be written to the file or shared with another
@@ -428,6 +433,8 @@ export class StashpadView extends ItemView {
   /** Mobile only (0.278.2): watches for overlays (modals/menus) that the composer
    *  textarea's native caret would paint over, so we can blur the composer. */
   private caretGuardObserver: MutationObserver | null = null;
+  /** 0.317.4: style observers on the two mobile drawers (see setupComposerCaretGuard #3). */
+  private drawerCaretObservers: MutationObserver[] = [];
   // Composer controls whose appearance depends on split/enter mode. Held so a
   // mode toggle can update them IN PLACE instead of a full render() (which
   // rebuilds the list — scroll jump + collapses the button group).
@@ -496,6 +503,13 @@ export class StashpadView extends ItemView {
    *  producing the flicker + landing a couple rows short (a stale loop pinning
    *  an old, shorter scrollHeight, or scrolling a now-detached list). */
   private scrollPinToken = 0;
+  /** 0.317.2 review (post root fix 0.316.8, on-device confirmed 2026-09-09): the
+   *  R1-era helpers below were re-evaluated. KEPT on purpose — `scrollPinToken`
+   *  (cancels stale settle loops; still correct), `hideListUntilSettled` + the
+   *  settle loop's 2-tick stable streak (they hide the empty→partial→full paint
+   *  of a fresh open, which is real content arrival, not the estimate bug).
+   *  REMOVED — the duplicated `|| stickToListBottom` in renderInner's legacy
+   *  and preserve branches (`prevAtBottom` folds the flag in at its definition). */
   /** 0.316.3 (R1): while true, a freshly opened / switched folder's list is
    *  rendered HIDDEN (opacity 0, layout intact so scrollHeight is measurable)
    *  until the first settled bottom-pin — so the empty→partial→full progressive
@@ -1085,7 +1099,12 @@ export class StashpadView extends ItemView {
       // typing — that'd erase their in-progress text mid-word. We only
       // clear the in-memory copy in that case; the next blur/submit
       // will re-persist whatever they're currently typing.
-      const persisted = this.plugin.settings.drafts?.[this.noteFolder] ?? "";
+      // 0.319.0: our bound draft may have been deleted elsewhere (submit in
+      // another tab, the drafts modal, another device) — drop the binding so the
+      // next save mints a fresh id instead of resurrecting the deleted one.
+      if (this.activeDraftId && !this.plugin.settings.composerDrafts?.[this.activeDraftId]) { this.activeDraftId = null; this.setDraftPointer(null); }
+      const persisted = this.activeDraft()?.text ?? "";
+      this.refreshDraftsChip();
       const liveText = this.composerInputEl?.value ?? "";
       if (persisted === "" && this.composerDraft !== "" && liveText === "") {
         this.composerDraft = "";
@@ -1703,6 +1722,8 @@ export class StashpadView extends ItemView {
     // registerDomEvent, auto-cleaned).
     this.caretGuardObserver?.disconnect();
     this.caretGuardObserver = null;
+    for (const mo of this.drawerCaretObservers) mo.disconnect();
+    this.drawerCaretObservers = [];
     // Cancel any pending debounced render so it can't fire post-close (the
     // render() isConnected guard also catches it — belt and suspenders). 0.140.9
     (this.debouncedRender as any)?.cancel?.();
@@ -2440,11 +2461,46 @@ export class StashpadView extends ItemView {
 
   // --- Per-folder composer drafts (one shared draft per Stashpad folder) ---
 
+  // 0.319.0: drafts are id-keyed entries in settings.composerDrafts (several per
+  // folder allowed: this device's, other devices' via sync, stashed text, an
+  // edit in progress). This view is BOUND to one of them per folder
+  // (`activeDraftId`, remembered per device). Everything the old per-folder
+  // string did still works; what's new is that nothing is ever silently
+  // overwritten — see .claude/TODO.md "editing model" for why.
+  private draftPointerKey(folder: string): string { return `stashpad-active-draft:${folder}`; }
+  private setDraftPointer(id: string | null): void {
+    try { this.app.saveLocalStorage(this.draftPointerKey(this.noteFolder), id); } catch { /* ignore */ }
+  }
+  private getDraftPointer(): string | null {
+    try { const v = this.app.loadLocalStorage(this.draftPointerKey(this.noteFolder)); return typeof v === "string" && v ? v : null; } catch { return null; }
+  }
+  /** Every draft for `folder`, newest-edited first. */
+  folderDrafts(folder: string = this.noteFolder): ComposerDraft[] {
+    return Object.values(this.plugin.settings.composerDrafts ?? {}).filter((d) => d.folder === folder).sort((a, b) => b.modified - a.modified);
+  }
+  activeDraft(): ComposerDraft | null {
+    return this.activeDraftId ? (this.plugin.settings.composerDrafts?.[this.activeDraftId] ?? null) : null;
+  }
+  private newDraftId(): string { return `${this.plugin.deviceId()}.${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`; }
+
   private async loadDraftsForFolder(): Promise<void> {
     if (this.draftsLoadedFor === this.noteFolder) return;
     this.draftsLoadedFor = this.noteFolder;
-    const all = this.plugin.settings.drafts ?? {};
-    this.composerDraft = all[this.noteFolder] ?? "";
+    const all = this.plugin.settings.composerDrafts ?? {};
+    // Bind: this device's remembered draft for the folder, else adopt the most
+    // recently edited one (a single draft synced from another device just works).
+    let id = this.getDraftPointer();
+    // Edit drafts are never adopted implicitly — they're resumed from the
+    // drafts modal — so a stopped edit can't hijack the composer.
+    if (!id || !all[id] || all[id].folder !== this.noteFolder) id = this.folderDrafts().find((d) => d.kind === "new")?.id ?? null;
+    this.activeDraftId = id;
+    this.setDraftPointer(id);
+    const d = id ? all[id] : null;
+    this.composerDraft = d?.text ?? "";
+    // The reply target rides along with the draft (it used to be lost on reload).
+    this.replyTarget = this.resolveDraftReply(d);
+    this.refreshReplyChip();
+    this.refreshDraftsChip();
     // 0.223.0: restore the bound append target alongside the draft. Resolved
     // against the tree, so a target deleted while we were away simply doesn't
     // come back (and the draft becomes an ordinary new note — the same
@@ -2458,7 +2514,14 @@ export class StashpadView extends ItemView {
       ? { id: saved!.id as StashpadId, label: saved!.label ?? savedFile.basename, path: saved!.path, folder: saved!.folder, mode: saved!.mode === "prepend" ? "prepend" : "append" }
       : null;
     this.refreshAppendButton();
-    console.debug("[Stashpad] loadDrafts", { folder: this.noteFolder, has: !!all[this.noteFolder], available: Object.keys(all) });
+    console.debug("[Stashpad] loadDrafts", { folder: this.noteFolder, bound: id, drafts: this.folderDrafts().length });
+  }
+
+  /** A draft's saved reply target, only if the note still exists. */
+  private resolveDraftReply(d: ComposerDraft | null | undefined): { id: StashpadId; title: string; path: string } | null {
+    const r = d?.replyTo;
+    if (!r?.path) return null;
+    return this.app.vault.getAbstractFileByPath(r.path) instanceof TFile ? { id: r.id as StashpadId, title: r.title, path: r.path } : null;
   }
 
   private async saveDraft(text: string): Promise<void> {
@@ -2474,24 +2537,185 @@ export class StashpadView extends ItemView {
     try {
       // Snapshot the folder we're saving for, in case noteFolder changes mid-await.
       const folder = this.noteFolder;
-      const existing = this.plugin.settings.drafts?.[folder] ?? "";
+      const all = this.plugin.settings.composerDrafts ?? {};
+      const cur = this.activeDraftId ? all[this.activeDraftId] : undefined;
+      const existing = cur?.text ?? "";
       // No-op when the slot already matches the desired state. Without
       // this, blur events from torn-down textareas during render would
       // fire saveDraft("") even though the slot was already empty,
       // looping through saveSettings → broadcast → render → blur and
       // producing a visible focus-border flicker on the new composer.
       if (existing === text) return;
-      const all = { ...(this.plugin.settings.drafts ?? {}) };
-      if (text.length === 0) delete all[folder];
-      else all[folder] = text;
-      this.plugin.settings.drafts = all;
+      const next = { ...all };
+      const now = Date.now();
+      if (text.length === 0) {
+        // Cleared: a NEW draft disappears; an EDIT draft keeps its identity with
+        // empty text (the edit itself is still in progress until saved/cancelled).
+        if (cur && cur.kind === "edit") next[cur.id] = { ...cur, text: "", modified: now };
+        else if (cur) { delete next[cur.id]; this.activeDraftId = null; this.setDraftPointer(null); }
+      } else {
+        const id = cur?.id ?? this.newDraftId();
+        next[id] = {
+          id, folder, text, modified: now,
+          created: cur?.created ?? now,
+          device: cur?.device ?? this.plugin.deviceId(),
+          kind: cur?.kind ?? "new",
+          ...(cur?.edit ? { edit: cur.edit } : {}),
+          replyTo: this.replyTarget ? { id: this.replyTarget.id, title: this.replyTarget.title, path: this.replyTarget.path } : null,
+        };
+        if (!cur) { this.activeDraftId = id; this.setDraftPointer(id); }
+      }
+      this.plugin.settings.composerDrafts = next;
       // Cleared drafts (post-submit) broadcast via saveSettings so OTHER
       // Stashpad tabs viewing the same folder drop their stale in-memory
       // composerDraft and don't write it back on the next blur. Mid-typing
       // saves stay quiet to avoid focus-stealing re-render storms.
       if (text.length === 0) await this.plugin.saveSettings();
       else await this.plugin.persistSettingsQuiet();
+      this.refreshDraftsChip();
     } catch (e) { console.warn("Stashpad: drafts save failed", e); }
+  }
+
+  /** 0.319.0: persist a metadata-only change (reply target set/cleared) onto
+   *  the bound draft without touching its text. No-op when nothing is bound. */
+  private async persistDraftMeta(): Promise<void> {
+    const cur = this.activeDraft();
+    if (!cur) return;
+    const replyTo = this.replyTarget ? { id: this.replyTarget.id, title: this.replyTarget.title, path: this.replyTarget.path } : null;
+    if (JSON.stringify(cur.replyTo ?? null) === JSON.stringify(replyTo)) return;
+    this.plugin.settings.composerDrafts = { ...(this.plugin.settings.composerDrafts ?? {}), [cur.id]: { ...cur, replyTo, modified: Date.now() } };
+    try { await this.plugin.persistSettingsQuiet(); } catch { /* ignore */ }
+  }
+
+  /** 0.319.0: bind the composer to draft `id` (from the drafts modal). Whatever
+   *  is in the composer now is flushed first, so it survives as its own draft. */
+  async switchToDraft(id: string): Promise<void> {
+    const d = this.plugin.settings.composerDrafts?.[id];
+    if (!d || d.folder !== this.noteFolder) { new Notice("That draft belongs to another folder."); return; }
+    await this.flushDrafts();
+    this.activeDraftId = id;
+    this.setDraftPointer(id);
+    this.composerDraft = d.text;
+    if (this.composerInputEl) this.composerInputEl.value = d.text;
+    this.replyTarget = this.resolveDraftReply(d);
+    this.refreshReplyChip();
+    this.refreshDraftsChip();
+    this.refreshDupPanel(d.text);
+    this.composerInputEl?.focus({ preventScroll: true });
+  }
+
+  /** 0.319.0: rebind to the folder's newest remaining draft (after a send, a
+   *  cancelled edit, a deletion) and put its text in the composer. */
+  private async rebindToNextDraft(): Promise<void> {
+    this.activeDraftId = null;
+    this.setDraftPointer(null);
+    this.draftsLoadedFor = null;
+    await this.loadDraftsForFolder();
+    if (this.composerInputEl) this.composerInputEl.value = this.composerDraft;
+    this.refreshDupPanel(this.composerDraft);
+  }
+
+  /** Render (or clear) the composer's drafts chip: "Editing: <title> ✕" while an
+   *  edit is bound, and/or "N drafts" when the folder holds more than the bound one. */
+  private refreshDraftsChip(): void {
+    const host = this.draftsChipHost;
+    if (!host) return;
+    host.empty();
+    const cur = this.activeDraft();
+    const others = this.folderDrafts().filter((d) => d.id !== cur?.id);
+    const show = (cur?.kind === "edit") || others.length > 0;
+    host.toggleClass("is-active", show);
+    if (!show) return;
+    if (cur?.kind === "edit") {
+      const chip = host.createDiv({ cls: "stashpad-reply-chip stashpad-draft-chip is-edit" });
+      const top = chip.createDiv({ cls: "stashpad-reply-chip-top" });
+      setIcon(top.createSpan({ cls: "stashpad-reply-chip-icon" }), "pencil-line");
+      top.createSpan({ cls: "stashpad-reply-chip-label", text: "Editing" });
+      const x = top.createEl("button", { cls: "stashpad-reply-chip-x" });
+      setIcon(x, "x");
+      x.setAttr("aria-label", "Stop editing");
+      x.title = "Stop editing — the note is left unchanged; changed text is kept in Drafts";
+      x.onclick = (e) => { e.preventDefault(); void this.cancelComposerEdit(); };
+      chip.createDiv({ cls: "stashpad-reply-chip-title", text: cur.edit?.title || "note" });
+      chip.createDiv({ cls: "stashpad-draft-chip-hint", text: "Send saves the note. R on another note makes it a reply." });
+    }
+    if (others.length > 0) {
+      const b = host.createEl("button", { cls: "stashpad-draft-count", text: `${others.length + (cur ? 1 : 0)} drafts` });
+      b.title = "Review this folder's drafts";
+      b.onmousedown = (e) => e.preventDefault();
+      b.onclick = (e) => { e.preventDefault(); this.plugin.openComposerDrafts(this.noteFolder); };
+    }
+  }
+
+  // --- 0.319.0: edit-in-composer PROVISION (command-only; UX undecided) ---
+
+  /** Put `node`'s body in the composer as an EDIT draft. The current composer
+   *  text (if any) is flushed and kept as its own draft. */
+  async beginComposerEdit(node?: TreeNode): Promise<void> {
+    const target = node ?? this.resolveActionTarget();
+    if (!target?.file) { new Notice("Pick a note to edit."); return; }
+    const file = target.file;
+    const md = await this.app.vault.read(file);
+    const body = this.stripFrontmatter(md).replace(/\s+$/, "");
+    await this.flushDrafts();
+    const id = this.newDraftId();
+    const now = Date.now();
+    const draft: ComposerDraft = {
+      id, folder: this.noteFolder, text: body, created: now, modified: now, device: this.plugin.deviceId(), kind: "edit",
+      edit: { id: target.id, path: file.path, title: this.titleForNode(target).trim() || "(untitled)", openMd: md },
+      replyTo: null,
+    };
+    this.plugin.settings.composerDrafts = { ...(this.plugin.settings.composerDrafts ?? {}), [id]: draft };
+    try { await this.plugin.persistSettingsQuiet(); } catch { /* ignore */ }
+    this.activeDraftId = id;
+    this.setDraftPointer(id);
+    this.composerDraft = body;
+    if (this.composerInputEl) this.composerInputEl.value = body;
+    this.replyTarget = null;
+    this.refreshReplyChip();
+    this.refreshDraftsChip();
+    this.focusComposerOnNextRender = true;
+    this.composerInputEl?.focus({ preventScroll: true });
+  }
+
+  /** Stop editing without writing the note. 0.319.1 (loss-proofing): if the
+   *  text was CHANGED it stays in the drafts list as an edit draft ("Resume
+   *  editing" in the modal); an untouched edit is simply dropped. Then rebind
+   *  to the folder's newest plain draft — i.e. whatever the composer held
+   *  before the edit began comes back. */
+  async cancelComposerEdit(): Promise<void> {
+    const cur = this.activeDraft();
+    if (cur?.kind !== "edit") return;
+    const live = this.composerInputEl?.value ?? cur.text;
+    const original = this.stripFrontmatter(cur.edit?.openMd ?? "").replace(/\s+$/, "");
+    const dirty = live.replace(/\s+$/, "") !== original;
+    const all = { ...(this.plugin.settings.composerDrafts ?? {}) };
+    if (dirty) all[cur.id] = { ...cur, text: live, modified: Date.now(), replyTo: this.replyTarget ? { id: this.replyTarget.id, title: this.replyTarget.title, path: this.replyTarget.path } : null };
+    else delete all[cur.id];
+    this.plugin.settings.composerDrafts = all;
+    try { await this.plugin.saveSettings(); } catch { /* ignore */ }
+    if (dirty) new Notice("Your changes are kept in Drafts (\u201cResume editing\u201d).");
+    this.replyTarget = null;
+    this.refreshReplyChip();
+    await this.rebindToNextDraft();
+  }
+
+  /** Send while an EDIT draft is bound = save the note's body through the same
+   *  chokepoint the edit modal uses, then apply a pending reply target. Returns
+   *  false when the save was refused (text is put back in the composer). */
+  private async submitComposerEdit(draft: ComposerDraft, text: string): Promise<boolean> {
+    const edit = draft.edit!;
+    const node = this.tree.get(edit.id as StashpadId);
+    if (!node?.file) { new Notice("The note being edited is gone — the text stays in the composer."); return false; }
+    const ok = await this.writeEditedBody(node, edit.openMd, text);
+    if (!ok) return false;
+    if (this.replyTarget) { await this.setReplyLink(node, this.replyTarget); this.replyTarget = null; this.refreshReplyChip(); }
+    const all = { ...(this.plugin.settings.composerDrafts ?? {}) };
+    delete all[draft.id];
+    this.plugin.settings.composerDrafts = all;
+    try { await this.plugin.saveSettings(); } catch { /* ignore */ }
+    await this.rebindToNextDraft();
+    return true;
   }
 
   private async recordLastSubmitted(text: string): Promise<void> {
@@ -2501,15 +2725,6 @@ export class StashpadView extends ItemView {
       this.plugin.settings.lastSubmitted = all;
       await this.plugin.persistSettingsQuiet();
     } catch { /* ignore */ }
-  }
-
-  /** True if there's a saved draft for this folder that's worth offering to restore. */
-  private hasRestorableDraft(): boolean {
-    const saved = this.plugin.settings.drafts?.[this.noteFolder];
-    if (!saved || !saved.trim()) return false;
-    const last = this.plugin.settings.lastSubmitted?.[this.noteFolder];
-    if (last && last === saved) return false; // Auto-clear didn't land but the text was just sent.
-    return true;
   }
 
   /** Kept as a no-op (called from old call sites). The per-folder draft doesn't change with focus. */
@@ -4020,15 +4235,17 @@ export class StashpadView extends ItemView {
           // the anchor row's offset and the view jitters.
           if (legacyPinBottom) {
             this.scrollListToBottom();
-          } else if (prevAtBottom || this.stickToListBottom) {
+          } else if (prevAtBottom) {
             // 0.59.6: use scrollListToBottom (with its multi-frame
             // settle watchdog) instead of a one-shot scrollTop set.
             // The async markdown re-render of the just-mutated row
             // shifts the row height a few hundred ms later; the
             // watchdog keeps re-pinning until layout stabilises.
             //
-            // 0.316.7 (R1): ALSO re-pin when stickToListBottom holds even if
-            // prevAtBottom is false. The reconcile pass fires a PRESERVE render
+            // 0.316.7 (R1): re-pin when stickToListBottom holds even if the
+            // pixel test is false (0.317.2: `prevAtBottom` already folds the
+            // flag in at its definition, so the extra `|| stickToListBottom`
+            // that shipped here was dead and is gone). The reconcile pass fires a PRESERVE render
             // ~1.5s after a folder switch that renders the real (much taller)
             // note bodies — growing scrollHeight by thousands of px. By then the
             // scroll had drifted a little so prevAtBottom read false, and this
@@ -4140,7 +4357,7 @@ export class StashpadView extends ItemView {
       this.scrollToBottomOnNextRender = false;
       this.plugin.trace("r1:legacy", { branch: "flag", stick: this.stickToListBottom });
       this.scrollListToBottom();
-    } else if (this.listEl && (prevAtBottom || this.stickToListBottom)) {
+    } else if (this.listEl && prevAtBottom) {
       // Was at bottom — re-pin to the *new* bottom and arm the
       // scrollHeight watchdog scrollListToBottom uses (0.293.0: was a
       // per-row ResizeObserver), so async markdown / font / image
@@ -4149,7 +4366,9 @@ export class StashpadView extends ItemView {
       // markdown is still parsing.
       //
       // 0.315.1 (R1 mix fix): also re-pin when `stickToListBottom` is set even
-      // if `prevAtBottom` reads false. After a folder switch (folder panel then
+      // if the pixel test reads false (0.317.2: that is `prevAtBottom`'s own
+      // definition now, so the duplicated `|| stickToListBottom` here is gone).
+      // After a folder switch (folder panel then
       // switcher, or vice-versa) an async re-render — tree rebuild / frontmatter
       // sync finishing — can fire while the settle loop is still climbing to the
       // new bottom, so prevScroll is mid-list and prevAtBottom is false. Falling
@@ -6663,6 +6882,9 @@ export class StashpadView extends ItemView {
     if (node.file) {
       menu.addItem((it: any) => it.setTitle("React…").setIcon("smile-plus").onClick(() => { onAction?.(); this.cmdReact(node); }));
       menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => { onAction?.(); this.cmdReply(node); }));
+      // 0.317.0: retro-link an existing note as a reply (+ remove when it is one).
+      menu.addItem((it: any) => it.setTitle("Make a reply to\u2026").setIcon("corner-up-left").onClick(() => { onAction?.(); this.cmdReplyLinkPicker(node); }));
+      if (this.hasReplyLink(node)) menu.addItem((it: any) => it.setTitle("Remove reply link").setIcon("unlink").onClick(() => { onAction?.(); void this.setReplyLink(node, null); }));
       menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => { onAction?.(); void this.cmdEdit(node); }));
       menu.addItem((it: any) => it.setTitle("Open in Obsidian editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
     }
@@ -8149,6 +8371,23 @@ export class StashpadView extends ItemView {
       const w = window.innerWidth;
       if (t.clientX <= EDGE || t.clientX >= w - EDGE) this.blurComposerCaret();
     }, { capture: true, passive: true });
+    // (3) 0.317.4: ANY drawer motion. The edge heuristic in (2) missed the cases
+    //     the user still hits — iOS Obsidian opens a drawer from a swipe that
+    //     starts well inside the content, and from the navbar buttons — so the
+    //     caret still showed above the left drawer. Both drawers animate via an
+    //     inline `style` (transform/transition, also during a live swipe), so a
+    //     style-attribute observer on their containers fires on the first frame
+    //     of any open, whatever started it. Blur is a no-op when the composer
+    //     isn't focused, so the close-side mutations cost nothing.
+    for (const mo of this.drawerCaretObservers) mo.disconnect();
+    this.drawerCaretObservers = [];
+    const ws = this.app.workspace as unknown as { leftSplit?: { containerEl?: HTMLElement }; rightSplit?: { containerEl?: HTMLElement } };
+    for (const el of [ws.leftSplit?.containerEl, ws.rightSplit?.containerEl]) {
+      if (!(el instanceof HTMLElement)) continue;
+      const mo = new MutationObserver(() => this.blurComposerCaret());
+      mo.observe(el, { attributes: true, attributeFilter: ["style"] });
+      this.drawerCaretObservers.push(mo);
+    }
   }
 
   /** 0.281.0 (teams): start a reply to `node` — the next composer send becomes a
@@ -8263,11 +8502,117 @@ export class StashpadView extends ItemView {
     if (!target?.file) { new Notice("Pick a note to reply to."); return; }
     this.replyTarget = { id: target.id, title: this.titleForNode(target).trim() || "(untitled)", path: target.file.path };
     this.refreshReplyChip();
+    void this.persistDraftMeta(); // 0.319.0: rides along with the draft
     // 0.302.0: reply is an EXPLICIT action (button or R key) — always focus the
     // composer so the user can type the reply immediately, regardless of the
     // "focus composer on open" preference (focusComposer() self-gates on it).
     this.focusComposerOnNextRender = true;
     this.composerInputEl?.focus({ preventScroll: true });
+  }
+
+  /** 0.317.0: does this note carry a reply link? (cheap cache read) */
+  hasReplyLink(node: TreeNode): boolean {
+    if (!node.file) return false;
+    const raw = this.app.metadataCache.getFileCache(node.file)?.frontmatter?.replyTo;
+    return typeof raw === "string" && raw.length > 0;
+  }
+
+  /** 0.317.0: the display title of a note's current reply target (null = not a reply). */
+  replyLinkTitleForNode(node: TreeNode): string | null {
+    if (!node.file) return null;
+    const raw = this.app.metadataCache.getFileCache(node.file)?.frontmatter?.replyTo;
+    if (typeof raw !== "string" || !raw) return null;
+    return this.replyLinkTitle(raw) || raw;
+  }
+
+  /** 0.317.0: make an EXISTING note a reply to `target`, or clear its reply link
+   *  when `target` is null. Writes the SAME frontmatter the composer stamps on a
+   *  new reply (`replyTo` wikilink + `replyToBlurb`), so the row's "Reply to"
+   *  quote and jump-to-source behave identically. One undo entry; logged as
+   *  `reply_link`. Resolves to the target's title when something was written,
+   *  null when the link was removed, undefined when nothing changed. */
+  async setReplyLink(node: TreeNode, target: { id: StashpadId; title: string; path: string } | null): Promise<string | null | undefined> {
+    const file = node.file;
+    if (!file) return undefined;
+    if (target && target.path === file.path) { new Notice("A note can't be a reply to itself."); return undefined; }
+    const fmNow = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    const prev = {
+      link: typeof fmNow?.replyTo === "string" && fmNow.replyTo ? (fmNow.replyTo as string) : null,
+      blurb: typeof fmNow?.replyToBlurb === "string" ? (fmNow.replyToBlurb as string) : null,
+    };
+    const payload = target ? this.buildReplyPayload(target) : null;
+    const next = payload ? { link: payload.link, blurb: payload.blurb || null } : null;
+    if (!next && !prev.link) { new Notice("This note isn't a reply."); return undefined; }
+    if (next && next.link === prev.link) return undefined;
+    const id = node.id, path = file.path, folder = this.noteFolder;
+    const apply = async (v: { link: string | null; blurb: string | null }): Promise<void> => {
+      // id-first lookup: the note may have been re-slugged since (0.211.4 lesson).
+      const f = this.fileForNote(id, path);
+      if (!f) throw new Error("note not found");
+      this.markFmSelfWrite(f.path); // the modify event re-renders the row's quote
+      await this.app.fileManager.processFrontMatter(f, (fm) => {
+        if (v.link) {
+          fm.replyTo = v.link;
+          if (v.blurb) fm.replyToBlurb = v.blurb; else delete fm.replyToBlurb;
+        } else {
+          delete fm.replyTo;
+          delete fm.replyToBlurb;
+        }
+      });
+    };
+    const cleared = { link: null, blurb: null };
+    try { await apply(next ?? cleared); }
+    catch (e) { new Notice(`Couldn't update the reply link: ${(e as Error).message}`); return undefined; }
+    void this.log.append({ type: "reply_link", id, payload: { path, replyTo: next?.link ?? null, was: prev.link } });
+    new Notice(next ? `Now a reply to "${target!.title}".` : "Reply link removed.");
+    this.plugin.getUndoStack(folder).push({
+      label: next ? (prev.link ? "Change reply link" : "Make reply") : "Remove reply link",
+      undo: () => apply(prev),
+      redo: () => apply(next ?? cleared),
+    });
+    return next ? target!.title : null;
+  }
+
+  /** 0.317.0: a picker result as a reply target (local or cross-folder). */
+  private pickerItemAsReplyTarget(item: import("./note-picker").PickerItem): { id: StashpadId; title: string; path: string } | null {
+    if (item.kind !== "note") return null;
+    if (item.crossFolder && item.crossFile) {
+      const rawId = item.crossId ?? item.id.replace(/^cross:[^:]*:/, "");
+      return { id: rawId, title: (item.label || item.crossFile.basename).trim() || "(untitled)", path: item.crossFile.path };
+    }
+    if (!item.node?.file) return null;
+    return { id: item.node.id, title: this.titleForNode(item.node).trim() || "(untitled)", path: item.node.file.path };
+  }
+
+  /** 0.317.0: "Make a reply to…" — pick the note an EXISTING note should reply
+   *  to (context menu, command, edit-surface chip). `onDone` fires with the new
+   *  target title after a successful write (the chip repaints from it). */
+  cmdReplyLinkPicker(node?: TreeNode): void {
+    const target = node ?? this.getActionTargets()[0] ?? (this.headingNode() ?? undefined);
+    if (!target?.file) { new Notice("Pick a note first."); return; }
+    this.pickReplyTarget(target, (t) => { void this.setReplyLink(target, t); });
+  }
+
+  /** 0.317.1: open the "reply to which note?" picker for `target` and hand the
+   *  chosen note back WITHOUT writing — the context menu writes at once, the
+   *  edit surface keeps it pending until Save. */
+  private pickReplyTarget(target: TreeNode, onPicked: (t: { id: StashpadId; title: string; path: string }) => void): void {
+    const title = this.titleForNode(target).trim() || "(untitled)";
+    new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+      mode: "pick",
+      placeholder: `Make \u201c${title}\u201d a reply to which note?`,
+      // 0.317.1 (user): this folder's notes newest → oldest by CREATED date, home
+      // not floated (it is the oldest note and rarely the reply target).
+      recency: "created",
+      pinHomes: false,
+      crossFolderNotes: () => this.collectCrossFolderDestinations(),
+      onPick: (item) => {
+        const t = this.pickerItemAsReplyTarget(item);
+        if (!t) return;
+        if (t.path === target.file?.path) { new Notice("A note can't be a reply to itself."); return; }
+        onPicked(t);
+      },
+    }).open();
   }
 
   /** Render (or clear) the composer's reply chip from replyTarget. */
@@ -8284,9 +8629,11 @@ export class StashpadView extends ItemView {
     const top = chip.createDiv({ cls: "stashpad-reply-chip-top" });
     setIcon(top.createSpan({ cls: "stashpad-reply-chip-icon" }), "reply");
     top.createSpan({ cls: "stashpad-reply-chip-label", text: "Reply to" });
-    const x = top.createEl("button", { cls: "stashpad-reply-chip-x", text: "\u2715" });
+    const x = top.createEl("button", { cls: "stashpad-reply-chip-x" });
+    setIcon(x, "x");
+    x.setAttr("aria-label", "Cancel reply");
     x.title = "Cancel reply";
-    x.onclick = () => { this.replyTarget = null; this.refreshReplyChip(); };
+    x.onclick = () => { this.replyTarget = null; this.refreshReplyChip(); void this.persistDraftMeta(); };
     const title = chip.createSpan({ cls: "stashpad-reply-chip-title", text: t.title.length > 80 ? t.title.slice(0, 80) + "\u2026" : t.title });
     title.title = "Open this note";
     title.onclick = () => {
@@ -8422,6 +8769,9 @@ export class StashpadView extends ItemView {
     // though replyTarget was still set, so a reply set before the rebuild
     // stopped showing its quote (F4b: "subsequent replies don't render").
     if (this.replyTarget) this.refreshReplyChip();
+    // 0.319.0: "Editing: …" / "N drafts" chip row (same slot as the reply chip).
+    this.draftsChipHost = composer.createDiv({ cls: "stashpad-drafts-chip-host" });
+    this.refreshDraftsChip();
     this.dupPanelHost = composer.createDiv({ cls: "stashpad-dup-panel" });
     if (this.composerDraft) this.refreshDupPanel(this.composerDraft);
     this.composerRootEl = composer;
@@ -8998,6 +9348,14 @@ export class StashpadView extends ItemView {
     const submit = async () => {
       const text = ta.value.trim();
       if (!text) return;
+      // 0.319.0: an EDIT draft is bound → Send saves that note instead of creating one.
+      const bound = this.activeDraft();
+      if (bound?.kind === "edit") {
+        this.debouncedSaveDraft?.cancel();
+        const ok = await this.submitComposerEdit(bound, text);
+        if (ok && getSettings().autofocusComposerAfterSend) this.composerInputEl?.focus();
+        return;
+      }
       ta.value = "";
       this.composerDraft = "";
       // 0.298.0: a trailing dup-search debounce armed by the last keystroke
@@ -11851,6 +12209,19 @@ export class StashpadView extends ItemView {
     return [...roots, ...notes];
   }
 
+  /** 0.317.3: a cross-folder note's display title without a TreeNode —
+   *  heading → first cached body line → filename slug (mirrors titleForNode,
+   *  minus the memo). `slugOnly` tells the picker the title is a fallback it
+   *  may upgrade once it lazy-reads the body. */
+  private crossTitleForFile(file: TFile): string {
+    const heading = this.app.metadataCache.getFileCache(file)?.headings?.[0]?.heading;
+    if (heading) { const s = stripInlineMarkdown(heading); if (s) return s; }
+    const text = this.plugin.renderCacheStore.get(file.path)?.text;
+    const firstLine = text?.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+    if (firstLine) { const s = stripInlineMarkdown(firstLine); if (s) return s; }
+    return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
+  }
+
   private collectCrossFolderNotes(folderList?: string[]): import("./note-picker").CrossFolderNote[] {
     const out: import("./note-picker").CrossFolderNote[] = [];
     const folders = (folderList ?? this.plugin.searchableFolders(this.noteFolder))
@@ -11884,9 +12255,12 @@ export class StashpadView extends ItemView {
         // the synthetic "Home — <folder>" entry in
         // `collectCrossFolderDestinations` so it doesn't appear twice.
         if (id === ROOT_ID) continue;
-        const title = file.basename
-          .replace(/-[a-z0-9]{4,12}$/, "")
-          .replace(/-/g, " ");
+        // 0.317.3: derive the title the way titleForNode does for LOCAL notes
+        // (first heading → first cached body line → filename slug). The slug
+        // alone ("Top Level Note 5 Beta" for "Top-level note 5 in Beta.") never
+        // equals the real title, so an exact-title search across folders
+        // could not reach the top band and sat behind local body hits.
+        const title = this.crossTitleForFile(file);
         // Parent blurb: try to read the parent file synchronously from
         // the metadataCache (no body — the picker will fill it later
         // via cachedRead for the row's main body).
@@ -17170,7 +17544,22 @@ export class StashpadView extends ItemView {
    *  Second part becomes a new sibling with no children. */
   /** 0.170.0: also the entry for the in-app EDIT surface — `surface: "edit"` opens
    *  the same modal on the Edit tab (edits + Save), which can toggle to Split. */
-  cmdEdit(node?: TreeNode, onClosed?: () => void): Promise<void> { return this.cmdSplit(node, "edit", onClosed); }
+  /** 0.319.1: "Edit" picks its surface by the note's length (settings
+   *  editRouting, per platform): composer (opt-in) → modal → workbench tab →
+   *  Obsidian's editor. */
+  async cmdEdit(node?: TreeNode, onClosed?: () => void): Promise<void> {
+    const target = node ?? this.resolveActionTarget();
+    if (!target?.file) { new Notice("Pick a note to edit."); onClosed?.(); return; }
+    const r = this.plugin.settings.editRouting;
+    const lim = Platform.isMobile ? r.mobile : r.desktop;
+    let len = 0;
+    try { len = this.stripFrontmatter(await this.app.vault.cachedRead(target.file)).trim().length; } catch { /* fall through to the modal */ }
+    if (r.toComposer && len <= lim.composer) { await this.beginComposerEdit(target); onClosed?.(); return; }
+    if (len <= lim.modal) return this.cmdSplit(target, "edit", onClosed, "modal");
+    if (len <= lim.tab) return this.cmdSplit(target, "edit", onClosed, "tab");
+    await this.openFileAtEnd(target.file);
+    onClosed?.();
+  }
 
   /** 0.276.8: edit a MULTI-selection one note at a time — a slot queue. Opens the
    *  edit modal for note 1; when it closes (saved OR dismissed), the next opens,
@@ -17259,7 +17648,151 @@ export class StashpadView extends ItemView {
     return this.cmdEdit(focused);
   }
 
-  async cmdSplit(node?: TreeNode, surface: "edit" | "split" = "split", onClosed?: () => void): Promise<void> {
+  /** 0.170.0: write an edited body back to `target` (frontmatter preserved from a
+   *  FRESH read), as one undo entry. 0.319.0: lifted out of cmdSplit so the
+   *  edit modal, the popped-out tab AND the composer's edit draft share the
+   *  one chokepoint (divergence prompt, self-write markers, reslug, log, undo).
+   *  `openMd` = the note as it was when editing began (divergence baseline +
+   *  undo target). Resolves false when the save was REFUSED (empty body,
+   *  truncated frontmatter, user cancelled the divergence prompt). */
+  async writeEditedBody(target: TreeNode, openMd: string, newBody: string): Promise<boolean> {
+    const file = target.file!;
+    const originalPath = file.path;
+    const originalContent = openMd;
+    const _editT0 = performance.now(); // 0.279.29 diag (perf flag)
+    const nb = newBody.replace(/\s+$/, "");
+    if (!nb.trim()) { new Notice("Can't save an empty note."); return false; }
+
+    // 0.210.6: take the frontmatter from a FRESH read, never from the snapshot
+    // taken when the surface opened.
+    //
+    // The old code spliced `md` (read at open time) back together with the new
+    // body and overwrote the whole file. Anything that touched the note's
+    // frontmatter while the editor sat open was therefore silently reverted on
+    // Save — and the most frequent writer is Stashpad ITSELF: FrontmatterSyncQueue
+    // writing parentLink/children, a color change, a completed toggle, a drag
+    // that rewrites `parent`, an author contribution stamp. Reverting `parent`
+    // moves the note back under its old parent on disk.
+    //
+    // Re-reading fixes the whole self-write class outright, because we only ever
+    // write OUR body onto THEIR frontmatter. A concurrent BODY edit is the one
+    // case that cannot be merged, so it asks instead of picking a winner.
+    const current = await this.app.vault.read(file);
+    const fresh = this.splitFrontmatterForWrite(current, originalPath);
+    if (!fresh) return false;   // truncated frontmatter — refuse rather than orphan the note
+    const openSplit = this.splitFrontmatterForWrite(openMd, originalPath);
+    const freshBody = fresh.body.replace(/\s+$/, "");
+    const openBody = (openSplit?.body ?? "").replace(/\s+$/, "");
+    if (freshBody !== openBody && freshBody !== nb) {
+      const proceed = await new Promise<boolean>((resolve) => {
+        new ConfirmModal(
+          this.app,
+          "This note changed while you were editing",
+          `"${this.titleForNode(target)}" was modified somewhere else (another window, a synced device, or a collaborator) after you opened it here.\n\n`
+          + "Saving now replaces their version of the text with yours. Their edit is not merged.\n\n"
+          + "Cancel keeps both: nothing is written, and your text stays in the editor so you can copy it out.",
+          "Overwrite with my version",
+          // Single callback taking the choice; ConfirmModal reports Escape and
+          // overlay-clicks as Cancel, so this always resolves.
+          (confirmed: boolean) => resolve(confirmed),
+          "Cancel (keep both)",
+        ).open();
+      });
+      if (!proceed) return false;
+    }
+    const fm = fresh.fm;
+    const newContent = fm + (fm ? "\n" : "") + nb + "\n";
+    if (newContent === current) return true; // no change
+    // 0.275.0: mark this as our own body write so onFileModify doesn't log it
+    // as an external edit. The modify event carries the CURRENT path (rename,
+    // if any, comes after), so mark originalPath.
+    // 0.291.0 (perf): `owned` — this save does its OWN evict + slug decision +
+    // repaint below, so onFileModify must not repeat any of them. Before this,
+    // one save cost a full render HERE plus a second slug rename, a second
+    // evict and a second repaint from the modify handler.
+    this.markBodySelfWrite(originalPath, true);
+    await this.app.vault.modify(file, newContent);
+    // 0.291.0 (perf): evict here (not in onFileModify) so the repaint below
+    // reads fresh content whichever order the modify event lands in.
+    this.bodyRenderer.evict(file);
+    // 0.170.2: re-slug the filename to match the new first line (user chose auto-rename).
+    // 0.291.0 (perf): still called unconditionally — reslugFile is a pure function
+    // of the first non-empty line (bodyToSlug reads only that) and returns early
+    // when `file.name` already matches, so an unchanged first line costs a cache
+    // lookup and no vault I/O. Gating it on `firstLineChanged` instead would drop
+    // the drift-healing case (stop-word setting changed, an earlier rename failed)
+    // now that onFileModify no longer schedules a second slug rename for our write.
+    const renamedTo = await this.reslugFile(file, nb);
+    const finalPath = renamedTo ?? originalPath;
+    // 0.291.1: the marker was keyed on the PRE-rename path. If the modify
+    // event lands after the rename, onFileModify looks up the new path, misses,
+    // and treats our own save as an external edit (spurious log + the full
+    // cascade). Move the marker along — but only while it is still unconsumed,
+    // so a modify that already landed under the old path can't leave a stale
+    // "owned" entry that would swallow a genuine external edit seconds later.
+    if (renamedTo) {
+      const pending = this.recentBodySelfWrites.get(originalPath);
+      if (pending) { this.recentBodySelfWrites.delete(originalPath); this.recentBodySelfWrites.set(renamedTo, pending); }
+    }
+    // 0.274.0: record the in-app edit so the activity heatmap can count it.
+    // `external_edit` covers writes from elsewhere; this is the matching entry
+    // for edits made through Stashpad's own editor (which are self-writes and
+    // otherwise leave no log trace).
+    void this.log.append({ type: "edit", id: target.id, payload: { path: finalPath } });
+    // 0.291.0 (perf): a body edit changes no structure, so the O(N) tree rebuild +
+    // full render only earn their cost when the row's ORDER (or its path) can move.
+    // The row renders its title and body as one `.stashpad-note-body-content`
+    // block — there is no separate title element — so repaintRowBody already
+    // refreshes the visible title. What it cannot fix is the row's POSITION, hence
+    // the fall-backs below. Note `performEdit` never creates a note (the split
+    // paths are performSplit / createNoteUnder, which keep rebuild + render), and
+    // it preserves frontmatter verbatim, so completion/task state — and therefore
+    // `hideCompletedNotes` visibility — cannot change here.
+    const firstLine = (s: string): string => (s.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
+    const firstLineChanged = firstLine(freshBody) !== firstLine(nb);
+    const sortMode = this.sortStore.getMode(this.noteFolder, target.parent ?? ROOT_ID);
+    const orderMayChange = renamedTo !== null
+      // title sort reads titleForNode → the first heading/first body line.
+      || (firstLineChanged && (sortMode === "title-az" || sortMode === "title-za"))
+      // modified sort reads the `modified` frontmatter, which the fmSync pass
+      // stamps after this write — position can move on ANY edit.
+      || sortMode === "modified-asc" || sortMode === "modified-desc";
+    if (orderMayChange) {
+      this.tree.rebuild(this.noteFolder);
+      this.render();
+    } else if (!this.repaintRowBody(file)) {
+      // off-screen, or the row isn't repaintable → full render, debounced.
+      this.debouncedRender();
+    }
+    perf.record("edit.save.total", performance.now() - _editT0); // 0.279.29 diag (perf flag)
+    this.plugin.notifications.show({
+      message: `Saved "${this.titleForNode(target)}"`, kind: "success", category: "split",
+      affectedIds: [target.id], folder: this.noteFolder,
+    });
+    const folder = this.noteFolder;
+    this.plugin.getUndoStack(folder).push({
+      label: "Edit note",
+      // 0.211.4: same stale-path class as H6. A save can trigger an auto-reslug, so
+      // by the time undo runs the note may sit at neither finalPath nor originalPath;
+      // a path-only lookup then silently no-ops while the undo stack advances, and
+      // the user's edit is unrecoverable through undo. Resolve id-first.
+      undo: async () => {
+        const f = this.fileForNote(target.id, finalPath) ?? this.fileForNote(target.id, originalPath);
+        if (!f) { new Notice("Can't undo the edit — that note was moved or deleted."); return; }
+        if (f.path !== originalPath) { try { await this.app.fileManager.renameFile(f, originalPath); } catch { /* ignore */ } }
+        await this.app.vault.modify(f, originalContent);
+        this.tree.rebuild(folder); this.render();
+      },
+      redo: async () => {
+        const f = this.fileForNote(target.id, originalPath);
+        if (f) { await this.app.vault.modify(f, newContent); if (f.path !== finalPath) { try { await this.app.fileManager.renameFile(f, finalPath); } catch { /* ignore */ } } }
+        this.tree.rebuild(folder); this.render();
+      },
+    });
+    return true;
+  }
+
+  async cmdSplit(node?: TreeNode, surface: "edit" | "split" = "split", onClosed?: () => void, host: "modal" | "tab" = "modal"): Promise<void> {
     const target = node ?? this.resolveActionTarget();
     if (!target?.file) { new Notice(surface === "edit" ? "Pick a note to edit." : "Pick a note to split."); onClosed?.(); return; }
     const file = target.file;
@@ -17276,140 +17809,8 @@ export class StashpadView extends ItemView {
     // — a path-only lookup returns null after the reslug, and the undo then trashed
     // the split-off half while never restoring the original's pre-split body.
     const originalId = target.id;
-    // 0.170.0: Edit-surface Save — write the edited body back to the note (frontmatter
-    // preserved), as one undo entry.
-    const performEdit = async (newBody: string): Promise<void> => {
-      const _editT0 = performance.now(); // 0.279.29 diag (perf flag)
-      const nb = newBody.replace(/\s+$/, "");
-      if (!nb.trim()) { new Notice("Can't save an empty note."); return; }
-
-      // 0.210.6: take the frontmatter from a FRESH read, never from the snapshot
-      // taken when the surface opened.
-      //
-      // The old code spliced `md` (read at open time) back together with the new
-      // body and overwrote the whole file. Anything that touched the note's
-      // frontmatter while the editor sat open was therefore silently reverted on
-      // Save — and the most frequent writer is Stashpad ITSELF: FrontmatterSyncQueue
-      // writing parentLink/children, a color change, a completed toggle, a drag
-      // that rewrites `parent`, an author contribution stamp. Reverting `parent`
-      // moves the note back under its old parent on disk.
-      //
-      // Re-reading fixes the whole self-write class outright, because we only ever
-      // write OUR body onto THEIR frontmatter. A concurrent BODY edit is the one
-      // case that cannot be merged, so it asks instead of picking a winner.
-      const current = await this.app.vault.read(file);
-      const fresh = this.splitFrontmatterForWrite(current, originalPath);
-      if (!fresh) return;   // truncated frontmatter — refuse rather than orphan the note
-      const openSplit = this.splitFrontmatterForWrite(md, originalPath);
-      const freshBody = fresh.body.replace(/\s+$/, "");
-      const openBody = (openSplit?.body ?? "").replace(/\s+$/, "");
-      if (freshBody !== openBody && freshBody !== nb) {
-        const proceed = await new Promise<boolean>((resolve) => {
-          new ConfirmModal(
-            this.app,
-            "This note changed while you were editing",
-            `"${this.titleForNode(target)}" was modified somewhere else (another window, a synced device, or a collaborator) after you opened it here.\n\n`
-            + "Saving now replaces their version of the text with yours. Their edit is not merged.\n\n"
-            + "Cancel keeps both: nothing is written, and your text stays in the editor so you can copy it out.",
-            "Overwrite with my version",
-            // Single callback taking the choice; ConfirmModal reports Escape and
-            // overlay-clicks as Cancel, so this always resolves.
-            (confirmed: boolean) => resolve(confirmed),
-            "Cancel (keep both)",
-          ).open();
-        });
-        if (!proceed) return;
-      }
-      const fm = fresh.fm;
-      const newContent = fm + (fm ? "\n" : "") + nb + "\n";
-      if (newContent === current) return; // no change
-      // 0.275.0: mark this as our own body write so onFileModify doesn't log it
-      // as an external edit. The modify event carries the CURRENT path (rename,
-      // if any, comes after), so mark originalPath.
-      // 0.291.0 (perf): `owned` — this save does its OWN evict + slug decision +
-      // repaint below, so onFileModify must not repeat any of them. Before this,
-      // one save cost a full render HERE plus a second slug rename, a second
-      // evict and a second repaint from the modify handler.
-      this.markBodySelfWrite(originalPath, true);
-      await this.app.vault.modify(file, newContent);
-      // 0.291.0 (perf): evict here (not in onFileModify) so the repaint below
-      // reads fresh content whichever order the modify event lands in.
-      this.bodyRenderer.evict(file);
-      // 0.170.2: re-slug the filename to match the new first line (user chose auto-rename).
-      // 0.291.0 (perf): still called unconditionally — reslugFile is a pure function
-      // of the first non-empty line (bodyToSlug reads only that) and returns early
-      // when `file.name` already matches, so an unchanged first line costs a cache
-      // lookup and no vault I/O. Gating it on `firstLineChanged` instead would drop
-      // the drift-healing case (stop-word setting changed, an earlier rename failed)
-      // now that onFileModify no longer schedules a second slug rename for our write.
-      const renamedTo = await this.reslugFile(file, nb);
-      const finalPath = renamedTo ?? originalPath;
-      // 0.291.1: the marker was keyed on the PRE-rename path. If the modify
-      // event lands after the rename, onFileModify looks up the new path, misses,
-      // and treats our own save as an external edit (spurious log + the full
-      // cascade). Move the marker along — but only while it is still unconsumed,
-      // so a modify that already landed under the old path can't leave a stale
-      // "owned" entry that would swallow a genuine external edit seconds later.
-      if (renamedTo) {
-        const pending = this.recentBodySelfWrites.get(originalPath);
-        if (pending) { this.recentBodySelfWrites.delete(originalPath); this.recentBodySelfWrites.set(renamedTo, pending); }
-      }
-      // 0.274.0: record the in-app edit so the activity heatmap can count it.
-      // `external_edit` covers writes from elsewhere; this is the matching entry
-      // for edits made through Stashpad's own editor (which are self-writes and
-      // otherwise leave no log trace).
-      void this.log.append({ type: "edit", id: target.id, payload: { path: finalPath } });
-      // 0.291.0 (perf): a body edit changes no structure, so the O(N) tree rebuild +
-      // full render only earn their cost when the row's ORDER (or its path) can move.
-      // The row renders its title and body as one `.stashpad-note-body-content`
-      // block — there is no separate title element — so repaintRowBody already
-      // refreshes the visible title. What it cannot fix is the row's POSITION, hence
-      // the fall-backs below. Note `performEdit` never creates a note (the split
-      // paths are performSplit / createNoteUnder, which keep rebuild + render), and
-      // it preserves frontmatter verbatim, so completion/task state — and therefore
-      // `hideCompletedNotes` visibility — cannot change here.
-      const firstLine = (s: string): string => (s.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
-      const firstLineChanged = firstLine(freshBody) !== firstLine(nb);
-      const sortMode = this.sortStore.getMode(this.noteFolder, target.parent ?? ROOT_ID);
-      const orderMayChange = renamedTo !== null
-        // title sort reads titleForNode → the first heading/first body line.
-        || (firstLineChanged && (sortMode === "title-az" || sortMode === "title-za"))
-        // modified sort reads the `modified` frontmatter, which the fmSync pass
-        // stamps after this write — position can move on ANY edit.
-        || sortMode === "modified-asc" || sortMode === "modified-desc";
-      if (orderMayChange) {
-        this.tree.rebuild(this.noteFolder);
-        this.render();
-      } else if (!this.repaintRowBody(file)) {
-        // off-screen, or the row isn't repaintable → full render, debounced.
-        this.debouncedRender();
-      }
-      perf.record("edit.save.total", performance.now() - _editT0); // 0.279.29 diag (perf flag)
-      this.plugin.notifications.show({
-        message: `Saved "${this.titleForNode(target)}"`, kind: "success", category: "split",
-        affectedIds: [target.id], folder: this.noteFolder,
-      });
-      const folder = this.noteFolder;
-      this.plugin.getUndoStack(folder).push({
-        label: "Edit note",
-        // 0.211.4: same stale-path class as H6. A save can trigger an auto-reslug, so
-        // by the time undo runs the note may sit at neither finalPath nor originalPath;
-        // a path-only lookup then silently no-ops while the undo stack advances, and
-        // the user's edit is unrecoverable through undo. Resolve id-first.
-        undo: async () => {
-          const f = this.fileForNote(target.id, finalPath) ?? this.fileForNote(target.id, originalPath);
-          if (!f) { new Notice("Can't undo the edit — that note was moved or deleted."); return; }
-          if (f.path !== originalPath) { try { await this.app.fileManager.renameFile(f, originalPath); } catch { /* ignore */ } }
-          await this.app.vault.modify(f, originalContent);
-          this.tree.rebuild(folder); this.render();
-        },
-        redo: async () => {
-          const f = this.fileForNote(target.id, originalPath);
-          if (f) { await this.app.vault.modify(f, newContent); if (f.path !== finalPath) { try { await this.app.fileManager.renameFile(f, finalPath); } catch { /* ignore */ } } }
-          this.tree.rebuild(folder); this.render();
-        },
-      });
-    };
+    // 0.170.0 / 0.319.0: Edit-surface Save → the shared writeEditedBody chokepoint.
+    const performEdit = (newBody: string): Promise<boolean> => this.writeEditedBody(target, md, newBody);
     const performSplit = async (firstBody: string, secondBody: string, payload: Record<string, unknown>, nest = false) => {
       if (!firstBody.trim() || !secondBody.trim()) { new Notice("Split would leave one part empty."); return; }
       try {
@@ -17581,6 +17982,7 @@ export class StashpadView extends ItemView {
       }
     };
 
+    let replyTitle: string | null = this.replyLinkTitleForNode(target);
     // 0.169.0: the split handlers, shared by the modal AND the popped-out tab.
     const splitCore = {
       onSplitAtLine: async (lineIdx: number, nest: boolean) => {
@@ -17596,10 +17998,24 @@ export class StashpadView extends ItemView {
         await performSplit(firstBody, secondBody, { mode: "cursor", splitAtChar: charIdx, edited: text !== body, nest }, nest);
       },
       onSplitMany: async (parts: string[], nest: boolean) => { await performMultiSplit(parts, nest); },
-      onSave: performEdit,
+      // 0.317.1: the body write first; the surface's pending reply-link change
+      // (if any) only after a save that was not refused. Two undo entries.
+      onSave: async (text: string, reply?: { id: StashpadId; title: string; path: string } | null) => {
+        const ok = await performEdit(text);
+        if (ok && reply !== undefined) { const r = await this.setReplyLink(target, reply); if (r !== undefined) replyTitle = r; }
+      },
       onOpenExternal: () => { void this.openFileAtEnd(file); },
       onImportFile: (f: File): Promise<string | null> => this.importAttachment(f),
+      // 0.317.0: the edit surface's "Reply to …" chip. `replyTitle` is tracked
+      // here rather than re-read from the metadata cache, which can lag a
+      // processFrontMatter write by a tick and would repaint the chip stale.
+      reply: {
+        current: () => replyTitle,
+        pick: (onPicked: (t: { id: StashpadId; title: string; path: string }) => void) => this.pickReplyTarget(target, onPicked),
+      },
     };
+    // 0.319.1: long notes route straight to the workbench TAB (see cmdEdit).
+    if (host === "tab") { await this.plugin.openWorkbench(body, splitCore, { surface }); onClosed?.(); return; }
     new NoteWorkbenchModal(this.app, body, {
       ...splitCore,
       popOut: (state) => { void this.plugin.openWorkbench(body, splitCore, state); },
@@ -19162,7 +19578,10 @@ export class StashpadView extends ItemView {
           tries, kbd, virt: !!this.virt,
           scrollTop: Math.round(list.scrollTop), scrollH: h, clientH: list.clientHeight,
           gap: Math.round(gap),
-          lastIdx: (list.querySelector(".stashpad-note:last-of-type") as HTMLElement | null)?.dataset.idx ?? null,
+          // 0.317.2: last RENDERED row (`:last-of-type` never matched in a
+          // virtualized list — the trailing spacer is the last div — so this
+          // read null even when the newest note was flush).
+          lastIdx: (() => { const rows = list.querySelectorAll<HTMLElement>(".stashpad-note"); return rows[rows.length - 1]?.dataset.idx ?? null; })(),
         });
         const atBottom = Math.abs(gap) <= 2;
         // 0.316.6 (R1): require the height to hold steady for a couple of ticks
@@ -19403,6 +19822,9 @@ export class StashpadView extends ItemView {
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("React…").setIcon("smile-plus").onClick(() => this.cmdReact(node)));
     menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => this.cmdReply(node)));
+    // 0.317.0: retro-link an existing note as a reply (+ remove when it is one).
+    menu.addItem((it: any) => it.setTitle("Make a reply to\u2026").setIcon("corner-up-left").onClick(() => this.cmdReplyLinkPicker(node)));
+    if (this.hasReplyLink(node)) menu.addItem((it: any) => it.setTitle("Remove reply link").setIcon("unlink").onClick(() => void this.setReplyLink(node, null)));
     menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => void this.cmdEdit(node)));
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
     // Only meaningful on a repeating task; hidden otherwise so the menu stays short.

@@ -1,3 +1,5 @@
+import { stripInlineMarkdown } from "./slug-service";
+import { parseNaturalDate } from "./natural-date";
 import { App, FuzzySuggestModal, Notice, Platform, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
 import type { TreeIndex } from "./tree-index";
 import type { TreeNode } from "./types";
@@ -32,69 +34,11 @@ interface ParsedQuery {
  *      value resolves to midnight (start of day).
  *  Returns null when the string can't be parsed. */
 function parseDateToken(raw: string): number | null {
-  const t = raw.trim().toLowerCase();
-  if (!t) return null;
-  const now = Date.now();
-  const startOfDay = (ts: number): number => momentFn(ts).startOf("day").valueOf();
-  // Try to extract a time-of-day component first so it doesn't confuse
-  // the date keyword/ISO parsers below. Matches "10am", "10:30am",
-  // "14:00", "9pm" etc.
-  // Global so we can scan PAST leading date digits to the real time token.
-  // Non-global exec found the first `\b\d{1,2}\b` (e.g. the month "01" in
-  // "2025-01-15 14:30"), which lacked a colon/am-pm so time-detection failed and
-  // the whole strict-format date parse then failed → the filter was dropped.
-  // Iterate to the first match that's actually shaped like a time. 0.140.14
-  const timeRe = /\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/gi;
-  let timeOffsetMs = 0;
-  let timeMatched = false;
-  let dateStr = t;
-  let tm: RegExpExecArray | null = null;
-  for (let mt = timeRe.exec(t); mt != null; mt = timeRe.exec(t)) {
-    if (mt[3] || mt[2]) { tm = mt; break; } // am/pm OR colon-minutes = a real time
-  }
-  if (tm) {
-    let hours = parseInt(tm[1], 10);
-    const mins = tm[2] ? parseInt(tm[2], 10) : 0;
-    const ampm = tm[3]?.toLowerCase();
-    if (ampm === "pm" && hours < 12) hours += 12;
-    if (ampm === "am" && hours === 12) hours = 0;
-    if (hours >= 0 && hours < 24 && mins >= 0 && mins < 60) {
-      timeOffsetMs = (hours * 3600 + mins * 60) * 1000;
-      timeMatched = true;
-      dateStr = t.replace(tm[0], " ").replace(/\s+/g, " ").trim();
-    }
-  }
-
-  const applyTime = (dayMidnight: number) => timeMatched ? dayMidnight + timeOffsetMs : dayMidnight;
-
-  // Keywords (date part only — empty dateStr means "today" implicit).
-  if (dateStr === "" || dateStr === "today") return applyTime(startOfDay(now));
-  // Calendar-day arithmetic via moment, not ±86.4e6 ms — a DST transition makes a
-  // day 23 or 25h, so fixed-ms math lands yesterday/tomorrow at the wrong hour. 0.140.14
-  if (dateStr === "yesterday") return applyTime(momentFn(now).startOf("day").subtract(1, "day").valueOf());
-  if (dateStr === "tomorrow") return applyTime(momentFn(now).startOf("day").add(1, "day").valueOf());
-  // Day names (Sun-Sat) — return the most recent past occurrence (or
-  // today if today matches).
-  const dayNames = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
-  const shortDays = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
-  const dayIdx = dayNames.indexOf(dateStr) >= 0 ? dayNames.indexOf(dateStr) : shortDays.indexOf(dateStr);
-  if (dayIdx >= 0) {
-    const today = momentFn().startOf("day");
-    const todayIdx = today.day();
-    const back = (todayIdx - dayIdx + 7) % 7;
-    return applyTime(today.subtract(back, "days").valueOf());
-  }
-  // Relative duration: <N><unit> e.g. 7d, 2w, 1m, 1y.
-  const rel = /^(\d+)\s*([dwmy])$/.exec(dateStr);
-  if (rel) {
-    const n = parseInt(rel[1], 10);
-    const unit = { d: "days", w: "weeks", m: "months", y: "years" }[rel[2]] as moment.unitOfTime.DurationConstructor;
-    return applyTime(momentFn().subtract(n, unit).startOf("day").valueOf());
-  }
-  // ISO-like date attempt via moment.
-  const m = momentFn(dateStr, ["YYYY-MM-DD", "YYYY/MM/DD", "MM-DD-YYYY", "MM/DD/YYYY", "M-D-YYYY", "M/D/YYYY"], true);
-  if (m.isValid()) return applyTime(m.startOf("day").valueOf());
-  return null;
+  // 0.319.0: the shared natural-language parser, preferring the PAST (a bare
+  // weekday = its most recent occurrence, "7d" = seven days ago) — the same
+  // conventions this filter always had, plus everything else it understands
+  // ("last tuesday", "3 weeks ago", "sep 12", "yesterday 3:30pm", …).
+  return parseNaturalDate(raw, { prefer: "past" })?.ms ?? null;
 }
 
 export function parseSearchQuery(query: string): ParsedQuery {
@@ -283,6 +227,14 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       /** 0.85.10: fired from onClose (any close — pick or dismiss). The
        *  destination picker uses it to refocus the composer on dismiss. */
       onClose?: () => void;
+      /** 0.317.1: within a relevance band (and for the whole list on an empty
+       *  query) order by last-EDITED (default) or by CREATED date — the
+       *  "make a reply to…" picker wants the folder's items newest → oldest. */
+      recency?: "modified" | "created";
+      /** 0.317.1: pick mode floats each folder's home note up by default (the
+       *  common "move here" target). Pass false where the home is not a
+       *  likely target (reply links). */
+      pinHomes?: boolean;
       /** Optional source for cross-folder notes. Resolved lazily when
        *  the user starts typing — local results from `tree` are returned
        *  first, and this source is queried only after the local set is
@@ -368,7 +320,18 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         if (!n.cross || n.body) continue;
         // Skip the synthetic-root entries (no TFile to read).
         if (!n.cross.file) continue;
-        this.app.vault.cachedRead(n.cross.file).then((md) => { n.body = this.stripFm(md); });
+        this.app.vault.cachedRead(n.cross.file).then((md) => {
+          n.body = this.stripFm(md);
+          // 0.317.3: a slug-derived title (body not in the render cache yet)
+          // is upgraded to the real first line once the body is read, so
+          // title-band ranking works for notes never shown in a Stashpad view.
+          const slug = n.cross?.file?.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+          if (n.title === slug) {
+            const first = n.body.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
+            const clean = first ? stripInlineMarkdown(first.replace(/^#+\s*/, "")) : "";
+            if (clean) n.title = clean;
+          }
+        });
       }
     }
   }
@@ -531,7 +494,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     const mtimeFor = (n: NoteBody): number =>
       n.node?.file?.stat?.mtime ?? n.cross?.file?.stat?.mtime ?? 0;
     const isHome = (n: NoteBody): boolean => n.node?.id === ROOT_ID || n.cross?.id === ROOT_ID;
-    const pinHomes = this.opts.mode === "pick";
+    const pinHomes = this.opts.mode === "pick" && this.opts.pinHomes !== false;
+    const recencyFor = this.opts.recency === "created"
+      ? (n: NoteBody): number => this.createdMsFor(n) ?? mtimeFor(n)
+      : mtimeFor;
     const relevanceBand = (n: NoteBody): number => {
       let band: number;
       if (!q) {
@@ -550,7 +516,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       return band;
     };
 
-    const matchTier = (tier: NoteBody[]): PickerItem[] => {
+    // 0.317.3: `matchTier` now returns the SCORED matches (not items) so search
+    // mode can rank the local and cross-folder tiers together — see below.
+    type Scored = { n: NoteBody; matchLines: number[]; band: number; mtime: number; tier: number };
+    const matchTier = (tier: NoteBody[], tierRank: number): Scored[] => {
       // 1. Collect the notes that match (+ their per-line clusters for search).
       const matched: { n: NoteBody; matchLines: number[] }[] = [];
       for (const n of tier) {
@@ -578,10 +547,13 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       // 2. Rank: relevance band desc, then most-recently-edited. Precompute the
       //    keys (band does substring work) so the comparator stays cheap. Array
       //    sort is stable, so same-band/same-mtime ties keep tree order.
-      const scored = matched.map((m) => ({ ...m, band: relevanceBand(m.n), mtime: mtimeFor(m.n) }));
+      const scored: Scored[] = matched.map((m) => ({ ...m, band: relevanceBand(m.n), mtime: recencyFor(m.n), tier: tierRank }));
       scored.sort((a, b) => (b.band - a.band) || (b.mtime - a.mtime));
-      // 3. Emit rows — one per note (title/body hit) or one per match cluster
-      //    (search mode, capped at 5) so a long note surfaces each hit in context.
+      return scored;
+    };
+    // 3. Emit rows — one per note (title/body hit) or one per match cluster
+    //    (search mode, capped at 5) so a long note surfaces each hit in context.
+    const emit = (scored: Scored[]): PickerItem[] => {
       const out: PickerItem[] = [];
       for (const { n, matchLines } of scored) {
         if (this.opts.mode === "search" && q && matchLines.length > 0) {
@@ -597,7 +569,8 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       return out;
     };
 
-    const localItems = matchTier(local);
+    const localScored = matchTier(local, 0);
+    const localItems = emit(localScored);
     const items: PickerItem[] = [...localItems];
     // Only consult the cross-folder tier when local results are sparse
     // OR when the user is in search mode with a real query (so they can
@@ -612,11 +585,25 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       ? (q ? true : localItems.length < 10)
       : (q ? true : false);
     if (crossWanted) {
-      const crossItems = matchTier(cross);
-      // Cap the local tier so the user sees the cross-folder section
-      // come up without scrolling through hundreds of local hits.
-      if (this.opts.mode === "search" && !q) items.length = Math.min(items.length, 50);
-      items.push(...crossItems);
+      const crossScored = matchTier(cross, 1);
+      if (this.opts.mode === "search" && q) {
+        // 0.317.3 (user): with a query, rank BOTH tiers together — relevance
+        // band first, the current folder winning ties, then recency. Before,
+        // every local hit (even a weak body match) sat above every other
+        // folder's hit, so an exact-title match in another Stashpad landed
+        // 8th behind seven local body mentions. Each row carries its folder
+        // badge, so mixing the tiers loses nothing. Pick mode (Move / reply
+        // destinations) keeps local-first tiers.
+        const all = [...localScored, ...crossScored];
+        all.sort((a, b) => (b.band - a.band) || (a.tier - b.tier) || (b.mtime - a.mtime));
+        items.length = 0;
+        items.push(...emit(all));
+      } else {
+        // Cap the local tier so the user sees the cross-folder section
+        // come up without scrolling through hundreds of local hits.
+        if (this.opts.mode === "search" && !q) items.length = Math.min(items.length, 50);
+        items.push(...emit(crossScored));
+      }
     }
 
     // 0.57.3: folder-open results — prepended to the list so they're easy

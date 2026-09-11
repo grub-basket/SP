@@ -1,3 +1,4 @@
+import type StashpadPlugin from "./main";
 import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, type SecretStorage } from "obsidian";
 import { normalisePastedPath } from "./paste-path";
 import { splitIntoChunks, splitByDelimiter, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
@@ -399,6 +400,7 @@ export class LogPanel {
       case "restore": return `Restored ${ev.id}${p.to ? ` → ${p.to}` : ""} from trash`;
       case "external_edit": return `Edited outside Stashpad — ${p.path ?? ev.id}`;
       case "edit": return `Edited ${p.path ?? ev.id}`;
+      case "reply_link": return p.replyTo ? `Made ${p.path ?? ev.id} a reply to ${p.replyTo}` : `Removed the reply link from ${p.path ?? ev.id}`;
       case "open": return `Viewed ${p.path ?? ev.id}`;
       default: return JSON.stringify(p);
     }
@@ -504,14 +506,23 @@ export interface WorkbenchState {
   nest: boolean;
   cursorText: string;
   lineCursorIdx: number;
+  /** 0.317.1: an UNSAVED reply-link change on the edit surface (null = remove
+   *  the link; absent = untouched). Carried across pop-out; written on Save. */
+  pendingReply?: WorkbenchReplyTarget | null;
 }
+
+/** 0.317.0: a reply-link target as the edit surface handles it. */
+export interface WorkbenchReplyTarget { id: string; title: string; path: string }
 
 export interface WorkbenchCallbacks {
   onSplitAtLine: (firstLineOfSecondPart: number, nest: boolean) => void | Promise<void>;
   onSplitAtChar: (text: string, charIndex: number, nest: boolean) => void | Promise<void>;
   onSplitMany: (parts: string[], nest: boolean) => void | Promise<void>;
-  /** 0.170.0: Edit surface — write the edited body back to the note. */
-  onSave: (text: string) => void | Promise<void>;
+  /** 0.170.0: Edit surface — write the edited body back to the note.
+   *  0.317.1: `reply` is the surface's pending reply-link change (see
+   *  WorkbenchState.pendingReply); the host writes it AFTER a successful body
+   *  save. `undefined` = untouched. */
+  onSave: (text: string, reply?: WorkbenchReplyTarget | null) => void | Promise<void>;
   /** 0.170.1: open the note in a full Obsidian markdown tab (leaves the modal). */
   onOpenExternal?: () => void;
   /** Dismiss the host WITHOUT committing (Cancel / Esc). */
@@ -527,6 +538,13 @@ export interface WorkbenchCallbacks {
    *  `![[wikilink]]` (or null). Wired to the view's `importAttachment` so the
    *  edit/split textarea gets the composer's paste-a-file-as-a-link behaviour. */
   onImportFile?: (file: File) => Promise<string | null>;
+  /** 0.317.0: edit surface only — the note's reply link ("Reply to …" chip above
+   *  the editor). `current()` = the SAVED target's display title (null = not a
+   *  reply). `pick` opens the note picker and hands back the chosen target
+   *  WITHOUT writing — the surface keeps it pending (dirty → discard guard) and
+   *  passes it to `onSave`. 0.317.1: was write-immediately; the user wants it
+   *  gated on Save like the body. */
+  reply?: { current: () => string | null; pick: (onPicked: (t: WorkbenchReplyTarget) => void) => void };
 }
 
 /** 0.169.0: the split UI extracted from the modal so it can render into EITHER a
@@ -554,6 +572,8 @@ export class NoteWorkbench {
   private customRemove = false;
   private nest = false;
   private cursorTextarea: HTMLTextAreaElement | null = null;
+  /** 0.317.1: unsaved reply-link change (see WorkbenchState.pendingReply). */
+  private pendingReply: WorkbenchReplyTarget | null | undefined = undefined;
   /** 0.185.0: composer-parity autocomplete bound to the live editor textarea.
    *  Recreated on each render (surface/mode switch rebuilds the textarea); the
    *  old instance is detached first so listeners don't leak. */
@@ -580,6 +600,7 @@ export class NoteWorkbench {
     else if (this.lines.length < 2) this.mode = "cursor"; // single-line → cursor only
     if (init.presetMode) this.presetMode = init.presetMode;
     if (init.nest != null) this.nest = init.nest;
+    if ("pendingReply" in init) this.pendingReply = init.pendingReply;
     if (init.surface) this.surface = init.surface;
     // 0.169.4: wrap Tab focus within the split content — Shift+Tab on the first
     // control jumps to the last, Tab on the last wraps to the first (rather than
@@ -611,6 +632,7 @@ export class NoteWorkbench {
       mode: this.mode, presetMode: this.presetMode, nest: this.nest,
       cursorText: this.cursorTextarea?.value ?? this.cursorText,
       lineCursorIdx: this.lineCursorIdx,
+      ...(this.pendingReply !== undefined ? { pendingReply: this.pendingReply } : {}),
     };
   }
 
@@ -784,13 +806,14 @@ export class NoteWorkbench {
   private async saveEdit(): Promise<void> {
     const ta = this.cursorTextarea;
     if (!ta) return;
-    await this.cb.onSave(ta.value);
+    await this.cb.onSave(ta.value, this.pendingReply);
     this.cb.onDone();
   }
 
-  /** 0.170.5: the current text differs from the note's original body → unsaved. */
+  /** 0.170.5: the current text differs from the note's original body → unsaved.
+   *  0.317.1: a pending reply-link change counts too. */
   isDirty(): boolean {
-    return (this.cursorTextarea?.value ?? this.cursorText) !== this.body;
+    return (this.cursorTextarea?.value ?? this.cursorText) !== this.body || this.pendingReply !== undefined;
   }
 
   /** 0.170.3: switch surface (Mod+E / Mod+S host shortcuts). No-op if already there. */
@@ -894,7 +917,7 @@ export class NoteWorkbench {
   async openExternalSaving(): Promise<void> {
     if (!this.cb.onOpenExternal) return;
     if (this.isDirty()) {
-      try { await this.cb.onSave(this.cursorTextarea?.value ?? this.cursorText); }
+      try { await this.cb.onSave(this.cursorTextarea?.value ?? this.cursorText, this.pendingReply); }
       catch (e) { console.warn("[Stashpad] save-before-open failed", e); new Notice("Couldn't save the edits — not opening. See console."); return; }
     }
     this.cb.onOpenExternal();
@@ -914,6 +937,7 @@ export class NoteWorkbench {
 
   /** 0.170.0: plain editing — the shared Original/Changes/editor sections + a Save. */
   private renderEditSurface(): void {
+    this.renderReplyChip();
     this.renderEditorSections();
 
     // 0.170.3: edit tools — live word/char count + a case-cycle button.
@@ -953,6 +977,43 @@ export class NoteWorkbench {
     saveBtn.createSpan({ text: "Save" });
     saveBtn.onmousedown = (e) => e.preventDefault();
     saveBtn.onclick = () => void this.commit();
+  }
+
+  /** 0.317.0: "Reply to …" chip on the edit surface (see WorkbenchCallbacks.reply).
+   *  0.317.1: changes are PENDING until Save (and make the surface dirty). */
+  private renderReplyChip(): void {
+    const r = this.cb.reply;
+    if (!r) return;
+    const host = this.host.createDiv({ cls: "stashpad-split-reply" });
+    const paint = (): void => {
+      host.empty();
+      const saved = r.current();
+      const pending = this.pendingReply;
+      const cur = pending === undefined ? saved : (pending ? pending.title : null);
+      host.toggleClass("is-reply", !!cur);
+      host.toggleClass("is-pending", pending !== undefined);
+      setIcon(host.createSpan({ cls: "stashpad-split-reply-icon" }), "reply");
+      host.createSpan({ cls: "stashpad-split-reply-label", text: cur ? "Reply to" : "Not a reply" });
+      if (cur) host.createSpan({ cls: "stashpad-split-reply-title", text: cur });
+      if (pending !== undefined) host.createSpan({ cls: "stashpad-split-reply-pending", text: "unsaved" });
+      const change = host.createEl("button", { cls: "stashpad-split-reply-btn", text: cur ? "Change\u2026" : "Make a reply\u2026" });
+      change.setAttr("aria-label", "Pick the note this one replies to (applied on Save)");
+      change.onmousedown = (e) => e.preventDefault();
+      change.onclick = () => r.pick((t) => { this.pendingReply = t; paint(); });
+      if (cur) {
+        const x = host.createEl("button", { cls: "stashpad-split-reply-btn", text: "Remove" });
+        x.setAttr("aria-label", "Remove the reply link (applied on Save)");
+        x.onmousedown = (e) => e.preventDefault();
+        x.onclick = () => { this.pendingReply = null; paint(); };
+      }
+      if (pending !== undefined) {
+        const rv = host.createEl("button", { cls: "stashpad-split-reply-btn", text: "Revert" });
+        rv.setAttr("aria-label", "Drop the unsaved reply-link change");
+        rv.onmousedown = (e) => e.preventDefault();
+        rv.onclick = () => { this.pendingReply = undefined; paint(); };
+      }
+    };
+    paint();
   }
 
   private caseCycleIndex = 0;
@@ -1409,6 +1470,7 @@ export class NoteWorkbenchModal extends Modal {
       onSave: this.cbs.onSave,
       onOpenExternal: this.cbs.onOpenExternal,
       onImportFile: this.cbs.onImportFile,
+      reply: this.cbs.reply,
       close: () => this.close(),
       onDone: () => { this.committing = true; this.close(); }, // split/save ran → dismiss
       onTitle: (t) => this.titleEl.setText(t),
@@ -1509,6 +1571,7 @@ export class NoteWorkbenchView extends ItemView {
       onSave: this.ctx.cbs.onSave,
       onOpenExternal: this.ctx.cbs.onOpenExternal,
       onImportFile: this.ctx.cbs.onImportFile,
+      reply: this.ctx.cbs.reply,
       close: () => this.guardedDetach(),
       onDone: () => this.startClosePanel("✓ Done.", null, true),
       onTitle: (t) => this.setHeader(t, t.startsWith("Edit") ? "pencil-line" : "split"),
@@ -2727,6 +2790,53 @@ export class ColorPickerModal extends Modal {
       this.popoutKeyHandler = null;
     }
     this.contentEl.empty();
+  }
+}
+
+/** 0.319.0: review every composer draft (or one folder's) — load into the
+ *  composer or delete. Drafts from other devices arrive via settings sync and
+ *  show their device label; an edit-in-progress shows the note it edits. */
+export class ComposerDraftsModal extends Modal {
+  constructor(app: App, private plugin: StashpadPlugin, private folder?: string) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText(this.folder ? `Drafts — ${this.folder.split("/").pop() ?? this.folder}` : "Composer drafts");
+    this.modalEl.addClass("stashpad-drafts-modal");
+    this.render();
+  }
+  onClose(): void { this.contentEl.empty(); }
+  private render(): void {
+    const c = this.contentEl;
+    c.empty();
+    const all = Object.values(this.plugin.settings.composerDrafts ?? {})
+      .filter((d) => !this.folder || d.folder === this.folder)
+      .sort((a, b) => (a.folder === b.folder ? b.modified - a.modified : a.folder.localeCompare(b.folder)));
+    if (!all.length) { c.createDiv({ cls: "stashpad-drafts-empty", text: "No drafts." }); return; }
+    c.createDiv({ cls: "stashpad-drafts-help", text: "Load puts a draft in that folder's composer (whatever is there now is kept as its own draft). Delete is immediate." });
+    const me = this.plugin.deviceId();
+    let lastFolder: string | null = null;
+    for (const d of all) {
+      if (!this.folder && d.folder !== lastFolder) {
+        c.createDiv({ cls: "stashpad-drafts-folder", text: d.folder.split("/").pop() ?? d.folder });
+        lastFolder = d.folder;
+      }
+      const row = c.createDiv({ cls: "stashpad-drafts-row" + (d.kind === "edit" ? " is-edit" : "") });
+      const meta = row.createDiv({ cls: "stashpad-drafts-meta" });
+      if (d.kind === "edit") meta.createSpan({ cls: "stashpad-drafts-badge", text: `Editing: ${d.edit?.title || "note"}` });
+      const ago = (ms: number): string => (moment as unknown as (ms: number) => { fromNow: () => string })(ms).fromNow();
+      const parts = [d.device === me ? "This device" : d.device, `edited ${ago(d.modified)}`];
+      if (Math.abs(d.created - d.modified) > 60_000) parts.push(`started ${ago(d.created)}`);
+      if (d.replyTo?.title) parts.push(`reply to \u201c${d.replyTo.title}\u201d`);
+      meta.createSpan({ text: parts.join("  \u00b7  ") });
+      const preview = (d.text.trim() || "(empty)").split(/\r?\n/).slice(0, 3).join(" ⏎ ");
+      row.createDiv({ cls: "stashpad-drafts-preview", text: preview.length > 220 ? preview.slice(0, 220) + "…" : preview });
+      const actions = row.createDiv({ cls: "stashpad-drafts-actions" });
+      const load = actions.createEl("button", { cls: "mod-cta", text: d.kind === "edit" ? "Resume editing" : "Load into composer" });
+      load.onclick = () => { void this.plugin.loadComposerDraft(d.id).then(() => this.close()); };
+      const copy = actions.createEl("button", { text: "Copy" });
+      copy.onclick = () => { void navigator.clipboard?.writeText(d.text).then(() => new Notice("Draft copied.")); };
+      const del = actions.createEl("button", { cls: "mod-warning", text: "Delete" });
+      del.onclick = () => { void this.plugin.deleteComposerDraft(d.id).then(() => { new Notice("Draft deleted."); this.render(); }); };
+    }
   }
 }
 

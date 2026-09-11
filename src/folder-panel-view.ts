@@ -46,16 +46,41 @@ export class StashpadFolderPanelView extends ItemView {
   refresh(): void { this.scheduleRender(); }
 
   private renderTimer: number | null = null;
+  /** 0.318.1: a touch is down / a scroll just happened inside the panel. A
+   *  scheduled render waits for this to clear — the first swipe on an unfocused
+   *  sidebar fires `active-leaf-change`, and the rebuild 100ms later landed
+   *  under the finger, cutting the gesture short (user report). */
+  private gestureUntil = 0;
+  private gestureDown = false;
   private scheduleRender(): void {
     if (this.renderTimer != null) return;
-    this.renderTimer = window.setTimeout(() => {
+    const tick = (): void => {
       this.renderTimer = null;
-      if (this.containerEl.isConnected) this.render();
-    }, 100);
+      if (!this.containerEl.isConnected) return;
+      if (this.gestureDown || Date.now() < this.gestureUntil) { this.renderTimer = window.setTimeout(tick, 150); return; }
+      this.render();
+    };
+    this.renderTimer = window.setTimeout(tick, 100);
+  }
+  private gestureListenersInstalled = false;
+  private installGestureListeners(): void {
+    if (this.gestureListenersInstalled) return;
+    this.gestureListenersInstalled = true;
+    const el = this.contentEl;
+    const bump = (): void => { this.gestureUntil = Date.now() + 300; };
+    this.registerDomEvent(el, "pointerdown", (e: PointerEvent) => { if (e.pointerType !== "mouse") { this.gestureDown = true; bump(); } });
+    const up = (): void => { this.gestureDown = false; bump(); };
+    this.registerDomEvent(el, "pointerup", up);
+    this.registerDomEvent(el, "pointercancel", up);
+    this.registerDomEvent(el, "scroll", bump, { capture: true, passive: true });
   }
 
   private render(): void {
     const root = this.contentEl;
+    this.installGestureListeners();
+    // 0.318.1: keep both lists' scroll positions across the rebuild (the pins
+    // list and the folders list are the two scrollers; empty() zeroed them).
+    const saved = Array.from(root.querySelectorAll<HTMLElement>(".stashpad-folderpanel-list")).map((l) => l.scrollTop);
     root.empty();
     root.addClass("stashpad-folderpanel-root");
 
@@ -107,6 +132,10 @@ export class StashpadFolderPanelView extends ItemView {
       trashBtn.onmousedown = (e) => { if (e.button === 0) { e.preventDefault(); e.stopPropagation(); this.plugin.openEncryptedTrash(); } };
     }
     this.renderFolders(folderSection.createDiv({ cls: "stashpad-folderpanel-list" }));
+    if (saved.length) {
+      const lists = root.querySelectorAll<HTMLElement>(".stashpad-folderpanel-list");
+      lists.forEach((l, i) => { if (saved[i]) l.scrollTop = saved[i]; });
+    }
   }
 
   private clampFrac(f: number): number {
@@ -839,9 +868,25 @@ export class StashpadFolderPanelView extends ItemView {
     // touch device the FIRST tap on an unfocused sidebar is consumed focusing
     // the pane and no synthesized mousedown fires, so it took a second tap.
     // pointerdown fires on the first touch contact regardless of focus.
+    // 0.317.4: TOUCH must not act on pointerdown — that made every touch a
+    // tap, so a scroll gesture that began on a row opened that folder and the
+    // panel could no longer be scrolled (user report). For touch, arm on
+    // pointerdown and act on pointerup only if the finger stayed put; a scroll
+    // ends the pointer stream with `pointercancel`, which disarms. pointerup
+    // still fires on the first tap of an unfocused sidebar (the 0.302.0 case),
+    // so this keeps the single-tap open. Mouse keeps the pointerdown path.
+    const isAction = (e: PointerEvent) => !!(e.target as HTMLElement)?.closest?.(".stashpad-folderpanel-actions");
+    let touchArm: { x: number; y: number; id: number } | null = null;
     row.addEventListener("pointerdown", (e) => {
-      if (e.button !== 0) return;
-      if ((e.target as HTMLElement)?.closest?.(".stashpad-folderpanel-actions")) return;
+      if (e.button !== 0 || isAction(e)) return;
+      if (e.pointerType === "touch" || e.pointerType === "pen") { touchArm = { x: e.clientX, y: e.clientY, id: e.pointerId }; return; }
+      this.onNavigateAway(); this.jumpToFolder(folder);
+    });
+    row.addEventListener("pointercancel", () => { touchArm = null; });
+    row.addEventListener("pointerup", (e) => {
+      const arm = touchArm; touchArm = null;
+      if (!arm || arm.id !== e.pointerId || isAction(e)) return;
+      if (Math.hypot(e.clientX - arm.x, e.clientY - arm.y) > 10) return; // moved → it was a scroll
       this.onNavigateAway(); this.jumpToFolder(folder);
     });
     // 0.276.3: desktop keeps right-click → menu. On mobile the long-press that

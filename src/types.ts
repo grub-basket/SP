@@ -184,6 +184,24 @@ export function isStashpadSidecar(path: string): boolean {
   return STASHPAD_SIDECAR_FILES.includes(name);
 }
 
+/** 0.319.0: one composer draft. Keyed by `id` in settings.composerDrafts so two
+ *  devices each writing their OWN drafts merge by key (union) instead of one
+ *  folder-level string clobbering the other. `kind: "edit"` is the
+ *  edit-in-composer provision: the note being edited + the markdown snapshot
+ *  taken when editing began (for the divergence check on save). */
+export interface ComposerDraft {
+  id: string;
+  folder: string;
+  text: string;
+  created: number;
+  modified: number;
+  /** Per-device label ("phone-ab12", "desktop-9f3e", "legacy"). */
+  device: string;
+  kind: "new" | "edit";
+  edit?: { id: string; path: string; title: string; openMd: string };
+  replyTo?: { id: string; title: string; path: string } | null;
+}
+
 export const RESERVED_SUBFOLDER_NAMES: ReadonlySet<string> = new Set([
   "_attachments", "_authors", "_exports", "_imports", "_processed", "_failed-imports",
   "_archive", ".archive", // .archive is legacy (pre-0.79.10)
@@ -378,6 +396,10 @@ export type LogEventType =
   // the activity heatmap can count "edited in Stashpad" as first-class work —
   // without it, in-app edits left no trace in the log at all.
   | "edit"
+  // 0.317.0: an EXISTING note's reply link (`replyTo`) was set, changed or
+  // removed after the fact (context menu / edit-surface chip) — distinct from
+  // a reply created through the composer, which is a plain `create`.
+  | "reply_link"
   // 0.276.0: a Stashpad note was OPENED/viewed. OPT-IN (settings.logNoteOpens,
   // default off) because opens are frequent and would bloat the log for users
   // who don't want view tracking. Feeds the activity heatmap's "Viewed" bucket.

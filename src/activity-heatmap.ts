@@ -18,7 +18,7 @@ type Bucket = "created" | "edited" | "tasks" | "moved" | "files" | "vault" | "de
 
 const BUCKET_OF: Record<LogEventType, Bucket> = {
   create: "created",
-  edit: "edited", external_edit: "edited",
+  edit: "edited", external_edit: "edited", reply_link: "edited",
   open: "viewed",
   complete: "tasks", uncomplete: "tasks",
   parent_change: "moved", reorder: "moved", rename: "moved",
@@ -299,6 +299,7 @@ function describeEvent(ev: LogEvent, title?: string): string {
   switch (ev.type) {
     case "create": return `Created ${who}`;
     case "edit": return `Edited ${who}`;
+    case "reply_link": return ev.payload?.replyTo ? `Made ${who} a reply` : `Removed the reply link from ${who}`;
     case "external_edit": return `Edited ${who} (outside Stashpad)`;
     case "open": return `Viewed ${who}`;
     case "complete": return `Completed ${who}`;

@@ -2409,12 +2409,21 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note.is-task {
   grid-template-columns: 1fr auto auto auto auto;
   grid-template-areas:
-    "meta toggle react quick more"
-    "body body   body  body  body"
-    "foot foot   foot  foot  foot";
+    "meta   toggle react  quick  more"
+    "body   body   body   body   body"
+    "foot   foot   foot   foot   foot"
+    "reacts reacts reacts reacts reacts";
   align-items: center;
   row-gap: 2px;
   column-gap: 8px;
+}
+/* 0.318.0 (user): on mobile the reaction CHIPS row sits at the bottom of the
+   note, full width, growing as it fills — the picker button stays up top with
+   its fellow buttons (`react`). Desktop keeps the chips in the meta column. */
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-reaction-cluster {
+  grid-area: reacts;
+  margin-top: 0;
+  flex-wrap: wrap;
 }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note-meta,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note-actions {
@@ -2748,6 +2757,46 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-split-btn-icon svg { width: 14px; height: 14px; }
 .stashpad-split-kbd-hint { margin-left: auto; padding-left: 6px; opacity: 0.6; font-size: var(--font-ui-smaller); }
 /* 0.170.3: edit-surface footer — live word/char count + case-cycle. */
+/* 0.317.0: edit-surface "Reply to …" chip (mirrors the composer reply chip). */
+.stashpad-split-reply {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.stashpad-split-reply.is-reply { border-left-color: var(--interactive-accent); }
+.stashpad-split-reply.is-pending { border-style: dashed; }
+.stashpad-split-reply-pending {
+  color: var(--text-faint);
+  font-style: italic;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-split-reply-icon { display: inline-flex; color: var(--text-faint); }
+.stashpad-split-reply.is-reply .stashpad-split-reply-icon { color: var(--interactive-accent); }
+.stashpad-split-reply-icon .svg-icon { width: 13px; height: 13px; }
+.stashpad-split-reply-label { font-weight: 600; }
+.stashpad-split-reply-title {
+  color: var(--text-normal);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.stashpad-split-reply-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: var(--font-ui-smaller);
+}
+.stashpad-split-reply-btn + .stashpad-split-reply-btn { margin-left: 0; }
 .stashpad-split-edit-tools {
   display: flex;
   align-items: center;
@@ -9340,7 +9389,18 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   border-color: var(--interactive-accent);
   background: var(--background-modifier-hover);
 }
-.stashpad-reaction-emoji { font-size: 0.95em; }
+/* 0.318.0 (user): the chip was 44px on mobile — Obsidian's mobile <button>
+   padding/min-height won over the 0.316.4 rule. Pin it to the action buttons'
+   22px box on every platform. */
+button.stashpad-reaction-chip,
+.is-mobile button.stashpad-reaction-chip {
+  height: 22px;
+  min-height: 22px;
+  padding: 0 7px;
+  line-height: 1;
+  box-shadow: none;
+}
+.stashpad-reaction-emoji { font-size: 13px; line-height: 1; }
 .stashpad-reaction-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .stashpad-reaction-chip.is-mine .stashpad-reaction-count { color: var(--text-normal); }
 /* 0.287.0: the in-cluster hover “＋” add button was removed — reactions are
@@ -9474,6 +9534,76 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 }
 .stashpad-reaction-modal .stashpad-reaction-result { font-size: 28px; padding: 6px 8px; }
 
+/* 0.318.0: picker sections (favorites / recent / all), tab strip, edit mode,
+   multi-pick footer. Shared by popover + modal; the modal overrides sizes. */
+.stashpad-reaction-picker.stashpad-reaction-body { flex-direction: column; width: 320px; max-width: calc(100vw - 16px); }
+.stashpad-reaction-body .stashpad-reaction-input { margin-bottom: 6px; }
+.stashpad-reaction-sections { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.stashpad-reaction-sections.is-hidden { display: none; }
+.stashpad-reaction-section { display: flex; flex-direction: column; gap: 3px; min-height: 0; }
+.stashpad-reaction-section-head { display: flex; align-items: center; gap: 6px; }
+.stashpad-reaction-section-title {
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.stashpad-reaction-editbtn {
+  margin-left: auto;
+  padding: 1px 8px;
+  font-size: var(--font-ui-smaller);
+  min-height: 0;
+  height: auto;
+  line-height: 1.4;
+}
+.stashpad-reaction-sections.is-editing .stashpad-reaction-pick,
+.stashpad-reaction-sections.is-editing .stashpad-reaction-result { outline: 1px dashed var(--background-modifier-border); }
+.stashpad-reaction-pick.is-fav::after,
+.stashpad-reaction-result.is-fav::after {
+  content: "\2605";
+  position: absolute;
+  right: -1px;
+  top: -3px;
+  font-size: 9px;
+  color: var(--interactive-accent);
+}
+.stashpad-reaction-pick, .stashpad-reaction-result { position: relative; }
+.stashpad-reaction-sections.is-editing .stashpad-reaction-pick.is-mine,
+.stashpad-reaction-sections.is-editing .stashpad-reaction-result.is-mine { box-shadow: none; background: transparent; }
+.stashpad-reaction-hint { font-size: var(--font-ui-smaller); color: var(--text-faint); }
+.stashpad-reaction-tabs { display: flex; gap: 2px; flex-wrap: wrap; }
+.stashpad-reaction-tab {
+  border: none;
+  background: transparent;
+  font-size: 15px;
+  line-height: 1;
+  padding: 3px 5px;
+  min-height: 0;
+  height: auto;
+  border-radius: 6px;
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-reaction-tab:hover { background: var(--background-modifier-hover); }
+.stashpad-reaction-all {
+  max-height: 220px;
+  overflow-y: auto;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 4px;
+}
+.stashpad-reaction-group-title { font-size: var(--font-ui-smaller); color: var(--text-faint); margin: 4px 0 2px; }
+.stashpad-reaction-pickgrid.is-all-grid { max-width: none; justify-content: flex-start; }
+.stashpad-reaction-body .stashpad-reaction-results { max-width: none; max-height: 260px; }
+.stashpad-reaction-results.is-none { display: flex; }
+.stashpad-reaction-footer { display: flex; align-items: center; gap: 8px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--background-modifier-border); }
+.stashpad-reaction-done { margin-left: auto; padding: 2px 12px; min-height: 0; height: auto; line-height: 1.6; }
+.stashpad-reaction-modal .stashpad-reaction-sections { gap: 10px; }
+.stashpad-reaction-modal .stashpad-reaction-all { max-height: 50vh; }
+.stashpad-reaction-modal .stashpad-reaction-tab { font-size: 22px; padding: 6px 8px; }
+.stashpad-reaction-modal .stashpad-reaction-pickgrid.is-all-grid { justify-content: flex-start; }
+.stashpad-reaction-modal .stashpad-reaction-done { padding: 8px 18px; }
+
 /* ============================================================
    Quoted replies (teams, 0.281.0)
    ============================================================ */
@@ -9504,11 +9634,26 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   text-overflow: ellipsis; overflow: hidden; white-space: nowrap;
 }
 .stashpad-reply-chip-title:hover { text-decoration: underline; }
+/* 0.319.3 (user): a square 22px icon button (lucide x), not a bare glyph. */
 .stashpad-reply-chip-x {
-  border: none; background: transparent; color: var(--text-faint);
-  cursor: pointer; padding: 0 2px; margin-left: auto; font-size: 12px; line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0;
+  margin-left: auto;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  box-shadow: none;
+  flex: 0 0 auto;
 }
-.stashpad-reply-chip-x:hover { color: var(--text-normal); }
+.stashpad-reply-chip-x .svg-icon { width: 14px; height: 14px; }
+.stashpad-reply-chip-x:hover { color: var(--text-normal); background: var(--background-modifier-hover); border-color: var(--background-modifier-border); }
 
 /* The "in reply to …" jump block above a reply's body */
 /* 0.288.0: two-line quote — a "Reply to" label row, the quoted preview beneath. */
@@ -9666,3 +9811,75 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-launcher-icon { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; color: var(--text-muted); }
 .stashpad-launcher-icon svg { width: 18px; height: 18px; }
 .stashpad-launcher-text { min-width: 0; }
+
+/* ============================================================
+   0.319.2: Composer drafts modal (.stashpad-drafts-modal)
+   ============================================================ */
+.stashpad-drafts-modal .modal-content { display: flex; flex-direction: column; gap: 10px; }
+.stashpad-drafts-help { font-size: var(--font-ui-smaller); color: var(--text-muted); line-height: 1.4; }
+.stashpad-drafts-empty { color: var(--text-faint); padding: 24px 0; text-align: center; }
+.stashpad-drafts-folder {
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+.stashpad-drafts-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-primary);
+}
+.stashpad-drafts-row.is-edit { border-left-color: var(--interactive-accent); }
+.stashpad-drafts-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+.stashpad-drafts-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.stashpad-drafts-preview {
+  font-size: var(--font-ui-medium);
+  line-height: 1.4;
+  color: var(--text-normal);
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.stashpad-drafts-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.stashpad-drafts-actions button { flex: 0 0 auto; }
+.stashpad-drafts-actions .mod-cta { flex: 1 1 auto; }
+.is-mobile .stashpad-drafts-modal .modal-content { gap: 12px; }
+.is-mobile .stashpad-drafts-row { padding: 12px; gap: 10px; }
+.is-mobile .stashpad-drafts-actions button { min-height: 40px; }
+.is-mobile .stashpad-drafts-actions .mod-cta { flex-basis: 100%; }
+
+/* 0.319.4: edit-surface limit boxes, each with a label above. */
+.stashpad-edit-limits { display: flex; gap: 8px; align-items: flex-end; }
+.stashpad-edit-limit { display: flex; flex-direction: column; gap: 2px; }
+.stashpad-edit-limit-label { font-size: var(--font-ui-smaller); color: var(--text-muted); text-transform: capitalize; }
+.stashpad-edit-limit input { width: 6.5em; }
+.is-mobile .stashpad-edit-limits { flex-wrap: wrap; }

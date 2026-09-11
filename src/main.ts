@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId } from "./id-service";
-import { STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
+import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
 import { StashpadTrashView, openTrashView } from "./trash-view";
@@ -17,7 +17,7 @@ import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-vie
 import { ViewLauncherModal } from "./view-launcher";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
-import { EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult} from "./modals";
+import { ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
 import { writeClipboardText } from "./cross-vault-clipboard";
@@ -3753,6 +3753,11 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-move-to-bottom", name: "Move note to bottom", callback: () => call("cmdMoveToBottom") });
     this.addCommand({ id: "stashpad-outdent", name: "Outdent (move to grandparent)", callback: () => call("cmdOutdent") });
     this.addCommand({ id: "stashpad-set-color", name: "Set note color…", callback: () => call("cmdSetColor") });
+    this.addCommand({ id: "stashpad-reply-link", name: "Make note a reply to…", callback: () => call("cmdReplyLinkPicker") });
+    // 0.319.0: drafts machinery (+ the edit-in-composer provision, deliberately
+    // command-only until the UX is decided — see .claude/TODO.md "editing model").
+    this.addCommand({ id: "stashpad-composer-drafts", name: "Show composer drafts", callback: () => this.openComposerDrafts() });
+    this.addCommand({ id: "stashpad-edit-in-composer", name: "Edit note in the composer (experimental)", callback: () => call("beginComposerEdit") });
     this.addCommand({ id: "stashpad-focus-list", name: "Focus the list (leave the composer)", callback: () => call("cmdFocusList") });
     this.addCommand({ id: "stashpad-toggle-obscured", name: "Obscure / reveal note (blur \u2014 visual only, not encryption)", callback: () => call("cmdToggleObscured") });
     // "Clone / duplicate / copy" — three synonyms in the name so command-palette
@@ -5674,6 +5679,50 @@ export default class StashpadPlugin extends Plugin {
    *  it's reachable from the launcher and sits alongside the other views. The
    *  tab renders its own "No events yet" empty state, so the old pre-open
    *  "No log yet" Notice is gone. */
+  /** 0.319.0: a stable per-DEVICE label for drafts ("phone-ab12"). Lives in
+   *  Obsidian's local storage, so it is never synced. */
+  deviceId(): string {
+    try {
+      const cur = this.app.loadLocalStorage("stashpad-device-id");
+      if (typeof cur === "string" && cur) return cur;
+      const id = `${Platform.isMobile ? "phone" : "desktop"}-${Math.random().toString(36).slice(2, 6)}`;
+      this.app.saveLocalStorage("stashpad-device-id", id);
+      return id;
+    } catch { return "unknown"; }
+  }
+
+  /** 0.319.0: the drafts review modal (all folders, or one). */
+  openComposerDrafts(folder?: string): void {
+    new ComposerDraftsModal(this.app, this, folder).open();
+  }
+
+  /** 0.319.0: delete a draft everywhere (broadcast so open views reconcile). */
+  async deleteComposerDraft(id: string): Promise<void> {
+    const all = { ...(this.settings.composerDrafts ?? {}) };
+    if (!(id in all)) return;
+    delete all[id];
+    this.settings.composerDrafts = all;
+    await this.saveSettings();
+  }
+
+  /** 0.319.0: load a draft into the composer of a view on its folder (opening
+   *  one if needed). */
+  async loadComposerDraft(id: string): Promise<void> {
+    const d = this.settings.composerDrafts?.[id];
+    if (!d) { new Notice("That draft is gone."); return; }
+    let view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+      .map((l) => l.view as unknown as { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> })
+      .find((v) => v.noteFolder === d.folder);
+    if (!view) {
+      await this.activateViewForFolder(d.folder);
+      view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
+        .map((l) => l.view as unknown as { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> })
+        .find((v) => v.noteFolder === d.folder);
+    }
+    if (!view?.switchToDraft) { new Notice("Couldn't open a Stashpad view for that folder."); return; }
+    await view.switchToDraft(id);
+  }
+
   async openActionLog(): Promise<void> {
     await openStashpadLogView(this);
   }
@@ -10192,7 +10241,19 @@ export default class StashpadPlugin extends Plugin {
       notifiedDueKeys: Array.isArray(data?.notifiedDueKeys)
         ? data.notifiedDueKeys.filter((x: unknown): x is string => typeof x === "string").slice(-2000)
         : [],
-      drafts: normalizeDrafts(data?.drafts),
+      // 0.319.0: legacy per-folder strings migrate into composerDrafts (id-keyed)
+      // and the legacy map is cleared so it can't re-migrate a since-edited draft.
+      drafts: {},
+      composerDrafts: normalizeComposerDrafts(data?.composerDrafts, normalizeDrafts(data?.drafts)),
+      editRouting: (() => {
+        const d = DEFAULT_SETTINGS.editRouting; const r = data?.editRouting ?? {};
+        const tri = (x: any, def: { composer: number; modal: number; tab: number }) => ({
+          composer: typeof x?.composer === "number" ? x.composer : def.composer,
+          modal: typeof x?.modal === "number" ? x.modal : def.modal,
+          tab: typeof x?.tab === "number" ? x.tab : def.tab,
+        });
+        return { toComposer: r.toComposer === true, desktop: tri(r.desktop, d.desktop), mobile: tri(r.mobile, d.mobile) };
+      })(),
       lastSubmitted: data?.lastSubmitted && typeof data.lastSubmitted === "object" ? data.lastSubmitted : {},
       // Migrate: when slugStopWords has never been set on this install
       // (undefined on disk), seed it with the default list so the
@@ -10568,7 +10629,7 @@ export default class StashpadPlugin extends Plugin {
    *  right because the entries are independent. Anything not listed keeps
    *  whole-value semantics, which is correct for scalars and ordered arrays. */
   private static UNION_MERGE_KEYS: readonly string[] = [
-    "drafts", "lastSubmitted", "noteTemplates", "colorAliases", "viewModes",
+    "drafts", "composerDrafts", "lastSubmitted", "noteTemplates", "colorAliases", "viewModes",
   ];
 
   private async guardedSave(): Promise<void> {
@@ -11074,6 +11135,37 @@ function mergeBindings(
       b.secondary = m.defaultSecondary ?? "";
       b.useBoth = !!m.defaultUseBoth;
     }
+  }
+  return out;
+}
+
+/** 0.319.0: validate the id-keyed draft map and fold LEGACY per-folder strings
+ *  in as `legacy:<folder>` entries (skipped when an entry with the same folder +
+ *  text already exists, e.g. after a partial sync). */
+function normalizeComposerDrafts(raw: any, legacy: Record<string, string>): Record<string, ComposerDraft> {
+  const out: Record<string, ComposerDraft> = {};
+  if (raw && typeof raw === "object") {
+    for (const [id, v] of Object.entries(raw as Record<string, any>)) {
+      if (!v || typeof v !== "object" || typeof v.folder !== "string" || typeof v.text !== "string") continue;
+      const kind: "new" | "edit" = v.kind === "edit" && v.edit && typeof v.edit.id === "string" ? "edit" : "new";
+      out[id] = {
+        id, folder: v.folder, text: v.text,
+        created: typeof v.created === "number" ? v.created : Date.now(),
+        modified: typeof v.modified === "number" ? v.modified : Date.now(),
+        device: typeof v.device === "string" ? v.device : "unknown",
+        kind,
+        ...(kind === "edit" ? { edit: { id: String(v.edit.id), path: String(v.edit.path ?? ""), title: String(v.edit.title ?? ""), openMd: String(v.edit.openMd ?? "") } } : {}),
+        replyTo: v.replyTo && typeof v.replyTo === "object" && typeof v.replyTo.path === "string"
+          ? { id: String(v.replyTo.id ?? ""), title: String(v.replyTo.title ?? ""), path: v.replyTo.path } : null,
+      };
+    }
+  }
+  for (const [folder, text] of Object.entries(legacy)) {
+    if (!text || !text.trim()) continue;
+    if (Object.values(out).some((d) => d.folder === folder && d.text === text)) continue;
+    const id = `legacy:${folder}`;
+    const now = Date.now();
+    out[id] = { id, folder, text, created: now, modified: now, device: "legacy", kind: "new", replyTo: null };
   }
   return out;
 }
