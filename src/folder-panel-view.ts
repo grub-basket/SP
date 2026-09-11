@@ -204,10 +204,12 @@ export class StashpadFolderPanelView extends ItemView {
       .onClick(() => void this.setPinnedGrouping("pin-order")));
     menu.addItem((i) => i.setTitle("Group by folder").setChecked(cur === "folder")
       .onClick(() => void this.setPinnedGrouping("folder")));
+    menu.addItem((i) => i.setTitle("Folder tabs").setChecked(cur === "tabs")
+      .onClick(() => void this.setPinnedGrouping("tabs")));
     menu.showAtMouseEvent(e);
   }
 
-  private async setPinnedGrouping(mode: "pin-order" | "folder"): Promise<void> {
+  private async setPinnedGrouping(mode: "pin-order" | "folder" | "tabs"): Promise<void> {
     if ((this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order") === mode) return;
     this.plugin.settings.folderPanelPinnedGrouping = mode;
     await this.plugin.saveSettings();
@@ -284,6 +286,106 @@ export class StashpadFolderPanelView extends ItemView {
     }
   }
 
+  /** 0.320.0: active tab (folder path, or "" for All) in the folder-tabs pinned
+   *  view. Per device (local storage), so it never syncs or churns settings. */
+  private pinnedTabActive: string | null = null;
+  private getPinnedTab(): string {
+    if (this.pinnedTabActive != null) return this.pinnedTabActive;
+    try { const v = this.app.loadLocalStorage("stashpad-pinned-tab"); this.pinnedTabActive = typeof v === "string" ? v : ""; }
+    catch { this.pinnedTabActive = ""; }
+    return this.pinnedTabActive;
+  }
+  private setPinnedTab(folder: string): void {
+    this.pinnedTabActive = folder;
+    try { this.app.saveLocalStorage("stashpad-pinned-tab", folder); } catch { /* ignore */ }
+  }
+
+  /** 0.320.0: render the pinned panel as folder TABS + the active tab's items. */
+  private renderPinnedTabs(list: HTMLElement, items: PinnedItem[], open: Set<string>): void {
+    // Folders present, ordered by their earliest pin (stable).
+    const firstAt = new Map<string, number>();
+    for (const it of items) { const cur = firstAt.get(it.folder); if (cur == null || it.at < cur) firstAt.set(it.folder, it.at); }
+    const folders = [...firstAt.keys()].sort((a, b) => (firstAt.get(a)! - firstAt.get(b)!) || a.localeCompare(b));
+    let active = this.getPinnedTab();
+    if (active && !folders.includes(active)) active = "";   // its folder lost all pins
+    const activeStashpad = (this.plugin.lastActiveStashpadLeaf?.view as any)?.noteFolder as string | undefined;
+
+    const tabs = list.createDiv({ cls: "stashpad-pinned-tabs" });
+    const mkTab = (folder: string, label: string): void => {
+      const t = tabs.createDiv({ cls: "stashpad-pinned-tab", text: label });
+      if (folder) t.setAttr("title", folder);
+      if (folder === active) t.addClass("is-active");
+      if (folder && folder === activeStashpad) t.addClass("is-current-folder");
+      const count = items.filter((i) => !folder || i.folder === folder).length;
+      t.createSpan({ cls: "stashpad-pinned-tab-count", text: String(count) });
+      t.onclick = () => { this.setPinnedTab(folder); this.render(); };
+      // 0.320.3: right-click a folder tab for its actions.
+      if (folder) t.oncontextmenu = (e) => { e.preventDefault(); this.pinnedTabMenu(e, folder, items); };
+    };
+    mkTab("", "All");
+    for (const f of folders) mkTab(f, f.split("/").pop() || f);
+
+    // 0.320.3: an action bar for the active tab — jump to the Stashpad, expand /
+    // collapse the home-pin sublists, and (per folder) unpin everything here.
+    const bar = list.createDiv({ cls: "stashpad-pinned-tab-actions" });
+    const mkBtn = (icon: string, label: string, onClick: () => void): void => {
+      const b = bar.createEl("button", { cls: "stashpad-pinned-tab-action" });
+      setIcon(b, icon); b.createSpan({ text: label }); b.setAttr("aria-label", label);
+      b.onclick = onClick;
+    };
+    if (active) {
+      mkBtn("list-tree", "Open", () => { this.onNavigateAway(); this.jumpToFolder(active); });
+    }
+    const shownFolders = active ? [active] : folders;
+    const anyExpandable = shownFolders.some((f) => this.folderHomePinnedNotes(f).length > 0);
+    if (anyExpandable) {
+      const keyOf = (f: string) => StashpadFolderPanelView.clean(f);
+      const allOpen = shownFolders.every((f) => this.folderPinExpanded.has(keyOf(f)) || this.folderHomePinnedNotes(f).length === 0);
+      mkBtn(allOpen ? "chevrons-down-up" : "chevrons-up-down", allOpen ? "Collapse" : "Expand", () => {
+        for (const f of shownFolders) { if (this.folderHomePinnedNotes(f).length === 0) continue; const key = keyOf(f); if (allOpen) this.folderPinExpanded.delete(key); else this.folderPinExpanded.add(key); }
+        this.render();
+      });
+    }
+    if (active) {
+      const notes = items.filter((i) => i.folder === active && i.kind === "note");
+      if (notes.length) mkBtn("pin-off", "Unpin all", () => this.confirmUnpinAll(active, items));
+    }
+
+    const body = list.createDiv({ cls: "stashpad-pinned-tab-body" });
+    const shown = active ? items.filter((i) => i.folder === active) : items;
+    const idxOf = new Map<PinnedItem, number>();
+    items.forEach((it, i) => idxOf.set(it, i));
+    if (shown.length === 0) { body.createDiv({ cls: "stashpad-folderpanel-empty", text: active ? "No pins in this folder." : "Nothing pinned yet — pin a note or folder from its right-click menu." }); return; }
+    // Drag-reorder is disabled in the tabbed view (the index space is the whole
+    // pin list, not the filtered slice) — switch to pin-order / group mode to
+    // reorder.
+    for (const it of shown) this.renderPinnedItem(body, it, idxOf.get(it)!, open, false);
+    if (shown.length > 1) body.createDiv({ cls: "setting-item-description stashpad-pinned-tab-hint", text: "Switch to \u201cSort by pin order\u201d to drag-reorder pins." });
+  }
+
+  /** 0.320.3: right-click menu on a folder tab. */
+  private pinnedTabMenu(e: MouseEvent, folder: string, items: PinnedItem[]): void {
+    const menu = new Menu();
+    menu.addItem((i) => i.setTitle("Open this Stashpad").setIcon("list-tree").onClick(() => { this.setPinnedTab(folder); this.onNavigateAway(); this.jumpToFolder(folder); }));
+    menu.addItem((i) => i.setTitle("Open in a new tab").setIcon("layout-grid").onClick(() => { this.onNavigateAway(); void this.plugin.activateViewForFolder(folder); }));
+    if (items.some((it) => it.folder === folder && it.kind === "note")) {
+      menu.addSeparator();
+      menu.addItem((i) => i.setTitle("Unpin all in this folder").setIcon("pin-off").onClick(() => this.confirmUnpinAll(folder, items)));
+    }
+    menu.showAtMouseEvent(e);
+  }
+
+  /** 0.320.3: confirm + unpin every pinned NOTE in a folder (pinned folders are
+   *  left alone). */
+  private confirmUnpinAll(folder: string, items: PinnedItem[]): void {
+    const notes = items.filter((it): it is Extract<PinnedItem, { kind: "note" }> => it.kind === "note" && it.folder === folder);
+    if (!notes.length) return;
+    const name = folder.split("/").pop() || folder;
+    new ConfirmModal(this.app, `Unpin ${notes.length} note${notes.length === 1 ? "" : "s"}?`,
+      `Remove all ${notes.length} pinned note${notes.length === 1 ? "" : "s"} in “${name}” from the sidebar. The notes themselves are not changed.`,
+      "Unpin all", (ok: boolean) => { if (!ok) return; void (async () => { for (const n of notes) await this.plugin.unpinNote({ folder: n.folder, id: n.id }); this.render(); })(); }, "Cancel").open();
+  }
+
   private renderPinned(list: HTMLElement): void {
     this.ensureFolderPinOrder();
     // 0.306.0 (encrypted-pins P1): append LOCKED pinned bundles below the live
@@ -299,6 +401,11 @@ export class StashpadFolderPanelView extends ItemView {
     const grouping = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
     const idxOf = new Map<PinnedItem, number>();
     items.forEach((it, i) => idxOf.set(it, i));
+
+    // 0.320.0: TAB VIEW — a strip of folder tabs (+ "All") across the top; only
+    // the active tab's pinned items show below. Compact when many folders are
+    // pinned. Active tab remembered per device.
+    if (grouping === "tabs") { this.renderPinnedTabs(list, items, open); return; }
 
     if (grouping !== "folder") {
       // Flat, shared pin order: folders and notes interleave and drag-reorder together.

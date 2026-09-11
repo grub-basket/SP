@@ -9883,3 +9883,96 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-edit-limit-label { font-size: var(--font-ui-smaller); color: var(--text-muted); text-transform: capitalize; }
 .stashpad-edit-limit input { width: 6.5em; }
 .is-mobile .stashpad-edit-limits { flex-wrap: wrap; }
+
+/* 0.320.0: user-defined per-note command buttons that overflow to a bottom bar. */
+.stashpad-note-extra-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.stashpad-note-extra-actions .stashpad-note-itembtn { flex: 0 0 auto; }
+
+/* 0.320.0: note-action settings builders. */
+.stashpad-cmdicon-preview { display: inline-flex; margin-right: 6px; vertical-align: -2px; color: var(--text-muted); }
+.stashpad-cmdicon-preview .svg-icon { width: 16px; height: 16px; }
+.stashpad-action-builder { margin-top: 4px; }
+.stashpad-action-empty { padding: 6px 0; }
+
+/* 0.320.0: pinned-panel folder TAB view. */
+.stashpad-pinned-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 4px;
+}
+.stashpad-pinned-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background: var(--background-modifier-hover);
+  cursor: pointer;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.stashpad-pinned-tab:hover { color: var(--text-normal); }
+.stashpad-pinned-tab.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-weight: 600;
+}
+.stashpad-pinned-tab.is-current-folder:not(.is-active) { border-color: var(--interactive-accent); }
+.stashpad-pinned-tab-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+  font-size: 0.85em;
+}
+.stashpad-pinned-tab.is-active .stashpad-pinned-tab-count { opacity: 0.9; }
+
+/* 0.320.3: intro paragraph under a settings sub-heading. */
+.stashpad-section-intro { margin: -2px 0 8px; }
+
+/* 0.320.3: pinned tab action bar. */
+.stashpad-pinned-tab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 2px 6px;
+}
+.stashpad-pinned-tab-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: var(--font-ui-smaller);
+  border-radius: var(--radius-s);
+  background: var(--background-modifier-hover);
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.stashpad-pinned-tab-action:hover { color: var(--text-normal); border-color: var(--background-modifier-border); }
+.stashpad-pinned-tab-action .svg-icon { width: 14px; height: 14px; }
+
+/* 0.320.3: distinguish user item buttons; overflow bar affordance. */
+.stashpad-note-itembtn { position: relative; }
+.stashpad-note-extra-actions {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 5px;
+}
+.stashpad-note-extra-actions::before {
+  content: "⋯";
+  color: var(--text-faint);
+  font-size: 0.9em;
+  align-self: center;
+  margin-right: 2px;
+}
+/* Cap the pinned tab strip so many folders don't push the list off-screen. */
+.stashpad-pinned-tabs { max-height: 4.6em; overflow-y: auto; }
+.stashpad-pinned-tab-hint { margin-top: 6px; opacity: 0.75; }

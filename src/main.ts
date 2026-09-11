@@ -10192,6 +10192,20 @@ export default class StashpadPlugin extends Plugin {
     // seed the Shift modifier (hold Shift while copying to still get timestamps).
     // A user who had it off maps to "" (off). Idempotent — only fires when the
     // new key is absent.
+    // 0.320.0: fold legacy quickMenuCustom into quickMenuActions + commandIcons.
+    if (Array.isArray((data)?.quickMenuCustom) && (data).quickMenuCustom.length) {
+      const qa = Array.isArray((data).quickMenuActions) ? (data).quickMenuActions.slice() : [];
+      const ci = (data).commandIcons && typeof (data).commandIcons === "object" ? { ...(data).commandIcons } : {};
+      for (const c of (data).quickMenuCustom) {
+        if (!c || typeof c.commandId !== "string") continue;
+        const key = `cmd:${c.commandId}`;
+        if (!qa.includes(key)) qa.push(key);
+        if (typeof c.icon === "string") ci[key] = c.icon;
+      }
+      (data).quickMenuActions = qa;
+      (data).commandIcons = ci;
+      (data).quickMenuCustom = [];
+    }
     if (typeof (data)?.prefixTimestampsOnCopy === "boolean" && typeof (data)?.copyTimestampModifiers !== "string") {
       (data).copyTimestampModifiers = (data).prefixTimestampsOnCopy ? "shift" : "";
       delete (data).prefixTimestampsOnCopy;
@@ -10254,6 +10268,16 @@ export default class StashpadPlugin extends Plugin {
         });
         return { toComposer: r.toComposer === true, desktop: tri(r.desktop, d.desktop), mobile: tri(r.mobile, d.mobile) };
       })(),
+      // 0.320.0: note-action customization keys — validate shape so bad disk data
+      // can't crash a render.
+      commandIcons: (data?.commandIcons && typeof data.commandIcons === "object" && !Array.isArray(data.commandIcons))
+        ? Object.fromEntries(Object.entries(data.commandIcons).filter(([, v]) => typeof v === "string")) as Record<string, string>
+        : {},
+      itemButtons: Array.isArray(data?.itemButtons) ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string") : [],
+      contextMenuOrder: Array.isArray(data?.contextMenuOrder) ? data.contextMenuOrder.filter((x: unknown): x is string => typeof x === "string") : [],
+      // 0.320.0: legacy quickMenuCustom entries fold into quickMenuActions as
+      // `cmd:<id>` (with their icon into commandIcons) — one ordered list now.
+      quickMenuCustom: [],
       lastSubmitted: data?.lastSubmitted && typeof data.lastSubmitted === "object" ? data.lastSubmitted : {},
       // Migrate: when slugStopWords has never been set on this install
       // (undefined on disk), seed it with the default list so the
@@ -10629,7 +10653,7 @@ export default class StashpadPlugin extends Plugin {
    *  right because the entries are independent. Anything not listed keeps
    *  whole-value semantics, which is correct for scalars and ordered arrays. */
   private static UNION_MERGE_KEYS: readonly string[] = [
-    "drafts", "composerDrafts", "lastSubmitted", "noteTemplates", "colorAliases", "viewModes",
+    "drafts", "composerDrafts", "lastSubmitted", "noteTemplates", "colorAliases", "viewModes", "commandIcons",
   ];
 
   private async guardedSave(): Promise<void> {

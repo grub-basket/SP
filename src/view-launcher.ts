@@ -185,7 +185,11 @@ export class ViewLauncherModal extends SuggestModal<LauncherEntry> {
   }
 
   getSuggestions(query: string): LauncherEntry[] {
-    return LAUNCHER_ENTRIES.filter((e) => siftMatch(query, `${e.label} ${e.keywords}`));
+    // 0.320.3 (user): list alphabetically by label so the launcher is scannable,
+    // rather than in catalog-definition order.
+    return LAUNCHER_ENTRIES
+      .filter((e) => siftMatch(query, `${e.label} ${e.keywords}`))
+      .sort((a, b) => a.label.localeCompare(b.label));
   }
 
   renderSuggestion(entry: LauncherEntry, el: HTMLElement): void {

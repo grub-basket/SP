@@ -75,7 +75,7 @@ import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMet
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE } from "./quick-actions";
+import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
@@ -7576,6 +7576,7 @@ export class StashpadView extends ItemView {
       rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "Actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
+      this.maybeAddItemButtons(actions, body, node, moreBtn);
       toggleAnchor = moreBtn;
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil" });
@@ -7604,6 +7605,7 @@ export class StashpadView extends ItemView {
       rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "More actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
+      this.maybeAddItemButtons(actions, body, node, moreBtn);
       toggleAnchor = pencil;
     }
 
@@ -19738,20 +19740,56 @@ export class StashpadView extends ItemView {
       this.openStashpadCommandPalette();
       return;
     }
+    // 0.320.0: an arbitrary Obsidian command id — run it directly (custom
+    // star-menu entries / item buttons carry `cmd:<id>`).
+    if (id.startsWith("cmd:")) {
+      if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+      (this.app as any).commands?.executeCommandById?.(id.slice(4));
+      return;
+    }
     if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
+    this.runNoteActionInner(id, node);
+  }
+
+  /** 0.320.0: the unified per-note action dispatcher (superset of the old
+   *  quick-action switch). Selection is already normalised to `node`. */
+  private runNoteActionInner(id: string, node: TreeNode): void {
     switch (id) {
-      case "copy":      void this.cmdCopy(); break;
-      case "copyTree":  void this.cmdCopyTree(); break;
-      case "move":      this.cmdMovePicker(); break;
-      case "clone":     void this.cmdClone(); break;
-      case "setColor":  this.cmdSetColor(); break;
-      case "blur":      void this.cmdToggleObscured(); break;
-      case "setDue":    this.cmdSetDue(); break;
-      case "archive":   void this.cmdMoveToArchive(); break;
-      case "largeText": this.cmdRevealLargeText(node); break;
-      case "edit":      void this.cmdEdit(node); break;
+      case "copy":             void this.cmdCopy(); break;
+      case "copyTree":         void this.cmdCopyTree(); break;
+      case "copyLevelMarkers": void this.cmdCopyTreeLevelMarkers(); break;
+      case "copySubtree":      void this.cmdCopyFocusedSubtree(); break;
+      case "move":             this.cmdMovePicker(); break;
+      case "moveHome":         void this.changeParent(node, ROOT_ID); break;
+      case "clone":            void this.cmdClone(); break;
+      case "fork":             this.cmdForkNote(); break;
+      case "setColor":         this.cmdSetColor(); break;
+      case "blur":             void this.cmdToggleObscured(); break;
+      case "setDue":           this.cmdSetDue(); break;
+      case "archive":          void this.cmdMoveToArchive(); break;
+      case "largeText":        this.cmdRevealLargeText(node); break;
+      case "edit":             void this.cmdEdit(node); break;
+      case "focus":            this.navigateTo(node.id); break;
+      case "openNewTab":       void this.openInNewStashpadTab(node.id); break;
+      case "openObsidian":     if (node.file) void this.openFileAtEnd(node.file); break;
+      case "reply":            this.cmdReply(node); break;
+      case "replyLink":        this.cmdReplyLinkPicker(node); break;
+      case "react":            this.cmdReact(node); break;
+      case "split":            void this.cmdSplit(node); break;
+      case "pinSidebar": {
+        const ref = { folder: this.noteFolder, id: node.id };
+        if (this.plugin.isPinned(ref)) void this.plugin.unpinNote(ref); else void this.plugin.pinNote(ref);
+        break;
+      }
       default: /* unknown id (stale settings) — skip silently */ break;
     }
+  }
+
+  /** 0.320.0: the effective icon for a catalog action id — the user override
+   *  from `commandIcons`, else the catalog default. For a `cmd:<id>` custom
+   *  action, callers pass their own icon. */
+  actionIcon(id: string): string {
+    return getSettings().commandIcons?.[id] || defaultActionIcon(id);
   }
 
   /** 0.272.0: add the star quick-action button to a row/header actions cluster,
@@ -19767,6 +19805,47 @@ export class StashpadView extends ItemView {
     if (before) container.insertBefore(btn, before);
   }
 
+  /** 0.320.0: user-defined command buttons on the row (settings.itemButtons).
+   *  Each id is a catalog action or `cmd:<obsidian command id>`. The first
+   *  `inlineMax` render inline in the action cluster (inserted before the ⋮
+   *  button so the hardcoded buttons keep their right-to-left slots); any
+   *  overflow spills to a full-width bar at the bottom of the note that wraps.
+   *  `inlineMax` is platform-aware (a phone row has less room). */
+  private maybeAddItemButtons(actions: HTMLElement, body: HTMLElement, node: TreeNode, before: HTMLElement): void {
+    const ids = getSettings().itemButtons ?? [];
+    if (!ids.length) return;
+    const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
+    const resolve = (id: string): { icon: string; label: string } | null => {
+      if (id.startsWith("cmd:")) {
+        const cid = id.slice(4);
+        if (!cmdRegistry[cid]) return null;   // uninstalled/disabled
+        const custom = (getSettings().commandIcons ?? {})[id];
+        return { icon: custom || "terminal", label: cmdRegistry[cid]?.name || cid };
+      }
+      const def = noteAction(id);
+      return def ? { icon: this.actionIcon(id), label: def.label } : null;
+    };
+    const resolved = ids.map((id) => ({ id, meta: resolve(id) })).filter((x): x is { id: string; meta: { icon: string; label: string } } => x.meta != null);
+    if (!resolved.length) return;
+    const inlineMax = Platform.isMobile ? 2 : 4;
+    const mkBtn = (host: HTMLElement, id: string, meta: { icon: string; label: string }): HTMLElement => {
+      const b = host.createEl("button", { cls: "stashpad-pencil stashpad-note-itembtn" });
+      setIcon(b, meta.icon);
+      b.title = meta.label;
+      b.setAttr("aria-label", meta.label);
+      b.onclick = (e) => { e.stopPropagation(); this.runQuickAction(id, node, e); };
+      return b;
+    };
+    const inline = resolved.slice(0, inlineMax);
+    const overflow = resolved.slice(inlineMax);
+    for (const { id, meta } of inline) actions.insertBefore(mkBtn(actions, id, meta), before);
+    if (overflow.length) {
+      const bar = body.createDiv({ cls: "stashpad-note-extra-actions" });
+      bar.setAttr("aria-label", "More note actions");
+      for (const { id, meta } of overflow) mkBtn(bar, id, meta);
+    }
+  }
+
   /** 0.272.0: the short, user-curated quick menu opened by the star button.
    *  Sits before the full ⋮ menu; contents come from `settings.quickMenuActions`
    *  in that order. Falls back to nothing (button hidden) when the list is
@@ -19775,14 +19854,28 @@ export class StashpadView extends ItemView {
   private openQuickMenu(evt: MouseEvent, node: TreeNode): void {
     if (!node.file) return;
     this.lastQuickMenuEvt = evt;   // fallback position for "More commands…"
-    const ids = getSettings().quickMenuActions ?? [];
-    const byId = new Map(QUICK_ACTION_CATALOG.map((a) => [a.id, a]));
+    // 0.320.0: quickMenuActions is one ordered list holding catalog ids AND
+    // arbitrary `cmd:<obsidian id>` entries (custom command icons live in
+    // commandIcons["cmd:<id>"]).
+    const cfg = getSettings();
+    const ids = cfg.quickMenuActions ?? [];
+    const byId = new Map(NOTE_ACTION_CATALOG.map((a) => [a.id, a]));
+    const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const menu = new Menu();
     let added = 0;
     for (const id of ids) {
+      if (id.startsWith("cmd:")) {
+        const cid = id.slice(4);
+        if (!cmdRegistry[cid]) continue;   // uninstalled/disabled
+        const label = cmdRegistry[cid]?.name || cid;
+        const icon = (cfg.commandIcons ?? {})[id] || "terminal";
+        menu.addItem((it: any) => it.setTitle(label).setIcon(icon).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
+        added += 1;
+        continue;
+      }
       const def = byId.get(id);
       if (!def) continue;   // stale/unknown id
-      menu.addItem((it: any) => it.setTitle(def.label).setIcon(def.icon).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
+      menu.addItem((it: any) => it.setTitle(def.label).setIcon(this.actionIcon(id)).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
       added += 1;
     }
     if (added === 0) { this.openNoteMenu(evt, node); return; }   // nothing configured → fall back to full menu
@@ -19792,6 +19885,53 @@ export class StashpadView extends ItemView {
       menu.addItem((it: any) => it.setTitle(QUICK_MENU_MORE.label).setIcon(QUICK_MENU_MORE.icon).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction("more", node, e)));
     }
     menu.showAtMouseEvent(evt);
+  }
+
+  /** 0.320.0: render ONE reorderable context-menu leaf item by catalog id.
+   *  `focusClicked` normalises the selection to the right-clicked row for the
+   *  selection-based commands. */
+  private renderCtxLeaf(menu: any, id: string, node: TreeNode, file: TFile, focusClicked: () => void): void {
+    const A = (title: string, icon: string, onClick: (e?: MouseEvent | KeyboardEvent) => void): void =>
+      menu.addItem((it: any) => it.setTitle(title).setIcon(icon).onClick(onClick));
+    switch (id) {
+      case "edit":         A("Edit in Stashpad", this.actionIcon("edit"), () => void this.cmdEdit(node)); break;
+      case "focus":        A("Focus in Stashpad", this.actionIcon("focus"), () => this.navigateTo(node.id)); break;
+      case "openNewTab":   A("Open in new Stashpad tab", this.actionIcon("openNewTab"), () => void this.openInNewStashpadTab(node.id)); break;
+      case "openObsidian": A("Open in Obsidian editor", this.actionIcon("openObsidian"), () => void this.openFileAtEnd(file)); break;
+      case "react":        A("React…", this.actionIcon("react"), () => this.cmdReact(node)); break;
+      case "reply":        A("Reply", this.actionIcon("reply"), () => this.cmdReply(node)); break;
+      case "replyLink":
+        A("Make a reply to\u2026", this.actionIcon("replyLink"), () => this.cmdReplyLinkPicker(node));
+        if (this.hasReplyLink(node)) A("Remove reply link", "unlink", () => void this.setReplyLink(node, null));
+        break;
+      case "split":        A("Split note…", this.actionIcon("split"), () => void this.cmdSplit(node)); break;
+      case "clone":        A("Clone (duplicate / copy)", this.actionIcon("clone"), () => { focusClicked(); void this.cmdClone(); }); break;
+      case "fork":         A("Fork into a separate note…", this.actionIcon("fork"), () => { focusClicked(); this.cmdForkNote(); }); break;
+      case "setDue":       A("Set due date…", this.actionIcon("setDue"), () => { focusClicked(); this.cmdSetDue(); }); break;
+      case "largeText":    A("Reveal in large text", this.actionIcon("largeText"), () => this.cmdRevealLargeText(node)); break;
+      case "archive":      A("Move to archive", this.actionIcon("archive"), () => { focusClicked(); void this.cmdMoveToArchive(); }); break;
+      case "copy": {
+        const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
+        const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
+        menu.addItem((it: any) => {
+          it.setTitle("Copy").setIcon(this.actionIcon("copy"));
+          const sub = it.setSubmenu?.();
+          if (!sub) { it.onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopy(eventHasMods(evt, tsMods)); }); return; }
+          sub.addItem((s: any) => s.setTitle(`Copy text${tsHint}`).setIcon(this.actionIcon("copy")).onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopy(eventHasMods(evt, tsMods)); }));
+          sub.addItem((s: any) => s.setTitle(`Copy tree${tsHint}`).setIcon(this.actionIcon("copyTree")).onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopyTree(eventHasMods(evt, tsMods)); }));
+          sub.addItem((s: any) => s.setTitle("Copy tree with level markers").setIcon(this.actionIcon("copyLevelMarkers")).onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopyTreeLevelMarkers(eventHasMods(evt, tsMods)); }));
+          sub.addItem((s: any) => s.setTitle("Copy focused subtree").setIcon(this.actionIcon("copySubtree")).onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopyFocusedSubtree(eventHasMods(evt, tsMods)); }));
+          if (!tsMods.length) {
+            // No timestamp modifier configured → offer timestamps explicitly.
+            sub.addSeparator();
+            sub.addItem((s: any) => s.setTitle("Copy text with timestamps").setIcon(this.actionIcon("copy")).onClick(() => { focusClicked(); void this.cmdCopy(true); }));
+            sub.addItem((s: any) => s.setTitle("Copy tree with timestamps").setIcon(this.actionIcon("copyTree")).onClick(() => { focusClicked(); void this.cmdCopyTree(true); }));
+          }
+        });
+        break;
+      }
+      default: break;
+    }
   }
 
   private openNoteMenu(evt: MouseEvent, node: TreeNode): void {
@@ -19812,46 +19952,26 @@ export class StashpadView extends ItemView {
     const focusClicked = (): void => {
       if (!this.selection.has(node.id)) { this.selection.clear(); this.selection.add(node.id); this.lastSelected = node.id; }
     };
-    menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("layout-grid").onClick(() => {
-      void this.openInNewStashpadTab(node.id);
-    }));
-    menu.addItem((it: any) => it.setTitle("Open in Obsidian editor").setIcon("file-text").onClick(() => {
-      void this.openFileAtEnd(file);
-    }));
-    menu.addItem((it: any) => it.setTitle("Focus in Stashpad").setIcon("arrow-right").onClick(() => this.navigateTo(node.id)));
-    menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("React…").setIcon("smile-plus").onClick(() => this.cmdReact(node)));
-    menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => this.cmdReply(node)));
-    // 0.317.0: retro-link an existing note as a reply (+ remove when it is one).
-    menu.addItem((it: any) => it.setTitle("Make a reply to\u2026").setIcon("corner-up-left").onClick(() => this.cmdReplyLinkPicker(node)));
-    if (this.hasReplyLink(node)) menu.addItem((it: any) => it.setTitle("Remove reply link").setIcon("unlink").onClick(() => void this.setReplyLink(node, null)));
-    menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => void this.cmdEdit(node)));
-    menu.addItem((it: any) => it.setTitle("Split note…").setIcon("split").onClick(() => void this.cmdSplit(node)));
+    // 0.320.0: Edit in Stashpad leads (most-reachable slot, user request); the
+    // Obsidian-editor handoff moves down into the open-elsewhere group. Catalog
+    // icons route through actionIcon() so the icon registry can restyle them.
+    // 0.320.0: the reorderable top block (settings.contextMenuOrder). Stateful
+    // items (obscure, pin, task, share/export, encrypt, delete) stay fixed below.
+    {
+      const custom = (getSettings().contextMenuOrder ?? []).filter((id) => CONTEXT_LEAF_IDS.includes(id));
+      const order = custom.length ? custom : CONTEXT_DEFAULT_ORDER;
+      order.forEach((id, idx) => {
+        this.renderCtxLeaf(menu, id, node, file, focusClicked);
+        // Keep the original visual break after the "open" group when it leads.
+        if (id === "openObsidian" && idx < order.length - 1) menu.addSeparator();
+      });
+      // Always separate the reorderable block from the fixed stateful items below.
+      if (order.length) menu.addSeparator();
+    }
     // Only meaningful on a repeating task; hidden otherwise so the menu stays short.
     if (parseRecurrence(this.app.metadataCache.getFileCache(node.file!)?.frontmatter?.repeat as string | undefined)) {
       menu.addItem((it: any) => it.setTitle("Skip to next occurrence").setIcon("skip-forward").onClick(() => void this.cmdSkipOccurrence(node)));
     }
-    // 0.122.2 (#9): copy the note's text. `focusClicked` (defined below)
-    // normalises selection to the right-clicked row.
-    // 0.122.10: ordered above Clone so the plain "Copy text" reads first.
-    {
-      // 0.278.0: timestamps via modifier gesture — hint it and read it off the click.
-      const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
-      const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
-      menu.addItem((it: any) => it.setTitle(`Copy text${tsHint}`).setIcon("copy").onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopy(eventHasMods(evt, tsMods)); }));
-    }
-    menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").onClick(() => {
-      // Operate on the right-clicked row even if it isn't selected.
-      focusClicked();
-      void this.cmdClone();
-    }));
-    // 0.122.7: "Cut note" pulled from the menu for now — cut/paste has known bugs
-    // and cutting a parent/home note from the context menu is too easy a footgun.
-    // Still available via the cutNotes hotkey. (See ui-polish todos.)
-    menu.addItem((it: any) => it.setTitle("Fork into a separate note…").setIcon("git-branch").onClick(() => {
-      focusClicked();
-      this.cmdForkNote();
-    }));
     // 0.122.2 (#9): "Insert template…" removed from the right-click menu to keep
     // it compact — still available via command palette + its hotkey.
     // 0.155.0: Copy Stashpad link + both export flows grouped under a shared
@@ -19902,8 +20022,8 @@ export class StashpadView extends ItemView {
         : "Obscure this note (visual only)")
       .setIcon(shown || !obscured ? "eye-off" : "eye")
       .onClick(() => { focusClicked(); void this.menuObscureAction(node); }));
-    menu.addItem((it: any) => it.setTitle("Move to…").setIcon("move").onClick(() => { focusClicked(); this.cmdMovePicker(); }));
-    menu.addItem((it: any) => it.setTitle("Move to Home").setIcon("home").onClick(async () => {
+    menu.addItem((it: any) => it.setTitle("Move to…").setIcon(this.actionIcon("move")).onClick(() => { focusClicked(); this.cmdMovePicker(); }));
+    menu.addItem((it: any) => it.setTitle("Move to Home").setIcon(this.actionIcon("moveHome")).onClick(async () => {
       await this.changeParent(node, ROOT_ID);
       // 0.72.6: follow the moved note up to Home if the user enabled
       // it. No-op when the view is already focused on Home.
@@ -19947,7 +20067,7 @@ export class StashpadView extends ItemView {
           .onClick(() => { focusClicked(); void this.cmdToggleListPin(pinEdge); }));
       }
     });
-    menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").onClick(() => {
+    menu.addItem((it: any) => it.setTitle("Set color…").setIcon(this.actionIcon("setColor")).onClick(() => {
       // Operate on the right-clicked row even if it isn't selected.
       focusClicked();
       this.cmdSetColor();
