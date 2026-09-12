@@ -17178,6 +17178,13 @@ export class StashpadView extends ItemView {
     const newOrder = computeReorder(allChildren, targetIds, dir);
     if (arraysEqual(newOrder, allChildren)) return; // already at the edge
 
+    await this.persistReorder(parentId, newOrder, targetIds, dir);
+  }
+
+  /** 0.321.0: persist a computed manual reorder for `parentId` (+ manual mode,
+   *  log, follow-cursor render, undo). Extracted so the move-to-neighbor
+   *  commands share the exact reorder plumbing. */
+  private async persistReorder(parentId: StashpadId, newOrder: StashpadId[], targetIds: StashpadId[], dir: "up" | "down" | "top" | "bottom"): Promise<void> {
     const folder = this.noteFolder;
     const prev = this.order.getOrder(folder, parentId).slice();
     this.order.setOrder(folder, parentId, newOrder);
@@ -17246,6 +17253,37 @@ export class StashpadView extends ItemView {
         this.render();
       },
     });
+  }
+
+  /** 0.321.0: move the cursor/selected note next to the note LITERALLY
+   *  above/below it in the CURRENT displayed order — so it jumps PAST any notes
+   *  hidden by a filter, unlike move up/down which step one slot through the
+   *  full (unfiltered) child list. Single target; same-parent only. Switches the
+   *  folder to manual ordering (like move up/down). */
+  cmdMoveToNeighbor(dir: "up" | "down"): void { void this.moveToNeighbor(dir); }
+  private async moveToNeighbor(dir: "up" | "down"): Promise<void> {
+    // 0.321.0: the focused note's own header can't be reordered among its
+    // siblings from here — it isn't in this list.
+    if (this.cursorOnHeading) { new Notice("Move into the list (press ↓) to reorder notes."); return; }
+    if (this.selection.size > 1) { new Notice("Move-to-neighbor moves one note at a time."); return; }
+    let target: TreeNode | null = null;
+    if (this.cursorIdx >= 0 && this.currentChildren[this.cursorIdx]) target = this.currentChildren[this.cursorIdx];
+    else if (this.selection.size === 1) target = this.tree.get([...this.selection][0] as StashpadId) ?? null;
+    if (!target?.file) { new Notice("Put the cursor on a note first."); return; }
+    const i = this.currentChildren.findIndex((n) => n.id === target!.id);
+    if (i < 0) { new Notice("That note isn't in this list."); return; }
+    const neighbor = dir === "up" ? this.currentChildren[i - 1] : this.currentChildren[i + 1];
+    if (!neighbor) { new Notice(dir === "up" ? "Already at the top." : "Already at the bottom."); return; }
+    const parentId = (target.parent as StashpadId) ?? ROOT_ID;
+    if (((neighbor.parent as StashpadId) ?? ROOT_ID) !== parentId) { new Notice(`The note ${dir === "up" ? "above" : "below"} is nested under a different note — nothing to swap with here.`); return; }
+    const allChildren = this.tree.getChildren(parentId).map((n) => n.id);
+    const without = allChildren.filter((id) => id !== target!.id);
+    const nIdx = without.indexOf(neighbor.id);
+    if (nIdx < 0) return;
+    const insertAt = dir === "up" ? nIdx : nIdx + 1;
+    const newOrder = [...without.slice(0, insertAt), target.id, ...without.slice(insertAt)];
+    if (arraysEqual(newOrder, allChildren)) return;
+    await this.persistReorder(parentId, newOrder, [target.id], dir);
   }
 
   /** Delete selection via Obsidian's OWN trash routing (system trash or `.trash`,

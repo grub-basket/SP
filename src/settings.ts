@@ -326,8 +326,13 @@ export interface StashpadSettings {
    *  a row at the bottom of the note. Empty = none. */
   itemButtons: string[];
   /** 0.320.0: user icon overrides for catalog actions, keyed by action id →
-   *  lucide icon name. Missing = the catalog default (so "reset" = delete key). */
+   *  lucide icon name. Missing = the catalog default (so "reset" = delete key).
+   *  Custom Obsidian commands are keyed `cmd:<id>`. */
   commandIcons: Record<string, string>;
+  /** 0.321.0: arbitrary Obsidian command ids the user has REGISTERED in the icon
+   *  section (so they can set an icon before wiring the command into a menu /
+   *  buttons). Commands already used in a menu/buttons show automatically. */
+  customCommandIds: string[];
   /** 0.320.0: the large context menu's leaf-item order (catalog ids). Empty =
    *  the built-in default order. Stateful items (task/pin submenus, encrypt,
    *  recurrence) are always appended and are not reorderable. */
@@ -976,6 +981,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   itemButtons: [],
   commandIcons: {},
   contextMenuOrder: [],
+  customCommandIds: [],
   quickMenuIncludeMore: true,
   openNotesInStashpad: false,
   debugTrace: false,
@@ -1997,9 +2003,80 @@ export class StashpadSettingTab extends PluginSettingTab {
             this.display();
           }));
         }
+        this.renderCustomCommandIcons(host);
       },
-      ["icon", "registry", "command", "reset", "default", "customize"],
+      ["icon", "registry", "command", "reset", "default", "customize", "custom command"],
     );
+  }
+
+  /** 0.321.0: the `cmd:<id>` custom-command ids referenced anywhere the user
+   *  can wire a command — the star menu, item buttons, the context menu — so the
+   *  icon section auto-lists a command as soon as it's used. */
+  private usedCustomCmdIds(): string[] {
+    const s = this.plugin.settings;
+    const all = [...(s.quickMenuActions ?? []), ...(s.itemButtons ?? []), ...(s.contextMenuOrder ?? [])];
+    return [...new Set(all.filter((id) => id.startsWith("cmd:")).map((id) => id.slice(4)))];
+  }
+
+  /** 0.321.0: the "Custom commands" block of the icon registry — every command
+   *  used in a menu/buttons PLUS any the user pre-registered here, each with an
+   *  icon input + a remove. "Add command…" registers one ahead of using it. */
+  private renderCustomCommandIcons(host: HTMLElement): void {
+    new Setting(host).setName("Custom commands").setHeading();
+    host.createEl("p", { cls: "setting-item-description stashpad-section-intro", text: "Any Obsidian command you add to the star menu, item buttons, or the ⋮ menu shows up here automatically so you can give it an icon. Add one ahead of time with the button below." });
+    const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
+    const registered = new Set(this.plugin.settings.customCommandIds ?? []);
+    const ids = [...new Set([...this.usedCustomCmdIds(), ...registered])].sort((a, b) => (registry[a]?.name || a).localeCompare(registry[b]?.name || b));
+    if (!ids.length) host.createEl("p", { cls: "setting-item-description", text: "No custom commands yet." });
+    for (const cid of ids) {
+      const key = `cmd:${cid}`;
+      const name = registry[cid]?.name || cid;
+      const used = this.usedCustomCmdIds().includes(cid);
+      const cur = this.plugin.settings.commandIcons?.[key] || "terminal";
+      const row = new Setting(host).setName(name);
+      const notInstalled = !registry[cid];
+      row.setDesc([used ? "In use" : "Not used yet — add it to a menu to show its icon", notInstalled ? "not installed" : ""].filter(Boolean).join(" · "));
+      const preview = row.nameEl.createSpan({ cls: "stashpad-cmdicon-preview" });
+      setIcon(preview, cur); row.nameEl.prepend(preview);
+      row.addText((t) => {
+        new IconSuggest(this.app, t.inputEl);
+        t.setValue(cur).setPlaceholder("terminal");
+        t.inputEl.addClass("stashpad-cmdicon-input");
+        const commit = async () => {
+          const v = t.getValue().trim().replace(/^lucide-/, "");
+          const map = { ...(this.plugin.settings.commandIcons ?? {}) };
+          if (!v) delete map[key]; else map[key] = v;
+          this.plugin.settings.commandIcons = map;
+          await this.plugin.saveSettings();
+          setIcon(preview, v || "terminal");
+        };
+        t.inputEl.addEventListener("blur", () => void commit());
+        t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
+      });
+      // Remove from the registered list (only when not in active use) + drop its icon.
+      row.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset icon to default").onClick(async () => {
+        const map = { ...(this.plugin.settings.commandIcons ?? {}) }; delete map[key];
+        this.plugin.settings.commandIcons = map;
+        await this.plugin.saveSettings();
+        this.display();
+      }));
+      if (!used) row.addExtraButton((b) => b.setIcon("x").setTooltip("Remove from this list").onClick(async () => {
+        this.plugin.settings.customCommandIds = (this.plugin.settings.customCommandIds ?? []).filter((x) => x !== cid);
+        const map = { ...(this.plugin.settings.commandIcons ?? {}) }; delete map[key];
+        this.plugin.settings.commandIcons = map;
+        await this.plugin.saveSettings();
+        this.display();
+      }));
+    }
+    new Setting(host).addButton((b) => b.setButtonText("Add command…").setCta().onClick(() => {
+      const already = new Set<string>([...this.usedCustomCmdIds(), ...(this.plugin.settings.customCommandIds ?? [])]);
+      new CommandPickModal(this.app, async (id) => {
+        const list = new Set(this.plugin.settings.customCommandIds ?? []); list.add(id);
+        this.plugin.settings.customCommandIds = [...list];
+        await this.plugin.saveSettings();
+        this.display();
+      }, already).open();
+    }));
   }
 
   /** 0.320.0: a reorderable list of note-action ids (catalog ids or
@@ -2053,7 +2130,8 @@ export class StashpadSettingTab extends PluginSettingTab {
         if (allowCustom) {
           if (any) menu.addSeparator();
           menu.addItem((it: any) => it.setTitle("Custom command…").setIcon("terminal").onClick(() => {
-            new CommandPickModal(this.app, async (id) => { const key = `cmd:${id}`; if (!effective().includes(key)) await rerender(true, [...effective(), key]); }).open();
+            const exclude = new Set(effective().filter((i) => i.startsWith("cmd:")).map((i) => i.slice(4)));
+            new CommandPickModal(this.app, async (id) => { const key = `cmd:${id}`; if (!effective().includes(key)) await rerender(true, [...effective(), key]); }, exclude).open();
           }));
         } else if (!any) {
           menu.addItem((it: any) => it.setTitle("(all actions added)").setDisabled(true));
