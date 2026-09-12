@@ -9990,3 +9990,20 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-cal-note.is-recurring { border-left-color: var(--sp-cal-recurring); }
 .stashpad-cal-note.is-recurring .stashpad-cal-dot { color: var(--sp-cal-recurring); }
 .stashpad-cal-note.is-projected { opacity: 0.7; border-left-style: dashed; }
+
+/* 0.322.0: recent / saved search rows in the search modal. */
+.stashpad-search-special-row { display: flex; align-items: center; gap: 7px; }
+.stashpad-search-special-icon { display: inline-flex; color: var(--text-muted); }
+.stashpad-search-special-icon .svg-icon { width: 15px; height: 15px; }
+.is-saved-search .stashpad-search-special-icon { color: var(--interactive-accent); }
+.stashpad-search-special-del {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 4px;
+  font-size: 12px;
+}
+.stashpad-search-special-del:hover { color: var(--text-normal); }
+.is-save-search .stashpad-search-special-icon { color: var(--interactive-accent); }

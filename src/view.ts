@@ -12043,6 +12043,30 @@ export class StashpadView extends ItemView {
    *  second press of the keybind selects-all in the existing modal's
    *  input (escape any popover the user is in + clear-by-typing). */
   private openSearchInstance: StashpadSuggest | null = null;
+  /** 0.322.0: recent searches — per device (local storage), newest first, cap 12. */
+  private recentSearches(): string[] {
+    try { const v = this.app.loadLocalStorage("stashpad-recent-searches"); return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, 12) : []; }
+    catch { return []; }
+  }
+  private pushRecentSearch(q: string): void {
+    const t = q.trim(); if (!t) return;
+    const next = [t, ...this.recentSearches().filter((x) => x.toLowerCase() !== t.toLowerCase())].slice(0, 12);
+    try { this.app.saveLocalStorage("stashpad-recent-searches", next); } catch { /* ignore */ }
+  }
+  /** 0.322.0: save the current query as a synced saved search (deduped by query). */
+  private async saveSearch(q: string): Promise<void> {
+    const t = q.trim(); if (!t) return;
+    const list = (this.plugin.settings.savedSearches ?? []).filter((s) => s.query.trim().toLowerCase() !== t.toLowerCase());
+    list.push({ name: t, query: t });
+    this.plugin.settings.savedSearches = list;
+    await this.plugin.saveSettings();
+    new Notice(`Saved search "${t}".`);
+  }
+  private async deleteSavedSearch(name: string): Promise<void> {
+    this.plugin.settings.savedSearches = (this.plugin.settings.savedSearches ?? []).filter((s) => s.name !== name);
+    await this.plugin.saveSettings();
+  }
+
   openSearchModal(): void {
     // If a search modal is already open, focus its input + select all
     // so the next keystroke replaces the query. Don't stack a new modal.
@@ -12056,6 +12080,12 @@ export class StashpadView extends ItemView {
     }
     const instance = new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
       mode: "search", placeholder: "Search Stashpad notes…",
+      // 0.322.0: recent (per-device) + saved (synced) searches.
+      recentQueries: () => this.recentSearches(),
+      savedSearches: () => this.plugin.settings.savedSearches ?? [],
+      onRunQuery: (q) => this.pushRecentSearch(q),
+      onSaveSearch: (q) => { void this.saveSearch(q); },
+      onDeleteSaved: (name) => { void this.deleteSavedSearch(name); },
       // 0.69.22 / 0.69.24 / 0.69.25: Create flow opens a destination
       // picker. The picker spans EVERY searchable Stashpad folder so
       // the user can drop the new note under any parent across the

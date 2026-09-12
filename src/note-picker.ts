@@ -123,7 +123,10 @@ export interface PickerItem {
    *    tab. Carries `folder` but no node. 0.57.3.
    *  - "search-excluded": bottom-of-list action that pulls notes from
    *    Stashpad folders excluded from search into the result set. 0.92.1. */
-  kind: "note" | "create" | "folder-open" | "search-excluded";
+  kind: "note" | "create" | "folder-open" | "search-excluded" | "recent" | "saved" | "save-search";
+  /** For recent/saved/save-search items: the query text. */
+  query?: string;
+  savedName?: string;
   bodyPreview?: string; // for search mode
   matchLine?: number;
   /** For cross-folder results: the source folder + raw TFile so the
@@ -264,6 +267,14 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       /** 0.124.0: when true, locked notes show the "Locked note" placeholder
        *  instead of their real title (matches the list's hideLockedTitles). */
       hideLockedTitles?: boolean;
+      /** 0.322.0: recent + saved searches (search mode). Shown on an empty query;
+       *  picking one fills the box. */
+      recentQueries?: () => string[];
+      savedSearches?: () => { name: string; query: string }[];
+      onSaveSearch?: (query: string) => void;
+      onDeleteSaved?: (name: string) => void;
+      /** Record a query as "recent" when the user opens a result. */
+      onRunQuery?: (query: string) => void;
     },
   ) {
     super(app);
@@ -360,6 +371,16 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
 
   getSuggestions(query: string): PickerItem[] {
     const q = query.trim().toLowerCase();
+    // 0.322.0: recent + saved searches head the SEARCH modal when the box is
+    // empty; a "Save this search" row leads when there's a query to save.
+    if (this.opts.mode === "search") {
+      if (q === "") {
+        const head: PickerItem[] = [];
+        for (const sv of this.opts.savedSearches?.() ?? []) head.push({ id: `saved:${sv.name}`, label: sv.name, node: null, kind: "saved", query: sv.query, savedName: sv.name });
+        for (const rq of this.opts.recentQueries?.() ?? []) head.push({ id: `recent:${rq}`, label: rq, node: null, kind: "recent", query: rq });
+        return head;
+      }
+    }
     // 0.64.0: parse out advanced filter syntax (in:/before:/after:/on:)
     // before we run the token match. Remaining free-text tokens still
     // run token-order-agnostic match against title/body.
@@ -672,6 +693,12 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         kind: "search-excluded",
       });
     }
+    // 0.322.0: offer to save the current search (search mode, non-empty query,
+    // not already saved).
+    if (this.opts.mode === "search" && q !== "" && this.opts.onSaveSearch) {
+      const already = (this.opts.savedSearches?.() ?? []).some((s) => s.query.trim().toLowerCase() === q);
+      if (!already) items.push({ id: "__save_search__", label: `Save this search: "${query.trim()}"`, node: null, kind: "save-search", query: query.trim() });
+    }
     return items;
   }
 
@@ -731,6 +758,26 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       el.createDiv({ cls: "stashpad-suggest-title", text: item.label });
       if (item.folder) el.createDiv({ cls: "stashpad-suggest-preview", text: item.folder });
       else el.createDiv({ cls: "stashpad-suggest-preview", text: "Click to choose a folder…" });
+      return;
+    }
+    if (item.kind === "recent" || item.kind === "saved") {
+      el.addClass(item.kind === "saved" ? "is-saved-search" : "is-recent-search");
+      const row = el.createDiv({ cls: "stashpad-suggest-title stashpad-search-special-row" });
+      const icon = row.createSpan({ cls: "stashpad-search-special-icon" }); setIcon(icon, item.kind === "saved" ? "star" : "history");
+      row.createSpan({ text: item.label });
+      if (item.kind === "saved" && item.query && item.query !== item.label) el.createDiv({ cls: "stashpad-suggest-preview", text: item.query });
+      if (item.kind === "saved" && item.savedName) {
+        const del = row.createEl("button", { cls: "stashpad-search-special-del", text: "\u2715" });
+        del.setAttr("aria-label", "Delete saved search");
+        del.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this.opts.onDeleteSaved?.(item.savedName!); const ie = (this as any).inputEl as HTMLInputElement | undefined; if (ie) ie.dispatchEvent(new Event("input")); };
+      }
+      return;
+    }
+    if (item.kind === "save-search") {
+      el.addClass("is-save-search");
+      const row = el.createDiv({ cls: "stashpad-suggest-title stashpad-search-special-row" });
+      const icon = row.createSpan({ cls: "stashpad-search-special-icon" }); setIcon(icon, "star");
+      row.createSpan({ text: item.label });
       return;
     }
     if (item.kind === "search-excluded") {
@@ -1782,10 +1829,27 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       this.loadExcludedNotes();
       return;
     }
+    // 0.322.0: recent/saved picks FILL the box (don't close); save-search saves.
+    if (value && (value.kind === "recent" || value.kind === "saved")) {
+      const ie = (this as any).inputEl as HTMLInputElement | undefined;
+      if (ie) { ie.value = value.query ?? ""; ie.dispatchEvent(new Event("input")); ie.focus(); }
+      return;
+    }
+    if (value && value.kind === "save-search") {
+      this.opts.onSaveSearch?.(value.query ?? "");
+      const ie = (this as any).inputEl as HTMLInputElement | undefined;
+      if (ie) ie.dispatchEvent(new Event("input"));
+      return;
+    }
     super.selectSuggestion(value, evt);
   }
 
   onChooseSuggestion(item: PickerItem): void {
+    // 0.322.0: record the query that led to opening a result.
+    if (this.opts.mode === "search" && (item.kind === "note")) {
+      const q = ((this as any).inputEl?.value ?? "").trim();
+      if (q) try { this.opts.onRunQuery?.(q); } catch { /* ignore */ }
+    }
     if (item.kind === "create" && this.opts.onCreate) {
       // Strip filter qualifiers (in:/before:/after:/on:) so a query like
       // `in: [work] meeting notes` creates a note titled "meeting notes", not the

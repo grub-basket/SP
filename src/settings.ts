@@ -339,6 +339,8 @@ export interface StashpadSettings {
    *  `contextSubmenus`. Empty = the built-in default order. Stateful items
    *  (task/pin submenus, encrypt, recurrence) are always appended. */
   contextMenuOrder: string[];
+  /** 0.322.0: saved searches (synced): a name + the query string. */
+  savedSearches: { name: string; query: string }[];
   /** 0.321.2: user-defined submenus for the ⋮ menu, keyed by an opaque id.
    *  `items` are catalog ids or `cmd:<id>`. Referenced from contextMenuOrder as
    *  `submenu:<key>`. */
@@ -989,6 +991,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextMenuOrder: [],
   contextSubmenus: {},
   customCommandIds: [],
+  savedSearches: [],
   quickMenuIncludeMore: true,
   openNotesInStashpad: false,
   debugTrace: false,

@@ -10281,6 +10281,7 @@ export default class StashpadPlugin extends Plugin {
       itemButtons: Array.isArray(data?.itemButtons) ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string") : [],
       contextMenuOrder: Array.isArray(data?.contextMenuOrder) ? data.contextMenuOrder.filter((x: unknown): x is string => typeof x === "string") : [],
       customCommandIds: Array.isArray(data?.customCommandIds) ? data.customCommandIds.filter((x: unknown): x is string => typeof x === "string") : [],
+      savedSearches: Array.isArray(data?.savedSearches) ? data.savedSearches.filter((x: any) => x && typeof x.query === "string").map((x: any) => ({ name: typeof x.name === "string" && x.name ? x.name : x.query, query: x.query })) : [],
       contextSubmenus: (data?.contextSubmenus && typeof data.contextSubmenus === "object" && !Array.isArray(data.contextSubmenus))
         ? Object.fromEntries(Object.entries(data.contextSubmenus).filter(([, v]: [string, any]) => v && typeof v.name === "string").map(([k, v]: [string, any]) => [k, { name: String(v.name), icon: typeof v.icon === "string" ? v.icon : "folder", items: Array.isArray(v.items) ? v.items.filter((x: unknown): x is string => typeof x === "string") : [] }])) as Record<string, { name: string; icon: string; items: string[] }>
         : {},
