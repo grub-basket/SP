@@ -1,6 +1,7 @@
 import { App, moment, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
 import { collectIndexRows, type IndexRow } from "./aggregate-index";
+import { parseRecurrence } from "./recurrence";
 
 /** 0.274.0: the DUE CALENDAR — a month grid where each day cell lists the notes
  *  that "belong" to that day under the SAME rule as the main view's day filter
@@ -12,7 +13,7 @@ import { collectIndexRows, type IndexRow } from "./aggregate-index";
  *  only: a chip OPENS the note; the "reason" (created / due / link) is colour-
  *  coded and filterable, since a due-heavy month is the headline use. */
 
-type Reason = "created" | "due" | "link";
+type Reason = "created" | "due" | "link" | "recurring";
 
 export interface DueCalendarState {
   /** Epoch ms of any instant in the displayed period (month/week/day). */
@@ -25,7 +26,7 @@ export interface DueCalendarState {
   view: "month" | "week" | "day";
 }
 export function defaultDueCalendarState(): DueCalendarState {
-  return { monthAnchor: Date.now(), folder: "all", reasons: { created: true, due: true, link: true }, openDay: null, view: "month" };
+  return { monthAnchor: Date.now(), folder: "all", reasons: { created: true, due: true, link: true, recurring: true }, openDay: null, view: "month" };
 }
 
 export interface DueCalendarOpts { onOpen: (folder: string, id: string) => void; }
@@ -45,12 +46,13 @@ interface MomentLike {
 }
 const M = moment as unknown as { (ms?: number): MomentLike; (s: string, f: string): MomentLike; localeData: () => { firstDayOfWeek: () => number } };
 
-interface DayHit { row: IndexRow; reasons: Set<Reason>; }
+interface DayHit { row: IndexRow; reasons: Set<Reason>; projected?: boolean; }
 
 const REASON_META: Record<Reason, { label: string; cls: string; icon: string; title: string }> = {
   created: { label: "Created", cls: "is-created", icon: "sparkles", title: "Notes created on this day" },
   due:     { label: "Due",     cls: "is-due",     icon: "flag",     title: "Tasks due on this day" },
   link:    { label: "Links",   cls: "is-link",    icon: "link",     title: "Notes linking to this day" },
+  recurring: { label: "Recurring", cls: "is-recurring", icon: "repeat", title: "Projected future occurrences of repeating tasks" },
 };
 
 export async function renderDueCalendar(
@@ -84,6 +86,34 @@ export async function renderDueCalendar(
     add(r.created ? M(r.created).format("YYYY-MM-DD") : null, r, "created");
     add(r.dueDay, r, "due");
     for (const d of r.linkedDays) add(d, r, "link");
+  }
+  // 0.321.3 (user): PROJECT future occurrences of repeating tasks across the
+  // visible period, so a "daily" task shows on every day, not just its current
+  // due. Cheap: one .next() walk per recurring task, bounded to the window.
+  if (state.reasons.recurring) {
+    const a = M(state.monthAnchor);
+    const winStart = (state.view === "day" ? a.clone().startOf("day") : state.view === "week" ? weekStart(a) : a.clone().startOf("month").startOf("day")).subtract(7, "day").valueOf();
+    const winEnd = (state.view === "day" ? a.clone().endOf("day") : state.view === "week" ? weekStart(a).clone().add(6, "day") : a.clone().endOf("month")).add(7, "day").valueOf();
+    for (const r of rows) {
+      if (r.isHome || !r.repeat || r.dueMs == null) continue;
+      const rec = parseRecurrence(r.repeat);
+      if (!rec) continue;
+      let t = r.dueMs;
+      let guard = 0;
+      while (t < winEnd && guard++ < 800) {
+        t = rec.next(t);
+        if (t <= r.dueMs) break;            // non-advancing rule → bail
+        if (t < winStart) continue;
+        if (t > winEnd) break;
+        const day = M(t).format("YYYY-MM-DD");
+        if (day === r.dueDay) continue;      // its real due is already a "due" hit
+        // register a projected occurrence
+        let hits = byDay.get(day); if (!hits) { hits = []; byDay.set(day, hits); }
+        let hit = hits.find((h) => h.row.file.path === r.file.path);
+        if (!hit) { hit = { row: r, reasons: new Set(), projected: true }; hits.push(hit); }
+        hit.reasons.add("recurring");
+      }
+    }
   }
 
   // ---- controls ----
@@ -224,13 +254,14 @@ function weekStart(m: MomentLike): MomentLike {
 function reasonRank(h: DayHit): number {
   if (h.reasons.has("due")) return 0;
   if (h.reasons.has("created")) return 1;
-  return 2;
+  if (h.reasons.has("recurring")) return 2;
+  return 3;
 }
 
 function chipFor(parent: HTMLElement, h: DayHit, opts: DueCalendarOpts, full = false): HTMLElement {
   const blurred = h.row.obscured;
-  const primary: Reason = h.reasons.has("due") ? "due" : h.reasons.has("created") ? "created" : "link";
-  const chip = parent.createDiv({ cls: `stashpad-cal-note ${REASON_META[primary].cls}` + (full ? " is-full" : "") });
+  const primary: Reason = h.reasons.has("due") ? "due" : h.reasons.has("created") ? "created" : h.reasons.has("recurring") ? "recurring" : "link";
+  const chip = parent.createDiv({ cls: `stashpad-cal-note ${REASON_META[primary].cls}` + (full ? " is-full" : "") + (h.projected ? " is-projected" : "") });
   const dot = chip.createSpan({ cls: "stashpad-cal-dot" }); setIcon(dot, REASON_META[primary].icon);
   chip.createSpan({ cls: "stashpad-cal-note-title" + (blurred ? " is-blurred" : ""), text: blurred ? "•••••" : h.row.title });
   if (full) chip.createSpan({ cls: "stashpad-cal-note-folder", text: h.row.folder.split("/").pop() || h.row.folder });

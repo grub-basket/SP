@@ -69,14 +69,35 @@ export const BUTTON_ACTION_CATALOG = NOTE_ACTION_CATALOG.filter((a) => a.button)
  *  non-stateful actions are user-reorderable; the stateful items below them in
  *  the menu (obscure, pin, task submenu, share/export, encrypt, delete) always
  *  render in their fixed positions. */
+/** 0.321.3: the ⋮ menu is now ENTIRELY built from this order (stateful items
+ *  included), so the settings builder shows and reorders the whole menu. `sep`
+ *  is a divider. `encrypt` / `recurrenceSkip` self-hide when not applicable. */
 export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
+  "edit", "focus", "openNewTab", "openObsidian", "sep",
+  "react", "reply", "replyLink", "split", "recurrenceSkip",
+  "copy", "clone", "fork", "shareExport", "encrypt", "sep",
+  "obscure", "move", "moveHome", "pinSidebar", "pinList", "setColor",
+  "taskSubmenu", "sep", "delete", "moreCommands",
+];
+/** Stateful/compound context-menu items that live only in the ⋮ menu (not the
+ *  star menu or item buttons). Given labels/icons here so the builder can list
+ *  them under "Add action…". */
+export const CONTEXT_EXTRA_ACTIONS: readonly NoteActionDef[] = [
+  { id: "sep",            label: "── Divider ──",           icon: "minus",           group: "Organize" },
+  { id: "obscure",        label: "Obscure / reveal",        icon: "eye-off",         group: "Organize" },
+  { id: "pinList",        label: "Pin in list ▸",           icon: "pin",             group: "Organize" },
+  { id: "shareExport",    label: "Share & export ▸",        icon: "share",           group: "Copy" },
+  { id: "taskSubmenu",    label: "Task ▸",                  icon: "square-check-big",group: "Organize" },
+  { id: "encrypt",        label: "Encrypt (lock) note",     icon: "lock",            group: "Organize" },
+  { id: "recurrenceSkip", label: "Skip to next occurrence", icon: "skip-forward",    group: "Compose" },
+  { id: "delete",         label: "Delete",                  icon: "trash",           group: "Organize" },
+  { id: "moreCommands",   label: "More commands…",          icon: "terminal",        group: "Organize" },
+];
+/** Actions the ⋮-menu builder can add: the catalog's context leaves + the extras
+ *  above + a few catalog actions not in the default order. */
+export const CONTEXT_LEAF_IDS: readonly string[] = [
   "edit", "focus", "openNewTab", "openObsidian",
   "react", "reply", "replyLink", "split",
-  "copy", "clone", "fork",
-];
-/** Actions that MAY appear in the context-menu top block (defaults + a few
- *  extras the user can add). Excludes ids that already have a fixed, stateful
- *  entry lower in the menu (move / moveHome / setColor / pinSidebar / blur). */
-export const CONTEXT_LEAF_IDS: readonly string[] = [
-  ...CONTEXT_DEFAULT_ORDER, "setDue", "largeText", "archive",
+  "copy", "clone", "fork", "setColor", "move", "moveHome", "setDue", "largeText", "archive", "pinSidebar",
+  ...CONTEXT_EXTRA_ACTIONS.map((a) => a.id),
 ];

@@ -11,7 +11,7 @@ import type StashpadPlugin from "./main";
 import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
-import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
+import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal } from "./modals";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
@@ -1888,16 +1888,21 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.320.3: the dedicated "Note Actions & Menus" tab — every note-action
    *  customization in one place, each with a visible heading + explainer. */
   private noteActionsItems(): SettingDefinitionItem[] {
-    return [
-      this.sectionDef("", "", (host) => {
-        const intro = host.createDiv({ cls: "setting-item-description" });
-        intro.setText("Customize the buttons and menus on every Stashpad note — the star menu, the buttons on each row, the right-click / ⋮ menu, and the icon each action uses. Nothing here changes what an action DOES, only where it appears.");
-      }),
-      this.quickMenuSection(),
-      this.itemButtonsSection(),
-      this.contextMenuSection(),
-      this.iconRegistrySection(),
-    ];
+    return [this.sectionDef("Note actions & menus", "star menu item buttons right-click menu command icons custom command submenu", (host) => {
+      // 0.321.3 (user): one self-owned container with a master rebuild, so an
+      // icon change (or any edit) re-walks the whole page and updates every place
+      // that action's icon appears.
+      const box = host.createDiv();
+      const rebuild = (): void => { box.empty(); buildAll(box); };
+      const buildAll = (h: HTMLElement): void => {
+        h.createDiv({ cls: "setting-item-description", text: "Customize the buttons and menus on every Stashpad note — the star menu, the buttons on each row, the right-click / ⋮ menu, and the icon each action uses. Nothing here changes what an action DOES, only where it appears." });
+        this.quickMenuBody(h, rebuild);
+        this.itemButtonsBody(h, rebuild);
+        this.contextMenuBody(h, rebuild);
+        this.iconRegistryBody(h, rebuild);
+      };
+      buildAll(box);
+    }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu"])];
   }
 
   /** 0.320.3: a visible heading + description at the top of a builder section
@@ -1908,11 +1913,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     host.createEl("p", { cls: "setting-item-description stashpad-section-intro", text: desc });
   }
 
-  private quickMenuSection(): SettingDefinitionItem {
-    return this.sectionDef(
-      "Quick actions menu (the star button)",
-      "A short, tap-first menu on each note, shown before the full ⋮ menu. Build and reorder the actions; empty the list to hide the star button. Actions run on the note you tapped.",
-      (host) => {
+  private quickMenuBody(host: HTMLElement, rebuild: () => void): void {
         this.sectionHeader(host, "⭐ Star menu (quick actions)", "The ⭐ button on each note opens this short, tap-friendly menu. Reorder it or add commands (including any Obsidian command). Empty it to hide the star button entirely.");
         new Setting(host)
           .setName("End with \"More commands…\"")
@@ -1925,54 +1926,33 @@ export class StashpadSettingTab extends PluginSettingTab {
           () => this.plugin.settings.quickMenuActions ?? [],
           (ids) => { this.plugin.settings.quickMenuActions = ids; },
           "No actions yet — the star button is hidden. Add some below.");
-      },
-      ["quick", "menu", "star", "actions", "shortcut", "copy", "move", "blur", "large text", "custom command"],
-    );
   }
 
   /** 0.320.0: item-button builder — user command buttons ON each note row. */
-  private itemButtonsSection(): SettingDefinitionItem {
-    return this.sectionDef(
-      "Item buttons (on every note)",
-      "Extra command buttons on each note's action row, after the built-in buttons. The first few show inline; the rest spill to a bar at the bottom of the note. Reorder them below.",
-      (host) => {
+  private itemButtonsBody(host: HTMLElement, rebuild: () => void): void {
         this.sectionHeader(host, "🔘 Item buttons (on every note row)", "Add your own icon buttons to each note's action row, alongside the built-in Edit / Reply / ⋮ buttons. The first few sit inline; any extras drop to a bar under the note. Great for one-tap Copy, Move, or a custom command.");
         this.actionListBuilder(host,
           () => this.plugin.settings.itemButtons ?? [],
           (ids) => { this.plugin.settings.itemButtons = ids; },
           "No item buttons yet. Add one below.",
           { catalogIds: BUTTON_ACTION_CATALOG.map((a) => a.id) });
-      },
-      ["item", "button", "row", "note", "actions", "toolbar", "custom command"],
-    );
   }
 
   /** 0.320.0: the large context-menu top-block builder (reorderable leaf
    *  actions; stateful items stay fixed below them in the menu). */
-  private contextMenuSection(): SettingDefinitionItem {
-    return this.sectionDef(
-      "Right-click / ⋮ menu (top actions)",
-      "The order of the plain actions at the TOP of a note's full menu. Reorder, remove, or add from the list; Reset restores the default. The stateful items lower down (obscure, pin, tasks, share & export, encrypt, delete) always keep their places.",
-      (host) => {
+  private contextMenuBody(host: HTMLElement, rebuild: () => void): void {
         this.sectionHeader(host, "☰ Right-click / ⋮ menu", "The full menu you get from right-clicking a note (or its ⋮ button). Reorder the actions at the TOP here, add commands, and build your own submenus. The items that depend on a note's state — obscure, pin, tasks, share & export, encrypt, delete — always keep their fixed places below.");
         this.contextMenuBuilder(host);
-      },
-      ["context", "menu", "right click", "actions", "reorder", "copy", "edit"],
-    );
   }
 
   /** 0.320.0: the command + icon REGISTRY — every catalog action with its icon,
    *  editable, resettable to the built-in default. */
-  private iconRegistrySection(): SettingDefinitionItem {
-    return this.sectionDef(
-      "Command icons",
-      "The icon each note action uses across the menus, the star menu and item buttons. Change any icon; Reset restores the built-in default.",
-      (host) => {
+  private iconRegistryBody(host: HTMLElement, rebuild: () => void): void {
         this.sectionHeader(host, "🎨 Command icons", "The icon each action uses everywhere it appears — the menus, the star menu, and item buttons. Type any Lucide icon name (with live preview) or reset one to its default. (The four built-in row buttons — Edit, open, Reply, React — keep their fixed icons.)");
         new Setting(host).addButton((b) => b.setButtonText("Reset all icons").setWarning().onClick(async () => {
           this.plugin.settings.commandIcons = {};
           await this.plugin.saveSettings();
-          this.display();
+          rebuild();
         }));
         let curGroup = "";
         for (const def of NOTE_ACTION_CATALOG) {
@@ -1993,6 +1973,7 @@ export class StashpadSettingTab extends PluginSettingTab {
               this.plugin.settings.commandIcons = map;
               await this.plugin.saveSettings();
               setIcon(preview, v || def.icon);
+              rebuild();   // re-walk so the icon updates in the builders above
             };
             t.inputEl.addEventListener("blur", () => void commit());
             t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
@@ -2002,13 +1983,10 @@ export class StashpadSettingTab extends PluginSettingTab {
             delete map[def.id];
             this.plugin.settings.commandIcons = map;
             await this.plugin.saveSettings();
-            this.display();
+            rebuild();
           }));
         }
-        this.renderCustomCommandIcons(host);
-      },
-      ["icon", "registry", "command", "reset", "default", "customize", "custom command"],
-    );
+        this.renderCustomCommandIcons(host, rebuild);
   }
 
   /** 0.321.0: the `cmd:<id>` custom-command ids referenced anywhere the user
@@ -2026,19 +2004,22 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.321.2: set while the icon registry is on screen so the builders can
    *  refresh the "Other commands" list the instant a command is added there. */
   private refreshCustomCmdIcons: (() => void) | null = null;
-  private renderCustomCommandIcons(host: HTMLElement): void {
+  private renderCustomCommandIcons(host: HTMLElement, pageRebuild?: () => void): void {
     new Setting(host).setName("Other commands").setHeading();
     host.createEl("p", { cls: "setting-item-description stashpad-section-intro", text: "Commands that aren't in the default list above. Any Obsidian command you add to the star menu, item buttons, or the ⋮ menu appears here automatically so you can give it an icon; \"Add command…\" registers one ahead of time." });
     // Self-rendering container so add/remove/reset (and builder edits elsewhere on
     // this page) update instantly without a full settings re-render.
     const box = host.createDiv();
-    const rebuild = (): void => { box.empty(); this.buildCustomCmdRows(box); };
+    const rebuild = (): void => { box.empty(); this.buildCustomCmdRows(box, pageRebuild); };
     this.refreshCustomCmdIcons = rebuild;
-    this.buildCustomCmdRows(box);
+    this.buildCustomCmdRows(box, pageRebuild);
   }
 
-  private buildCustomCmdRows(host: HTMLElement): void {
+  private buildCustomCmdRows(host: HTMLElement, pageRebuild?: () => void): void {
+    // Icon changes re-walk the whole page (so the builders update too); add/remove
+    // only need the local list rebuild.
     const rebuild = () => this.refreshCustomCmdIcons?.();
+    const iconChanged = () => (pageRebuild ?? rebuild)();
     const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const registered = new Set(this.plugin.settings.customCommandIds ?? []);
     const ids = [...new Set([...this.usedCustomCmdIds(), ...registered])].sort((a, b) => (registry[a]?.name || a).localeCompare(registry[b]?.name || b));
@@ -2064,6 +2045,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           this.plugin.settings.commandIcons = map;
           await this.plugin.saveSettings();
           setIcon(preview, v || "terminal");
+          iconChanged();
         };
         t.inputEl.addEventListener("blur", () => void commit());
         t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
@@ -2073,7 +2055,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         const map = { ...(this.plugin.settings.commandIcons ?? {}) }; delete map[key];
         this.plugin.settings.commandIcons = map;
         await this.plugin.saveSettings();
-        rebuild();
+        iconChanged();
       }));
       if (!used) row.addExtraButton((b) => b.setIcon("x").setTooltip("Remove from this list").onClick(async () => {
         this.plugin.settings.customCommandIds = (this.plugin.settings.customCommandIds ?? []).filter((x) => x !== cid);
@@ -2104,9 +2086,11 @@ export class StashpadSettingTab extends PluginSettingTab {
     const effective = (): string[] => { const c = get(); return c.length ? c : [...CONTEXT_DEFAULT_ORDER]; };
     const save = async (ids: string[]) => { this.plugin.settings.contextMenuOrder = ids; await this.plugin.saveSettings(); rebuild(); };
     const rebuild = () => { box.empty(); build(); };
+    const extras = new Map(CONTEXT_EXTRA_ACTIONS.map((a) => [a.id, a]));
     const labelFor = (id: string): { icon: string; name: string } => {
       if (id.startsWith("submenu:")) { const sm = this.plugin.settings.contextSubmenus?.[id.slice(8)]; return { icon: sm?.icon || "folder", name: (sm?.name || "Submenu") + " ▸" }; }
       if (id.startsWith("cmd:")) { const cid = id.slice(4); return { icon: this.plugin.settings.commandIcons?.[id] || "terminal", name: (registry[cid]?.name || cid) + (registry[cid] ? "" : " (not installed)") }; }
+      const ex = extras.get(id); if (ex) return { icon: this.plugin.settings.commandIcons?.[id] || ex.icon, name: ex.label };
       const def = noteAction(id); return { icon: this.plugin.settings.commandIcons?.[id] || def?.icon || "terminal", name: def?.label || id };
     };
     const build = (): void => {
@@ -2129,6 +2113,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       add.addButton((b) => b.setButtonText("Add action…").onClick((e) => {
         const cur = effective(); const menu = new Menu();
         for (const def of NOTE_ACTION_CATALOG) { if (!CONTEXT_LEAF_IDS.includes(def.id) || cur.includes(def.id)) continue; menu.addItem((it: any) => it.setTitle(def.label).setIcon(this.plugin.settings.commandIcons?.[def.id] || def.icon).onClick(async () => { await save([...cur, def.id]); })); }
+        // Menu-only items (submenus, task/pin/obscure/share/encrypt/delete, divider).
+        menu.addSeparator();
+        for (const ex of CONTEXT_EXTRA_ACTIONS) { if (ex.id !== "sep" && cur.includes(ex.id)) continue; menu.addItem((it: any) => it.setTitle(ex.label).setIcon(this.plugin.settings.commandIcons?.[ex.id] || ex.icon).onClick(async () => { await save([...effective(), ex.id]); })); }
         menu.addSeparator();
         menu.addItem((it: any) => it.setTitle("Custom command…").setIcon("terminal").onClick(() => {
           const exclude = new Set(cur.filter((i) => i.startsWith("cmd:")).map((i) => i.slice(4)));

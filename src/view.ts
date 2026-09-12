@@ -17283,9 +17283,25 @@ export class StashpadView extends ItemView {
     // the parent in a background tab), matching the in-list picker's behaviour.
     if (this.plugin.settings.autoNavOnMoveIn) { this.navigateTo(parent.id); return; }
     void this.openParentInBackgroundTab(parent.id);
-    this.selection.clear();
+    // 0.321.3 (user): cursor/select the NEW PARENT so you see where the note
+    // went — even with the background-tab setting on. Same reselect-guard as the
+    // in-list picker (the list shifts as the moved note leaves this level).
     this.tree.rebuild(this.noteFolder);
-    this.render();
+    this.selection.clear();
+    this.cursorIdx = -1;
+    this.pendingFocusIds = [parent.id];
+    this.render({ kind: "follow-cursor" });
+    const guardKey = this.selectionGuardKey;
+    const reselect = () => {
+      if (this.selectionGuardKey !== guardKey) return;
+      const idx = this.currentChildren.findIndex((n) => n.id === parent.id);
+      if (idx < 0) return;
+      if (this.selection.size === 1 && this.selection.has(parent.id) && this.cursorIdx === idx) return;
+      this.selection.clear(); this.selection.add(parent.id); this.cursorIdx = idx;
+      this.render({ kind: "follow-cursor" });
+    };
+    setTimeout(reselect, 120);
+    setTimeout(reselect, 400);
   }
 
   /** Delete selection via Obsidian's OWN trash routing (system trash or `.trash`,
@@ -19927,6 +19943,38 @@ export class StashpadView extends ItemView {
     menu.showAtMouseEvent(evt);
   }
 
+  /** 0.321.3: the "Task ▸" submenu, extracted so renderCtxLeaf can place it. */
+  private addTaskSubmenu(menu: any, node: TreeNode, focusClicked: () => void): void {
+    let taskSubmenu: { close?: () => void } | null = null;
+    const taskAct = (fn: () => unknown): void => {
+      focusClicked();
+      try { taskSubmenu?.close?.(); } catch { /* not all builds expose it */ }
+      menu.close();
+      void fn();
+    };
+    const addTaskItems = (target: { addItem: (cb: (it: any) => unknown) => unknown }): void => {
+      const isTaskNote = this.isTask(node);
+      if (isTaskNote) {
+        const isDone = this.isCompleted(node);
+        target.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => taskAct(() => this.cmdToggleComplete())));
+      } else {
+        target.addItem((it: any) => it.setTitle("Mark complete").setIcon("check-circle").onClick(() => taskAct(() => this.toggleCompletedForNode(node))));
+        target.addItem((it: any) => it.setTitle("Turn into task").setIcon("square-check-big").onClick(() => taskAct(() => this.cmdToggleTask())));
+      }
+      target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => taskAct(() => this.cmdAssign())));
+      if (isTaskNote) {
+        target.addItem((it: any) => it.setTitle("Snooze (reschedule)…").setIcon("alarm-clock").onClick(() => taskAct(() => this.cmdSnooze(node))));
+        target.addItem((it: any) => it.setTitle("Remove from tasks").setIcon("square").onClick(() => taskAct(() => this.cmdToggleTask())));
+      }
+    };
+    menu.addItem((it: any) => {
+      it.setTitle("Task").setIcon("square-check-big");
+      const sub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
+      if (sub && typeof sub.addItem === "function") { taskSubmenu = sub; addTaskItems(sub); }
+      else it.onClick(() => this.openCommandPalette());
+    });
+  }
+
   /** 0.320.0: render ONE reorderable context-menu leaf item by catalog id.
    *  `focusClicked` normalises the selection to the right-clicked row for the
    *  selection-based commands. */
@@ -19974,6 +20022,49 @@ export class StashpadView extends ItemView {
       case "setDue":       A("Set due date…", this.actionIcon("setDue"), () => { focusClicked(); this.cmdSetDue(); }); break;
       case "largeText":    A("Reveal in large text", this.actionIcon("largeText"), () => this.cmdRevealLargeText(node)); break;
       case "archive":      A("Move to archive", this.actionIcon("archive"), () => { focusClicked(); void this.cmdMoveToArchive(); }); break;
+      case "move":         A("Move to…", this.actionIcon("move"), () => { focusClicked(); this.cmdMovePicker(); }); break;
+      case "moveHome":     A("Move to Home", this.actionIcon("moveHome"), async () => { await this.changeParent(node, ROOT_ID); if (this.plugin.settings.autoNavOnMoveOut && this.focusId !== ROOT_ID) this.navigateTo(ROOT_ID); }); break;
+      case "setColor":     A("Set color…", this.actionIcon("setColor"), () => { focusClicked(); this.cmdSetColor(); }); break;
+      case "sep":          menu.addSeparator(); break;
+      case "moreCommands": A("More commands…", "terminal", () => this.openCommandPalette()); break;
+      case "delete":       A("Delete", this.actionIcon("delete") || "trash", () => { focusClicked(); void this.cmdDelete(); }); break;
+      case "recurrenceSkip":
+        if (parseRecurrence(this.app.metadataCache.getFileCache(node.file!)?.frontmatter?.repeat as string | undefined)) A("Skip to next occurrence", "skip-forward", () => void this.cmdSkipOccurrence(node));
+        break;
+      case "shareExport":  this.addShareExportSubmenu(menu, node, { normalizeToNode: true }); break;
+      case "encrypt":
+        if (this.plugin.encryption?.isConfigured?.()) menu.addItem((it: any) => it.setTitle("Encrypt (lock) note + children").setIcon(this.actionIcon("encrypt")).onClick(async () => {
+          const ord = this.order.getOrder(this.noteFolder, node.parent ?? ROOT_ID); const idx = ord.indexOf(node.id);
+          const prevSibling = idx > 0 ? ord[idx - 1] : null;
+          const r = await this.plugin.lockNoteSubtree(this.noteFolder, node.id, prevSibling); if (r) this.render();
+        }));
+        break;
+      case "obscure": {
+        const obscured = this.isObscured(node);
+        const shown = obscured && this.revealedObscured.has(node.id);
+        A(shown ? "Hide this note again" : obscured ? "Stop obscuring this note" : "Obscure this note (visual only)",
+          shown || !obscured ? "eye-off" : "eye", () => { focusClicked(); void this.menuObscureAction(node); });
+        break;
+      }
+      case "pinSidebar": {
+        const pinRef = { folder: this.noteFolder, id: node.id };
+        const pinned = this.plugin.isPinned(pinRef);
+        A(pinned ? "Unpin from sidebar" : "Pin to sidebar", pinned ? "pin-off" : "pin", async () => { if (pinned) await this.plugin.unpinNote(pinRef); else await this.plugin.pinNote(pinRef); });
+        break;
+      }
+      case "pinList": {
+        const pinEdge = this.listPinEdge(node.id);
+        menu.addItem((it: any) => {
+          it.setTitle("Pin in list").setIcon(pinEdge ? "pin-off" : "pin");
+          const sub = it.setSubmenu?.();
+          if (!sub) { it.onClick(() => { focusClicked(); void this.cmdToggleListPin("top"); }); return; }
+          sub.addItem((s: any) => s.setTitle("Top of list").setIcon("arrow-up-to-line").setChecked(pinEdge === "top").onClick(() => { focusClicked(); void this.cmdToggleListPin("top"); }));
+          sub.addItem((s: any) => s.setTitle("Bottom of list").setIcon("arrow-down-to-line").setChecked(pinEdge === "bottom").onClick(() => { focusClicked(); void this.cmdToggleListPin("bottom"); }));
+          if (pinEdge) { sub.addSeparator(); sub.addItem((s: any) => s.setTitle("Unpin from list").setIcon("pin-off").onClick(() => { focusClicked(); void this.cmdToggleListPin(pinEdge); })); }
+        });
+        break;
+      }
+      case "taskSubmenu": this.addTaskSubmenu(menu, node, focusClicked); break;
       case "copy": {
         const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
         const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
@@ -20024,179 +20115,10 @@ export class StashpadView extends ItemView {
     {
       const custom = (getSettings().contextMenuOrder ?? []).filter((id) => CONTEXT_LEAF_IDS.includes(id) || id.startsWith("cmd:") || id.startsWith("submenu:"));
       const order = custom.length ? custom : CONTEXT_DEFAULT_ORDER;
-      order.forEach((id, idx) => {
-        this.renderCtxLeaf(menu, id, node, file, focusClicked);
-        // Keep the original visual break after the "open" group when it leads.
-        if (id === "openObsidian" && idx < order.length - 1) menu.addSeparator();
-      });
-      // Always separate the reorderable block from the fixed stateful items below.
-      if (order.length) menu.addSeparator();
+      // 0.321.3: the WHOLE menu renders from the order now (stateful items are
+      // renderCtxLeaf cases too), so nothing is appended below.
+      for (const id of order) this.renderCtxLeaf(menu, id, node, file, focusClicked);
     }
-    // Only meaningful on a repeating task; hidden otherwise so the menu stays short.
-    if (parseRecurrence(this.app.metadataCache.getFileCache(node.file!)?.frontmatter?.repeat as string | undefined)) {
-      menu.addItem((it: any) => it.setTitle("Skip to next occurrence").setIcon("skip-forward").onClick(() => void this.cmdSkipOccurrence(node)));
-    }
-    // 0.122.2 (#9): "Insert template…" removed from the right-click menu to keep
-    // it compact — still available via command palette + its hotkey.
-    // 0.155.0: Copy Stashpad link + both export flows grouped under a shared
-    // "Share & export ▸" submenu (mirrors the Task ▸ submenu + the locked-row
-    // menu) so the top level stays short. Multi-select normalisation matches
-    // Clone / Delete / Set color. Degrades to the command palette if the running
-    // Obsidian lacks setSubmenu (never on the 1.13 minAppVersion floor).
-    this.addShareExportSubmenu(menu, node, { normalizeToNode: true });
-    // 0.98.1: encrypt (lock) this note + its whole subtree into one .stashenc
-    // bundle, in place. Only shown once a vault encryption password is set up.
-    if (this.plugin.encryption?.isConfigured?.()) {
-      menu.addItem((it: any) => it.setTitle("Encrypt (lock) note + children").setIcon("lock").onClick(async () => {
-        // Capture the note's preceding sibling in any explicit manual order, so
-        // unlock can drop it back into the same slot.
-        const order = this.order.getOrder(this.noteFolder, node.parent ?? ROOT_ID);
-        const idx = order.indexOf(node.id);
-        const prevSibling = idx > 0 ? order[idx - 1] : null;
-        const r = await this.plugin.lockNoteSubtree(this.noteFolder, node.id, prevSibling);
-        if (r) this.render();
-      }));
-    }
-    menu.addSeparator();
-    // 0.257.0: focusClicked FIRST. Without it this moved whatever the LIST had
-    // selected instead of the note the menu was opened on — and since a list
-    // row is always selected, it always moved the wrong note. Worst from the
-    // focused-note header, where the note you right-clicked isn't even in the
-    // list: you asked to move the parent and a child moved. Every other item in
-    // this menu already normalises (directly, via focusClicked, or via taskAct);
-    // this one was the only hole.
-    // 0.267.1: obscure/reveal on the ROW menu, not only the lightning menu.
-    //
-    // Without it there was no per-note control at all once a global or folder
-    // default was on: a note carrying an explicit "don't obscure" had no
-    // visible way back, and the state was invisible too. The title states the
-    // CURRENT state rather than a bare "toggle", so the menu answers "is this
-    // one hidden?" without having to try it.
-    // 0.267.2: THREE states, not two. `isObscured` stays true for a note that
-    // is merely revealed — revealing is a viewing state, not a change to the
-    // note — so asking it alone offered "Reveal" on something already revealed.
-    //
-    // Routed through the same per-node action the badge uses, so the label and
-    // the behaviour cannot drift apart.
-    const obscured = this.isObscured(node);
-    const shown = obscured && this.revealedObscured.has(node.id);
-    menu.addItem((it: any) => it
-      .setTitle(shown ? "Hide this note again"
-        : obscured ? "Stop obscuring this note"
-        : "Obscure this note (visual only)")
-      .setIcon(shown || !obscured ? "eye-off" : "eye")
-      .onClick(() => { focusClicked(); void this.menuObscureAction(node); }));
-    menu.addItem((it: any) => it.setTitle("Move to…").setIcon(this.actionIcon("move")).onClick(() => { focusClicked(); this.cmdMovePicker(); }));
-    menu.addItem((it: any) => it.setTitle("Move to Home").setIcon(this.actionIcon("moveHome")).onClick(async () => {
-      await this.changeParent(node, ROOT_ID);
-      // 0.72.6: follow the moved note up to Home if the user enabled
-      // it. No-op when the view is already focused on Home.
-      if (this.plugin.settings.autoNavOnMoveOut && this.focusId !== ROOT_ID) {
-        this.navigateTo(ROOT_ID);
-      }
-    }));
-    // 0.68.0: pin / unpin from the sidebar Pinned Notes panel.
-    const pinRef = { folder: this.noteFolder, id: node.id };
-    const pinned = this.plugin.isPinned(pinRef);
-    menu.addItem((it: any) => it
-      .setTitle(pinned ? "Unpin from sidebar" : "Pin to sidebar")
-      .setIcon(pinned ? "pin-off" : "pin")
-      .onClick(async () => {
-        if (pinned) await this.plugin.unpinNote(pinRef);
-        else await this.plugin.pinNote(pinRef);
-      }));
-    // 0.105.0: list pin — float to an end of THIS list (distinct from sidebar).
-    // 0.270.0: now a submenu, since there are two ends to pin to. A pinned note
-    // also ignores the time filter, so the label says so once here rather than
-    // surprising the user later.
-    const pinEdge = this.listPinEdge(node.id);
-    menu.addItem((it: any) => {
-      it.setTitle("Pin in list").setIcon(pinEdge ? "pin-off" : "pin");
-      const sub = it.setSubmenu();
-      sub.addItem((s: any) => s
-        .setTitle("Top of list")
-        .setIcon("arrow-up-to-line")
-        .setChecked(pinEdge === "top")
-        .onClick(() => { focusClicked(); void this.cmdToggleListPin("top"); }));
-      sub.addItem((s: any) => s
-        .setTitle("Bottom of list")
-        .setIcon("arrow-down-to-line")
-        .setChecked(pinEdge === "bottom")
-        .onClick(() => { focusClicked(); void this.cmdToggleListPin("bottom"); }));
-      if (pinEdge) {
-        sub.addSeparator();
-        sub.addItem((s: any) => s
-          .setTitle("Unpin from list")
-          .setIcon("pin-off")
-          .onClick(() => { focusClicked(); void this.cmdToggleListPin(pinEdge); }));
-      }
-    });
-    menu.addItem((it: any) => it.setTitle("Set color…").setIcon(this.actionIcon("setColor")).onClick(() => {
-      // Operate on the right-clicked row even if it isn't selected.
-      focusClicked();
-      this.cmdSetColor();
-    }));
-    // 0.104.x: task actions grouped under a "Task ▸" submenu to keep the
-    // right-click menu compact (Obsidian already repositions to stay
-    // on-screen; height is the real lever). Task gating: completion is only
-    // offered once a note IS a task — non-tasks show "Turn into task"; tasks
-    // show "Mark complete" + "Remove from tasks". Right-click is single-node,
-    // so the gate is unambiguous (the mobile ⚡ menu keeps its multi-select
-    // toggles). Every entry normalises selection to the right-clicked row.
-    // setSubmenu is internal/untyped — accessed via the existing `it: any`
-    // pattern; falls back to opening the command palette if unavailable
-    // (effectively never on the 1.13 minAppVersion floor).
-    // 0.224.0: these items live in a SUBMENU. Obsidian dismisses the menu a
-    // clicked item belongs to, but on mobile the parent sheet stays up — so
-    // marking a task complete left the overlay covering the very row you were
-    // acting on. Close the ROOT menu explicitly, before running the action, so
-    // the list is visible while it updates.
-    let taskSubmenu: { close?: () => void } | null = null;
-    const taskAct = (fn: () => unknown): void => {
-      focusClicked();
-      // Close the SUBMENU explicitly as well as the root. Closing the root
-      // usually cascades, but the submenu is the sheet actually covering the
-      // row on mobile — so it is the one that must be gone, and it should not
-      // depend on cascade behaviour we don't control.
-      try { taskSubmenu?.close?.(); } catch { /* not all builds expose it */ }
-      menu.close();
-      void fn();
-    };
-    const addTaskItems = (target: { addItem: (cb: (it: any) => unknown) => unknown }): void => {
-      const isTaskNote = this.isTask(node);
-      if (isTaskNote) {
-        const isDone = this.isCompleted(node);
-        target.addItem((it: any) => it.setTitle(isDone ? "Mark incomplete" : "Mark complete").setIcon(isDone ? "circle" : "check-circle").onClick(() => taskAct(() => this.cmdToggleComplete())));
-      } else {
-        // 0.122.2 (#10): let non-tasks be marked complete too (sets `completed`;
-        // the note then counts as a task via the bare-completed field).
-        target.addItem((it: any) => it.setTitle("Mark complete").setIcon("check-circle").onClick(() => taskAct(() => this.toggleCompletedForNode(node))));
-        target.addItem((it: any) => it.setTitle("Turn into task").setIcon("square-check-big").onClick(() => taskAct(() => this.cmdToggleTask())));
-      }
-      target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => taskAct(() => this.cmdAssign())));
-      if (isTaskNote) {
-        // 0.125.0: Snooze — reschedule the due date (date-only picker).
-        target.addItem((it: any) => it.setTitle("Snooze (reschedule)…").setIcon("alarm-clock").onClick(() => taskAct(() => this.cmdSnooze(node))));
-        target.addItem((it: any) => it.setTitle("Remove from tasks").setIcon("square").onClick(() => taskAct(() => this.cmdToggleTask())));
-      }
-    };
-    menu.addItem((it: any) => {
-      it.setTitle("Task").setIcon("square-check-big");
-      const sub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
-      if (sub && typeof sub.addItem === "function") { taskSubmenu = sub; addTaskItems(sub); }
-      else it.onClick(() => this.openCommandPalette()); // degraded fallback
-    });
-    menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Delete").setIcon("trash").onClick(async () => {
-      // Route through cmdDelete (not deleteNote directly) so the encryptTrash
-      // override applies here too — otherwise right-click Delete sends
-      // plaintext to the system trash with "Encrypt items sent to trash" ON.
-      focusClicked();
-      await this.cmdDelete();
-    }));
-    menu.addSeparator();
-    // 0.87.0: "more commands" escape hatch (parity with the ⚡ menu).
-    menu.addItem((it: any) => it.setTitle("More commands…").setIcon("terminal").onClick(() => this.openCommandPalette()));
     menu.showAtMouseEvent(evt);
   }
 

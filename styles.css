@@ -9983,3 +9983,10 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 /* 0.321.2: submenu row in the ⋮-menu builder + the submenu editor modal. */
 .stashpad-action-builder .setting-item.is-submenu { border-left: 2px solid var(--interactive-accent); padding-left: 8px; }
 .stashpad-submenu-modal .modal-content { display: flex; flex-direction: column; gap: 6px; }
+
+/* 0.321.3: projected recurring occurrences in the due calendar. */
+:root { --sp-cal-recurring: var(--color-purple, #a78bfa); }
+.stashpad-cal-chip.is-recurring.is-active { color: var(--sp-cal-recurring); border-color: var(--sp-cal-recurring); }
+.stashpad-cal-note.is-recurring { border-left-color: var(--sp-cal-recurring); }
+.stashpad-cal-note.is-recurring .stashpad-cal-dot { color: var(--sp-cal-recurring); }
+.stashpad-cal-note.is-projected { opacity: 0.7; border-left-style: dashed; }

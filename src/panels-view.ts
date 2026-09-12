@@ -225,10 +225,12 @@ export class StashpadPanelsView extends ItemView {
       .onClick(() => void this.setPinnedGrouping("pin-order")));
     menu.addItem((i: any) => i.setTitle("Group by folder").setChecked(cur === "folder")
       .onClick(() => void this.setPinnedGrouping("folder")));
+    menu.addItem((i: any) => i.setTitle("Folder tabs").setChecked(cur === "tabs")
+      .onClick(() => void this.setPinnedGrouping("tabs")));
     menu.showAtMouseEvent(e);
   }
 
-  private async setPinnedGrouping(mode: "pin-order" | "folder"): Promise<void> {
+  private async setPinnedGrouping(mode: "pin-order" | "folder" | "tabs"): Promise<void> {
     if ((this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order") === mode) return;
     this.plugin.settings.folderPanelPinnedGrouping = mode;
     await this.plugin.saveSettings();
@@ -271,6 +273,26 @@ export class StashpadPanelsView extends ItemView {
     // 0.95.2: "Sort by pin order" = flat list; "Group by folder" = the original
     // per-Stashpad grouping (shared setting with the folder panel's Pinned list).
     const grouping = this.plugin.settings.folderPanelPinnedGrouping ?? "pin-order";
+    // 0.321.3: Folder tabs — a strip of per-folder tabs (+ All) filtering the
+    // pins; the active tab is shared per device with the sidebar panel.
+    if (grouping === "tabs") {
+      const folders = [...new Set(pins.map((p) => p.folder))];
+      let active = "";
+      try { const t = this.app.loadLocalStorage("stashpad-pinned-tab"); active = typeof t === "string" && folders.includes(t) ? t : ""; } catch { /* ignore */ }
+      const tabs = list.createDiv({ cls: "stashpad-pinned-tabs" });
+      const mkTab = (folder: string, label: string) => {
+        const t = tabs.createDiv({ cls: "stashpad-pinned-tab" + (folder === active ? " is-active" : ""), text: label });
+        if (folder) t.setAttr("title", folder);
+        t.createSpan({ cls: "stashpad-pinned-tab-count", text: String(pins.filter((p) => !folder || p.folder === folder).length) });
+        t.onclick = () => { try { this.app.saveLocalStorage("stashpad-pinned-tab", folder); } catch { /* ignore */ } this.render(); };
+      };
+      mkTab("", "All");
+      for (const f of folders) mkTab(f, f.split("/").pop() || f);
+      const shown = active ? pins.filter((p) => p.folder === active) : pins;
+      if (shown.length === 0) { list.createDiv({ cls: "stashpad-pinned-empty", text: "No pins in this folder." }); return; }
+      shown.forEach((pin) => this.renderPinnedRow(list, pin, pins.indexOf(pin)));
+      return;
+    }
     if (grouping !== "folder") {
       pins.forEach((pin, idx) => this.renderPinnedRow(list, pin, idx));
       return;

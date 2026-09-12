@@ -55,6 +55,11 @@ export interface IndexRow {
    *  day string "YYYY-MM-DD", or null. Kept as a day string (not epoch) because
    *  a bare `due: 2026-08-18` is a day, not an instant — see nodeMatchesDate. */
   dueDay: string | null;
+  /** 0.321.3 (calendar recurrence projection): the note's `due` as epoch ms
+   *  (null when absent/invalid) and its `repeat` rule string, so the calendar
+   *  can compute future occurrences without re-reading frontmatter. */
+  dueMs: number | null;
+  repeat: string | null;
   /** 0.274.0: every "YYYY-MM-DD" this note LINKS to (`[[2026-08-18]]`), for the
    *  calendar's "links to this day" membership rule. */
   linkedDays: string[];
@@ -229,6 +234,8 @@ export async function collectIndexRows(
       isHome: id === ROOT_ID,
       obscured: plugin.isFileObscured(f),
       dueDay: dayStr(fm.due),
+      dueMs: (() => { if (fm.due == null || fm.due === "") return null; const m = (moment as unknown as (x: unknown) => { isValid: () => boolean; valueOf: () => number })(typeof fm.due === "number" ? fm.due : String(fm.due)); return m.isValid() ? m.valueOf() : null; })(),
+      repeat: typeof fm.repeat === "string" && fm.repeat.trim() ? fm.repeat.trim() : null,
       linkedDays: [...linkedDays],
       orphan: id !== ROOT_ID && (() => {
         const parent = typeof fm.parent === "string" ? fm.parent : "";
