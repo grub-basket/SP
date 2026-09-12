@@ -1954,6 +1954,11 @@ export class StashpadSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
           rebuild();
         }));
+        // 0.321.4 (user): the custom commands go FIRST for reachability — that's
+        // where a command you added shows up.
+        this.renderCustomCommandIcons(host, rebuild);
+        const builtinHead = new Setting(host).setName("Built-in actions").setHeading();
+        builtinHead.setDesc("Stashpad's own note actions (already in the menus). Add more commands in “Other commands” above.");
         let curGroup = "";
         for (const def of NOTE_ACTION_CATALOG) {
           if (def.group !== curGroup) { curGroup = def.group; new Setting(host).setName(curGroup).setHeading(); }
@@ -1986,7 +1991,6 @@ export class StashpadSettingTab extends PluginSettingTab {
             rebuild();
           }));
         }
-        this.renderCustomCommandIcons(host, rebuild);
   }
 
   /** 0.321.0: the `cmd:<id>` custom-command ids referenced anywhere the user
@@ -2123,14 +2127,20 @@ export class StashpadSettingTab extends PluginSettingTab {
         }));
         menu.showAtMouseEvent(e as MouseEvent);
       }));
+      add.addButton((b) => b.setButtonText("Add divider").onClick(async () => { await save([...effective(), "sep"]); }));
       add.addButton((b) => b.setButtonText("New submenu…").onClick(async () => {
         const key = `sm-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
         this.plugin.settings.contextSubmenus = { ...(this.plugin.settings.contextSubmenus ?? {}), [key]: { name: "New submenu", icon: "folder", items: [] } };
         await this.plugin.saveSettings();
-        await save([...effective(), `submenu:${key}`]);
+        // A divider before a new submenu by default, so it reads as its own group.
+        await save([...effective(), "sep", `submenu:${key}`]);
         this.editContextSubmenu(key, rebuild);
       }));
-      add.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset to default order").onClick(async () => { await save([]); }));
+      add.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset the menu to its default").onClick(() => {
+        new ConfirmModal(this.app, "Reset the right-click menu?",
+          "This restores the default order and items. Your custom submenus are kept but removed from the menu (re-add them from “New submenu…”). This can't be undone from here.",
+          "Reset menu", (ok: boolean) => { if (ok) void save([]); }, "Cancel").open();
+      }));
     };
     build();
   }
