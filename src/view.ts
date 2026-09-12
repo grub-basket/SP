@@ -76,6 +76,7 @@ import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
 import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
+import { guessCommandIcon } from "./icon-guess";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import type StashpadPlugin from "./main";
 
@@ -19876,7 +19877,8 @@ export class StashpadView extends ItemView {
         const cid = id.slice(4);
         if (!cmdRegistry[cid]) return null;   // uninstalled/disabled
         const custom = (getSettings().commandIcons ?? {})[id];
-        return { icon: custom || "terminal", label: cmdRegistry[cid]?.name || cid };
+        const nm = cmdRegistry[cid]?.name || cid;
+        return { icon: custom || guessCommandIcon(nm, getSettings().slugStopWords), label: nm };
       }
       const def = noteAction(id);
       return def ? { icon: this.actionIcon(id), label: def.label } : null;
@@ -19924,7 +19926,7 @@ export class StashpadView extends ItemView {
         const cid = id.slice(4);
         if (!cmdRegistry[cid]) continue;   // uninstalled/disabled
         const label = cmdRegistry[cid]?.name || cid;
-        const icon = (cfg.commandIcons ?? {})[id] || "terminal";
+        const icon = (cfg.commandIcons ?? {})[id] || guessCommandIcon(label, cfg.slugStopWords);
         menu.addItem((it: any) => it.setTitle(label).setIcon(icon).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
         added += 1;
         continue;
@@ -19986,8 +19988,9 @@ export class StashpadView extends ItemView {
       const cid = id.slice(4);
       const reg: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
       if (!reg[cid]) return;   // uninstalled/disabled
-      const icon = (getSettings().commandIcons ?? {})[id] || "terminal";
-      A(reg[cid]?.name || cid, icon, () => { focusClicked(); (this.app as any).commands?.executeCommandById?.(cid); });
+      const nm = reg[cid]?.name || cid;
+      const icon = (getSettings().commandIcons ?? {})[id] || guessCommandIcon(nm, getSettings().slugStopWords);
+      A(nm, icon, () => { focusClicked(); (this.app as any).commands?.executeCommandById?.(cid); });
       return;
     }
     // 0.321.2: a user-defined submenu.

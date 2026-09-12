@@ -13,6 +13,7 @@ import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
 import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
+import { guessCommandIcon } from "./icon-guess";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal } from "./modals";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
@@ -2032,7 +2033,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       const key = `cmd:${cid}`;
       const name = registry[cid]?.name || cid;
       const used = this.usedCustomCmdIds().includes(cid);
-      const cur = this.plugin.settings.commandIcons?.[key] || "terminal";
+      const guessed = guessCommandIcon(name, this.plugin.settings.slugStopWords);
+      const cur = this.plugin.settings.commandIcons?.[key] || guessed;
       const row = new Setting(host).setName(name);
       const notInstalled = !registry[cid];
       row.setDesc([used ? "In use" : "Not used yet — add it to a menu to show its icon", notInstalled ? "not installed" : ""].filter(Boolean).join(" · "));
@@ -2040,15 +2042,15 @@ export class StashpadSettingTab extends PluginSettingTab {
       setIcon(preview, cur); row.nameEl.prepend(preview);
       row.addText((t) => {
         new IconSuggest(this.app, t.inputEl);
-        t.setValue(cur).setPlaceholder("terminal");
+        t.setValue(cur).setPlaceholder(guessed);
         t.inputEl.addClass("stashpad-cmdicon-input");
         const commit = async () => {
           const v = t.getValue().trim().replace(/^lucide-/, "");
           const map = { ...(this.plugin.settings.commandIcons ?? {}) };
-          if (!v) delete map[key]; else map[key] = v;
+          if (!v || v === guessed) delete map[key]; else map[key] = v;
           this.plugin.settings.commandIcons = map;
           await this.plugin.saveSettings();
-          setIcon(preview, v || "terminal");
+          setIcon(preview, v || guessed);
           iconChanged();
         };
         t.inputEl.addEventListener("blur", () => void commit());
@@ -2093,7 +2095,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     const extras = new Map(CONTEXT_EXTRA_ACTIONS.map((a) => [a.id, a]));
     const labelFor = (id: string): { icon: string; name: string } => {
       if (id.startsWith("submenu:")) { const sm = this.plugin.settings.contextSubmenus?.[id.slice(8)]; return { icon: sm?.icon || "folder", name: (sm?.name || "Submenu") + " ▸" }; }
-      if (id.startsWith("cmd:")) { const cid = id.slice(4); return { icon: this.plugin.settings.commandIcons?.[id] || "terminal", name: (registry[cid]?.name || cid) + (registry[cid] ? "" : " (not installed)") }; }
+      if (id.startsWith("cmd:")) { const cid = id.slice(4); const nm = registry[cid]?.name || cid; return { icon: this.plugin.settings.commandIcons?.[id] || guessCommandIcon(nm, this.plugin.settings.slugStopWords), name: nm + (registry[cid] ? "" : " (not installed)") }; }
       const ex = extras.get(id); if (ex) return { icon: this.plugin.settings.commandIcons?.[id] || ex.icon, name: ex.label };
       const def = noteAction(id); return { icon: this.plugin.settings.commandIcons?.[id] || def?.icon || "terminal", name: def?.label || id };
     };
@@ -2189,7 +2191,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       this.refreshCustomCmdIcons?.();   // keep the "Other commands" icon list in sync
     };
     const label = (id: string): { icon: string; name: string } => {
-      if (id.startsWith("cmd:")) { const cid = id.slice(4); return { icon: this.plugin.settings.commandIcons?.[id] || "terminal", name: (registry[cid]?.name || cid) + (registry[cid] ? "" : " (missing)") }; }
+      if (id.startsWith("cmd:")) { const cid = id.slice(4); const nm = registry[cid]?.name || cid; return { icon: this.plugin.settings.commandIcons?.[id] || guessCommandIcon(nm, this.plugin.settings.slugStopWords), name: nm + (registry[cid] ? "" : " (missing)") }; }
       const def = noteAction(id);
       return { icon: this.plugin.settings.commandIcons?.[id] || def?.icon || "terminal", name: def?.label || id };
     };
