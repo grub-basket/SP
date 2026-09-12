@@ -185,11 +185,25 @@ export class ViewLauncherModal extends SuggestModal<LauncherEntry> {
   }
 
   getSuggestions(query: string): LauncherEntry[] {
-    // 0.320.3 (user): list alphabetically by label so the launcher is scannable,
-    // rather than in catalog-definition order.
+    const q = query.trim().toLowerCase();
+    // Empty query → the full list, alphabetical (0.320.3).
+    if (!q) return [...LAUNCHER_ENTRIES].sort((a, b) => a.label.localeCompare(b.label));
+    // 0.321.2 (user): rank NAME matches above description/keyword matches.
+    //   0 exact label · 1 label starts-with · 2 label contains · 3 hint contains ·
+    //   4 keyword/sift-only. Within a rank, alphabetical.
+    const rank = (e: LauncherEntry): number => {
+      const label = e.label.toLowerCase();
+      if (label === q) return 0;
+      if (label.startsWith(q)) return 1;
+      if (label.includes(q)) return 2;
+      if ((e.hint ?? "").toLowerCase().includes(q)) return 3;
+      return 4;
+    };
     return LAUNCHER_ENTRIES
-      .filter((e) => siftMatch(query, `${e.label} ${e.keywords}`))
-      .sort((a, b) => a.label.localeCompare(b.label));
+      .filter((e) => siftMatch(query, `${e.label} ${e.keywords} ${e.hint ?? ""}`))
+      .map((e) => ({ e, r: rank(e) }))
+      .sort((a, b) => a.r - b.r || a.e.label.localeCompare(b.e.label))
+      .map((x) => x.e);
   }
 
   renderSuggestion(entry: LauncherEntry, el: HTMLElement): void {

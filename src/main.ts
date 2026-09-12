@@ -3751,11 +3751,11 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-move-down", name: "Move note down", callback: () => call("cmdMoveDown") });
     this.addCommand({ id: "stashpad-move-to-top", name: "Move note to top", callback: () => call("cmdMoveToTop") });
     this.addCommand({ id: "stashpad-move-to-bottom", name: "Move note to bottom", callback: () => call("cmdMoveToBottom") });
-    // 0.321.0: move to the note LITERALLY above/below in the current display
-    // (respects manual order, sort, and filters — unlike move up/down which step
-    // through the full unfiltered child list).
-    this.addCommand({ id: "stashpad-move-above-neighbor", name: "Move up past the note above it (visible order)", callback: () => call("cmdMoveToNeighbor", "up") });
-    this.addCommand({ id: "stashpad-move-below-neighbor", name: "Move down past the note below it (visible order)", callback: () => call("cmdMoveToNeighbor", "down") });
+    // 0.321.2 (user): one-action "nest this note INTO the note above/below it"
+    // (the note becomes a CHILD of its visible neighbour) — like Nest under…
+    // (in-list) + arrow + Enter, in a single command.
+    this.addCommand({ id: "stashpad-nest-into-above", name: "Move note into the note above", callback: () => call("cmdNestIntoNeighbor", "up") });
+    this.addCommand({ id: "stashpad-nest-into-below", name: "Move note into the note below", callback: () => call("cmdNestIntoNeighbor", "down") });
     this.addCommand({ id: "stashpad-outdent", name: "Outdent (move to grandparent)", callback: () => call("cmdOutdent") });
     this.addCommand({ id: "stashpad-set-color", name: "Set note color…", callback: () => call("cmdSetColor") });
     this.addCommand({ id: "stashpad-reply-link", name: "Make note a reply to…", callback: () => call("cmdReplyLinkPicker") });
@@ -10281,6 +10281,9 @@ export default class StashpadPlugin extends Plugin {
       itemButtons: Array.isArray(data?.itemButtons) ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string") : [],
       contextMenuOrder: Array.isArray(data?.contextMenuOrder) ? data.contextMenuOrder.filter((x: unknown): x is string => typeof x === "string") : [],
       customCommandIds: Array.isArray(data?.customCommandIds) ? data.customCommandIds.filter((x: unknown): x is string => typeof x === "string") : [],
+      contextSubmenus: (data?.contextSubmenus && typeof data.contextSubmenus === "object" && !Array.isArray(data.contextSubmenus))
+        ? Object.fromEntries(Object.entries(data.contextSubmenus).filter(([, v]: [string, any]) => v && typeof v.name === "string").map(([k, v]: [string, any]) => [k, { name: String(v.name), icon: typeof v.icon === "string" ? v.icon : "folder", items: Array.isArray(v.items) ? v.items.filter((x: unknown): x is string => typeof x === "string") : [] }])) as Record<string, { name: string; icon: string; items: string[] }>
+        : {},
       // 0.320.0: legacy quickMenuCustom entries fold into quickMenuActions as
       // `cmd:<id>` (with their icon into commandIcons) — one ordered list now.
       quickMenuCustom: [],

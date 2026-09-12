@@ -17255,35 +17255,37 @@ export class StashpadView extends ItemView {
     });
   }
 
-  /** 0.321.0: move the cursor/selected note next to the note LITERALLY
-   *  above/below it in the CURRENT displayed order — so it jumps PAST any notes
-   *  hidden by a filter, unlike move up/down which step one slot through the
-   *  full (unfiltered) child list. Single target; same-parent only. Switches the
-   *  folder to manual ordering (like move up/down). */
-  cmdMoveToNeighbor(dir: "up" | "down"): void { void this.moveToNeighbor(dir); }
-  private async moveToNeighbor(dir: "up" | "down"): Promise<void> {
-    // 0.321.0: the focused note's own header can't be reordered among its
-    // siblings from here — it isn't in this list.
-    if (this.cursorOnHeading) { new Notice("Move into the list (press ↓) to reorder notes."); return; }
-    if (this.selection.size > 1) { new Notice("Move-to-neighbor moves one note at a time."); return; }
-    let target: TreeNode | null = null;
-    if (this.cursorIdx >= 0 && this.currentChildren[this.cursorIdx]) target = this.currentChildren[this.cursorIdx];
-    else if (this.selection.size === 1) target = this.tree.get([...this.selection][0] as StashpadId) ?? null;
-    if (!target?.file) { new Notice("Put the cursor on a note first."); return; }
-    const i = this.currentChildren.findIndex((n) => n.id === target!.id);
-    if (i < 0) { new Notice("That note isn't in this list."); return; }
-    const neighbor = dir === "up" ? this.currentChildren[i - 1] : this.currentChildren[i + 1];
-    if (!neighbor) { new Notice(dir === "up" ? "Already at the top." : "Already at the bottom."); return; }
-    const parentId = (target.parent as StashpadId) ?? ROOT_ID;
-    if (((neighbor.parent as StashpadId) ?? ROOT_ID) !== parentId) { new Notice(`The note ${dir === "up" ? "above" : "below"} is nested under a different note — nothing to swap with here.`); return; }
-    const allChildren = this.tree.getChildren(parentId).map((n) => n.id);
-    const without = allChildren.filter((id) => id !== target!.id);
-    const nIdx = without.indexOf(neighbor.id);
-    if (nIdx < 0) return;
-    const insertAt = dir === "up" ? nIdx : nIdx + 1;
-    const newOrder = [...without.slice(0, insertAt), target.id, ...without.slice(insertAt)];
-    if (arraysEqual(newOrder, allChildren)) return;
-    await this.persistReorder(parentId, newOrder, [target.id], dir);
+  /** 0.321.2 (user): move the cursor/selected note(s) INTO the note LITERALLY
+   *  above/below in the CURRENT displayed order — i.e. make it a CHILD of that
+   *  neighbour. This is the one-action form of "Nest under… (in-list)" +
+   *  arrow-to-the-neighbour + Enter. Honours the auto-navigate-into-parent /
+   *  open-parent-in-background settings like the picker does. */
+  cmdNestIntoNeighbor(dir: "up" | "down"): void { void this.nestIntoNeighbor(dir); }
+  private async nestIntoNeighbor(dir: "up" | "down"): Promise<void> {
+    if (this.cursorOnHeading) { new Notice("Move into the list (press ↓) first."); return; }
+    // The cursor's visible neighbour is the destination parent.
+    let anchorIdx = this.cursorIdx;
+    if (anchorIdx < 0 && this.selection.size === 1) anchorIdx = this.currentChildren.findIndex((n) => this.selection.has(n.id));
+    if (anchorIdx < 0 || !this.currentChildren[anchorIdx]) { new Notice("Put the cursor on a note first."); return; }
+    const parent = dir === "up" ? this.currentChildren[anchorIdx - 1] : this.currentChildren[anchorIdx + 1];
+    if (!parent?.file) { new Notice(dir === "up" ? "No note above to nest into." : "No note below to nest into."); return; }
+    // Targets: the selection (if any) else the cursor row; never the parent itself.
+    const targets = this.getActionTargets().filter((n) => n.id !== parent.id && n.file);
+    if (targets.length === 0) { new Notice("Nothing to move."); return; }
+    // Guard the obvious no-op: everything already sits under this parent.
+    if (targets.every((t) => (t.parent as StashpadId) === parent.id)) { new Notice(`Already nested under "${this.titleForNode(parent)}".`); return; }
+    const childCounts = new Map(targets.map((t) => [t.id, this.tree.getChildren(t.id).length]));
+    const moved: TreeNode[] = [];
+    for (const t of targets) { if (await this.changeParent(t, parent.id, { silentSuccess: true })) moved.push(t); }
+    if (moved.length === 0) return;
+    this.notifyBatchMove(moved, parent.id, childCounts);
+    // Tetris-like "take the wheel": follow the note into its new parent (or open
+    // the parent in a background tab), matching the in-list picker's behaviour.
+    if (this.plugin.settings.autoNavOnMoveIn) { this.navigateTo(parent.id); return; }
+    void this.openParentInBackgroundTab(parent.id);
+    this.selection.clear();
+    this.tree.rebuild(this.noteFolder);
+    this.render();
   }
 
   /** Delete selection via Obsidian's OWN trash routing (system trash or `.trash`,
@@ -19931,6 +19933,30 @@ export class StashpadView extends ItemView {
   private renderCtxLeaf(menu: any, id: string, node: TreeNode, file: TFile, focusClicked: () => void): void {
     const A = (title: string, icon: string, onClick: (e?: MouseEvent | KeyboardEvent) => void): void =>
       menu.addItem((it: any) => it.setTitle(title).setIcon(icon).onClick(onClick));
+    // 0.321.2: an arbitrary Obsidian command leaf (used inside custom submenus).
+    if (id.startsWith("cmd:")) {
+      const cid = id.slice(4);
+      const reg: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
+      if (!reg[cid]) return;   // uninstalled/disabled
+      const icon = (getSettings().commandIcons ?? {})[id] || "terminal";
+      A(reg[cid]?.name || cid, icon, () => { focusClicked(); (this.app as any).commands?.executeCommandById?.(cid); });
+      return;
+    }
+    // 0.321.2: a user-defined submenu.
+    if (id.startsWith("submenu:")) {
+      const cfg = getSettings().contextSubmenus?.[id.slice(8)];
+      if (!cfg || !cfg.items.length) return;
+      menu.addItem((it: any) => {
+        it.setTitle(cfg.name || "Submenu").setIcon(cfg.icon || "folder");
+        const sub = it.setSubmenu?.();
+        if (!sub) { // no submenu support → flatten inline
+          for (const sid of cfg.items) this.renderCtxLeaf(menu, sid, node, file, focusClicked);
+          return;
+        }
+        for (const sid of cfg.items) this.renderCtxLeaf(sub, sid, node, file, focusClicked);
+      });
+      return;
+    }
     switch (id) {
       case "edit":         A("Edit in Stashpad", this.actionIcon("edit"), () => void this.cmdEdit(node)); break;
       case "focus":        A("Focus in Stashpad", this.actionIcon("focus"), () => this.navigateTo(node.id)); break;
@@ -19996,7 +20022,7 @@ export class StashpadView extends ItemView {
     // 0.320.0: the reorderable top block (settings.contextMenuOrder). Stateful
     // items (obscure, pin, task, share/export, encrypt, delete) stay fixed below.
     {
-      const custom = (getSettings().contextMenuOrder ?? []).filter((id) => CONTEXT_LEAF_IDS.includes(id));
+      const custom = (getSettings().contextMenuOrder ?? []).filter((id) => CONTEXT_LEAF_IDS.includes(id) || id.startsWith("cmd:") || id.startsWith("submenu:"));
       const order = custom.length ? custom : CONTEXT_DEFAULT_ORDER;
       order.forEach((id, idx) => {
         this.renderCtxLeaf(menu, id, node, file, focusClicked);

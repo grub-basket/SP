@@ -9979,3 +9979,7 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 
 /* 0.320.5: icon-registry input width (store lint forbids literal el.style.width). */
 .stashpad-cmdicon-input { width: 10em; }
+
+/* 0.321.2: submenu row in the ⋮-menu builder + the submenu editor modal. */
+.stashpad-action-builder .setting-item.is-submenu { border-left: 2px solid var(--interactive-accent); padding-left: 8px; }
+.stashpad-submenu-modal .modal-content { display: flex; flex-direction: column; gap: 6px; }
