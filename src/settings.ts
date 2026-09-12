@@ -341,6 +341,9 @@ export interface StashpadSettings {
   contextMenuOrder: string[];
   /** 0.322.0: saved searches (synced): a name + the query string. */
   savedSearches: { name: string; query: string }[];
+  /** 0.322.1: saved VIEWS (synced): a name + a captured view state (folder +
+   *  filters + focus) launchable from the view launcher. */
+  savedViews: { name: string; state: Record<string, unknown> }[];
   /** 0.321.2: user-defined submenus for the ⋮ menu, keyed by an opaque id.
    *  `items` are catalog ids or `cmd:<id>`. Referenced from contextMenuOrder as
    *  `submenu:<key>`. */
@@ -992,6 +995,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextSubmenus: {},
   customCommandIds: [],
   savedSearches: [],
+  savedViews: [],
   quickMenuIncludeMore: true,
   openNotesInStashpad: false,
   debugTrace: false,

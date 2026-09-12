@@ -10007,3 +10007,7 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 }
 .stashpad-search-special-del:hover { color: var(--text-normal); }
 .is-save-search .stashpad-search-special-icon { color: var(--interactive-accent); }
+
+/* 0.322.1: saved-view delete button in the launcher. */
+.stashpad-launcher-del { margin-left: auto; border: none; background: transparent; color: var(--text-faint); cursor: pointer; padding: 0 6px; font-size: 12px; }
+.stashpad-launcher-del:hover { color: var(--text-normal); }

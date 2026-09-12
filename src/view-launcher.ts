@@ -179,15 +179,28 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
  *  close-on-pick and Escape, and it works on mobile like every other
  *  SuggestModal-based Stashpad picker. */
 export class ViewLauncherModal extends SuggestModal<LauncherEntry> {
-  constructor(app: App) {
+  constructor(app: App, private plugin?: any) {
     super(app);
     this.setPlaceholder("Jump to a Stashpad view…");
   }
 
+  /** 0.322.1: built-in views + the user's saved views. */
+  private allEntries(): LauncherEntry[] {
+    const saved: LauncherEntry[] = (this.plugin?.settings?.savedViews ?? []).map((v: { name: string; state: Record<string, unknown> }) => ({
+      label: v.name,
+      keywords: "saved view filter " + ((v.state.folderOverride as string) ?? ""),
+      hint: "Saved view",
+      icon: "bookmark",
+      command: `__saved_view__:${v.name}`,
+    }));
+    return [...LAUNCHER_ENTRIES, ...saved];
+  }
+
   getSuggestions(query: string): LauncherEntry[] {
     const q = query.trim().toLowerCase();
+    const ALL = this.allEntries();
     // Empty query → the full list, alphabetical (0.320.3).
-    if (!q) return [...LAUNCHER_ENTRIES].sort((a, b) => a.label.localeCompare(b.label));
+    if (!q) return [...ALL].sort((a, b) => a.label.localeCompare(b.label));
     // 0.321.2 (user): rank NAME matches above description/keyword matches.
     //   0 exact label · 1 label starts-with · 2 label contains · 3 hint contains ·
     //   4 keyword/sift-only. Within a rank, alphabetical.
@@ -199,7 +212,7 @@ export class ViewLauncherModal extends SuggestModal<LauncherEntry> {
       if ((e.hint ?? "").toLowerCase().includes(q)) return 3;
       return 4;
     };
-    return LAUNCHER_ENTRIES
+    return ALL
       .filter((e) => siftMatch(query, `${e.label} ${e.keywords} ${e.hint ?? ""}`))
       .map((e) => ({ e, r: rank(e) }))
       .sort((a, b) => a.r - b.r || a.e.label.localeCompare(b.e.label))
@@ -214,9 +227,20 @@ export class ViewLauncherModal extends SuggestModal<LauncherEntry> {
     const text = el.createDiv({ cls: "stashpad-launcher-text" });
     text.createDiv({ text: entry.label, cls: "stashpad-launcher-name" });
     text.createDiv({ text: entry.hint, cls: "stashpad-launcher-hint" });
+    if (entry.command.startsWith("__saved_view__:") && this.plugin) {
+      const del = el.createEl("button", { cls: "stashpad-launcher-del", text: "\u2715" });
+      del.setAttr("aria-label", "Delete saved view");
+      del.onclick = (e) => { e.preventDefault(); e.stopPropagation(); void this.plugin.deleteSavedView(entry.command.slice("__saved_view__:".length)).then(() => { const ie = (this as any).inputEl as HTMLInputElement | undefined; if (ie) ie.dispatchEvent(new Event("input")); }); };
+    }
   }
 
   onChooseSuggestion(entry: LauncherEntry): void {
+    if (entry.command.startsWith("__saved_view__:") && this.plugin) {
+      const name = entry.command.slice("__saved_view__:".length);
+      const view = (this.plugin.settings.savedViews ?? []).find((v: { name: string }) => v.name === name);
+      if (view) void this.plugin.openSavedView(view.state);
+      return;
+    }
     (this.app as any).commands?.executeCommandById?.(entry.command);
   }
 }

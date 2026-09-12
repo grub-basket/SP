@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId } from "./id-service";
 import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
@@ -3395,9 +3395,14 @@ export default class StashpadPlugin extends Plugin {
     // reimplements view creation. Plugin-level (no active view required), so a
     // plain addCommand — the user assigns a hotkey on Obsidian's Hotkeys page.
     this.addCommand({
+      id: "stashpad-save-view",
+      name: "Save current view (folder + filters)…",
+      callback: () => this.saveCurrentView(),
+    });
+    this.addCommand({
       id: "stashpad-open-view-launcher",
       name: "Launch view (jump to a Stashpad view)",
-      callback: () => new ViewLauncherModal(this.app).open(),
+      callback: () => new ViewLauncherModal(this.app, this).open(),
     });
     this.addCommand({
       id: "stashpad-encrypt-applicable",
@@ -5726,6 +5731,45 @@ export default class StashpadPlugin extends Plugin {
     }
     if (!view?.switchToDraft) { new Notice("Couldn't open a Stashpad view for that folder."); return; }
     await view.switchToDraft(id);
+  }
+
+  /** 0.322.1: capture the active Stashpad view's launchable state (folder +
+   *  filters + focus) — a subset of getState() that setState() re-applies. */
+  private captureViewState(): Record<string, unknown> | null {
+    const v: any = getActiveView();
+    if (!v || typeof v.getState !== "function") return null;
+    const s = v.getState() ?? {};
+    const pick = ["folderOverride", "timeFilterCount", "timeFilterUnit", "timeFilterAnchor", "timeFilterCalendar", "tagFilter", "colorFilter", "focusId"];
+    const out: Record<string, unknown> = {};
+    for (const k of pick) if (k in s) out[k] = s[k];
+    return out;
+  }
+
+  /** 0.322.1: save the active view under a name (prompt) for the launcher. */
+  saveCurrentView(): void {
+    const state = this.captureViewState();
+    if (!state) { new Notice("Open a Stashpad view first."); return; }
+    const folder = (state.folderOverride as string | null) || this.settings.folder;
+    const suggested = `${(folder.split("/").pop() || folder)}${state.tagFilter ? " #" + state.tagFilter : ""}${state.colorFilter ? " •color" : ""}`;
+    new NamePromptModal(this.app, "Save this view", "View name", suggested, async (name) => {
+      const nm = name.trim(); if (!nm) return;
+      const list = (this.settings.savedViews ?? []).filter((x) => x.name !== nm);
+      list.push({ name: nm, state });
+      this.settings.savedViews = list;
+      await this.saveSettings();
+      new Notice(`Saved view "${nm}".`);
+    }).open();
+  }
+
+  /** 0.322.1: open a saved view in a new Stashpad tab. */
+  async openSavedView(state: Record<string, unknown>): Promise<void> {
+    const leaf = this.app.workspace.getLeaf("tab");
+    await leaf.setViewState({ type: STASHPAD_VIEW_TYPE, state, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+  async deleteSavedView(name: string): Promise<void> {
+    this.settings.savedViews = (this.settings.savedViews ?? []).filter((x) => x.name !== name);
+    await this.saveSettings();
   }
 
   async openActionLog(): Promise<void> {
@@ -10282,6 +10326,7 @@ export default class StashpadPlugin extends Plugin {
       contextMenuOrder: Array.isArray(data?.contextMenuOrder) ? data.contextMenuOrder.filter((x: unknown): x is string => typeof x === "string") : [],
       customCommandIds: Array.isArray(data?.customCommandIds) ? data.customCommandIds.filter((x: unknown): x is string => typeof x === "string") : [],
       savedSearches: Array.isArray(data?.savedSearches) ? data.savedSearches.filter((x: any) => x && typeof x.query === "string").map((x: any) => ({ name: typeof x.name === "string" && x.name ? x.name : x.query, query: x.query })) : [],
+      savedViews: Array.isArray(data?.savedViews) ? data.savedViews.filter((x: any) => x && typeof x.name === "string" && x.state && typeof x.state === "object").map((x: any) => ({ name: x.name, state: x.state })) : [],
       contextSubmenus: (data?.contextSubmenus && typeof data.contextSubmenus === "object" && !Array.isArray(data.contextSubmenus))
         ? Object.fromEntries(Object.entries(data.contextSubmenus).filter(([, v]: [string, any]) => v && typeof v.name === "string").map(([k, v]: [string, any]) => [k, { name: String(v.name), icon: typeof v.icon === "string" ? v.icon : "folder", items: Array.isArray(v.items) ? v.items.filter((x: unknown): x is string => typeof x === "string") : [] }])) as Record<string, { name: string; icon: string; items: string[] }>
         : {},
@@ -11272,4 +11317,17 @@ class FolderBundleSuggest extends SuggestModal<{ folder: string; blobPath: strin
     el.createDiv({ cls: "stashpad-suggest-note", text: item.blobPath });
   }
   onChooseSuggestion(item: { folder: string; blobPath: string }): void { this.onPick(item); }
+}
+
+/** 0.322.1: a one-field name prompt (saved views). */
+class NamePromptModal extends Modal {
+  constructor(app: App, private title: string, private label: string, private initial: string, private onSubmit: (name: string) => void) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText(this.title);
+    let value = this.initial;
+    const setting = new Setting(this.contentEl).setName(this.label);
+    setting.addText((t) => { t.setValue(this.initial).onChange((v) => { value = v; }); t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); this.onSubmit(value); this.close(); } }); setTimeout(() => { t.inputEl.focus(); t.inputEl.select(); }, 0); });
+    new Setting(this.contentEl).addButton((b) => b.setButtonText("Save").setCta().onClick(() => { this.onSubmit(value); this.close(); }));
+  }
+  onClose(): void { this.contentEl.empty(); }
 }
