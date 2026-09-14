@@ -5186,22 +5186,28 @@ export class DuplicateIdsModal extends Modal {
     const where = this.folders.length === 1
       ? `“${this.folders[0].folder}”`
       : `${this.folders.length} folders`;
+
+    // 0.365.0: a compact summary instead of three paragraphs before any content.
+    // Stat chips answer "how bad is it" at a glance; the explanation that used
+    // to sit above the list is still here, but folded into a details block so it
+    // never blocks the actual work.
+    const summary = c.createDiv({ cls: "stashpad-dupes-summary" });
+    const stat = (n: number, one: string, many: string): void => {
+      const s = summary.createDiv({ cls: "stashpad-dupes-stat" });
+      s.createSpan({ cls: "stashpad-dupes-stat-n", text: String(n) });
+      s.createSpan({ cls: "stashpad-dupes-stat-l", text: n === 1 ? one : many });
+    };
+    stat(ids, "duplicate id", "duplicate ids");
+    stat(hidden, "hidden copy", "hidden copies");
+    if (this.folders.length > 1) stat(this.folders.length, "folder", "folders");
     c.createEl("p", {
-      cls: "setting-item-description",
-      text: `${ids} id${ids === 1 ? "" : "s"} ${ids === 1 ? "is" : "are"} used by more than one note across ${where}. `
-        + `Notes sharing an id collapse into a single row, so ${hidden} note${hidden === 1 ? " is" : "s are"} currently `
-        + `hidden from the list even though the file still exists.`,
+      cls: "stashpad-dupes-lead",
+      text: `Each id below is shared by more than one note in ${where}. Only one copy per id can appear in the list; the rest exist on disk but stay hidden.`,
     });
-    c.createEl("p", {
-      cls: "setting-item-description",
-      text: "Most of these are copies that kept their frontmatter — a sync conflict copy, a re-import, or a restored backup. "
-        + "Compare a hidden copy against the one being shown before deciding: a conflict copy can hold edits the shown note doesn't.",
-    });
-    c.createEl("p", {
-      cls: "setting-item-description",
-      text: "“Visible” just means the copy the app happens to display for this id — whichever one the tree loaded first — NOT the better or original copy. "
-        + "A sync-conflict copy can end up being the visible one, so read the recommendation on each id rather than trusting visible / hidden.",
-    });
+    const help = c.createEl("details", { cls: "stashpad-dupes-help" });
+    help.createEl("summary", { text: "How to decide what to keep" });
+    help.createEl("p", { text: "Most duplicates are copies that kept their frontmatter — a sync conflict copy, a re-import, or a restored backup. Compare a hidden copy against the shown one before deciding: a conflict copy can hold edits the shown note doesn't." });
+    help.createEl("p", { text: "“Shown in list” only means the copy the app happens to display — whichever loaded first — not the better or original one. A conflict copy can be the shown one, so trust the recommendation and the verdict on each row rather than which copy is shown." });
 
     const list = c.createDiv({ cls: "stashpad-dupes-list" });
     for (const { folder, groups } of this.folders) {
@@ -5274,64 +5280,43 @@ export class DuplicateIdsModal extends Modal {
       }
     }
 
+    // 0.365.0: row layout rebuilt for scanning. The ONE fact that frames a row
+    // (shown / hidden / conflict) is a status chip up front; the filename — the
+    // only thing that tells the copies apart — is the prominent line, with the
+    // folder demoted beneath it; the verdict sits with the name; and the actions
+    // are a consistent icon+label cluster on the right (stacked below on
+    // mobile). Same accessibility rules as before: emphasis by weight, semantic
+    // text colour on a neutral surface, never a red fill with a red label.
     for (const f of ordered) {
-      const row = box.createDiv({ cls: f.isShown ? "stashpad-dupes-file is-shown" : "stashpad-dupes-file" });
+      const conflict = isConflictCopy(f.path);
+      const row = box.createDiv({ cls: "stashpad-dupes-row" + (f.isShown ? " is-shown" : "") });
+      const main = row.createDiv({ cls: "stashpad-dupes-row-main" });
 
-      // Actions FIRST in the DOM (and so on the left): paths are long, wrap to
-      // several lines, and when the buttons trailed them they were pushed out
-      // of reach and had to be scrolled to.
-      const acts = row.createDiv({ cls: "stashpad-dupes-actions" });
-      acts.createEl("button", { cls: "stashpad-dupes-act", text: "Open" })
-        .onclick = () => { this.app.workspace.openLinkText(f.path, "", true); };
-      if (this.opts.onDelete && g.files.length > 1) {
-        // NOT Obsidian's `mod-warning`: that is a FILLED red button, and colouring
-        // its label red on top left an unreadable red block. Same lesson the
-        // badges above already record (0.219.7b) — semantic text colour on the
-        // normal button surface, never a fill plus a matching foreground.
-        const del = acts.createEl("button", { cls: "stashpad-dupes-act is-danger", text: "Discard" });
-        del.title = f.isShown
-          ? "Move THIS note to trash. It is the copy currently visible in the list — check the others first. Undo reverses it."
-          : "Move this hidden copy to trash. Undo reverses it.";
-        del.onclick = () => { void this.confirmDelete(f.path, folder); };
-      }
-      if (this.opts.onMerge && g.files.length > 1) {
-        const mrg = acts.createEl("button", { cls: "stashpad-dupes-act", text: "Merge into…" });
-        mrg.title = "Fold this copy's text and any fields the other copy is missing into that copy, then discard this one.";
-        mrg.onclick = (e) => { this.pickMergeTarget(e, f.path, ordered, folder); };
-      }
-
-      const main = row.createDiv({ cls: "stashpad-dupes-main" });
-      // 0.262.1: "Visible:" / "Hidden:" LABEL the path on the same line, so the
-      // colon introduces something instead of dangling before a line break.
-      // The tooltip carries the explanation the words alone can't.
-      const pathLine = main.createDiv({ cls: "stashpad-dupes-pathline" });
-      // 0.272.4: Compare sits at the START of the path line — right next to the
-      // note this row identifies — instead of in the left action cluster, so a
-      // row's "is this worth keeping?" control is on the same line as its id.
-      // At the line start (not after the wrapping path) it stays reachable.
-      if (!f.isShown && shown) {
-        const cmp = pathLine.createEl("button", { cls: "stashpad-dupes-act stashpad-dupes-compare-inline", text: "Compare" });
-        cmp.title = `Diff this copy against ${shown.path}`;
-        cmp.onclick = () => { this.rememberScroll(); void this.showDiff(shown.path, f.path); };
-      }
-      const b = pathLine.createSpan({
-        cls: f.isShown ? "stashpad-dupes-badge is-shown-badge" : "stashpad-dupes-badge",
-        text: f.isShown ? "Visible: " : "Hidden: ",
+      // Two INDEPENDENT facts, two chips: shown/hidden is the row's place in the
+      // list; conflict is a property of the FILE — a shown copy can itself be the
+      // conflict copy (it happens), and collapsing the two into one chip hid it.
+      const chips = main.createDiv({ cls: "stashpad-dupes-chips" });
+      const chip = chips.createSpan({
+        cls: "stashpad-dupes-status" + (f.isShown ? " is-shown" : " is-hidden"),
+        text: f.isShown ? "Shown in list" : "Hidden copy",
       });
-      b.title = f.isShown
+      chip.title = f.isShown
         ? "This is the copy Stashpad shows for this id — the one you see and edit in the list."
-        : "This file is in your vault but never appears in the Stashpad list: another note claimed the same id, and only one of them can be displayed.";
-      const path = pathLine.createSpan({ cls: "stashpad-dupes-path", text: f.path });
-      path.title = f.path;
-      const badges = main.createDiv({ cls: "stashpad-dupes-badges" });
-      if (isConflictCopy(f.path)) {
-        const cb = badges.createSpan({ cls: "stashpad-dupes-badge is-conflict", text: "conflict copy" });
-        cb.title = "The filename marks this as a sync conflict copy. Usually the one to discard — but read it first: a conflict copy can hold the newer edit.";
+        : "This file is in your vault but never appears in the Stashpad list: another note claimed the same id, and only one can be displayed.";
+      if (conflict) {
+        const cc = chips.createSpan({ cls: "stashpad-dupes-status is-conflict", text: "Conflict copy" });
+        cc.title = "The filename marks this as a sync conflict copy. Usually the one to discard — but read it first: it can hold the newer edit.";
       }
+
+      const slash = f.path.lastIndexOf("/");
+      const name = main.createDiv({ cls: "stashpad-dupes-name", text: f.path.slice(slash + 1) });
+      name.title = f.path;
+      if (slash > 0) main.createDiv({ cls: "stashpad-dupes-dir", text: f.path.slice(0, slash) });
+
       // Verdict per row, so the list answers "is this worth opening" without a
       // click. Async (it reads both files), filled in when it resolves.
       if (!f.isShown && shown) {
-        const v = badges.createSpan({ cls: "stashpad-dupes-verdict", text: "comparing…" });
+        const v = main.createSpan({ cls: "stashpad-dupes-verdict", text: "comparing…" });
         void this.verdictFor(shown.path, f.path).then((res) => {
           if (!res) { v.setText("compare failed"); return; }
           const { label, cls, title } = describeVerdict(res);
@@ -5339,6 +5324,35 @@ export class DuplicateIdsModal extends Modal {
           v.addClass(cls);
           v.title = title;
         });
+      }
+
+      const acts = row.createDiv({ cls: "stashpad-dupes-actions" });
+      const act = (label: string, icon: string, glyph: string, extra = ""): HTMLButtonElement => {
+        const b = acts.createEl("button", { cls: "stashpad-dupes-act" + (extra ? " " + extra : "") });
+        setIconSafe(b.createSpan({ cls: "stashpad-dupes-act-icon" }), icon, glyph);
+        b.createSpan({ text: label });
+        return b;
+      };
+      act("Open", "file-text", "↗").onclick = () => { this.app.workspace.openLinkText(f.path, "", true); };
+      if (!f.isShown && shown) {
+        const cmp = act("Compare", "git-compare", "⇄");
+        cmp.title = `Diff this copy against ${shown.path}`;
+        cmp.onclick = () => { this.rememberScroll(); void this.showDiff(shown.path, f.path); };
+      }
+      if (this.opts.onMerge && g.files.length > 1) {
+        const mrg = act("Merge into…", "git-merge", "⤵");
+        mrg.title = "Fold this copy's text and any fields the other copy is missing into that copy, then discard this one.";
+        mrg.onclick = (e) => { this.pickMergeTarget(e, f.path, ordered, folder); };
+      }
+      if (this.opts.onDelete && g.files.length > 1) {
+        // Destructive = red LABEL on the neutral surface (never a red fill with
+        // a red label — that red-on-red block is the mistake this modal has
+        // already fixed twice). Hover swaps fill and label together in CSS.
+        const del = act("Discard", "trash", "✕", "is-danger");
+        del.title = f.isShown
+          ? "Move THIS note to trash. It is the copy currently shown in the list — check the others first. Undo reverses it."
+          : "Move this hidden copy to trash. Undo reverses it.";
+        del.onclick = () => { void this.confirmDelete(f.path, folder); };
       }
     }
   }
@@ -5449,7 +5463,7 @@ export class DuplicateIdsModal extends Modal {
       new ConfirmModal(
         this.app,
         "Discard this copy?",
-        `“${name}” goes to the trash. The other copies of this id are untouched, and Undo in the list reverses it.`,
+        `Discarding:  ${name}\n\nIt goes to the trash. The other copies of this id are untouched, and Undo in the list reverses it.`,
         "Discard",
         (confirmed) => resolve(confirmed),
         "Keep it",
@@ -5563,22 +5577,40 @@ export class DuplicateIdsModal extends Modal {
     const [a, b] = [await read(shownPath), await read(hiddenPath)];
     const c = this.contentEl;
     c.empty();
-    const meta = c.createDiv({ cls: "stashpad-dupes-diff-meta" });
-    meta.createDiv({ text: `shown: ${shownPath}` });
-    meta.createDiv({ text: `hidden: ${hiddenPath}` });
+    // 0.365.0: a real compare header — the two copies as labelled cards (which
+    // is which is the whole question) plus the colour legend up front, and a
+    // footer that stays reachable on mobile.
+    const nameOf = (p: string): string => p.slice(p.lastIndexOf("/") + 1);
+    const dirOf = (p: string): string => { const i = p.lastIndexOf("/"); return i > 0 ? p.slice(0, i) : ""; };
+    const head = c.createDiv({ cls: "stashpad-dupes-cmp-head" });
+    const card = (cls: string, label: string, p: string): void => {
+      const k = head.createDiv({ cls: "stashpad-dupes-cmp-card " + cls });
+      // Same two-chip rule as the list rows: place-in-list + (independently) conflict.
+      const chips = k.createDiv({ cls: "stashpad-dupes-chips" });
+      chips.createSpan({ cls: "stashpad-dupes-status " + cls, text: label });
+      if (isConflictCopy(p)) chips.createSpan({ cls: "stashpad-dupes-status is-conflict", text: "Conflict copy" });
+      const n = k.createDiv({ cls: "stashpad-dupes-name", text: nameOf(p) });
+      n.title = p;
+      const d = dirOf(p);
+      if (d) k.createDiv({ cls: "stashpad-dupes-dir", text: d });
+    };
+    card("is-shown", "Shown in list", shownPath);
+    card("is-hidden", "Hidden copy", hiddenPath);
+    const legend = c.createDiv({ cls: "stashpad-dupes-legend" });
+    legend.createSpan({ cls: "stashpad-diff-del", text: "only in the shown copy" });
+    legend.createSpan({ cls: "stashpad-diff-ins", text: "only in the hidden copy" });
     this.renderFrontmatterDiff(c, shownPath, hiddenPath);
     c.createDiv({ cls: "stashpad-dupes-fm-head", text: "Body" });
     if (a === b) {
-      c.createEl("p", { cls: "stashpad-dupes-identical", text: "The bodies are IDENTICAL — any difference between these two is in the frontmatter above." });
+      c.createEl("p", { cls: "stashpad-dupes-identical", text: "The bodies are identical — any difference between these two is in the frontmatter above." });
     } else {
       const pane = c.createDiv({ cls: "stashpad-dupes-diff" });
       for (const part of splitWordDiff(a, b)) {
         pane.createSpan({ cls: part.t === "eq" ? "stashpad-diff-eq" : part.t === "ins" ? "stashpad-diff-ins" : "stashpad-diff-del", text: part.s });
       }
-      c.createEl("p", { cls: "setting-item-description", text: "Green is only in the hidden copy; red is only in the shown note." });
     }
-    const row = c.createDiv({ cls: "stashpad-modal-btns" });
-    row.createEl("button", { text: "Back" }).onclick = () => this.render();
+    const row = c.createDiv({ cls: "stashpad-modal-btns stashpad-dupes-footer" });
+    row.createEl("button", { text: "← Back to list" }).onclick = () => this.render();
     row.createEl("button", { text: "Open hidden copy" }).onclick = () => { this.app.workspace.openLinkText(hiddenPath, "", true); };
   }
 

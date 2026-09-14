@@ -7959,6 +7959,74 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   font-weight: var(--font-semibold, 600);
 }
 
+/* 0.365.0: duplicate-id modal overhaul. NEW class names (additive) so the older
+   row rules above can't collide with them. The accessibility rules recorded
+   above still govern: emphasis is carried by WEIGHT, colour stays the measured
+   semantic text tokens on a neutral surface, and a destructive control is never
+   a red fill under a red label. */
+/* Summary: stat chips + one lead line + the explanation folded away. */
+.stashpad-dupes-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 2px 0 8px; }
+.stashpad-dupes-stat {
+  display: inline-flex; align-items: baseline; gap: 5px; padding: 4px 10px;
+  border-radius: 999px; background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-dupes-stat-n { font-weight: var(--font-semibold, 600); font-size: var(--font-ui-medium); }
+.stashpad-dupes-stat-l { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.stashpad-dupes-lead { margin: 0 0 6px; color: var(--text-muted); font-size: var(--font-ui-small); line-height: 1.45; }
+.stashpad-dupes-help { margin: 0 0 4px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-dupes-help summary { cursor: pointer; color: var(--text-normal); font-weight: var(--font-semibold, 600); }
+.stashpad-dupes-help p { margin: 6px 0 0 14px; line-height: 1.45; }
+/* Folder heading inside the list. */
+.stashpad-dupes-folder { display: flex; align-items: baseline; gap: 8px; margin: 10px 2px 6px; }
+.stashpad-dupes-folder-name { font-weight: var(--font-semibold, 600); }
+.stashpad-dupes-folder-meta { color: var(--text-muted); font-size: var(--font-ui-smaller); margin-left: auto; }
+/* One copy = one row: status chip, prominent filename, demoted folder, verdict
+   on the left; the action cluster on the right. */
+.stashpad-dupes-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; align-items: start;
+  padding: 8px 6px; border-radius: 6px;
+}
+.stashpad-dupes-row:hover { background: var(--background-modifier-hover); }
+.stashpad-dupes-row + .stashpad-dupes-row { border-top: 1px solid var(--background-modifier-border); }
+.stashpad-dupes-row.is-shown { background: var(--background-primary-alt); }
+.stashpad-dupes-row-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; }
+.stashpad-dupes-status {
+  font-size: var(--font-ui-smaller); letter-spacing: 0.02em; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--background-modifier-border); color: var(--text-muted); white-space: nowrap;
+}
+.stashpad-dupes-status.is-shown { color: var(--text-normal); font-weight: var(--font-semibold, 600); }
+.stashpad-dupes-status.is-conflict { color: var(--text-normal); font-weight: var(--font-semibold, 600); border-style: dashed; }
+.stashpad-dupes-chips { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.stashpad-dupes-name { font-weight: var(--font-semibold, 600); font-size: var(--font-ui-small); overflow-wrap: anywhere; min-width: 0; }
+.stashpad-dupes-dir { color: var(--text-faint); font-size: var(--font-ui-smaller); overflow-wrap: anywhere; }
+/* Desktop: keep the four actions on ONE line; the filename column (minmax(0,1fr))
+   gives way and wraps instead. Mobile re-enables wrapping below. */
+.stashpad-dupes-actions { display: flex; gap: 4px; flex-wrap: nowrap; justify-content: flex-end; align-items: center; }
+.stashpad-dupes-act { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; min-height: 26px; }
+.stashpad-dupes-act-icon { display: inline-flex; }
+.stashpad-dupes-act-icon .svg-icon { width: 13px; height: 13px; }
+/* Compare view: the two copies as labelled cards + a legend up front. */
+.stashpad-dupes-cmp-head { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+.stashpad-dupes-cmp-card {
+  display: flex; flex-direction: column; gap: 3px; min-width: 0; align-items: flex-start;
+  padding: 8px 10px; border-radius: 6px; background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-dupes-legend { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; font-size: var(--font-ui-smaller); }
+.stashpad-dupes-legend span { padding: 1px 6px; border-radius: 4px; }
+.stashpad-dupes-footer { margin-top: 10px; }
+/* Mobile: stack each row, bigger tap targets, one compare column, and a footer
+   that stays reachable while the diff scrolls. */
+@media (max-width: 640px) {
+  .stashpad-dupes-row { grid-template-columns: 1fr; gap: 6px; }
+  .stashpad-dupes-actions { justify-content: flex-start; flex-wrap: wrap; }
+  .stashpad-dupes-act { min-height: 32px; padding: 5px 11px; }
+  .stashpad-dupes-cmp-head { grid-template-columns: 1fr; }
+  .stashpad-dupes-list { max-height: 52vh; }
+  .stashpad-dupes-footer { position: sticky; bottom: 0; background: var(--background-primary); padding: 8px 0 2px; }
+}
+
 /* Detail panel: "last viewed" banner shown when the Stashpad tab the preview
    came from has been closed (0.220.0). Theme variables only. */
 .stashpad-detail-retained {
@@ -10310,7 +10378,8 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
    bubbly/cheap. Dial STASHPAD's own modals back to a cleaner radius. Scoped to
    our modal classes so Obsidian's core surfaces (and themes) are untouched. */
 .is-mobile .modal.stashpad-quickcapture-modal,
-.is-mobile .modal.stashpad-split-modal { border-radius: 14px; }
+.is-mobile .modal.stashpad-split-modal,
+.is-mobile .modal.stashpad-dupes-modal { border-radius: 14px; }
 
 /* 0.329.0: find-in-list bar — sits above the list, narrows it as you type. */
 .stashpad-findbar {
