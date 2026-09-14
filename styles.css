@@ -10596,3 +10596,8 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   border: 1px solid var(--background-modifier-border); font-weight: var(--font-semibold, 600);
 }
 .stashpad-inlist-banner-cancel:hover { background: var(--interactive-hover); }
+
+/* 0.367.0: a context-menu action row that's hidden from the menu (kept in config,
+   not rendered) reads muted in settings, with its name struck through. */
+.stashpad-action-builder .setting-item.is-ctx-hidden .setting-item-name { opacity: 0.5; text-decoration: line-through; }
+.stashpad-action-builder .setting-item.is-ctx-hidden .stashpad-cmdicon-preview { opacity: 0.5; }

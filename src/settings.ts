@@ -371,6 +371,12 @@ export interface StashpadSettings {
    *  clears such a stale order once (→ live default), then sets this so a user who
    *  later builds a submenu-less menu on purpose keeps it. */
   contextMenuOrderRefreshedV2: boolean;
+  /** 0.367.0: ids HIDDEN from the ⋮ / right-click menu. Baked-in defaults can't be
+   *  truly deleted — the seed re-adds a removed submenu or item next launch — so
+   *  instead you HIDE them: they stay in the config but the menu skips rendering
+   *  them, and hiding sticks. Holds leaf ids ("delete"), `submenu:<key>`, and
+   *  `cmd:<id>`. Only the context menu honors it (not the star menu / item buttons). */
+  contextMenuHidden: string[];
   /** 0.363.2: the composer action-bar button (right of the deep-link button)
    *  runs this Obsidian command id. Defaults to the built-in command palette
    *  ("command-palette:open"); a user on a third-party palette can point it at
@@ -1062,6 +1068,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextSubmenus: Object.fromEntries(Object.entries(DEFAULT_CONTEXT_SUBMENUS).map(([k, v]) => [k, { name: v.name, icon: v.icon, items: [...v.items] }])),
   contextMenusSeededV1: false,
   contextMenuOrderRefreshedV2: false,
+  contextMenuHidden: [],
   composerActionCommand: "command-palette:open",
   customCommandIds: [],
   savedSearches: [],
@@ -2229,7 +2236,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.320.0: the large context-menu top-block builder (reorderable leaf
    *  actions; stateful items stay fixed below them in the menu). */
   private contextMenuBody(host: HTMLElement, rebuild: () => void): void {
-        this.sectionHeader(host, "☰ Right-click / ⋮ menu", "The full menu you get from right-clicking a note (or its ⋮ button). Reorder the actions at the TOP here, add commands, and build your own submenus. The items that depend on a note's state — obscure, pin, tasks, share & export, encrypt, delete — always keep their fixed places below.");
+        this.sectionHeader(host, "☰ Right-click / ⋮ menu", "The full menu you get from right-clicking a note (or its ⋮ button). Reorder actions, add commands, and build your own submenus. Built-in items and submenus can't be deleted (they return on restart) — use the eye button to HIDE one instead, which sticks; commands and your own submenus you added keep the ✕ to remove them.");
         this.contextMenuBuilder(host);
   }
 
@@ -2372,6 +2379,36 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.321.2: the ⋮-menu builder — reorderable catalog actions + custom commands
    *  + user-defined SUBMENUS (name + icon + their own item list). Renders into a
    *  self-owned container so edits update in place. */
+  /** 0.367.0: a baked-in default can only be HIDDEN, not deleted (the seed re-adds
+   *  it) — so its row shows a hide/show eye instead of ✕. cmd:/sep/user-submenus are
+   *  genuinely removable and keep ✕. */
+  private ctxCanHide(id: string): boolean {
+    if (id === "sep" || id.startsWith("cmd:")) return false;
+    if (id.startsWith("submenu:")) return id.slice(8) in DEFAULT_CONTEXT_SUBMENUS;
+    return true; // a baked-in catalog / extra leaf
+  }
+  private ctxIsHidden(id: string): boolean { return (this.plugin.settings.contextMenuHidden ?? []).includes(id); }
+  private async ctxToggleHidden(id: string): Promise<void> {
+    const set = new Set(this.plugin.settings.contextMenuHidden ?? []);
+    if (set.has(id)) set.delete(id); else set.add(id);
+    this.plugin.settings.contextMenuHidden = [...set];
+    await this.plugin.saveSettings();
+  }
+  /** Attach the right removal control to a context-menu row: an eye toggle for a
+   *  baked-in default (hide/show, sticks), or ✕ for a genuinely removable item. */
+  private ctxRowRemoveControl(row: Setting, id: string, remove: () => Promise<void>, rebuild: () => void): void {
+    if (this.ctxCanHide(id)) {
+      const hidden = this.ctxIsHidden(id);
+      row.settingEl.toggleClass("is-ctx-hidden", hidden);
+      row.addExtraButton((b) => b
+        .setIcon(hidden ? "eye-off" : "eye")
+        .setTooltip(hidden ? "Hidden from the menu — click to show" : "Hide from the menu")
+        .onClick(async () => { await this.ctxToggleHidden(id); rebuild(); }));
+    } else {
+      row.addExtraButton((b) => b.setIcon("x").setTooltip("Remove").onClick(async () => { await remove(); }));
+    }
+  }
+
   private contextMenuBuilder(host: HTMLElement): void {
     const box = host.createDiv({ cls: "stashpad-action-builder" });
     const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
@@ -2400,7 +2437,9 @@ export class StashpadSettingTab extends PluginSettingTab {
         }
         row.addExtraButton((b) => b.setIcon("arrow-up").setTooltip("Move up").setDisabled(i === 0).onClick(async () => { const n = ids.slice(); [n[i-1], n[i]] = [n[i], n[i-1]]; await save(n); }));
         row.addExtraButton((b) => b.setIcon("arrow-down").setTooltip("Move down").setDisabled(i === ids.length - 1).onClick(async () => { const n = ids.slice(); [n[i+1], n[i]] = [n[i], n[i+1]]; await save(n); }));
-        row.addExtraButton((b) => b.setIcon("x").setTooltip("Remove").onClick(async () => { const n = ids.slice(); n.splice(i, 1); await save(n); }));
+        // 0.367.0: hide (baked-in) vs ✕ remove (user item). Removing from the order
+        // materializes it (save the effective list minus this one), so it sticks too.
+        this.ctxRowRemoveControl(row, id, async () => { const n = effective().slice(); n.splice(i, 1); await save(n); }, rebuild);
       });
       const add = new Setting(box);
       add.addButton((b) => b.setButtonText("Add action…").onClick((e) => {
@@ -2503,7 +2542,20 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => sm.items,
       (ids) => { sm.items = ids; void persist(); },
       "No items yet. Add actions, commands, or other submenus below.",
-      { allowCustom: true, catalogIds: CONTEXT_LEAF_IDS });
+      { allowCustom: true, catalogIds: CONTEXT_LEAF_IDS, ctxHide: true });
+    // 0.367.0: a BAKED-IN submenu can't be deleted (the seed re-adds it) — offer
+    // Hide instead, which sticks. A user-made submenu keeps the real delete below.
+    if (`submenu:${key}` && (key in DEFAULT_CONTEXT_SUBMENUS)) {
+      const meId = `submenu:${key}`;
+      const hidden = this.ctxIsHidden(meId);
+      new Setting(host)
+        .setName(hidden ? "This submenu is hidden from the menu" : "Hide this submenu")
+        .setDesc("Built-in submenus can't be deleted (they come back on restart), but hiding sticks.")
+        .addButton((b) => b.setButtonText(hidden ? "Show it again" : "Hide from menu").onClick(async () => {
+          await this.ctxToggleHidden(meId); close?.();
+        }));
+      return;
+    }
     // 0.360.0: real delete — removes the submenu config AND strips `submenu:<key>`
     // from the top-level order and every other submenu's items, so it can't linger
     // as an orphan or a stale nesting target.
@@ -2529,7 +2581,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.320.0: a reorderable list of note-action ids (catalog ids or
    *  `cmd:<obsidian id>`), with add / remove / move up / move down. Shared by the
    *  star menu and the item-button builders. Re-renders `host` in place. */
-  private actionListBuilder(host: HTMLElement, getIds: () => string[], setIds: (ids: string[]) => void, emptyText: string, opts?: { allowCustom?: boolean; catalogIds?: readonly string[]; defaultOrder?: readonly string[] }): void {
+  private actionListBuilder(host: HTMLElement, getIds: () => string[], setIds: (ids: string[]) => void, emptyText: string, opts?: { allowCustom?: boolean; catalogIds?: readonly string[]; defaultOrder?: readonly string[]; ctxHide?: boolean }): void {
     const wrap = host.createDiv({ cls: "stashpad-action-builder" });
     const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const rerender = async (persist: boolean, ids: string[]) => {
@@ -2561,9 +2613,15 @@ export class StashpadSettingTab extends PluginSettingTab {
         row.addExtraButton((b) => b.setIcon("arrow-down").setTooltip("Move down").setDisabled(i === ids.length - 1).onClick(async () => {
           const n = ids.slice(); [n[i + 1], n[i]] = [n[i], n[i + 1]]; await rerender(true, n);
         }));
-        row.addExtraButton((b) => b.setIcon("x").setTooltip("Remove").onClick(async () => {
-          const n = ids.slice(); n.splice(i, 1); await rerender(true, n);
-        }));
+        // 0.367.0: inside the context menu, a baked-in item hides (sticks) instead
+        // of deleting (which the seed would undo); user items keep ✕.
+        if (opts?.ctxHide) {
+          this.ctxRowRemoveControl(row, id, async () => { const n = ids.slice(); n.splice(i, 1); await rerender(true, n); }, () => { void rerender(false, ids); });
+        } else {
+          row.addExtraButton((b) => b.setIcon("x").setTooltip("Remove").onClick(async () => {
+            const n = ids.slice(); n.splice(i, 1); await rerender(true, n);
+          }));
+        }
       });
       const addRow = new Setting(wrap);
       addRow.addButton((b) => b.setButtonText("Add action…").onClick((e) => {

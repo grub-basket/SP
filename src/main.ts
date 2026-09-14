@@ -8318,7 +8318,7 @@ export default class StashpadPlugin extends Plugin {
 
   /** 0.342.0: FOLDER-based cross-vault PASTE — reads the clipboard pointer, imports
    *  the staged folder as COPIES (fresh ids, subtree re-linked). Desktop only. */
-  async crossVaultPasteFolder(destFolder: string): Promise<{ status: "ok" | "none" | "unavailable" | "unreachable" | "failed"; count?: number; cut?: boolean }> {
+  async crossVaultPasteFolder(destFolder: string): Promise<{ status: "ok" | "none" | "unavailable" | "unreachable" | "failed"; count?: number; cut?: boolean; notePaths?: string[] }> {
     if (!folderTransferAvailable()) return { status: "unavailable" };
     const ptr = readXvFolderPointer();
     if (!ptr) return { status: "none" };
@@ -8335,7 +8335,7 @@ export default class StashpadPlugin extends Plugin {
       // 0.344.0: a CUT — ACK the token back to the clipboard so the SOURCE vault
       // offers to delete the originals (finishing the move). Mirrors pasteCrossVault.
       if (ptr.meta.mode === "cut" && ptr.meta.cutToken) writeXvAck(ptr.meta.cutToken, this.app.vault.getName());
-      return { status: "ok", count: summary.notesWritten, cut: ptr.meta.mode === "cut" };
+      return { status: "ok", count: summary.notesWritten, cut: ptr.meta.mode === "cut", notePaths: summary.notePaths };
     } catch (e) { console.warn("[Stashpad] cross-vault folder paste failed", e); return { status: "failed" }; }
   }
 
@@ -10675,6 +10675,9 @@ export default class StashpadPlugin extends Plugin {
       migratedToggleTaskG: data?.migratedToggleTaskG === true,
       contextMenusSeededV1: data?.contextMenusSeededV1 === true,
       contextMenuOrderRefreshedV2: data?.contextMenuOrderRefreshedV2 === true,
+      contextMenuHidden: Array.isArray(data?.contextMenuHidden)
+        ? data.contextMenuHidden.filter((x: unknown): x is string => typeof x === "string")
+        : [],
       dueQuickAdjusts: Array.isArray(data?.dueQuickAdjusts)
         ? data.dueQuickAdjusts.filter((x: unknown): x is string => typeof x === "string")
         : ["5m", "15m", "30m", "1h", "1d", "1w"],

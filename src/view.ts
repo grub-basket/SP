@@ -15087,6 +15087,12 @@ export class StashpadView extends ItemView {
       this.tree.rebuild(folder);
       this.pendingFocusIds = newIds.slice();
       this.render();
+      // 0.368.0: same cache-lag settle as the folder path — rebuild against real
+      // parents once the new files are parsed, so nesting shows without a reload.
+      if (summary.notePaths?.length) {
+        await this.awaitNotesResolved(summary.notePaths);
+        if (this.viewRoot?.isConnected) { this.tree.rebuild(folder); this.pendingFocusIds = newIds.slice(); this.render(); }
+      }
       // Undo/redo: snapshot the created files (same pattern as same-vault
       // copy-paste) — undo trashes them, redo restores from the snapshot.
       // Paths come from the import summary, NOT the tree — the metadata cache
@@ -15163,6 +15169,32 @@ export class StashpadView extends ItemView {
     }
   }
 
+  /** 0.368.0: resolve once the metadata cache has parsed the frontmatter of every
+   *  given path (or a timeout). Freshly-written files lag the cache, and the
+   *  count-based tree reconcile can't see a nesting change (same note count, moved
+   *  parents), so a paste that rebuilds while the cache is stale leaves the subtree
+   *  FLAT until a manual reload. Waiting here lets us rebuild against real parents. */
+  private awaitNotesResolved(paths: string[], timeoutMs = 5000): Promise<void> {
+    const remaining = new Set(paths);
+    const parsed = (p: string): boolean => {
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) return false;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      return !!fm && typeof fm.id === "string"; // id present ⇒ this file's frontmatter (incl. parent) is parsed
+    };
+    for (const p of [...remaining]) if (parsed(p)) remaining.delete(p);
+    if (!remaining.size) return Promise.resolve();
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (): void => { if (done) return; done = true; this.app.metadataCache.offref(ref); window.clearTimeout(timer); resolve(); };
+      const ref = this.app.metadataCache.on("changed", (file) => {
+        if (remaining.has(file.path) && parsed(file.path)) remaining.delete(file.path);
+        if (!remaining.size) finish();
+      });
+      const timer = window.setTimeout(finish, timeoutMs);
+    });
+  }
+
   async cmdPasteNotes(): Promise<void> {
     const clip = this.plugin.noteClipboard;
     if (!clip) {
@@ -15177,8 +15209,21 @@ export class StashpadView extends ItemView {
         const res = await this.plugin.crossVaultPasteFolder(this.noteFolder);
         if (res.status === "ok") {
           const folder = this.noteFolder;
+          // First paint is immediate (notes appear), but nesting needs the cache
+          // to parse each new file's `parent`. 0.368.0: wait for that, then rebuild
+          // against real parents — so the subtree shows nested WITHOUT a reload. A
+          // brief "Organizing…" notice covers the settle; the tree count-reconcile
+          // can't detect the reparent on its own (same count).
           this.tree.rebuild(folder);
           this.render();
+          const paths = res.notePaths ?? [];
+          if (paths.length) {
+            const settling = new Notice(`Organizing ${res.count} pasted note${res.count === 1 ? "" : "s"}…`, 0);
+            try {
+              await this.awaitNotesResolved(paths);
+              if (this.viewRoot?.isConnected) { this.tree.rebuild(folder); this.render(); }
+            } finally { settling.hide(); }
+          }
           this.plugin.notifications.show({
             message: res.cut
               ? `Received ${res.count} cut note${res.count === 1 ? "" : "s"} from "${fptr.meta.sourceVault}". Switch back to that vault to finish the move (delete the originals there).`
@@ -20909,6 +20954,11 @@ export class StashpadView extends ItemView {
    *  `focusClicked` normalises the selection to the right-clicked row for the
    *  selection-based commands. */
   private renderCtxLeaf(menu: any, id: string, node: TreeNode, file: TFile, focusClicked: () => void): void {
+    // 0.367.0: a HIDDEN id renders nothing — the way baked-in defaults (which the
+    // seed keeps re-adding) are removed for good. `sep` is never hidden (it has no
+    // stable identity to hide); everything else — leaves, `submenu:<key>`, `cmd:` —
+    // is checked. A hidden submenu drops the whole group.
+    if (id !== "sep" && (getSettings().contextMenuHidden ?? []).includes(id)) return;
     const A = (title: string, icon: string, onClick: (e?: MouseEvent | KeyboardEvent) => void): void =>
       menu.addItem((it: any) => it.setTitle(title).setIcon(icon).onClick(onClick));
     // 0.321.2: an arbitrary Obsidian command leaf (used inside custom submenus).
