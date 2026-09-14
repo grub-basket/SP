@@ -2011,7 +2011,8 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  command id (default: the command palette); empty hides the button. Text
    *  field so third-party command-palette users can point it at their own id. */
   private composerActionButtonBody(host: HTMLElement): void {
-    host.createEl("h4", { text: "Composer command button" });
+    // A Setting heading, not a manual h4 (store lint: no-manual-html-headings).
+    new Setting(host).setName("Composer command button").setHeading();
     host.createDiv({ cls: "setting-item-description", text: "The button to the right of the deep-link button (below the composer) runs an Obsidian command. Default: the command palette. To use a third-party palette, enter its command id (e.g. from a plugin's command). Leave empty to hide the button." });
     new Setting(host)
       .setName("Command id")

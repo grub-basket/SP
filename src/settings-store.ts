@@ -275,7 +275,7 @@ export class SettingsStore {
       const moved = new Set(MOVED_KEYS);
       for (const [k, v] of Object.entries(base)) if (!moved.has(k)) stripped[k] = v;
       await this.plugin.saveData(stripped);
-      console.info(`[Stashpad] settings split: moved ${MOVED_KEYS.length} keys out of data.json (backup: ${BACKUP_FILE}).`);
+      console.debug(`[Stashpad] settings split: moved ${MOVED_KEYS.length} keys out of data.json (backup: ${BACKUP_FILE}).`);
     } catch (e) {
       // A failed migration is survivable: data.json still holds everything, and the
       // merged in-memory view is correct, so the app runs normally and we retry next load.

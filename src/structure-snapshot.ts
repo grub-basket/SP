@@ -267,7 +267,7 @@ export class StructureSnapshotStore {
       retained++;
     }
     if (retained) {
-      console.info(`[Stashpad] structure snapshot: kept ${retained} entr${retained === 1 ? "y" : "ies"} for note(s) whose file still exists but which left the tree (possible frontmatter damage) in "${folder}".`);
+      console.debug(`[Stashpad] structure snapshot: kept ${retained} entr${retained === 1 ? "y" : "ies"} for note(s) whose file still exists but which left the tree (possible frontmatter damage) in "${folder}".`);
     }
     return { ...next, notes };
   }

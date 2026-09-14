@@ -3990,7 +3990,7 @@ export default class StashpadPlugin extends Plugin {
           return;
         }
         const report = perf.report();
-        console.log(report);
+        console.debug(report); // debug, not log (store lint); the report is also copied to the clipboard
         try { await navigator.clipboard.writeText(report); } catch { /* ignore */ }
         new Notice("Performance profile copied to clipboard (also in the console).");
       },
@@ -8121,7 +8121,7 @@ export default class StashpadPlugin extends Plugin {
     if (dirty) {
       this.settings.archiveFolders = kept;
       await this.saveSettings();
-      console.info(`[Stashpad] pruned ${before.length - kept.length} stale archive-folder entr${before.length - kept.length === 1 ? "y" : "ies"}.`);
+      console.debug(`[Stashpad] pruned ${before.length - kept.length} stale archive-folder entr${before.length - kept.length === 1 ? "y" : "ies"}.`);
     }
   }
 

@@ -10091,11 +10091,10 @@ export class StashpadView extends ItemView {
     // so it's trivially copyable on mobile (a Notice isn't).
     const modal = new Modal(this.app);
     modal.titleEl.setText("Composer debug — tap Copy");
-    const box = modal.contentEl.createEl("textarea");
+    // Classes, not inline style writes (store lint: no-static-styles-assignment).
+    const box = modal.contentEl.createEl("textarea", { cls: "stashpad-debug-box" });
     box.value = text; box.readOnly = true; box.rows = 14;
-    box.style.width = "100%"; box.style.fontFamily = "var(--font-monospace)"; box.style.fontSize = "12px";
-    const copy = modal.contentEl.createEl("button", { text: "Copy to clipboard", cls: "mod-cta" });
-    copy.style.marginTop = "8px";
+    const copy = modal.contentEl.createEl("button", { text: "Copy to clipboard", cls: "mod-cta stashpad-debug-copy" });
     const doCopy = (): void => {
       box.focus(); box.select(); box.setSelectionRange(0, text.length);
       let ok = false;

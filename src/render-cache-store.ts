@@ -155,7 +155,7 @@ export class RenderCacheStore implements RenderCacheLike {
       // sync tool. It's stale note PLAINTEXT that evict()/secure-delete can no
       // longer reach; remove it rather than letting it linger on the share.
       if (parsed && !this.idbBroken && (await adapter.exists(this.legacyPath))) {
-        try { await adapter.remove(this.legacyPath); console.log("[Stashpad] removed stale legacy render-cache.json (IndexedDB is authoritative)"); }
+        try { await adapter.remove(this.legacyPath); console.debug("[Stashpad] removed stale legacy render-cache.json (IndexedDB is authoritative)"); }
         catch (e) { console.warn("[Stashpad] couldn't remove stale render-cache.json", e); }
       }
       if (!parsed && (await adapter.exists(this.legacyPath))) {
@@ -169,7 +169,7 @@ export class RenderCacheStore implements RenderCacheLike {
           try {
             await this.idbSet(parsed);
             await adapter.remove(this.legacyPath);
-            console.log("[Stashpad] render cache migrated to IndexedDB (render-cache.json removed)");
+            console.debug("[Stashpad] render cache migrated to IndexedDB (render-cache.json removed)");
           } catch (e) {
             console.warn("[Stashpad] render cache migration failed; keeping vault file", e);
             this.idbBroken = true;

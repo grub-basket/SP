@@ -10482,3 +10482,11 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 
 /* Mobile: slightly narrower columns so two peek on a phone. */
 .is-mobile .stashpad-kanban-col { flex-basis: 78vw; max-width: 78vw; }
+
+/* 0.364.4: classes that replaced inline style writes (store lint:
+   no-static-styles-assignment). */
+/* Autocomplete popup held hidden until the mobile keyboard settles. */
+.stashpad-composer-suggest.is-awaiting-reveal { visibility: hidden; }
+/* Composer-debug modal: the copyable trace box + its Copy button. */
+.stashpad-debug-box { width: 100%; font-family: var(--font-monospace); font-size: 12px; }
+.stashpad-debug-copy { margin-top: 8px; }

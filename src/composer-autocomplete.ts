@@ -875,12 +875,15 @@ export class ComposerAutocomplete {
    *  keyboard). */
   private revealWhenViewportSettles(win: Window): void {
     if (!this.popupEl) return;
-    this.popupEl.style.visibility = "hidden";
+    // Class toggle rather than an inline visibility write (store lint:
+    // no-static-styles-assignment). The popup is removed outright on close, so
+    // the class can't go stale.
+    this.popupEl.addClass("is-awaiting-reveal");
     const vv = win.visualViewport;
     let settleTimer = 0;
     const reveal = (): void => {
       this.mobileRevealCleanup?.();
-      if (this.popupEl && this.state) { this.position(); this.popupEl.style.visibility = "visible"; }
+      if (this.popupEl && this.state) { this.position(); this.popupEl.removeClass("is-awaiting-reveal"); }
     };
     // Each viewport move (keyboard animating) pushes the reveal out; when the
     // moves stop for 200ms the keyboard has settled → position + reveal.
