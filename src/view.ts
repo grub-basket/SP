@@ -13478,11 +13478,19 @@ export class StashpadView extends ItemView {
       await this.commitReplyPicker(picker.sourceIds, target);
       return;
     }
-    const target = this.currentChildren[this.inListPicker.activeIdx];
+    const picker = this.inListPicker;
+    const target = this.currentChildren[picker.activeIdx];
     this.inListPicker = null;
     this.endInListPickerBanner();
     if (!target) { this.render(); return; }
-    const targets = this.getActionTargets().filter((n) => n.id !== target.id);
+    // 0.366.1: move the notes CAPTURED when the picker started (picker.sourceIds),
+    // not the live selection. Creating a new note mid-pick (e.g. to make a parent
+    // that didn't exist yet) re-selects it, and reading getActionTargets() here
+    // then moved that NEW note instead of the one you set out to move. The reply
+    // branch already used the captured ids; the nest branch didn't.
+    const targets = picker.sourceIds
+      .map((id) => this.tree.get(id))
+      .filter((n): n is TreeNode => !!n?.file && n.id !== target.id);
     // 0.91.1: move quietly (no per-note success toasts), then emit ONE
     // consolidated persistent notification with a Jump-to-destination button.
     // Capture child counts BEFORE moving so the summary is accurate even if a

@@ -365,6 +365,12 @@ export interface StashpadSettings {
    *  the user already has), then set this so a later delete of a seeded submenu
    *  sticks. See the migration in main.ts (loadSettings). */
   contextMenusSeededV1: boolean;
+  /** 0.366.1: one-time flag — a `contextMenuOrder` snapshot saved BEFORE the
+   *  0.360/0.363 submenu reorg references none of the current default's submenus
+   *  and so renders a stale, submenu-less menu forever. The migration in main.ts
+   *  clears such a stale order once (→ live default), then sets this so a user who
+   *  later builds a submenu-less menu on purpose keeps it. */
+  contextMenuOrderRefreshedV2: boolean;
   /** 0.363.2: the composer action-bar button (right of the deep-link button)
    *  runs this Obsidian command id. Defaults to the built-in command palette
    *  ("command-palette:open"); a user on a third-party palette can point it at
@@ -1055,6 +1061,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   // (guarded by contextMenusSeededV1) merges these into an existing install too.
   contextSubmenus: Object.fromEntries(Object.entries(DEFAULT_CONTEXT_SUBMENUS).map(([k, v]) => [k, { name: v.name, icon: v.icon, items: [...v.items] }])),
   contextMenusSeededV1: false,
+  contextMenuOrderRefreshedV2: false,
   composerActionCommand: "command-palette:open",
   customCommandIds: [],
   savedSearches: [],

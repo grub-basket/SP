@@ -32,7 +32,7 @@ import {
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
-import { DEFAULT_CONTEXT_SUBMENUS } from "./note-actions";
+import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER } from "./note-actions";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { writeXvClipboard, readXvAck, writeXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
@@ -10674,6 +10674,7 @@ export default class StashpadPlugin extends Plugin {
         : [...DEFAULT_STOPWORDS],
       migratedToggleTaskG: data?.migratedToggleTaskG === true,
       contextMenusSeededV1: data?.contextMenusSeededV1 === true,
+      contextMenuOrderRefreshedV2: data?.contextMenuOrderRefreshedV2 === true,
       dueQuickAdjusts: Array.isArray(data?.dueQuickAdjusts)
         ? data.dueQuickAdjusts.filter((x: unknown): x is string => typeof x === "string")
         : ["5m", "15m", "30m", "1h", "1d", "1w"],
@@ -10735,6 +10736,26 @@ export default class StashpadPlugin extends Plugin {
         this.settings.contextMenusSeededV1 = true;
         await this.saveSettings();
       }
+    }
+    // 0.366.1: refresh a STALE contextMenuOrder. A snapshot saved before the
+    // 0.360/0.363 submenu reorg lists items like `obscure`/`setColor` at the top
+    // level and references NONE of the current default's submenus — so the whole
+    // menu renders without React/Reply, Move, Pin, Appearance or Advanced, no
+    // matter how the submenus themselves are seeded (the reported "mobile menu is
+    // missing everything, and I never customized it"). Clear such an order ONCE so
+    // the live default is used again; the flag then lets a user who deliberately
+    // builds a submenu-less menu keep it. A custom order that still references any
+    // current submenu is treated as intentional and left alone.
+    if (!this.settings.contextMenuOrderRefreshedV2) {
+      const order = this.settings.contextMenuOrder ?? [];
+      const defaultSubmenus = CONTEXT_DEFAULT_ORDER.filter((id) => id.startsWith("submenu:"));
+      const referencesASubmenu = order.some((id) => defaultSubmenus.includes(id));
+      if (order.length && !referencesASubmenu) {
+        this.settings.contextMenuOrder = [];
+        console.debug("[Stashpad] refreshed a pre-reorg context-menu order to the current default.");
+      }
+      this.settings.contextMenuOrderRefreshedV2 = true;
+      await this.saveSettings();
     }
     // Sync the notification service's mute set from settings. Safe to
     // call before any toasts fire — the service no-ops on empty mute
