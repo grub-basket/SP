@@ -7,14 +7,17 @@ function osFileManagerName(): string {
 import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal, buildJdPreviewNotice } from "./index-builder";
 import { FolderSuggest } from "./folder-suggest";
 import { IconSuggest } from "./icon-suggest";
+import { CommandSuggest } from "./command-suggest";
 import type StashpadPlugin from "./main";
 import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
-import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
+import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
 import { guessCommandIcon } from "./icon-guess";
-import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal } from "./modals";
+import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal } from "./modals";
+import { makeSnippet } from "./snippets";
+import { resolveToolbarButtons, type ToolbarButtonConfig } from "./formatting-toolbar";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
 import { DEFAULT_STOPWORDS } from "./slug-service";
@@ -344,10 +347,29 @@ export interface StashpadSettings {
   /** 0.322.1: saved VIEWS (synced): a name + a captured view state (folder +
    *  filters + focus) launchable from the view launcher. */
   savedViews: { name: string; state: Record<string, unknown> }[];
+  /** 0.338.0: user text snippets — toolbar buttons and/or typed auto-expansions,
+   *  with template variables. See snippets.ts. */
+  snippets: import("./snippets").Snippet[];
+  /** 0.351.0: formatting-toolbar customization — per built-in button order (array
+   *  order), hidden flag, and icon override. Empty = the built-in default order.
+   *  See formatting-toolbar.ts (ToolbarButtonConfig / resolveToolbarButtons). */
+  toolbarButtons: import("./formatting-toolbar").ToolbarButtonConfig[];
   /** 0.321.2: user-defined submenus for the ⋮ menu, keyed by an opaque id.
    *  `items` are catalog ids or `cmd:<id>`. Referenced from contextMenuOrder as
    *  `submenu:<key>`. */
   contextSubmenus: Record<string, { name: string; icon: string; items: string[] }>;
+  /** 0.363.0: one-time seed marker — the four built-in reorg submenus (Move, Pin,
+   *  Advanced, React / Reply) were converted from hand-built menu cases into
+   *  DEFAULT_CONTEXT_SUBMENUS entries. On first load after the change we MERGE any
+   *  missing default submenu keys into `contextSubmenus` (never clobbering a key
+   *  the user already has), then set this so a later delete of a seeded submenu
+   *  sticks. See the migration in main.ts (loadSettings). */
+  contextMenusSeededV1: boolean;
+  /** 0.363.2: the composer action-bar button (right of the deep-link button)
+   *  runs this Obsidian command id. Defaults to the built-in command palette
+   *  ("command-palette:open"); a user on a third-party palette can point it at
+   *  their own command. Empty string hides the button. */
+  composerActionCommand: string;
   /** 0.272.1: append a "More commands…" escape hatch (opens the full ⋮ menu) to
    *  the quick menu. A separate boolean rather than a catalog id so it defaults
    *  on for existing installs without a migration. */
@@ -411,11 +433,17 @@ export interface StashpadSettings {
    *  malformed body never silently undercounts. */
   confirmAttachmentDelete: boolean;
   /** 0.214.2: stamp the cross-vault payload on EVERY cut/copy again (pre-0.214.0
-   *  behaviour). Off by default because building it reads every note and
-   *  attachment in the selection, which is slow on a big selection or a network
-   *  drive. On a fast machine that cost is unnoticeable and always-on is more
-   *  convenient than remembering the explicit command. */
+   *  behaviour). 0.343.0: default ON — cross-vault COPY now stages a plain folder
+   *  (fast, no zip; see cross-vault-folder.ts) instead of zipping into the
+   *  clipboard, so preparing every copy is cheap. Turn OFF to keep plain Mod+C
+   *  instant and only prepare on the explicit "Copy/Cut for another vault"
+   *  command (e.g. cut, which still uses the slower zip path). */
   alwaysStampCrossVault: boolean;
+  /** 0.343.0: set once the one-shot migration that flips a persisted
+   *  alwaysStampCrossVault:false to true (now that the folder path makes it cheap)
+   *  has run, so a user who later turns it back off isn't re-flipped. New installs
+   *  start true (already "migrated"). */
+  crossVaultAlwaysStampDefaultedOn: boolean;
   /** 0.215.0: set once the one-shot "automatic link updating is off" notice has
    *  been shown, so it never nags. The settings warning stays regardless. */
   /** 0.246.0: retained so an existing vault's saved value loads without a
@@ -799,8 +827,27 @@ export interface StashpadSettings {
    *  cares about this" are different questions and people want them at
    *  different times. */
   railShowBacklinks: boolean;
+  /** 0.333.0: show a "↩ N replies" chip on notes other notes reply to (via
+   *  replyTo). Tapping lists the replies to jump to. On by default. */
+  showReplyCount: boolean;
+  /** 0.337.0: keep a per-note version history (past bodies) in
+   *  `<folder>/.stashpad/history/<id>.jsonl` so you can view / diff / restore
+   *  what a note said before. On by default. */
+  enableNoteHistory: boolean;
+  /** 0.337.0: max versions kept per note (oldest pruned). */
+  noteHistoryCap: number;
+  /** 0.341.0: keep device-local settings backups (restore after a synced device
+   *  overwrites this vault's settings). On by default. */
+  settingsBackups: boolean;
   /** 0.237.0: render ||spoiler|| in note bodies as blurred-until-tapped. */
   spoilerMarkup: boolean;
+  /** 0.353.0: on send, trim a duplicated OPENING emphasis marker (e.g. `***bold**`
+   *  → `**bold**`) left by some mobile keyboards' autopair. Narrow + safe (never
+   *  touches symmetric or empty markup); on by default, toggleable. */
+  fixAutopairDupOnSend: boolean;
+  /** 0.363.11: normalize iOS smart-punctuation curly quotes (“ ” ‘ ’) to straight
+   *  ASCII (" ') on send, so notes stay plain-ASCII. On by default. */
+  straightenCurlyQuotesOnSend: boolean;
   /** 0.238.0: bulk recolour from the colour-alias swatch applies to EVERY
    *  Stashpad rather than only the one selected. Off by default — a vault-wide
    *  write should be opted into, not stumbled into. */
@@ -820,6 +867,17 @@ export interface StashpadSettings {
   /** 0.199.2: composer/edit textareas auto-close `[[` with `]]` and type-over
    *  an existing closing bracket. On by default. */
   autoPairBrackets: boolean;
+  /** 0.326.0: when on, Tab / Shift+Tab indent / outdent the current line(s) in
+   *  the composer + edit textareas even on plain (non-list) lines — an outliner
+   *  keyboard model for building structure while typing. Off by default so Tab
+   *  keeps its usual job of leaving the field on a prose line. */
+  tabIndentsProse: boolean;
+  /** 0.330.0: the Stashpad folder the global quick-capture box last filed into,
+   *  so it defaults there next time. Empty = fall back to the first folder. */
+  lastCaptureFolder: string;
+  /** 0.332.0: show the formatting toolbar (bold/italic/highlight/code/link/
+   *  checkbox/spoiler) at the top of the composer. On by default. */
+  showComposerToolbar: boolean;
   /** 0.207.0: line-number gutter beside the edit/split editor (desktop). */
   showEditorLineNumbers: boolean;
   /** 0.73.14: when on, the row under the keyboard cursor temporarily
@@ -992,10 +1050,17 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   itemButtons: [],
   commandIcons: {},
   contextMenuOrder: [],
-  contextSubmenus: {},
+  // 0.363.0: seed the four built-in reorg submenus so the default order's
+  // `submenu:<key>` entries resolve out of the box. The seed migration in main.ts
+  // (guarded by contextMenusSeededV1) merges these into an existing install too.
+  contextSubmenus: Object.fromEntries(Object.entries(DEFAULT_CONTEXT_SUBMENUS).map(([k, v]) => [k, { name: v.name, icon: v.icon, items: [...v.items] }])),
+  contextMenusSeededV1: false,
+  composerActionCommand: "command-palette:open",
   customCommandIds: [],
   savedSearches: [],
   savedViews: [],
+  snippets: [],
+  toolbarButtons: [],
   quickMenuIncludeMore: true,
   openNotesInStashpad: false,
   debugTrace: false,
@@ -1022,7 +1087,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   confirmCrossParentDrag: true,
   confirmBulkDelete: true,
   confirmAttachmentDelete: true,
-  alwaysStampCrossVault: false,
+  alwaysStampCrossVault: true,
+  crossVaultAlwaysStampDefaultedOn: true,
   linkUpdateWarningShown: false,
   attachmentLocation: "per-folder",
   attachmentUniversalFolder: "Attachments",
@@ -1116,12 +1182,21 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   attachmentsEmbedded: true,
   railShowOutgoing: false,
   railShowBacklinks: false,
+  showReplyCount: true,
+  enableNoteHistory: true,
+  noteHistoryCap: 40,
+  settingsBackups: true,
   spoilerMarkup: true,
+  fixAutopairDupOnSend: true,
+  straightenCurlyQuotesOnSend: true,
   bulkRecolorAllFolders: false,
   autoNavOnMoveIn: false,
   openParentTabOnMoveIn: true,
   newTabsInBackground: false,
   autoPairBrackets: true,
+  tabIndentsProse: false,
+  lastCaptureFolder: "",
+  showComposerToolbar: true,
   showEditorLineNumbers: true,
   autoNavOnMoveOut: false,
   pinnedFilterMode: "all",
@@ -1287,12 +1362,30 @@ let forceTick = 0;
  *  Needed on the SYNC adoption path (`onExternalDataJsonChange`): another device
  *  can change an excluded per-folder key, and no local setter runs to repaint
  *  it, so the signature alone would leave the list stale. */
+let broadcastScheduled = false;
+let pendingForce = false;
 export function setSettings(next: StashpadSettings, force = false): void {
+  // `current` updates SYNCHRONOUSLY so getSettings() readers never see stale
+  // state; only the listener BROADCAST is coalesced below.
   current = next;
-  // Computed ONCE per save and handed to every listener. Per-view computation
-  // would repeat this work for each open view, which is the cost being removed.
-  const sig = force ? `${renderSignature(next)}|force=${++forceTick}` : renderSignature(next);
-  for (const fn of listeners) fn(sig);
+  if (force) pendingForce = true;
+  // 0.363.3 (perf): coalesce the broadcast into one microtask. A burst of
+  // saveSettings() calls (bulk moves, contribution stamping, reminder pruning)
+  // used to recompute the render signature (a JSON.stringify of ~90 keys) AND
+  // re-notify every open view ON EVERY CALL — hundreds of `render:skip-settings`
+  // and, when the settings blob is large, a multi-second main-thread stall from
+  // the repeated stringify alone. A synchronous burst drains this microtask only
+  // once it finishes, so N calls collapse to ONE signature computation + ONE
+  // notify against the final state (which `current` already reflects).
+  if (broadcastScheduled) return;
+  broadcastScheduled = true;
+  queueMicrotask(() => {
+    broadcastScheduled = false;
+    const f = pendingForce;
+    pendingForce = false;
+    const sig = f ? `${renderSignature(current)}|force=${++forceTick}` : renderSignature(current);
+    for (const fn of listeners) fn(sig);
+  });
 }
 export function onSettingsChange(fn: (sig: string) => void): () => void {
   listeners.add(fn);
@@ -1563,7 +1656,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.headingDef("🔢 JD Index (Johnny Decimal)"), ...this.jdIndexItems(),
         this.headingDef("📚 Open Knowledge Format (OKF)"), ...this.okfItems(),
       ];
-      case "noteActions": return this.noteActionsItems();
+      case "noteActions": return [...this.noteActionsItems(), ...this.snippetsItems()];
       case "encryption": return this.encryptionItems();
       // 0.99.15: authorship/templates/jdindex decomposed too — static fields as
       // per-setting items, the per-folder editors as sectionDefs (rendered fresh
@@ -1908,9 +2001,188 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.itemButtonsBody(h, rebuild);
         this.contextMenuBody(h, rebuild);
         this.iconRegistryBody(h, rebuild);
+        this.composerActionButtonBody(h);
       };
       buildAll(box);
     }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu"])];
+  }
+
+  /** 0.363.2: the configurable composer action-bar button. Runs one Obsidian
+   *  command id (default: the command palette); empty hides the button. Text
+   *  field so third-party command-palette users can point it at their own id. */
+  private composerActionButtonBody(host: HTMLElement): void {
+    host.createEl("h4", { text: "Composer command button" });
+    host.createDiv({ cls: "setting-item-description", text: "The button to the right of the deep-link button (below the composer) runs an Obsidian command. Default: the command palette. To use a third-party palette, enter its command id (e.g. from a plugin's command). Leave empty to hide the button." });
+    new Setting(host)
+      .setName("Command id")
+      .setDesc("The Obsidian command this button runs.")
+      .addText((t) => {
+        t.setPlaceholder("command-palette:open")
+          .setValue(this.plugin.settings.composerActionCommand ?? "")
+          .onChange(async (v) => {
+            this.plugin.settings.composerActionCommand = v.trim();
+            await this.plugin.saveSettings();
+          });
+        new CommandSuggest(this.app, t.inputEl);
+      });
+  }
+
+  /** 0.338.0: Snippets & formatting-toolbar customization. Each snippet can be a
+   *  toolbar button and/or a typed auto-expansion, with template variables. */
+  private snippetsItems(): SettingDefinitionItem[] {
+    return [this.sectionDef("Snippets and Formatting Toolbar", "snippet toolbar formatting template expand trigger button espanso variable date reorder hide icon heading bold highlight code block", (host) => {
+      const box = host.createDiv();
+      const rebuild = (): void => { box.empty(); build(box); };
+      const build = (h: HTMLElement): void => {
+        // 0.351.0: a master heading for the whole section, then the formatting-
+        // toolbar customization, then the snippets list beneath it.
+        this.sectionHeader(h, "Snippets and Formatting Toolbar", "Customize the formatting toolbar that sits above the composer and the note editor — reorder its buttons, hide the ones you don't use, change their icons — and manage your reusable text snippets.");
+        this.toolbarButtonsBody(h, rebuild);
+        this.sectionHeader(h, "✂️ Snippets", "Reusable text for the composer / edit toolbar. A snippet can show as a toolbar button, and/or auto-expand when you type its trigger followed by a space. Values support template variables: {{date}}, {{time}}, {{date:FORMAT}}, {{title}} (date/time use your core Templates plugin format). Snippets without a button live in the toolbar's Snippets menu.");
+        const list = this.plugin.settings.snippets ?? [];
+        if (list.length === 0) h.createEl("p", { cls: "setting-item-description", text: "No snippets yet — add one below." });
+        for (const sn of list) {
+          const off = sn.enabled === false; // 0.346.0
+          const desc = [sn.trigger ? `trigger “${sn.trigger}”${sn.caseSensitive ? " (case-sensitive)" : ""}` : null, sn.button ? "toolbar button" : "in menu", off ? "disabled" : null].filter(Boolean).join(" · ");
+          const row = new Setting(h).setName(`${sn.name || "(unnamed)"}${off ? " (off)" : ""}`).setDesc(desc);
+          if (off) row.setClass("stashpad-snippet-off"); // 0.346.0: muted when deactivated
+          // 0.346.0: enable/disable without deleting.
+          row.addToggle((t) => t.setValue(!off).setTooltip("Active").onChange(async (v) => {
+            this.plugin.settings.snippets = (this.plugin.settings.snippets ?? []).map((x) => x.id === sn.id ? { ...x, enabled: v } : x);
+            await this.plugin.saveSettings();
+            this.plugin.refreshAllStashpadViews();
+            rebuild();
+          }));
+          row.addExtraButton((b) => b.setIcon("pencil").setTooltip("Edit").onClick(() => {
+            new SnippetEditModal(this.app, sn, async (updated) => {
+              this.plugin.settings.snippets = (this.plugin.settings.snippets ?? []).map((x) => x.id === updated.id ? updated : x);
+              await this.plugin.saveSettings();
+              this.plugin.refreshAllStashpadViews();
+              rebuild();
+            }, this.plugin.settings.snippets ?? []).open();
+          }));
+          row.addExtraButton((b) => b.setIcon("trash").setTooltip("Delete").onClick(async () => {
+            this.plugin.settings.snippets = (this.plugin.settings.snippets ?? []).filter((x) => x.id !== sn.id);
+            await this.plugin.saveSettings();
+            this.plugin.refreshAllStashpadViews();
+            rebuild();
+          }));
+        }
+        const addRow = new Setting(h);
+        addRow.addButton((b) => b.setButtonText("Add snippet").setCta().onClick(() => {
+          new SnippetEditModal(this.app, makeSnippet(), async (created) => {
+            this.plugin.settings.snippets = [...(this.plugin.settings.snippets ?? []), created];
+            await this.plugin.saveSettings();
+            this.plugin.refreshAllStashpadViews();
+            rebuild();
+          }, this.plugin.settings.snippets ?? []).open();
+        }));
+        addRow.addButton((b) => b.setButtonText("Import CSV/TSV…").onClick(() => {
+          new SnippetImportModal(this.app, this.plugin.settings.snippets ?? [], async (merged, stats) => {
+            this.plugin.settings.snippets = merged;
+            await this.plugin.saveSettings();
+            this.plugin.refreshAllStashpadViews();
+            new Notice(`Imported: ${stats.added} added, ${stats.skipped} duplicate(s) skipped, ${stats.conflicts} conflict(s).`);
+            rebuild();
+          }).open();
+        }));
+      };
+      build(box);
+    }, ["snippet", "toolbar", "template", "expand", "trigger", "button", "espanso", "variable"])];
+  }
+
+  /** 0.351.0: the built-in formatting-toolbar customization — a reorderable list
+   *  of every built-in button with a show/hide toggle and an icon override. The
+   *  full effective order is persisted the moment anything is touched, so a saved
+   *  config always carries the complete ordering (unconfigured = default order). */
+  private toolbarButtonsBody(host: HTMLElement, rebuild: () => void): void {
+    this.sectionHeader(host, "🧰 Toolbar buttons", "The built-in buttons on the formatting toolbar (above the composer and note editor). Drag with the arrows to reorder, toggle a button off to hide it, or type a Lucide icon name to change its icon. Snippet buttons are managed below and can be placed at the start or end of the bar per snippet.");
+    const listBox = host.createDiv({ cls: "stashpad-action-builder" });
+    // Persist the full current effective order (all built-ins, in order) so
+    // reorder / hide / icon all round-trip; an empty override array = defaults.
+    const persist = async (rows: ReturnType<typeof resolveToolbarButtons>): Promise<void> => {
+      this.plugin.settings.toolbarButtons = rows.map(({ def, hidden, icon }) => {
+        const entry: ToolbarButtonConfig = { id: def.id };
+        if (hidden) entry.hidden = true;
+        if (icon && icon !== def.icon) entry.icon = icon;
+        return entry;
+      });
+      await this.plugin.saveSettings();
+      this.plugin.refreshAllStashpadViews();
+      render();
+    };
+    const render = (): void => { listBox.empty(); build(); };
+    const build = (): void => {
+      const rows = resolveToolbarButtons(this.plugin.settings.toolbarButtons);
+      rows.forEach((r, i) => {
+        const { def, hidden, icon } = r;
+        const row = new Setting(listBox).setName(def.title + (hidden ? " (hidden)" : ""));
+        if (hidden) row.setClass("stashpad-snippet-off");
+        const ic = row.nameEl.createSpan({ cls: "stashpad-cmdicon-preview" });
+        setIcon(ic, icon); row.nameEl.prepend(ic);
+        row.addExtraButton((b) => b.setIcon("arrow-up").setTooltip("Move up").setDisabled(i === 0).onClick(async () => {
+          const n = rows.slice(); [n[i - 1], n[i]] = [n[i], n[i - 1]]; await persist(n);
+        }));
+        row.addExtraButton((b) => b.setIcon("arrow-down").setTooltip("Move down").setDisabled(i === rows.length - 1).onClick(async () => {
+          const n = rows.slice(); [n[i + 1], n[i]] = [n[i], n[i + 1]]; await persist(n);
+        }));
+        row.addToggle((t) => t.setValue(!hidden).setTooltip("Show on toolbar").onChange(async (v) => {
+          const n = rows.slice(); n[i] = { ...n[i], hidden: !v }; await persist(n);
+        }));
+        row.addText((t) => {
+          new IconSuggest(this.app, t.inputEl);
+          t.setValue(icon).setPlaceholder(def.icon);
+          t.inputEl.addClass("stashpad-cmdicon-input");
+          const commit = async () => {
+            const v = t.getValue().trim().replace(/^lucide-/, "");
+            const n = rows.slice(); n[i] = { ...n[i], icon: v || def.icon }; await persist(n);
+          };
+          t.inputEl.addEventListener("blur", () => void commit());
+          t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
+        });
+        row.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset icon to default").onClick(async () => {
+          const n = rows.slice(); n[i] = { ...n[i], icon: def.icon }; await persist(n);
+        }));
+      });
+      const resetRow = new Setting(listBox);
+      resetRow.addButton((b) => b.setButtonText("Reset toolbar to defaults").setWarning().onClick(async () => {
+        this.plugin.settings.toolbarButtons = [];
+        await this.plugin.saveSettings();
+        this.plugin.refreshAllStashpadViews();
+        render();
+      }));
+    };
+    build();
+  }
+
+  /** 0.341.0: device-local settings backups — a toggle + a per-device list of
+   *  snapshots you can restore. Guards against a synced device overwriting this
+   *  vault's settings (the snapshots live in a dot folder Sync doesn't carry). */
+  private settingsBackupSection(): SettingDefinitionItem {
+    return this.sectionDef("Settings backups", "settings backup restore sync conflict device overwrite data.json", (host) => {
+      this.sectionHeader(host, "💾 Settings backups (per device)", "Snapshots of this vault's settings are saved on THIS device (in “.stashpad-settings-backups/”, which Obsidian Sync doesn't carry between devices). If a synced device overwrites your settings, restore a good version here. Restoring backs up the current settings first, then reload Obsidian to apply.");
+      new Setting(host).setName("Keep settings backups").setDesc("Snapshot core settings (debounced) as you change them, capped per device.")
+        .addToggle((t) => t.setValue(this.plugin.settings.settingsBackups !== false).onChange(async (v) => { this.plugin.settings.settingsBackups = v; await this.plugin.saveSettings(); }));
+      const listHost = host.createDiv();
+      listHost.createEl("p", { cls: "setting-item-description", text: "Loading backups…" });
+      void this.plugin.settingsBackup.list().then((groups) => {
+        listHost.empty();
+        if (groups.length === 0) { listHost.createEl("p", { cls: "setting-item-description", text: "No backups yet — they appear as you change settings." }); return; }
+        for (const g of groups) {
+          new Setting(listHost).setName(g.device).setHeading();
+          for (const b of g.backups.slice(0, 12)) {
+            const when = new Date(b.ts);
+            const row = new Setting(listHost).setName(when.toLocaleString());
+            row.addButton((btn) => btn.setButtonText("Restore").onClick(() => {
+              new ConfirmModal(this.app, "Restore these settings?",
+                `Replace this vault's current settings with the “${g.device}” backup from ${when.toLocaleString()}?\n\nYour current settings are backed up first, and you'll reload Obsidian to apply.`,
+                "Restore", async (ok: boolean) => { if (ok) await this.plugin.restoreSettingsBackup(b.path); },
+                "Cancel").open();
+            }));
+          }
+        }
+      });
+    }, ["settings", "backup", "restore", "sync", "conflict", "device", "overwrite"]);
   }
 
   /** 0.320.3: a visible heading + description at the top of a builder section
@@ -2157,11 +2429,11 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.321.2: edit ONE ⋮-menu submenu — name, icon, and its item list. */
   private editContextSubmenu(key: string, onDone: () => void): void {
     if (!this.plugin.settings.contextSubmenus?.[key]) return;
-    new ContextSubmenuModal(this.app, (host) => this.renderSubmenuEditorBody(host, key), onDone).open();
+    new ContextSubmenuModal(this.app, (host, close) => this.renderSubmenuEditorBody(host, key, close), onDone).open();
   }
 
   /** 0.321.2: the body of the submenu editor (name / icon / item list). */
-  private renderSubmenuEditorBody(host: HTMLElement, key: string): void {
+  private renderSubmenuEditorBody(host: HTMLElement, key: string, close?: () => void): void {
     const sm = this.plugin.settings.contextSubmenus?.[key];
     if (!sm) { host.createDiv({ text: "This submenu was removed." }); return; }
     const persist = async () => { this.plugin.settings.contextSubmenus = { ...(this.plugin.settings.contextSubmenus ?? {}), [key]: sm }; await this.plugin.saveSettings(); };
@@ -2176,12 +2448,74 @@ export class StashpadSettingTab extends PluginSettingTab {
       t.inputEl.addEventListener("blur", () => void commit());
       t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
     });
+    // 0.359.0: parent menu — where this submenu appears. "Main menu" = top level;
+    // picking another submenu NESTS this one inside it (the ⋮-menu renderer already
+    // recurses on `submenu:` items). A submenu can't be nested inside itself or one
+    // of its own descendants (cycle guard).
+    const meId = `submenu:${key}`;
+    const subsNow = (): Record<string, { name: string; icon: string; items: string[] }> => this.plugin.settings.contextSubmenus ?? {};
+    const descendants = (k: string, seen = new Set<string>()): Set<string> => {
+      if (seen.has(k)) return seen;
+      seen.add(k);
+      for (const it of (subsNow()[k]?.items ?? [])) if (it.startsWith("submenu:")) descendants(it.slice(8), seen);
+      return seen;
+    };
+    const forbidden = descendants(key); // self + everything nested under it
+    const currentParent = (): string => {
+      for (const [k, s] of Object.entries(subsNow())) if (s.items.includes(meId)) return k;
+      return "main";
+    };
+    new Setting(host).setName("Parent menu")
+      .setDesc("Where this submenu appears. “Main menu” = the top level; pick another submenu to nest it inside that one.")
+      .addDropdown((d) => {
+        // Only submenus actually PLACED in the menu (top-level order or inside
+        // another submenu) are valid nesting targets — an orphaned/removed submenu
+        // config shouldn't show up here (fixes: deleted submenus still listed).
+        const referenced = new Set<string>();
+        for (const x of (this.plugin.settings.contextMenuOrder ?? [])) if (x.startsWith("submenu:")) referenced.add(x.slice(8));
+        for (const s of Object.values(subsNow())) for (const it of s.items) if (it.startsWith("submenu:")) referenced.add(it.slice(8));
+        d.addOption("main", "Main menu");
+        for (const [k, s] of Object.entries(subsNow())) if (!forbidden.has(k) && referenced.has(k)) d.addOption(k, s.name || "Submenu");
+        d.setValue(currentParent());
+        d.onChange(async (np) => {
+          const order = this.plugin.settings.contextMenuOrder ?? [];
+          const base = order.length ? [...order] : [...CONTEXT_DEFAULT_ORDER];
+          const subs: Record<string, { name: string; icon: string; items: string[] }> = {};
+          for (const [k, s] of Object.entries(subsNow())) subs[k] = { ...s, items: s.items.filter((x) => x !== meId) };
+          let newOrder = base.filter((x) => x !== meId);
+          if (np === "main") { if (!newOrder.includes(meId)) newOrder.push(meId); }
+          else if (subs[np]) { subs[np] = { ...subs[np], items: [...subs[np].items, meId] }; }
+          this.plugin.settings.contextMenuOrder = newOrder;
+          this.plugin.settings.contextSubmenus = subs;
+          await this.plugin.saveSettings();
+        });
+      });
     new Setting(host).setName("Items").setHeading();
     this.actionListBuilder(host,
       () => sm.items,
       (ids) => { sm.items = ids; void persist(); },
-      "No items yet. Add actions or commands below.",
+      "No items yet. Add actions, commands, or other submenus below.",
       { allowCustom: true, catalogIds: CONTEXT_LEAF_IDS });
+    // 0.360.0: real delete — removes the submenu config AND strips `submenu:<key>`
+    // from the top-level order and every other submenu's items, so it can't linger
+    // as an orphan or a stale nesting target.
+    new Setting(host).addButton((b) => b.setButtonText("Delete this submenu").setWarning().onClick(() => {
+      new ConfirmModal(this.app, "Delete submenu?",
+        `Remove the “${sm.name || "Submenu"}” submenu? Its items aren't deleted — they just stop being grouped here. This can't be undone from here.`,
+        "Delete", async (ok: boolean) => {
+          if (!ok) return;
+          const meId = `submenu:${key}`;
+          const subs: Record<string, { name: string; icon: string; items: string[] }> = {};
+          for (const [k, s] of Object.entries(this.plugin.settings.contextSubmenus ?? {})) {
+            if (k === key) continue;
+            subs[k] = { ...s, items: s.items.filter((x) => x !== meId) };
+          }
+          this.plugin.settings.contextSubmenus = subs;
+          this.plugin.settings.contextMenuOrder = (this.plugin.settings.contextMenuOrder ?? []).filter((x) => x !== meId);
+          await this.plugin.saveSettings();
+          close?.();
+        }).open();
+    }));
   }
 
   /** 0.320.0: a reorderable list of note-action ids (catalog ids or
@@ -2800,6 +3134,8 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.plugin.settings.writeRecoveryLinks = v; await set();
       })), ["recovery", "parentlink", "children", "frontmatter"]));
 
+    cats.maintenance.push(this.settingsBackupSection());
+
     // Date display block — dropdown leads (it now drives EVERY timestamp surface:
     // notes list, Tasks, detail panel), then the Templates-format toggle, the
     // timezone, and a live sample. 0.121.7: reordered + copy updated.
@@ -2893,6 +3229,10 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.railShowOutgoing, (v) => { this.plugin.settings.railShowOutgoing = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "links", "outgoing", "backlinks"]));
     cats.listDisplay.push(toggle("Show backlinks in the rail", "List the notes that link TO this one, in a row under its files. Off by default. Kept separate from outgoing links because \"what does this point at\" and \"who refers to this\" are different questions.",
       () => this.plugin.settings.railShowBacklinks, (v) => { this.plugin.settings.railShowBacklinks = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "backlinks", "incoming", "links"]));
+    cats.listDisplay.push(toggle("Show reply count", "On a note that others reply to (via a reply link), show a “↩ N replies” chip. Tap it to list those replies and jump to one — Telegram-style, but you can actually reach them. On by default.",
+      () => this.plugin.settings.showReplyCount, (v) => { this.plugin.settings.showReplyCount = v; this.plugin.refreshAllStashpadViews(); }, ["reply", "replies", "count", "backlink", "thread"]));
+    cats.listDisplay.push(toggle("Keep note history", "Capture a version of a note’s BODY each time you edit it, in “<folder>/.stashpad/history/<id>.jsonl”, so you can see what it said before, diff, and restore (command: “View note history”). Includes a “by <person>” filter so collaborators can see the versions each of them saved. On by default. For keystroke-level history, the Edit History community plugin goes deeper; canvases and bases are NOT captured here.",
+      () => this.plugin.settings.enableNoteHistory, (v) => { this.plugin.settings.enableNoteHistory = v; }, ["history", "version", "revision", "restore", "undo", "timeline", "edit history", "Edit History AntonioTejada"]));
     cats.listDisplay.push(toggle("Similar-note hints in the composer", "As you type a note, show existing notes with a similar title so you can spot a duplicate before creating one — Discourse-style. Desktop searches live; on mobile it is off until you tap the ⌕ toggle in the composer (so the keyboard isn't crowded). On by default. Click a hint to open that note.",
       () => this.plugin.settings.duplicateHints, (v) => { this.plugin.settings.duplicateHints = v; this.plugin.refreshAllStashpadViews(); }, ["duplicate", "similar", "hint", "composer", "search", "discourse"]));
     cats.listDisplay.push(toggle("Select text in notes (desktop)", "Let you select and copy text inside a note in the list. On by default. With it on, you drag a note to reorder by its grip handle (a draggable row can't have selectable text); turn it off to drag a note from anywhere on the row again, with no text selection. Desktop only — mobile is always tap-first.",
@@ -3162,7 +3502,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     cats.deleting.push(toggle("Offer to delete attachments with note", "When a note references attachments, the delete modal includes an \"Also delete attachments\" checkbox so orphaned files don't pile up in your vault. Attachments are detected from both ![[…]] embeds in the body and the frontmatter attachments: list. Off = attachments are always preserved on delete (no checkbox shown), and a single childless note with attachments deletes silently.",
       () => this.plugin.settings.confirmAttachmentDelete, (v) => { this.plugin.settings.confirmAttachmentDelete = v; }, ["delete", "attachment", "orphan"]));
 
-    cats.movingNotes.push(toggle("Always prepare cut/copy for another vault", "Cross-vault copy/cut builds a bundle of the whole selection — every note and every attachment is read — so it is the slow part of a copy, especially on a network drive or a big selection. By default that only happens when you run “Copy/Cut for another vault”, keeping ordinary cut/copy instant. Turn this ON to prepare it on EVERY cut and copy, so plain Mod+C in one vault can be pasted into another. Fine on a fast machine; noticeable on a slow disk.",
+    cats.movingNotes.push(toggle("Always prepare cut/copy for another vault", "Prepare the cross-vault transfer on EVERY cut and copy, so plain Mod+C in one vault can be pasted into another. ON by default now that COPY stages a plain folder in _exports/ (fast — no zip) rather than zipping the whole selection into the clipboard. Turn OFF to keep plain Mod+C instant and only prepare on the explicit “Copy/Cut for another vault” command — worth doing if you use CUT across vaults a lot (cut still uses the slower zip bundle so its originals can be deleted after the other vault confirms), or on a slow network drive.",
       () => this.plugin.settings.alwaysStampCrossVault, (v) => { this.plugin.settings.alwaysStampCrossVault = v; }, ["cross-vault", "clipboard", "copy", "cut", "paste", "slow", "zip", "performance"]));
 
     // 0.215.0: where new attachments go. Default stays per-folder so existing
@@ -3279,6 +3619,14 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.showEditorLineNumbers, (v) => { this.plugin.settings.showEditorLineNumbers = v; }, ["line", "number", "gutter", "editor", "count"]));
     cats.composerCopy.push(toggle("Auto-pair Markdown syntax", "Brackets, parentheses, quotes (double + single, at word starts only — apostrophes are safe), inline code, **bold**, ~~strikethrough~~ and ==highlight== markers auto-close with the caret between them. Select text first and the character WRAPS it instead of replacing it (press again to nest: [note] → [[note]], *word* → **word**). Typing the closing character steps over an existing one, and Backspace on an empty pair removes both. Applies to the composer and the edit/split textareas. On by default.",
       () => this.plugin.settings.autoPairBrackets, (v) => { this.plugin.settings.autoPairBrackets = v; }, ["bracket", "autopair", "wikilink", "close", "complete"]));
+    cats.composerCopy.push(toggle("Formatting toolbar in the composer", "Show a row of formatting buttons at the top of the composer — bold, italic, highlight, code, link a note, checkbox, and (when spoiler markup is on) spoiler. Each wraps the selected text (or inserts at the caret). Sits above the text box so it never shrinks it. On by default.",
+      () => this.plugin.settings.showComposerToolbar, (v) => { this.plugin.settings.showComposerToolbar = v; }, ["toolbar", "format", "bold", "italic", "highlight", "composer", "buttons"]));
+    cats.composerCopy.push(toggle("Tab indents in the composer", "ON: Tab / Shift+Tab indent and outdent the current line (or the selected lines) in the composer and edit boxes — even plain, non-list lines — so you can build an outline structure while typing, Workflowy-style. OFF (default): Tab keeps its usual job of moving focus out of a prose line; indenting still works on list lines and multi-line selections. Enter-to-newline vs submit stays controlled by the Enter/Shift-Enter setting.",
+      () => this.plugin.settings.tabIndentsProse, (v) => { this.plugin.settings.tabIndentsProse = v; }, ["tab", "indent", "outdent", "outline", "composer", "structure"]));
+    cats.composerCopy.push(toggle("Fix duplicated emphasis markers on send", "Some mobile keyboards duplicate the OPENING marker when auto-pairing (you end up with ***bold** or ====text==). On send, trim the extra opener so it matches the closer (→ **bold**, ==text==). Narrow and safe: it never touches balanced (**bold**, ***bold-italic***) or empty (****, ||||) markup. On by default.",
+      () => this.plugin.settings.fixAutopairDupOnSend, (v) => { this.plugin.settings.fixAutopairDupOnSend = v; }, ["autopair", "duplicate", "emphasis", "bold", "mobile", "cleanup", "send"]));
+    cats.composerCopy.push(toggle("Straighten curly quotes on send", "iOS “Smart Punctuation” turns typed straight quotes into curly ones (“ ” ‘ ’). On send, convert them back to straight \" and ' so notes stay plain-ASCII. On by default.",
+      () => this.plugin.settings.straightenCurlyQuotesOnSend, (v) => { this.plugin.settings.straightenCurlyQuotesOnSend = v; }, ["curly", "quote", "smart", "punctuation", "straight", "ascii", "mobile", "send"]));
     cats.composerCopy.push(this.copyTimestampModifiersSection());
     cats.composerCopy.push(toggle("Indent-safe copy (level markers)", "When copying a subtree (Copy tree / Copy focused subtree), prefix each line with a `[L1]`, `[L2]`, … depth marker instead of leading spaces — relative to what you copied, so the top of the selection is always `[L1]`. Survives pasting into apps that strip indentation. Off by default (normal indented outline).",
       () => this.plugin.settings.copyTreeLevelMarkers, (v) => { this.plugin.settings.copyTreeLevelMarkers = v; }, ["copy", "indent", "level", "marker", "tree", "depth", "paste"]));
@@ -5032,12 +5380,14 @@ export class StashpadSettingTab extends PluginSettingTab {
 
 /** 0.321.2: a small modal that hosts the ⋮-menu submenu editor body. */
 class ContextSubmenuModal extends Modal {
-  constructor(app: App, private renderBody: (host: HTMLElement) => void, private onDone: () => void) { super(app); }
+  constructor(app: App, private renderBody: (host: HTMLElement, close: () => void) => void, private onDone: () => void) { super(app); }
   onOpen(): void {
     this.titleEl.setText("Edit submenu");
     this.modalEl.addClass("stashpad-submenu-modal");
-    this.renderBody(this.contentEl);
-    new Setting(this.contentEl).addButton((b) => b.setButtonText("Done").setCta().onClick(() => this.close()));
+    this.renderBody(this.contentEl, () => this.close());
+    new Setting(this.contentEl)
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((b) => b.setButtonText("Done").setCta().onClick(() => this.close()));
   }
   onClose(): void { this.contentEl.empty(); this.onDone(); }
 }

@@ -63,6 +63,14 @@ export class AuthorshipTracker {
    *
    *  Wired from the view's existing vault "rename" listener, alongside the same
    *  re-keying it already does for completedState/taskTaggedState. */
+  /** 0.337.0: seed the known body for a note we just CREATED, so its FIRST edit
+   *  registers as a real change (prev !== body) instead of a "first sighting"
+   *  that would be skipped. Without this the first edit after creation recorded
+   *  neither a contribution stamp reliably nor a history version. */
+  seedKnownBody(path: string, body: string): void {
+    if (!this.knownBodies.has(path)) this.knownBodies.set(path, body);
+  }
+
   handleRename(oldPath: string, newPath: string): void {
     if (oldPath === newPath) return;
     const t = this.contribTimers.get(oldPath);
@@ -457,6 +465,10 @@ export class AuthorshipTracker {
     // genuine edit is still detected correctly.
     if (this.host.plugin.rebootstrapInProgress) return;
     const author = this.currentAuthorLink();
+    // 0.337.0: capture a history version on a genuine body change. Done here (not
+    // gated on `author`) so history works even when the user hasn't set a name —
+    // the entry just records an empty author then. Best-effort inside.
+    try { this.host.plugin.captureNoteHistory(file, body, author ? { id: author.id, name: author.name } : null); } catch { /* never block */ }
     if (!author) return;                  // user opted out of stamping
     void this.ensureAuthorFile(author);
     const now = new Date().toISOString();

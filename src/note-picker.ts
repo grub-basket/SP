@@ -207,7 +207,13 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
    *  popover setup. We track cleanup callbacks ourselves and fire
    *  them in our onClose override. */
   private pendingCleanups: Array<() => void> = [];
+  /** 0.324.0: debounce handle for recording a searched query as "recent" after a
+   *  typing pause — so a search you refine and read (but never open a result of)
+   *  is still remembered, not only one that ended in a pick. */
+  private recentRecordTimer: number | null = null;
+  private lastRecordedRecent = "";
   onClose(): void {
+    if (this.recentRecordTimer != null) { clearTimeout(this.recentRecordTimer); this.recentRecordTimer = null; }
     while (this.pendingCleanups.length > 0) {
       const cb = this.pendingCleanups.pop();
       try { if (cb) cb(); } catch { /* ignore */ }
@@ -375,11 +381,18 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // empty; a "Save this search" row leads when there's a query to save.
     if (this.opts.mode === "search") {
       if (q === "") {
+        // An empty box cancels any pending record — nothing to remember.
+        if (this.recentRecordTimer != null) { clearTimeout(this.recentRecordTimer); this.recentRecordTimer = null; }
         const head: PickerItem[] = [];
         for (const sv of this.opts.savedSearches?.() ?? []) head.push({ id: `saved:${sv.name}`, label: sv.name, node: null, kind: "saved", query: sv.query, savedName: sv.name });
         for (const rq of this.opts.recentQueries?.() ?? []) head.push({ id: `recent:${rq}`, label: rq, node: null, kind: "recent", query: rq });
         return head;
       }
+      // 0.324.0: record the query after an ~900ms typing pause even without a
+      // pick. Guard: ≥ 2 chars, and skip an immediate repeat of what we last
+      // recorded so refining a query doesn't stack near-duplicates. onRunQuery
+      // dedups against existing recents, so re-searching an old query is a no-op.
+      this.scheduleRecordRecent(query.trim());
     }
     // 0.64.0: parse out advanced filter syntax (in:/before:/after:/on:)
     // before we run the token match. Remaining free-text tokens still
@@ -1842,6 +1855,24 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       return;
     }
     super.selectSuggestion(value, evt);
+  }
+
+  /** 0.324.0: (re)arm the debounced "remember this search" timer. Fires
+   *  onRunQuery after the pause with whatever the box currently holds, so a
+   *  query you type and pause on is remembered even if you never open a result.
+   *  A pick still records immediately (onChooseSuggestion) — this only covers the
+   *  no-pick path. Cleared on empty box and on close. */
+  private scheduleRecordRecent(query: string): void {
+    if (this.recentRecordTimer != null) clearTimeout(this.recentRecordTimer);
+    if (query.length < 2) return;
+    this.recentRecordTimer = window.setTimeout(() => {
+      this.recentRecordTimer = null;
+      // Read the box live at fire time — the user may have typed on since we armed.
+      const live = ((this as any).inputEl?.value ?? "").trim();
+      if (live.length < 2 || live.toLowerCase() === this.lastRecordedRecent.toLowerCase()) return;
+      this.lastRecordedRecent = live;
+      try { this.opts.onRunQuery?.(live); } catch { /* ignore */ }
+    }, 900);
   }
 
   onChooseSuggestion(item: PickerItem): void {

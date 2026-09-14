@@ -1,13 +1,19 @@
 import type StashpadPlugin from "./main";
-import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, type SecretStorage } from "obsidian";
+import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, Setting, type SecretStorage } from "obsidian";
 import { normalisePastedPath } from "./paste-path";
-import { splitIntoChunks, splitByDelimiter, SPLIT_MODE_LABELS, type SplitMode } from "./view-helpers";
+import { splitIntoChunks, splitByDelimiter, SPLIT_MODE_LABELS, setIconSafe, type SplitMode } from "./view-helpers";
+import { parseFormatSpans, FORMAT_KINDS, type FormatSpan } from "./formatting-toolbar";
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch, ROOT_ID } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL, parseRecurrence, parseDuration } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
+import { renderFormattingToolbar } from "./formatting-toolbar";
+import { dedupeDrafts } from "./drafts";
+import { IconSuggest } from "./icon-suggest";
+import { lineDiff } from "./note-history";
+import { parseDelimited, snippetsFromRows, mergeSnippets, findTriggerCollision } from "./snippets";
 import { readClipboardText } from "./cross-vault-clipboard";
 import { getSettings } from "./settings";
 import type { ExportContent } from "./stash-package";
@@ -30,6 +36,9 @@ export interface DuePickResult {
    *  still open past the due date. Present only when the picker showed the
    *  recurrence section. */
   failIfOverdue?: boolean;
+  /** 0.327.0: note color (hex) to apply, or null to clear. undefined = the
+   *  picker didn't show the color section, so the caller must not touch color. */
+  color?: string | null;
 }
 export interface DuePickerOptions {
   /** 0.140.0: show the "Repeat & reminders" section, pre-filled from these. */
@@ -51,6 +60,12 @@ export interface DuePickerOptions {
   currentTags?: string[];
   tagChips?: string[];
   tagSuggestions?: string[];
+  /** 0.327.0: show a color-swatch section (No color + palette). `currentColor`
+   *  pre-selects the active swatch; `customPalette` appends the user's saved
+   *  custom colors after the defaults. Section shown only when showColor is on. */
+  showColor?: boolean;
+  currentColor?: string | null;
+  customPalette?: string[];
   /** Modal title. Defaults to "Set due date". The "Assign to" command
    *  opens this same modal with a different title. */
   title?: string;
@@ -545,6 +560,16 @@ export interface WorkbenchCallbacks {
    *  passes it to `onSave`. 0.317.1: was write-immediately; the user wants it
    *  gated on Save like the body. */
   reply?: { current: () => string | null; pick: (onPicked: (t: WorkbenchReplyTarget) => void) => void };
+  /** 0.355.0: edit surface only — the note's color ("Color" chip below the reply
+   *  chip). `current()` = the note's current color hex (null = none). `pick`
+   *  opens the shared color picker and APPLIES the choice immediately through the
+   *  same code path as the "Set color…" action (undo/palette/aliases included),
+   *  then calls back with the applied color so the chip repaints its swatch.
+   *  Omitted when the note has no file yet (a brand-new note from the composer). */
+  color?: { current: () => string | null; pick: (onApplied: () => void) => void };
+  /** 0.357.0: edit surface only — a "History" button that opens this note's edit
+   *  history viewer. Omitted when history is off or the note has no file. */
+  history?: () => void;
 }
 
 /** 0.169.0: the split UI extracted from the modal so it can render into EITHER a
@@ -640,12 +665,48 @@ export class NoteWorkbench {
    *  autocomplete plus paste/drop of files as `![[wikilink]]` attachments. Called
    *  from each textarea-creation site; re-entrant (detaches any prior autocomplete
    *  first, since render() rebuilds the textarea on surface/mode switches). */
+  /** 0.336.0: open the formatting inspector for the current editor textarea —
+   *  a list of the formatted spans in the note that you can change, remove, or
+   *  layer, without hunting for and selecting the text (the mobile pain point). */
+  private openFormatInspector(): void {
+    const ta = this.cursorTextarea;
+    if (!ta) return;
+    new FormatInspectorModal(this.app, ta).open();
+  }
+
   private enhanceTextarea(ta: HTMLTextAreaElement): void {
     this.autocomplete?.detach();
     // 0.202.0: in the workbench, Mod+Enter commits — every other Enter is a
     // newline, so list continuation always applies.
     this.autocomplete = new ComposerAutocomplete(this.app, ta, { insertsNewline: () => true });
     this.autocomplete.attach();
+
+    // 0.336.0: formatting toolbar above the editor textarea — edit-modal parity
+    // with the composer (0.332.0). Inserted before the textarea so it never
+    // shrinks it. The "Modify formatting" button opens the inspector, which lets
+    // you change/remove/layer formatting WITHOUT fighting text selection.
+    if (getSettings().showComposerToolbar && ta.parentElement) {
+      // 0.345.2: on the desktop split, the textarea lives inside a flex ROW
+      // (.stashpad-edit-wrap = line-number gutter + textarea), so a toolbar
+      // inserted as its sibling lands BESIDE the textarea. Render it into the
+      // section body ABOVE that wrap instead (still under the "Your edit" header),
+      // spanning full width. The mobile tab panel / composer parent is a column,
+      // so there the toolbar sits directly above the textarea as before.
+      const wrap = ta.parentElement;
+      const isEditRow = wrap.classList.contains("stashpad-edit-wrap");
+      const host = isEditRow ? (wrap.parentElement ?? wrap) : wrap;
+      const anchor: HTMLElement = isEditRow ? wrap : ta;
+      Array.from(host.children).forEach((c) => { if (c !== anchor && c.classList.contains("stashpad-composer-toolbar")) c.remove(); });
+      const bar = renderFormattingToolbar(host, () => this.cursorTextarea, {
+        spoilers: getSettings().spoilerMarkup,
+        onInspect: () => this.openFormatInspector(),
+        app: this.app,
+        snippets: getSettings().snippets,
+        toolbarButtons: getSettings().toolbarButtons,
+        titleFor: () => (this.cursorTextarea?.value ?? this.body).split(/\r?\n/).find((l) => l.trim())?.trim(),
+      });
+      host.insertBefore(bar, anchor);
+    }
 
     const imp = this.cb.onImportFile;
     if (!imp) return; // no import hook (e.g. new-note composer path) → autocomplete only
@@ -935,9 +996,31 @@ export class NoteWorkbench {
     b.onclick = () => { void this.openExternalSaving(); };
   }
 
+  /** 0.357.0: a "History" row/button that opens this note's edit history viewer.
+   *  Rendered under the color row; omitted when no history callback was passed. */
+  private renderHistoryButton(parent: HTMLElement = this.host): void {
+    const h = this.cb.history;
+    if (!h) return;
+    const host = parent.createDiv({ cls: "stashpad-split-history is-rowclickable" });
+    host.onmousedown = (e) => e.preventDefault();
+    host.onclick = () => h();
+    setIcon(host.createSpan({ cls: "stashpad-split-history-icon" }), "history");
+    host.createSpan({ cls: "stashpad-split-history-label", text: "History" });
+    const btn = host.createEl("button", { cls: "stashpad-split-history-btn", text: "View edits…" });
+    btn.setAttr("aria-label", "Open this note's edit history");
+    btn.onmousedown = (e) => e.preventDefault();
+    btn.onclick = (e) => { e.stopPropagation(); h(); };
+  }
+
   /** 0.170.0: plain editing — the shared Original/Changes/editor sections + a Save. */
   private renderEditSurface(): void {
-    this.renderReplyChip();
+    // 0.359.0: the three assignment rows share a wrapper. History first (a quick
+    // jump), then reply + color. On mobile the wrapper collapses to one row of
+    // three buttons (like the edit/split tabs above).
+    const assign = this.host.createDiv({ cls: "stashpad-split-assign" });
+    this.renderHistoryButton(assign);
+    this.renderReplyChip(assign);
+    this.renderColorChip(assign);
     this.renderEditorSections();
 
     // 0.170.3: edit tools — live word/char count + a case-cycle button.
@@ -981,10 +1064,15 @@ export class NoteWorkbench {
 
   /** 0.317.0: "Reply to …" chip on the edit surface (see WorkbenchCallbacks.reply).
    *  0.317.1: changes are PENDING until Save (and make the surface dirty). */
-  private renderReplyChip(): void {
+  private renderReplyChip(parent: HTMLElement = this.host): void {
     const r = this.cb.reply;
     if (!r) return;
-    const host = this.host.createDiv({ cls: "stashpad-split-reply" });
+    const host = parent.createDiv({ cls: "stashpad-split-reply is-rowclickable" });
+    // 0.357.0: the WHOLE row picks the reply target (no aiming for the button);
+    // the secondary buttons stopPropagation so they don't also fire the pick.
+    const doPick = (): void => r.pick((t) => { this.pendingReply = t; paint(); });
+    host.onmousedown = (e) => e.preventDefault();
+    host.onclick = doPick;
     const paint = (): void => {
       host.empty();
       const saved = r.current();
@@ -999,19 +1087,50 @@ export class NoteWorkbench {
       const change = host.createEl("button", { cls: "stashpad-split-reply-btn", text: cur ? "Change\u2026" : "Make a reply\u2026" });
       change.setAttr("aria-label", "Pick the note this one replies to (applied on Save)");
       change.onmousedown = (e) => e.preventDefault();
-      change.onclick = () => r.pick((t) => { this.pendingReply = t; paint(); });
+      change.onclick = (e) => { e.stopPropagation(); doPick(); };
       if (cur) {
         const x = host.createEl("button", { cls: "stashpad-split-reply-btn", text: "Remove" });
         x.setAttr("aria-label", "Remove the reply link (applied on Save)");
         x.onmousedown = (e) => e.preventDefault();
-        x.onclick = () => { this.pendingReply = null; paint(); };
+        x.onclick = (e) => { e.stopPropagation(); this.pendingReply = null; paint(); };
       }
       if (pending !== undefined) {
         const rv = host.createEl("button", { cls: "stashpad-split-reply-btn", text: "Revert" });
         rv.setAttr("aria-label", "Drop the unsaved reply-link change");
         rv.onmousedown = (e) => e.preventDefault();
-        rv.onclick = () => { this.pendingReply = undefined; paint(); };
+        rv.onclick = (e) => { e.stopPropagation(); this.pendingReply = undefined; paint(); };
       }
+    };
+    paint();
+  }
+
+  /** 0.355.0: "Color" chip on the edit surface, directly under the reply chip.
+   *  Shows the note's current color swatch and opens the shared color picker
+   *  (see WorkbenchCallbacks.color). Unlike the reply chip, a color pick APPLIES
+   *  immediately (through the same undo-backed set-color path), so there is no
+   *  pending/unsaved state — the chip just repaints its swatch on apply. */
+  private renderColorChip(parent: HTMLElement = this.host): void {
+    const c = this.cb.color;
+    if (!c) return;
+    const host = parent.createDiv({ cls: "stashpad-split-color is-rowclickable" });
+    // 0.357.0: the whole row opens the color picker (no aiming for the button).
+    const doPick = (): void => c.pick(() => paint());
+    host.onmousedown = (e) => e.preventDefault();
+    host.onclick = doPick;
+    const paint = (): void => {
+      host.empty();
+      const cur = c.current();
+      host.toggleClass("is-color", !!cur);
+      const icon = host.createSpan({ cls: "stashpad-split-color-icon" });
+      setIcon(icon, "palette");
+      const swatch = host.createSpan({ cls: "stashpad-split-color-swatch" });
+      if (cur) swatch.style.setProperty("background-color", cur);
+      else swatch.addClass("is-empty");
+      host.createSpan({ cls: "stashpad-split-color-label", text: cur ? "Color" : "No color" });
+      const change = host.createEl("button", { cls: "stashpad-split-color-btn", text: cur ? "Change…" : "Set color…" });
+      change.setAttr("aria-label", "Pick a color for this note");
+      change.onmousedown = (e) => e.preventDefault();
+      change.onclick = (e) => { e.stopPropagation(); doPick(); };
     };
     paint();
   }
@@ -1471,6 +1590,8 @@ export class NoteWorkbenchModal extends Modal {
       onOpenExternal: this.cbs.onOpenExternal,
       onImportFile: this.cbs.onImportFile,
       reply: this.cbs.reply,
+      color: this.cbs.color,
+      history: this.cbs.history,
       close: () => this.close(),
       onDone: () => { this.committing = true; this.close(); }, // split/save ran → dismiss
       onTitle: (t) => this.titleEl.setText(t),
@@ -1572,6 +1693,8 @@ export class NoteWorkbenchView extends ItemView {
       onOpenExternal: this.ctx.cbs.onOpenExternal,
       onImportFile: this.ctx.cbs.onImportFile,
       reply: this.ctx.cbs.reply,
+      color: this.ctx.cbs.color,
+      history: this.ctx.cbs.history,
       close: () => this.guardedDetach(),
       onDone: () => this.startClosePanel("✓ Done.", null, true),
       onTitle: (t) => this.setHeader(t, t.startsWith("Edit") ? "pencil-line" : "split"),
@@ -2807,9 +2930,14 @@ export class ComposerDraftsModal extends Modal {
   private render(): void {
     const c = this.contentEl;
     c.empty();
-    const all = Object.values(this.plugin.settings.composerDrafts ?? {})
-      .filter((d) => !this.folder || d.folder === this.folder)
-      .sort((a, b) => (a.folder === b.folder ? b.modified - a.modified : a.folder.localeCompare(b.folder)));
+    // 0.345.4: dedupe with the SAME helper the chip uses (drop effectively-empty
+    // drafts + collapse whitespace/content duplicates), so the modal list and the
+    // chip count can't diverge (was: chip "2", modal ~10 empty `[[]]` entries).
+    const all = dedupeDrafts(
+      Object.values(this.plugin.settings.composerDrafts ?? {})
+        .filter((d) => !this.folder || d.folder === this.folder)
+        .sort((a, b) => (a.folder === b.folder ? b.modified - a.modified : a.folder.localeCompare(b.folder))),
+    );
     if (!all.length) { c.createDiv({ cls: "stashpad-drafts-empty", text: "No drafts." }); return; }
     c.createDiv({ cls: "stashpad-drafts-help", text: "Load puts a draft in that folder's composer (whatever is there now is kept as its own draft). Delete is immediate." });
     const me = this.plugin.deviceId();
@@ -2838,6 +2966,553 @@ export class ComposerDraftsModal extends Modal {
       del.onclick = () => { void this.plugin.deleteComposerDraft(d.id).then(() => { new Notice("Draft deleted."); this.render(); }); };
     }
   }
+}
+
+/** 0.338.0: editor for a single text snippet — name, trigger, value (with
+ *  template variables), icon, and whether it shows as a toolbar button. Calls
+ *  `onSave` with the edited snippet; the caller appends or replaces by id. */
+export class SnippetEditModal extends Modal {
+  private draft: import("./snippets").Snippet;
+  /** 0.346.0: the full current snippet list (incl. this one), for the
+   *  duplicate-trigger check on save. */
+  constructor(app: App, initial: import("./snippets").Snippet, private onSave: (s: import("./snippets").Snippet) => void, private all: import("./snippets").Snippet[] = []) {
+    super(app);
+    this.draft = { ...initial };
+  }
+  onOpen(): void {
+    const { contentEl } = this;
+    this.titleEl.setText(this.draft.name ? "Edit snippet" : "New snippet");
+    contentEl.empty();
+
+    new Setting(contentEl).setName("Name").setDesc("Shown in the tooltip and the snippets menu.")
+      .addText((t) => { t.setValue(this.draft.name).onChange((v) => { this.draft.name = v; }); });
+
+    new Setting(contentEl).setName("Value").setDesc("The text to insert. Template variables: {{date}}, {{time}}, {{date:FORMAT}}, {{title}}.")
+      .addTextArea((t) => { t.setValue(this.draft.value).onChange((v) => { this.draft.value = v; }); t.inputEl.rows = 4; t.inputEl.addClass("stashpad-snippet-value"); });
+
+    new Setting(contentEl).setName("Trigger (optional)").setDesc("Type this then a space to auto-expand it, e.g. “:sig”. Leave blank for no auto-expand.")
+      .addText((t) => t.setValue(this.draft.trigger).onChange((v) => { this.draft.trigger = v.trim(); }));
+
+    // 0.346.0: match the trigger case-sensitively (default off = case-insensitive).
+    new Setting(contentEl).setName("Case-sensitive trigger")
+      .setDesc("On: the trigger must be typed with matching case. Off (default): matches any case.")
+      .addToggle((t) => t.setValue(this.draft.caseSensitive === true).onChange((v) => { this.draft.caseSensitive = v; }));
+
+    // 0.346.0: activate / deactivate without deleting. Off: no auto-expand, no
+    // toolbar button, hidden from the Snippets menu.
+    new Setting(contentEl).setName("Active")
+      .setDesc("Off: keep the snippet but stop it auto-expanding and showing on the toolbar.")
+      .addToggle((t) => t.setValue(this.draft.enabled !== false).onChange((v) => { this.draft.enabled = v; }));
+
+    new Setting(contentEl).setName("Show as toolbar button")
+      .setDesc("On: a button on the formatting toolbar. Off: reachable from the toolbar's Snippets menu.")
+      .addToggle((t) => t.setValue(this.draft.button).onChange((v) => { this.draft.button = v; }));
+
+    new Setting(contentEl).setName("Icon (optional)").setDesc("A Lucide icon name for the button (e.g. “calendar”, “signature”).")
+      .addText((t) => { t.setValue(this.draft.icon).onChange((v) => { this.draft.icon = v.trim(); }); new IconSuggest(this.app, t.inputEl); });
+
+    // 0.351.0: place the snippet's toolbar button at the START (before the
+    // built-in buttons) or the END of the formatting toolbar. Default: end.
+    new Setting(contentEl).setName("Button placement")
+      .setDesc("Where the toolbar button sits: at the start (before the built-in buttons) or the end.")
+      .addDropdown((d) => d
+        .addOption("end", "End (default)")
+        .addOption("start", "Start")
+        .setValue(this.draft.buttonPlacement === "start" ? "start" : "end")
+        .onChange((v) => { this.draft.buttonPlacement = v === "start" ? "start" : "end"; }));
+
+    const actions = new Setting(contentEl);
+    actions.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+    actions.addButton((b) => b.setButtonText("Save").setCta().onClick(() => {
+      if (!this.draft.name.trim() && !this.draft.value.trim()) { new Notice("Give the snippet a name or a value."); return; }
+      if (!this.draft.name.trim()) this.draft.name = this.draft.value.slice(0, 24);
+      // 0.346.0: block a save whose trigger collides with another snippet's
+      // (respecting case-sensitivity) — a shadowed trigger would never expand.
+      const clash = findTriggerCollision(this.draft, this.all);
+      if (clash) { new Notice(`Trigger “${this.draft.trigger}” already used by “${clash.name || "another snippet"}”. Change it or clear one.`); return; }
+      this.onSave(this.draft);
+      this.close();
+    }));
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.340.0: import snippets from CSV/TSV (paste or file). Dedupes exact matches,
+ *  and for a same-trigger-different-value clash offers Replace or Keep both. */
+export class SnippetImportModal extends Modal {
+  private text = "";
+  private mode: "replace" | "keep-both" = "keep-both";
+  private summaryEl: HTMLElement | null = null;
+  private importBtn: HTMLButtonElement | null = null;
+  constructor(app: App, private existing: import("./snippets").Snippet[], private onImport: (merged: import("./snippets").Snippet[], stats: { added: number; skipped: number; conflicts: number }) => void) { super(app); }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    this.titleEl.setText("Import snippets");
+    contentEl.empty();
+    contentEl.createEl("p", { cls: "setting-item-description", text: "Paste CSV or TSV (e.g. from a spreadsheet). Columns: “trigger, value” or “name, trigger, value”. A header row is skipped. Exact duplicates are ignored." });
+
+    const ta = contentEl.createEl("textarea", { cls: "stashpad-snippet-import", attr: { placeholder: ":sig\\tBest,\\n{{date}}\\n:addr\\t123 Main St", rows: "6" } });
+    ta.addEventListener("input", () => { this.text = ta.value; this.updateSummary(); });
+
+    const row = contentEl.createDiv({ cls: "stashpad-import-actions" });
+    const fileBtn = row.createEl("button", { text: "Load file…" });
+    const fileInput = row.createEl("input", { cls: "stashpad-qc-fileinput", attr: { type: "file", accept: ".csv,.tsv,.txt" } });
+    fileBtn.onclick = () => fileInput.click();
+    fileInput.onchange = async () => {
+      const f = fileInput.files?.[0];
+      if (!f) return;
+      try { const t = await f.text(); ta.value = t; this.text = t; this.updateSummary(); }
+      catch { new Notice("Couldn't read that file."); }
+    };
+
+    // Conflict handling.
+    new Setting(contentEl).setName("When a trigger already exists with a different value")
+      .setDesc("Replace overwrites the existing value; Keep both adds the imported one as a variation.")
+      .addDropdown((d) => { d.addOption("keep-both", "Keep both (merge variations)"); d.addOption("replace", "Replace existing"); d.setValue(this.mode).onChange((v) => { this.mode = v as any; this.updateSummary(); }); });
+
+    this.summaryEl = contentEl.createDiv({ cls: "stashpad-import-summary setting-item-description" });
+
+    const actions = new Setting(contentEl);
+    actions.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+    actions.addButton((b) => { this.importBtn = b.buttonEl as HTMLButtonElement; b.setButtonText("Import").setCta().onClick(() => this.doImport()); });
+    this.updateSummary();
+  }
+
+  private candidates(): import("./snippets").Snippet[] {
+    return this.text.trim() ? snippetsFromRows(parseDelimited(this.text)) : [];
+  }
+
+  private updateSummary(): void {
+    if (!this.summaryEl) return;
+    const cands = this.candidates();
+    const stats = mergeSnippets(this.existing, cands, this.mode);
+    this.summaryEl.setText(cands.length === 0 ? "Nothing to import yet." :
+      `${cands.length} parsed · ${stats.added} new · ${stats.skipped} exact duplicate(s) skipped · ${stats.conflicts} conflict(s) (${this.mode === "replace" ? "replaced" : "kept both"}).`);
+    if (this.importBtn) this.importBtn.disabled = cands.length === 0;
+  }
+
+  private doImport(): void {
+    const cands = this.candidates();
+    if (!cands.length) { new Notice("Nothing to import."); return; }
+    const { result, added, skipped, conflicts } = mergeSnippets(this.existing, cands, this.mode);
+    this.onImport(result, { added, skipped, conflicts });
+    this.close();
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.337.0: per-note version history viewer. Shows the captured past bodies of a
+ *  note (newest first) plus the current version; selecting one shows its content,
+ *  and a past version can be restored. Points to the Edit History plugin for
+ *  keystroke-level history, and notes which file types are / aren't captured. */
+export class HistoryModal extends Modal {
+  private entries: { t: number; a: string; n: string; b: string }[] = [];
+  private currentBody = "";
+  private selected = -1; // -1 = current
+  private byAuthor: string | null = null; // collab filter: only this author's versions
+  private showDiff = true; // 0.339.0: show a version as a diff vs current (toggle to full text)
+  private mode: "timeline" | "byperson" = "timeline"; // 0.355.0: view toggle
+  private selectedGroup = -1; // 0.355.0: by-person view — index into the grouped list
+
+  constructor(
+    app: App,
+    private plugin: StashpadPlugin,
+    private file: TFile,
+    private opts: { onRestore: (body: string) => Promise<void> },
+  ) { super(app); }
+
+  async onOpen(): Promise<void> {
+    this.modalEl.addClass("stashpad-history-modal");
+    this.titleEl.setText("Note history");
+    this.contentEl.setText("Loading…");
+    try {
+      this.entries = await this.plugin.history.readForFile(this.app, this.file);
+      this.currentBody = this.stripFm(await this.app.vault.cachedRead(this.file));
+    } catch { /* render whatever we have */ }
+    this.render();
+  }
+
+  private stripFm(md: string): string {
+    return md.replace(/^﻿?---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").replace(/^\s+/, "");
+  }
+
+  private authors(): string[] {
+    const set = new Set<string>();
+    for (const e of this.entries) if (e.n) set.add(e.n);
+    return [...set];
+  }
+
+  /** 0.355.0: display name for a revision — author NAME, then author id,
+   *  then "Unknown" (an entry recorded before the user set a name). */
+  private authorLabel(e: { n?: string; a?: string }): string {
+    return (e.n && e.n.trim()) || (e.a && e.a.trim()) || "Unknown";
+  }
+
+  /** 0.355.0: collapse CONSECUTIVE revisions by the same author into one group.
+   *  Works in chronological (ascending) order so "consecutive" and "the body
+   *  BEFORE the stretch" are well-defined; the caller displays newest-first.
+   *  `beforeBody` is the body of the revision immediately preceding the stretch
+   *  ("" when the stretch opens the history); `endBody`/`endIndex` are the LAST
+   *  revision in the stretch (what a restore from this group restores). */
+  private buildPersonGroups(): {
+    key: string; label: string; count: number; firstT: number; lastT: number;
+    endIndex: number; beforeBody: string; endBody: string;
+  }[] {
+    const chron = this.entries.map((e, i) => ({ e, i })).sort((a, b) => a.e.t - b.e.t);
+    const groups: {
+      key: string; label: string; count: number; firstT: number; lastT: number;
+      endIndex: number; beforeBody: string; endBody: string;
+    }[] = [];
+    for (let k = 0; k < chron.length; k++) {
+      const { e, i } = chron[k];
+      const key = (e.a && e.a.trim()) || (e.n && e.n.trim()) || "unknown";
+      const last = groups[groups.length - 1];
+      if (last && last.key === key) {
+        last.count++; last.lastT = e.t; last.endIndex = i; last.endBody = e.b;
+      } else {
+        groups.push({
+          key, label: this.authorLabel(e), count: 1, firstT: e.t, lastT: e.t,
+          endIndex: i, beforeBody: k > 0 ? chron[k - 1].e.b : "", endBody: e.b,
+        });
+      }
+    }
+    return groups;
+  }
+
+  /** 0.355.0: shared line-diff renderer (fromBody → toBody). */
+  private renderDiffInto(pane: HTMLElement, fromBody: string, toBody: string, sameMsg: string): void {
+    const diff = lineDiff(fromBody, toBody);
+    const pre = pane.createEl("pre", { cls: "stashpad-hist-body stashpad-hist-diff" });
+    if (diff.every((d) => d.type === "same")) {
+      pre.createDiv({ cls: "stashpad-hist-diff-same-all", text: sameMsg });
+      return;
+    }
+    for (const d of diff) {
+      const line = pre.createDiv({ cls: `stashpad-hist-diff-line is-${d.type}` });
+      line.createSpan({ cls: "stashpad-hist-diff-gutter", text: d.type === "add" ? "+" : d.type === "del" ? "−" : " " });
+      line.createSpan({ cls: "stashpad-hist-diff-text", text: d.text || " " });
+    }
+  }
+
+  /** 0.355.0: "By person" view — consecutive revisions by one author collapse
+   *  into a single row; selecting one shows the CUMULATIVE diff across that
+   *  whole stretch (body before the stretch → body at its end), and restoring
+   *  restores the END-of-stretch body (the latest in the group). Read-only
+   *  apart from that restore. */
+  private renderByPerson(contentEl: HTMLElement): void {
+    const groups = this.buildPersonGroups();
+    // Newest stretch first, to match the Timeline's newest-first ordering.
+    const display = groups.map((g, gi) => ({ g, gi })).sort((a, b) => b.g.lastT - a.g.lastT);
+
+    const wrap = contentEl.createDiv({ cls: "stashpad-hist-wrap" });
+    const list = wrap.createDiv({ cls: "stashpad-hist-list" });
+
+    for (const { g, gi } of display) {
+      const row = list.createDiv({ cls: "stashpad-hist-item" + (this.selectedGroup === gi ? " is-active" : "") });
+      const editWord = g.count === 1 ? "edit" : "edits";
+      row.createDiv({ cls: "stashpad-hist-when", text: `${g.label} · ${g.count} ${editWord}` });
+      const span = g.firstT === g.lastT
+        ? (moment as any)(g.lastT).format("MMM D, HH:mm")
+        : `${(moment as any)(g.firstT).format("MMM D, HH:mm")} – ${(moment as any)(g.lastT).format("MMM D, HH:mm")}`;
+      row.createDiv({ cls: "stashpad-hist-who", text: span });
+      row.onclick = () => { this.selectedGroup = gi; this.render(); };
+    }
+
+    const pane = wrap.createDiv({ cls: "stashpad-hist-pane" });
+    const sel = this.selectedGroup >= 0 ? groups[this.selectedGroup] : null;
+    if (!sel) {
+      pane.createEl("pre", { cls: "stashpad-hist-body" }).setText("Select a person's edits to see what changed during that stretch.");
+      return;
+    }
+    // Cumulative diff: body BEFORE the stretch → body at the END of the stretch.
+    this.renderDiffInto(pane, sel.beforeBody, sel.endBody, "No net change across this stretch.");
+
+    const actions = pane.createDiv({ cls: "stashpad-hist-actions" });
+    const restore = actions.createEl("button", { cls: "mod-cta", text: "Restore end of this stretch" });
+    restore.onclick = async () => {
+      restore.disabled = true;
+      try { await this.opts.onRestore(sel.endBody); new Notice("Restored this version."); this.close(); }
+      catch (e) { new Notice(`Restore failed: ${(e as Error).message}`); restore.disabled = false; }
+    };
+  }
+
+  private render(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    if (this.entries.length === 0) {
+      contentEl.createEl("p", { text: "No earlier versions recorded yet — edits from now on are tracked here." });
+      this.renderFooter(contentEl);
+      return;
+    }
+
+    // 0.355.0: Timeline / By person view toggle (a simple segmented control).
+    const modeRow = contentEl.createDiv({ cls: "stashpad-hist-modeswitch" });
+    const mkTab = (label: string, m: "timeline" | "byperson") => {
+      const b = modeRow.createEl("button", { text: label, cls: "stashpad-hist-modetab" + (this.mode === m ? " is-active" : "") });
+      b.onclick = () => { if (this.mode === m) return; this.mode = m; this.selected = -1; this.selectedGroup = -1; this.render(); };
+    };
+    mkTab("Timeline", "timeline");
+    mkTab("By person", "byperson");
+
+    if (this.mode === "byperson") { this.renderByPerson(contentEl); this.renderFooter(contentEl); return; }
+
+    // Collab filter: "last saved version by <person>".
+    const auths = this.authors();
+    if (auths.length > 1) {
+      const filterRow = contentEl.createDiv({ cls: "stashpad-hist-filter" });
+      filterRow.createSpan({ text: "By " });
+      const sel = filterRow.createEl("select", { cls: "dropdown" });
+      sel.createEl("option", { text: "Everyone", value: "" });
+      for (const a of auths) { const o = sel.createEl("option", { text: a, value: a }); if (a === this.byAuthor) o.selected = true; }
+      sel.onchange = () => { this.byAuthor = sel.value || null; this.selected = -1; this.render(); };
+    }
+
+    const wrap = contentEl.createDiv({ cls: "stashpad-hist-wrap" });
+    const list = wrap.createDiv({ cls: "stashpad-hist-list" });
+
+    // "Current" pseudo-version at the top.
+    const curRow = list.createDiv({ cls: "stashpad-hist-item" + (this.selected === -1 ? " is-active" : "") });
+    curRow.createDiv({ cls: "stashpad-hist-when", text: "Current" });
+    curRow.onclick = () => { this.selected = -1; this.render(); };
+
+    const visible = this.entries
+      .map((e, i) => ({ e, i }))
+      .filter(({ e }) => !this.byAuthor || e.n === this.byAuthor)
+      // 0.351.0: newest-first by timestamp (robust to any out-of-order line),
+      // not merely a reverse of the on-disk append order. `i` stays the index
+      // into `this.entries`, so diff/restore below still reference the right
+      // entry after reordering (they use `this.entries[this.selected]`).
+      .sort((a, b) => b.e.t - a.e.t);
+    for (const { e, i } of visible) {
+      const row = list.createDiv({ cls: "stashpad-hist-item" + (this.selected === i ? " is-active" : "") });
+      row.createDiv({ cls: "stashpad-hist-when", text: (moment as any)(e.t).fromNow() });
+      // 0.355.0: show the AUTHOR NAME on each row next to its timestamp.
+      row.createDiv({ cls: "stashpad-hist-who", text: `${this.authorLabel(e)} · ${(moment as any)(e.t).format("MMM D, HH:mm")}` });
+      row.onclick = () => { this.selected = i; this.render(); };
+    }
+
+    const pane = wrap.createDiv({ cls: "stashpad-hist-pane" });
+    const body = this.selected === -1 ? this.currentBody : (this.entries[this.selected]?.b ?? "");
+
+    if (this.selected !== -1 && this.showDiff) {
+      // Diff this version → current.
+      this.renderDiffInto(pane, body, this.currentBody, "No changes between this version and the current note.");
+    } else {
+      const pre = pane.createEl("pre", { cls: "stashpad-hist-body" });
+      pre.setText(body || "(empty)");
+    }
+
+    if (this.selected !== -1) {
+      const actions = pane.createDiv({ cls: "stashpad-hist-actions" });
+      const restore = actions.createEl("button", { cls: "mod-cta", text: "Restore this version" });
+      restore.onclick = async () => {
+        restore.disabled = true;
+        try { await this.opts.onRestore(this.entries[this.selected].b); new Notice("Restored this version."); this.close(); }
+        catch (e) { new Notice(`Restore failed: ${(e as Error).message}`); restore.disabled = false; }
+      };
+      const toggle = actions.createEl("button", { text: this.showDiff ? "Show full text" : "Show changes" });
+      toggle.onclick = () => { this.showDiff = !this.showDiff; this.render(); };
+    }
+
+    this.renderFooter(contentEl);
+  }
+
+  private renderFooter(host: HTMLElement): void {
+    const foot = host.createDiv({ cls: "stashpad-hist-foot" });
+    foot.createSpan({ text: "Stashpad captures note BODIES. For keystroke-level history try the " });
+    // 0.363.0: the show-plugin URL, when the id doesn't resolve, seeds the
+    // community-plugins SEARCH with the id (dashes → spaces). So this id makes the
+    // search "edit history antonio tejada" — the plugin's name + author — which
+    // finds it, instead of the stray "obsidian edit history".
+    const href = "obsidian://show-plugin?id=edit-history-antonio-tejada";
+    const link = foot.createEl("a", { text: "Edit History by Antonio Tejada", href });
+    link.onclick = (e) => { e.preventDefault(); window.open(href); };
+    foot.createSpan({ text: " community plugin. Canvases and bases aren't captured here." });
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.351.0: one row of the folder "who last saved each note" overview. */
+export interface FolderSavedRow {
+  id: string;
+  file: TFile;
+  title: string;
+  /** Display name of whoever last saved the note ("Unknown" when neither the
+   *  history nor the frontmatter names anyone). */
+  authorName: string;
+  authorId: string;
+  /** Last-saved time in ms. */
+  t: number;
+  /** Where the last-saved info came from: a recorded history entry, or the
+   *  note's `author`/`modified` frontmatter fallback when it has no history. */
+  source: "history" | "frontmatter";
+}
+
+/** 0.351.0: folder-level "last saved by person" overview. Lists the current
+ *  Stashpad folder's notes grouped by WHO last saved each one (newest activity
+ *  first, and newest note first within a person), so you can see everything a
+ *  given teammate last touched. Read-only: each row opens that note's full
+ *  history (HistoryModal) or focuses the note. The rows are prepared by the view
+ *  (which owns titles + the history store); this modal only renders them. */
+export class FolderSavedByPersonModal extends Modal {
+  constructor(
+    app: App,
+    private folderLabel: string,
+    private rows: FolderSavedRow[],
+    private truncatedAt: number | null,
+    private cbs: { onHistory: (row: FolderSavedRow) => void; onFocus: (row: FolderSavedRow) => void },
+  ) { super(app); }
+
+  onOpen(): void {
+    this.modalEl.addClass("stashpad-saved-by-modal");
+    this.titleEl.setText(`Last saved by — ${this.folderLabel}`);
+    this.render();
+  }
+
+  private render(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+
+    if (this.rows.length === 0) {
+      contentEl.createEl("p", { text: "No notes in this folder yet." });
+      return;
+    }
+
+    // Group by person. Each group carries its most-recent activity so we can
+    // order people by "who touched something last".
+    const groups = new Map<string, { name: string; rows: FolderSavedRow[]; latest: number }>();
+    for (const row of this.rows) {
+      const key = row.authorId || row.authorName || "unknown";
+      let g = groups.get(key);
+      if (!g) { g = { name: row.authorName || "Unknown", rows: [], latest: 0 }; groups.set(key, g); }
+      g.rows.push(row);
+      if (row.t > g.latest) g.latest = row.t;
+    }
+    const ordered = [...groups.values()].sort((a, b) => b.latest - a.latest);
+
+    for (const g of ordered) {
+      const section = contentEl.createDiv({ cls: "stashpad-saved-group" });
+      const head = section.createDiv({ cls: "stashpad-saved-group-head" });
+      head.createSpan({ cls: "stashpad-saved-group-name", text: g.name });
+      head.createSpan({ cls: "stashpad-saved-group-count", text: `${g.rows.length} note${g.rows.length === 1 ? "" : "s"}` });
+      const list = section.createDiv({ cls: "stashpad-saved-list" });
+      for (const row of g.rows.sort((a, b) => b.t - a.t)) {
+        const el = list.createDiv({ cls: "stashpad-saved-row" });
+        const main = el.createDiv({ cls: "stashpad-saved-main" });
+        main.createDiv({ cls: "stashpad-saved-title", text: row.title || "(untitled)" });
+        const when = `${(moment as any)(row.t).fromNow()} · ${(moment as any)(row.t).format("MMM D, HH:mm")}`;
+        const meta = main.createDiv({ cls: "stashpad-saved-when", text: when });
+        if (row.source === "frontmatter") meta.createSpan({ cls: "stashpad-saved-src", text: " · no recorded history" });
+        const actions = el.createDiv({ cls: "stashpad-saved-actions" });
+        const hist = actions.createEl("button", { text: "History" });
+        hist.onclick = () => this.cbs.onHistory(row);
+        const open = actions.createEl("button", { cls: "mod-cta", text: "Open" });
+        open.onclick = () => { this.cbs.onFocus(row); this.close(); };
+      }
+    }
+
+    if (this.truncatedAt !== null) {
+      contentEl.createEl("p", {
+        cls: "stashpad-saved-truncated",
+        text: `Showing the first ${this.truncatedAt} notes. This folder has more — narrow the folder to see the rest.`,
+      });
+    }
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.336.0: the formatting inspector. Lists the formatted spans in a note's text
+ *  (bold, italic, highlight, spoiler, strikethrough, code, links) so you can
+ *  change, remove, or layer their formatting from a menu — no text-selection
+ *  fight, which is the friction on mobile especially. Acts directly on the edit
+ *  modal's textarea and re-parses after each change. */
+export class FormatInspectorModal extends Modal {
+  constructor(app: App, private ta: HTMLTextAreaElement) { super(app); }
+
+  onOpen(): void {
+    this.modalEl.addClass("stashpad-format-inspector");
+    this.titleEl.setText("Formatting in this note");
+    this.render();
+  }
+
+  private render(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    const spans = parseFormatSpans(this.ta.value);
+    if (spans.length === 0) {
+      contentEl.createEl("p", { cls: "stashpad-fi-empty", text: "No formatted text found. Add some with the toolbar, then come back to tweak it here." });
+      return;
+    }
+    contentEl.createEl("p", { cls: "stashpad-fi-hint", text: "Change, remove, or layer formatting — no need to select the text." });
+    for (const span of spans) {
+      const row = contentEl.createDiv({ cls: "stashpad-fi-row" });
+      const icon = row.createSpan({ cls: "stashpad-fi-icon" });
+      setIconSafe(icon, span.icon, "•");
+      row.createSpan({ cls: "stashpad-fi-type", text: span.label });
+      const preview = span.inner.length > 44 ? span.inner.slice(0, 44) + "…" : span.inner;
+      row.createSpan({ cls: "stashpad-fi-preview", text: preview });
+      const menuBtn = row.createEl("button", { cls: "stashpad-fi-menu", attr: { "aria-label": "Formatting actions" } });
+      setIcon(menuBtn, "more-horizontal");
+      menuBtn.onclick = (e) => this.openSpanMenu(e, span);
+    }
+  }
+
+  private openSpanMenu(e: MouseEvent, span: FormatSpan): void {
+    e.preventDefault();
+    const menu = new Menu();
+    menu.addItem((it) => it.setTitle("Remove formatting").setIcon("eraser").onClick(() => this.apply(span, { remove: true })));
+    // Replace with a different emphasis (not links — that would drop the target).
+    const emphasis = FORMAT_KINDS.filter((k) => k.type !== "link");
+    menu.addItem((it: any) => {
+      it.setTitle("Replace with").setIcon("replace");
+      const sub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
+      if (sub) {
+        for (const k of emphasis) {
+          if (k.type === span.type) continue;
+          sub.addItem((si: any) => si.setTitle(k.label).setIcon(k.icon).onClick(() => this.apply(span, { replaceWith: k.type })));
+        }
+      } else {
+        // No submenu on this Obsidian: fall back to flat "Replace: X" items.
+        it.onClick(() => {});
+      }
+    });
+    menu.addItem((it: any) => {
+      it.setTitle("Add a layer").setIcon("layers");
+      const sub = typeof it.setSubmenu === "function" ? it.setSubmenu() : null;
+      if (sub) {
+        for (const k of emphasis) {
+          sub.addItem((si: any) => si.setTitle(k.label).setIcon(k.icon).onClick(() => this.apply(span, { layer: k.type })));
+        }
+      }
+    });
+    menu.showAtMouseEvent(e);
+  }
+
+  private apply(span: FormatSpan, action: { remove?: boolean; replaceWith?: string; layer?: string }): void {
+    const val = this.ta.value;
+    const outer = val.slice(span.outerStart, span.outerEnd);
+    let replacement: string;
+    if (action.remove) {
+      replacement = span.inner;
+    } else if (action.replaceWith) {
+      const k = FORMAT_KINDS.find((x) => x.type === action.replaceWith);
+      replacement = k ? `${k.open}${span.inner}${k.close}` : outer;
+    } else if (action.layer) {
+      const k = FORMAT_KINDS.find((x) => x.type === action.layer);
+      replacement = k ? `${k.open}${outer}${k.close}` : outer;
+    } else {
+      return;
+    }
+    this.ta.value = val.slice(0, span.outerStart) + replacement + val.slice(span.outerEnd);
+    this.ta.dispatchEvent(new Event("input", { bubbles: true }));
+    this.render(); // re-parse from the updated text
+  }
+
+  onClose(): void { this.contentEl.empty(); }
 }
 
 export class ConfirmModal extends Modal {
@@ -3083,6 +3758,9 @@ export class DueDatePickerModal extends Modal {
   private assignees: AssigneeRef[] = [];
   /** 0.276.0: working set of tags (without leading #), mutated by the tags UI. */
   private tags: string[] = [];
+  /** 0.327.0: working color selection (hex or null), mutated by the swatch UI.
+   *  undefined until the section is shown; seeded from opts.currentColor. */
+  private color: string | null = null;
   constructor(
     app: App,
     /** Existing due value (ISO) to pre-fill, or null/undefined. */
@@ -3097,6 +3775,7 @@ export class DueDatePickerModal extends Modal {
     super(app);
     this.assignees = [...(opts.currentAssignees ?? [])];
     this.tags = [...(opts.currentTags ?? [])].map((t) => t.replace(/^#/, "")).filter(Boolean);
+    this.color = opts.currentColor ?? null;
   }
 
   /** Whether the tags section is active for this open. */
@@ -3105,6 +3784,8 @@ export class DueDatePickerModal extends Modal {
   }
   /** tags result, or undefined when the section wasn't shown (don't touch tags). */
   private tagsResult(): string[] | undefined { return this.showTags ? [...this.tags] : undefined; }
+  /** color result, or undefined when the section wasn't shown (don't touch color). */
+  private colorResult(): string | null | undefined { return this.opts.showColor ? this.color : undefined; }
 
   onOpen(): void {
     this.modalEl?.addClass("stashpad-compact-modal"); // 0.76.18
@@ -3234,6 +3915,7 @@ export class DueDatePickerModal extends Modal {
     // grouped at the top; assign/tags/repeat are the optional extras below.
     if (!this.opts.hideAssignees) this.renderAssignSection(wrap);
     if (this.showTags) this.renderTagsSection(wrap);
+    if (this.opts.showColor) this.renderColorSection(wrap);
 
     // 0.140.0: optional "Repeat & reminders" section (collapsible). Three
     // free-text fields; recurrence uses natural language ("every weekday",
@@ -3464,7 +4146,7 @@ export class DueDatePickerModal extends Modal {
       if (!dateInput.value) {
         this.didChoose = true;
         this.close();
-        this.onPick({ iso: null, assignees: this.assignees, tags: this.tagsResult(), ...recur() });
+        this.onPick({ iso: null, assignees: this.assignees, tags: this.tagsResult(), color: this.colorResult(), ...recur() });
         return;
       }
       // Default time to 09:00 when only a date was chosen.
@@ -3474,7 +4156,7 @@ export class DueDatePickerModal extends Modal {
       const due = new Date(y, m - 1, d, hh, mm, 0, 0);
       this.didChoose = true;
       this.close();
-      this.onPick({ iso: due.toISOString(), assignees: this.assignees, tags: this.tagsResult(), ...recur() });
+      this.onPick({ iso: due.toISOString(), assignees: this.assignees, tags: this.tagsResult(), color: this.colorResult(), ...recur() });
     };
     requestAnimationFrame(() => dateInput.focus());
   }
@@ -3493,6 +4175,40 @@ export class DueDatePickerModal extends Modal {
       initial: this.assignees,
       onChange: (list) => { this.assignees = list; },
     });
+  }
+
+  /** 0.327.0: Color block — a compact swatch row (No color + the default palette
+   *  + the user's saved custom colors) that sets the note color alongside the due
+   *  date. Reuses ColorPickerModal's tile classes so it matches the standalone
+   *  color picker. This is the first "bulk attribute in the due modal" (item 6):
+   *  scheduling several notes can color them in the same pass. */
+  private renderColorSection(wrap: HTMLElement): void {
+    const sec = wrap.createDiv({ cls: "stashpad-tagsec stashpad-duecolor-sec" });
+    sec.createDiv({ cls: "stashpad-tagsec-label", text: "Color" });
+    const grid = sec.createDiv({ cls: "stashpad-color-grid stashpad-duecolor-grid" });
+    const tiles: { color: string | null; el: HTMLElement }[] = [];
+    const paint = (): void => {
+      for (const t of tiles) t.el.toggleClass("is-active", (t.color ?? null) === (this.color ?? null));
+    };
+    const addTile = (color: string | null, el: HTMLElement): void => {
+      tiles.push({ color, el });
+      el.onclick = () => { this.color = color; paint(); };
+    };
+    const noTile = grid.createDiv({ cls: "stashpad-color-tile stashpad-color-none" });
+    noTile.title = "No color";
+    addTile(null, noTile);
+    const presets = [...ColorPickerModal.DEFAULT_PALETTE, ...(this.opts.customPalette ?? [])];
+    const seen = new Set<string>();
+    for (const c of presets) {
+      const key = c.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const tile = grid.createDiv({ cls: "stashpad-color-tile" });
+      tile.style.background = c;
+      tile.title = c;
+      addTile(c, tile);
+    }
+    paint();
   }
 
   /** 0.276.0: Tags block — selected tags as removable chips, quick one-tap chips

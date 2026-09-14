@@ -17,6 +17,9 @@ export const STASHPAD_TRASH_VIEW_TYPE = "stashpad-trash";
  *  "encrypted" (all locked subtrees) and "archived" (all archive folders). The
  *  "deleted" aggregate is the existing trash view. Read-only: list + navigate. */
 export const STASHPAD_AGGREGATE_VIEW_TYPE = "stashpad-aggregate";
+/** 0.364.0: kanban board — property-pivot by color. Each color (+ "No color")
+ *  becomes a column, notes are cards, dragging a card sets its color. */
+export const STASHPAD_KANBAN_VIEW_TYPE = "stashpad-kanban";
 /** 0.315.0: the per-folder action log and the notification history, promoted
  *  from modals to dedicated tabs so they're reachable from the launcher and can
  *  sit alongside the other views. */

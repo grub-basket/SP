@@ -84,6 +84,7 @@ export class NoteBodyRenderer {
     const detached = createDiv({ cls: "stashpad-note-text" });
     await perf.timeAsync("render.row.markdown", () => MarkdownRenderer.render(this.host.app, text, detached, file.path, this.component));
     this.colorizeHighlights(detached);
+    this.autolinkDeepLinks(detached);
     const html = detached.innerHTML;
     const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html };
     this.renderCache.set(file.path, entry);
@@ -105,10 +106,58 @@ export class NoteBodyRenderer {
       const detached = createDiv({ cls: "stashpad-note-text" });
       await MarkdownRenderer.render(this.host.app, text, detached, file.path, this.component);
       this.colorizeHighlights(detached);
+      this.autolinkDeepLinks(detached);
       const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html: detached.innerHTML };
       this.renderCache.set(file.path, entry);
     } catch (e) {
       console.warn("[Stashpad] primeRender failed", e);
+    }
+  }
+
+  /** 0.331.0: autolink BARE `obsidian://…` URLs in the rendered body. Obsidian's
+   *  MarkdownRenderer doesn't autolink them, but a Stashpad deep link ("Copy
+   *  Stashpad link" yields a bare URL) should be clickable when pasted into a
+   *  note. Each match becomes an `a.external-link`, which the view's click
+   *  delegation opens (routing obsidian:// to the protocol handler). Text inside
+   *  existing links / inline code / code blocks is left untouched. */
+  private autolinkDeepLinks(root: HTMLElement): void {
+    const doc = root.ownerDocument ?? document;
+    const rx = /obsidian:\/\/[^\s<>"']+/g;
+    const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (node: Node): number => {
+        if (!node.textContent || !node.textContent.includes("obsidian://")) return NodeFilter.FILTER_REJECT;
+        let p = (node as Text).parentElement;
+        while (p && p !== root) {
+          const tag = p.tagName;
+          if (tag === "A" || tag === "CODE" || tag === "PRE") return NodeFilter.FILTER_REJECT;
+          p = p.parentElement;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const targets: Text[] = [];
+    let cur: Node | null;
+    while ((cur = walker.nextNode())) targets.push(cur as Text);
+    for (const textNode of targets) {
+      const text = textNode.textContent ?? "";
+      rx.lastIndex = 0;
+      if (!rx.test(text)) continue;
+      rx.lastIndex = 0;
+      const frag = doc.createDocumentFragment();
+      let last = 0;
+      let m: RegExpExecArray | null;
+      while ((m = rx.exec(text))) {
+        if (m.index > last) frag.appendChild(doc.createTextNode(text.slice(last, m.index)));
+        const a = doc.createElement("a");
+        a.className = "external-link";
+        a.setAttribute("href", m[0]);
+        a.setAttribute("rel", "noopener");
+        a.textContent = m[0];
+        frag.appendChild(a);
+        last = m.index + m[0].length;
+      }
+      if (last < text.length) frag.appendChild(doc.createTextNode(text.slice(last)));
+      textNode.parentNode?.replaceChild(frag, textNode);
     }
   }
 

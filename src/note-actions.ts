@@ -43,6 +43,9 @@ export const NOTE_ACTION_CATALOG: readonly NoteActionDef[] = [
   // Organize
   { id: "move",             label: "Move to…",                      icon: "move",               button: true,  group: "Organize" },
   { id: "moveHome",         label: "Move to Home",                  icon: "home",                              group: "Organize" },
+  // 0.363.0: outdent as a first-class leaf so the seeded "Move ▸" submenu can
+  // list it (and it's addable/renderable like any other action).
+  { id: "outdent",          label: "Outdent",                       icon: "outdent",                           group: "Organize" },
   { id: "setColor",         label: "Set color…",                    icon: "palette",            button: true,  group: "Organize" },
   { id: "setDue",           label: "Set due date…",                 icon: "calendar-clock",     button: true,  group: "Organize" },
   { id: "blur",             label: "Blur / unblur",                 icon: "eye-off",            button: true,  group: "Organize" },
@@ -50,7 +53,6 @@ export const NOTE_ACTION_CATALOG: readonly NoteActionDef[] = [
   { id: "archive",          label: "Move to archive",               icon: "archive",            button: true,  group: "Organize" },
 ];
 
-const BY_ID = new Map(NOTE_ACTION_CATALOG.map((a) => [a.id, a]));
 export function noteAction(id: string): NoteActionDef | undefined { return BY_ID.get(id); }
 /** Default icon for a catalog id, or a neutral fallback for an arbitrary
  *  Obsidian command id (which carries no catalog icon). */
@@ -73,11 +75,22 @@ export const BUTTON_ACTION_CATALOG = NOTE_ACTION_CATALOG.filter((a) => a.button)
  *  included), so the settings builder shows and reorders the whole menu. `sep`
  *  is a divider. `encrypt` / `recurrenceSkip` self-hide when not applicable. */
 export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
-  "edit", "focus", "openNewTab", "openObsidian", "sep",
-  "react", "reply", "replyLink", "split", "recurrenceSkip",
-  "copy", "clone", "fork", "shareExport", "encrypt", "sep",
-  "obscure", "move", "moveHome", "pinSidebar", "pinList", "setColor",
-  "taskSubmenu", "sep", "delete", "moreCommands",
+  "edit", "focus", "openNewTab", "sep",
+  // 0.363.0: the four former hand-built submenus (React/Reply, Move, Pin,
+  // Advanced) are now SEEDED user submenus in settings.contextSubmenus, referenced
+  // as `submenu:<key>` so they show up in the submenu editor and are renamable /
+  // reorderable / nestable / deletable like any user submenu. See
+  // DEFAULT_CONTEXT_SUBMENUS below + the seed migration in main.ts.
+  "submenu:reactreply", "recurrenceSkip",
+  // 0.357.0: clone + fork relocated INTO the "Copy ▸" submenu (view.ts, the
+  // `copy` case of renderCtxLeaf) — they no longer sit at the top level in the
+  // default order. Their catalog leaves survive, so a user who had reordered
+  // (custom contextMenuOrder still lists "clone"/"fork") keeps them top-level.
+  // 0.363.0: color + obscure + encrypt grouped into the "Appearance & privacy"
+  // submenu (submenu:appearance); they no longer sit at the top level by default.
+  "copy", "shareExport", "sep",
+  "submenu:move", "submenu:pin", "submenu:appearance",
+  "taskSubmenu", "sep", "submenu:advanced", "delete", "moreCommands",
 ];
 /** Stateful/compound context-menu items that live only in the ⋮ menu (not the
  *  star menu or item buttons). Given labels/icons here so the builder can list
@@ -86,18 +99,48 @@ export const CONTEXT_EXTRA_ACTIONS: readonly NoteActionDef[] = [
   { id: "sep",            label: "── Divider ──",           icon: "minus",           group: "Organize" },
   { id: "obscure",        label: "Obscure / reveal",        icon: "eye-off",         group: "Organize" },
   { id: "pinList",        label: "Pin in list ▸",           icon: "pin",             group: "Organize" },
+  // 0.363.0: the two "Pin in list" edges as individual leaves so the seeded
+  // "Pin ▸" submenu can list them (the old nested `pinList` submenu is kept as a
+  // leaf case for back-compat but is no longer in the default order).
+  { id: "pinListTop",     label: "Pin to top of list",      icon: "arrow-up-to-line",group: "Organize" },
+  { id: "pinListBottom",  label: "Pin to bottom of list",   icon: "arrow-down-to-line",group: "Organize" },
   { id: "shareExport",    label: "Share & export ▸",        icon: "share",           group: "Copy" },
   { id: "taskSubmenu",    label: "Task ▸",                  icon: "square-check-big",group: "Organize" },
   { id: "encrypt",        label: "Encrypt (lock) note",     icon: "lock",            group: "Organize" },
   { id: "recurrenceSkip", label: "Skip to next occurrence", icon: "skip-forward",    group: "Compose" },
+  { id: "history",        label: "View history",            icon: "history",         group: "Compose" },
   { id: "delete",         label: "Delete",                  icon: "trash",           group: "Organize" },
   { id: "moreCommands",   label: "More commands…",          icon: "terminal",        group: "Organize" },
 ];
+
+/** 0.350.0: id → def, built from the catalog AND the context-only extras. The
+ *  extras (delete, history, obscure, encrypt, …) were previously absent, so
+ *  defaultActionIcon() returned the "terminal" fallback for them and the ⋮ menu
+ *  showed a generic icon while settings — which reads the extras array directly —
+ *  showed the right one. Declared after both arrays (const, no hoist). */
+const BY_ID = new Map<string, NoteActionDef>(
+  [...NOTE_ACTION_CATALOG, ...CONTEXT_EXTRA_ACTIONS].map((a) => [a.id, a]),
+);
 /** Actions the ⋮-menu builder can add: the catalog's context leaves + the extras
  *  above + a few catalog actions not in the default order. */
 export const CONTEXT_LEAF_IDS: readonly string[] = [
   "edit", "focus", "openNewTab", "openObsidian",
   "react", "reply", "replyLink", "split",
-  "copy", "clone", "fork", "setColor", "move", "moveHome", "setDue", "largeText", "archive", "pinSidebar",
+  "copy", "clone", "fork", "setColor", "move", "moveHome", "outdent", "setDue", "largeText", "archive", "pinSidebar",
   ...CONTEXT_EXTRA_ACTIONS.map((a) => a.id),
 ];
+
+/** 0.363.0: the four built-in reorg submenus, seeded into a fresh install's
+ *  `settings.contextSubmenus` (DEFAULT_SETTINGS) AND merged into an existing
+ *  install once (the `contextMenusSeededV1` migration in main.ts), keyed so
+ *  CONTEXT_DEFAULT_ORDER's `submenu:<key>` entries resolve. Being ordinary
+ *  contextSubmenus entries, they render, appear in the submenu editor, and are
+ *  renamable / reorderable / nestable / deletable like any user submenu. Every
+ *  item id is a real renderCtxLeaf leaf case (see view.ts). */
+export const DEFAULT_CONTEXT_SUBMENUS: Record<string, { name: string; icon: string; items: string[] }> = {
+  move:      { name: "Move",          icon: "move",        items: ["move", "moveHome", "outdent"] },
+  pin:       { name: "Pin",           icon: "pin",         items: ["pinSidebar", "pinListTop", "pinListBottom"] },
+  advanced:  { name: "Advanced",      icon: "settings-2",  items: ["openObsidian", "history", "split"] },
+  reactreply:{ name: "React / Reply", icon: "smile-plus",  items: ["react", "reply", "replyLink"] },
+  appearance:{ name: "Appearance & privacy", icon: "palette", items: ["setColor", "obscure", "encrypt"] },
+};

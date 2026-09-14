@@ -99,7 +99,47 @@ export class SettingsStore {
 
   private async writeSplit(file: string, payload: Bag, rev: number): Promise<void> {
     const body = JSON.stringify({ ...payload, rev }, null, 2);
-    await this.plugin.app.vault.adapter.write(this.pathFor(file), body);
+    await this.atomicWrite(this.pathFor(file), body);
+  }
+
+  /** 0.349.0: ATOMIC write — stage into a temp file, verify the bytes landed, then
+   *  rename over the target (a crash/kill/sync mid-write can then only truncate the
+   *  temp, never the live file). This is what stops an interrupted save from zeroing
+   *  data.json — the corruption the loadAll() guard was catching after the fact.
+   *  Mirrors FolderKeyStore.write. Falls back to a direct write only where
+   *  rename-over-existing isn't supported, and reads back to confirm. */
+  private async atomicWrite(path: string, body: string): Promise<void> {
+    const a = this.plugin.app.vault.adapter;
+    const tmp = `${path}.tmp`;
+    // Stage + verify before touching the live file.
+    await a.write(tmp, body);
+    if ((await a.read(tmp)) !== body) {
+      try { if (await a.exists(tmp)) await a.remove(tmp); } catch { /* best-effort */ }
+      throw new Error(`Couldn't stage ${path} (verify failed).`);
+    }
+    let placed = false;
+    try { await a.rename(tmp, path); placed = true; }
+    catch {
+      // rename-over-existing unsupported by this adapter: write straight over the
+      // target (adapter.write truncates+writes in one step) rather than remove-first.
+      try { await a.write(path, body); placed = true; } catch { /* verified below */ }
+      try { if (await a.exists(tmp)) await a.remove(tmp); } catch { /* best-effort */ }
+    }
+    if (!placed || (await a.read(path)) !== body) throw new Error(`Couldn't write ${path} intact.`);
+  }
+
+  /** 0.349.0: atomically write the data.json-owned core (replaces the plugin's
+   *  non-atomic saveData for the settings blob). */
+  async saveCore(core: Bag): Promise<void> {
+    await this.atomicWrite(this.pathFor("data.json"), JSON.stringify(core));
+  }
+
+  /** djb2 hash of a string → short hex, for naming a corrupt backup by CONTENT so an
+   *  unchanged corrupt file is never backed up twice (was: `Date.now()` every load). */
+  private static hash(s: string): string {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(16);
   }
 
   private static pick(src: Bag, keys: readonly string[]): Bag {
@@ -145,28 +185,49 @@ export class SettingsStore {
     // rest of the session, and tell the user rather than quietly resetting them.
     const dataPath = this.pathFor("data.json");
     const adapter = this.plugin.app.vault.adapter;
+    // 0.349.0 (startup): read data.json ONCE here and reuse the parse below,
+    // instead of reading it for the corruption check and then again via loadData()
+    // — one fewer disk round-trip on the launch critical path (matters on a
+    // network/synced vault).
+    let parsedBase: Bag | null = null;
     try {
       if (await adapter.exists(dataPath)) {
         const raw = await adapter.read(dataPath);
-        try {
-          JSON.parse(raw);
-        } catch {
-          this.corruptDataJson = true;
-          const backup = `${dataPath}.corrupt-${Date.now()}`;
-          try { if (!(await adapter.exists(backup))) await adapter.write(backup, raw); } catch { /* best effort */ }
-          new Notice(
-            "Stashpad: your settings file (data.json) is damaged and could not be read.\n"
-            + `A copy was saved as ${backup.split("/").pop()}.\n`
-            + "Settings are showing defaults for now and Stashpad will NOT save over the "
-            + "damaged file this session, so it stays recoverable. Restart after restoring "
-            + "a backup, or reconfigure and restart to start saving again.",
-            0,
-          );
+        if (raw.trim() === "") {
+          // 0.349.0: an EMPTY data.json is almost always an interrupted write
+          // (crash/kill/sync mid-save). There is nothing to recover, so treating
+          // it as "corrupt, refuse to save" only strands the user on defaults
+          // forever. Treat it as ABSENT instead: fall through to defaults and let
+          // the next save (now atomic) heal it. Best-effort remove so the empty
+          // file isn't re-read as corrupt next launch.
+          try { await adapter.remove(dataPath); } catch { /* harmless if it lingers */ }
+        } else {
+          try {
+            const p: unknown = JSON.parse(raw);
+            parsedBase = p && typeof p === "object" ? (p as Bag) : null;
+          } catch {
+            this.corruptDataJson = true;
+            // Name the backup by CONTENT hash so re-loading the SAME corrupt file
+            // reuses one backup instead of minting a new `corrupt-<ts>` every launch
+            // (that bug produced dozens of identical copies).
+            const backup = `${dataPath}.corrupt-${SettingsStore.hash(raw)}`;
+            try { if (!(await adapter.exists(backup))) await adapter.write(backup, raw); } catch { /* best effort */ }
+            new Notice(
+              "Stashpad: your settings file (data.json) is damaged and could not be read.\n"
+              + `A copy was saved as ${backup.split("/").pop()}.\n`
+              + "Settings are showing defaults for now and Stashpad will NOT save over the "
+              + "damaged file this session, so it stays recoverable. Restart after restoring "
+              + "a backup, or reconfigure and restart to start saving again.",
+              0,
+            );
+          }
         }
       }
     } catch { /* adapter unavailable — fall through to the original behaviour */ }
 
-    const base = ((await this.plugin.loadData()) as Bag | null) ?? {};
+    // Reuse the parse from above (falls back to loadData only if our own read
+    // path was skipped by an adapter error — keeps the original behaviour).
+    const base: Bag = parsedBase ?? (((await this.plugin.loadData()) as Bag | null) ?? {});
     const merged: Bag = { ...base };
 
     for (const [file, keys] of Object.entries(SPLIT_FILES)) {

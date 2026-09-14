@@ -1617,6 +1617,32 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 .stashpad-note-task-checkbox:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
 .stashpad-note-task-checkbox svg { width: 16px; height: 16px; }
+/* 0.325.0: parent-task progress badge overlaid on the checkbox. Rendered as
+   ::after generated content from the data-spprog attribute (not a child span) so
+   an in-place icon refresh — which empties the checkbox's child nodes — can't
+   wipe it. It sits on the box glyph, ignores pointer events (so the box stays
+   clickable), and fades on hover so the control underneath is revealed. */
+.stashpad-note-task-checkbox.has-progress { position: relative; }
+.stashpad-note-task-checkbox.has-progress::after {
+  content: attr(data-spprog);
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  min-width: 1.6em;
+  padding: 0 3px;
+  font-size: 9px;
+  line-height: 1.4;
+  font-weight: 600;
+  text-align: center;
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-radius: 6px;
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+}
+.stashpad-note-task-checkbox.has-progress.is-progress-complete::after { background: var(--color-green, var(--interactive-success, #3ba55d)); }
+.stashpad-note-task-checkbox.has-progress:hover::after { opacity: 0; }
 /* Top row of meta: timestamp + grip side-by-side. */
 .stashpad-note-meta-top {
   display: flex;
@@ -2270,6 +2296,29 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 /* Keep typed text clear of the button. */
 .stashpad-composer-input { padding-right: 32px; }
 
+/* 0.363.3: custom placeholder overlay. iOS mis-paints the native textarea
+   placeholder as a stuck "N" after an internal-link insert+delete, so we paint
+   the native one TRANSPARENT and render this div in its place — iOS renders a
+   plain div correctly. Positioned to match the textarea's text origin (1px
+   border + 6px/10px padding). Visibility is pure CSS off `:placeholder-shown`,
+   so it tracks the value with no per-keystroke JS. */
+.stashpad-composer-input::placeholder { color: transparent; }
+.stashpad-composer-placeholder {
+  position: absolute;
+  top: 7px;
+  left: 11px;
+  right: 34px;
+  color: var(--text-faint);
+  font-size: var(--font-ui-medium);
+  line-height: 1.3;
+  pointer-events: none;
+  white-space: pre-wrap;
+  overflow: hidden;
+  z-index: 1;
+}
+/* Hide the overlay the moment the box has text. */
+.stashpad-composer-input:not(:placeholder-shown) ~ .stashpad-composer-placeholder { display: none; }
+
 .stashpad-composer {
   flex: 0 0 auto;
   display: flex;
@@ -2797,6 +2846,40 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   font-size: var(--font-ui-smaller);
 }
 .stashpad-split-reply-btn + .stashpad-split-reply-btn { margin-left: 0; }
+/* 0.355.0: "Color" chip on the edit surface — mirrors the reply chip's layout. */
+.stashpad-split-color {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.stashpad-split-color.is-color { border-left-color: var(--interactive-accent); }
+.stashpad-split-color-icon { display: inline-flex; color: var(--text-faint); }
+.stashpad-split-color.is-color .stashpad-split-color-icon { color: var(--interactive-accent); }
+.stashpad-split-color-icon .svg-icon { width: 13px; height: 13px; }
+.stashpad-split-color-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--background-modifier-border);
+  flex: 0 0 auto;
+}
+.stashpad-split-color-swatch.is-empty {
+  background: repeating-linear-gradient(45deg, var(--background-modifier-border) 0 2px, transparent 2px 4px);
+}
+.stashpad-split-color-label { font-weight: 600; }
+.stashpad-split-color-btn {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: var(--font-ui-smaller);
+}
 .stashpad-split-edit-tools {
   display: flex;
   align-items: center;
@@ -3056,9 +3139,15 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 /* 0.183.0: the editor FILLS the fixed-height modal (no empty gap under short
    notes). Flex chain: modal-content → tabs → tabbody → active panel → textarea,
    each stretching; the textarea/preview scrolls internally. */
-.is-mobile .stashpad-split-tabs { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
-.is-mobile .stashpad-split-tabbody { flex: 1 1 auto; min-height: 0; display: flex; }
-.is-mobile .stashpad-split-tabpanel.is-active { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.is-mobile .stashpad-split-tabs { flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
+/* 0.363.9: min-width:0 down the flex chain. Without it the edit panel's default
+   min-width:auto = its widest child (the formatting toolbar / textarea), so the
+   panel expanded past the modal and the WHOLE modal scrolled horizontally instead
+   of the toolbar. Pinning the chain to 0 lets the panel shrink to the modal width;
+   the toolbar's own overflow-x:auto then scrolls internally, and the textarea
+   wraps to width. */
+.is-mobile .stashpad-split-tabbody { flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; }
+.is-mobile .stashpad-split-tabpanel.is-active { flex: 1 1 auto; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
 .is-mobile .stashpad-split-tabpanel.is-active .stashpad-split-cursor-ta { flex: 1 1 auto; min-height: 0; height: auto; }
 .is-mobile .stashpad-split-tabpanel.is-active .stashpad-split-panel-body { flex: 1 1 auto; min-height: 0; max-height: none; }
 /* 0.183.3: copy button lives in its own right-aligned bar ABOVE the Original text
@@ -3987,6 +4076,9 @@ body.is-mobile .stashpad-jd-actions .setting-item-control {
 }
 .stashpad-color-tile:hover { transform: scale(1.06); }
 .stashpad-color-tile.is-active { border-color: var(--text-normal); }
+/* 0.327.0: compact swatches for the color section inside the due modal. */
+.stashpad-duecolor-grid { grid-template-columns: repeat(auto-fill, minmax(26px, 1fr)); gap: 6px; }
+.stashpad-duecolor-grid .stashpad-color-tile { width: 26px; height: 26px; border-radius: 5px; }
 /* Delete ✕ overlay on saved-custom tiles. Hidden until tile hover. */
 .stashpad-color-tile-del {
   position: absolute;
@@ -8856,6 +8948,22 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
   gap: 4px;
   margin-top: 6px;
 }
+/* 0.333.0: reply-count chip — "↩ N replies", tap to list & jump. */
+.stashpad-reply-count-rail { display: flex; margin-top: 6px; }
+.stashpad-reply-count-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.stashpad-reply-count-chip:hover { color: var(--text-normal); background: var(--background-modifier-border); }
+.stashpad-reply-count-icon { display: inline-flex; }
+.stashpad-reply-count-icon .svg-icon { width: 13px; height: 13px; }
 .stashpad-link-chip {
   display: inline-flex;
   align-items: center;
@@ -9623,6 +9731,14 @@ button.stashpad-reaction-chip,
   font-size: var(--font-ui-smaller);
 }
 .stashpad-reply-chip-top { display: flex; align-items: center; gap: 5px; }
+/* 0.363.11: push the edit chip's pop-out + ✕ to the right edge so they sit
+   TOGETHER at the end of the row. .stashpad-reply-chip-x already carries
+   margin-left:auto; with two auto-margined items flexbox splits the free space
+   between them (pop lands mid-row, ✕ at the edge — the reported "middle"). Give
+   the auto only to pop, and zero it on the ✕ that follows so the pair stays
+   flush (kept apart only by the row's 5px gap). */
+.stashpad-reply-chip-popout { margin-left: auto; }
+.stashpad-reply-chip-popout + .stashpad-reply-chip-x { margin-left: 0; }
 .stashpad-reply-chip-icon { display: inline-flex; color: var(--interactive-accent); }
 .stashpad-reply-chip-icon .svg-icon { width: 13px; height: 13px; }
 .stashpad-reply-chip-label {
@@ -9991,6 +10107,248 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-cal-note.is-recurring .stashpad-cal-dot { color: var(--sp-cal-recurring); }
 .stashpad-cal-note.is-projected { opacity: 0.7; border-left-style: dashed; }
 
+/* 0.338.0: snippet editor value box. */
+.stashpad-snippet-value { width: 100%; min-height: 80px; resize: vertical; font-family: var(--font-monospace); }
+.stashpad-snippet-import { width: 100%; min-height: 120px; resize: vertical; font-family: var(--font-monospace); font-size: 12px; }
+/* 0.346.0: deactivated snippet row in settings — muted but still legible. */
+.stashpad-snippet-off .setting-item-name { opacity: 0.55; }
+.stashpad-snippet-off .setting-item-description { opacity: 0.55; }
+.stashpad-import-actions { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+.stashpad-import-summary { margin-top: 6px; }
+
+/* 0.337.0: note history viewer. */
+.stashpad-history-modal { max-width: 720px; }
+/* 0.355.0: Timeline / By person segmented control at the top of the modal. */
+.stashpad-hist-modeswitch { display: inline-flex; gap: 0; margin-bottom: 10px; border: 1px solid var(--background-modifier-border); border-radius: 6px; overflow: hidden; }
+.stashpad-hist-modetab { background: var(--background-secondary); color: var(--text-muted); border: none; border-radius: 0; box-shadow: none; padding: 4px 12px; font-size: 13px; cursor: pointer; }
+.stashpad-hist-modetab:not(:last-child) { border-right: 1px solid var(--background-modifier-border); }
+.stashpad-hist-modetab.is-active { background: var(--interactive-accent); color: var(--text-on-accent); }
+.stashpad-hist-filter { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; color: var(--text-muted); font-size: 13px; }
+.stashpad-hist-wrap { display: flex; gap: 10px; min-height: 240px; max-height: 52vh; }
+.stashpad-hist-list {
+  flex: 0 0 200px;
+  overflow-y: auto;
+  border-right: 1px solid var(--background-modifier-border);
+  padding-right: 6px;
+}
+.stashpad-hist-item { padding: 6px 6px; border-radius: 5px; cursor: pointer; }
+.stashpad-hist-item:hover { background: var(--background-modifier-hover); }
+.stashpad-hist-item.is-active { background: var(--background-modifier-active-hover, var(--background-secondary)); }
+.stashpad-hist-when { font-size: 13px; color: var(--text-normal); }
+.stashpad-hist-who { font-size: 11px; color: var(--text-muted); }
+.stashpad-hist-pane { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+.stashpad-hist-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  background: var(--background-secondary);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+}
+.stashpad-hist-diff { display: block; }
+.stashpad-hist-diff-line { display: flex; gap: 6px; padding: 0 4px; white-space: pre-wrap; word-break: break-word; }
+.stashpad-hist-diff-gutter { flex: 0 0 auto; width: 1ch; color: var(--text-faint); user-select: none; }
+.stashpad-hist-diff-text { flex: 1 1 auto; min-width: 0; }
+.stashpad-hist-diff-line.is-add { background: color-mix(in srgb, var(--color-green, #3ba55d) 16%, transparent); }
+.stashpad-hist-diff-line.is-add .stashpad-hist-diff-gutter { color: var(--color-green, #3ba55d); }
+.stashpad-hist-diff-line.is-del { background: color-mix(in srgb, var(--color-red, #e5534b) 15%, transparent); }
+.stashpad-hist-diff-line.is-del .stashpad-hist-diff-gutter { color: var(--color-red, #e5534b); }
+.stashpad-hist-diff-line.is-del .stashpad-hist-diff-text { text-decoration: line-through; opacity: 0.75; }
+.stashpad-hist-diff-same-all { color: var(--text-muted); padding: 4px; }
+.stashpad-hist-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.stashpad-hist-note { font-size: 12px; color: var(--text-muted); }
+.stashpad-hist-foot { margin-top: 10px; font-size: 12px; color: var(--text-muted); }
+.is-mobile .stashpad-hist-wrap { flex-direction: column; max-height: none; }
+.is-mobile .stashpad-hist-list { flex-basis: auto; max-height: 30vh; border-right: none; border-bottom: 1px solid var(--background-modifier-border); padding-right: 0; }
+
+/* 0.351.0: folder "last saved by person" overview. */
+.stashpad-saved-by-modal { max-width: 640px; }
+.stashpad-saved-group { margin: 0 0 14px; }
+.stashpad-saved-group-head {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 4px 0; margin-bottom: 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-saved-group-name { font-weight: 600; }
+.stashpad-saved-group-count { font-size: 11px; color: var(--text-muted); }
+.stashpad-saved-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 6px; border-radius: 5px;
+}
+.stashpad-saved-row:hover { background: var(--background-modifier-hover); }
+.stashpad-saved-main { flex: 1 1 auto; min-width: 0; }
+.stashpad-saved-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stashpad-saved-when { font-size: 11px; color: var(--text-muted); }
+.stashpad-saved-src { font-style: italic; }
+.stashpad-saved-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.stashpad-saved-truncated { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+
+/* 0.336.0: formatting inspector — list of formatted spans you can act on. */
+.stashpad-fi-hint, .stashpad-fi-empty { color: var(--text-muted); font-size: 13px; margin: 0 0 8px; }
+.stashpad-fi-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-fi-row:last-child { border-bottom: none; }
+.stashpad-fi-icon { display: inline-flex; color: var(--text-muted); flex: 0 0 auto; }
+.stashpad-fi-icon .svg-icon { width: 15px; height: 15px; }
+.stashpad-fi-type { flex: 0 0 auto; font-size: 12px; color: var(--text-muted); min-width: 68px; }
+.stashpad-fi-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.stashpad-fi-menu {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  height: 22px;
+  min-height: 0; /* override Obsidian's default button min-height, which made this tall */
+  padding: 0 5px;
+  box-shadow: none;
+}
+.stashpad-fi-menu .svg-icon { width: 15px; height: 15px; }
+.stashpad-fi-menu:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-toolbar-inspect { margin-left: auto; }
+
+/* 0.332.0: composer formatting toolbar — a thin full-width row at the top of the
+   composer column, so it never shrinks the textarea. Horizontally scrollable on
+   narrow (mobile) widths. */
+.stashpad-composer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 2px 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  /* 0.363.5: let the toolbar SCROLL instead of widening its container. As a flex
+     child its default min-width is auto (= the full button-row content width),
+     which pushed the edit modal wider than the mobile screen. min-width:0 +
+     max-width:100% pin it to the parent so overflow-x:auto kicks in — the same
+     scroll behaviour the composer toolbar has. */
+  min-width: 0;
+  max-width: 100%;
+}
+.stashpad-composer-toolbar::-webkit-scrollbar { display: none; }
+.stashpad-composer-toolbar-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-composer-toolbar-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-composer-toolbar-btn .svg-icon { width: 16px; height: 16px; }
+.is-mobile .stashpad-composer-toolbar-btn { width: 34px; height: 34px; }
+
+/* 0.330.0: global quick-capture modal. */
+.stashpad-quickcapture-modal .stashpad-qc-fileinput { display: none; }
+.stashpad-quickcapture-modal.is-drag-over { outline: 2px dashed var(--interactive-accent); outline-offset: -6px; }
+.stashpad-qc-dest { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.stashpad-qc-dest-label { color: var(--text-muted); font-size: 13px; flex: 0 0 auto; }
+.stashpad-qc-select { flex: 1 1 auto; min-width: 0; }
+.stashpad-qc-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 90px;
+  resize: vertical;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 8px;
+}
+.stashpad-qc-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.stashpad-qc-chips.is-empty { display: none; }
+.stashpad-qc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: var(--background-secondary);
+  font-size: 12px;
+  max-width: 220px;
+}
+.stashpad-qc-chip-icon { display: inline-flex; color: var(--text-muted); }
+.stashpad-qc-chip-icon .svg-icon { width: 13px; height: 13px; }
+.stashpad-qc-chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-qc-chip-del { border: none; background: transparent; color: var(--text-faint); cursor: pointer; padding: 0 2px; font-size: 11px; }
+.stashpad-qc-chip-del:hover { color: var(--text-normal); }
+.stashpad-qc-actions { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.stashpad-qc-attach { display: inline-flex; align-items: center; gap: 2px; }
+.stashpad-qc-attach .svg-icon { width: 14px; height: 14px; }
+/* 0.364.2: split-on-newlines toggle in the quick-capture action row. It sits at
+   the left with Attach; margin-right:auto here pushes Cancel/Save to the right. */
+.stashpad-qc-split { display: inline-flex; align-items: center; gap: 2px; }
+.stashpad-qc-split .svg-icon { width: 14px; height: 14px; }
+.stashpad-qc-split.is-active { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
+.stashpad-qc-attach { margin-right: auto; }
+
+/* 0.364.2: Obsidian gives mobile modals a very round 30px corner that reads as
+   bubbly/cheap. Dial STASHPAD's own modals back to a cleaner radius. Scoped to
+   our modal classes so Obsidian's core surfaces (and themes) are untouched. */
+.is-mobile .modal.stashpad-quickcapture-modal,
+.is-mobile .modal.stashpad-split-modal { border-radius: 14px; }
+
+/* 0.329.0: find-in-list bar — sits above the list, narrows it as you type. */
+.stashpad-findbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+}
+.stashpad-findbar-icon { display: inline-flex; color: var(--text-muted); flex: 0 0 auto; }
+.stashpad-findbar-icon .svg-icon { width: 15px; height: 15px; }
+.stashpad-findbar-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-normal);
+  font-size: 14px;
+  outline: none;
+  padding: 2px 0;
+}
+.stashpad-findbar-clear {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 2px;
+}
+.stashpad-findbar-clear:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-findbar-clear .svg-icon { width: 14px; height: 14px; }
+
 /* 0.322.0: recent / saved search rows in the search modal. */
 .stashpad-search-special-row { display: flex; align-items: center; gap: 7px; }
 .stashpad-search-special-icon { display: inline-flex; color: var(--text-muted); }
@@ -9999,15 +10357,128 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-search-special-del {
   margin-left: auto;
   border: none;
+  /* 0.328.0: square chrome (the default button radius made it read as a pill). */
+  border-radius: 2px;
   background: transparent;
   color: var(--text-faint);
   cursor: pointer;
-  padding: 0 4px;
+  padding: 2px 5px;
   font-size: 12px;
+  line-height: 1;
 }
-.stashpad-search-special-del:hover { color: var(--text-normal); }
+.stashpad-search-special-del:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
 .is-save-search .stashpad-search-special-icon { color: var(--interactive-accent); }
 
 /* 0.322.1: saved-view delete button in the launcher. */
-.stashpad-launcher-del { margin-left: auto; border: none; background: transparent; color: var(--text-faint); cursor: pointer; padding: 0 6px; font-size: 12px; }
-.stashpad-launcher-del:hover { color: var(--text-normal); }
+.stashpad-launcher-del { margin-left: auto; border: none; border-radius: 2px; background: transparent; color: var(--text-faint); cursor: pointer; padding: 2px 5px; font-size: 12px; line-height: 1; }
+.stashpad-launcher-del:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+
+/* 0.357.0: whole reply/color rows in the edit modal are clickable. */
+.stashpad-split-reply.is-rowclickable, .stashpad-split-color.is-rowclickable { cursor: pointer; }
+.stashpad-split-reply.is-rowclickable:hover, .stashpad-split-color.is-rowclickable:hover { background: var(--background-modifier-hover); }
+
+/* 0.359.0: History row matches the reply/color rows; the three assignment rows
+   share a wrapper that collapses to one button-row on mobile. */
+.stashpad-split-history {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.stashpad-split-history-icon { display: inline-flex; color: var(--text-faint); }
+.stashpad-split-history-icon .svg-icon { width: 13px; height: 13px; }
+.stashpad-split-history-label { font-weight: 600; flex: 1; }
+/* Mobile: the three assignment rows collapse into one row of equal-width buttons,
+   like the edit/split tabs above. Detail text + secondary buttons hide so each is
+   a single tap target (whole-row click opens its picker/viewer). */
+.is-mobile .stashpad-split-assign { display: flex; gap: 6px; }
+.is-mobile .stashpad-split-assign > .stashpad-split-history,
+.is-mobile .stashpad-split-assign > .stashpad-split-reply,
+.is-mobile .stashpad-split-assign > .stashpad-split-color {
+  flex: 1 1 0; min-width: 0; justify-content: center; flex-wrap: nowrap;
+}
+.is-mobile .stashpad-split-reply-title,
+.is-mobile .stashpad-split-reply-pending,
+.is-mobile .stashpad-split-reply-btn,
+.is-mobile .stashpad-split-color-btn,
+.is-mobile .stashpad-split-history-btn { display: none; }
+.is-mobile .stashpad-split-history-label,
+.is-mobile .stashpad-split-reply-label,
+.is-mobile .stashpad-split-color-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 0.361.0 (fun): the self-measuring button beneath the composer. */
+.stashpad-composer-funsize {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  min-height: 22px;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  cursor: default;
+}
+
+/* ============================================================================
+   0.364.0: Kanban board — property-pivot by color (src/kanban-view.ts).
+   Columns scroll horizontally; each column's cards scroll vertically. Cards are
+   drag-to-recolor; the column swatch + name label the target color/alias.
+   ============================================================================ */
+.stashpad-kanban { display: flex; flex-direction: column; height: 100%; padding: 8px 10px; box-sizing: border-box; }
+.stashpad-kanban-bar { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; padding-bottom: 8px; }
+.stashpad-kanban-title { margin: 0; font-size: var(--font-ui-medium); }
+.stashpad-kanban-count { color: var(--text-muted); font-weight: normal; font-size: var(--font-ui-smaller); }
+/* 0.364.1: group-by picker + None-column reveal toggle. */
+.stashpad-kanban-select { font-size: var(--font-ui-smaller); padding: 3px 6px; border-radius: 5px; }
+.stashpad-kanban-nonetoggle {
+  font-size: var(--font-ui-smaller); padding: 3px 9px; border-radius: 5px; cursor: pointer;
+  background: transparent; border: 1px solid var(--background-modifier-border); color: var(--text-muted);
+}
+.stashpad-kanban-nonetoggle:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-kanban-refresh {
+  margin-left: auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 0; border-radius: 5px; background: transparent;
+  border: 1px solid var(--background-modifier-border); color: var(--text-muted); cursor: pointer;
+}
+.stashpad-kanban-refresh:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-kanban-refresh .svg-icon { width: 15px; height: 15px; }
+
+.stashpad-kanban-board {
+  flex: 1 1 auto; min-height: 0; display: flex; gap: 10px;
+  overflow-x: auto; overflow-y: hidden; align-items: stretch; padding-bottom: 4px;
+}
+.stashpad-kanban-col {
+  flex: 0 0 260px; max-width: 260px; display: flex; flex-direction: column; min-height: 0;
+  background: var(--background-secondary); border: 1px solid var(--background-modifier-border);
+  border-radius: 8px; padding: 8px;
+}
+.stashpad-kanban-col.is-dragover { border-color: var(--interactive-accent); box-shadow: 0 0 0 1px var(--interactive-accent) inset; }
+.stashpad-kanban-col-head { display: flex; align-items: center; gap: 6px; padding: 2px 4px 8px; flex: 0 0 auto; }
+.stashpad-kanban-swatch { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 0 1px var(--background-modifier-border) inset; }
+.stashpad-kanban-swatch.is-none { background: transparent; box-shadow: 0 0 0 1.5px var(--text-faint) inset; }
+.stashpad-kanban-col-name { font-weight: 600; font-size: var(--font-ui-smaller); color: var(--text-normal); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-kanban-col-count { margin-left: auto; color: var(--text-muted); font-size: var(--font-ui-smaller); flex: 0 0 auto; }
+
+.stashpad-kanban-cards { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding: 2px; }
+.stashpad-kanban-card {
+  background: var(--background-primary); border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--background-modifier-border); border-radius: 6px; padding: 7px 9px;
+  cursor: grab; font-size: var(--font-ui-smaller); line-height: 1.35;
+}
+.stashpad-kanban-card:hover { border-color: var(--interactive-accent); }
+.stashpad-kanban-card.is-dragging { opacity: 0.45; }
+.stashpad-kanban-card-title { color: var(--text-normal); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.stashpad-kanban-card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.stashpad-kanban-tag { color: var(--text-accent); font-size: var(--font-ui-smaller); opacity: 0.85; }
+.stashpad-kanban-empty { color: var(--text-muted); padding: 24px; }
+
+/* Mobile: slightly narrower columns so two peek on a phone. */
+.is-mobile .stashpad-kanban-col { flex-basis: 78vw; max-width: 78vw; }

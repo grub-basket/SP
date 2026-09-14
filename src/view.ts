@@ -1,5 +1,5 @@
 import {
-  App, ItemView, Keymap, MarkdownRenderer, Menu, Notice, Platform,
+  App, ItemView, Keymap, MarkdownRenderer, Menu, Modal, Notice, Platform,
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce, type Debouncer,
   moment, sanitizeHTMLToDom, setIcon,
 } from "obsidian";
@@ -31,7 +31,7 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal} from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow} from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import { AppImportModal } from "./stashpad-app-import-modal";
 import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
@@ -72,12 +72,16 @@ import {
 import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
 import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMeta } from "./cross-vault-clipboard";
+import { folderTransferAvailable, readXvFolderPointer } from "./cross-vault-folder";
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
 import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
+import { dedupeDrafts, draftHasContent, draftDedupKey } from "./drafts";
+import { fixDuplicatedEmphasisOpeners, straightenCurlyQuotes } from "./markdown-input";
+import { renderFormattingToolbar } from "./formatting-toolbar";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -253,6 +257,15 @@ export class StashpadView extends ItemView {
   /** Active color filter — null means show everything; otherwise the
    *  hex string (e.g. "#E07A78") that visible notes must carry. */
   private colorFilter: string | null = null;
+  /** 0.329.0: find-in-list — incremental type-to-filter of the CURRENT list
+   *  (the focus's shown children), distinct from the global search modal. null =
+   *  inactive; "" = bar open but empty (shows everything). Title matches live in
+   *  filterChildren; body matches are precomputed async into findBodyMatches. */
+  private findText: string | null = null;
+  private findBodyMatches: Set<StashpadId> = new Set();
+  private findBarEl: HTMLElement | null = null;
+  private findInputEl: HTMLInputElement | null = null;
+  private findDebounce: number | null = null;
   /** 0.88.1: when true, show only notes that came in via import
    *  (frontmatter `imported: true`). Per-session, like tag/color. */
   private importedOnly = false;
@@ -399,7 +412,7 @@ export class StashpadView extends ItemView {
    *  current folder. */
   private nextDestinationFolder: string | null = null;
   private nextDestinationLabel: string | null = null;
-  private inListPicker: { activeIdx: number } | null = null;
+  private inListPicker: { activeIdx: number; mode: "nest" | "reply"; sourceIds: StashpadId[] } | null = null;
   /** 0.91.2: timestamp of the last Escape that cancelled the in-list picker.
    *  The picker-cancel and the multi-selection "collapse to one" live in TWO
    *  different Escape handlers (the keymap Scope handler + the document keydown
@@ -419,6 +432,16 @@ export class StashpadView extends ItemView {
   /** public: read by ViewDnD (the host interface). */
   listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
+  /** 0.357.0: the full composer placeholder string, re-asserted when the box
+   *  empties (defensive against a mobile truncation to "N"). */
+  private composerPlaceholderText = "";
+  /** 0.363.3: custom placeholder OVERLAY. The native textarea placeholder paints
+   *  as a stuck "N" on iOS after an internal-link insert+delete — a WebKit
+   *  stale-glyph bug the attribute couldn't beat (three tries). We drive the
+   *  native `placeholder=""` and render this element over the textarea instead,
+   *  toggled purely by whether the box is empty, so painting never depends on
+   *  iOS's placeholder layer. */
+  private composerPlaceholderEl: HTMLElement | null = null;
   /** 0.282.0 (teams): duplicate-hint panel host. */
   private dupPanelHost: HTMLElement | null = null;
   /** 0.287.1: the mobile duplicate-hints toggle. PER-DEVICE (localStorage), not
@@ -1054,6 +1077,13 @@ export class StashpadView extends ItemView {
       // 0.267.1: the cache is now authoritative for this file, so drop our
       // override rather than letting it shadow a change made elsewhere.
       this.obscuredState.delete(file.path);
+      // 0.340.1: a just-created note's cache is now indexed — repaint its body
+      // ONCE from the fresh cache so links/embeds/tags that were stale at
+      // primeRender resolve, without waiting for an unrelated render.
+      if (this.pendingMetaRepaint.delete(file.path) && file.path.startsWith(this.noteFolder + "/")) {
+        this.bodyRenderer.evict(file);
+        this.repaintRowBody(file);
+      }
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       for (const map of [this.completedState, this.taskTaggedState]) {
@@ -1076,6 +1106,17 @@ export class StashpadView extends ItemView {
     this.registerEvent(this.app.vault.on("delete", (file) => {
       this.completedState.delete(file.path);
       this.taskTaggedState.delete(file.path);
+      // 0.339.0: handle a deleted note's version-history file. Path-independent
+      // (fires for every delete route); the id comes from the filename since the
+      // frontmatter is already gone.
+      // 0.355.0: MOVE it into the folder's `_trashed` holding area instead of
+      // hard-deleting, so restoring the note from the OS trash re-attaches its
+      // history (see restoreHistory + main.ts's create handler).
+      if (this.plugin.settings.enableNoteHistory && file.path.endsWith(".md")) {
+        const hid = parseIdFromFilename(file.name.replace(/\.md$/, "")); // parseIdFromFilename wants the basename
+        const hfolder = file.path.slice(0, file.path.lastIndexOf("/"));
+        if (hid && hfolder) void this.plugin.history.trashHistory(hfolder, hid);
+      }
       // Refresh the list when a note in THIS folder is deleted on the filesystem
       // (sync client, another device, OS-level delete) — the map cleanup above
       // doesn't redraw, and the metadataCache "resolved" reconcile can lag or not
@@ -1846,6 +1887,14 @@ export class StashpadView extends ItemView {
       if ((s as { cursorId?: string }).cursorId) this.pendingCursorId = (s as { cursorId?: string }).cursorId as StashpadId;
       if ("tagFilter" in s) this.tagFilter = s.tagFilter ?? null;
       if ("colorFilter" in s) this.colorFilter = s.colorFilter ?? null;
+      // 0.335.0: a FRESH folder open carries a folderOverride but NO serialized
+      // filters (activateViewForFolder sets only { folderOverride }). A reload,
+      // saved view, or deep link always includes tagFilter (getState /
+      // captureViewState do), so this restores the folder's cached chips ONLY on
+      // a bare open and never overrides an explicit state.
+      if (("folderOverride" in s) && !("tagFilter" in s) && s.folderOverride) {
+        this.restoreFolderChips(String(s.folderOverride));
+      }
       if ("timeFilterCalendar" in s) this.timeFilterCalendar = !!s.timeFilterCalendar;
       if ("tinyMode" in s) this.tinyMode = !!s.tinyMode;
       if ("tinyAlwaysOnTop" in s) this.tinyAlwaysOnTop = !!s.tinyAlwaysOnTop;
@@ -2038,6 +2087,9 @@ export class StashpadView extends ItemView {
     if (!opts.skipHistory) this.recordNavState();
     this.folderOverride = cleaned;
     this.focusId = ROOT_ID;
+    // 0.335.0: each folder remembers its own filter chips — clear the outgoing
+    // folder's filters and restore the incoming folder's saved set.
+    this.restoreFolderChips(cleaned ?? "");
     this.lastCursorByFocus.clear();
     this.selection.clear();
     this.cursorIdx = -1;
@@ -2220,6 +2272,7 @@ export class StashpadView extends ItemView {
    *  loses the new focus. requestSaveLayout is debounced by Obsidian so
    *  rapid navigation won't thrash disk. */
   private persistFocus(): void {
+    this.saveFolderChips(); // 0.335.0: persist chips on the user changes that route here (tag/color/…)
     try { this.app.workspace.requestSaveLayout(); } catch { /* ignore */ }
   }
 
@@ -2445,6 +2498,7 @@ export class StashpadView extends ItemView {
       if (!id) continue;
       const node = this.tree.get(id);
       if (node?.parent) orphanedParents.add(node.parent);
+      // (history cleanup happens in the vault "delete" listener — path-independent)
     }
     // Trash notes (children before parents — already in that order from our delete walk).
     for (const n of snap.notes) {
@@ -2475,9 +2529,34 @@ export class StashpadView extends ItemView {
   private getDraftPointer(): string | null {
     try { const v = this.app.loadLocalStorage(this.draftPointerKey(this.noteFolder)); return typeof v === "string" && v ? v : null; } catch { return null; }
   }
-  /** Every draft for `folder`, newest-edited first. */
+  /** Every draft for `folder`, newest-edited first, with EXACT-duplicate content
+   *  collapsed (0.340.0). "new" drafts with identical trimmed text — e.g. four
+   *  empty `[[]]` drafts — show as one (the newest); "edit" drafts are keyed by
+   *  their target so two edits of the same note also collapse. */
   folderDrafts(folder: string = this.noteFolder): ComposerDraft[] {
-    return Object.values(this.plugin.settings.composerDrafts ?? {}).filter((d) => d.folder === folder).sort((a, b) => b.modified - a.modified);
+    const all = Object.values(this.plugin.settings.composerDrafts ?? {}).filter((d) => d.folder === folder).sort((a, b) => b.modified - a.modified);
+    return dedupeDrafts(all);
+  }
+
+  /** 0.340.0: physically drop the older exact-duplicate drafts from storage
+   *  (keeping the newest of each), so duplicates don't accumulate across
+   *  devices/sessions. Never removes the active draft. Returns true if it changed
+   *  anything. */
+  private pruneDuplicateDrafts(folder: string): boolean {
+    const all = Object.values(this.plugin.settings.composerDrafts ?? {}).filter((d) => d.folder === folder).sort((a, b) => b.modified - a.modified);
+    const seen = new Set<string>();
+    const removeIds: string[] = [];
+    for (const d of all) {
+      if (d.kind !== "edit" && !draftHasContent(d.text)) { if (d.id !== this.activeDraftId) removeIds.push(d.id); continue; }
+      const key = draftDedupKey(d);
+      if (seen.has(key)) { if (d.id !== this.activeDraftId) removeIds.push(d.id); continue; }
+      seen.add(key);
+    }
+    if (removeIds.length === 0) return false;
+    const next = { ...(this.plugin.settings.composerDrafts ?? {}) };
+    for (const id of removeIds) delete next[id];
+    this.plugin.settings.composerDrafts = next;
+    return true;
   }
   activeDraft(): ComposerDraft | null {
     return this.activeDraftId ? (this.plugin.settings.composerDrafts?.[this.activeDraftId] ?? null) : null;
@@ -2496,6 +2575,8 @@ export class StashpadView extends ItemView {
     if (!id || !all[id] || all[id].folder !== this.noteFolder) id = this.folderDrafts().find((d) => d.kind === "new")?.id ?? null;
     this.activeDraftId = id;
     this.setDraftPointer(id);
+    // 0.340.0: clean up exact-duplicate drafts accumulated across sessions/devices.
+    if (this.pruneDuplicateDrafts(this.noteFolder)) void this.plugin.persistSettingsQuiet();
     const d = id ? all[id] : null;
     this.composerDraft = d?.text ?? "";
     // The reply target rides along with the draft (it used to be lost on reload).
@@ -2549,13 +2630,22 @@ export class StashpadView extends ItemView {
       if (existing === text) return;
       const next = { ...all };
       const now = Date.now();
-      if (text.length === 0) {
+      // 0.345.4: treat "effectively empty" text (an empty [[]] link, bare **, a
+      // lone #, whitespace) the same as truly empty — don't persist it. This is
+      // what let the toolbar's link button spawn a pile of empty `[[]]` drafts.
+      const empty = text.length === 0 || (cur?.kind !== "edit" && !draftHasContent(text));
+      if (empty) {
         // Cleared: a NEW draft disappears; an EDIT draft keeps its identity with
         // empty text (the edit itself is still in progress until saved/cancelled).
-        if (cur && cur.kind === "edit") next[cur.id] = { ...cur, text: "", modified: now };
+        if (cur && cur.kind === "edit") next[cur.id] = { ...cur, text, modified: now };
         else if (cur) { delete next[cur.id]; this.activeDraftId = null; this.setDraftPointer(null); }
       } else {
-        const id = cur?.id ?? this.newDraftId();
+        // Reuse an existing same-folder draft with identical (whitespace-normalized)
+        // content instead of minting a new id — otherwise a post-send composer,
+        // left unbound, spawns a fresh draft on every keystroke/insertion.
+        const wantKey = draftDedupKey({ folder, text, kind: cur?.kind ?? "new", edit: cur?.edit, id: cur?.id ?? "" });
+        const twin = cur ? undefined : Object.values(all).find((d) => draftDedupKey(d) === wantKey);
+        const id = cur?.id ?? twin?.id ?? this.newDraftId();
         next[id] = {
           id, folder, text, modified: now,
           created: cur?.created ?? now,
@@ -2571,7 +2661,7 @@ export class StashpadView extends ItemView {
       // Stashpad tabs viewing the same folder drop their stale in-memory
       // composerDraft and don't write it back on the next blur. Mid-typing
       // saves stay quiet to avoid focus-stealing re-render storms.
-      if (text.length === 0) await this.plugin.saveSettings();
+      if (empty) await this.plugin.saveSettings();
       else await this.plugin.persistSettingsQuiet();
       this.refreshDraftsChip();
     } catch (e) { console.warn("Stashpad: drafts save failed", e); }
@@ -2632,6 +2722,12 @@ export class StashpadView extends ItemView {
       const top = chip.createDiv({ cls: "stashpad-reply-chip-top" });
       setIcon(top.createSpan({ cls: "stashpad-reply-chip-icon" }), "pencil-line");
       top.createSpan({ cls: "stashpad-reply-chip-label", text: "Editing" });
+      // 0.363.8: pop the edit out into the full edit modal, carrying live text.
+      const pop = top.createEl("button", { cls: "stashpad-reply-chip-x stashpad-reply-chip-popout" });
+      setIcon(pop, "maximize-2");
+      pop.setAttr("aria-label", "Open in edit modal");
+      pop.title = "Open in the edit modal — your in-progress text comes with it";
+      pop.onclick = (e) => { e.preventDefault(); void this.popOutComposerEditToModal(); };
       const x = top.createEl("button", { cls: "stashpad-reply-chip-x" });
       setIcon(x, "x");
       x.setAttr("aria-label", "Stop editing");
@@ -2699,6 +2795,28 @@ export class StashpadView extends ItemView {
     this.replyTarget = null;
     this.refreshReplyChip();
     await this.rebindToNextDraft();
+  }
+
+  /** 0.363.8: pop the current composer edit OUT into the edit modal, carrying the
+   *  in-progress text. The composer's edit draft is dropped (the edit continues in
+   *  the modal, so leaving a stray "Resume editing" draft would be confusing), the
+   *  composer rebinds to its next draft, and the modal opens on the same note
+   *  seeded with the live text — Save there writes through the same chokepoint. */
+  async popOutComposerEditToModal(): Promise<void> {
+    const cur = this.activeDraft();
+    if (cur?.kind !== "edit" || !cur.edit) return;
+    const live = this.composerInputEl?.value ?? cur.text;
+    const node = this.tree.get(cur.edit.id as StashpadId);
+    if (!node?.file) { new Notice("The note being edited is gone."); return; }
+    // Drop the composer edit draft (moving the edit, not discarding it).
+    const all = { ...(this.plugin.settings.composerDrafts ?? {}) };
+    delete all[cur.id];
+    this.plugin.settings.composerDrafts = all;
+    try { await this.plugin.saveSettings(); } catch { /* ignore */ }
+    this.replyTarget = null;
+    this.refreshReplyChip();
+    await this.rebindToNextDraft();
+    await this.cmdSplit(node, "edit", undefined, "modal", live);
   }
 
   /** Send while an EDIT draft is bound = save the note's body through the same
@@ -3445,9 +3563,150 @@ export class StashpadView extends ItemView {
     return links.some((l) => l.link.includes(dayStr) || (l.displayText ?? "").includes(dayStr));
   }
 
+  /** 0.329.0: toggle the find-in-list bar. Opening focuses the input; a second
+   *  invocation (command / ribbon) closes it. */
+  toggleFindInList(): void {
+    if (this.findText !== null) { this.closeFindInList(); return; }
+    if (!this.listEl) { this.render(); }
+    this.findText = "";
+    this.findBodyMatches = new Set();
+    this.refreshList();      // rebuilds the list; renderInner isn't hit, so mount here
+    this.mountFindBar();
+    this.findInputEl?.focus();
+  }
+
+  /** Close the find bar, clear the filter, restore the full list. */
+  private closeFindInList(): void {
+    if (this.findDebounce != null) { clearTimeout(this.findDebounce); this.findDebounce = null; }
+    this.findText = null;
+    this.findBodyMatches = new Set();
+    this.findBarEl?.remove();
+    this.findBarEl = null;
+    this.findInputEl = null;
+    this.refreshList();
+  }
+
+  /** 0.329.0: (re)create the find bar above the list when find is active. Called
+   *  on open AND from renderInner, so a full render (folder switch, edit repaint)
+   *  keeps the bar. Idempotent — a bar already in the DOM is left as-is. */
+  private mountFindBar(): void {
+    if (this.findText === null) return;
+    const list = this.listEl;
+    const container = list?.parentElement;
+    if (!list || !container) return;
+    if (this.findBarEl && this.findBarEl.isConnected && this.findBarEl.parentElement === container) return;
+    const bar = container.createDiv({ cls: "stashpad-findbar" });
+    container.insertBefore(bar, list);
+    const icon = bar.createSpan({ cls: "stashpad-findbar-icon" });
+    setIcon(icon, "list-filter");
+    const input = bar.createEl("input", { cls: "stashpad-findbar-input", attr: { type: "text", placeholder: "Find in list…" } });
+    input.value = this.findText;
+    const clear = bar.createEl("button", { cls: "stashpad-findbar-clear", attr: { "aria-label": "Clear / close find" } });
+    setIcon(clear, "x");
+    input.addEventListener("input", () => {
+      this.findText = input.value;
+      this.refreshList();                    // instant title-level narrowing
+      if (this.findDebounce != null) clearTimeout(this.findDebounce);
+      this.findDebounce = window.setTimeout(() => { void this.recomputeFindBodyMatches(); }, 180);
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); this.closeFindInList(); }
+    });
+    clear.onclick = () => {
+      if (input.value) { input.value = ""; this.findText = ""; this.findBodyMatches = new Set(); this.refreshList(); input.focus(); }
+      else this.closeFindInList();
+    };
+    this.findBarEl = bar;
+    this.findInputEl = input;
+  }
+
+  /** 0.329.0: read the shown notes' bodies and record which match the find text,
+   *  so filterChildren can include body-only hits. Stale-guarded against a text
+   *  that changed mid-read. */
+  private async recomputeFindBodyMatches(): Promise<void> {
+    const text = this.findText ? this.findText.trim() : "";
+    if (!text) { this.findBodyMatches = new Set(); return; }
+    const items = this.collectViewItems(this.focusId);
+    const next = new Set<StashpadId>();
+    for (const n of items) {
+      if (!n.file) continue;
+      try {
+        const body = this.stripFrontmatter(await this.app.vault.cachedRead(n.file));
+        if (siftMatch(text, body)) next.add(n.id);
+      } catch { /* unreadable → title-only for this note */ }
+    }
+    if ((this.findText ? this.findText.trim() : "") !== text) return; // superseded
+    this.findBodyMatches = next;
+    this.refreshList();
+  }
+
+  // ---------- 0.335.0: per-folder filter-chip persistence ----------
+  //
+  // Filters persist per-LEAF in workspace.json (getState), so a reload restores
+  // them. But CLOSING a tab and opening the folder anew (a fresh leaf) started
+  // with no filters. These cache the selected chips per FOLDER in per-device
+  // localStorage, so reopening a folder shows the same chips. A reload / saved-
+  // view / deep-link open carries its OWN filters in the view state and is left
+  // alone (see setState); only a bare folder open restores the cache.
+  private chipStoreKey(folder: string): string { return `stashpad-chips:${folder}`; }
+
+  private snapshotChips(): Record<string, unknown> {
+    return {
+      timeFilterCount: this.timeFilterCount,
+      timeFilterUnit: this.timeFilterUnit,
+      timeFilterAnchor: this.timeFilterAnchor,
+      timeFilterCalendar: this.timeFilterCalendar,
+      tagFilter: this.tagFilter,
+      colorFilter: this.colorFilter,
+      importedOnly: this.importedOnly,
+      dateFilter: this.dateFilter,
+      authorFilter: this.authorFilter,
+    };
+  }
+
+  private saveFolderChips(): void {
+    const folder = this.noteFolder;
+    if (!folder) return;
+    try { this.app.saveLocalStorage(this.chipStoreKey(folder), this.snapshotChips()); } catch { /* per-device only */ }
+  }
+
+  private applyChipSnapshot(s: Record<string, unknown>): void {
+    if (typeof s.tagFilter === "string" || s.tagFilter === null) this.tagFilter = s.tagFilter as string | null;
+    if (typeof s.colorFilter === "string" || s.colorFilter === null) this.colorFilter = s.colorFilter as string | null;
+    if (typeof s.authorFilter === "string" || s.authorFilter === null) this.authorFilter = s.authorFilter as string | null;
+    if (typeof s.importedOnly === "boolean") this.importedOnly = s.importedOnly;
+    if (typeof s.timeFilterCalendar === "boolean") this.timeFilterCalendar = s.timeFilterCalendar;
+    if (typeof s.dateFilter === "number" || s.dateFilter === null) this.dateFilter = s.dateFilter as number | null;
+    if (typeof s.timeFilterCount === "number") this.timeFilterCount = s.timeFilterCount;
+    if (typeof s.timeFilterUnit === "string") this.timeFilterUnit = s.timeFilterUnit as TimeUnit;
+    if (typeof s.timeFilterAnchor === "number" || s.timeFilterAnchor === null) this.timeFilterAnchor = s.timeFilterAnchor as number | null;
+  }
+
+  /** Clear carried-over filters, then apply this folder's saved chip set. */
+  private restoreFolderChips(folder: string): void {
+    this.tagFilter = null; this.colorFilter = null; this.authorFilter = null;
+    this.importedOnly = false; this.dateFilter = null;
+    this.timeFilterCount = 0; this.timeFilterAnchor = null;
+    try {
+      const s = this.app.loadLocalStorage(this.chipStoreKey(folder.replace(/\/+$/, "")));
+      if (s && typeof s === "object") this.applyChipSnapshot(s as Record<string, unknown>);
+    } catch { /* ignore */ }
+  }
+
+  /** 0.335.0: Reset button/command — clear every filter chip for this folder. */
+  resetFilters(): void {
+    this.tagFilter = null; this.colorFilter = null; this.authorFilter = null;
+    this.importedOnly = false; this.dateFilter = null;
+    this.timeFilterCount = 0; this.timeFilterAnchor = null;
+    this.saveFolderChips();
+    this.render();
+    new Notice("Filters cleared.");
+  }
+
   /** Set/clear the single-day filter and repaint. */
   setDateFilter(dayStart: number | null): void {
     this.dateFilter = dayStart;
+    this.saveFolderChips(); // 0.335.0: keep the per-folder cache current
     this.render();
   }
   getDateFilter(): number | null { return this.dateFilter; }
@@ -3494,7 +3753,8 @@ export class StashpadView extends ItemView {
     const importedOnly = this.importedOnly;
     const authorId = this.authorFilter;
     const dateFilter = this.dateFilter;
-    if (!cutoff && !tag && !color && !hideCompleted && !attachmentsOnly && !importedOnly && !authorId && dateFilter === null) return children;
+    const find = this.findText ? this.findText.trim() : "";
+    if (!cutoff && !tag && !color && !hideCompleted && !attachmentsOnly && !importedOnly && !authorId && dateFilter === null && !find) return children;
     // 0.270.2: how far a pin outranks the filters is a three-way setting.
     // "all"  - a pinned note is never hidden (early return below).
     // "time" - it survives the TIME cutoff only; the content filters below still
@@ -3519,6 +3779,11 @@ export class StashpadView extends ItemView {
     };
     return children.filter((n) => {
       const pinned = pinMode !== "none" && (this.isPinnedAnyKind(n.id) || (keepChildren && hasPinnedAncestor(n)));
+      // 0.329.0: find-in-list is an EXPLICIT query, so it overrides the pin
+      // bypass below — a pinned note that doesn't match the find text is hidden
+      // (unlike the passive tag/colour filters, which a pin can outrank). Title
+      // matches live; body matches come from the async-precomputed set.
+      if (find && !siftMatch(find, this.titleForNode(n)) && !this.findBodyMatches.has(n.id)) return false;
       if (pinned && pinMode === "all") return true;
       // 0.88.1: imported-only + by-author filters (node-level, like tag/color).
       if (importedOnly) {
@@ -3527,8 +3792,16 @@ export class StashpadView extends ItemView {
       }
       if (authorId) {
         if (!n.file) return false;
-        const a = parseAuthorRef(this.app.metadataCache.getFileCache(n.file)?.frontmatter?.author);
-        if (!a || a.id !== authorId) return false;
+        // 0.339.0: "by <person>" matches the creator OR any contributor (editor),
+        // so a collaborator can see every note they've touched in this folder —
+        // the folder-level companion to the per-note history "by <person>" filter.
+        const fm = this.app.metadataCache.getFileCache(n.file)?.frontmatter as Record<string, unknown> | undefined;
+        const a = parseAuthorRef(fm?.author);
+        let match = !!a && a.id === authorId;
+        if (!match && Array.isArray(fm?.contributors)) {
+          match = (fm!.contributors as unknown[]).some((c) => typeof c === "string" && parseAuthorRef(c)?.id === authorId);
+        }
+        if (!match) return false;
       }
       if (cutoff && n.created && !pinned) {
         const t = Date.parse(n.created);
@@ -3841,6 +4114,7 @@ export class StashpadView extends ItemView {
       kb: this.keyboardVisible ? 1 : 0,
     });
     this.backlinkIndex = null;   // rebuilt on demand; never carried across renders
+    this.replyIndex = null;      // 0.333.0: same — reply reverse-index rebuilt per render
     try {
       this.renderInner(policy);
     } finally {
@@ -4147,6 +4421,10 @@ export class StashpadView extends ItemView {
     this.virtAnchorHint = anchor;
     this.virtAnchoredScrollTop = null;
     this.populateListBody(list, focused);
+    // 0.329.0: a full render rebuilds the chrome, so re-mount the find bar (a
+    // sibling of the fresh list) when find-in-list is active.
+    this.findBarEl = null;
+    this.mountFindBar();
     // Consumed by virtMount; clear it if the list didn't virtualize so it can't
     // leak into a later render.
     this.virtAnchorHint = null;
@@ -4340,7 +4618,18 @@ export class StashpadView extends ItemView {
             this.suppressScrollSave = true;
             this.virtEnsureId(targetId); // 0.295.0: the row may not be built yet
             const row = listForScroll.querySelector(`[data-id="${targetId}"]`);
-            if (row) row.scrollIntoView({ block: align, behavior: "auto" });
+            if (row) {
+              // 0.360.0: the focused HEADING row is sticky at top:0, so a plain
+              // scrollIntoView({block:"start"}) puts the target at scrollTop 0 —
+              // UNDER the heading, with its top cut off (regression on navigate-out).
+              // scroll-padding-top on the list makes scrollIntoView leave room for
+              // the heading, so a "start" target lands just BELOW it.
+              if (align === "start") {
+                const heading = listForScroll.querySelector(".is-heading-row") as HTMLElement | null;
+                listForScroll.style.scrollPaddingTop = heading ? `${heading.offsetHeight}px` : "";
+              }
+              row.scrollIntoView({ block: align, behavior: "auto" });
+            }
             Promise.resolve().then(() => { this.suppressScrollSave = false; });
           };
           // 0.270.1: re-assert only on the steps where the geometry moved —
@@ -5076,6 +5365,22 @@ export class StashpadView extends ItemView {
     setIconSafe(openLinkBtn, "link", "🔗");
     openLinkBtn.title = "Open a Stashpad link (paste a deep link / URL)";
     openLinkBtn.onclick = (e) => { e.preventDefault(); this.plugin.openDeepLinkModal(); };
+    // 0.363.1: composer-debug button, to the RIGHT of the deep-link button — opens
+    // the copyable debug modal (placeholder value + autocomplete reveal decision).
+    // 0.363.2: action-bar button that runs a configurable Obsidian command —
+    // defaults to the command palette (settings.composerActionCommand). Empty
+    // string hides it. Third-party-palette users can repoint it in settings.
+    const cmdId = this.plugin.settings.composerActionCommand;
+    if (cmdId) {
+      const cmdBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn stashpad-composer-command-btn" });
+      const cmd = (this.app as any).commands?.commands?.[cmdId];
+      setIconSafe(cmdBtn, cmd?.icon || "terminal", "⌘");
+      cmdBtn.title = cmd?.name ? `Run: ${cmd.name}` : "Run command";
+      cmdBtn.onclick = (e) => {
+        e.preventDefault();
+        (this.app as any).commands?.executeCommandById(cmdId);
+      };
+    }
   }
 
   /** Action menu for mobile — a single Menu with the most common
@@ -5112,6 +5417,7 @@ export class StashpadView extends ItemView {
     menu.addSeparator();
     menu.addItem((it: any) => it.setTitle("Move…").setIcon("arrow-right-circle").setDisabled(!hasTargets).onClick(() => this.cmdMovePicker()));
     menu.addItem((it: any) => it.setTitle("Nest under… (in-list)").setIcon("indent").setDisabled(!hasTargets).onClick(() => this.cmdInListPicker()));
+    menu.addItem((it: any) => it.setTitle("Reply to… (in-list)").setIcon("reply").setDisabled(!hasTargets).onClick(() => this.cmdReplyInListPicker()));
     menu.addItem((it: any) => it.setTitle("Outdent").setIcon("outdent").setDisabled(!hasTargets).onClick(() => void this.cmdOutdent()));
     menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").setDisabled(!hasTargets).onClick(() => this.cmdSetColor()));
     menu.addItem((it: any) => it.setTitle("Toggle complete").setIcon("check-circle").setDisabled(!hasTargets).onClick(() => void this.cmdToggleComplete()));
@@ -5865,17 +6171,22 @@ export class StashpadView extends ItemView {
     impRow.onclick = (e) => {
       if (e.target !== impCheck) { e.preventDefault(); impCheck.checked = !impCheck.checked; }
       this.importedOnly = impCheck.checked;
+      this.saveFolderChips(); // 0.335.0
       this.reconcileSelectionAfterFilter();
       this.refreshList();
     };
 
-    // By-author dropdown — distinct authors present in this folder.
+    // By author/editor dropdown — every creator AND contributor in this folder.
     const authors = new Map<string, string>();
     const dir = this.noteFolder.replace(/\/+$/, "");
     for (const f of this.app.vault.getMarkdownFiles()) {
       if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dir) continue;
-      const a = parseAuthorRef(this.app.metadataCache.getFileCache(f)?.frontmatter?.author);
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
+      const a = parseAuthorRef(fm?.author);
       if (a) authors.set(a.id, a.name);
+      if (Array.isArray(fm?.contributors)) {
+        for (const c of fm!.contributors as unknown[]) { const cr = typeof c === "string" ? parseAuthorRef(c) : null; if (cr) authors.set(cr.id, cr.name); }
+      }
     }
     // 0.122.7: divider above "By author" + a leading icon; dropped the
     // -toggle class so it isn't indented like the checkbox rows.
@@ -5883,7 +6194,7 @@ export class StashpadView extends ItemView {
     const authRow = container.createDiv({ cls: "stashpad-view-popover-row" });
     const authMain = authRow.createDiv({ cls: "stashpad-view-popover-main" });
     setIcon(authMain.createSpan({ cls: "stashpad-view-popover-icon" }), "user");
-    authMain.createSpan({ cls: "stashpad-view-popover-label", text: "By author" });
+    authMain.createSpan({ cls: "stashpad-view-popover-label", text: "By author / editor" });
     const authSel = authMain.createEl("select", { cls: "stashpad-view-author-select" });
     const allO = authSel.createEl("option", { text: "All authors", value: "" });
     if (!this.authorFilter) allO.selected = true;
@@ -5894,10 +6205,11 @@ export class StashpadView extends ItemView {
     authSel.onclick = (e) => e.stopPropagation();
     authSel.onchange = () => {
       this.authorFilter = authSel.value || null;
+      this.saveFolderChips(); // 0.335.0
       this.reconcileSelectionAfterFilter();
       this.refreshList();
     };
-    authRow.createDiv({ cls: "stashpad-view-popover-desc", text: authors.size ? "Show only notes by the chosen author." : "No authored notes in this folder yet." });
+    authRow.createDiv({ cls: "stashpad-view-popover-desc", text: authors.size ? "Show only notes the chosen person created or edited." : "No authored notes in this folder yet." });
   }
 
   private setTagFilter(raw: string | null): void {
@@ -6885,6 +7197,7 @@ export class StashpadView extends ItemView {
       menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => { onAction?.(); this.cmdReply(node); }));
       // 0.317.0: retro-link an existing note as a reply (+ remove when it is one).
       menu.addItem((it: any) => it.setTitle("Make a reply to\u2026").setIcon("corner-up-left").onClick(() => { onAction?.(); this.cmdReplyLinkPicker(node); }));
+      menu.addItem((it: any) => it.setTitle("Reply to\u2026 (in-list)").setIcon("reply").onClick(() => { onAction?.(); this.cmdReplyInListPicker(node); }));
       if (this.hasReplyLink(node)) menu.addItem((it: any) => it.setTitle("Remove reply link").setIcon("unlink").onClick(() => { onAction?.(); void this.setReplyLink(node, null); }));
       menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => { onAction?.(); void this.cmdEdit(node); }));
       menu.addItem((it: any) => it.setTitle("Open in Obsidian editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
@@ -7669,6 +7982,24 @@ export class StashpadView extends ItemView {
 
   /** Create + wire the task checkbox (used at the row's left edge on desktop,
    *  or inside the meta column on mobile). 0.87.1. */
+  /** 0.332.0: the composer formatting toolbar. Buttons wrap the current
+   *  selection (or insert at the caret) in Markdown markers — the same syntax
+   *  MarkdownInput's autopair produces — so structure is a click away, which
+   *  matters most on mobile where those markers are awkward to type. Each button
+   *  is tabindex -1 and preventDefaults mousedown so clicking never steals focus
+   *  or the selection from the textarea. */
+  private renderComposerToolbar(composer: HTMLElement): void {
+    if (!getSettings().showComposerToolbar) return;
+    // 0.336.0: shared with the edit modal (formatting-toolbar.ts). Tag +
+    // internal-link lead the row (user request), then the inline-format buttons.
+    renderFormattingToolbar(composer, () => this.composerInputEl, {
+      spoilers: getSettings().spoilerMarkup,
+      app: this.app,
+      snippets: getSettings().snippets,
+      toolbarButtons: getSettings().toolbarButtons,
+    });
+  }
+
   private addTaskCheckbox(parent: HTMLElement, node: TreeNode): void {
     const cb = parent.createSpan({ cls: "stashpad-note-task-checkbox" });
     const done = this.isCompleted(node);
@@ -7687,6 +8018,63 @@ export class StashpadView extends ItemView {
     cb.addEventListener("mousedown", (e) => e.stopPropagation());
     cb.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
     cb.onclick = (e) => { e.preventDefault(); e.stopPropagation(); void this.toggleCompletedForNode(node); };
+    // 0.325.0: parent-task progress. When this note has child TASKS, overlay a
+    // small "done/total" badge ON the checkbox (see renderTaskProgressBadge).
+    this.renderTaskProgressBadge(cb, node);
+  }
+
+  /** 0.325.0: (re)draw the "done/total" child-task progress badge on a checkbox.
+   *  Idempotent, so it's safe on fresh render and on in-place repaints.
+   *
+   *  The badge is a CSS `::after` fed by `data-spprog`, NOT a child element — on
+   *  purpose. The checkbox's icon is refreshed in place elsewhere via setIcon,
+   *  which empties the checkbox's CHILD nodes (it would wipe a child badge span)
+   *  but leaves classes and data-attributes intact. Generated content survives
+   *  that, so the count stays put without every icon-refresh path having to know
+   *  about it. Pointer-events:none + fade-on-hover (CSS) keep the box clickable. */
+  private renderTaskProgressBadge(cb: HTMLElement, node: TreeNode): void {
+    const prog = this.childTaskProgress(node);
+    if (!prog) {
+      cb.removeClass("has-progress", "is-progress-complete");
+      delete cb.dataset.spprog;
+      return;
+    }
+    cb.dataset.spprog = `${prog.done}/${prog.total}`;
+    cb.addClass("has-progress");
+    cb.toggleClass("is-progress-complete", prog.done >= prog.total);
+    cb.title = `${prog.done} of ${prog.total} subtasks done · click to toggle this note`;
+  }
+
+  /** 0.325.0: done/total over a parent note's DIRECT child tasks (nested
+   *  subtasks roll up through their own parents' badges). Returns null when the
+   *  note has no task children, so only real parents get a progress overlay. */
+  private childTaskProgress(node: TreeNode): { done: number; total: number } | null {
+    let done = 0, total = 0;
+    for (const k of this.tree.getChildren(node.id)) {
+      if (!this.isTask(k)) continue;
+      total++;
+      if (this.isCompleted(k)) done++;
+    }
+    return total > 0 ? { done, total } : null;
+  }
+
+  /** 0.325.0: after a child task toggles, refresh its PARENT's progress badge in
+   *  place — so "2/7" ticks to "3/7" without a full re-render. Best-effort: if
+   *  the parent row isn't currently rendered (scrolled out) or has no checkbox,
+   *  the badge simply refreshes on the next full render. */
+  private refreshParentProgress(node: TreeNode): void {
+    const pid = node.parent;
+    if (!pid) return;
+    const list = this.listEl;
+    if (!list) return;
+    const pnode = this.tree.get(pid);
+    if (!pnode) return;
+    let cb = list.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(pid)}"] .stashpad-note-task-checkbox`);
+    if (!cb) {
+      const heading = list.querySelector<HTMLElement>(".stashpad-focused.is-heading-row");
+      if (heading && heading.dataset.headingId === pid) cb = heading.querySelector<HTMLElement>(".stashpad-note-task-checkbox");
+    }
+    if (cb) this.renderTaskProgressBadge(cb, pnode);
   }
 
   /** Lazy-body render cache + IntersectionObserver machinery (0.82.1).
@@ -7879,6 +8267,7 @@ export class StashpadView extends ItemView {
       this.refreshStuckPreview(container, node, text);
       if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
       this.renderLinkRail(container, node);
+      this.renderReplyCount(container, node);
       // Multiplayer footer: author / contributors / last-edit. Each
       // sub-piece is gated by its own toggle in settings; the row only
       // renders if at least one piece is enabled AND has data.
@@ -7978,6 +8367,67 @@ export class StashpadView extends ItemView {
    *  Null until something asks for it, so a vault with the setting off never
    *  pays anything at all. */
   private backlinkIndex: Map<string, string[]> | null = null;
+  /** 0.333.0: reverse index of reply links — target note PATH → replier node ids.
+   *  Reply links live in `replyTo` frontmatter (a wikilink), NOT the body, so
+   *  they're deliberately separate from the backlink rail (which is body-only).
+   *  Rebuilt per render alongside backlinkIndex. */
+  private replyIndex: Map<string, StashpadId[]> | null = null;
+
+  /** 0.333.0: notes (in this folder's tree) whose `replyTo` resolves to `node`. */
+  private repliesTo(node: TreeNode): TreeNode[] {
+    if (!node.file) return [];
+    if (!this.replyIndex) {
+      const idx = new Map<string, StashpadId[]>();
+      for (const n of this.tree.allNodes()) {
+        if (!n.file) continue;
+        const rt = this.app.metadataCache.getFileCache(n.file)?.frontmatter?.replyTo;
+        if (typeof rt !== "string" || !rt) continue;
+        const linktext = rt.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0].split("#")[0].trim();
+        if (!linktext) continue;
+        const dest = this.app.metadataCache.getFirstLinkpathDest(linktext, n.file.path);
+        if (!dest) continue;
+        const list = idx.get(dest.path);
+        if (list) list.push(n.id); else idx.set(dest.path, [n.id]);
+      }
+      this.replyIndex = idx;
+    }
+    return (this.replyIndex.get(node.file.path) ?? [])
+      .map((id) => this.tree.get(id))
+      .filter((x): x is TreeNode => !!x && !!x.file);
+  }
+
+  /** 0.333.0: a "↩ N replies" chip on a note that others reply to. Tapping opens
+   *  a menu of the replies (newest first); picking one jumps to it. Telegram's
+   *  reply-count, but you can actually see and reach the replies. Setting-gated. */
+  private renderReplyCount(parent: HTMLElement, node: TreeNode): void {
+    if (!getSettings().showReplyCount) return;
+    const replies = this.repliesTo(node);
+    if (replies.length === 0) return;
+    const rail = parent.createDiv({ cls: "stashpad-reply-count-rail" });
+    const chip = rail.createDiv({ cls: "stashpad-reply-count-chip" });
+    setIcon(chip.createSpan({ cls: "stashpad-reply-count-icon" }), "reply");
+    chip.createSpan({ cls: "stashpad-reply-count-label", text: `${replies.length} ${replies.length === 1 ? "reply" : "replies"}` });
+    chip.title = "Show replies to this note";
+    chip.addEventListener("dblclick", (ev) => { ev.preventDefault(); ev.stopPropagation(); });
+    chip.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      // Newest first — the most recent replies are usually what you want.
+      const ordered = [...replies].sort((a, b) => Date.parse(b.created || "") - Date.parse(a.created || ""));
+      const menu = new Menu();
+      for (const r of ordered) {
+        const title = this.titleForNode(r).trim() || "(untitled)";
+        menu.addItem((it: any) => it
+          .setTitle(title.length > 60 ? title.slice(0, 60) + "…" : title)
+          .setIcon("corner-down-right")
+          .onClick(() => {
+            const row = this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(r.id)}"]`);
+            if (row) this.flashRowIntoView(row); else this.navigateTo(r.id);
+          }));
+      }
+      menu.showAtMouseEvent(ev);
+    };
+  }
 
   private backlinksFor(path: string): string[] {
     if (!this.backlinkIndex) {
@@ -8330,6 +8780,15 @@ export class StashpadView extends ItemView {
       Platform.isMobile,
       this.folderOverride ?? "",
       this.plugin.getFolderIcon(this.noteFolder) ?? "",
+      // 0.338.0: the formatting toolbar is baked into the composer build, so its
+      // inputs must invalidate the signature — otherwise a snippet/setting change
+      // wouldn't rebuild the bar until an unrelated composer rebuild happened.
+      getSettings().showComposerToolbar ? "1" : "0",
+      getSettings().spoilerMarkup ? "1" : "0",
+      (getSettings().snippets ?? []).map((sn) => `${sn.id}:${sn.button ? 1 : 0}:${sn.enabled === false ? 0 : 1}:${sn.icon}:${sn.name}:${sn.buttonPlacement ?? "end"}`).join(","),
+      // 0.351.0: the built-in toolbar customization (order / hidden / icon) is
+      // baked into the composer build too, so it must invalidate the signature.
+      JSON.stringify(getSettings().toolbarButtons ?? []),
     ].join("\u0000");
   }
 
@@ -8780,13 +9239,28 @@ export class StashpadView extends ItemView {
     this.composerRootEl = composer;
     this.composerSignature = this.composerSig();
 
+    // 0.332.0: formatting toolbar — a full-width row at the TOP of the composer
+    // column (above the textarea row), so it never shrinks the text box. On
+    // mobile it sits above the input, clear of the bottom-right Send button.
+    this.renderComposerToolbar(composer);
+
     const composerRow = composer.createDiv({ cls: "stashpad-composer-row" });
     // Wrap the textarea so we can absolutely-position the clear-X over it.
     const taWrap = composerRow.createDiv({ cls: "stashpad-composer-input-wrap" });
     const ta = taWrap.createEl("textarea", {
       cls: "stashpad-composer-input",
+      // 0.363.3: the native placeholder stays set (so `:placeholder-shown`
+      // tracks emptiness for the CSS sibling selector below), but CSS paints it
+      // TRANSPARENT — iOS mis-renders it as a stuck "N" after an internal-link
+      // insert+delete. The visible ghost text is the overlay div instead, which
+      // iOS paints correctly. Pure-CSS visibility means no per-call-site syncing.
       attr: { rows: "2", placeholder: this.composerPlaceholder(enterSubmits, splitMode) },
     });
+    // 0.363.3: overlay placeholder, layered over the textarea by CSS and shown
+    // only while empty (`:placeholder-shown` sibling rule). aria-hidden — the
+    // textarea's native placeholder is still the accessible label.
+    this.composerPlaceholderEl = taWrap.createDiv({ cls: "stashpad-composer-placeholder", attr: { "aria-hidden": "true" } });
+    this.composerPlaceholderEl.setText(this.composerPlaceholder(enterSubmits, splitMode));
 
     // 0.267.1 (CONFIRMED on device): keep a selection drag inside the composer
     // from reaching Obsidian's sidebar gesture.
@@ -9349,7 +9823,12 @@ export class StashpadView extends ItemView {
     sendBtn.title = "Send (Enter)";
     setIcon(sendBtn, "arrow-up");
     const submit = async () => {
-      const text = ta.value.trim();
+      // 0.353.0: post-send cleanup for the mobile autopair opening-duplication bug
+      // (trims `***bold**` → `**bold**`; narrow + safe, symmetric/empty untouched).
+      const raw = ta.value.trim();
+      let text = getSettings().fixAutopairDupOnSend ? fixDuplicatedEmphasisOpeners(raw) : raw;
+      // 0.363.11: normalize iOS smart-punctuation curly quotes to straight on send.
+      if (getSettings().straightenCurlyQuotesOnSend) text = straightenCurlyQuotes(text);
       if (!text) return;
       // 0.319.0: an EDIT draft is bound → Send saves that note instead of creating one.
       const bound = this.activeDraft();
@@ -9494,13 +9973,36 @@ export class StashpadView extends ItemView {
       void submit();
     };
     sendBtn.onclick = () => fireSubmit();
+    // 0.361.0: press-and-hold the Send button to pick the destination first (same
+    // picker as the map-pin button). Setting lastSubmitAt when the hold fires makes
+    // the click/tap that follows the release fall inside the 600ms guard, so the
+    // note isn't sent — you just get the destination menu.
+    let holdTimer = 0;
+    const clearHold = (): void => { if (holdTimer) { window.clearTimeout(holdTimer); holdTimer = 0; } };
+    const startHold = (): void => {
+      clearHold();
+      holdTimer = window.setTimeout(() => {
+        holdTimer = 0;
+        lastSubmitAt = Date.now(); // swallow the release-submit
+        const wasFocused = document.activeElement === ta;
+        const r = sendBtn.getBoundingClientRect();
+        this.openQuickDestinationMenu(new MouseEvent("click", { clientX: Math.round(r.left), clientY: Math.round(r.top) }), wasFocused);
+      }, 500);
+    };
+    sendBtn.addEventListener("mousedown", startHold);
+    sendBtn.addEventListener("mouseup", clearHold);
+    sendBtn.addEventListener("mouseleave", clearHold);
+    sendBtn.addEventListener("touchstart", startHold, { passive: true });
+    sendBtn.addEventListener("touchmove", clearHold, { passive: true });
     if (Platform.isMobile) {
       sendBtn.addEventListener("touchend", (e) => {
+        const wasHolding = holdTimer !== 0;
+        clearHold(); // a short tap must not leave the long-press timer pending
         // Only a real tap on the button — a drag that happens to end here is
         // not a press, and multi-touch is not either.
         if (e.changedTouches.length !== 1) return;
         e.preventDefault();
-        fireSubmit();
+        if (wasHolding) fireSubmit(); // released before the hold fired → normal send
       });
     }
 
@@ -9551,6 +10053,59 @@ export class StashpadView extends ItemView {
     const helper = parent.createDiv({ cls: "stashpad-composer-help" });
     this.composerHelperEl = helper;
     helper.setText(this.composerHelperText(enterSubmits, splitMode));
+  }
+
+  /** 0.362.0: on-device debug readout for the mobile placeholder-"N" and tag-delay
+   *  reports (unreproducible in desktop + emulator). Run it WHEN the bug is showing;
+   *  it prints the LIVE placeholder attribute (so we can tell an attribute bug from a
+   *  render clip) and the autocomplete's last reveal decision. Persistent Notice so
+   *  it's readable / screenshottable on a phone. */
+  cmdComposerDebug(): void {
+    const ta = this.composerInputEl;
+    const ac = this.composerAutocomplete;
+    // 0.363.12: fold the perf trace into this command (the one people reach for),
+    // so ONE copy carries composer state AND the ring buffer — including any
+    // `stall {ms,after}` line (the `after:` names the op before a freeze) and the
+    // `settings:save (xN)` / `settings:write {coalesced}` burst counters.
+    const trace = this.plugin.getDebugTrace();
+    const stallLine = trace
+      ? trace.split("\n").filter((l) => / stall /.test(l)).slice(-1)[0] ?? "(no stall recorded)"
+      : "(trace empty)";
+    const traceOn = getSettings().debugTrace;
+    const text = [
+      `Stashpad ${this.plugin.manifest.version} · composer debug`,
+      `isMobile: ${Platform.isMobile}`,
+      `placeholder attr: ${JSON.stringify(ta?.placeholder ?? null)}`,
+      `expected text: ${JSON.stringify(this.composerPlaceholderText)}`,
+      `ta value length: ${ta?.value.length ?? "?"}`,
+      `ta offset/client width: ${ta?.offsetWidth ?? "?"} / ${ta?.clientWidth ?? "?"}`,
+      `autocomplete lastOpen: ${ac?.lastOpenDebug ? JSON.stringify(ac.lastOpenDebug) : "(none yet — type # or [[ first)"}`,
+      ``,
+      `debugTrace: ${traceOn ? "ON" : "OFF — enable it in Settings → Diagnostics to capture stalls"}`,
+      `latest stall: ${stallLine}`,
+      ``,
+      `=== perf trace (${traceOn ? "newest last" : "off"}) ===`,
+      trace || "(empty — turn on Debug trace in Settings → Diagnostics, reproduce the lag, then re-open this)",
+    ].join("\n");
+    // 0.363.1: show it in a modal with a big Copy button + a pre-selected textarea,
+    // so it's trivially copyable on mobile (a Notice isn't).
+    const modal = new Modal(this.app);
+    modal.titleEl.setText("Composer debug — tap Copy");
+    const box = modal.contentEl.createEl("textarea");
+    box.value = text; box.readOnly = true; box.rows = 14;
+    box.style.width = "100%"; box.style.fontFamily = "var(--font-monospace)"; box.style.fontSize = "12px";
+    const copy = modal.contentEl.createEl("button", { text: "Copy to clipboard", cls: "mod-cta" });
+    copy.style.marginTop = "8px";
+    const doCopy = (): void => {
+      box.focus(); box.select(); box.setSelectionRange(0, text.length);
+      let ok = false;
+      try { void navigator.clipboard?.writeText(text); ok = true; } catch { /* fall through */ }
+      try { ok = document.execCommand("copy") || ok; } catch { /* ignore */ }
+      new Notice(ok ? "Copied" : "Select the text and copy manually");
+    };
+    copy.onclick = doCopy;
+    modal.open();
+    window.setTimeout(() => { box.focus(); box.select(); }, 60);
   }
 
   private composerPlaceholder(enterSubmits: boolean, split: boolean): string {
@@ -9780,6 +10335,21 @@ export class StashpadView extends ItemView {
         const sourcePath = node.file?.path || "";
         void this.app.workspace.openLinkText(href, sourcePath, true);
       }
+      return;
+    }
+    // 0.331.0: external links in the rendered body — INCLUDING `obsidian://`
+    // deep links (a Stashpad link pasted into a note). These are otherwise
+    // swallowed by the row-select delegation, so a deep link in a note was not
+    // clickable. Stop the row select and open the link: obsidian:// routes to
+    // the registered protocol handler (our handleDeepLink), http(s) to the
+    // browser. Popout-safe via the target's own window.
+    const ext = targetEl?.closest?.("a.external-link") as HTMLAnchorElement | null;
+    if (ext) {
+      e.preventDefault();
+      e.stopPropagation();
+      const href = ext.getAttribute("href");
+      if (href) (targetEl?.ownerDocument?.defaultView ?? window).open(href);
+      return;
     }
   }
 
@@ -10331,7 +10901,12 @@ export class StashpadView extends ItemView {
       const lr = list.getBoundingClientRect();
       const rr = row.getBoundingClientRect();
       const pad = 4;
-      const topBound = lr.top + pad;
+      // 0.363.0: the focused heading row is sticky at the list top, so the usable
+      // top is BELOW it — otherwise moving the cursor up scrolls it right under the
+      // heading (hidden). Offset topBound by the heading height.
+      const heading = list.querySelector(".is-heading-row") as HTMLElement | null;
+      const headH = heading ? heading.getBoundingClientRect().height : 0;
+      const topBound = lr.top + headH + pad;
       let bottomBound = lr.bottom - pad;
       // 0.89.0 mobile: while the keyboard/composer is up the list extends BEHIND
       // the composer, so a row that's technically "in the list rect" can still
@@ -10538,7 +11113,7 @@ export class StashpadView extends ItemView {
       // SAME selection — so "I meant to hit M, not O" doesn't cost you the
       // picker round-trip (or the selection). Honors the user's actual Move
       // binding, not a hard-coded "M".
-      if (matchBinding(e, getSettings().bindings.move)) {
+      if (this.inListPicker.mode === "nest" && matchBinding(e, getSettings().bindings.move)) {
         e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
         this.inListPicker = null;
         this.repaintSelectionClasses(); // drop the pick-target highlight
@@ -10687,7 +11262,7 @@ export class StashpadView extends ItemView {
     // and cut need a target, so they stay in the selection/cursor-gated block
     // below; paste used to be trapped there too, which is why pasting inside a
     // parent only worked when a child happened to be selected/under the cursor.)
-    if (matchBinding(e, sb.pasteNotes) && (this.plugin.noteClipboard || hasXvPayload())) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
+    if (matchBinding(e, sb.pasteNotes) && (this.plugin.noteClipboard || hasXvPayload() || !!readXvFolderPointer())) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPasteNotes(); return; }
     // openAllTasks (default Shift+T) is global — no selection/cursor needed — AND
     // must be checked BEFORE openTab (plain "T"): a plain-letter binding also fires
     // on its shifted form (matchKey ignores Shift, the shifted-key trap), so if
@@ -11084,6 +11659,9 @@ export class StashpadView extends ItemView {
       setIconSafe(cb, done ? "square-check-big" : "square", done ? "☑" : "☐"); // 0.279.22: glyph fallback — an unknown Lucide name injects an empty svg
       cb.title = done ? "Mark not done" : "Mark done";
       row.classList.toggle("is-completed", done);
+      // 0.325.0: cb.empty() dropped this note's own parent-progress badge (if it
+      // has task children); rebuild it so a parent task keeps its "3/7" overlay.
+      this.renderTaskProgressBadge(cb, node);
     }
     return true;
   }
@@ -11620,7 +12198,11 @@ export class StashpadView extends ItemView {
         ? "Enter sends (click to switch to Shift+Enter)"
         : "Shift+Enter sends (click to switch to Enter)";
     }
-    if (this.composerInputEl) this.composerInputEl.placeholder = this.composerPlaceholder(enter, split);
+    this.composerPlaceholderText = this.composerPlaceholder(enter, split);
+    // 0.363.3: keep BOTH in sync — the native placeholder (transparent, drives
+    // the `:placeholder-shown` visibility rule) and the visible overlay text.
+    if (this.composerInputEl) this.composerInputEl.placeholder = this.composerPlaceholderText;
+    if (this.composerPlaceholderEl) this.composerPlaceholderEl.setText(this.composerPlaceholderText);
     if (this.composerHelperEl) this.composerHelperEl.setText(this.composerHelperText(enter, split));
   }
 
@@ -12410,8 +12992,12 @@ export class StashpadView extends ItemView {
     this.selectCursor(false);
   }
 
-  cmdSetColor(): void {
-    const targets = this.getActionTargets();
+  cmdSetColor(nodes?: TreeNode[], onApplied?: (color: string | null) => void): void {
+    // 0.355.0: `nodes` lets a caller (e.g. the edit modal's Color chip) target a
+    // specific note instead of the current selection/cursor; `onApplied` fires
+    // once the pick is written so that caller can repaint. Undo, palette saving
+    // and frontmatter writes are otherwise identical to the menu/keybind path.
+    const targets = nodes ?? this.getActionTargets();
     if (!targets.length) return;
     // Seed the picker with the current color iff every target shares one.
     const colors = new Set(targets.map((n) => this.colorForNode(n) ?? ""));
@@ -12483,6 +13069,10 @@ export class StashpadView extends ItemView {
           undo: () => applyColors(priors.map((p) => ({ id: p.id, path: p.path, col: p.was }))),
           redo: () => applyColors(priors.map((p) => ({ id: p.id, path: p.path, col: newColor }))),
         });
+        // 0.355.0: let a targeted caller (edit modal Color chip) repaint with the
+        // freshly applied color — colorForNode reads the metadata cache, which
+        // can lag this processFrontMatter write by a tick, so hand it back here.
+        onApplied?.(color);
       },
       async (color) => {
         // Delete a saved custom color from the palette.
@@ -12634,6 +13224,11 @@ export class StashpadView extends ItemView {
         if (p.isRoot) {
           await this.app.fileManager.processFrontMatter(p.file, (fm) => { fm.parent = newParentId; });
         }
+        // 0.339.0: carry the note's version history to the new folder.
+        if (this.plugin.settings.enableNoteHistory) {
+          const fromFolder = p.oldPath.slice(0, p.oldPath.lastIndexOf("/"));
+          void this.plugin.history.moveTo(fromFolder, targetDir, p.id);
+        }
         await this.log.append({
           type: "parent_change", id: p.id,
           payload: { from: p.oldParent, to: p.isRoot ? newParentId : p.oldParent, crossFolder: { from: this.noteFolder, to: targetDir } },
@@ -12772,7 +13367,7 @@ export class StashpadView extends ItemView {
       const up = this.nextPickableIdx(start, -1);
       start = up !== start ? up : this.nextPickableIdx(start, 1);
     }
-    this.inListPicker = { activeIdx: start };
+    this.inListPicker = { activeIdx: start, mode: "nest", sourceIds: this.getActionTargets().map((t) => t.id) };
     // 0.91.0: surface the "switch to the full move picker" shortcut, using the
     // user's actual Move binding (default M) so the hint stays accurate.
     const moveBind = getSettings().bindings.move;
@@ -12789,8 +13384,59 @@ export class StashpadView extends ItemView {
       setTimeout(() => { list.scrollTop = keepScroll; }, 60);
     }
   }
+
+  /** 0.355.0: reply via the in-list picker — the same navigate-and-Enter flow as
+   *  "Nest under… (in-list)", but Enter makes the source note a REPLY of the picked
+   *  note (instead of reparenting it). Started by the reply-link action so you can
+   *  wire up a reply without opening the edit modal or the fuzzy picker. */
+  cmdReplyInListPicker(node?: TreeNode): void {
+    const src = node ?? this.getActionTargets()[0] ?? this.headingNode() ?? undefined;
+    if (!src?.file) { new Notice("Pick a note to reply from first."); return; }
+    if (this.currentChildren.length === 0) { new Notice("No notes here to reply to."); return; }
+    // Pre-select the note above the cursor; hop off the source note itself.
+    let start = this.cursorIdx > 0 ? this.cursorIdx - 1 : 0;
+    if (this.currentChildren[start]?.id === src.id) {
+      const up = this.nextPickableIdx(start, -1);
+      start = up !== start ? up : this.nextPickableIdx(start, 1);
+    }
+    this.inListPicker = { activeIdx: start, mode: "reply", sourceIds: [src.id] };
+    new Notice("Arrows to pick the note to reply to, Enter confirms, Esc cancels (“Make a reply to…” in the ⋮ menu searches all folders).");
+    const keepScroll = this.listEl?.scrollTop ?? 0;
+    this.render();
+    if (this.listEl) {
+      const list = this.listEl;
+      list.scrollTop = keepScroll;
+      requestAnimationFrame(() => { list.scrollTop = keepScroll; });
+      setTimeout(() => { list.scrollTop = keepScroll; }, 60);
+    }
+  }
+
+  /** Apply the reply picker's choice: make each source note a reply of `target`. */
+  private async commitReplyPicker(sourceIds: StashpadId[], target: TreeNode): Promise<void> {
+    if (!target.file) { this.render(); return; }
+    const t = { id: target.id, title: this.titleForNode(target).trim() || "(untitled)", path: target.file.path };
+    let ok = 0;
+    for (const sid of sourceIds) {
+      const node = this.tree.get(sid);
+      if (!node?.file) continue;
+      if (node.file.path === t.path) { new Notice("A note can't be a reply to itself."); continue; }
+      const r = await this.setReplyLink(node, t);
+      if (r !== undefined) ok++;
+    }
+    this.render();
+    if (ok) new Notice(`Set ${ok === 1 ? "note" : `${ok} notes`} as a reply to “${t.title}”.`);
+  }
+
   private async commitInListPicker(): Promise<void> {
     if (!this.inListPicker) return;
+    if (this.inListPicker.mode === "reply") {
+      const picker = this.inListPicker;
+      const target = this.currentChildren[picker.activeIdx];
+      this.inListPicker = null;
+      if (!target) { this.render(); return; }
+      await this.commitReplyPicker(picker.sourceIds, target);
+      return;
+    }
     const target = this.currentChildren[this.inListPicker.activeIdx];
     this.inListPicker = null;
     if (!target) { this.render(); return; }
@@ -13037,7 +13683,18 @@ export class StashpadView extends ItemView {
   // Clipboard commands — implementations live in commands/clipboard-cmds.ts.
   // These thin delegators keep the public method names stable for the keydown
   // dispatcher + main.ts's call("<method>") palette wiring.
-  cmdCopy(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopy(this, withTimestamps); }
+  async cmdCopy(withTimestamps = false): Promise<void> {
+    await clipboardCmds.cmdCopy(this, withTimestamps);
+    // 0.348.0: when "always prepare cut/copy for another vault" is on, the plain
+    // text-copy command (its default binding is a bare `C`) also stamps the
+    // cross-vault payload — so copying via the single-key shortcut is paste-able
+    // in another vault just like Mod+C (copyNotes) is. Bare-key CUT already stamps
+    // because it runs through cmdCutNotes, which stamps on this same setting.
+    if (getSettings().alwaysStampCrossVault) {
+      const targets = this.getActionTargets();
+      if (targets.length) await this.stampForOtherVault(targets.map((t) => t.id), "copy");
+    }
+  }
   cmdCopyCodeBlock(): Promise<void> { return clipboardCmds.cmdCopyCodeBlock(this); }
   cmdCopyTree(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyTree(this, withTimestamps); }
   cmdCopyTreeLevelMarkers(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyTreeLevelMarkers(this, withTimestamps); }
@@ -14191,6 +14848,16 @@ export class StashpadView extends ItemView {
       plain = req?.("electron")?.clipboard?.readText?.() ?? "";
     } catch { /* fall through — reported below */ }
     if (!plain) { this.reportXvStamp({ status: "failed" }, mode); return; }
+    // 0.342.0/0.344.0: BOTH copy and cut try the FOLDER path first (fast — no
+    // zip): stage the subtree to `_exports/xv-<stamp>/` and put a pointer on the
+    // clipboard. A CUT pointer carries a token and arms the same ACK handshake the
+    // zip cut uses (checkXvCutAck), so the originals are still deleted only after
+    // the destination confirms the paste. Any failure (or unavailable, e.g.
+    // mobile) falls through to the zip clipboard below.
+    if (folderTransferAvailable()) {
+      const fr = await this.plugin.crossVaultCopyFolder(this.noteFolder, ids, plain, mode);
+      if (fr.status === "ok") { this.reportXvStamp({ status: "ok" }, mode); return; }
+    }
     const notice = new Notice(`Preparing ${ids.length} note${ids.length === 1 ? "" : "s"} for another vault…`, 0);
     try {
       const r = await this.plugin.stampCrossVaultClipboard(this.noteFolder, ids, mode, plain);
@@ -14451,8 +15118,30 @@ export class StashpadView extends ItemView {
     if (!clip) {
       // 0.201.0: no local note clipboard — check the OS clipboard for a
       // cross-vault payload written by ANOTHER vault's Stashpad.
+      // 0.342.0: FOLDER pointer first (the fast, no-zip path). A copy from another
+      // vault leaves a pointer to its staged `_exports/xv-*` folder; import it as
+      // COPIES. If it can't be reached (different machine), fall through to the zip
+      // payload if one is present, then to the empty-clipboard notice.
+      const fptr = readXvFolderPointer();
+      if (fptr && fptr.meta.sourceVault !== this.app.vault.getName()) {
+        const res = await this.plugin.crossVaultPasteFolder(this.noteFolder);
+        if (res.status === "ok") {
+          const folder = this.noteFolder;
+          this.tree.rebuild(folder);
+          this.render();
+          this.plugin.notifications.show({
+            message: res.cut
+              ? `Received ${res.count} cut note${res.count === 1 ? "" : "s"} from "${fptr.meta.sourceVault}". Switch back to that vault to finish the move (delete the originals there).`
+              : `Pasted (copied) ${res.count} note${res.count === 1 ? "" : "s"} from "${fptr.meta.sourceVault}" into this folder.`,
+            kind: "success", category: res.cut ? "move" : "clone", folder, duration: 0,
+          });
+          return;
+        }
+        // unreachable/failed → fall through to the zip payload (if any).
+      }
       const xv = await readXvPayload();
       if (xv && xv.meta.sourceVault !== this.app.vault.getName()) { await this.pasteCrossVault(xv); return; }
+      if (fptr) { new Notice("Couldn't reach the staged cross-vault folder (different machine?). Re-copy with the .stash export in the source vault."); return; }
       new Notice("The note clipboard is empty — copy or cut notes first.");
       return;
     }
@@ -15784,6 +16473,7 @@ export class StashpadView extends ItemView {
     const structural = this.currentHideCompleted()
       || rolled.length > 0 || spawned > 0 || archivedSnapshots.length > 0;
     if (structural || !this.repaintCompletedState(changedIds)) this.render();
+    else for (const id of changedIds) { const n = this.tree.get(id); if (n) this.refreshParentProgress(n); } // 0.325.0
     for (const r of rolled) {
       const verb = spawned > 0 ? "Next up" : "Rescheduled";
       this.plugin.notifications.show({ message: `🔁 ${verb}: “${r.title}” → ${formatDateTime(r.when, this.plugin.settings)}.`, kind: "success", category: "system", folder: this.noteFolder });
@@ -15965,12 +16655,16 @@ export class StashpadView extends ItemView {
     const rawTags = (curFm ?? {}).tags;
     const currentTags = Array.isArray(rawTags) ? rawTags.map(String)
       : typeof rawTags === "string" ? rawTags.split(/[,\s]+/).filter(Boolean) : [];
+    // 0.327.0: seed the color swatch iff every target already shares one color.
+    const dueColors = new Set(targets.map((n) => this.colorForNode(n) ?? ""));
+    const seedColor = dueColors.size === 1 ? (Array.from(dueColors)[0] || null) : null;
     new DueDatePickerModal(this.app, current, (result) => {
       void this.applyDue(targets, result.iso, result.assignees, false, {
         repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode, failIfOverdue: result.failIfOverdue,
-      }, result.tags);
+      }, result.tags, result.color);
     }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts,
       showTags: true, currentTags, tagChips: this.plugin.settings.taskTagChips, tagSuggestions: this.plugin.settings.taskTagSuggestions,
+      showColor: true, currentColor: seedColor, customPalette: this.plugin.settings.customPalette ?? [],
       // 0.140.1: recurrence is a per-note concept — only show/write it for a
       // single target, else a multi-select would clobber 2..n's rules with #1's.
       showRecurrence: targets.length === 1,
@@ -15995,11 +16689,11 @@ export class StashpadView extends ItemView {
   /** Write the chosen due value (or clear it) across `targets`, with
    *  undo. Setting a date also flips `task: true`; clearing leaves the
    *  task flag intact (clearing a due ≠ "no longer a task"). */
-  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string; repeatMode?: string; failIfOverdue?: boolean }, tags?: string[]): Promise<void> {
+  private async applyDue(targets: TreeNode[], iso: string | null, assignees: Array<{ id: string; name: string }> = [], dueOnly = false, recur?: { repeat?: string; autoDoneAfter?: string; remindEvery?: string; repeatMode?: string; failIfOverdue?: boolean }, tags?: string[], color?: string | null): Promise<void> {
     // 0.276.0: `tags` undefined = picker didn't show the tags section → leave
     // tags untouched. An array (possibly empty) REPLACES the note's tag list.
     const normTags = tags === undefined ? undefined : [...new Set(tags.map((t) => t.trim().replace(/^#+/, "")).filter(Boolean))];
-    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown; repeatMode: unknown; failIfOverdue: unknown; tags: unknown }[] = [];
+    const prior: { id: StashpadId; path: string; due: unknown; task: unknown; assignedTo: unknown; assignedBy: unknown; wasTagged: boolean; repeat: unknown; autoDoneAfter: unknown; remindEvery: unknown; repeatMode: unknown; failIfOverdue: unknown; tags: unknown; color: unknown }[] = [];
     const changedIds: StashpadId[] = [];
     // 0.78.1: who is doing the assigning (the local user) — stamped as
     // assignedBy so the "assigned by me" filter works. Null if the user
@@ -16015,7 +16709,7 @@ export class StashpadView extends ItemView {
       if (!t.file) continue;
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter as any;
       const wasTagged = this.isTaskTagged(t);
-      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery, repeatMode: fm?.repeatMode, failIfOverdue: fm?.failIfOverdue, tags: fm?.tags });
+      prior.push({ id: t.id, path: t.file.path, due: fm?.due, task: fm?.task, assignedTo: fm?.assignedTo, assignedBy: fm?.assignedBy, wasTagged, repeat: fm?.repeat, autoDoneAfter: fm?.autoDoneAfter, remindEvery: fm?.remindEvery, repeatMode: fm?.repeatMode, failIfOverdue: fm?.failIfOverdue, tags: fm?.tags, color: fm?.color });
       this.markFmSelfWrite(t.file.path); // body unchanged → no placeholder flash
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         if (iso === null) delete m.due;
@@ -16053,6 +16747,12 @@ export class StashpadView extends ItemView {
         if (normTags !== undefined) {
           if (normTags.length > 0) m.tags = normTags;
           else delete m.tags;
+        }
+        // 0.327.0: color, when the picker showed the color section. A hex sets
+        // it; null clears it. undefined = section not shown → leave color alone.
+        if (color !== undefined) {
+          if (color) m.color = color;
+          else delete m.color;
         }
       });
       // 0.85.1: a due date or an assignment makes it a task; clearing leaves
@@ -16095,6 +16795,8 @@ export class StashpadView extends ItemView {
             if (p.failIfOverdue === undefined) delete m.failIfOverdue; else m.failIfOverdue = p.failIfOverdue;
             // 0.276.0: restore tags only if we changed them (normTags set).
             if (normTags !== undefined) { if (p.tags === undefined) delete m.tags; else m.tags = p.tags; }
+            // 0.327.0: restore color only if we changed it (color param set).
+            if (color !== undefined) { if (p.color === undefined) delete m.color; else m.color = p.color; }
           });
           this.taskTaggedState.set(p.path, p.wasTagged); // 0.85.1
         }
@@ -16322,6 +17024,7 @@ export class StashpadView extends ItemView {
     // fast path can't see (row scrolled out of the rendered set, no checkbox).
     this.traceScroll("completed");
     if (!this.repaintCompletedState([node.id])) this.render();
+    else this.refreshParentProgress(node); // 0.325.0: tick the parent's done/total in place
     const folder = this.noteFolder;
     this.plugin.getUndoStack(folder).push({
       label: was ? "Mark incomplete" : "Mark complete",
@@ -17650,6 +18353,88 @@ export class StashpadView extends ItemView {
     onClosed?.();
   }
 
+  /** 0.337.0: open the per-note version history — a timeline of past bodies with
+   *  restore, plus a "by <person>" collab filter. */
+  async cmdViewHistory(node?: TreeNode): Promise<void> {
+    const target = node ?? this.resolveActionTarget();
+    if (!target?.file) { new Notice("Pick a note to view its history."); return; }
+    const file = target.file;
+    new HistoryModal(this.app, this.plugin, file, {
+      onRestore: async (body: string) => {
+        const md = await this.app.vault.cachedRead(file);
+        await this.writeEditedBody(target, md, body);
+      },
+    }).open();
+  }
+
+  /** 0.351.0: folder-level "last saved by person" overview. For the CURRENT
+   *  Stashpad folder, lists its notes and WHO last saved each one (+ when) —
+   *  derived from each note's history (the newest entry's author + time), falling
+   *  back to the note's `author`/`modified` frontmatter when it has no history
+   *  yet. The modal groups by person; each row opens that note's full history or
+   *  focuses the note. Read-only — nothing is written.
+   *
+   *  Large-folder guard: notes are enumerated with the same collectMarkdown() the
+   *  tree uses (reserved subfolders like `_authors` excluded), then capped at
+   *  MAX so a folder with thousands of notes doesn't fire thousands of history
+   *  reads. The cap is reported in the modal. */
+  async cmdFolderSavedByPerson(): Promise<void> {
+    const folder = (this.noteFolder || "").trim();
+    if (!folder) { new Notice("Open a Stashpad folder first."); return; }
+    const MAX = 800;
+    const all = collectMarkdown(this.app, folder);
+    const truncatedAt = all.length > MAX ? MAX : null;
+    const files = truncatedAt !== null ? all.slice(0, MAX) : all;
+
+    const rows: FolderSavedRow[] = [];
+    for (const file of files) {
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as { id?: unknown; author?: unknown; modified?: unknown } | undefined;
+      const id = typeof fm?.id === "string" ? fm.id : "";
+      if (!id) continue; // not a Stashpad note (e.g. a stray .md)
+      const node = this.tree.get(id) ?? { id: id as StashpadId, parent: null, children: [], file, created: "" };
+      const title = this.titleForNode(node).trim();
+
+      let authorName = "Unknown", authorId = "", t = 0;
+      let source: "history" | "frontmatter" = "frontmatter";
+      const last = await this.plugin.history.lastSaved(folder, id);
+      if (last) {
+        source = "history";
+        authorId = last.authorId;
+        authorName = last.authorName || "Unknown";
+        t = last.t;
+      }
+      if (!last || !authorName || authorName === "Unknown") {
+        // Fall back to the note's own frontmatter for the person…
+        const fa = parseAuthorRef(fm?.author);
+        if (fa) { authorName = fa.name || "Unknown"; authorId = authorId || fa.id; }
+      }
+      if (!last) {
+        // …and for the time (modified frontmatter, else file mtime).
+        const mod = typeof fm?.modified === "string" ? Date.parse(fm.modified) : NaN;
+        t = Number.isFinite(mod) ? mod : file.stat.mtime;
+      }
+
+      rows.push({ id, file, title, authorName: authorName || "Unknown", authorId, t, source });
+    }
+
+    const label = folder.split("/").pop() || folder;
+    new FolderSavedByPersonModal(this.app, label, rows, truncatedAt, {
+      onHistory: (row) => {
+        const target: TreeNode = this.tree.get(row.id) ?? { id: row.id as StashpadId, parent: null, children: [], file: row.file, created: "" };
+        new HistoryModal(this.app, this.plugin, row.file, {
+          onRestore: async (body: string) => {
+            const md = await this.app.vault.cachedRead(row.file);
+            await this.writeEditedBody(target, md, body);
+          },
+        }).open();
+      },
+      onFocus: (row) => {
+        if (this.tree.get(row.id)) this.navigateTo(row.id as StashpadId);
+        else void this.app.workspace.openLinkText(row.file.path, "", false);
+      },
+    }).open();
+  }
+
   /** 0.276.8: edit a MULTI-selection one note at a time — a slot queue. Opens the
    *  edit modal for note 1; when it closes (saved OR dismissed), the next opens,
    *  until the queue drains. A persistent notice shows progress + a "Stop rest"
@@ -17828,6 +18613,15 @@ export class StashpadView extends ItemView {
     // for edits made through Stashpad's own editor (which are self-writes and
     // otherwise leave no log trace).
     void this.log.append({ type: "edit", id: target.id, payload: { path: finalPath } });
+    // 0.337.0: capture the new body as a history version. In-app edits (edit
+    // modal / split / composer edit) are self-writes and DON'T flow through the
+    // authorship tracker's maybeRecordContribution (that path is for EXTERNAL
+    // edits), so this is their history-capture point.
+    if (this.plugin.settings.enableNoteHistory) {
+      const ha = this.authorship.currentAuthorLink();
+      const folder = file.parent?.path ?? this.noteFolder;
+      void this.plugin.history.capture(folder, target.id, nb, ha ? { id: ha.id, name: ha.name } : null);
+    }
     // 0.291.0 (perf): a body edit changes no structure, so the O(N) tree rebuild +
     // full render only earn their cost when the row's ORDER (or its path) can move.
     // The row renders its title and body as one `.stashpad-note-body-content`
@@ -17881,7 +18675,7 @@ export class StashpadView extends ItemView {
     return true;
   }
 
-  async cmdSplit(node?: TreeNode, surface: "edit" | "split" = "split", onClosed?: () => void, host: "modal" | "tab" = "modal"): Promise<void> {
+  async cmdSplit(node?: TreeNode, surface: "edit" | "split" = "split", onClosed?: () => void, host: "modal" | "tab" = "modal", seedText?: string): Promise<void> {
     const target = node ?? this.resolveActionTarget();
     if (!target?.file) { new Notice(surface === "edit" ? "Pick a note to edit." : "Pick a note to split."); onClosed?.(); return; }
     const file = target.file;
@@ -18072,6 +18866,9 @@ export class StashpadView extends ItemView {
     };
 
     let replyTitle: string | null = this.replyLinkTitleForNode(target);
+    // 0.355.0: tracked locally (like replyTitle) so the Color chip repaints from
+    // the just-applied value instead of the metadata cache, which lags the write.
+    let currentColor: string | null = this.colorForNode(target) ?? null;
     // 0.169.0: the split handlers, shared by the modal AND the popped-out tab.
     const splitCore = {
       onSplitAtLine: async (lineIdx: number, nest: boolean) => {
@@ -18102,13 +18899,30 @@ export class StashpadView extends ItemView {
         current: () => replyTitle,
         pick: (onPicked: (t: { id: StashpadId; title: string; path: string }) => void) => this.pickReplyTarget(target, onPicked),
       },
+      // 0.355.0: the edit surface's "Color" chip. Reuses cmdSetColor's picker +
+      // apply + undo path (targeting just this note). target.file is guaranteed
+      // here — cmdSplit bails earlier when the note has no file — but the chip is
+      // still omitted for a fileless target as a defensive measure.
+      color: target.file ? {
+        current: () => currentColor,
+        pick: (onApplied: () => void) => this.cmdSetColor([target], (c) => { currentColor = c; onApplied(); }),
+      } : undefined,
+      // 0.357.0: a "History" shortcut from the edit modal straight into the edit
+      // history viewer for this note (only when history is enabled + the note has
+      // a file). Kept as a button rather than merging the two modals — the edit
+      // surface is for editing, the history viewer for reading/restoring versions.
+      history: (target.file && getSettings().enableNoteHistory) ? () => void this.cmdViewHistory(target) : undefined,
     };
+    // 0.363.8: `seedText` seeds the EDITOR with in-progress text (e.g. popping a
+    // composer edit out into the modal) while `body` stays the note's saved body,
+    // so the Original tab + diff still compare against what's on disk.
+    const init: Partial<WorkbenchState> = seedText != null ? { surface, cursorText: seedText } : { surface };
     // 0.319.1: long notes route straight to the workbench TAB (see cmdEdit).
-    if (host === "tab") { await this.plugin.openWorkbench(body, splitCore, { surface }); onClosed?.(); return; }
+    if (host === "tab") { await this.plugin.openWorkbench(body, splitCore, init); onClosed?.(); return; }
     new NoteWorkbenchModal(this.app, body, {
       ...splitCore,
       popOut: (state) => { void this.plugin.openWorkbench(body, splitCore, state); },
-    }, { surface }, onClosed).open();
+    }, init, onClosed).open();
   }
 
   cmdOpenInNewStashpadTab(node?: TreeNode): void {
@@ -18294,6 +19108,20 @@ export class StashpadView extends ItemView {
             // slow/network drive this is the difference between an instant, stable
             // new row and the body→title→body flash while the read resolves.
             await this.bodyRenderer.primeRender(f as TFile, body);
+            // 0.340.1: the primed body was rendered before the cache indexed this
+            // note, so schedule one repaint from the fresh cache on its first
+            // "changed" event (resolves links/embeds/tags that were stale).
+            this.pendingMetaRepaint.add((f as TFile).path);
+            // 0.337.0: record the ORIGINAL version and seed the tracker's known
+            // body, so the note's first edit registers as a real change (not a
+            // skipped first-sighting) and history begins at creation.
+            if (this.plugin.settings.enableNoteHistory) {
+              // Use the KNOWN id/folder — the metadataCache hasn't parsed the
+              // just-written frontmatter yet, so a cache lookup would find no id.
+              const ha = this.authorship.currentAuthorLink();
+              void this.plugin.history.capture(this.noteFolder, id, body, ha ? { id: ha.id, name: ha.name } : null);
+              this.authorship.seedKnownBody((f as TFile).path, body);
+            }
             // Batched splits defer the render to a single pass at the end
             // (see createNotesBatch) so a long paste doesn't repaint per note.
             if (!opts.deferRender) {
@@ -18697,6 +19525,18 @@ export class StashpadView extends ItemView {
       return dir.replace(/^\/+|\/+$/g, "");
     }
     return perFolder;
+  }
+
+  /** 0.330.0: public entry points for global quick-capture. The capture modal
+   *  is plugin-level and folder-agnostic; it routes here on a view whose
+   *  noteFolder is the chosen Stashpad, so creation + attachment import reuse the
+   *  exact same tested paths as the composer (createNoteUnder / importAttachment)
+   *  — no divergent headless writer. Note lands at the folder root (ROOT_ID). */
+  async captureNote(text: string): Promise<StashpadId | null> {
+    return this.createNoteUnder(text, ROOT_ID, { record: true });
+  }
+  async captureImport(file: File): Promise<string | null> {
+    return this.importAttachment(file);
   }
 
   private async importAttachment(file: File): Promise<string | null> {
@@ -19368,6 +20208,14 @@ export class StashpadView extends ItemView {
   /** 0.291.0 (perf): paths this view is creating itself (see createNoteUnder).
    *  Consumed by onFileCreate so the vault event doesn't double-render. */
   private selfCreatedPaths = new Set<string>();
+  /** 0.340.1: a just-created note's body is seeded (primeRender) BEFORE the
+   *  metadataCache indexes it, so anything in the body that depends on the cache
+   *  — resolved `[[links]]`, embeds, tags — renders stale. The reconcile won't
+   *  re-render (the synthetic insert already made the tree count match on disk),
+   *  so the metadata never filled in until something else forced a render. These
+   *  paths get ONE body repaint from the fresh cache on their first "changed"
+   *  event. Fixes "created items don't fully render until reload" on fast drives. */
+  private pendingMetaRepaint = new Set<string>();
   private onFileCreate = (file: TFile): void => {
     if (!(file instanceof TFile) || file.extension !== "md") return;
     // Consume the marker BEFORE the folder test: a composer create routed to
@@ -20061,6 +20909,7 @@ export class StashpadView extends ItemView {
       case "sep":          menu.addSeparator(); break;
       case "moreCommands": A("More commands…", "terminal", () => this.openCommandPalette()); break;
       case "delete":       A("Delete", this.actionIcon("delete") || "trash", () => { focusClicked(); void this.cmdDelete(); }); break;
+      case "history":      A("View history", this.actionIcon("history") || "history", () => { focusClicked(); void this.cmdViewHistory(node); }); break;
       case "recurrenceSkip":
         if (parseRecurrence(this.app.metadataCache.getFileCache(node.file!)?.frontmatter?.repeat as string | undefined)) A("Skip to next occurrence", "skip-forward", () => void this.cmdSkipOccurrence(node));
         break;
@@ -20098,12 +20947,32 @@ export class StashpadView extends ItemView {
         break;
       }
       case "taskSubmenu": this.addTaskSubmenu(menu, node, focusClicked); break;
+      // 0.363.0: outdent + the two list-pin edges as individual leaves. The former
+      // hand-built "Move ▸" / "Pin ▸" / "Advanced ▸" / "React / Reply ▸" cases are
+      // gone — they're now SEEDED user submenus (DEFAULT_CONTEXT_SUBMENUS), rendered
+      // through the generic `submenu:` branch above from settings.contextSubmenus.
+      case "outdent":      A("Outdent", this.actionIcon("outdent"), () => { focusClicked(); void this.cmdOutdent(); }); break;
+      case "pinListTop": {
+        const pinEdge = this.listPinEdge(node.id);
+        menu.addItem((it: any) => it.setTitle("Pin to top of list").setIcon(this.actionIcon("pinListTop")).setChecked(pinEdge === "top").onClick(() => { focusClicked(); void this.cmdToggleListPin("top"); }));
+        break;
+      }
+      case "pinListBottom": {
+        const pinEdge = this.listPinEdge(node.id);
+        menu.addItem((it: any) => it.setTitle("Pin to bottom of list").setIcon(this.actionIcon("pinListBottom")).setChecked(pinEdge === "bottom").onClick(() => { focusClicked(); void this.cmdToggleListPin("bottom"); }));
+        break;
+      }
       case "copy": {
         const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
         const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
         menu.addItem((it: any) => {
           it.setTitle("Copy").setIcon(this.actionIcon("copy"));
           const sub = it.setSubmenu?.();
+          // 0.357.0: clone + fork moved OFF the top level and INTO this Copy
+          // submenu (they belong with the copy family, not cluttering the root
+          // menu). When the running build has no submenu support, the whole
+          // Copy item degrades to a plain "Copy text" click — clone/fork still
+          // reach users via their catalog leaves / the command palette.
           if (!sub) { it.onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopy(eventHasMods(evt, tsMods)); }); return; }
           sub.addItem((s: any) => s.setTitle(`Copy text${tsHint}`).setIcon(this.actionIcon("copy")).onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopy(eventHasMods(evt, tsMods)); }));
           sub.addItem((s: any) => s.setTitle(`Copy tree${tsHint}`).setIcon(this.actionIcon("copyTree")).onClick((evt: MouseEvent | KeyboardEvent) => { focusClicked(); void this.cmdCopyTree(eventHasMods(evt, tsMods)); }));
@@ -20115,6 +20984,10 @@ export class StashpadView extends ItemView {
             sub.addItem((s: any) => s.setTitle("Copy text with timestamps").setIcon(this.actionIcon("copy")).onClick(() => { focusClicked(); void this.cmdCopy(true); }));
             sub.addItem((s: any) => s.setTitle("Copy tree with timestamps").setIcon(this.actionIcon("copyTree")).onClick(() => { focusClicked(); void this.cmdCopyTree(true); }));
           }
+          // 0.357.0: clone (duplicate) + fork, relocated here from the top level.
+          sub.addSeparator();
+          sub.addItem((s: any) => s.setTitle("Clone (duplicate / copy)").setIcon(this.actionIcon("clone")).onClick(() => { focusClicked(); void this.cmdClone(); }));
+          sub.addItem((s: any) => s.setTitle("Fork into a separate note…").setIcon(this.actionIcon("fork")).onClick(() => { focusClicked(); this.cmdForkNote(); }));
         });
         break;
       }

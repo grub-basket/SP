@@ -22,10 +22,14 @@ export type DeepLinkAction = (typeof DEEP_LINK_ACTIONS)[number];
 export interface StashpadLinkParts {
   /** Obsidian switches/opens this vault if given; omit for the active vault. */
   vault?: string;
-  /** The Stashpad folder path to route the view to (required). */
-  folder: string;
+  /** The Stashpad folder path to route the view to. Required UNLESS `view` is
+   *  given (a saved-view link carries its folder inside the saved state). */
+  folder?: string;
   /** The target note's 6-char frontmatter `id` (NOT its filename). Optional. */
   note?: string;
+  /** 0.334.0: open a SAVED VIEW by name (filter + focus + folder restored from
+   *  settings.savedViews). Mutually sufficient with `folder`. */
+  view?: string;
   /** Ordered macro tokens; defaults to `["reveal"]` when empty. */
   run?: string[];
 }
@@ -35,7 +39,13 @@ export interface StashpadLinkParts {
 export function buildStashpadLink(parts: StashpadLinkParts): string {
   const q: string[] = [];
   if (parts.vault) q.push(`vault=${encodeURIComponent(parts.vault)}`);
-  q.push(`folder=${encodeURIComponent(parts.folder)}`);
+  // 0.334.0: a saved-view link is just `?view=<name>` — no folder/note/run (the
+  // saved state restores all of that).
+  if (parts.view) {
+    q.push(`view=${encodeURIComponent(parts.view)}`);
+    return `obsidian://${STASHPAD_PROTOCOL_ACTION}?${q.join("&")}`;
+  }
+  if (parts.folder) q.push(`folder=${encodeURIComponent(parts.folder)}`);
   if (parts.note) q.push(`note=${encodeURIComponent(parts.note)}`);
   const run = parts.run && parts.run.length ? parts.run : ["reveal"];
   q.push(`run=${encodeURIComponent(run.join(","))}`);
@@ -47,6 +57,7 @@ export interface StashpadLinkParams {
   vault?: string;
   folder?: string;
   note?: string;
+  view?: string;
   run?: string;
   action?: string;
 }
@@ -74,9 +85,13 @@ export function parseStashpadLink(raw: string): StashpadLinkParams | null {
 
   const params = new URLSearchParams(query);
   const folder = params.get("folder");
-  if (!folder) return null; // folder is required to route a Stashpad link
+  const view = params.get("view");
+  // 0.334.0: a link needs EITHER a folder to route to OR a saved view to open.
+  if (!folder && !view) return null;
 
-  const out: StashpadLinkParams = { folder };
+  const out: StashpadLinkParams = {};
+  if (folder) out.folder = folder;
+  if (view) out.view = view;
   const vault = params.get("vault"); if (vault) out.vault = vault;
   const note = params.get("note"); if (note) out.note = note;
   const run = params.get("run"); if (run) out.run = run;

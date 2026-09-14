@@ -53,6 +53,14 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     command: "stashpad:stashpad-open-all-notes",
   },
   {
+    id: "kanban",
+    label: "Kanban board",
+    keywords: "kanban board columns color pivot drag card status swimlane group",
+    hint: "The active folder's notes as columns by color — drag a card to recolor",
+    icon: "columns-3",
+    command: "stashpad:stashpad-open-kanban",
+  },
+  {
     id: "tasks",
     label: "Tasks",
     keywords: "aggregate tasks todo all open due checkbox",

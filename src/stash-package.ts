@@ -92,7 +92,11 @@ interface ParsedNote {
 
 // ---------------- Export ----------------
 
-export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8Array> {
+/** 0.342.0: build the .stash file entries (notes/*, attachments/*, manifest.json)
+ *  WITHOUT zipping — so a caller can write them to a folder instead of a zip
+ *  (the folder-based cross-vault transfer avoids zip/unzip). buildStashZip is
+ *  just this + zipFiles. */
+export async function buildStashEntries(app: App, input: ExportInput): Promise<ZipEntry[]> {
   const entries: ZipEntry[] = [];
   const allNotes = dedupeById([...input.rootNotes, ...input.allDescendants]);
   const collectedAtts = new Map<string, ArrayBuffer>(); // BUNDLE name -> binary
@@ -197,7 +201,11 @@ export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8
     entries.push({ name: "warnings.txt", data: warnings.join("\n") });
   }
 
-  return zipFiles(entries, 6);
+  return entries;
+}
+
+export async function buildStashZip(app: App, input: ExportInput): Promise<Uint8Array> {
+  return zipFiles(await buildStashEntries(app, input), 6);
 }
 
 /** 0.167.0: build a PLAIN .zip (no manifest, not re-importable) of the given
@@ -265,7 +273,20 @@ export async function importStashZip(
   existingIds: Set<StashpadId>,
   opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null; stripReserved?: boolean } = {},
 ): Promise<ImportSummary> {
-  const zip = await unzipFiles(buf);
+  return importFromFileMap(app, await unzipFiles(buf), destFolder, existingIds, opts);
+}
+
+/** 0.342.0: import from a PRE-UNZIPPED file map (name → bytes) — the shared core
+ *  of importStashZip. The folder-based cross-vault transfer reads a staged folder
+ *  into a map and imports it here, reusing all the id/parent/attachment remap +
+ *  zip-slip-safe naming without ever zipping/unzipping. */
+export async function importFromFileMap(
+  app: App,
+  zip: Record<string, Uint8Array>,
+  destFolder: string,
+  existingIds: Set<StashpadId>,
+  opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null; stripReserved?: boolean } = {},
+): Promise<ImportSummary> {
   const manifestBytes = zip["manifest.json"];
   if (!manifestBytes) throw new Error("Not a valid .stash package: missing manifest.json");
   const manifest = JSON.parse(bytesToStr(manifestBytes)) as StashManifest;

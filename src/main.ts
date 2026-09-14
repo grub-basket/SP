@@ -4,11 +4,17 @@ import { freshId } from "./id-service";
 import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
+import { QuickCaptureModal } from "./quick-capture";
+import { NoteHistoryStore } from "./note-history";
+import { SettingsBackupStore } from "./settings-backup";
+import { stageEntriesToFolder, importStagedFolder, writeXvFolderPointer, readXvFolderPointer, folderTransferAvailable } from "./cross-vault-folder";
+import { normalizeSnippet } from "./snippets";
 import { StashpadTrashView, openTrashView } from "./trash-view";
 import { ReEncryptScheduler } from "./reencrypt-scheduler";
 import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
-import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
+import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_KANBAN_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
+import { StashpadKanbanView, openKanbanView } from "./kanban-view";
 import { StashpadLogView, StashpadNotificationsView, openStashpadLogView, openStashpadNotificationsView } from "./activity-views";
 import { StashpadPanelsView, openStashpadPanelsView, openStashpadSinglePanel, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { TaskReviewModal } from "./task-review-modal";
@@ -26,9 +32,10 @@ import {
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
+import { DEFAULT_CONTEXT_SUBMENUS } from "./note-actions";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
-import { writeXvClipboard, readXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
+import { writeXvClipboard, readXvAck, writeXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
 import { ensureOkfTemplate, okfFolders, rebuildOkfForFolder, OKF_DEFAULT_TEMPLATE_PATH } from "./okf";
 import { buildOkfBundleFiles, zipBundle, tarGzBundle } from "./okf-export";
 import { formatDateTime } from "./format";
@@ -59,7 +66,7 @@ import { RenderCacheStore } from "./render-cache-store";
 import { SettingsStore, MOVED_KEYS } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
 import { APP_IMPORT_VIEW_TYPE, AppImportView, type AppImporterViewContext } from "./stashpad-app-import-modal";
-import { settleNewTab, buildHomeFilename } from "./view-helpers";
+import { settleNewTab, buildHomeFilename, splitIntoChunks } from "./view-helpers";
 import { returnToOriginOnClose } from "./leaf-return";
 import { resolveObscureAll } from "./obscure-scope";
 
@@ -827,6 +834,62 @@ export default class StashpadPlugin extends Plugin {
     if (!this._notifications) this._notifications = new NotificationService(this.app);
     return this._notifications;
   }
+  /** 0.337.0: per-note version-history store (see note-history.ts). Lazy so
+   *  `this.app` / settings are ready. */
+  private _history: NoteHistoryStore | null = null;
+  get history(): NoteHistoryStore {
+    if (!this._history) this._history = new NoteHistoryStore(this.app, () => this.settings.noteHistoryCap ?? 40);
+    return this._history;
+  }
+  /** 0.341.0: device-local settings-backup store (see settings-backup.ts). */
+  private _settingsBackup: SettingsBackupStore | null = null;
+  get settingsBackup(): SettingsBackupStore {
+    if (!this._settingsBackup) this._settingsBackup = new SettingsBackupStore(this.app);
+    return this._settingsBackup;
+  }
+  private _backupTimer: number | null = null;
+  private _lastBackupCore = "";
+  /** Debounced device-local backup of the core settings — one snapshot per ~90s
+   *  of change activity, only when the content actually differs from the last. */
+  private scheduleSettingsBackup(core: Record<string, unknown>): void {
+    if (this.settings.settingsBackups === false) return;
+    const str = (() => { try { return JSON.stringify(core); } catch { return ""; } })();
+    if (!str || str === this._lastBackupCore) return;
+    if (this._backupTimer != null) clearTimeout(this._backupTimer);
+    this._backupTimer = window.setTimeout(() => {
+      this._backupTimer = null;
+      this._lastBackupCore = str;
+      void this.settingsBackup.save(this.deviceId(), core);
+    }, 90000);
+  }
+  /** 0.341.0: restore a settings-backup snapshot — backs up the CURRENT settings
+   *  first (so the restore is itself reversible), writes the snapshot to
+   *  data.json, and reloads settings. */
+  async restoreSettingsBackup(path: string): Promise<boolean> {
+    const snap = await this.settingsBackup.read(path);
+    if (!snap) { new Notice("Couldn't read that backup."); return false; }
+    try {
+      // Snapshot the live settings before overwriting them.
+      const cur: Record<string, unknown> = {};
+      const moved = new Set<string>(MOVED_KEYS);
+      for (const [k, v] of Object.entries(this.settings as unknown as Record<string, unknown>)) if (!moved.has(k)) cur[k] = v;
+      await this.settingsBackup.save(`${this.deviceId()}-before-restore`, cur);
+      await this.saveData(snap);
+      new Notice("Settings restored. Reload Obsidian (Cmd/Ctrl+R) to apply everywhere.");
+      return true;
+    } catch (e) { new Notice(`Restore failed: ${(e as Error).message}`); return false; }
+  }
+
+  /** 0.337.0: capture a version when a genuine body edit is recorded (called
+   *  from the authorship tracker, which already debounces + skips self / fm-only
+   *  writes). Best-effort and setting-gated. */
+  captureNoteHistory(file: TFile, body: string, author: { id: string; name: string } | null): void {
+    if (!this.settings.enableNoteHistory) return;
+    const id = (this.app.metadataCache.getFileCache(file)?.frontmatter as { id?: unknown } | undefined)?.id;
+    const folder = file.parent?.path ?? "";
+    if (typeof id !== "string" || !id || !folder) return;
+    void this.history.capture(folder, id, body, author);
+  }
   /** 0.77.1: rebuildable author registry (authors.json in the plugin
    *  private dir). NOT a source of truth — a recovery cache + rename
    *  history. See author-registry.ts. Lazily constructed; load() is
@@ -864,6 +927,9 @@ export default class StashpadPlugin extends Plugin {
   /** 0.201.1: a cross-vault CUT waiting for its destination ACK. Set when a
    *  cut payload is stamped; resolved by checkXvCutAck() on window focus. */
   pendingXvCut: { token: string; folder: string; ids: StashpadId[] } | null = null;
+  /** 0.345.0: token of the pending cut we've already reminded the user about, so
+   *  the "still pending" nudge on window focus fires once per cut, not every focus. */
+  private _xvCutRemindedToken: string | null = null;
 
   /** Clear the note clipboard + dismiss its notice. Callers re-render to drop
    *  the .is-cut-pending / .is-copy-pending row styling. */
@@ -938,6 +1004,14 @@ export default class StashpadPlugin extends Plugin {
    *  Old paths are LEFT in place for safety — the user can delete them
    *  manually after confirming the new location works. */
   private async migrateLegacyPaths(): Promise<void> {
+    // 0.349.0 (startup): on an already-migrated install this method still did two
+    // serial adapter.exists() probes every launch (on the pre-view critical path,
+    // and not free on a network/synced vault). Short-circuit with a synchronous,
+    // per-vault localStorage flag set after the first clean pass. If localStorage
+    // is cleared the probes simply run again and find nothing — the flag is an
+    // optimization, never correctness.
+    const flagKey = `stashpad-legacy-paths-migrated:${this.app.vault.getName()}`;
+    try { if (localStorage.getItem(flagKey) === "1") return; } catch { /* fall through */ }
     const adapter = this.app.vault.adapter;
     const newDir = this.pluginPrivatePath();
     const ensureDir = async (): Promise<void> => {
@@ -998,6 +1072,8 @@ export default class StashpadPlugin extends Plugin {
         console.warn("Stashpad: .stashpad migration scan failed", e);
       }
     }
+    // Clean pass complete — skip the probes next launch on this device.
+    try { localStorage.setItem(flagKey, "1"); } catch { /* fall through */ }
   }
 
   // 0.113.0: loadData/saveData are NO LONGER overridden. They previously
@@ -2282,6 +2358,25 @@ export default class StashpadPlugin extends Plugin {
     return s;
   }
 
+  /** 0.364.0: the folder of the most-recent Stashpad list view, for commands that
+   *  want to act on "the folder I'm looking at" (e.g. open the kanban board).
+   *  Reads the live `noteFolder`, falling back to a deferred leaf's persisted
+   *  folderOverride, then the default folder. Null only if no Stashpad tab exists. */
+  activeStashpadFolder(): string | null {
+    const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
+    if (!leaves.length) return null;
+    const active = this.app.workspace.getMostRecentLeaf();
+    const ordered = active && leaves.includes(active) ? [active, ...leaves] : leaves;
+    for (const leaf of ordered) {
+      const live = ((leaf.view as unknown as { noteFolder?: string })?.noteFolder ?? "").trim();
+      if (live) return live.replace(/\/+$/, "");
+      const st = ((leaf.getViewState?.() as { state?: { folderOverride?: string | null } } | undefined)?.state) ?? {};
+      const f = (st.folderOverride ?? "").trim();
+      if (f) return f.replace(/\/+$/, "");
+    }
+    return (this.settings.folder || "Stashpad").replace(/\/+$/, "");
+  }
+
   /** Mint a note id that doesn't collide with any id currently in the vault.
    *  Use this for EVERY note-creation site instead of bare newId(). Amortized
    *  O(1) — the used-id set is built once (lazily) and maintained by the
@@ -2531,8 +2626,16 @@ export default class StashpadPlugin extends Plugin {
     // sync). Deferred to onLayoutReady (below) so it runs AFTER the vault has
     // finished indexing the `.stashenc` blobs — running it during onload once
     // wiped the registry against an empty file index.
-    this.settingTab = new StashpadSettingTab(this.app, this);
-    this.addSettingTab(this.settingTab);
+    const settingTab = new StashpadSettingTab(this.app, this);
+    this.settingTab = settingTab;
+    // 0.351.0 (startup): defer REGISTERING the settings tab to onLayoutReady. The
+    // declarative base calls getSettingDefinitions() once at registration, which
+    // scans the metadata cache (discoverStashpadFolders) to build the search-scope
+    // group — pure work the launch critical path doesn't need, and the cache is
+    // better-populated a tick later. The tab is still CONSTRUCTED here so
+    // this.settingTab is defined for update()/openSettingsPage; only registration
+    // (and its definition build) moves off onload.
+    this.app.workspace.onLayoutReady(() => this.addSettingTab(settingTab));
     // 0.231.0: getSettingDefinitions() is called ONCE, here at registration,
     // and the result is cached in the tab's `settingItems`. Any definition
     // derived from the VAULT rather than from settings is therefore computed
@@ -2666,6 +2769,34 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("create", (f) => {
       if (f instanceof TFile && f.extension === "md") this.queueTeamNotify(f);
     }));
+    // 0.355.0: re-attach a note's version history when it reappears (restored
+    // from the OS trash, or re-synced). trashHistory (on delete) parks the
+    // timeline under `<folder>/.stashpad/history/_trashed/`; restoreHistory
+    // moves it back — but only if a trashed copy exists AND no active history
+    // does, so it's a cheap existence check + no-op in the common case.
+    //
+    // Startup-storm guard: Obsidian fires `create` for EVERY existing file
+    // during initial load. We skip until layoutReady (real user creates fire
+    // after), require the note-history feature on, and only touch files that
+    // land directly in a discovered Stashpad folder — so a normal create only
+    // does one adapter.exists() on `_trashed/<id>.jsonl`. The id comes from the
+    // filename (frontmatter isn't parsed synchronously on `create`).
+    this.registerEvent(this.app.vault.on("create", (f) => {
+      if (!this.app.workspace.layoutReady) return;            // skip the startup flood
+      if (!this.settings.enableNoteHistory) return;
+      if (!(f instanceof TFile) || f.extension !== "md") return;
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      if (!dir || !this.discoverStashpadFolders().includes(dir)) return;
+      const id = parseIdFromFilename(f.basename);
+      if (id) void this.history.restoreHistory(dir, id);
+    }));
+    // 0.355.0: opportunistically prune each folder's `_trashed` history holding
+    // area once on layout-ready, so it can't grow forever. Best-effort + fully
+    // async; gated on the feature being on.
+    this.app.workspace.onLayoutReady(() => {
+      if (!this.settings.enableNoteHistory) return;
+      for (const folder of this.discoverStashpadFolders()) void this.history.pruneTrashedHistory(folder);
+    });
     // 0.266.1: a shortcut stub swaps itself for the Stashpad it names.
     // 0.266.1: `active-leaf-change`, NOT `file-open`. Measured with listeners
     // on all three: opening a file raises active-leaf-change and layout-change
@@ -2870,6 +3001,11 @@ export default class StashpadPlugin extends Plugin {
     this.registerView(
       STASHPAD_FOLDER_PANEL_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadFolderPanelView(leaf, this),
+    );
+    // 0.364.0: kanban board (property-pivot by color).
+    this.registerView(
+      STASHPAD_KANBAN_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadKanbanView(leaf, this),
     );
     // 0.315.0: action log + notification history, promoted from modals to tabs.
     this.registerView(
@@ -3140,6 +3276,18 @@ export default class StashpadPlugin extends Plugin {
     this.addRibbonIcon("panel-right", "Open Stashpad detail panel (right sidebar)", () => {
       void openStashpadDetailView(this.app);
     });
+    // 0.329.0: find-in-list ribbon entry. Distinct "list-filter" icon (vs the
+    // Search modal's magnifier) — this narrows the CURRENT list in place. Routes
+    // through the command so it acts on the active Stashpad view.
+    this.addRibbonIcon("list-filter", "Find in Stashpad list (filter current list)", () => {
+      (this.app as unknown as { commands?: { executeCommandById?: (id: string) => void } })
+        .commands?.executeCommandById?.("stashpad:stashpad-find-in-list");
+    });
+    // 0.330.0: global quick-capture ribbon entry ("zap" — a quick, from-anywhere
+    // note into a chosen Stashpad, with drag-drop + attach).
+    this.addRibbonIcon("zap", "Stashpad quick capture", () => {
+      new QuickCaptureModal(this.app, this).open();
+    });
     // 0.274.0: calendar ribbon entry — opens the Due calendar (month grid of
     // notes created / due / linking to each day). Right-click opens the
     // activity heatmap, the log-driven companion.
@@ -3364,6 +3512,14 @@ export default class StashpadPlugin extends Plugin {
       name: "Open aggregated All notes view (master index / database)",
       callback: () => void openAggregateView(this, "index"),
     });
+    // 0.364.0: kanban board — pivot the ACTIVE folder's notes into columns by
+    // color (drag a card to recolor). Falls back to the whole vault if no
+    // Stashpad folder is active.
+    this.addCommand({
+      id: "stashpad-open-kanban",
+      name: "Open kanban board (columns by color)",
+      callback: () => void openKanbanView(this, this.activeStashpadFolder()),
+    });
     // 0.273.1: each task as a created→completed span on a time axis.
     this.addCommand({
       id: "stashpad-open-task-timeline",
@@ -3455,6 +3611,42 @@ export default class StashpadPlugin extends Plugin {
       name: "Search Stashpad notes",
       callback: () => call("openSearchModal"),
     });
+    // 0.329.0: find-in-list — incremental type-to-filter of the current list,
+    // distinct from the global Search modal above.
+    this.addCommand({
+      id: "stashpad-find-in-list",
+      name: "Find in list (filter the current list)",
+      callback: () => call("toggleFindInList"),
+    });
+    // 0.330.0: global quick-capture — plugin-level, works from ANYWHERE in
+    // Obsidian (no Stashpad view required), which is the whole point.
+    this.addCommand({
+      id: "stashpad-quick-capture",
+      name: "Quick capture (new note into a Stashpad)",
+      callback: () => { new QuickCaptureModal(this.app, this).open(); },
+    });
+    // 0.335.0: clear every filter chip (tag / color / time / date / author /
+    // imported) for the current folder.
+    this.addCommand({
+      id: "stashpad-reset-filters",
+      name: "Reset filters (clear all chips)",
+      callback: () => call("resetFilters"),
+    });
+    // 0.337.0: per-note version history (timeline / diff / restore).
+    this.addCommand({
+      id: "stashpad-view-history",
+      name: "View note edit history (past versions)",
+      callback: () => call("cmdViewHistory"),
+    });
+    // 0.351.0: folder-level "who last saved each note" overview, grouped by person.
+    this.addCommand({
+      id: "stashpad-folder-saved-by-person",
+      name: "Folder: who last saved each note (by person)",
+      callback: () => call("cmdFolderSavedByPerson"),
+    });
+    // 0.342.0: folder-based cross-vault transfer is folder-FIRST inside the
+    // existing "Copy for another vault" / paste doors (with zip fallback) — no
+    // separate command needed.
     this.addCommand({
       id: "stashpad-search-in-parent",
       name: "Search in current parent",
@@ -3764,6 +3956,8 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-outdent", name: "Outdent (move to grandparent)", callback: () => call("cmdOutdent") });
     this.addCommand({ id: "stashpad-set-color", name: "Set note color…", callback: () => call("cmdSetColor") });
     this.addCommand({ id: "stashpad-reply-link", name: "Make note a reply to…", callback: () => call("cmdReplyLinkPicker") });
+    this.addCommand({ id: "stashpad-reply-in-list", name: "Reply to… (pick in the list)", callback: () => call("cmdReplyInListPicker") });
+    this.addCommand({ id: "stashpad-composer-debug", name: "Debug: composer placeholder + autocomplete state", callback: () => call("cmdComposerDebug") });
     // 0.319.0: drafts machinery (+ the edit-in-composer provision, deliberately
     // command-only until the UX is decided — see .claude/TODO.md "editing model").
     this.addCommand({ id: "stashpad-composer-drafts", name: "Show composer drafts", callback: () => this.openComposerDrafts() });
@@ -8078,6 +8272,63 @@ export default class StashpadPlugin extends Plugin {
    *  Oversized selections are refused with a modal offering the .stash-file
    *  export instead (clipboards aren't for hundreds of MB of attachments).
    *  Best-effort: any failure just leaves the plain-text clipboard behavior. */
+  /** 0.342.0: FOLDER-based cross-vault COPY (a separate layer beside the zip
+   *  clipboard). Stages the selection's subtree to `_exports/xv-<stamp>/` as plain
+   *  files (fast — no zip) and puts a pointer on the clipboard. Desktop only. */
+  async crossVaultCopyFolder(folder: string, rootIds: StashpadId[], plainText: string, mode: "copy" | "cut" = "copy"): Promise<{ status: "ok" | "empty" | "unavailable" | "failed"; count?: number }> {
+    if (!folderTransferAvailable()) return { status: "unavailable" };
+    try {
+      const cleaned = folder.replace(/\/+$/, "");
+      const rootNotes: { id: StashpadId; file: TFile }[] = [];
+      const allDescendants: { id: StashpadId; file: TFile }[] = [];
+      for (const rid of rootIds) {
+        const sub = await collectSubtree(this.app, cleaned, rid);
+        if (!sub) continue;
+        rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
+        for (const d of sub.descendants) allDescendants.push({ id: d.id, file: d.file });
+      }
+      if (!rootNotes.length) return { status: "empty" };
+      const staged = await stageEntriesToFolder(this.app, { rootNotes, allDescendants, sourceFolder: cleaned });
+      if (!staged) return { status: "failed" };
+      const total = rootNotes.length + allDescendants.length;
+      // 0.344.0: a CUT carries a token; the destination writes it back as an ACK
+      // after pasting, and this vault (on window focus) offers to delete the
+      // originals — the SAME handshake the zip cut path uses (checkXvCutAck).
+      const cutToken = mode === "cut" ? this.mintNoteId() + this.mintNoteId() : undefined;
+      const ok = writeXvFolderPointer(plainText, {
+        v: 1, mode, sourceVault: this.app.vault.getName(), sourceFolder: cleaned,
+        parents: rootNotes.length, children: allDescendants.length,
+        ...(cutToken ? { cutToken } : {}),
+      }, staged.absPath);
+      if (!ok) return { status: "failed" };
+      if (cutToken) this.pendingXvCut = { token: cutToken, folder: cleaned, ids: rootIds.slice() };
+      return { status: "ok", count: total };
+    } catch (e) { console.warn("[Stashpad] cross-vault folder copy failed", e); return { status: "failed" }; }
+  }
+
+  /** 0.342.0: FOLDER-based cross-vault PASTE — reads the clipboard pointer, imports
+   *  the staged folder as COPIES (fresh ids, subtree re-linked). Desktop only. */
+  async crossVaultPasteFolder(destFolder: string): Promise<{ status: "ok" | "none" | "unavailable" | "unreachable" | "failed"; count?: number; cut?: boolean }> {
+    if (!folderTransferAvailable()) return { status: "unavailable" };
+    const ptr = readXvFolderPointer();
+    if (!ptr) return { status: "none" };
+    try {
+      const cleaned = destFolder.replace(/\/+$/, "");
+      const existingIds = new Set<string>();
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        if (!f.path.startsWith(cleaned + "/")) continue;
+        const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+        if (typeof id === "string") existingIds.add(id);
+      }
+      const summary = await importStagedFolder(this.app, ptr.absPath, cleaned, existingIds);
+      if (!summary) return { status: "unreachable" };
+      // 0.344.0: a CUT — ACK the token back to the clipboard so the SOURCE vault
+      // offers to delete the originals (finishing the move). Mirrors pasteCrossVault.
+      if (ptr.meta.mode === "cut" && ptr.meta.cutToken) writeXvAck(ptr.meta.cutToken, this.app.vault.getName());
+      return { status: "ok", count: summary.notesWritten, cut: ptr.meta.mode === "cut" };
+    } catch (e) { console.warn("[Stashpad] cross-vault folder paste failed", e); return { status: "failed" }; }
+  }
+
   async stampCrossVaultClipboard(folder: string, rootIds: StashpadId[], mode: "cut" | "copy", plainText: string): Promise<{ status: "ok" | "too-big" | "failed" | "empty"; mb?: string }> {
     try {
       const cleaned = folder.replace(/\/+$/, "");
@@ -8119,7 +8370,19 @@ export default class StashpadPlugin extends Plugin {
     const pending = this.pendingXvCut;
     if (!pending) return;
     const ack = readXvAck();
-    if (!ack || ack.token !== pending.token) return;
+    if (!ack || ack.token !== pending.token) {
+      // 0.345.0: no ACK yet — the cut hasn't been pasted anywhere. Remind ONCE
+      // per cut (on the first focus back to this vault) that the move is still
+      // pending and the originals are intact, so a failed/forgotten cross-vault
+      // paste (e.g. the destination couldn't reach the staged folder) isn't
+      // silently mistaken for a completed move.
+      if (this._xvCutRemindedToken !== pending.token) {
+        this._xvCutRemindedToken = pending.token;
+        const n = pending.ids.length;
+        new Notice(`${n} note${n === 1 ? "" : "s"} cut for another vault — paste in that vault to finish the move. The originals stay here until then.`, 8000);
+      }
+      return;
+    }
     // Consume the pending state FIRST so a second focus event can't stack a
     // second modal for the same cut.
     this.pendingXvCut = null;
@@ -8572,6 +8835,42 @@ export default class StashpadPlugin extends Plugin {
    *  pinned-note / folder click spawned a DUPLICATE tab next to the active
    *  one — the "current tab hijacked + cloned" bug). Deferred matches are
    *  loaded before being returned, so callers can navigate them. */
+  /** 0.330.0: file a quick-capture note into a chosen Stashpad. Prefers an
+   *  already-open view for the folder (so the capture lands WITHOUT navigating
+   *  you there); only opens the folder when none is open. Attachments are
+   *  imported into that folder and their links appended to the body — all through
+   *  the view's normal createNoteUnder / importAttachment paths. */
+  async runQuickCapture(folder: string, text: string, files: File[], split = false): Promise<boolean> {
+    const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
+    if (!cleaned) { new Notice("Pick a Stashpad to capture into."); return false; }
+    let leaf = await this.findStashpadLeafForFolder(cleaned);
+    if (!leaf) leaf = await this.activateViewForFolder(cleaned);
+    if (!leaf) { new Notice(`Couldn't open “${cleaned}”.`); return false; }
+    try { await (leaf as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.(); } catch { /* reveal still works */ }
+    const view = leaf.view;
+    if (!(view instanceof StashpadView)) { new Notice("Stashpad view not ready — try again."); return false; }
+    let body = text;
+    for (const f of files) {
+      const link = await view.captureImport(f);
+      if (link) body += (body ? "\n" : "") + link;
+    }
+    // 0.364.2: split toggle — file each chunk (per the configured split mode) as
+    // its own note, mirroring the composer's split-on-send. Same splitIntoChunks
+    // the composer uses, so attachment-link-only chunks behave identically.
+    let made = 0;
+    if (split) {
+      const chunks = splitIntoChunks(body, this.settings.splitMode).filter((c) => c.trim());
+      for (const c of (chunks.length ? chunks : [body])) if (await view.captureNote(c)) made++;
+    } else {
+      if (await view.captureNote(body)) made = 1;
+    }
+    if (made) {
+      const where = cleaned.split("/").pop();
+      this.notifications.show({ message: made > 1 ? `Captured ${made} notes to “${where}”` : `Captured to “${where}”`, kind: "success", category: "system", folder: cleaned });
+    }
+    return made > 0;
+  }
+
   private async findStashpadLeafForFolder(folder: string): Promise<WorkspaceLeaf | null> {
     const cleaned = folder.replace(/\/+$/, "");
     const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
@@ -8969,8 +9268,21 @@ export default class StashpadPlugin extends Plugin {
   async handleDeepLink(params: { folder?: string; note?: string; run?: string; action?: string; vault?: string }, opts: { forceNewTab?: boolean; silent?: boolean } = {}): Promise<boolean> {
     const folder = (params.folder || "").replace(/^\/+|\/+$/g, "");
     const noteId = (params.note || "").trim();
+    const viewName = ((params as { view?: string }).view || "").trim();
     const actions = parseRunActions(params);
     const fail = (msg: string): boolean => { if (!opts.silent) new Notice(msg); return false; };
+
+    // 0.334.0: a saved-view link (`?view=<name>`) opens that view from settings —
+    // the saved state carries its own folder/filter/focus. Only ever opens the
+    // user's OWN saved views (no data crosses from the link), so it's safe even
+    // from an untrusted note.
+    if (viewName) {
+      const saved = (this.settings.savedViews ?? []).find((x) => x.name === viewName);
+      if (!saved) return fail(`Stashpad link: saved view “${viewName}” not found.`);
+      await new Promise<void>((resolve) => this.app.workspace.onLayoutReady(() => resolve()));
+      try { await this.openSavedView(saved.state); return true; }
+      catch (e) { return fail(`Stashpad link: couldn't open view “${viewName}”: ${(e as Error).message}`); }
+    }
 
     // 1. Guard + resolve. Returns false (not thrown) on a bad link so a batch
     // caller can tally how many actually opened. `silent` suppresses the Notice
@@ -10259,6 +10571,14 @@ export default class StashpadPlugin extends Plugin {
       (data).copyTimestampModifiers = (data).prefixTimestampsOnCopy ? "shift" : "";
       delete (data).prefixTimestampsOnCopy;
     }
+    // 0.343.0: one-time flip of alwaysStampCrossVault false→true for existing
+    // installs — the cross-vault COPY path now stages a fast plain folder instead
+    // of zipping into the clipboard, so preparing every copy is cheap. Guarded by
+    // a persisted flag so a user who later turns it back off isn't re-flipped.
+    if (data && data.crossVaultAlwaysStampDefaultedOn !== true) {
+      if (data.alwaysStampCrossVault === false) data.alwaysStampCrossVault = true;
+      data.crossVaultAlwaysStampDefaultedOn = true;
+    }
     if (data?.shortcuts && data.shortcuts.openEditor === "E") data.shortcuts.openEditor = "Mod+Shift+E";
     if (data?.bindings?.openEditor && data.bindings.openEditor.primary === "E") data.bindings.openEditor.primary = "Mod+Shift+E";
     this.settings = {
@@ -10327,6 +10647,7 @@ export default class StashpadPlugin extends Plugin {
       customCommandIds: Array.isArray(data?.customCommandIds) ? data.customCommandIds.filter((x: unknown): x is string => typeof x === "string") : [],
       savedSearches: Array.isArray(data?.savedSearches) ? data.savedSearches.filter((x: any) => x && typeof x.query === "string").map((x: any) => ({ name: typeof x.name === "string" && x.name ? x.name : x.query, query: x.query })) : [],
       savedViews: Array.isArray(data?.savedViews) ? data.savedViews.filter((x: any) => x && typeof x.name === "string" && x.state && typeof x.state === "object").map((x: any) => ({ name: x.name, state: x.state })) : [],
+      snippets: Array.isArray(data?.snippets) ? data.snippets.map((x: any) => normalizeSnippet(x)).filter((x: any): x is import("./snippets").Snippet => !!x) : [],
       contextSubmenus: (data?.contextSubmenus && typeof data.contextSubmenus === "object" && !Array.isArray(data.contextSubmenus))
         ? Object.fromEntries(Object.entries(data.contextSubmenus).filter(([, v]: [string, any]) => v && typeof v.name === "string").map(([k, v]: [string, any]) => [k, { name: String(v.name), icon: typeof v.icon === "string" ? v.icon : "folder", items: Array.isArray(v.items) ? v.items.filter((x: unknown): x is string => typeof x === "string") : [] }])) as Record<string, { name: string; icon: string; items: string[] }>
         : {},
@@ -10342,6 +10663,7 @@ export default class StashpadPlugin extends Plugin {
         ? data.slugStopWords
         : [...DEFAULT_STOPWORDS],
       migratedToggleTaskG: data?.migratedToggleTaskG === true,
+      contextMenusSeededV1: data?.contextMenusSeededV1 === true,
       dueQuickAdjusts: Array.isArray(data?.dueQuickAdjusts)
         ? data.dueQuickAdjusts.filter((x: unknown): x is string => typeof x === "string")
         : ["5m", "15m", "30m", "1h", "1d", "1w"],
@@ -10360,6 +10682,33 @@ export default class StashpadPlugin extends Plugin {
       }
       this.settings.migratedToggleTaskG = true;
       await this.saveSettings();
+    }
+    // 0.363.0: one-time seed of the four built-in reorg submenus (Move, Pin,
+    // Advanced, React / Reply). They used to be hand-built menu cases; they're now
+    // ordinary contextSubmenus entries referenced from CONTEXT_DEFAULT_ORDER as
+    // `submenu:<key>`, so `submenu:move` etc. must resolve. MERGE only the missing
+    // keys — never clobber a submenu the user already keyed the same (e.g. a
+    // hand-made "move") — then mark seeded so a later delete of one sticks. A fresh
+    // install hits this too (default flag false) and gets all four; existing installs
+    // keep any custom contextMenuOrder, and a user still on the default (empty) order
+    // picks up the new order that references these seeded submenus.
+    // 0.363.0: ensure every DEFAULT_CONTEXT_SUBMENUS key EXISTS (add only missing
+    // ones — never clobber a user's own submenu under the same key). Unconditional
+    // (not gated on the seed flag) so a NEW baked-in submenu added in a later version
+    // (e.g. "appearance") reaches users who were already seeded. A user who deletes a
+    // baked-in default gets it back next launch — acceptable for a "baked-in" set;
+    // they can empty its items or drop it from their custom order instead.
+    {
+      const subs = { ...(this.settings.contextSubmenus ?? {}) };
+      let added = false;
+      for (const [k, v] of Object.entries(DEFAULT_CONTEXT_SUBMENUS)) {
+        if (!subs[k]) { subs[k] = { name: v.name, icon: v.icon, items: [...v.items] }; added = true; }
+      }
+      if (added || !this.settings.contextMenusSeededV1) {
+        this.settings.contextSubmenus = subs;
+        this.settings.contextMenusSeededV1 = true;
+        await this.saveSettings();
+      }
     }
     // Sync the notification service's mute set from settings. Safe to
     // call before any toasts fire — the service no-ops on empty mute
@@ -10560,13 +10909,38 @@ export default class StashpadPlugin extends Plugin {
    *  a settings-tab edit and clobber a freshly-changed shortcut. Both
    *  saveSettings() and persistSettingsQuiet() funnel through here. */
   private writeChain: Promise<void> = Promise.resolve();
+  /** 0.363.12: the write that is QUEUED behind the in-flight one but has not yet
+   *  started reading settings. While it exists, further queueWrite() calls join it
+   *  instead of scheduling their own — see the coalescing note below. */
+  private trailingWrite: Promise<void> | null = null;
+  /** Diagnostics: saveSettings() calls absorbed since the last actual disk write
+   *  (surfaced in the `settings:write` trace so a burst is visible). */
+  private savesSinceWrite = 0;
+
   private queueWrite(): Promise<void> {
-    // Snapshot the settings reference at queue time. saveData itself does
-    // a synchronous JSON.stringify, but we still chain so two in-flight
-    // writes can't interleave their adapter.write calls.
-    const next = this.writeChain.then(() => this.guardedSave());
-    this.writeChain = next.catch(() => {});
-    return next;
+    // 0.363.12 (perf): TRAILING-COALESCE. Every saveSettings() used to chain its
+    // own guardedSave() — a burst = N disk read+write round-trips. guardedSave
+    // reads `this.settings` LIVE, and settings are mutated in place (shared
+    // reference), so ONE write captures the latest state and satisfies every
+    // caller whose change landed before it starts reading. So: while a write is
+    // queued-but-not-started, join it; a burst collapses to ~2 disk writes (the
+    // in-flight one + a single trailing one) instead of N.
+    //
+    // SAFETY: we only join a write that has NOT yet run its callback (it re-reads
+    // settings there, after its own loadData await). The moment the callback runs
+    // we clear the slot, so a mutation arriving after that point schedules its own
+    // fresh write rather than riding a write that already snapshotted — no
+    // silently-dropped save, and the collision-merge guard still runs per write.
+    if (this.trailingWrite) return this.trailingWrite;
+    const run: Promise<void> = this.writeChain.then(() => {
+      if (this.trailingWrite === run) this.trailingWrite = null; // about to read settings — stop coalescing
+      this.trace("settings:write", { coalesced: this.savesSinceWrite });
+      this.savesSinceWrite = 0;
+      return this.guardedSave();
+    });
+    this.writeChain = run.catch(() => {});
+    this.trailingWrite = run;
+    return run;
   }
 
   /** 0.137.3: MULTI-WRITER COLLISION GUARD. Two Obsidian instances on the same
@@ -10837,14 +11211,22 @@ export default class StashpadPlugin extends Plugin {
       const core: Record<string, unknown> = {};
       const moved = new Set<string>(MOVED_KEYS);
       for (const [k, v] of Object.entries(all)) if (!moved.has(k)) core[k] = v;
-      await this.saveData(core);
+      await this.store.saveCore(core); // 0.349.0: atomic write (temp + rename) — an
+      // interrupted save can no longer zero data.json.
       this.lastSeenSettingsRev = rev;
       this.store.markCoreSaved(all);
+      this.scheduleSettingsBackup(core); // 0.341.0: device-local backup
     }
     this.snapshotSettingsBaseline(curStr);
   }
 
   async saveSettings(): Promise<void> {
+    // 0.363.12: count + trace every call. A burst dedups to `settings:save (xN)`
+    // in the trace (N = burst size), and the paired `settings:write {coalesced:N}`
+    // shows how many of those collapsed into one disk write — so the render-storm
+    // burst is legible even without catching the exact stall.
+    this.savesSinceWrite++;
+    this.trace("settings:save");
     await this.queueWrite();
     setSettings(this.settings);
     // 0.291.0 (perf): discovery filters on `importExcludePrefixes` — the third
@@ -10881,6 +11263,9 @@ export default class StashpadPlugin extends Plugin {
    *  so high-frequency writes (e.g. composer drafts) don't trigger re-renders
    *  that would steal focus from the textarea. */
   async persistSettingsQuiet(): Promise<void> {
+    // 0.363.12: trace quiet writes too (draft churn is a prime burst suspect).
+    this.savesSinceWrite++;
+    this.trace("settings:write-quiet");
     await this.queueWrite();
   }
 

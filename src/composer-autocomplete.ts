@@ -1,8 +1,9 @@
 import { parseNaturalDate, naturalDatePhrases, formatNaturalDate } from "./natural-date";
-import { App, Scope, TFile, moment } from "obsidian";
+import { App, Platform, Scope, TFile, moment } from "obsidian";
 import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore, siftMatch } from "./types";
 import { HIGHLIGHT_COLORS, takeLeadingColor } from "./highlight-colors";
 import { getSettings, getTemplatesFormats } from "./settings";
+import { expandSnippet } from "./snippets";
 import { MarkdownInput, type MarkdownInputOptions } from "./markdown-input";
 
 /**
@@ -110,6 +111,27 @@ export class ComposerAutocomplete {
    *  because they're internal-tooling files users never link to. */
   private fileIndex: FileIndexEntry[] = [];
   private tagIndex: string[] = [];
+  /** 0.350.0: true when the tag list shown is a browsable FALLBACK (the query
+   *  matched nothing) rather than real matches — commit is suppressed so it can't
+   *  hijack a brand-new tag the user is typing. */
+  private tagListIsFallback = false;
+  /** 0.353.0: tears down the mobile "reveal when the keyboard settles" timers +
+   *  listeners; set while a popup is waiting to be revealed, cleared on reveal/close. */
+  private mobileRevealCleanup: (() => void) | null = null;
+  /** 0.357.0: timestamp of the textarea's last focus (see the focus listener). */
+  private lastFocusAt = 0;
+  private onFocusTs = (): void => { this.lastFocusAt = Date.now(); };
+  /** 0.363.3: the largest visualViewport height seen = the keyboard-DOWN height.
+   *  In Obsidian's mobile webview `window.innerHeight` shrinks WITH the keyboard,
+   *  so `innerHeight - vv.height` is ~0 whether the keyboard is up or down — a
+   *  useless signal (it made 0.363.2 treat the keyboard as always-down). Comparing
+   *  the current vv.height to its own historical max is reliable: keyboard up ⇒
+   *  vv.height well below the max. Seeded/kept current by the vv resize listener. */
+  private maxVvHeight = 0;
+  private onVvResize = (): void => {
+    const vv = (this.ta.ownerDocument?.defaultView ?? window).visualViewport;
+    if (vv && vv.height > this.maxVvHeight) this.maxVvHeight = vv.height;
+  };
   private indexBuilt = false;
   private vaultListeners: Array<() => void> = [];
   /** Obsidian Scope pushed onto the keymap while the popup is open. It
@@ -139,12 +161,32 @@ export class ComposerAutocomplete {
 
   attach(): void {
     this.ta.addEventListener("input", this.onInput);
+    // 0.357.0: track when the textarea last GAINED focus, so the mobile
+    // reveal-delay only kicks in when the keyboard is actually rising (a toolbar
+    // `[[`/`#` button just focused it) — not when you're already typing with the
+    // keyboard up (e.g. `#tag`), where the popup should appear immediately.
+    this.ta.addEventListener("focus", this.onFocusTs);
+    this.vaultListeners.push(() => this.ta.removeEventListener("focus", this.onFocusTs));
+    // 0.363.3: track the max visualViewport height (keyboard-down height) so
+    // openFor() can tell keyboard-up from keyboard-down reliably. Seed it now.
+    const vv0 = (this.ta.ownerDocument?.defaultView ?? window).visualViewport;
+    if (vv0) {
+      this.maxVvHeight = vv0.height;
+      vv0.addEventListener("resize", this.onVvResize);
+      this.vaultListeners.push(() => vv0.removeEventListener("resize", this.onVvResize));
+    }
     // 0.202.0: the Markdown editing behaviors (autopair, wrap, list
     // continuation, Tab indent, double-click trim) live in their own layer —
     // attached here so EVERY surface that gets suggestions also gets them.
     this.input = new MarkdownInput(this.app, this.ta, this.inputOpts);
     this.input.attach();
     this.ta.addEventListener("keydown", this.onKeyDown, true);
+    // 0.323.0: parity with Obsidian's link editing — the wikilink suggester
+    // reopens when the caret LANDS inside an existing `[[link]]` via click or
+    // arrow key, not only when you type. So changing an existing link is
+    // "click inside it → pick a new target", exactly like the CodeMirror editor.
+    this.ta.addEventListener("keyup", this.onCaretMove);
+    this.ta.addEventListener("click", this.onCaretMove);
     this.ta.addEventListener("blur", this.onBlur);
     // Document-capture Escape interceptor — only acts while a popup is
     // open. Without this, Obsidian's workspace-level Escape (which
@@ -155,6 +197,22 @@ export class ComposerAutocomplete {
     this.vaultListeners.push(() => doc.removeEventListener("keydown", this.onDocEscape, true));
     doc.addEventListener("keydown", this.onDocSelectAll, true);
     this.vaultListeners.push(() => doc.removeEventListener("keydown", this.onDocSelectAll, true));
+    // 0.337.2: keep the popup anchored to the textarea when the layout shifts —
+    // above all the MOBILE keyboard revealing (pressing the toolbar's `[[`/`#`
+    // button focuses the textarea, which raises the keyboard and moves the
+    // composer up, but the popup was staying put and covering it). visualViewport
+    // fires resize/scroll through the whole keyboard animation, so re-positioning
+    // on each event lands the popup correctly; window resize covers desktop.
+    const win = this.ta.ownerDocument?.defaultView ?? window;
+    const vv = win.visualViewport;
+    if (vv) {
+      vv.addEventListener("resize", this.reposition);
+      vv.addEventListener("scroll", this.reposition);
+      this.vaultListeners.push(() => vv.removeEventListener("resize", this.reposition));
+      this.vaultListeners.push(() => vv.removeEventListener("scroll", this.reposition));
+    }
+    win.addEventListener("resize", this.reposition);
+    this.vaultListeners.push(() => win.removeEventListener("resize", this.reposition));
     this.buildIndex();
     // Refresh index on vault structure changes. Coalesce by just
     // invalidating; next openFor call rebuilds lazily.
@@ -183,6 +241,8 @@ export class ComposerAutocomplete {
     this.input?.detach();
     this.input = null;
     this.ta.removeEventListener("keydown", this.onKeyDown, true);
+    this.ta.removeEventListener("keyup", this.onCaretMove);
+    this.ta.removeEventListener("click", this.onCaretMove);
     this.ta.removeEventListener("blur", this.onBlur);
     for (const off of this.vaultListeners) off();
     this.vaultListeners = [];
@@ -285,10 +345,11 @@ export class ComposerAutocomplete {
     }
 
     // Tag: # followed by tag chars, preceded by start-of-line/whitespace.
-    // Require at least one character after the # — opening the popup the
-    // moment the bare # is typed flooded it with the entire tag list and
-    // (mysteriously) seemed to coincide with the textarea losing focus.
-    const tagMatch = before.match(/(^|\s)#([A-Za-z0-9_/\-]+)$/);
+    // 0.350.0: the BARE `#` shows the list again (a browsable full list), but the
+    // list no longer TAKES OVER — a following space/Enter on a bare `#` (or on a
+    // brand-new tag with no match) is let through, so `# ` still starts a Markdown
+    // heading (see onKeyDown). The `(^|\s)` guard keeps `C#`/`issue#5` mid-word out.
+    const tagMatch = before.match(/(^|\s)#([A-Za-z0-9_/\-]*)$/);
     if (tagMatch) {
       const query = tagMatch[2];
       return {
@@ -434,6 +495,21 @@ export class ComposerAutocomplete {
    *  maintain.
    *
    *  A few are held back — see SLASH_EXCLUDED. */
+  /** 0.334.0: saved-view suggestions for the `[[` / `@` menus. Picking one
+   *  inserts a markdown deep link `[name](obsidian://stashpad?view=name)` — which
+   *  renders clickable (0.331.0) and opens that saved view (0.334.0 handler). */
+  private savedViewItems(query: string): SuggestItem[] {
+    const views = ((getSettings() as { savedViews?: Array<{ name?: unknown }> }).savedViews ?? [])
+      .filter((v): v is { name: string } => !!v && typeof v.name === "string" && v.name.length > 0);
+    if (!views.length) return [];
+    const matched = query ? views.filter((v) => siftMatch(query, v.name)) : views;
+    return matched.slice(0, 8).map((v) => ({
+      label: `\u{1F441} ${v.name}`,
+      insert: `[${v.name}](obsidian://stashpad?view=${encodeURIComponent(v.name)})`,
+      subtitle: "saved view",
+    }));
+  }
+
   private commandItems(query: string): SuggestItem[] {
     const registry: Record<string, { name?: string }> =
       (this.app as unknown as { commands?: { commands?: Record<string, { name?: string }> } })
@@ -507,19 +583,23 @@ export class ComposerAutocomplete {
       });
 
     if (state.kind === "link") {
+      // 0.334.0: saved views head the `[[` menu — picking one inserts a deep link
+      // that opens that view (clickable in rendered notes). Then note matches.
       // 0.73.3: cap bumped 30 → 50 now that the index includes every file type.
-      return fileMatches(50);
+      return [...this.savedViewItems(q), ...fileMatches(50)];
     }
     if (state.kind === "command") {
       return this.commandItems(q);
     }
     if (state.kind === "tag") {
       // Tag autocomplete: same all-tokens rule, against the pre-sorted (by
-      // usage count) tag list.
-      return this.tagIndex
-        .filter((t) => matchesAll(t.toLowerCase()))
-        .slice(0, 30)
-        .map((t) => ({ label: t, insert: t, subtitle: "" }));
+      // usage count) tag list. 0.350.0: when the query matches NOTHING, fall back
+      // to the full list (top 30 by usage) so the popup stays a browsable list
+      // instead of vanishing — flagged as fallback so it doesn't auto-commit.
+      const matched = this.tagIndex.filter((t) => matchesAll(t.toLowerCase())).slice(0, 30);
+      this.tagListIsFallback = state.query !== "" && matched.length === 0;
+      const list = this.tagListIsFallback ? this.tagIndex.slice(0, 30) : matched;
+      return list.map((t) => ({ label: t, insert: t, subtitle: "" }));
     }
     // 0.186.0: unified `@` — natural-language dates (via NLD) blended with
     // note links. Dates rank first so Enter on `@today` inserts the date.
@@ -561,15 +641,80 @@ export class ComposerAutocomplete {
     const noteItems = q === ""
       ? (dateItems.length ? [] : fileMatches(15))
       : fileMatches(30);
-    return [...dateItems, ...noteItems];
+    // 0.334.0: saved views appear here too, but only once you're typing — a bare
+    // `@` should stay the tight date popup.
+    const svItems = q === "" ? [] : this.savedViewItems(q);
+    return [...svItems, ...dateItems, ...noteItems];
   }
 
   // ---------- Event handlers ----------
 
   private onInput = (): void => {
+    // 0.338.0: espanso-style snippet auto-expand — when a snippet trigger is
+    // committed by a following whitespace, replace it with the expanded value.
+    if (this.tryExpandSnippet()) { this.close(); return; }
     const state = this.detectTrigger();
     if (!state) { this.close(); return; }
     this.openFor(state);
+  };
+
+  /** Expand a snippet whose trigger was just committed by a trailing space/newline
+   *  (so a trigger that is a prefix of a longer word isn't expanded prematurely).
+   *  Returns true when an expansion happened. */
+  private tryExpandSnippet(): boolean {
+    // 0.346.0: skip deactivated snippets (enabled === false).
+    const snippets = (getSettings().snippets ?? []).filter((s) => s.trigger && s.value && s.enabled !== false);
+    if (!snippets.length) return false;
+    const val = this.ta.value;
+    const caret = this.ta.selectionStart ?? val.length;
+    const before = val.slice(0, caret);
+    const boundary = before[before.length - 1];
+    if (!boundary || !/\s/.test(boundary)) return false; // commit only on whitespace
+    const upto = before.slice(0, before.length - 1);
+    for (const sn of snippets) {
+      // 0.346.0: case-insensitive by default; exact match when caseSensitive.
+      if (upto.length < sn.trigger.length) continue;
+      const tail = upto.slice(upto.length - sn.trigger.length);
+      const hit = sn.caseSensitive === true ? tail === sn.trigger : tail.toLowerCase() === sn.trigger.toLowerCase();
+      if (!hit) continue;
+      const prevCh = upto[upto.length - sn.trigger.length - 1];
+      if (prevCh !== undefined && !/\s/.test(prevCh)) continue; // trigger must start at a boundary
+      const start = upto.length - sn.trigger.length;
+      const expanded = expandSnippet(this.app, sn.value, {});
+      this.ta.value = val.slice(0, start) + expanded + boundary + val.slice(caret);
+      const c = start + expanded.length + 1;
+      this.ta.setSelectionRange(c, c);
+      this.ta.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    }
+    return false;
+  }
+
+  /** 0.323.0: reopen the wikilink suggester when the caret MOVES into an
+   *  existing `[[link]]` (click / Left / Right / Home / End) without any typing.
+   *  Obsidian's EditorSuggest triggers on cursor change, so a link is edited by
+   *  clicking inside it and picking a new target; matching that here gives the
+   *  edit modal (and every shared surface) the same "live adjusting" feel.
+   *
+   *  Scoped to the `link` kind only — the typed triggers (`#`, `@`, `/`, `==`)
+   *  stay input-driven so a stray click after a word doesn't flash a popup. And
+   *  ArrowUp/Down are excluded so navigating an OPEN popup never re-searches it. */
+  private onCaretMove = (e: Event): void => {
+    // `e.type` rather than `instanceof KeyboardEvent`: a keyup from a popped-out
+    // Obsidian window is an instance of THAT window's KeyboardEvent, so the
+    // instanceof check would be false cross-realm and treat every keystroke's
+    // keyup like a click (re-searching on each char). Type string is realm-safe.
+    if (e.type === "keyup") {
+      const k = (e as KeyboardEvent).key;
+      if (k !== "ArrowLeft" && k !== "ArrowRight" && k !== "Home" && k !== "End") return;
+    }
+    const st = this.detectTrigger();
+    if (st && st.kind === "link") {
+      this.openFor(st);
+    } else if (this.state && this.state.kind === "link") {
+      // Caret left the link → dismiss the popup we opened from a caret move.
+      this.close();
+    }
   };
 
   private onBlur = (): void => {
@@ -627,25 +772,34 @@ export class ComposerAutocomplete {
       this.activeIdx = (this.activeIdx - 1 + this.items.length) % this.items.length;
       this.refreshActive();
     } else if (e.key === "Enter" || e.key === "Tab") {
-      e.preventDefault();
-      e.stopPropagation();
-      this.commit();
+      // 0.350.0: on a browsable FALLBACK tag list (query matched nothing) that the
+      // user hasn't navigated, Enter/Tab must NOT insert an unrelated tag — keep
+      // what they typed and close.
+      if (this.state.kind === "tag" && this.tagListIsFallback && this.activeIdx === 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.close();
+      } else {
+        e.preventDefault();
+        e.stopPropagation();
+        this.commit();
+      }
     } else if (e.key === " " && this.state.kind === "tag") {
       // Space completes a tag (tags can't contain spaces, so the space that
       // would end the tag doubles as "accept the highlighted suggestion").
-      // NOT for links / @ (those legitimately contain spaces). Guard: only
-      // complete when the highlighted tag actually STARTS WITH what's typed —
-      // otherwise a mere substring match would hijack a brand-new tag the user
-      // is typing (e.g. typing `#foo` when only `#barfoo` exists). The inserted
-      // tag keeps the space so typing flows on.
+      // NOT for links / @ (those legitimately contain spaces). Guards: only
+      // complete when there's a real (non-empty, non-fallback) query AND the
+      // highlighted tag STARTS WITH what's typed. So a bare `#` + space starts a
+      // Markdown heading, and `#newtag` + space creates the new tag — neither is
+      // hijacked. The inserted tag keeps the space so typing flows on.
       const active = this.items[this.activeIdx];
       const typed = "#" + this.state.query.toLowerCase();
-      if (active && active.insert.toLowerCase().startsWith(typed)) {
+      if (this.state.query !== "" && !this.tagListIsFallback && active && active.insert.toLowerCase().startsWith(typed)) {
         e.preventDefault();
         e.stopPropagation();
         this.commit(" ");
       } else {
-        this.close(); // new tag the user is typing — let the space through
+        this.close(); // bare `#` (heading), new tag, or fallback — let the space through
       }
     } else if (e.key === "Escape") {
       // stopImmediatePropagation beats Obsidian's workspace-level
@@ -666,6 +820,85 @@ export class ComposerAutocomplete {
     if (!this.items.length) { this.close(); return; }
     this.renderPopup();
     this.pushScope();
+    const win = this.ta.ownerDocument?.defaultView ?? window;
+    // 0.353.0: on MOBILE, opening the popup often coincides with the keyboard
+    // revealing (a toolbar `[[`/`#` button focuses the textarea) — positioning
+    // against the mid-animation layout dropped the popup UNDER the keyboard. So
+    // keep it hidden until the visual viewport settles (keyboard fully up), then
+    // position once against the final layout and reveal. Desktop is unchanged: it
+    // re-anchors a couple of times across any layout shift.
+    // 0.363.2: hold-for-settle only when the KEYBOARD IS DOWN at open — because
+    // that's when opening the popup (a toolbar button focusing the textarea) will
+    // RAISE the keyboard and shift the layout under us. Keyboard state is read from
+    // the visual viewport (keyboard down ⇒ viewport ≈ full window height), NOT from
+    // focus recency: on iOS the keyboard can hide while the textarea stays focused,
+    // so a stale focus age wrongly reported "keyboard already up" and revealed
+    // instantly into a rising keyboard (the reported bug).
+    const vv = win.visualViewport;
+    if (vv && vv.height > this.maxVvHeight) this.maxVvHeight = vv.height;
+    // 0.363.3: keyboard-down when the current viewport height is at (or near) its
+    // max-seen height. vpGap here is the drop from the keyboard-down height, NOT
+    // innerHeight - vv.height (which stays ~0 in Obsidian's mobile webview because
+    // innerHeight tracks the keyboard). A >120px drop ⇒ keyboard is up.
+    const vpGap = vv ? Math.round(this.maxVvHeight - vv.height) : 0;
+    const keyboardDown = !!vv && vpGap < 120;
+    // Only DELAY (wait for the keyboard to finish rising) when it's actually down
+    // at open — i.e. opening the popup is what will raise it (a toolbar button
+    // focusing the textarea). If the keyboard is already up (mid-typing), show now.
+    // Requires a visualViewport: without one we can't watch the keyboard rise, so
+    // delaying would just strand the popup until the hard cap — show instantly.
+    const useDelay = Platform.isMobile && !!vv && keyboardDown;
+    // Debug snapshot of the reveal decision (surfaced by the composer debug command).
+    this.lastOpenDebug = { mode: useDelay ? "mobile-delay-settle" : "instant", focusAgeMs: Date.now() - this.lastFocusAt, vpGap, keyboardDown, isMobile: Platform.isMobile, hasVisualViewport: !!vv, kind: state.kind, at: new Date().toLocaleTimeString() };
+    if (useDelay) {
+      this.revealWhenViewportSettles(win);
+    } else {
+      win.setTimeout(this.reposition, 160);
+      win.setTimeout(this.reposition, 400);
+    }
+  }
+
+  /** 0.362.0: last reveal decision, for the composer debug command. */
+  lastOpenDebug: { mode: string; focusAgeMs: number; vpGap?: number; keyboardDown?: boolean; isMobile: boolean; hasVisualViewport: boolean; kind: string; at: string } | null = null;
+
+  /** Hold the popup hidden until the mobile keyboard has finished rising, then
+   *  position against the final layout and reveal.
+   *
+   *  0.363.3: this is only called when the keyboard is DOWN at open (a toolbar
+   *  `[[`/`#` button just focused the textarea and is about to raise it), so we
+   *  must WAIT for the rise — NOT shortcut past it. The old 130ms "if nothing
+   *  moved yet, reveal now" timer was the bug the user reported: iOS takes a beat
+   *  to even START the keyboard animation, so that timer fired first and revealed
+   *  straight into the rising keyboard ("pushes through instantly"). We now reveal
+   *  only after a viewport move has actually settled, with a hard cap as the sole
+   *  fallback so it can never stay stuck hidden (e.g. focus never raised a
+   *  keyboard). */
+  private revealWhenViewportSettles(win: Window): void {
+    if (!this.popupEl) return;
+    this.popupEl.style.visibility = "hidden";
+    const vv = win.visualViewport;
+    let settleTimer = 0;
+    const reveal = (): void => {
+      this.mobileRevealCleanup?.();
+      if (this.popupEl && this.state) { this.position(); this.popupEl.style.visibility = "visible"; }
+    };
+    // Each viewport move (keyboard animating) pushes the reveal out; when the
+    // moves stop for 200ms the keyboard has settled → position + reveal.
+    const onResize = (): void => {
+      if (settleTimer) win.clearTimeout(settleTimer);
+      settleTimer = win.setTimeout(reveal, 200);
+    };
+    vv?.addEventListener("resize", onResize);
+    // Hard cap — the ONLY unconditional reveal, so a focus that never raises a
+    // keyboard (hardware keyboard, already-up edge case) still shows the popup.
+    // Generous enough to outlast iOS's keyboard-show start latency + animation.
+    const maxTimer = win.setTimeout(reveal, 1200);
+    this.mobileRevealCleanup = (): void => {
+      vv?.removeEventListener("resize", onResize);
+      if (settleTimer) win.clearTimeout(settleTimer);
+      win.clearTimeout(maxTimer);
+      this.mobileRevealCleanup = null;
+    };
   }
 
   /** Push an Obsidian keymap Scope that consumes Escape so the
@@ -732,6 +965,12 @@ export class ComposerAutocomplete {
     if (active) active.scrollIntoView({ block: "nearest" });
   }
 
+  /** Re-anchor an OPEN popup to the textarea — driven by visualViewport/window
+   *  resize + scroll (the mobile keyboard reveal is the main case). */
+  private reposition = (): void => {
+    if (this.popupEl && this.state) this.position();
+  };
+
   private position(): void {
     if (!this.popupEl) return;
     const r = this.ta.getBoundingClientRect();
@@ -777,6 +1016,7 @@ export class ComposerAutocomplete {
   }
 
   private close(): void {
+    this.mobileRevealCleanup?.(); // 0.353.0: cancel a pending mobile reveal
     if (this.popupEl) {
       this.popupEl.remove();
       this.popupEl = null;

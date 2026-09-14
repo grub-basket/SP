@@ -1,4 +1,5 @@
 import type { App } from "obsidian";
+import { Platform } from "obsidian";
 import { getSettings } from "./settings";
 
 /** 0.202.0: the shared Markdown text-editing behaviors for Stashpad's plain
@@ -29,12 +30,21 @@ import { getSettings } from "./settings";
  *  See `docs/markdown-input-parity.md` for the full checklist + audit. */
 
 /** Opener → closer. Quotes are symmetric; a prose-guard keeps apostrophes
- *  ("don't") from spawning a pair. */
-const SIMPLE: Record<string, string> = { "[": "]", "(": ")", "`": "`", '"': '"', "'": "'" };
+ *  ("don't") from spawning a pair.
+ *  0.363.10: curly quotes included — iOS "Smart Punctuation" converts a typed
+ *  straight quote to a LEFT curly (U+201C/U+2018) before it reaches us, and on
+ *  mobile the pair logic runs off beforeinput whose `data` carries that curly
+ *  char. Each left curly pairs with its RIGHT curly closer, so a smart-quote
+ *  opener still auto-closes. Desktop keydown only ever sees straight quotes, so
+ *  these entries are inert there. */
+const SIMPLE: Record<string, string> = { "[": "]", "(": ")", "`": "`", '"': '"', "'": "'", "“": "”", "‘": "’" };
+/** Opening-quote characters (straight + iOS smart curly), word-start-gated so
+ *  apostrophes and closing quotes don't spawn a pair. */
+const QUOTE_OPENERS = new Set(['"', "'", "“", "‘"]);
 /** Emphasis markers that pair on the SECOND keypress (`**|**`). */
 const DOUBLED = new Set(["*", "~", "="]);
 /** Characters that "type over" an identical character sitting at the caret. */
-const CLOSERS = new Set(["]", ")", "`", "*", "~", "=", '"', "'"]);
+const CLOSERS = new Set(["]", ")", "`", "*", "~", "=", '"', "'", "”", "’"]);
 /** What a keypress wraps a SELECTION in — every opener plus each doubled
  *  marker acting as its own closer. */
 const WRAP: Record<string, string> = { ...SIMPLE, "*": "*", "~": "~", "=": "=" };
@@ -83,6 +93,44 @@ export function parseListLine(line: string): ListLine | null {
   };
 }
 
+/** 0.353.0: post-send cleanup for the mobile soft-keyboard autopair-duplication
+ *  bug — on some mobile keyboards, producing a closing emphasis pair leaves the
+ *  OPENING marker doubled (e.g. `***bold**`, `====hi==`). This trims an opening
+ *  marker run that is LONGER than its matching closing run down to match (keeping
+ *  the first markers). It is deliberately narrow and never touches valid markup:
+ *  a symmetric span (`**bold**`, `***bolditalic***`, `==hl==`, `||spoiler||`) has
+ *  equal runs and is left alone, and an EMPTY pair (`****`, `||||`, no inner text)
+ *  has no inner match and is left alone. Single-marker inline (`*i*`, `` `c` ``)
+ *  is never matched (opener must be 2+). Runs on send, behind a setting.
+ *
+ *  0.363.6: quotes `"` and `'` included — the same iOS duplication hits an
+ *  auto-paired opening quote (`"` at a word start ⇒ `""`, and the soft keyboard
+ *  leaves the opener doubled: `"""after"`). Same symmetric-run logic applies, so
+ *  a real quoted span (`"hi"`) and an empty pair (`""`) are untouched. Brackets
+ *  are deliberately NOT covered: `[` pairs with a DIFFERENT closer, and `[[x]`
+ *  is a legitimate wikilink, so the symmetric-run trim doesn't apply to them. */
+/** 0.363.11: normalize iOS "Smart Punctuation" curly quotes/dashes back to their
+ *  straight ASCII forms on send. Left/right double quotes → ", left/right single
+ *  quotes → ' (also fixes a curly apostrophe in "don't"). Requested so notes stay
+ *  plain-ASCII. Deliberately narrow to quotes; other characters are left alone. */
+export function straightenCurlyQuotes(text: string): string {
+  return text
+    .replace(/[“”]/g, '"')   // “ ” → "
+    .replace(/[‘’]/g, "'");  // ‘ ’ → '
+}
+
+export function fixDuplicatedEmphasisOpeners(text: string): string {
+  let out = text;
+  for (const m of ["*", "~", "=", "`", "|", '"', "'"]) {
+    const e = m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // <opener run of 2+> <inner: no marker, no newline> <closer run of 1+>
+    const re = new RegExp(`(${e}{2,})([^${e}\\n]+?)(${e}+)`, "g");
+    out = out.replace(re, (full, open: string, inner: string, close: string) =>
+      open.length > close.length ? close + inner + close : full);
+  }
+  return out;
+}
+
 export interface MarkdownInputOptions {
   /** True when THIS keydown will insert a newline rather than submit/commit.
    *  The composer submits on Enter (or Shift+Enter, per its mode); the
@@ -91,16 +139,27 @@ export interface MarkdownInputOptions {
   insertsNewline?: (e: KeyboardEvent) => boolean;
 }
 
+/** The minimal shape handlePairs needs. KeyboardEvent satisfies it (desktop
+ *  keydown path); the beforeinput adapter builds one for mobile. */
+interface PairKey { key: string; metaKey?: boolean; ctrlKey?: boolean; altKey?: boolean; preventDefault: () => void; }
+
 export class MarkdownInput {
   constructor(private app: App, private ta: HTMLTextAreaElement, private opts: MarkdownInputOptions = {}) {}
 
   attach(): void {
     this.ta.addEventListener("keydown", this.onKeyDown, true);
+    // 0.363.7: on MOBILE, autopair runs off beforeinput instead of keydown —
+    // iOS soft keyboards do NOT honour preventDefault() on keydown, so the manual
+    // pair-insert AND the native character both landed, doubling every paired
+    // opener ("("→"((", '"'→'""', etc.). beforeinput's preventDefault IS honoured
+    // there, so the native insert is reliably suppressed and only our pair lands.
+    if (Platform.isMobile) this.ta.addEventListener("beforeinput", this.onBeforeInput);
     this.ta.addEventListener("dblclick", this.onDoubleClick);
   }
 
   detach(): void {
     this.ta.removeEventListener("keydown", this.onKeyDown, true);
+    this.ta.removeEventListener("beforeinput", this.onBeforeInput);
     this.ta.removeEventListener("dblclick", this.onDoubleClick);
   }
 
@@ -154,7 +213,31 @@ export class MarkdownInput {
 
     if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.altKey) { this.handleEnter(e, start, end); return; }
     if (e.key === "Tab" && !e.metaKey && !e.ctrlKey && !e.altKey) { this.handleTab(e, start, end); return; }
+    // 0.363.7: on mobile the pair family runs off beforeinput (see attach()); a
+    // keydown pass there would double it. Enter/Tab above still run on keydown on
+    // both platforms — they're not affected by the preventDefault-suppression bug.
+    if (Platform.isMobile) return;
     this.handlePairs(e, start, end);
+  };
+
+  /** 0.363.7: mobile autopair via beforeinput. keydown's preventDefault is
+   *  ignored by iOS soft keyboards, so pairing had to move to beforeinput, which
+   *  IS cancelable there. Only single-character text inserts and a plain backspace
+   *  are relevant to pairing; multi-char inserts (autocorrect/predictive) and
+   *  composition pass straight through untouched. */
+  private onBeforeInput = (e: InputEvent): void => {
+    if (e.isComposing) return;
+    const start = this.ta.selectionStart;
+    const end = this.ta.selectionEnd;
+    if (start == null || end == null) return;
+    const pd = (): void => e.preventDefault();
+    if (e.inputType === "insertText" && typeof e.data === "string" && e.data.length === 1) {
+      this.handlePairs({ key: e.data, preventDefault: pd }, start, end);
+    } else if (e.inputType === "deleteContentBackward" && start === end) {
+      // Pair deletion (opener + its closer straddling the caret). A selection
+      // delete is left to the browser (start !== end guarded above).
+      this.handlePairs({ key: "Backspace", preventDefault: pd }, start, end);
+    }
   };
 
   /** List continuation (Obsidian's `smartIndentList`). Runs ONLY when this
@@ -198,7 +281,9 @@ export class MarkdownInput {
     const multiline = start !== end && v.slice(start, end).includes("\n");
     const { start: ls, end: le } = this.lineBounds(start);
     const onListLine = !!parseListLine(v.slice(ls, le));
-    if (!multiline && !onListLine) return; // let Tab do its normal job
+    // 0.326.0: with "Tab indents in the composer" ON, a single plain line also
+    // indents (outliner model). Default OFF preserves Tab-to-leave on prose.
+    if (!multiline && !onListLine && !getSettings().tabIndentsProse) return;
 
     e.preventDefault();
     const unit = this.indentUnit();
@@ -226,13 +311,23 @@ export class MarkdownInput {
       Math.max(blockStart, end + totalDelta));
   }
 
-  /** Autopair family: wrap-selection, pair insert, type-over, pair delete. */
-  private handlePairs(e: KeyboardEvent, start: number, end: number): void {
+  /** Autopair family: wrap-selection, pair insert, type-over, pair delete.
+   *  Driven by keydown on desktop and by beforeinput on mobile (see onBeforeInput
+   *  for why), so it takes a minimal structural key rather than a KeyboardEvent —
+   *  KeyboardEvent satisfies it, and the beforeinput adapter supplies the same
+   *  shape. */
+  private handlePairs(e: PairKey, start: number, end: number): void {
     if (!getSettings().autoPairBrackets) return;
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     const v = this.ta.value;
     const prev = v[start - 1];
     const next = v[start];
+
+    // 0.345.3: the spoiler `||` pair (Stashpad's spoilerMarkup feature). It rides
+    // Obsidian's markdown-pair toggle and is off unless spoilers are enabled — so
+    // ordinary `|` (tables) never auto-pairs. Like the doubled markers, it only
+    // pairs on the SECOND consecutive `|`, keeping `| cell | cell |` untouched.
+    const spoilerPair = getSettings().spoilerMarkup && this.obsidianFlag("autoPairMarkdown");
 
     // Which Obsidian toggle governs this character?
     const allowed = (ch: string): boolean =>
@@ -242,8 +337,9 @@ export class MarkdownInput {
     // selected so repeats nest: note → [note] → [[note]], word → *word* →
     // **word**. Quotes skip the prose-guard: a selection is explicit intent.
     if (start !== end) {
-      const closer = e.key.length === 1 ? WRAP[e.key] : undefined;
-      if (!closer || !allowed(e.key)) return;
+      const isSpoilerWrap = e.key === "|" && spoilerPair;
+      const closer = e.key.length === 1 ? (isSpoilerWrap ? "|" : WRAP[e.key]) : undefined;
+      if (!closer || (!isSpoilerWrap && !allowed(e.key))) return;
       e.preventDefault();
       this.splice(start, end, e.key + v.slice(start, end) + closer, start + 1, end + 1);
       return;
@@ -257,7 +353,7 @@ export class MarkdownInput {
     if (e.key === "Backspace") {
       // Pair deletion: opener before the caret + its closer right after.
       const pairClose = prev !== undefined ? SIMPLE[prev] : undefined;
-      const symmetric = prev !== undefined && DOUBLED.has(prev) && next === prev;
+      const symmetric = prev !== undefined && (DOUBLED.has(prev) || (prev === "|" && spoilerPair)) && next === prev;
       if ((pairClose && next === pairClose) || symmetric) {
         e.preventDefault();
         this.splice(start - 1, start + 1, "", start - 1);
@@ -266,8 +362,8 @@ export class MarkdownInput {
     }
     if (e.key.length !== 1) return;
 
-    // Type-over an existing closer.
-    if (CLOSERS.has(e.key) && next === e.key) {
+    // Type-over an existing closer (spoiler `|` included when enabled).
+    if ((CLOSERS.has(e.key) || (e.key === "|" && spoilerPair)) && next === e.key) {
       e.preventDefault();
       this.ta.setSelectionRange(start + 1, start + 1);
       return;
@@ -283,7 +379,7 @@ export class MarkdownInput {
       if (e.key === "`" && prev === "`") return;                          // ``` fences
       // Quotes pair only at a WORD START, so apostrophes ("don't") and a
       // hand-typed closing quote insert plainly.
-      if ((e.key === '"' || e.key === "'") && !(prev === undefined || /[\s([{"'‘“]/.test(prev))) return;
+      if (QUOTE_OPENERS.has(e.key) && !(prev === undefined || /[\s([{"'‘“]/.test(prev))) return;
       if (!beforeOk) return;
       insertPair(e.key, SIMPLE[e.key]);
       return;
@@ -291,6 +387,11 @@ export class MarkdownInput {
     if (DOUBLED.has(e.key)) {
       // Pair on the SECOND marker only, and never on a third.
       if (prev === e.key && v[start - 2] !== e.key && beforeOk) insertPair(e.key, e.key + e.key);
+    }
+    // Spoiler `||` — pairs like a doubled marker on the second `|`, gated on the
+    // spoiler setting so tables are untouched.
+    if (e.key === "|" && spoilerPair) {
+      if (prev === "|" && v[start - 2] !== "|" && beforeOk) insertPair("|", "||");
     }
   }
 
