@@ -233,9 +233,13 @@ export class StashpadKanbanView extends ItemView {
     // the empties must stay reachable as drop targets, so CSS keeps them as
     // narrow stubs that widen on hover / drag-over. None stays last: noisy pile.
     const board = root.createDiv({ cls: "stashpad-kanban-board" });
-    const used = keys.filter((k) => (byCol.get(k)?.length ?? 0) > 0);
-    const empty = keys.filter((k) => (byCol.get(k)?.length ?? 0) === 0);
-    for (const key of [...used, ...empty]) this.renderColumn(board, key, byCol.get(key) ?? []);
+    // 0.365.2: only COLOR reorders used-first. Status is a workflow with a fixed
+    // order (To do → Done) and tag columns are alphabetical — reordering those by
+    // emptiness put "Done" before an empty "To do".
+    const ordered = this.groupBy === "color"
+      ? [...keys.filter((k) => (byCol.get(k)?.length ?? 0) > 0), ...keys.filter((k) => (byCol.get(k)?.length ?? 0) === 0)]
+      : keys;
+    for (const key of ordered) this.renderColumn(board, key, byCol.get(key) ?? []);
     if (this.showNone) this.renderColumn(board, NONE, noneCards);
 
     // 0.365.1: the empty-state hint keys off visible CARDS, not column count.
@@ -255,7 +259,10 @@ export class StashpadKanbanView extends ItemView {
   }
 
   private renderColumn(board: HTMLElement, key: string, cards: Card[]): void {
-    const col = board.createDiv({ cls: "stashpad-kanban-col" + (cards.length === 0 && key !== NONE ? " is-empty" : "") });
+    // Stubs are for the color palette's many optional columns only — an empty
+    // "To do" should keep full width.
+    const stub = this.groupBy === "color" && cards.length === 0 && key !== NONE;
+    const col = board.createDiv({ cls: "stashpad-kanban-col" + (stub ? " is-empty" : "") });
     const head = col.createDiv({ cls: "stashpad-kanban-col-head" });
     const swatch = this.columnSwatch(key);
     if (swatch !== undefined) {
