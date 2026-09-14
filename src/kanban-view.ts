@@ -164,10 +164,20 @@ export class StashpadKanbanView extends ItemView {
     };
     try { await write(forward); } catch (e) { new Notice(`Stashpad: couldn't update note (${(e as Error).message})`); return; }
     localFwd(); await this.render();
+    // 0.365.1: undo/redo may run after a Refresh re-collected `rows`, leaving
+    // the `card` this closure holds as an orphan — mutating it then changed
+    // nothing on screen until the next refresh. Mirror the closure card's state
+    // onto the LIVE row for the same file, or re-collect if there is none.
+    // Frontmatter stays the source of truth; this just keeps the board honest.
+    const syncLive = (): void => {
+      const live = (this.rows ?? []).find((x) => x.file.path === card.file.path);
+      if (!live) { this.rows = null; return; }
+      if (live !== card) { live.color = card.color; live.tags = card.tags.slice(); live.completed = card.completed; }
+    };
     this.plugin.getUndoStack(card.folder).push({
       label: "Board change",
-      undo: async () => { try { await write(backward); } catch { /* ignore */ } localBack(); await this.render(); },
-      redo: async () => { try { await write(forward); } catch { /* ignore */ } localFwd(); await this.render(); },
+      undo: async () => { try { await write(backward); } catch { /* ignore */ } localBack(); syncLive(); await this.render(); },
+      redo: async () => { try { await write(forward); } catch { /* ignore */ } localFwd(); syncLive(); await this.render(); },
     });
   }
 
@@ -217,29 +227,46 @@ export class StashpadKanbanView extends ItemView {
     refresh.onclick = () => { this.rows = null; void this.render(); };
 
     // ---- board ----
+    // 0.365.1: in-use columns FIRST (stable order within each band), then the
+    // empty palette columns as compact stubs. Six empty full-height slabs
+    // scattered among three live columns was the board's biggest eyesore — but
+    // the empties must stay reachable as drop targets, so CSS keeps them as
+    // narrow stubs that widen on hover / drag-over. None stays last: noisy pile.
     const board = root.createDiv({ cls: "stashpad-kanban-board" });
-    for (const key of keys) this.renderColumn(board, key, byCol.get(key) ?? []);
-    if (this.showNone) this.renderColumn(board, NONE, noneCards); // None last — it's the noisy pile
+    const used = keys.filter((k) => (byCol.get(k)?.length ?? 0) > 0);
+    const empty = keys.filter((k) => (byCol.get(k)?.length ?? 0) === 0);
+    for (const key of [...used, ...empty]) this.renderColumn(board, key, byCol.get(key) ?? []);
+    if (this.showNone) this.renderColumn(board, NONE, noneCards);
 
-    if (!keys.length && !(this.showNone && noneCards.length)) {
+    // 0.365.1: the empty-state hint keys off visible CARDS, not column count.
+    // Color always renders its palette columns, so the old `!keys.length` gate
+    // never fired there — the hint was dead for the very case it was written
+    // for (a folder with no coloured notes opening to nine empty columns).
+    const visibleCards = keys.reduce((n, k) => n + (byCol.get(k)?.length ?? 0), 0)
+      + (this.showNone ? noneCards.length : 0);
+    if (visibleCards === 0) {
       board.createDiv({
         cls: "stashpad-kanban-empty",
         text: noneCards.length
-          ? `All ${noneCards.length} notes are in the hidden "${NONE_LABEL[this.groupBy]}" column — use the button above to show it, or drag cards once it's shown.`
+          ? `All ${noneCards.length} notes are in the hidden "${NONE_LABEL[this.groupBy]}" column — tap "Show" above to reveal them, then drag cards into a column.`
           : (this.folder ? "No notes in this folder yet." : "No notes yet."),
       });
     }
   }
 
   private renderColumn(board: HTMLElement, key: string, cards: Card[]): void {
-    const col = board.createDiv({ cls: "stashpad-kanban-col" });
+    const col = board.createDiv({ cls: "stashpad-kanban-col" + (cards.length === 0 && key !== NONE ? " is-empty" : "") });
     const head = col.createDiv({ cls: "stashpad-kanban-col-head" });
     const swatch = this.columnSwatch(key);
     if (swatch !== undefined) {
       const sw = head.createSpan({ cls: "stashpad-kanban-swatch" });
       if (swatch === null) sw.addClass("is-none"); else sw.style.background = swatch;
     }
-    head.createSpan({ cls: "stashpad-kanban-col-name", text: this.columnLabel(key) });
+    const label = this.columnLabel(key);
+    // A raw hex title (no alias) is data, not a name: the swatch already carries
+    // the colour, so the hex is set muted + mono rather than as a bold heading.
+    const isHex = this.groupBy === "color" && key !== NONE && /^#/.test(label);
+    head.createSpan({ cls: "stashpad-kanban-col-name" + (isHex ? " is-hex" : ""), text: label });
     head.createSpan({ cls: "stashpad-kanban-col-count", text: String(cards.length) });
 
     const list = col.createDiv({ cls: "stashpad-kanban-cards" });
@@ -266,7 +293,13 @@ export class StashpadKanbanView extends ItemView {
       const tagRow = el.createDiv({ cls: "stashpad-kanban-card-tags" });
       for (const t of card.tags.slice(0, 4)) tagRow.createSpan({ cls: "stashpad-kanban-tag", text: `#${t}` });
     }
-    el.onclick = () => void this.plugin.revealNoteByRef(card.folder, card.id as StashpadId);
+    const reveal = (): void => void this.plugin.revealNoteByRef(card.folder, card.id as StashpadId);
+    el.onclick = reveal;
+    // 0.365.1: keyboard-reachable. Cards are plain divs, so without a role, a tab
+    // stop and Enter / Space to open, the board was mouse/touch only.
+    el.setAttr("tabindex", "0");
+    el.setAttr("role", "button");
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); reveal(); } });
     el.setAttr("draggable", "true");
     el.addEventListener("dragstart", (e) => {
       this.dragging = card; this.draggingFrom = colKey; el.addClass("is-dragging");
