@@ -3835,6 +3835,16 @@ export default class StashpadPlugin extends Plugin {
       // command never did what its name said.
       callback: () => call("cmdCopyFocusedSubtree"),
     });
+    // 0.366.0: the ACTUAL "Copy tree" (selection + everything nested under it) —
+    // the thing bound to Y — had NO palette command since 0.259.0 renamed the id
+    // above to "Copy focused subtree". So "Copy tree" was unsearchable in the
+    // command list / Hotkeys even though its binding worked. Register it under a
+    // fresh id (the old one is taken by focused-subtree).
+    this.addCommand({
+      id: "stashpad-copy-tree-selection",
+      name: "Copy tree (selection + everything nested)",
+      callback: () => call("cmdCopyTree"),
+    });
     // 0.279.9: on-demand indent-safe copy — always uses the [L1]/[L2] level-marker
     // format regardless of the "Indent-safe copy" setting. Bindable via Obsidian's
     // Hotkeys page. Copies the SELECTION's subtree(s), like Copy tree.
@@ -10700,11 +10710,27 @@ export default class StashpadPlugin extends Plugin {
     // they can empty its items or drop it from their custom order instead.
     {
       const subs = { ...(this.settings.contextSubmenus ?? {}) };
-      let added = false;
+      let changed = false;
       for (const [k, v] of Object.entries(DEFAULT_CONTEXT_SUBMENUS)) {
-        if (!subs[k]) { subs[k] = { name: v.name, icon: v.icon, items: [...v.items] }; added = true; }
+        const cur = subs[k];
+        if (!cur) {
+          subs[k] = { name: v.name, icon: v.icon, items: [...v.items] };
+          changed = true;
+        } else if (cur.name === v.name) {
+          // 0.366.0 (menu parity): a baked-in submenu the user hasn't repurposed
+          // (its name is still the default) must contain the current default's
+          // items. The old seed only added MISSING KEYS, so a device that seeded
+          // an earlier version — or before a default gained an item — kept a stale
+          // set and diverged from another device (the "mobile menu isn't the same
+          // as desktop" + "grew after visiting settings" reports). Top up only the
+          // MISSING defaults, appended after the user's own items; existing items
+          // and their order are untouched. Idempotent once every device converges,
+          // so it stops writing after the first launch that fills the gap.
+          const missing = v.items.filter((it) => !cur.items.includes(it));
+          if (missing.length) { subs[k] = { ...cur, items: [...cur.items, ...missing] }; changed = true; }
+        }
       }
-      if (added || !this.settings.contextMenusSeededV1) {
+      if (changed || !this.settings.contextMenusSeededV1) {
         this.settings.contextSubmenus = subs;
         this.settings.contextMenusSeededV1 = true;
         await this.saveSettings();

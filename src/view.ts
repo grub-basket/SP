@@ -413,6 +413,10 @@ export class StashpadView extends ItemView {
   private nextDestinationFolder: string | null = null;
   private nextDestinationLabel: string | null = null;
   private inListPicker: { activeIdx: number; mode: "nest" | "reply"; sourceIds: StashpadId[] } | null = null;
+  /** 0.366.0: persistent on-screen banner for the in-list picker, so it can be
+   *  cancelled on mobile — there is no Esc key on a soft keyboard, and the picker
+   *  otherwise had no tap-to-cancel. Cleared whenever the picker ends. */
+  private inListPickerNotice: Notice | null = null;
   /** 0.91.2: timestamp of the last Escape that cancelled the in-list picker.
    *  The picker-cancel and the multi-selection "collapse to one" live in TWO
    *  different Escape handlers (the keymap Scope handler + the document keydown
@@ -952,6 +956,7 @@ export class StashpadView extends ItemView {
         // selected note but one — the exact repro the user reported.
         if (this.inListPicker) {
           this.inListPicker = null;
+          this.endInListPickerBanner();
           this.pickerEscapeAt = Date.now();
           this.repaintSelectionClasses(); // clears the pick-target highlight
           return false;
@@ -1755,6 +1760,7 @@ export class StashpadView extends ItemView {
 
   async onClose(): Promise<void> {
     this.hideInstantTooltip();
+    this.endInListPickerBanner(); // 0.366.0: don't strand the picker's cancel banner
     if (this.initialRenderTimer != null) {
       window.clearTimeout(this.initialRenderTimer);
       this.initialRenderTimer = null;
@@ -11057,6 +11063,7 @@ export class StashpadView extends ItemView {
       e.preventDefault();
       e.stopPropagation();
       this.inListPicker = null;
+      this.endInListPickerBanner();
       this.pickerEscapeAt = Date.now(); // 0.91.2: suppress the sibling collapse handler
       // Pin scroll across the cancel-render so dismissing the highlight near
       // the bottom of the list doesn't bump the viewport up. (When the user
@@ -11115,6 +11122,7 @@ export class StashpadView extends ItemView {
       if (this.inListPicker.mode === "nest" && matchBinding(e, getSettings().bindings.move)) {
         e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
         this.inListPicker = null;
+        this.endInListPickerBanner();
         this.repaintSelectionClasses(); // drop the pick-target highlight
         this.cmdMovePicker();
         return;
@@ -13355,6 +13363,35 @@ export class StashpadView extends ItemView {
     return from;
   }
 
+  /** 0.366.0: show the picker's instructions. On mobile, a PERSISTENT banner with
+   *  a Cancel button (no Esc key there); on desktop, the old transient hint. */
+  private showInListPickerBanner(hint: string): void {
+    this.inListPickerNotice?.hide();
+    this.inListPickerNotice = null;
+    if (!Platform.isMobile) { new Notice(hint); return; }
+    const n = new Notice("", 0); // 0 = stays until dismissed
+    n.noticeEl.empty();
+    n.noticeEl.addClass("stashpad-inlist-banner");
+    n.noticeEl.createDiv({ cls: "stashpad-inlist-banner-hint", text: hint });
+    const cancel = n.noticeEl.createEl("button", { cls: "stashpad-inlist-banner-cancel", text: "Cancel" });
+    cancel.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this.cancelInListPicker(); };
+    this.inListPickerNotice = n;
+  }
+
+  /** Tear down the picker's banner. Safe to call when there is none. */
+  private endInListPickerBanner(): void {
+    this.inListPickerNotice?.hide();
+    this.inListPickerNotice = null;
+  }
+
+  /** 0.366.0: cancel the in-list picker (the mobile Cancel button + a shared exit). */
+  private cancelInListPicker(): void {
+    if (!this.inListPicker) { this.endInListPickerBanner(); return; }
+    this.inListPicker = null;
+    this.endInListPickerBanner();
+    this.render();
+  }
+
   private cmdInListPicker(): void {
     if (this.currentChildren.length === 0) return;
     // Pre-select the note above the cursor (the most common nest target).
@@ -13371,7 +13408,9 @@ export class StashpadView extends ItemView {
     // user's actual Move binding (default M) so the hint stays accurate.
     const moveBind = getSettings().bindings.move;
     const moveLabel = humanCombo(moveBind.primary || moveBind.secondary || "M");
-    new Notice(`Arrows to pick parent, Enter confirms, ${moveLabel} for the full picker, Esc cancels.`);
+    this.showInListPickerBanner(Platform.isMobile
+      ? "Tap a note to nest the selection under it, or Cancel."
+      : `Arrows to pick parent, Enter confirms, ${moveLabel} for the full picker, Esc cancels.`);
     // Preserve scroll position across the activation render — the highlight is
     // a visual cue only; we shouldn't jump the viewport to reveal it.
     const keepScroll = this.listEl?.scrollTop ?? 0;
@@ -13399,7 +13438,9 @@ export class StashpadView extends ItemView {
       start = up !== start ? up : this.nextPickableIdx(start, 1);
     }
     this.inListPicker = { activeIdx: start, mode: "reply", sourceIds: [src.id] };
-    new Notice("Arrows to pick the note to reply to, Enter confirms, Esc cancels (“Make a reply to…” in the ⋮ menu searches all folders).");
+    this.showInListPickerBanner(Platform.isMobile
+      ? "Tap the note to reply to, or Cancel."
+      : "Arrows to pick the note to reply to, Enter confirms, Esc cancels (“Make a reply to…” in the ⋮ menu searches all folders).");
     const keepScroll = this.listEl?.scrollTop ?? 0;
     this.render();
     if (this.listEl) {
@@ -13432,12 +13473,14 @@ export class StashpadView extends ItemView {
       const picker = this.inListPicker;
       const target = this.currentChildren[picker.activeIdx];
       this.inListPicker = null;
+      this.endInListPickerBanner();
       if (!target) { this.render(); return; }
       await this.commitReplyPicker(picker.sourceIds, target);
       return;
     }
     const target = this.currentChildren[this.inListPicker.activeIdx];
     this.inListPicker = null;
+    this.endInListPickerBanner();
     if (!target) { this.render(); return; }
     const targets = this.getActionTargets().filter((n) => n.id !== target.id);
     // 0.91.1: move quietly (no per-note success toasts), then emit ONE

@@ -1629,19 +1629,32 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  min-width: 1.6em;
+  /* 0.366.0: a real disc that fully COVERS the box glyph (was a rounded pill that
+     left the checkbox peeking around it). min-width == height keeps a 1–2 digit
+     fraction a perfect circle; a longer count (e.g. 12/20) grows into a clean
+     stadium instead of clipping. A ring in the page background separates it from
+     the row's hover fill. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 20px;
+  height: 20px;
   padding: 0 3px;
   font-size: 9px;
-  line-height: 1.4;
-  font-weight: 600;
-  text-align: center;
-  color: var(--text-on-accent);
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #fff;
   background: var(--interactive-accent);
-  border-radius: 6px;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1.5px var(--background-primary);
   pointer-events: none;
-  transition: opacity 0.1s ease;
+  transition: opacity 0.12s ease;
 }
-.stashpad-note-task-checkbox.has-progress.is-progress-complete::after { background: var(--color-green, var(--interactive-success, #3ba55d)); }
+/* A crisp, universally-"done" green rather than the theme's muddy --color-green;
+   white text on it clears contrast in both light and dark. */
+.stashpad-note-task-checkbox.has-progress.is-progress-complete::after { background: #16a34a; }
 .stashpad-note-task-checkbox.has-progress:hover::after { opacity: 0; }
 /* Top row of meta: timestamp + grip side-by-side. */
 .stashpad-note-meta-top {
@@ -10572,3 +10585,14 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 /* Composer-debug modal: the copyable trace box + its Copy button. */
 .stashpad-debug-box { width: 100%; font-family: var(--font-monospace); font-size: 12px; }
 .stashpad-debug-copy { margin-top: 8px; }
+
+/* 0.366.0: in-list picker cancel banner (mobile — no Esc key on a soft keyboard).
+   A persistent Notice restyled to hold a hint line + a full-width Cancel button. */
+.stashpad-inlist-banner { display: flex; flex-direction: column; gap: 8px; }
+.stashpad-inlist-banner-hint { line-height: 1.35; }
+.stashpad-inlist-banner-cancel {
+  align-self: stretch; padding: 8px 12px; border-radius: 6px; cursor: pointer;
+  background: var(--interactive-normal); color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border); font-weight: var(--font-semibold, 600);
+}
+.stashpad-inlist-banner-cancel:hover { background: var(--interactive-hover); }
