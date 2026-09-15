@@ -8466,6 +8466,21 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   display: block;
   background: var(--background-primary);
 }
+/* 0.374.0: note-itself slide — the note's markdown, scrollable, filling the
+   stage (text, so no zoom/pan transform). */
+.stashpad-media-pan.is-note { width: 100%; height: 100%; }
+.stashpad-media-note {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  padding: 24px 28px;
+  background: var(--background-primary);
+  user-select: text;
+  line-height: var(--line-height-normal);
+}
+.stashpad-media-note img { max-width: 100%; height: auto; }
+.stashpad-media-railbadge.is-note { --stashpad-file-color: var(--text-accent); }
+
 /* 0.371.0: secondary PDF render — Obsidian's own viewer embedded via markdown.
    Fill the stage and let the embedded viewer own its scrolling. */
 .stashpad-media-pdf-embed {

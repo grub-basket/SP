@@ -1,6 +1,7 @@
 import type { App } from "obsidian";
 import { Platform } from "obsidian";
 import { getSettings } from "./settings";
+import { detectTable, formatTable, emptyRow, splitRow, type TableCtx } from "./md-tables";
 
 /** 0.202.0: the shared Markdown text-editing behaviors for Stashpad's plain
  *  `<textarea>` surfaces (composer, edit/split workbench, detail panel).
@@ -249,9 +250,14 @@ export class MarkdownInput {
   /** List continuation (Obsidian's `smartIndentList`). Runs ONLY when this
    *  Enter inserts a newline — a submit/commit Enter is left alone. */
   private handleEnter(e: KeyboardEvent, start: number, end: number): void {
+    if (!this.opts.insertsNewline?.(e)) return;       // Enter submits → not ours
+    // 0.375.0: inside a table, Enter adds a new row (or exits from an empty last
+    // row). Independent of the autopair/list toggles, but still only when Enter
+    // inserts a newline (above) and the selection stays on one line.
+    const multilineSel = start !== end && this.ta.value.slice(start, end).includes("\n");
+    if (getSettings().tableAssists && !multilineSel && this.tableEnter(e, start)) return;
     if (!getSettings().autoPairBrackets) return;      // master switch
     if (!this.obsidianFlag("smartIndentList")) return; // Obsidian's toggle
-    if (!this.opts.insertsNewline?.(e)) return;
     if (start !== end) return; // a selection + Enter is a plain replace
 
     const { start: ls } = this.lineBounds(start);
@@ -281,6 +287,12 @@ export class MarkdownInput {
    *  Applies when the caret sits on a list line, or when the selection spans
    *  multiple lines (where nobody expects Tab to leave the field). */
   private handleTab(e: KeyboardEvent, start: number, end: number): void {
+    // 0.375.0: inside a table, Tab / Shift+Tab move between cells (and re-align
+    // the table) rather than indenting. Takes precedence; a single-line selection
+    // (e.g. a cell selected by the previous Tab) still navigates — only a
+    // multi-line selection falls through to block indent.
+    const multilineSel0 = start !== end && this.ta.value.slice(start, end).includes("\n");
+    if (getSettings().tableAssists && !multilineSel0 && this.tableTab(e, start)) return;
     if (!getSettings().autoPairBrackets) return;
     if (!this.obsidianFlag("smartIndentList")) return;
     const v = this.ta.value;
@@ -315,6 +327,84 @@ export class MarkdownInput {
     this.splice(blockStart, blockEnd, out,
       Math.max(blockStart, start + firstDelta),
       Math.max(blockStart, end + totalDelta));
+  }
+
+  /** 0.375.0: Tab / Shift+Tab between table cells. Re-aligns the whole table on
+   *  every move, appends a new row when tabbing past the last cell, and selects
+   *  the destination cell's text (spreadsheet-style, so typing replaces it).
+   *  Returns false when the caret isn't in a table (caller falls back to indent). */
+  private tableTab(e: KeyboardEvent, caret: number): boolean {
+    const ctx = detectTable(this.ta.value, caret);
+    if (!ctx) return false;
+    e.preventDefault();
+    const back = e.shiftKey;
+    const { delimIdx, colCount } = ctx;
+    let rows = ctx.lines.slice();
+    let row = ctx.caretLine;
+    let col = ctx.caretCol;
+    const nextBody = (from: number, dir: 1 | -1): number => {
+      let r = from + dir;
+      if (r === delimIdx) r += dir; // never land on the `|---|` row
+      return r;
+    };
+    if (row === delimIdx) {
+      // Don't navigate within the delimiter row — hop to an adjacent data row.
+      row = back ? Math.max(0, delimIdx - 1) : Math.min(rows.length - 1, delimIdx + 1);
+      col = back ? colCount - 1 : 0;
+    } else if (!back) {
+      if (col + 1 < colCount) col++;
+      else {
+        const nr = nextBody(row, 1);
+        if (nr >= rows.length) { rows = [...rows, emptyRow(colCount)]; row = rows.length - 1; col = 0; }
+        else { row = nr; col = 0; }
+      }
+    } else {
+      if (col - 1 >= 0) col--;
+      else {
+        const pr = nextBody(row, -1);
+        if (pr >= 0) { row = pr; col = colCount - 1; } // else at very start — stay
+      }
+    }
+    const ctx2: TableCtx = { ...ctx, lines: rows };
+    const { lines: out, textRange } = formatTable(ctx2);
+    const block = out.join("\n");
+    const rng = textRange(row, col);
+    this.splice(ctx.blockStart, ctx.blockEnd, block, ctx.blockStart + rng.start, ctx.blockStart + rng.end);
+    return true;
+  }
+
+  /** 0.375.0: Enter inside a table. On a filled body/header row it adds a new
+   *  empty row below (caret in its first cell); on an already-empty body row it
+   *  EXITS the table (drops that row, caret on a fresh line beneath). */
+  private tableEnter(e: KeyboardEvent, caret: number): boolean {
+    const ctx = detectTable(this.ta.value, caret);
+    if (!ctx) return false;
+    const { delimIdx, colCount } = ctx;
+    const row = ctx.caretLine;
+    const rowIsEmpty = (rrel: number): boolean => splitRow(ctx.lines[rrel] ?? "").every((c) => c.trim() === "");
+    e.preventDefault();
+    let rows = ctx.lines.slice();
+
+    if (row !== delimIdx && row > delimIdx && rowIsEmpty(row)) {
+      // Exit the table: remove the empty row, reflow, land on a new line below.
+      rows.splice(row, 1);
+      const { lines: out } = formatTable({ ...ctx, lines: rows });
+      const block = out.join("\n");
+      const caretPos = ctx.blockStart + block.length + 1; // just after the added "\n"
+      this.splice(ctx.blockStart, ctx.blockEnd, block + "\n", caretPos, caretPos);
+      return true;
+    }
+
+    // Add a new row. Enter on the header (above the delimiter) drops the row
+    // below the delimiter, so a fresh table's first Enter starts the body.
+    const insertAfter = row < delimIdx ? delimIdx : row;
+    rows.splice(insertAfter + 1, 0, emptyRow(colCount));
+    const { lines: out, textRange } = formatTable({ ...ctx, lines: rows });
+    const block = out.join("\n");
+    const rng = textRange(insertAfter + 1, 0);
+    const at = ctx.blockStart + rng.start;
+    this.splice(ctx.blockStart, ctx.blockEnd, block, at, at);
+    return true;
   }
 
   /** Autopair family: wrap-selection, pair insert, type-over, pair delete.

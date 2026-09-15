@@ -381,6 +381,16 @@ export interface StashpadSettings {
    *  them, and hiding sticks. Holds leaf ids ("delete"), `submenu:<key>`, and
    *  `cmd:<id>`. Only the context menu honors it (not the star menu / item buttons). */
   contextMenuHidden: string[];
+  /** 0.374.0: show the per-row "Preview" button that opens the note in the file
+   *  preview modal (the note itself as slide 0, its attachments after). */
+  showNotePreviewButton: boolean;
+  /** 0.374.0: show the per-row Show more / Show less (expand/collapse) toggle.
+   *  Independent of the preview button — a user can keep either, both, or (via
+   *  the preview modal) read long notes without inline expansion at all. */
+  showExpandToggle: boolean;
+  /** 0.375.0: Markdown table assists in the editor — Tab/Shift+Tab move between
+   *  cells (auto-aligning the table), Enter adds a row / exits an empty one. */
+  tableAssists: boolean;
   /** 0.363.2: the composer action-bar button (right of the deep-link button)
    *  runs this Obsidian command id. Defaults to the built-in command palette
    *  ("command-palette:open"); a user on a third-party palette can point it at
@@ -1074,6 +1084,9 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextMenuOrderRefreshedV2: false,
   contextMoveInListFirstV1: false,
   contextMenuHidden: [],
+  showNotePreviewButton: true,
+  showExpandToggle: true,
+  tableAssists: true,
   composerActionCommand: "command-palette:open",
   customCommandIds: [],
   savedSearches: [],
@@ -3088,6 +3101,13 @@ export class StashpadSettingTab extends PluginSettingTab {
       paint(this.plugin.getFolderIcon(this.iconPickFolder) ?? "");
     }, ["icon", "folder", "tab", "lucide", "emoji", "switcher"]));
 
+    // 0.374.0: the note-preview button + the expand/collapse toggle — two
+    // independent per-row affordances for reading a long note.
+    cats.listDisplay.push(toggle("Note preview button", "Show a “Preview” button on each note row that opens the note in the file-preview modal — the note itself as the first slide (scrollable), its attachments in the rail after. Hiding the button doesn't remove the note slide from the modal; you still reach it by opening any attachment.",
+      () => this.plugin.settings.showNotePreviewButton, (v) => { this.plugin.settings.showNotePreviewButton = v; }, ["preview", "modal", "note", "row", "button", "expand"]));
+    cats.listDisplay.push(toggle("Show more / less toggle", "Show the inline expand/collapse (“Show more” / “Show less”) control on note rows whose body is clamped. Turn it off if you'd rather read long notes through the preview modal than expand them in the list.",
+      () => this.plugin.settings.showExpandToggle, (v) => { this.plugin.settings.showExpandToggle = v; }, ["expand", "collapse", "show more", "clamp", "toggle"]));
+
     // 0.267.1: per-folder obscure default, mirrored here from the folder
     // panel's right-click menu. The menu is where you reach for it while
     // working; settings is where you go to see them ALL at once, which the
@@ -3692,6 +3712,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.autoPairBrackets, (v) => { this.plugin.settings.autoPairBrackets = v; }, ["bracket", "autopair", "wikilink", "close", "complete"]));
     cats.composerCopy.push(toggle("Formatting toolbar in the composer", "Show a row of formatting buttons at the top of the composer — bold, italic, highlight, code, link a note, checkbox, and (when spoiler markup is on) spoiler. Each wraps the selected text (or inserts at the caret). Sits above the text box so it never shrinks it. On by default.",
       () => this.plugin.settings.showComposerToolbar, (v) => { this.plugin.settings.showComposerToolbar = v; }, ["toolbar", "format", "bold", "italic", "highlight", "composer", "buttons"]));
+    cats.composerCopy.push(toggle("Markdown table assists", "Inside a Markdown table, Tab / Shift+Tab move between cells and Enter adds a new row (or, on an empty row, exits the table) — and the table's columns re-align automatically as you go, so it stays readable in the raw text. Applies to the composer and the edit/split textareas. On by default; a plain table (no `|---|` delimiter row) is left alone.",
+      () => this.plugin.settings.tableAssists, (v) => { this.plugin.settings.tableAssists = v; }, ["table", "cell", "align", "tab", "pipe", "column", "row"]));
     cats.composerCopy.push(toggle("Tab indents in the composer", "ON: Tab / Shift+Tab indent and outdent the current line (or the selected lines) in the composer and edit boxes — even plain, non-list lines — so you can build an outline structure while typing, Workflowy-style. OFF (default): Tab keeps its usual job of moving focus out of a prose line; indenting still works on list lines and multi-line selections. Enter-to-newline vs submit stays controlled by the Enter/Shift-Enter setting.",
       () => this.plugin.settings.tabIndentsProse, (v) => { this.plugin.settings.tabIndentsProse = v; }, ["tab", "indent", "outdent", "outline", "composer", "structure"]));
     cats.composerCopy.push(toggle("Fix duplicated emphasis markers on send", "Some mobile keyboards duplicate the OPENING marker when auto-pairing (you end up with ***bold** or ====text==). On send, trim the extra opener so it matches the closer (→ **bold**, ==text==). Narrow and safe: it never touches balanced (**bold**, ***bold-italic***) or empty (****, ||||) markup. On by default.",

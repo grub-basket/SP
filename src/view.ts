@@ -75,7 +75,7 @@ import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMet
 import { folderTransferAvailable, readXvFolderPointer } from "./cross-vault-folder";
 import { collectDropEntries, readDroppedTree, countTreeFiles, countTreeDirs, type DroppedDir } from "./dropped-folders";
 import { importStashZip } from "./stash-package";
-import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
+import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
 import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
@@ -7909,6 +7909,7 @@ export class StashpadView extends ItemView {
       // carries Focus / Open in editor / everything (the two separate focus +
       // edit buttons were too cramped on a phone). Press-and-hold is avoided
       // deliberately (it would fight drag-reorder / nesting).
+      this.maybeAddPreviewButton(actions, node); // 0.374.0
       this.addReactionButton(actions, node); // 0.287.0 (teams)
       this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
@@ -7934,6 +7935,7 @@ export class StashpadView extends ItemView {
       rowIcon(replyBtn, "reply");   // 0.296.0 (perf)
       replyBtn.title = "Reply to this note";
       replyBtn.onclick = (e) => { e.stopPropagation(); this.cmdReply(node); };
+      this.maybeAddPreviewButton(actions, node); // 0.374.0
       // 0.287.0 (teams): reaction button next to the quick/more menu buttons.
       this.addReactionButton(actions, node);
       // "More actions" button — opens the same context menu as right-click
@@ -8334,6 +8336,10 @@ export class StashpadView extends ItemView {
     const host = opts.toggleHost ?? container;
     // Remove any old toggle the host may already have (re-renders).
     host.querySelector(".stashpad-expand-toggle")?.remove();
+    // 0.374.0: the expand/collapse toggle is optional — a user who reads long
+    // notes through the preview modal can hide it. (The body simply stays
+    // clamped; the preview button / attachment chips still open the full note.)
+    if (!getSettings().showExpandToggle) return;
     // 0.118.10: the row may be transiently auto-expanded by the cursor
     // (.is-cursor-expanded). The toggle must reflect what's VISIBLE — so a
     // cursor-auto-expanded row shows the "collapse" (up) affordance, and
@@ -19720,6 +19726,40 @@ export class StashpadView extends ItemView {
       });
       this.registerEvent(ref);
     });
+  }
+
+  /** 0.374.0: open the file-preview modal for a NOTE — the note itself as slide
+   *  0 (its rendered markdown, scrollable), followed by its attachments in the
+   *  rail exactly as an attachment click would show them. Clicking an attachment
+   *  chip still opens that attachment (never a thumbnail of the note — no
+   *  recursion). */
+  private async openNotePreview(node: TreeNode): Promise<void> {
+    if (!node.file) return;
+    let raw = "";
+    try { raw = await this.app.vault.cachedRead(node.file); } catch { /* ignore */ }
+    const body = this.stripFrontmatter(raw);
+    const firstLine = body.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+    const title = (firstLine
+      .replace(/!\[\[[^\]]*\]\]/g, "")                                   // drop embeds (not title text)
+      .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_m, a, b) => b || a) // wikilink → alias/target
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")                         // md image/link → text
+      .replace(/^#+\s*/, "").replace(/[*_`>]/g, "").trim()
+      || node.file.basename).slice(0, 80) || "Note";
+    const noteItem: MediaItem = { path: node.file.path, file: node.file, note: { id: node.id, title, body } };
+    const attachItems = mediaItemsFor(this.app, this.extractAttachments(body));
+    new MediaViewerModal(this.app, [noteItem, ...attachItems], 0, (f) => this.openAttachmentInTab(f)).open();
+  }
+
+  /** 0.374.0: the per-row "Preview" button (setting-gated). Opens the note in the
+   *  file-preview modal at its own slide. Lives beside the other row actions. */
+  private maybeAddPreviewButton(actions: HTMLElement, node: TreeNode): void {
+    if (!getSettings().showNotePreviewButton) return;
+    if (!node.file) return;
+    const btn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-preview" });
+    setIcon(btn, "maximize-2"); // not in the rowIcon sprite set; one setIcon per row is fine
+    btn.title = "Preview note";
+    btn.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
+    btn.onclick = (e) => { e.stopPropagation(); void this.openNotePreview(node); };
   }
 
   /** 0.373.0: wrap the selection of a markdown text field in `before`/`after`

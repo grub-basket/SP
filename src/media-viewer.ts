@@ -54,6 +54,10 @@ export interface MediaItem {
   /** Resolved file. Null when the link is broken — the viewer still lists it
    *  and says so, rather than silently skipping it. */
   file: TFile | null;
+  /** 0.374.0: when set, this slide is the NOTE ITSELF (not an attachment) —
+   *  rendered as scrollable markdown as slide 0 of the preview. `body` is the
+   *  raw markdown (frontmatter stripped); `title` labels the rail + caption. */
+  note?: { id: string; title: string; body: string };
 }
 
 /** A large overlay for previewing a note's attachments: a rail of every file on
@@ -84,6 +88,9 @@ export class MediaViewerModal extends Modal {
    *  Windows network-user drive where app:// resources come back empty. Unloaded
    *  on the next slide / on close so PDF.js tears down. */
   private pdfEmbedComponent: Component | null = null;
+  /** 0.374.0: owns the note-slide markdown render (MarkdownRenderer child), so
+   *  its embeds/widgets are torn down on the next slide / on close. */
+  private noteComponent: Component | null = null;
   private captionEl!: HTMLElement;
   private zoomLabelEl!: HTMLElement;
   private railEl!: HTMLElement;
@@ -213,7 +220,37 @@ export class MediaViewerModal extends Modal {
 
   onClose(): void {
     this.disposePdfEmbed();
+    this.disposeNoteRender();
     this.contentEl.empty();
+  }
+
+  /** Tear down the note-slide markdown render, if any. */
+  private disposeNoteRender(): void {
+    if (this.noteComponent) {
+      try { this.noteComponent.unload(); } catch { /* ignore */ }
+      this.noteComponent = null;
+    }
+  }
+
+  /** 0.374.0: render the note's own markdown into the stage — scrollable, no
+   *  zoom/pan (it's text, not an image). Reuses Obsidian's MarkdownRenderer so
+   *  embeds, callouts, tags and links render exactly as in a note. */
+  private async renderNoteSlide(note: { id: string; title: string; body: string }): Promise<void> {
+    this.mediaEl = null;
+    this.sized = true;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.panEl.addClass("is-note");
+    this.applyTransform();
+    const host = this.panEl.createDiv({ cls: "stashpad-media-note markdown-rendered" });
+    const comp = new Component();
+    comp.load();
+    this.noteComponent = comp;
+    try {
+      const src = this.current()?.file?.path ?? "";
+      await MarkdownRenderer.render(this.app, note.body || "*(empty note)*", host, src, comp);
+    } catch {
+      host.setText(note.body);
+    }
   }
 
   /** Tear down the secondary Obsidian PDF embed (unloads PDF.js), if any. */
@@ -356,16 +393,20 @@ export class MediaViewerModal extends Modal {
   private show(): void {
     const item = this.current();
     this.disposePdfEmbed();
+    this.disposeNoteRender();
     this.panEl.empty();
     this.panEl.removeClass("is-placeholder");
     this.panEl.removeClass("is-frame");
+    this.panEl.removeClass("is-note");
     this.mediaEl = null;
     this.sized = false;
     this.rotation = 0;
     this.naturalW = 0;
     this.naturalH = 0;
 
-    const name = item ? (item.path.split("/").pop() ?? item.path) : "";
+    // 0.374.0: a note slide (slide 0 of a note preview) captions with the note's
+    // title, not a filename.
+    const name = item ? (item.note ? item.note.title : (item.path.split("/").pop() ?? item.path)) : "";
     this.captionEl.empty();
     this.captionEl.createSpan({ cls: "stashpad-media-name", text: name });
     if (this.items.length > 1) {
@@ -377,6 +418,13 @@ export class MediaViewerModal extends Modal {
 
     if (!item) return;
     const ext = (item.path.split(".").pop() ?? "").toLowerCase();
+
+    // 0.374.0: the NOTE ITSELF — render its markdown, scrollable, as the stage.
+    if (item.note) {
+      void this.renderNoteSlide(item.note);
+      this.paintRailSelection();
+      return;
+    }
 
     if (!item.file) {
       // Broken link — say so rather than showing an empty stage that reads as
@@ -667,6 +715,16 @@ export class MediaViewerModal extends Modal {
       const cell = this.railEl.createDiv({ cls: "stashpad-media-railcell" });
       cell.title = item.path;
       const ext = (item.path.split(".").pop() ?? "").toLowerCase();
+      if (item.note) {
+        // 0.374.0: the note-itself slide — a distinct badge + the note title, so
+        // it reads as "the note" rather than a `.md` file in the rail.
+        const badge = cell.createDiv({ cls: "stashpad-media-railbadge is-note" });
+        setIcon(badge, "file-text");
+        badge.createSpan({ cls: "stashpad-media-railext", text: "NOTE" });
+        cell.title = item.note.title;
+        cell.onclick = (e) => { e.stopPropagation(); this.idx = i; this.show(); };
+        return;
+      }
       if (item.file && VIEWER_IMG_EXT.has(ext)) {
         const t = cell.createEl("img", { cls: "stashpad-media-railimg" });
         t.src = this.app.vault.getResourcePath(item.file);
