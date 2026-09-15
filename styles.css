@@ -5395,6 +5395,16 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
    must be able to reach. */
 .stashpad-confirm-body { margin: 0 0 12px; max-height: 40vh; overflow-y: auto; }
 .stashpad-confirm-line { margin: 0; padding: 1px 0; }
+/* 0.369.0: a filename in a confirm line is monospace `code` — let a long one WRAP
+   inside its own row (never push the modal wide or clip). A line that is ONLY a
+   code span (the Keep/Discard filename rows) gets a touch more breathing room and
+   a wrapping, full-width code block so the whole name stays readable. */
+.stashpad-confirm-line code { overflow-wrap: anywhere; word-break: break-word; white-space: normal; }
+.stashpad-confirm-line:has(> code:only-child) { padding: 3px 0 8px; }
+.stashpad-confirm-line > code:only-child {
+  display: block; padding: 5px 9px; border-radius: 5px;
+  background: var(--background-secondary); font-size: var(--font-ui-smaller); line-height: 1.4;
+}
 
 /* Clickable file rows under a confirm's message. Own scroll region so an
    unbounded list (hundreds of shared attachments) never grows the modal. */

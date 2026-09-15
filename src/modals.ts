@@ -5429,21 +5429,27 @@ export class DuplicateIdsModal extends Modal {
       if (fmValueText(A[k]) !== fmValueText(B[k])) structuralDelta++;
     }
 
+    // 0.369.0: filenames are monospace (backtick → <code> in ConfirmModal's
+    // markup renderer) and get their OWN lines under bold action labels, so a
+    // long name wraps in its own row instead of shoving the prose around. The
+    // description prose stays normal font, with names inline-coded.
+    const code = (n: string): string => "`" + n + "`";
     // What the merge actually MOVES from the discarded copy into the kept one.
     const moves: string[] = [];
     if (v && !v.bodySame) moves.push("its body text, appended under a labelled separator");
-    if (v && v.fieldDiffs > 0) moves.push(`values for any fields “${tgtName}” left blank (nothing already set is overwritten)`);
+    if (v && v.fieldDiffs > 0) moves.push(`values for any fields ${code(tgtName)} left blank (nothing already set is overwritten)`);
 
-    // Filenames on their own lines (ConfirmModal splits the message on newlines).
-    const lines = [`Keep:  ${tgtName}`, `Discard:  ${srcName}`, ""];
+    const lines: string[] = [];
+    lines.push("**Keep** this copy:", code(tgtName), "");
+    lines.push("**Discard** this copy — it moves to the trash:", code(srcName), "");
     if (moves.length) {
-      lines.push(`Before it is discarded, “${srcName}” folds into “${tgtName}”: ${moves.join("; and ")}.`);
+      lines.push(`First, ${code(srcName)} folds into ${code(tgtName)}: ${moves.join("; and ")}.`);
     } else if (structuralDelta > 0) {
-      lines.push(`“${srcName}” matches “${tgtName}” in body and content fields. Only Stashpad's own structural / timestamp fields differ, and those are NOT merged — “${tgtName}” keeps its own — so “${srcName}” is discarded as it is.`);
+      lines.push(`${code(srcName)} matches ${code(tgtName)} in body and content fields. Only Stashpad's own structural / timestamp fields differ, and those are NOT merged — ${code(tgtName)} keeps its own — so ${code(srcName)} is discarded as it is.`);
     } else {
-      lines.push(`“${srcName}” has nothing “${tgtName}” is missing, so merging is the same as discarding it.`);
+      lines.push(`${code(srcName)} has nothing ${code(tgtName)} is missing, so merging just discards it.`);
     }
-    lines.push("", "“" + srcName + "” goes to the trash. Undo restores both.");
+    lines.push("", "Undo restores both.");
 
     const ok = await new Promise<boolean>((resolve) => {
       new ConfirmModal(this.app, "Merge this copy?", lines.join("\n"),
