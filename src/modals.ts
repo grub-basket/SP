@@ -5435,19 +5435,21 @@ export class DuplicateIdsModal extends Modal {
     // description prose stays normal font, with names inline-coded.
     const code = (n: string): string => "`" + n + "`";
     // What the merge actually MOVES from the discarded copy into the kept one.
+    // The names are shown in full up top, so the explanation below refers to them
+    // as "the kept copy" / "the discarded copy" rather than repeating the names.
     const moves: string[] = [];
     if (v && !v.bodySame) moves.push("its body text, appended under a labelled separator");
-    if (v && v.fieldDiffs > 0) moves.push(`values for any fields ${code(tgtName)} left blank (nothing already set is overwritten)`);
+    if (v && v.fieldDiffs > 0) moves.push("values for any fields the kept copy left blank (nothing already set is overwritten)");
 
     const lines: string[] = [];
     lines.push("**Keep** this copy:", code(tgtName), "");
     lines.push("**Discard** this copy — it moves to the trash:", code(srcName), "");
     if (moves.length) {
-      lines.push(`First, ${code(srcName)} folds into ${code(tgtName)}: ${moves.join("; and ")}.`);
+      lines.push(`First, the discarded copy folds into the kept copy: ${moves.join("; and ")}.`);
     } else if (structuralDelta > 0) {
-      lines.push(`${code(srcName)} matches ${code(tgtName)} in body and content fields. Only Stashpad's own structural / timestamp fields differ, and those are NOT merged — ${code(tgtName)} keeps its own — so ${code(srcName)} is discarded as it is.`);
+      lines.push("The discarded copy matches the kept copy in body and content fields. Only Stashpad's own structural / timestamp fields differ, and those are NOT merged — the kept copy keeps its own — so the discarded copy is dropped as it is.");
     } else {
-      lines.push(`${code(srcName)} has nothing ${code(tgtName)} is missing, so merging just discards it.`);
+      lines.push("The discarded copy has nothing the kept copy is missing, so merging just discards it.");
     }
     lines.push("", "Undo restores both.");
 
