@@ -1,6 +1,7 @@
 import { App } from "obsidian";
 import { buildStashEntries, importFromFileMap, type ExportInput, type ImportSummary } from "./stash-package";
 import type { XvMeta } from "./cross-vault-clipboard";
+import type { StashpadId } from "./types";
 
 /** 0.342.0: FOLDER-based cross-vault transfer — a SEPARATE layer beside the
  *  zip/clipboard path (which stays untouched as the fallback). Instead of zipping
@@ -146,8 +147,11 @@ export async function readStagedFolder(absPath: string): Promise<Record<string, 
 
 /** Import a staged folder into `destFolder` as COPIES — every note gets a fresh
  *  id (forceNewIds), the subtree re-linked internally. Reuses importFromFileMap. */
-export async function importStagedFolder(app: App, absPath: string, destFolder: string, existingIds: Set<string>): Promise<ImportSummary | null> {
+export async function importStagedFolder(app: App, absPath: string, destFolder: string, existingIds: Set<string>, reparentRootsTo: StashpadId | null = null): Promise<ImportSummary | null> {
   const map = await readStagedFolder(absPath);
   if (!map || !map["manifest.json"]) return null;
-  return importFromFileMap(app, map, destFolder, existingIds, { forceNewIds: true, stripReserved: true });
+  // 0.368.1: reparentRootsTo nests the pasted roots under the focused node (like
+  // the zip paste path). null = the vault home. Without it the folder path always
+  // anchored to home, ignoring where you were focused.
+  return importFromFileMap(app, map, destFolder, existingIds, { forceNewIds: true, stripReserved: true, reparentRootsTo });
 }

@@ -8318,7 +8318,7 @@ export default class StashpadPlugin extends Plugin {
 
   /** 0.342.0: FOLDER-based cross-vault PASTE — reads the clipboard pointer, imports
    *  the staged folder as COPIES (fresh ids, subtree re-linked). Desktop only. */
-  async crossVaultPasteFolder(destFolder: string): Promise<{ status: "ok" | "none" | "unavailable" | "unreachable" | "failed"; count?: number; cut?: boolean; notePaths?: string[] }> {
+  async crossVaultPasteFolder(destFolder: string, reparentRootsTo: StashpadId | null = null): Promise<{ status: "ok" | "none" | "unavailable" | "unreachable" | "failed"; count?: number; cut?: boolean; notePaths?: string[] }> {
     if (!folderTransferAvailable()) return { status: "unavailable" };
     const ptr = readXvFolderPointer();
     if (!ptr) return { status: "none" };
@@ -8330,7 +8330,7 @@ export default class StashpadPlugin extends Plugin {
         const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
         if (typeof id === "string") existingIds.add(id);
       }
-      const summary = await importStagedFolder(this.app, ptr.absPath, cleaned, existingIds);
+      const summary = await importStagedFolder(this.app, ptr.absPath, cleaned, existingIds, reparentRootsTo);
       if (!summary) return { status: "unreachable" };
       // 0.344.0: a CUT — ACK the token back to the clipboard so the SOURCE vault
       // offers to delete the originals (finishing the move). Mirrors pasteCrossVault.

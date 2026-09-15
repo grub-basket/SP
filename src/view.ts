@@ -15206,7 +15206,12 @@ export class StashpadView extends ItemView {
       // payload if one is present, then to the empty-clipboard notice.
       const fptr = readXvFolderPointer();
       if (fptr && fptr.meta.sourceVault !== this.app.vault.getName()) {
-        const res = await this.plugin.crossVaultPasteFolder(this.noteFolder);
+        // 0.368.1: nest under where you're focused, same as the zip path — the
+        // cursor row's parent (paste as its sibling), else the focused node. The
+        // folder path used to ignore this and always anchor to the vault home.
+        const cursorNode = this.currentChildren[this.cursorIdx] ?? null;
+        const destParent = ((cursorNode?.parent ?? this.focusId) ?? ROOT_ID);
+        const res = await this.plugin.crossVaultPasteFolder(this.noteFolder, destParent === ROOT_ID ? null : destParent);
         if (res.status === "ok") {
           const folder = this.noteFolder;
           // First paint is immediate (notes appear), but nesting needs the cache
