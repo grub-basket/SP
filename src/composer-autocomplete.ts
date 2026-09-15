@@ -1,6 +1,7 @@
 import { parseNaturalDate, naturalDatePhrases, formatNaturalDate } from "./natural-date";
 import { App, Platform, Scope, TFile, moment } from "obsidian";
 import { isArchivedPath, isIgnoredFileExtension, matchesObsidianIgnore, siftMatch } from "./types";
+import { isUnderAnyConfigFolder } from "./config-layout";
 import { HIGHLIGHT_COLORS, takeLeadingColor } from "./highlight-colors";
 import { getSettings, getTemplatesFormats } from "./settings";
 import { expandSnippet } from "./snippets";
@@ -267,9 +268,12 @@ export class ComposerAutocomplete {
     const ignoreFilters = inherit
       ? ((this.app.vault as any).getConfig?.("userIgnoreFilters") as string[] | undefined)
       : undefined;
+    const cfgSettings = getSettings(); // 0.378.0/0.379.0: never index the config folder(s) — primary + mirrors
+    const configPaths = [cfgSettings.configFolder || null, ...(Array.isArray(cfgSettings.configMirrors) ? cfgSettings.configMirrors : [])];
     this.fileIndex = this.app.vault.getFiles()
       .filter((f) => !isArchivedPath(f.path)
         && !isIgnoredFileExtension(f.path)
+        && !isUnderAnyConfigFolder(f.path, configPaths)
         && !(inherit && matchesObsidianIgnore(f.path, ignoreFilters)))
       .flatMap((f) => {
         const isMd = f.extension === "md";

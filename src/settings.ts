@@ -6,6 +6,7 @@ function osFileManagerName(): string {
 }
 import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal, buildJdPreviewNotice } from "./index-builder";
 import { FolderSuggest } from "./folder-suggest";
+import { isValidConfigFolder } from "./config-layout";
 import { IconSuggest } from "./icon-suggest";
 import { CommandSuggest } from "./command-suggest";
 import type StashpadPlugin from "./main";
@@ -391,6 +392,14 @@ export interface StashpadSettings {
   /** 0.375.0: Markdown table assists in the editor — Tab/Shift+Tab move between
    *  cells (auto-aligning the table), Enter adds a row / exits an empty one. */
   tableAssists: boolean;
+  /** 0.378.0: opt-in in-vault config folder. "" = off (settings live in
+   *  data.json as always); a path = the large list-type settings (snippets,
+   *  saved views, menus, templates, per-folder appearance) live in that vault
+   *  folder instead, so any file-sync picks them up. Managed by SettingsStore;
+   *  this pointer itself always stays in data.json. */
+  configFolder: string;
+  /** 0.379.0: mirror folders config writes also fan out to (redundant synced backups; kept after a relocate). */
+  configMirrors: string[];
   /** 0.363.2: the composer action-bar button (right of the deep-link button)
    *  runs this Obsidian command id. Defaults to the built-in command palette
    *  ("command-palette:open"); a user on a third-party palette can point it at
@@ -1087,6 +1096,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   showNotePreviewButton: true,
   showExpandToggle: true,
   tableAssists: true,
+  configFolder: "",
+  configMirrors: [],
   composerActionCommand: "command-palette:open",
   customCommandIds: [],
   savedSearches: [],
@@ -3071,6 +3082,116 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.foldersStorage.push(toggle("Inherit Obsidian's excluded files", "Also hide files matching Obsidian's “Excluded files” list (Settings → Files & Links) from Stashpad's link autocomplete and file surfaces — so you manage exclusions in one place. Plugin-internal formats like .edtz are always excluded regardless.",
       () => this.plugin.settings.inheritObsidianExclusions, (v) => { this.plugin.settings.inheritObsidianExclusions = v; }, ["excluded", "ignore", "files"]));
+
+    // 0.378.0: opt-in in-vault config folder — moves the big list-type settings
+    // out of data.json into a vault folder that any file-sync picks up.
+    cats.foldersStorage.push(this.renderDef(
+      "Store settings in a vault folder (syncs everywhere)",
+      "Move the large, list-type settings — snippets, saved views & searches, menus & toolbar, note templates, and per-folder appearance — out of the plugin's data.json into a normal vault folder, so ANY file sync (Obsidian Sync, Git, Syncthing, iCloud…) carries them, not just Obsidian's plugin-settings sync. Core preferences, hotkeys and encryption stay in data.json. Opt-in: a backup of data.json is made first, and you can turn it off any time to move everything back.",
+      (s) => {
+        const cur = this.plugin.getConfigFolder();
+        const reserved = [
+          this.plugin.settings.folder, this.plugin.settings.importDropFolder, this.plugin.settings.exportFolder,
+          "_attachments", "_processed", "_failed-imports", "_authors", "_deleted", "archive", "trash", ".stashpad",
+        ].filter((x): x is string => typeof x === "string" && !!x);
+        if (!cur) {
+          let path = "Stashpad Config";
+          s.addText((t) => {
+            new FolderSuggest(this.app, t.inputEl);
+            t.setPlaceholder("Stashpad Config").setValue(path).onChange((v) => { path = v; });
+          });
+          s.addButton((b) => b.setButtonText("Enable").setCta().onClick(() => {
+            const clean = (path || "").trim().replace(/^\/+|\/+$/g, "") || "Stashpad Config";
+            const v = isValidConfigFolder(clean, reserved);
+            if (!v.ok) { new Notice(`Can't use “${clean}” as the config folder (${v.reason}). Pick another.`); return; }
+            new ConfirmModal(
+              this.app,
+              "Store settings in a vault folder?",
+              `Stashpad will move snippets, saved views, menus, templates and per-folder appearance into **${clean}/**, back up your current data.json, and read/write them there from now on. You can turn this off any time to move them back.`,
+              "Enable",
+              async (confirmed) => {
+                if (!confirmed) return;
+                const r = await this.plugin.enableConfigFolder(clean);
+                if (r.ok) { new Notice(`Config folder enabled → ${clean}`); this.display(); }
+                else new Notice(`Couldn't enable the config folder: ${r.error}`);
+              },
+            ).open();
+          }));
+        } else {
+          const mirrors = this.plugin.getConfigMirrors();
+          const mirrorLine = mirrors.length ? ` Also kept mirrored (synced backups) in: ${mirrors.map((m) => `“${m}/”`).join(", ")}.` : "";
+          s.setDesc(`Settings are stored in the vault folder “${cur}/”.${mirrorLine} Change the folder below (Stashpad copies your config across and keeps the old folder as a synced mirror), or turn it off to move everything back into data.json.`);
+          let path = cur;
+          s.addText((t) => {
+            new FolderSuggest(this.app, t.inputEl);
+            t.setValue(cur).onChange((v) => { path = v; });
+          });
+          s.addButton((b) => b.setButtonText("Move").onClick(() => {
+            const clean = (path || "").trim().replace(/^\/+|\/+$/g, "");
+            if (!clean || clean === cur) { new Notice("Enter a different folder to move to."); return; }
+            const v = isValidConfigFolder(clean, reserved);
+            if (!v.ok) { new Notice(`Can't use “${clean}” (${v.reason}).`); return; }
+            new ConfirmModal(
+              this.app,
+              "Move the config folder?",
+              `Copy your config from **${cur}/** to **${clean}/** and read/write there from now on. The old folder is kept as a synced mirror (a redundant backup that Stashpad keeps up to date) — you can stop mirroring it below.`,
+              "Move",
+              async (confirmed) => {
+                if (!confirmed) return;
+                const r = await this.plugin.relocateConfigFolder(clean);
+                if (r.ok) { new Notice(`Config folder moved → ${clean}`); this.display(); }
+                else new Notice(`Couldn't move the config folder: ${r.error}`);
+              },
+            ).open();
+          }));
+          s.addButton((b) => b.setButtonText("Add mirror").setTooltip("Also write config to this folder as a synced backup").onClick(async () => {
+            const clean = (path || "").trim().replace(/^\/+|\/+$/g, "");
+            if (!clean || clean === cur) { new Notice("Enter a different folder to mirror to."); return; }
+            const v = isValidConfigFolder(clean, reserved);
+            if (!v.ok) { new Notice(`Can't use “${clean}” (${v.reason}).`); return; }
+            const r = await this.plugin.addConfigMirror(clean);
+            if (r.ok) { new Notice(`Now mirroring config to ${clean}`); this.display(); }
+            else new Notice(`Couldn't add the mirror: ${r.error}`);
+          }));
+          s.addExtraButton((b) => b.setIcon("panel-left").setTooltip("Show in Obsidian's file explorer").onClick(() => {
+            const file = this.app.vault.getAbstractFileByPath(`${cur}/DO NOT DELETE — Stashpad config.md`);
+            const fe = (this.app as unknown as { internalPlugins?: { getPluginById?: (id: string) => { instance?: { revealInFolder?: (f: unknown) => void } } } }).internalPlugins?.getPluginById?.("file-explorer");
+            if (file && fe?.instance?.revealInFolder) fe.instance.revealInFolder(file);
+          }));
+          if (mirrors.length) {
+            s.addButton((b) => b.setButtonText(`Stop mirroring (${mirrors.length})`).onClick(() => {
+              new ConfirmModal(
+                this.app,
+                "Stop mirroring config?",
+                `Stashpad will stop writing to the mirror folder(s): ${mirrors.map((m) => `**${m}/**`).join(", ")}. The folders are left on disk (now stale) — you can delete them.`,
+                "Stop mirroring",
+                async (confirmed) => {
+                  if (!confirmed) return;
+                  for (const m of mirrors) await this.plugin.removeConfigMirror(m);
+                  new Notice("Stopped mirroring.");
+                  this.display();
+                },
+              ).open();
+            }));
+          }
+          s.addButton((b) => b.setButtonText("Turn off").setWarning().onClick(() => {
+            new ConfirmModal(
+              this.app,
+              "Move settings back into data.json?",
+              `This moves everything from **${cur}/** back into the plugin's data.json. The folder is left in place — you can delete it afterwards.`,
+              "Turn off",
+              async (confirmed) => {
+                if (!confirmed) return;
+                const r = await this.plugin.disableConfigFolder();
+                if (r.ok) { new Notice("Settings moved back into data.json."); this.display(); }
+                else new Notice(`Couldn't turn off the config folder: ${r.error}`);
+              },
+            ).open();
+          }));
+        }
+      },
+      ["config", "sync", "vault folder", "snippets", "data.json", "portable", "storage", "stashpad config"],
+    ));
 
     cats.foldersStorage.push(toggle("Include pinned notes in the folder switcher", "When on, the folder switcher / creator (the folder button and the “Open or switch Stashpad folder” command) also lists your pinned notes, so you can jump straight to one. Off keeps the picker focused on folders.",
       () => this.plugin.settings.folderSwitcherIncludePinned, (v) => { this.plugin.settings.folderSwitcherIncludePinned = v; }, ["pinned", "switcher", "folder", "picker", "jump"]));

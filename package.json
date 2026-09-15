@@ -1,6 +1,6 @@
 {
 	"name": "stashpad-obsidian",
-	"version": "0.377.1",
+	"version": "0.379.2",
 	"private": true,
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
@@ -10,7 +10,8 @@
 		"deploy": "pnpm run build && node scripts/deploy.mjs",
 		"typecheck": "tsc --noEmit",
 		"lint": "eslint src",
-		"lint:store": "eslint src --max-warnings 0"
+		"lint:store": "eslint src --max-warnings 0",
+		"test": "node scripts/tests/run.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^20.10.0",

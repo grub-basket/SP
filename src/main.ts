@@ -63,7 +63,7 @@ import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
 import { perf } from "./perf";
 import { RenderCacheStore } from "./render-cache-store";
-import { SettingsStore, MOVED_KEYS } from "./settings-store";
+import { SettingsStore } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
 import { APP_IMPORT_VIEW_TYPE, AppImportView, type AppImporterViewContext } from "./stashpad-app-import-modal";
 import { settleNewTab, buildHomeFilename, splitIntoChunks } from "./view-helpers";
@@ -871,7 +871,7 @@ export default class StashpadPlugin extends Plugin {
     try {
       // Snapshot the live settings before overwriting them.
       const cur: Record<string, unknown> = {};
-      const moved = new Set<string>(MOVED_KEYS);
+      const moved = this.store.movedKeys(); // 0.378.0: dynamic (history + config)
       for (const [k, v] of Object.entries(this.settings as unknown as Record<string, unknown>)) if (!moved.has(k)) cur[k] = v;
       await this.settingsBackup.save(`${this.deviceId()}-before-restore`, cur);
       await this.saveData(snap);
@@ -11034,6 +11034,36 @@ export default class StashpadPlugin extends Plugin {
   private store = new SettingsStore(this);
   private externalReloadDebounced = debounce(() => void this.onExternalDataJsonChange(), 600, false);
 
+  // 0.378.0: public wrappers for the config-folder feature (the settings UI +
+  // commands drive it through these; the store does the file work).
+  getConfigFolder(): string | null { return this.store.getConfigFolder(); }
+  getConfigMirrors(): string[] { return this.store.getConfigMirrors(); }
+  async removeConfigMirror(folder: string): Promise<{ ok: boolean; error?: string }> {
+    const r = await this.store.removeConfigMirror(folder, this.settings as unknown as Record<string, unknown>);
+    if (r.ok) this.snapshotSettingsBaseline();
+    return r;
+  }
+  async addConfigMirror(folder: string): Promise<{ ok: boolean; error?: string }> {
+    const r = await this.store.addConfigMirror(folder, this.settings as unknown as Record<string, unknown>);
+    if (r.ok) this.snapshotSettingsBaseline();
+    return r;
+  }
+  async enableConfigFolder(folder: string): Promise<{ ok: boolean; error?: string }> {
+    const r = await this.store.enableConfigFolder(folder, this.settings as unknown as Record<string, unknown>);
+    if (r.ok) this.snapshotSettingsBaseline();
+    return r;
+  }
+  async disableConfigFolder(): Promise<{ ok: boolean; error?: string }> {
+    const r = await this.store.disableConfigFolder(this.settings as unknown as Record<string, unknown>);
+    if (r.ok) this.snapshotSettingsBaseline();
+    return r;
+  }
+  async relocateConfigFolder(folder: string): Promise<{ ok: boolean; error?: string; oldFolder?: string }> {
+    const r = await this.store.relocateConfigFolder(folder, this.settings as unknown as Record<string, unknown>);
+    if (r.ok) this.snapshotSettingsBaseline();
+    return r;
+  }
+
   /** Coalesce a burst of `raw` data.json events (a sync often writes in chunks). */
   private scheduleExternalDataJsonReload(): void { this.externalReloadDebounced(); }
 
@@ -11066,7 +11096,7 @@ export default class StashpadPlugin extends Plugin {
       // laptop's rebinds died on the desktop. Only adopt keys we have NOT changed
       // ourselves this session: an unsaved local edit must not be silently reverted
       // by an incoming file.
-      const churn = new Set(MOVED_KEYS);
+      const churn = this.store.movedKeys(); // 0.378.0: dynamic (history + config)
       const candidates = new Set([...Object.keys(s), ...Object.keys(disk)]);
       for (const k of candidates) {
         if (k === "settingsRev" || churn.has(k)) continue;
@@ -11132,7 +11162,7 @@ export default class StashpadPlugin extends Plugin {
    *  so the baseline is byte-identical to the uncached version. */
   private snapshotSettingsBaseline(cur?: Map<string, string>): void {
     const all = this.settings as unknown as Record<string, unknown>;
-    const moved = cur ? new Set<string>(MOVED_KEYS) : null;
+    const moved = cur ? this.store.movedKeys() : null; // 0.378.0: dynamic
     this.settingsBaseline = {};
     for (const k of Object.keys(all)) {
       if (k === "settingsRev") continue; // bookkeeping, never adopted
@@ -11172,7 +11202,7 @@ export default class StashpadPlugin extends Plugin {
     // read can't leave the cache stale.
     try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { /* first write / unreadable */ }
     const ours0 = this.settings as unknown as Record<string, unknown>;
-    const movedSet = new Set<string>(MOVED_KEYS);
+    const movedSet = this.store.movedKeys(); // 0.378.0: dynamic (history + config)
     const curStr = new Map<string, string>();
     for (const k of Object.keys(ours0)) {
       if (k === "settingsRev" || movedSet.has(k)) continue;
@@ -11202,7 +11232,7 @@ export default class StashpadPlugin extends Plugin {
       //  - The loud Notice stays scoped to the SECURITY-critical keys. Widening the
       //    protection should not mean interrupting the user because the other
       //    machine pinned a folder.
-      const churn = new Set(MOVED_KEYS);
+      const churn = this.store.movedKeys(); // 0.378.0: dynamic (history + config)
       const ours = this.settings as unknown as Record<string, unknown>;
       const candidates = new Set([...Object.keys(ours), ...Object.keys(disk)]);
       for (const k of candidates) {
@@ -11275,7 +11305,7 @@ export default class StashpadPlugin extends Plugin {
     }
     if (coreDirty) {
       const core: Record<string, unknown> = {};
-      const moved = new Set<string>(MOVED_KEYS);
+      const moved = this.store.movedKeys(); // 0.378.0: history keys + config keys (when the folder is on)
       for (const [k, v] of Object.entries(all)) if (!moved.has(k)) core[k] = v;
       await this.store.saveCore(core); // 0.349.0: atomic write (temp + rename) — an
       // interrupted save can no longer zero data.json.

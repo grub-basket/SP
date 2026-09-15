@@ -1,5 +1,9 @@
 import type { Plugin } from "obsidian";
 import { Notice } from "obsidian";
+import {
+  CONFIG_FILES, CONFIG_KEYS, CONFIG_POINTER_KEY, CONFIG_SUBFOLDERS,
+  CONFIG_SENTINEL, CONFIG_SENTINEL_BODY, CONFIG_BACKUP_FILE,
+} from "./config-layout";
 
 /** 0.189.0 — persistence layer for plugin settings, split across several files.
  *
@@ -60,6 +64,13 @@ export class SettingsStore {
   private baseline: Record<string, string | undefined> = {};
   /** file → last known rev (monotonic, bumped on each write of that file). */
   private revs = new Map<string, number>();
+  /** 0.378.0: the in-vault config folder ("" / null = off, everything classic).
+   *  Set from the data.json pointer at load, or by enable/disable/relocate. */
+  private configFolder: string | null = null;
+  /** 0.379.0: additional folders that config WRITES fan out to — redundant,
+   *  synced mirrors (e.g. the previous folder kept after a relocate). Read is
+   *  always from the primary `configFolder`; mirrors are write-only backups. */
+  private configMirrors: string[] = [];
 
   constructor(private plugin: Plugin) {}
 
@@ -68,13 +79,83 @@ export class SettingsStore {
     return this.plugin.manifest.dir ?? "";
   }
 
+  /** 0.378.0: config-folder files resolve UNDER the config folder; everything
+   *  else (data.json, history.json) stays in the plugin dir. */
   private pathFor(file: string): string {
+    if (this.configFolder && file in CONFIG_FILES) return `${this.configFolder}/${file}`;
     return `${this.dir()}/${file}`;
+  }
+
+  /** 0.378.0: current config-folder path (null when off) — for the settings UI. */
+  getConfigFolder(): string | null { return this.configFolder; }
+
+  /** 0.379.0: the mirror folders (redundant synced copies) — for the settings UI. */
+  getConfigMirrors(): string[] { return [...this.configMirrors]; }
+
+  /** 0.379.0: every folder config lives in right now — primary + mirrors. Used to
+   *  exclude them all from note scanning / link autocomplete. */
+  configPaths(): string[] {
+    return [this.configFolder, ...this.configMirrors].filter((f): f is string => !!f);
+  }
+
+  /** 0.379.0: stop mirroring to `folder` (leaves the folder on disk). */
+  async removeConfigMirror(folder: string, settings: Bag): Promise<{ ok: boolean; error?: string }> {
+    try {
+      this.configMirrors = this.configMirrors.filter((m) => m !== folder);
+      (settings as Bag)["configMirrors"] = [...this.configMirrors];
+      await this.writeCoreWithPointer(settings, this.configFolder ?? "");
+      this.snapshotKeys(settings, Object.keys(settings));
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+
+  /** 0.379.2: start mirroring to `folder` — create + sentinel it, add it to the
+   *  list, and populate it now (a full config write fans out to it). Symmetric
+   *  with removeConfigMirror. Requires the config folder to be on, and the folder
+   *  to be a different, valid path. */
+  async addConfigMirror(folder: string, settings: Bag): Promise<{ ok: boolean; error?: string }> {
+    if (!this.configFolder) return { ok: false, error: "the config folder is off" };
+    const clean = folder.trim().replace(/^\/+|\/+$/g, "");
+    if (!clean) return { ok: false, error: "empty folder" };
+    if (clean === this.configFolder) return { ok: false, error: "that's already the primary config folder" };
+    if (this.configMirrors.includes(clean)) return { ok: true }; // already mirroring
+    try {
+      await this.ensureConfigFolder(clean);
+      if (!(await this.sentinelPresent(clean))) return { ok: false, error: "couldn't create the folder or its sentinel" };
+      this.configMirrors = [...this.configMirrors, clean];
+      (settings as Bag)["configMirrors"] = [...this.configMirrors];
+      await this.writeAllConfigFiles(settings); // fans out to the new mirror, populating it
+      await this.writeCoreWithPointer(settings, this.configFolder);
+      this.snapshotKeys(settings, Object.keys(settings));
+      return { ok: true };
+    } catch (e) {
+      this.configMirrors = this.configMirrors.filter((m) => m !== clean); // roll back
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+
+  /** 0.378.0: the split files ACTIVE right now — history.json always, plus the
+   *  config-folder files when the folder is enabled. */
+  private activeFiles(): [string, readonly string[]][] {
+    const out: [string, readonly string[]][] = Object.entries(SPLIT_FILES);
+    if (this.configFolder) out.push(...Object.entries(CONFIG_FILES));
+    return out;
+  }
+
+  /** 0.378.0: every key that lives OUTSIDE data.json right now — history.json's
+   *  always, plus the config keys when the folder is on. Used to build the
+   *  data.json payload (moved keys are excluded from it). */
+  movedKeys(): Set<string> {
+    const s = new Set<string>(MOVED_KEYS);
+    if (this.configFolder) for (const k of CONFIG_KEYS) s.add(k);
+    return s;
   }
 
   /** Every file this store owns, data.json included. */
   fileNames(): string[] {
-    return ["data.json", ...Object.keys(SPLIT_FILES)];
+    return ["data.json", ...this.activeFiles().map(([f]) => f)];
   }
 
   /** Absolute-ish vault paths for all owned files — used by the external-change watcher. */
@@ -100,6 +181,17 @@ export class SettingsStore {
   private async writeSplit(file: string, payload: Bag, rev: number): Promise<void> {
     const body = JSON.stringify({ ...payload, rev }, null, 2);
     await this.atomicWrite(this.pathFor(file), body);
+    // 0.379.0: fan a config-file write out to every mirror folder (best-effort —
+    // a mirror failing must never fail the primary write). A mirror without its
+    // sentinel is skipped, same guard as the primary.
+    if (this.configFolder && file in CONFIG_FILES && this.configMirrors.length) {
+      for (const mirror of this.configMirrors) {
+        if (!mirror || mirror === this.configFolder) continue;
+        try {
+          if (await this.sentinelPresent(mirror)) await this.atomicWrite(`${mirror}/${file}`, body);
+        } catch { /* mirror is a redundant backup — ignore its failures */ }
+      }
+    }
   }
 
   /** 0.349.0: ATOMIC write — stage into a temp file, verify the bytes landed, then
@@ -230,7 +322,33 @@ export class SettingsStore {
     const base: Bag = parsedBase ?? (((await this.plugin.loadData()) as Bag | null) ?? {});
     const merged: Bag = { ...base };
 
-    for (const [file, keys] of Object.entries(SPLIT_FILES)) {
+    // 0.378.0: resolve the config-folder pointer BEFORE reading split files, so
+    // activeFiles() includes the config files. Trust the pointer only if the
+    // folder + sentinel are present (on a device where the folder hasn't synced
+    // yet, read what's there and let the values fill in as it arrives — never
+    // auto-revert, which would fight the sync).
+    const pointer = typeof base[CONFIG_POINTER_KEY] === "string" ? (base[CONFIG_POINTER_KEY] as string).trim() : "";
+    this.configFolder = pointer || null;
+    this.configMirrors = Array.isArray(base["configMirrors"])
+      ? (base["configMirrors"] as unknown[]).filter((m): m is string => typeof m === "string" && !!m && m !== this.configFolder)
+      : [];
+    if (this.configFolder && !(await this.sentinelPresent(this.configFolder))) {
+      // The folder is enabled but not present (deleted, or not synced to this
+      // device yet). Reads fall back to defaults and — because the sentinel
+      // guard skips writes to a missing folder — edits to these settings won't
+      // persist until it returns. Tell the user rather than let that be silent;
+      // no data is lost (the config files, once they arrive, are untouched).
+      new Notice(
+        `Stashpad: the config folder "${this.configFolder}" isn't available yet.\n`
+        + "Snippets, saved views, menus, templates and per-folder appearance are "
+        + "showing defaults, and changes to them won't be saved until the folder "
+        + "syncs to this device — or you turn off \"Store config in a vault folder\" "
+        + "in settings to move everything back into data.json.",
+        0,
+      );
+    }
+
+    for (const [file, keys] of this.activeFiles()) {
       const disk = await this.readSplit(file);
       if (disk) {
         for (const k of keys) if (disk[k] !== undefined) merged[k] = disk[k];
@@ -240,10 +358,16 @@ export class SettingsStore {
       }
     }
 
-    // One-time migration: data.json still carrying moved keys means this is a
-    // pre-split install (or a partial migration that was interrupted).
+    // One-time migration: data.json still carrying HISTORY-split keys means this
+    // is a pre-split install (or a partial migration that was interrupted).
     const leftovers = MOVED_KEYS.filter((k) => base[k] !== undefined);
     if (leftovers.length) await this.migrate(base, merged);
+    // 0.378.0: an interrupted config migration can leave config keys in BOTH
+    // data.json and the config files. The config-file copy already won the merge
+    // above; finish the strip so data.json shrinks as intended.
+    if (this.configFolder && CONFIG_KEYS.some((k) => base[k] !== undefined)) {
+      await this.stripConfigKeysFromDataJson(base);
+    }
 
     this.snapshotKeys(merged, Object.keys(merged));
     this.revs.set("data.json", typeof merged.settingsRev === "number" ? (merged.settingsRev as number) : 0);
@@ -289,7 +413,7 @@ export class SettingsStore {
   async saveSplit(settings: Bag): Promise<AdoptionReport> {
     const report: AdoptionReport = { adopted: {}, any: false };
 
-    for (const [file, keys] of Object.entries(SPLIT_FILES)) {
+    for (const [file, keys] of this.activeFiles()) {
       const changed = keys.some((k) => JSON.stringify(settings[k]) !== this.baseline[k]);
       const disk = await this.readSplit(file);
 
@@ -319,6 +443,11 @@ export class SettingsStore {
 
       const payload = SettingsStore.pick(settings, keys);
       if (Object.keys(payload).length === 0) continue; // never write an empty domain over a populated one
+      // 0.378.0: never scatter config into a folder that isn't ours — the
+      // sentinel must be present. If it's gone (folder deleted/renamed), skip
+      // the config write this round; the keys stay safe in memory + data.json
+      // fallback until the folder returns or the user reverts.
+      if (file in CONFIG_FILES && !(await this.sentinelPresent(this.configFolder))) continue;
       const rev = (this.revs.get(file) ?? 0) + 1;
       await this.writeSplit(file, payload, rev);
       this.revs.set(file, rev);
@@ -358,7 +487,7 @@ export class SettingsStore {
    *  change ourselves. Returns which keys changed so the caller can refresh UI. */
   async adoptExternal(settings: Bag): Promise<AdoptionReport> {
     const report: AdoptionReport = { adopted: {}, any: false };
-    for (const [file, keys] of Object.entries(SPLIT_FILES)) {
+    for (const [file, keys] of this.activeFiles()) {
       const disk = await this.readSplit(file);
       if (!disk) continue;
       const diskRev = typeof disk.rev === "number" ? disk.rev : 0;
@@ -383,5 +512,153 @@ export class SettingsStore {
   /** Re-baseline everything (after an external adoption or a forced reload). */
   rebaseline(settings: Bag): void {
     this.snapshotKeys(settings, Object.keys(settings));
+  }
+
+  // ---------- config folder (0.378.0) ----------
+
+  /** True when the config folder's sentinel is present — the write guard. */
+  private async sentinelPresent(folder: string | null): Promise<boolean> {
+    if (!folder) return false;
+    try { return await this.plugin.app.vault.adapter.exists(`${folder}/${CONFIG_SENTINEL}`); }
+    catch { return false; }
+  }
+
+  /** Create the config folder (recursively), its category subfolders, and the
+   *  sentinel file. Idempotent. */
+  private async ensureConfigFolder(folder: string): Promise<void> {
+    const a = this.plugin.app.vault.adapter;
+    const mkChain = async (path: string): Promise<void> => {
+      let cur = "";
+      for (const seg of path.split("/").filter(Boolean)) {
+        cur = cur ? `${cur}/${seg}` : seg;
+        try { if (!(await a.exists(cur))) await a.mkdir(cur); } catch { /* concurrent */ }
+      }
+    };
+    await mkChain(folder);
+    for (const sub of CONFIG_SUBFOLDERS) await mkChain(`${folder}/${sub}`);
+    const sentinel = `${folder}/${CONFIG_SENTINEL}`;
+    try { if (!(await a.exists(sentinel))) await a.write(sentinel, CONFIG_SENTINEL_BODY); } catch { /* below */ }
+  }
+
+  /** Rewrite data.json without the config keys — finishes an interrupted
+   *  migration on load. Keeps the pointer + everything else. */
+  private async stripConfigKeysFromDataJson(base: Bag): Promise<void> {
+    try {
+      const drop = new Set<string>(CONFIG_KEYS);
+      const stripped: Bag = {};
+      for (const [k, v] of Object.entries(base)) if (!drop.has(k)) stripped[k] = v;
+      stripped[CONFIG_POINTER_KEY] = this.configFolder ?? "";
+      await this.saveCore(stripped);
+    } catch (e) { console.warn("[Stashpad] couldn't finish config strip on load", e); }
+  }
+
+  /** Write + verify each category file from the live settings, into whatever
+   *  `this.configFolder` currently points at. Throws on the first failure. */
+  private async writeAllConfigFiles(settings: Bag): Promise<void> {
+    for (const [file, keys] of Object.entries(CONFIG_FILES)) {
+      const payload = SettingsStore.pick(settings, keys);
+      const rev = (this.revs.get(file) ?? 0) + 1;
+      await this.writeSplit(file, payload, rev); // atomicWrite verifies the bytes landed
+      this.revs.set(file, rev);
+    }
+  }
+
+  /** Build the data.json payload = settings minus the currently-moved keys, plus
+   *  the pointer, and write it atomically. */
+  private async writeCoreWithPointer(settings: Bag, pointer: string): Promise<void> {
+    const moved = this.movedKeys();
+    const core: Bag = {};
+    for (const [k, v] of Object.entries(settings)) if (!moved.has(k)) core[k] = v;
+    core[CONFIG_POINTER_KEY] = pointer;
+    await this.saveCore(core);
+  }
+
+  /** ENABLE: back up data.json, copy every category out + verify, THEN set the
+   *  pointer and strip the moved keys from data.json. Nothing is authoritative
+   *  until the pointer write at the end — a failure anywhere leaves data.json
+   *  intact and the folder ignored. Reversible via disableConfigFolder. */
+  async enableConfigFolder(folder: string, settings: Bag): Promise<{ ok: boolean; error?: string }> {
+    const a = this.plugin.app.vault.adapter;
+    const clean = folder.trim().replace(/^\/+|\/+$/g, "");
+    if (!clean) return { ok: false, error: "empty folder" };
+    try {
+      await this.ensureConfigFolder(clean);
+      if (!(await this.sentinelPresent(clean))) return { ok: false, error: "couldn't create the folder or its sentinel" };
+      // One-time backup of data.json (never overwrite an existing backup).
+      try {
+        const backup = `${this.dir()}/${CONFIG_BACKUP_FILE}`;
+        const dataPath = `${this.dir()}/data.json`;
+        if (!(await a.exists(backup)) && await a.exists(dataPath)) await a.write(backup, await a.read(dataPath));
+      } catch { /* best-effort */ }
+      const prev = this.configFolder;
+      this.configFolder = clean; // so pathFor + movedKeys resolve to the folder
+      this.configMirrors = []; // fresh enable starts with no mirrors
+      try {
+        await this.writeAllConfigFiles(settings);
+      } catch (e) {
+        this.configFolder = prev; // pointer never got set — full rollback
+        return { ok: false, error: `couldn't write config files: ${(e as Error).message}` };
+      }
+      (settings as Bag)[CONFIG_POINTER_KEY] = clean;
+      (settings as Bag)["configMirrors"] = [];
+      await this.writeCoreWithPointer(settings, clean); // strips moved keys from data.json
+      this.snapshotKeys(settings, Object.keys(settings));
+      console.debug(`[Stashpad] config folder enabled → ${clean}`);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+
+  /** DISABLE: move the config keys back INTO data.json, clear the pointer. The
+   *  in-memory `settings` already holds the current values, so we just rewrite
+   *  data.json with them and drop the pointer. Leaves the folder in place. */
+  async disableConfigFolder(settings: Bag): Promise<{ ok: boolean; error?: string }> {
+    try {
+      this.configFolder = null; // movedKeys() now excludes the config keys
+      this.configMirrors = []; // 0.379.0: mirrors are meaningless once off
+      (settings as Bag)[CONFIG_POINTER_KEY] = "";
+      (settings as Bag)["configMirrors"] = [];
+      await this.writeCoreWithPointer(settings, ""); // config keys ride back into data.json
+      this.snapshotKeys(settings, Object.keys(settings));
+      console.debug("[Stashpad] config folder disabled → back to data.json");
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+
+  /** RELOCATE: copy every category into the new folder + verify, then repoint.
+   *  Leaves the old folder for the caller to offer to remove. */
+  async relocateConfigFolder(newFolder: string, settings: Bag): Promise<{ ok: boolean; error?: string; oldFolder?: string }> {
+    const clean = newFolder.trim().replace(/^\/+|\/+$/g, "");
+    if (!clean) return { ok: false, error: "empty folder" };
+    if (!this.configFolder) return this.enableConfigFolder(clean, settings);
+    const old = this.configFolder;
+    if (clean === old) return { ok: true };
+    try {
+      await this.ensureConfigFolder(clean);
+      if (!(await this.sentinelPresent(clean))) return { ok: false, error: "couldn't create the new folder" };
+      // 0.379.0: keep the OLD folder as a synced mirror rather than orphaning
+      // it — writes fan out to it (it already has its sentinel + files), it stays
+      // ignored, and it syncs alongside the new one as a redundant backup.
+      const mirrors = [...this.configMirrors.filter((m) => m !== clean && m !== old), old];
+      this.configFolder = clean;
+      this.configMirrors = mirrors;
+      try {
+        await this.writeAllConfigFiles(settings); // fans out to the mirror(s) too
+      } catch (e) {
+        this.configFolder = old; this.configMirrors = this.configMirrors.filter((m) => m !== old); // roll back
+        return { ok: false, error: (e as Error).message };
+      }
+      (settings as Bag)[CONFIG_POINTER_KEY] = clean;
+      (settings as Bag)["configMirrors"] = mirrors;
+      await this.writeCoreWithPointer(settings, clean);
+      this.snapshotKeys(settings, Object.keys(settings));
+      console.debug(`[Stashpad] config folder relocated ${old} → ${clean} (old kept as mirror)`);
+      return { ok: true, oldFolder: old };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
   }
 }
