@@ -147,6 +147,11 @@ export class MarkdownInput {
   constructor(private app: App, private ta: HTMLTextAreaElement, private opts: MarkdownInputOptions = {}) {}
 
   attach(): void {
+    // 0.373.0: tag the field so the view's keymap Scope can offer the inline
+    // format shortcuts (Mod+B/I/E) on markdown surfaces ONLY — never a search or
+    // folder-name input. (The shortcuts live in the Scope, not here, because
+    // Obsidian dispatches its own Mod+B before any DOM keydown we could add.)
+    this.ta.classList.add("stashpad-md-input");
     this.ta.addEventListener("keydown", this.onKeyDown, true);
     // 0.363.7: on MOBILE, autopair runs off beforeinput instead of keydown —
     // iOS soft keyboards do NOT honour preventDefault() on keydown, so the manual
@@ -158,6 +163,7 @@ export class MarkdownInput {
   }
 
   detach(): void {
+    this.ta.classList.remove("stashpad-md-input");
     this.ta.removeEventListener("keydown", this.onKeyDown, true);
     this.ta.removeEventListener("beforeinput", this.onBeforeInput);
     this.ta.removeEventListener("dblclick", this.onDoubleClick);

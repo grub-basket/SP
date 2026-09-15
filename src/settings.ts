@@ -371,6 +371,10 @@ export interface StashpadSettings {
    *  clears such a stale order once (→ live default), then sets this so a user who
    *  later builds a submenu-less menu on purpose keeps it. */
   contextMenuOrderRefreshedV2: boolean;
+  /** 0.372.0: one-time flag — insert the new "Move in list" leaf at the FRONT of
+   *  the (unrenamed) "Move" submenu for existing users. The general seed top-up
+   *  only APPENDS missing defaults, so without this the item would land last. */
+  contextMoveInListFirstV1: boolean;
   /** 0.367.0: ids HIDDEN from the ⋮ / right-click menu. Baked-in defaults can't be
    *  truly deleted — the seed re-adds a removed submenu or item next launch — so
    *  instead you HIDE them: they stay in the config but the menu skips rendering
@@ -1068,6 +1072,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextSubmenus: Object.fromEntries(Object.entries(DEFAULT_CONTEXT_SUBMENUS).map(([k, v]) => [k, { name: v.name, icon: v.icon, items: [...v.items] }])),
   contextMenusSeededV1: false,
   contextMenuOrderRefreshedV2: false,
+  contextMoveInListFirstV1: false,
   contextMenuHidden: [],
   composerActionCommand: "command-palette:open",
   customCommandIds: [],

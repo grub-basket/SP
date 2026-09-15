@@ -10,7 +10,7 @@ import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL, parseRecurrence, parseDuration } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
-import { renderFormattingToolbar } from "./formatting-toolbar";
+import { renderFormattingToolbar, wrapSelection } from "./formatting-toolbar";
 import { dedupeDrafts } from "./drafts";
 import { IconSuggest } from "./icon-suggest";
 import { lineDiff } from "./note-history";
@@ -1607,6 +1607,20 @@ export class NoteWorkbenchModal extends Modal {
     // 0.170.3: Mod+E / Mod+S toggle the Edit / Split surface while open.
     this.scope.register(["Mod"], "e", (e) => { e.preventDefault(); this.ui?.setSurface("edit"); });
     this.scope.register(["Mod"], "s", (e) => { e.preventDefault(); this.ui?.setSurface("split"); });
+    // 0.373.0: Mod+B / Mod+I wrap the selection in the editor textarea, matching
+    // the composer's inline-format shortcuts. Only when a markdown field is
+    // focused (`.stashpad-md-input`) — otherwise fall through (return true) so
+    // the title input etc. behave normally. Mod+E stays the surface toggle above,
+    // so there's no code shortcut here (deliberate — the surface toggle predates it).
+    const wrapField = (wrap: string) => (e: KeyboardEvent): boolean => {
+      const el = (document.activeElement ?? null) as HTMLElement | null;
+      if (!el || !el.classList.contains("stashpad-md-input")) return true;
+      e.preventDefault();
+      wrapSelection(el as HTMLTextAreaElement, wrap);
+      return false;
+    };
+    this.scope.register(["Mod"], "b", wrapField("**"));
+    this.scope.register(["Mod"], "i", wrapField("*"));
     // 0.184.0: Mod+Shift+E → open the note in Obsidian's editor (no-op for a new
     // note from the composer, which has no onOpenExternal).
     this.scope.register(["Mod", "Shift"], "e", (e) => { e.preventDefault(); void this.ui?.openExternalSaving(); }); // 0.201.2: saves first, no discard prompt

@@ -1018,6 +1018,24 @@ export class StashpadView extends ItemView {
         }
         return false; // consumed — a document-level listener elsewhere never runs
       });
+      // 0.373.0: inline-format shortcuts (Mod+B/I/E → Bold/Italic/Code) on
+      // markdown surfaces. Registered in the keymap SCOPE, not a DOM listener,
+      // because Obsidian dispatches its own Mod+B ("Toggle bold") through the
+      // keymap before any capture-phase DOM handler on the textarea — so a DOM
+      // approach never sees the key (verified: the event is preventDefault'd and
+      // stopped at the window before it reaches the field). Only a
+      // markdown-input-managed field (`.stashpad-md-input`) is claimed; every
+      // other input (search, folder name…) returns true and behaves normally.
+      const wrapShortcut = (wrap: string) => (evt: KeyboardEvent): boolean => {
+        const el = (this.containerEl?.ownerDocument?.activeElement ?? null) as HTMLElement | null;
+        if (!el || !el.classList.contains("stashpad-md-input")) return true; // not ours — fall through
+        evt.preventDefault();
+        this.wrapTextField(el as HTMLTextAreaElement, wrap, wrap);
+        return false; // consumed
+      };
+      viewScope.register(["Mod"], "b", wrapShortcut("**"));
+      viewScope.register(["Mod"], "i", wrapShortcut("*"));
+      viewScope.register(["Mod"], "e", wrapShortcut("`"));
       // 0.279.25: reserve Mod+Shift+F while a Stashpad tab is focused. Registered
       // in the keymap SCOPE (not a DOM listener) because Obsidian dispatches its
       // own hotkeys through the keymap before bubble-phase DOM handlers — a
@@ -19704,6 +19722,22 @@ export class StashpadView extends ItemView {
     });
   }
 
+  /** 0.373.0: wrap the selection of a markdown text field in `before`/`after`
+   *  (empty pair with the caret between when nothing is selected) for the
+   *  Mod+B/I/E scope shortcuts. Mirrors the toolbar's wrapSelection; the `input`
+   *  event keeps the draft, autosave and native undo in sync. */
+  private wrapTextField(ta: HTMLTextAreaElement, before: string, after: string): void {
+    const s = ta.selectionStart ?? ta.value.length;
+    const e = ta.selectionEnd ?? s;
+    const val = ta.value;
+    const sel = val.slice(s, e);
+    ta.value = val.slice(0, s) + before + sel + after + val.slice(e);
+    if (sel) ta.setSelectionRange(s + before.length, e + before.length);
+    else { const c = s + before.length; ta.setSelectionRange(c, c); }
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    ta.focus();
+  }
+
   /** 0.370.0: import one or more DROPPED FOLDERS as a note subtree — each folder
    *  becomes a note (named after the folder), each file inside becomes a child
    *  note whose body is the imported attachment's embed, and sub-folders nest
@@ -20985,6 +21019,7 @@ export class StashpadView extends ItemView {
       case "copyTree":         void this.cmdCopyTree(); break;
       case "copyLevelMarkers": void this.cmdCopyTreeLevelMarkers(); break;
       case "copySubtree":      void this.cmdCopyFocusedSubtree(); break;
+      case "moveInList":       this.cmdInListPicker(); break;
       case "move":             this.cmdMovePicker(); break;
       case "moveHome":         void this.changeParent(node, ROOT_ID); break;
       case "clone":            void this.cmdClone(); break;
@@ -21199,6 +21234,7 @@ export class StashpadView extends ItemView {
       case "setDue":       A("Set due date…", this.actionIcon("setDue"), () => { focusClicked(); this.cmdSetDue(); }); break;
       case "largeText":    A("Reveal in large text", this.actionIcon("largeText"), () => this.cmdRevealLargeText(node)); break;
       case "archive":      A("Move to archive", this.actionIcon("archive"), () => { focusClicked(); void this.cmdMoveToArchive(); }); break;
+      case "moveInList":   A("Move in list", this.actionIcon("moveInList"), () => { focusClicked(); this.cmdInListPicker(); }); break;
       case "move":         A("Move to…", this.actionIcon("move"), () => { focusClicked(); this.cmdMovePicker(); }); break;
       case "moveHome":     A("Move to Home", this.actionIcon("moveHome"), async () => { await this.changeParent(node, ROOT_ID); if (this.plugin.settings.autoNavOnMoveOut && this.focusId !== ROOT_ID) this.navigateTo(ROOT_ID); }); break;
       case "setColor":     A("Set color…", this.actionIcon("setColor"), () => { focusClicked(); this.cmdSetColor(); }); break;

@@ -97,6 +97,9 @@ export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
  *  them under "Add action…". */
 export const CONTEXT_EXTRA_ACTIONS: readonly NoteActionDef[] = [
   { id: "sep",            label: "── Divider ──",           icon: "minus",           group: "Organize" },
+  // 0.372.0: the in-list move picker (arrow + Enter to reposition/nest within the
+  // list) as a first-class context leaf, so it can head the "Move ▸" submenu.
+  { id: "moveInList",     label: "Move in list",            icon: "indent",          group: "Organize" },
   { id: "obscure",        label: "Obscure / reveal",        icon: "eye-off",         group: "Organize" },
   { id: "pinList",        label: "Pin in list ▸",           icon: "pin",             group: "Organize" },
   // 0.363.0: the two "Pin in list" edges as individual leaves so the seeded
@@ -138,7 +141,7 @@ export const CONTEXT_LEAF_IDS: readonly string[] = [
  *  renamable / reorderable / nestable / deletable like any user submenu. Every
  *  item id is a real renderCtxLeaf leaf case (see view.ts). */
 export const DEFAULT_CONTEXT_SUBMENUS: Record<string, { name: string; icon: string; items: string[] }> = {
-  move:      { name: "Move",          icon: "move",        items: ["move", "moveHome", "outdent"] },
+  move:      { name: "Move",          icon: "move",        items: ["moveInList", "move", "moveHome", "outdent"] },
   pin:       { name: "Pin",           icon: "pin",         items: ["pinSidebar", "pinListTop", "pinListBottom"] },
   advanced:  { name: "Advanced",      icon: "settings-2",  items: ["openObsidian", "history", "split"] },
   reactreply:{ name: "React / Reply", icon: "smile-plus",  items: ["react", "reply", "replyLink"] },

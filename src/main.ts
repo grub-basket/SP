@@ -10675,6 +10675,7 @@ export default class StashpadPlugin extends Plugin {
       migratedToggleTaskG: data?.migratedToggleTaskG === true,
       contextMenusSeededV1: data?.contextMenusSeededV1 === true,
       contextMenuOrderRefreshedV2: data?.contextMenuOrderRefreshedV2 === true,
+      contextMoveInListFirstV1: data?.contextMoveInListFirstV1 === true,
       contextMenuHidden: Array.isArray(data?.contextMenuHidden)
         ? data.contextMenuHidden.filter((x: unknown): x is string => typeof x === "string")
         : [],
@@ -10739,6 +10740,21 @@ export default class StashpadPlugin extends Plugin {
         this.settings.contextMenusSeededV1 = true;
         await this.saveSettings();
       }
+    }
+    // 0.372.0: seat the new "Move in list" leaf at the FRONT of the "Move"
+    // submenu for existing users. The top-up above only appends missing defaults,
+    // so on its own the item lands last; the user asked for it first. One-time,
+    // and only for a submenu the user hasn't renamed (name still "Move") — a
+    // repurposed submenu is left untouched.
+    if (!this.settings.contextMoveInListFirstV1) {
+      const subs = { ...(this.settings.contextSubmenus ?? {}) };
+      const mv = subs.move;
+      if (mv && mv.name === DEFAULT_CONTEXT_SUBMENUS.move.name && mv.items[0] !== "moveInList") {
+        subs.move = { ...mv, items: ["moveInList", ...mv.items.filter((it) => it !== "moveInList")] };
+        this.settings.contextSubmenus = subs;
+      }
+      this.settings.contextMoveInListFirstV1 = true;
+      await this.saveSettings();
     }
     // 0.366.1: refresh a STALE contextMenuOrder. A snapshot saved before the
     // 0.360/0.363 submenu reorg lists items like `obscure`/`setColor` at the top
