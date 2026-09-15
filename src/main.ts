@@ -3967,6 +3967,9 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-set-color", name: "Set note color…", callback: () => call("cmdSetColor") });
     this.addCommand({ id: "stashpad-reply-link", name: "Make note a reply to…", callback: () => call("cmdReplyLinkPicker") });
     this.addCommand({ id: "stashpad-reply-in-list", name: "Reply to… (pick in the list)", callback: () => call("cmdReplyInListPicker") });
+    this.addCommand({ id: "stashpad-copy-links", name: "Copy link(s) from note (first / pick / all)", callback: () => call("cmdCopyLinks") });
+    this.addCommand({ id: "stashpad-preview-note", name: "Preview selected note", callback: () => call("cmdPreviewSelected") });
+    this.addCommand({ id: "stashpad-preview-home", name: "Preview home (focused) note", callback: () => call("cmdPreviewHome") });
     this.addCommand({ id: "stashpad-composer-debug", name: "Debug: composer placeholder + autocomplete state", callback: () => call("cmdComposerDebug") });
     // 0.319.0: drafts machinery (+ the edit-in-composer provision, deliberately
     // command-only until the UX is decided — see .claude/TODO.md "editing model").

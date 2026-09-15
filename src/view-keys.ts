@@ -12,6 +12,10 @@ function eventKeyId(e: KeyboardEvent): string {
   if (letter) return letter[1].toLowerCase();
   const digit = /^Digit(\d)$/.exec(code);
   if (digit) return digit[1];
+  // 0.384.0: the Space key produces e.key === " ", which can't survive a chord's
+  // "+"-split/trim (it gets filtered out as empty). Normalize it to the stable
+  // token "space" so a "Shift+Space" chord can match — mirrors the recorder.
+  if (code === "Space") return "space";
   return (e.key || "").toLowerCase();
 }
 

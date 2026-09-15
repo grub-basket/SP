@@ -2469,12 +2469,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    areas. Scoped to NON-compact mobile (compact has its own dense layout). */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note.is-task {
-  grid-template-columns: 1fr auto auto auto auto;
+  grid-template-columns: 1fr auto auto auto auto auto;
   grid-template-areas:
-    "meta   toggle react  quick  more"
-    "body   body   body   body   body"
-    "foot   foot   foot   foot   foot"
-    "reacts reacts reacts reacts reacts";
+    "meta   toggle react  quick  preview more"
+    "body   body   body   body   body   body"
+    "foot   foot   foot   foot   foot    foot"
+    "reacts reacts reacts reacts reacts  reacts";
   align-items: center;
   row-gap: 2px;
   column-gap: 8px;
@@ -2502,6 +2502,10 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    dropped BELOW the body on long/multi-line notes instead of staying up top with
    the toggle/quick/more buttons. Give it its own slot on the top row. */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-react { grid-area: react; }
+/* 0.380.0: the per-row Preview button (0.374.0) had the SAME missing-grid-area
+   bug as the react button above — under display:contents it auto-flowed into an
+   implicit row and dropped BELOW the note body. Give it a top-row slot. */
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-preview { grid-area: preview; }
 /* 0.276.4: the FOCUSED heading-note header crammed its title (in
    .stashpad-focused-body) onto the same row as the timestamp + action buttons
    on mobile. Mirror the body-note layout: timestamp + buttons on top, the
@@ -2531,6 +2535,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-quick,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-react,
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-preview,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more {
   align-self: center;
   width: 22px;
@@ -2538,9 +2543,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle .svg-icon,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-react .svg-icon,
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-preview .svg-icon,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more .svg-icon {
   width: 15px;
   height: 15px;
+  flex-shrink: 0;
 }
 /* Timestamp nudged up a step (smaller → small) so it matches the now-smaller
    top-row buttons instead of looking tiny beside them. */

@@ -71,9 +71,10 @@ export type CommandId =
   | "clone" | "forkNote" | "insertTemplate"
   | "toggleExpand" | "expandAll" | "collapseAll"
   | "exportStash" | "importStash" | "pickFolder"
-  | "cloneStashpadTab" | "selectAll" | "copyCodeBlock"
+  | "cloneStashpadTab" | "selectAll" | "copyCodeBlock" | "copyLinks"
   | "swapWithParent"
   | "togglePin" | "listPin" | "listPinBottom"
+  | "previewNote" | "previewHome"
   | "toggleTask" | "setDue" | "openAllTasks" | "reply"
   | "jumpToTop" | "jumpToBottom"
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
@@ -151,10 +152,13 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "cloneStashpadTab",label: "Clone (duplicate / copy) this Stashpad tab", desc: "Open a second tab on the same folder + focus, mirroring the \"copy\" button in the focused-header actions.", defaultPrimary: "" },
   { id: "selectAll",       label: "Select all notes in view",      desc: "Default: Mod+A — adds every visible row to the selection.",                              defaultPrimary: "Mod+A" },
   { id: "copyCodeBlock",   label: "Copy code from codeblock",      desc: "Default: { — copy the contents of the cursor row's first codeblock (or pick one when multiple exist).", defaultPrimary: "{" },
+  { id: "copyLinks",       label: "Copy link(s) from note",        desc: "Default: } — copy the first hyperlink in the cursor row's note (or pick one / copy all when several exist). Sibling of Copy code from codeblock.", defaultPrimary: "}" },
   { id: "swapWithParent",  label: "Swap with parent (ouroboros)",  desc: "Promote the cursor row above its current parent; the parent slides under it (carrying its other children). No default — bind in this tab.", defaultPrimary: "" },
   { id: "togglePin",       label: "Pin / unpin selected note",     desc: "Default: P — toggle the sidebar pin state of the cursor row (or focused note).", defaultPrimary: "P" },
   { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
   { id: "listPinBottom",   label: "Pin / unpin to bottom of list", desc: "Float the cursor row (or selection) to the BOTTOM of its list. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
+  { id: "previewNote",     label: "Preview selected note",         desc: "Default: Shift+Space — open the cursor row (or selection) in the note-preview viewer.", defaultPrimary: "Shift+Space" },
+  { id: "previewHome",     label: "Preview home note",             desc: "Default: Mod+Shift+Space — open the current list's home (focused) note in the note-preview viewer.", defaultPrimary: "Mod+Shift+Space" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: G — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "G" },
   { id: "reply",           label: "Reply to selection",            desc: "Default: R — start a reply to the cursor row (or selection): the composer's next send links back to it and shows a quote. Press R on another note to switch the reply target.", defaultPrimary: "R" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },

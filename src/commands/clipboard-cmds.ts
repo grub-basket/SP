@@ -1,7 +1,7 @@
 import { Notice, SuggestModal } from "obsidian";
 import type { TreeNode } from "../types";
 import { getSettings } from "../settings";
-import { extractCodeBlocks } from "../view-helpers";
+import { extractCodeBlocks, extractLinks } from "../view-helpers";
 import type { StashpadView } from "../view";
 
 /** Clipboard command group extracted from StashpadView (view-split stage 5).
@@ -119,6 +119,55 @@ export async function cmdCopyCodeBlock(view: StashpadView): Promise<void> {
     }
   })(view.app);
   modal.setPlaceholder(`${blocks.length} codeblocks in "${view.titleForNode(node)}" — pick one to copy.`);
+  modal.open();
+}
+
+/** 0.385.0: copy the first hyperlink in the cursor row's note (or pick one / all
+ *  when several exist). Mirrors cmdCopyCodeBlock — the OG-Stashpad "copy code from
+ *  codeblock" gesture, but for links. */
+export async function cmdCopyLinks(view: StashpadView): Promise<void> {
+  const targets = view.getActionTargets();
+  if (!targets.length || !targets[0].file) { new Notice("Nothing to copy from."); return; }
+  const node = targets[0];
+  const raw = await view.app.vault.cachedRead(node.file!);
+  const body = view.stripFrontmatter(raw);
+  const links = extractLinks(body);
+  const notify = (message: string, kind: "info" | "success"): void => {
+    view.plugin.notifications.show({ message, kind, category: "system", affectedIds: [node.id], folder: view.noteFolder });
+  };
+  if (links.length === 0) { notify(`No link found in "${view.titleForNode(node)}".`, "info"); return; }
+  if (links.length === 1) {
+    await navigator.clipboard.writeText(links[0].url);
+    notify(`Copied link from "${view.titleForNode(node)}".`, "success");
+    return;
+  }
+  // Several — pick one (or all). Item 1 is the FIRST link ("copy first link").
+  type Item = { kind: "one" | "all"; idx: number; label: string };
+  const items: Item[] = links.map((l, i) => ({
+    kind: "one" as const,
+    idx: i,
+    label: `${i + 1}. ${l.url}${l.text && l.text !== l.url ? `  — ${l.text.slice(0, 40)}` : ""}`,
+  }));
+  items.push({ kind: "all", idx: -1, label: `Copy all ${links.length} links (one per line)` });
+  const modal = new (class extends SuggestModal<Item> {
+    getSuggestions(query: string): Item[] {
+      const q = query.trim().toLowerCase();
+      if (!q) return items;
+      const tokens = q.split(/\s+/).filter(Boolean);
+      return items.filter((it) => tokens.every((t) => it.label.toLowerCase().includes(t)));
+    }
+    renderSuggestion(item: Item, el: HTMLElement): void {
+      el.createDiv({ cls: "stashpad-suggest-title", text: item.label });
+    }
+    async onChooseSuggestion(item: Item): Promise<void> {
+      const text = item.kind === "all" ? links.map((l) => l.url).join("\n") : links[item.idx].url;
+      await navigator.clipboard.writeText(text);
+      notify(item.kind === "all"
+        ? `Copied all ${links.length} links from "${view.titleForNode(node)}".`
+        : `Copied link from "${view.titleForNode(node)}".`, "success");
+    }
+  })(view.app);
+  modal.setPlaceholder(`${links.length} links in "${view.titleForNode(node)}" — pick one (or all) to copy.`);
   modal.open();
 }
 

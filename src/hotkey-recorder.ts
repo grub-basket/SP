@@ -138,6 +138,9 @@ function normalizeKey(k: string, code?: string): string {
     if (m) return m[1];
     const d = /^Digit(\d)$/.exec(code);
     if (d) return d[1];
+    // 0.384.0: serialize the Space key as the stable token "Space" (its e.key is
+    // " ", which a chord's "+"-split would drop). Matches view-keys' matcher.
+    if (code === "Space") return "Space";
   }
   if (k.length === 1) {
     return k.toUpperCase();

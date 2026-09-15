@@ -122,6 +122,33 @@ export function isAnyModalOpen(target?: EventTarget | null): boolean {
  *  one entry per block in document order with the language tag and
  *  inner content (no surrounding fences). Tildes (~~~) are not matched
  *  — Obsidian's writers always emit backtick fences. 0.61.0. */
+/** 0.385.0: pull the hyperlinks out of a note body, in document order, de-duped.
+ *  Mirrors extractCodeBlocks (used by the "copy first / all links" command).
+ *  Covers markdown links [text](url), angle-bracket autolinks <url>, and bare
+ *  http(s)/mailto URLs. Internal [[wikilinks]] are intentionally excluded — this
+ *  is for grabbing a copyable external link, not resolving vault references. */
+export function extractLinks(body: string): Array<{ url: string; text: string }> {
+  const out: Array<{ url: string; text: string }> = [];
+  const seen = new Set<string>();
+  const push = (rawUrl: string, text: string): void => {
+    const url = rawUrl.trim().replace(/^<|>$/g, "");
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    out.push({ url, text: (text || url).trim() });
+  };
+  // One left-to-right pass so order is preserved and a markdown link's own URL
+  // isn't also caught by the bare-URL branch (the [..](..) alternative matches
+  // first at the '[' and consumes past the URL).
+  const re = /!?\[([^\]]*)\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\)|<((?:https?|mailto):[^>\s]+)>|\b((?:https?:\/\/|mailto:)[^\s<>()[\]]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) != null) {
+    if (m[2] != null) push(m[2], m[1]);       // [text](url)
+    else if (m[3] != null) push(m[3], "");     // <url>
+    else if (m[4] != null) push(m[4], "");     // bare url
+  }
+  return out;
+}
+
 export function extractCodeBlocks(body: string): Array<{ lang: string; code: string }> {
   const out: Array<{ lang: string; code: string }> = [];
   // ``` (optional info string) <newline> body <newline> ```.

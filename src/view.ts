@@ -10159,16 +10159,24 @@ export class StashpadView extends ItemView {
     const box = modal.contentEl.createEl("textarea", { cls: "stashpad-debug-box" });
     box.value = text; box.readOnly = true; box.rows = 14;
     const copy = modal.contentEl.createEl("button", { text: "Copy to clipboard", cls: "mod-cta stashpad-debug-copy" });
-    const doCopy = (): void => {
-      box.focus(); box.select(); box.setSelectionRange(0, text.length);
+    // 0.383.0: copy via the async clipboard API, which needs no text selection —
+    // so the button works on the first tap. Only fall back to execCommand (which
+    // DOES need a selection) if the clipboard write rejects, and only report
+    // success once it actually resolves. Don't pre-select the box on open: the
+    // default select-all was swallowing the first tap on mobile (the tap
+    // collapsed the selection instead of hitting Copy) and made the button seem
+    // to require a manual select before it would work.
+    const doCopy = async (): Promise<void> => {
       let ok = false;
-      try { void navigator.clipboard?.writeText(text); ok = true; } catch { /* fall through */ }
-      try { ok = document.execCommand("copy") || ok; } catch { /* ignore */ }
-      new Notice(ok ? "Copied" : "Select the text and copy manually");
+      try { await navigator.clipboard?.writeText(text); ok = true; }
+      catch {
+        try { box.focus(); box.setSelectionRange(0, text.length); ok = document.execCommand("copy"); }
+        catch { /* ignore */ }
+      }
+      new Notice(ok ? "Copied" : "Couldn't copy — select the text and copy manually");
     };
-    copy.onclick = doCopy;
+    copy.onclick = () => { void doCopy(); };
     modal.open();
-    window.setTimeout(() => { box.focus(); box.select(); }, 60);
   }
 
   private composerPlaceholder(enterSubmits: boolean, split: boolean): string {
@@ -11217,7 +11225,12 @@ export class StashpadView extends ItemView {
     if (matchBinding(e, b.undo)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdUndo(); return; }
     if (matchBinding(e, b.redo)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdRedo(); return; }
 
-    if (e.key === " ") {
+    // 0.387.0: only a BARE Space focuses the composer. A chorded Space
+    // (Shift+Space, Mod+Shift+Space) must fall through to its binding — the
+    // preview shortcuts (previewNote / previewHome) live below this point, so
+    // an unguarded `e.key === " "` was swallowing them and focusing the composer
+    // instead. Plain-Space-focuses-composer is unchanged.
+    if (e.key === " " && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault();
       const ta = this.composerInputEl;
       if (ta) {
@@ -11334,6 +11347,9 @@ export class StashpadView extends ItemView {
     // "T" ran first it would swallow Shift+T. Checking here (above the gated block
     // that holds openTab) fixes both.
     if (matchBinding(e, sb.openAllTasks)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void openAggregateView(this.plugin, "tasks"); return; }
+    // previewHome (Mod+Shift+Space) is global — it targets the current list's home
+    // (focused) note, not the selection — so it lives above the selection-gated block.
+    if (matchBinding(e, sb.previewHome)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPreviewHome(); return; }
     if (this.selection.size > 0 || (this.cursorIdx >= 0 && this.currentChildren[this.cursorIdx])) {
       if (matchBinding(e, sb.move)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdMovePicker(); return; }
       if (matchBinding(e, sb.pickMove)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInListPicker(); return; }
@@ -11359,6 +11375,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.copyLink)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyStashpadLink(); return; }
       if (matchBinding(e, sb.copyOutline)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyOutline(); return; }
       if (matchBinding(e, sb.copyCodeBlock)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyCodeBlock(); return; }
+      if (matchBinding(e, sb.copyLinks)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdCopyLinks(); return; }
       if (matchBinding(e, sb.openEditor)) {
         e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
         if (e.shiftKey) {
@@ -11386,6 +11403,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.togglePin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdTogglePin(); return; }
       if (matchBinding(e, sb.listPin)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin("top"); return; }
       if (matchBinding(e, sb.listPinBottom)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin("bottom"); return; }
+      if (matchBinding(e, sb.previewNote)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPreviewSelected(); return; }
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
       // 0.300.0: R replies to the cursor row; pressing R on another note switches the target.
@@ -13804,6 +13822,7 @@ export class StashpadView extends ItemView {
     }
   }
   cmdCopyCodeBlock(): Promise<void> { return clipboardCmds.cmdCopyCodeBlock(this); }
+  cmdCopyLinks(): Promise<void> { return clipboardCmds.cmdCopyLinks(this); }
   cmdCopyTree(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyTree(this, withTimestamps); }
   cmdCopyTreeLevelMarkers(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyTreeLevelMarkers(this, withTimestamps); }
   cmdCopyFocusedSubtree(withTimestamps = false): Promise<void> { return clipboardCmds.cmdCopyFocusedSubtree(this, withTimestamps); }
@@ -18732,6 +18751,12 @@ export class StashpadView extends ItemView {
       });
       if (!proceed) return false;
     }
+    // 0.382.0: a Save that didn't change the body is a no-op — don't rewrite the
+    // file (and thereby bump `modified` via the modify handler) just to normalize
+    // trailing whitespace or a final newline. We only ever write OUR body onto
+    // THEIR frontmatter, so an unchanged body means nothing of ours needs writing.
+    // This makes the modification time change only on a real body difference.
+    if (freshBody === nb) return true;
     const fm = fresh.fm;
     const newContent = fm + (fm ? "\n" : "") + nb + "\n";
     if (newContent === current) return true; // no change
@@ -19733,6 +19758,22 @@ export class StashpadView extends ItemView {
    *  rail exactly as an attachment click would show them. Clicking an attachment
    *  chip still opens that attachment (never a thumbnail of the note — no
    *  recursion). */
+  /** 0.384.0: preview the selected/cursor note (Shift+Space, palette). */
+  async cmdPreviewSelected(): Promise<void> {
+    const target = this.getActionTargets()[0] ?? this.headingNode() ?? null;
+    if (!target?.file) { new Notice("No note selected to preview."); return; }
+    await this.openNotePreview(target);
+  }
+
+  /** 0.384.0: preview the current list's home (focused) note (Mod+Shift+Space,
+   *  palette). "Home" = the note you're focused into, whose children this list
+   *  shows; at the folder root there's no note file to preview. */
+  async cmdPreviewHome(): Promise<void> {
+    const focused = this.tree.get(this.focusId) ?? this.tree.getRoot();
+    if (!focused?.file) { new Notice("No home note to preview here (you're at the folder root)."); return; }
+    await this.openNotePreview(focused);
+  }
+
   private async openNotePreview(node: TreeNode): Promise<void> {
     if (!node.file) return;
     let raw = "";
@@ -19746,30 +19787,44 @@ export class StashpadView extends ItemView {
       .replace(/^#+\s*/, "").replace(/[*_`>]/g, "").trim()
       || node.file.basename).slice(0, 80) || "Note";
     const parentId = node.parent && node.parent !== ROOT_ID ? node.parent : null;
+    // 0.386.0 (user): actions invoked from inside the preview modal — Edit
+    // (which routes to the composer / edit modal / tab), Move, Reply, etc. —
+    // would open their surface BEHIND this modal, hidden. So dismiss the preview
+    // first when its ⋮ menu opens: those actions then run against the visible
+    // list (you might need to move a note, select others, or edit in the
+    // composer, all of which live underneath). `dismiss` closes this modal.
+    let modalRef: MediaViewerModal | null = null;
+    const dismiss = (): void => { modalRef?.close(); modalRef = null; };
     const noteItem: MediaItem = {
       path: node.file.path, file: node.file,
       note: {
         id: node.id, title, body,
-        actions: (host) => this.renderPreviewActions(host, node),
+        actions: (host) => this.renderPreviewActions(host, node, dismiss),
         onJumpToParent: parentId ? () => void this.openInNewStashpadTab(parentId) : undefined,
       },
     };
     const attachItems = mediaItemsFor(this.app, this.extractAttachments(body));
-    new MediaViewerModal(this.app, [noteItem, ...attachItems], 0, (f) => this.openAttachmentInTab(f)).open();
+    modalRef = new MediaViewerModal(this.app, [noteItem, ...attachItems], 0, (f) => this.openAttachmentInTab(f));
+    modalRef.open();
   }
 
   /** 0.376.0: render the note's row action buttons into the preview modal's
    *  caption — the same react / quick-menu / custom-item / ⋮ context-menu buttons
    *  the row carries, MINUS expand-collapse and preview (redundant in the modal).
    *  Edit / open / reply stay reachable through the ⋮ menu. */
-  private renderPreviewActions(host: HTMLElement, node: TreeNode): void {
+  private renderPreviewActions(host: HTMLElement, node: TreeNode, dismiss?: () => void): void {
     this.addReactionButton(host, node);
     this.maybeAddQuickButton(host, node);
     const moreBtn = host.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
     rowIcon(moreBtn, "ellipsis-vertical");
     moreBtn.title = "More actions";
     moreBtn.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
-    moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
+    // 0.386.0: close the preview modal before opening the menu — every actionable
+    // item (Edit → composer/modal/tab, Move, Reply, open, …) needs the list
+    // underneath, and would otherwise open its surface hidden behind this modal.
+    // Capture the coords first: showAtMouseEvent reads them, and closing the
+    // modal can move focus. Reaction stays on its own button (react in place).
+    moreBtn.onclick = (e) => { e.stopPropagation(); dismiss?.(); this.openNoteMenu(e, node); };
     // Custom item buttons (settings.itemButtons) insert before the ⋮; overflow
     // renders into the same host.
     this.maybeAddItemButtons(host, host, node, moreBtn);
@@ -21350,13 +21405,16 @@ export class StashpadView extends ItemView {
       // through the generic `submenu:` branch above from settings.contextSubmenus.
       case "outdent":      A("Outdent", this.actionIcon("outdent"), () => { focusClicked(); void this.cmdOutdent(); }); break;
       case "pinListTop": {
-        const pinEdge = this.listPinEdge(node.id);
-        menu.addItem((it: any) => it.setTitle("Pin to top of list").setIcon(this.actionIcon("pinListTop")).setChecked(pinEdge === "top").onClick(() => { focusClicked(); void this.cmdToggleListPin("top"); }));
+        // 0.381.0: flip the label to "Unpin…" when already pinned to this edge
+        // (matches the sidebar Pin/Unpin toggle above), instead of leaving a
+        // "Pin to top of list" leaf with a checkmark that reads as still-unpinned.
+        const isTop = this.listPinEdge(node.id) === "top";
+        menu.addItem((it: any) => it.setTitle(isTop ? "Unpin from top of list" : "Pin to top of list").setIcon(isTop ? "pin-off" : this.actionIcon("pinListTop")).onClick(() => { focusClicked(); void this.cmdToggleListPin("top"); }));
         break;
       }
       case "pinListBottom": {
-        const pinEdge = this.listPinEdge(node.id);
-        menu.addItem((it: any) => it.setTitle("Pin to bottom of list").setIcon(this.actionIcon("pinListBottom")).setChecked(pinEdge === "bottom").onClick(() => { focusClicked(); void this.cmdToggleListPin("bottom"); }));
+        const isBottom = this.listPinEdge(node.id) === "bottom";
+        menu.addItem((it: any) => it.setTitle(isBottom ? "Unpin from bottom of list" : "Pin to bottom of list").setIcon(isBottom ? "pin-off" : this.actionIcon("pinListBottom")).onClick(() => { focusClicked(); void this.cmdToggleListPin("bottom"); }));
         break;
       }
       case "copy": {
