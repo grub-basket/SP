@@ -8479,7 +8479,58 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   line-height: var(--line-height-normal);
 }
 .stashpad-media-note img { max-width: 100%; height: auto; }
+/* 0.377.0: readable line length for the note slide (toggle in the toolbar). */
+.stashpad-media-note.is-narrow > * { max-width: 42rem; margin-inline: auto; }
+/* 0.377.0: immersive — hide the caption + rail for distraction-free reading;
+   the thin bottom toolbar stays so the toggle remains reachable. */
+.stashpad-media-modal.is-immersive .stashpad-media-header,
+.stashpad-media-modal.is-immersive .stashpad-media-rail { display: none; }
 .stashpad-media-railbadge.is-note { --stashpad-file-color: var(--text-accent); }
+/* 0.376.1: the note's row action buttons, relayed to the END of the bottom
+   toolbar so they line up with the other controls. The buttons keep their own
+   `.stashpad-pencil` look (which renders the sprite icon correctly); we only
+   un-hide them (rows fade them until hover) and lay them out inline. */
+.stashpad-media-noteactions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 8px;
+  padding-left: 8px;
+  border-left: 1px solid var(--background-modifier-border);
+}
+/* 0.376.2: match the toolbar buttons on the left (.stashpad-media-btn) — same
+   size, colour and hover — so the relayed row buttons don't read as a different
+   control. `position:static`/`opacity:1` undo the row's fade-until-hover. */
+.stashpad-media-noteactions .stashpad-pencil {
+  position: static;
+  opacity: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-media-noteactions .stashpad-pencil:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+/* An <svg> in a flex box collapses to width 0 (see .stashpad-media-btn svg,
+   0.244.0) — size it and refuse to shrink so the sprite icon actually draws. */
+.stashpad-media-noteactions .stashpad-pencil svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+/* 0.376.1: with the buttons moved to the toolbar, the caption is just the title
+   + count — centre it (it's a flex row, so justify-content, not text-align). */
+.stashpad-media-caption { justify-content: center; }
 
 /* 0.371.0: secondary PDF render — Obsidian's own viewer embedded via markdown.
    Fill the stage and let the embedded viewer own its scrolling. */

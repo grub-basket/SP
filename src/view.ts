@@ -19745,9 +19745,34 @@ export class StashpadView extends ItemView {
       .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")                         // md image/link → text
       .replace(/^#+\s*/, "").replace(/[*_`>]/g, "").trim()
       || node.file.basename).slice(0, 80) || "Note";
-    const noteItem: MediaItem = { path: node.file.path, file: node.file, note: { id: node.id, title, body } };
+    const parentId = node.parent && node.parent !== ROOT_ID ? node.parent : null;
+    const noteItem: MediaItem = {
+      path: node.file.path, file: node.file,
+      note: {
+        id: node.id, title, body,
+        actions: (host) => this.renderPreviewActions(host, node),
+        onJumpToParent: parentId ? () => void this.openInNewStashpadTab(parentId) : undefined,
+      },
+    };
     const attachItems = mediaItemsFor(this.app, this.extractAttachments(body));
     new MediaViewerModal(this.app, [noteItem, ...attachItems], 0, (f) => this.openAttachmentInTab(f)).open();
+  }
+
+  /** 0.376.0: render the note's row action buttons into the preview modal's
+   *  caption — the same react / quick-menu / custom-item / ⋮ context-menu buttons
+   *  the row carries, MINUS expand-collapse and preview (redundant in the modal).
+   *  Edit / open / reply stay reachable through the ⋮ menu. */
+  private renderPreviewActions(host: HTMLElement, node: TreeNode): void {
+    this.addReactionButton(host, node);
+    this.maybeAddQuickButton(host, node);
+    const moreBtn = host.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
+    rowIcon(moreBtn, "ellipsis-vertical");
+    moreBtn.title = "More actions";
+    moreBtn.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
+    moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
+    // Custom item buttons (settings.itemButtons) insert before the ⋮; overflow
+    // renders into the same host.
+    this.maybeAddItemButtons(host, host, node, moreBtn);
   }
 
   /** 0.374.0: the per-row "Preview" button (setting-gated). Opens the note in the

@@ -56,8 +56,15 @@ export interface MediaItem {
   file: TFile | null;
   /** 0.374.0: when set, this slide is the NOTE ITSELF (not an attachment) —
    *  rendered as scrollable markdown as slide 0 of the preview. `body` is the
-   *  raw markdown (frontmatter stripped); `title` labels the rail + caption. */
-  note?: { id: string; title: string; body: string };
+   *  raw markdown (frontmatter stripped); `title` labels the rail + caption.
+   *  0.376.0: `actions` renders the note's row action buttons (react / quick /
+   *  custom / ⋮) into a host in the caption — the view owns their behavior. */
+  note?: {
+    id: string; title: string; body: string;
+    actions?: (host: HTMLElement) => void;
+    /** 0.377.0: open the parent note in a new tab (undefined at the top level). */
+    onJumpToParent?: () => void;
+  };
 }
 
 /** A large overlay for previewing a note's attachments: a rail of every file on
@@ -92,9 +99,23 @@ export class MediaViewerModal extends Modal {
    *  its embeds/widgets are torn down on the next slide / on close. */
   private noteComponent: Component | null = null;
   private captionEl!: HTMLElement;
+  /** 0.376.1: per-slide host at the END of the bottom toolbar for the note's
+   *  relayed row buttons (react / quick / custom / ⋮) — repopulated in show(). */
+  private noteActionsEl!: HTMLElement;
   private zoomLabelEl!: HTMLElement;
   private railEl!: HTMLElement;
   private transformBtns: HTMLElement[] = [];
+  /** 0.377.0: per-slide toolbar buttons (shown/hidden by slide in show()). */
+  private fileBtns: HTMLElement[] = [];   // any file: save / reveal-in-fs / reveal-in-nav
+  private readWidthBtn!: HTMLElement;     // NOTE SLIDE only (acts on the rendered note)
+  private copyLinkBtn!: HTMLElement;      // note-LEVEL: copy a link to the note
+  private jumpParentBtn!: HTMLElement;    // note-LEVEL: open the note's parent
+  /** 0.377.1: the modal's note item (slide 0), if opened from a note — its
+   *  note-level buttons (copy-link / jump-parent / relayed actions) persist on
+   *  every slide, since the whole preview is about this one note. */
+  private noteItem: MediaItem | null = null;
+  private immersive = false;
+  private noteNarrow = true;              // note slide starts at a readable width
   private naturalW = 0;
   private naturalH = 0;
   /** Set once the current item has been sized, so "fit" is not computed against
@@ -176,6 +197,22 @@ export class MediaViewerModal extends Modal {
     // attachment link for anything else.
     act("copy", "Copy (image to clipboard, else a link)", () => void this.copyCurrent());
 
+    // 0.377.0: reading-width (note slide) + copy-link (note-level).
+    try { this.noteNarrow = window.localStorage.getItem("stashpad-preview-narrow") !== "0"; } catch { /* default true */ }
+    this.readWidthBtn = act("text", "Toggle reading width", () => this.toggleReadingWidth());
+    this.copyLinkBtn = act("link", "Copy a link to this note", () => void this.copyNoteLink());
+    this.jumpParentBtn = act("corner-left-up", "Open the parent note in a new tab", () => {
+      const jump = this.noteItem?.note?.onJumpToParent;
+      if (jump) { this.close(); jump(); }
+    });
+    // 0.377.0: save / reveal — for ANY file (note .md or attachment).
+    this.fileBtns = [];
+    this.fileBtns.push(act("download", "Save a copy…", () => void this.saveCurrent()));
+    this.fileBtns.push(act("folder-open", "Show in the system file manager", () => this.revealInSystem()));
+    this.fileBtns.push(act("panel-left", "Show in Obsidian's file explorer", () => this.revealInObsidian()));
+    // 0.377.0: immersive — hide the chrome for distraction-free reading.
+    act("maximize", "Immersive (hide the chrome)", () => this.toggleImmersive());
+
     // View-mode switch. Only meaningful with more than one file — with a single
     // attachment there is nothing to browse, so the whole group is omitted
     // rather than shown as three buttons that all do the same thing.
@@ -190,6 +227,10 @@ export class MediaViewerModal extends Modal {
       modeBtn("grid", "layout-grid", "Grid");
       modeBtn("details", "list", "Details");
     }
+
+    // 0.376.1: the note's relayed row buttons live at the END of this toolbar, so
+    // they sit in the same line as the other controls. Repopulated per slide.
+    this.noteActionsEl = actions.createDiv({ cls: "stashpad-media-noteactions stashpad-note-actions is-hidden" });
 
     // --- prev / next ---
     const nav = (dir: -1 | 1, icon: string, title: string): void => {
@@ -208,6 +249,9 @@ export class MediaViewerModal extends Modal {
     this.railEl = contentEl.createDiv({ cls: "stashpad-media-rail" });
     if (this.items.length <= 1) this.railEl.addClass("is-hidden");
 
+    // 0.377.1: the note item (slide 0, when opened from a note) drives the
+    // note-level buttons on every slide.
+    this.noteItem = this.items.find((i) => !!i.note) ?? null;
     this.wireGestures();
     this.buildRail();
     this.show();
@@ -242,6 +286,7 @@ export class MediaViewerModal extends Modal {
     this.panEl.addClass("is-note");
     this.applyTransform();
     const host = this.panEl.createDiv({ cls: "stashpad-media-note markdown-rendered" });
+    host.toggleClass("is-narrow", this.noteNarrow);
     const comp = new Component();
     comp.load();
     this.noteComponent = comp;
@@ -251,6 +296,64 @@ export class MediaViewerModal extends Modal {
     } catch {
       host.setText(note.body);
     }
+  }
+
+  /** 0.377.0: toggle the note slide between a readable width and full width. */
+  private toggleReadingWidth(): void {
+    this.noteNarrow = !this.noteNarrow;
+    try { window.localStorage.setItem("stashpad-preview-narrow", this.noteNarrow ? "1" : "0"); } catch { /* ignore */ }
+    this.panEl.querySelector(".stashpad-media-note")?.toggleClass("is-narrow", this.noteNarrow);
+  }
+
+  /** 0.377.0: copy an Obsidian link to the note this preview is about. */
+  private async copyNoteLink(): Promise<void> {
+    const file = this.noteItem?.file;
+    if (!file) return;
+    try { await navigator.clipboard.writeText(`[[${file.path}]]`); new Notice("Link copied."); }
+    catch { new Notice("Couldn't copy to the clipboard."); }
+  }
+
+  /** 0.377.0: save a copy of the current file to disk (a plain browser download,
+   *  which the desktop app resolves to the OS save flow). */
+  private async saveCurrent(): Promise<void> {
+    const file = this.current()?.file;
+    if (!file) return;
+    try {
+      const data = await this.app.vault.readBinary(file);
+      const url = URL.createObjectURL(new Blob([data]));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name;
+      a.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+    } catch (e) {
+      new Notice(`Couldn't save the file: ${(e as Error).message}`);
+    }
+  }
+
+  /** 0.377.0: reveal the current file in the OS file manager (desktop only). */
+  private revealInSystem(): void {
+    const file = this.current()?.file;
+    if (!file) return;
+    const base = (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.();
+    const shell = (window as unknown as { require?: (m: string) => { shell?: { showItemInFolder?: (p: string) => void } } }).require?.("electron")?.shell;
+    if (base && shell?.showItemInFolder) shell.showItemInFolder(`${base}/${file.path}`);
+    else new Notice("Only available on the desktop app.");
+  }
+
+  /** 0.377.0: reveal the current file in Obsidian's own file-explorer sidebar. */
+  private revealInObsidian(): void {
+    const file = this.current()?.file;
+    if (!file) return;
+    const fe = (this.app as unknown as { internalPlugins?: { getPluginById?: (id: string) => { instance?: { revealInFolder?: (f: TFile) => void } } } }).internalPlugins?.getPluginById?.("file-explorer");
+    if (fe?.instance?.revealInFolder) { this.close(); fe.instance.revealInFolder(file); }
+    else new Notice("The file explorer isn't available.");
+  }
+
+  /** 0.377.0: immersive mode — hide the header/toolbar/rail for a clean read. */
+  private toggleImmersive(): void {
+    this.immersive = !this.immersive;
+    this.modalEl.toggleClass("is-immersive", this.immersive);
   }
 
   /** Tear down the secondary Obsidian PDF embed (unloads PDF.js), if any. */
@@ -415,6 +518,22 @@ export class MediaViewerModal extends Modal {
         text: `${this.idx + 1} / ${this.items.length}`,
       });
     }
+    // 0.376.1: relay the note's row action buttons (react / quick / custom / ⋮)
+    // into the END of the bottom toolbar for a note slide, so they line up with
+    // the other controls. Cleared/hidden for attachment slides.
+    // 0.377.1: note-LEVEL controls persist on EVERY slide (the whole preview is
+    // about one note) — the relayed action cluster, copy-link and jump-parent
+    // stay put whether you're on the note or one of its attachments. The action
+    // cluster is populated once.
+    const nc = this.noteItem;
+    if (nc?.note?.actions && !this.noteActionsEl.childElementCount) nc.note.actions(this.noteActionsEl);
+    this.noteActionsEl.toggleClass("is-hidden", !nc);
+    this.copyLinkBtn.toggleClass("is-hidden", !nc);
+    this.jumpParentBtn.toggleClass("is-hidden", !nc?.note?.onJumpToParent);
+    // Reading width acts on the rendered note markdown → note SLIDE only.
+    this.readWidthBtn.toggleClass("is-hidden", !item?.note);
+    // Save / reveal apply to the CURRENT file — note `.md` or attachment alike.
+    for (const b of this.fileBtns) b.toggleClass("is-hidden", !item?.file);
 
     if (!item) return;
     const ext = (item.path.split(".").pop() ?? "").toLowerCase();
