@@ -73,6 +73,7 @@ import * as clipboardCmds from "./commands/clipboard-cmds";
 import * as ioCmds from "./commands/io-cmds";
 import { readXvPayload, hasXvPayload, writeXvAck, writeClipboardText, type XvMeta } from "./cross-vault-clipboard";
 import { folderTransferAvailable, readXvFolderPointer } from "./cross-vault-folder";
+import { collectDropEntries, readDroppedTree, countTreeFiles, countTreeDirs, type DroppedDir } from "./dropped-folders";
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
@@ -8657,8 +8658,7 @@ export class StashpadView extends ItemView {
         const siblingExts = paths.map((q) => q.split(".").pop() ?? "");
         const openViewer = (): void => {
           new MediaViewerModal(this.app, mediaItemsFor(this.app, paths), paths.indexOf(p), (f) => {
-            const ws = this.app.workspace; const prev = ws.activeLeaf;
-            void ws.getLeaf("tab").openFile(f).then(() => { settleNewTab(ws, prev); });
+            this.openAttachmentInTab(f);
           }).open();
         };
         // 0.245.0: a MISSING file always opens the viewer. There is no file to
@@ -9515,11 +9515,27 @@ export class StashpadView extends ItemView {
       try { e.dataTransfer.dropEffect = "copy"; } catch { /* ignore */ }
     });
     ta.addEventListener("drop", (e) => {
+      // 0.370.0: a dropped FOLDER leaves dataTransfer.files empty — the only way
+      // to see inside it is webkitGetAsEntry, and the entry handles are valid
+      // ONLY during this event, so collect them synchronously BEFORE any await.
+      const { entries, hasDirectory } = collectDropEntries(e.dataTransfer);
       const files = Array.from(e.dataTransfer?.files ?? []);
-      if (files.length === 0) return;
+      if (!hasDirectory) {
+        if (files.length === 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        void importAndAppend(files);
+        return;
+      }
+      // Folder(s) dropped: build a note subtree from each folder, and attach any
+      // loose files dropped alongside to the composer as before.
       e.preventDefault();
       e.stopPropagation();
-      void importAndAppend(files);
+      void (async () => {
+        const tree = await readDroppedTree(entries);
+        if (tree.dirs.length) await this.importDroppedFolders(tree.dirs, this.focusId);
+        if (tree.looseFiles.length) await importAndAppend(tree.looseFiles);
+      })();
     });
     ta.addEventListener("paste", (e) => {
       const clip = this.plugin.noteClipboard;
@@ -9719,7 +9735,14 @@ export class StashpadView extends ItemView {
         input.click();
         return;
       }
-      new DropzoneModal(this.app, (files) => void importAndAppend(files)).open();
+      new DropzoneModal(
+        this.app,
+        (files) => void importAndAppend(files),
+        (tree) => void (async () => {
+          if (tree.dirs.length) await this.importDroppedFolders(tree.dirs, this.focusId);
+          if (tree.looseFiles.length) await importAndAppend(tree.looseFiles);
+        })(),
+      ).open();
     };
     clipBtn.addEventListener("dragover", (e) => {
       if (!e.dataTransfer || !Array.from(e.dataTransfer.types).includes("Files")) return;
@@ -9730,7 +9753,18 @@ export class StashpadView extends ItemView {
     clipBtn.addEventListener("dragleave", () => clipBtn.removeClass("is-dropover"));
     clipBtn.addEventListener("drop", (e) => {
       clipBtn.removeClass("is-dropover");
+      // 0.370.0: folder-aware (see the composer drop handler above).
+      const { entries, hasDirectory } = collectDropEntries(e.dataTransfer);
       const files = Array.from(e.dataTransfer?.files ?? []);
+      if (hasDirectory) {
+        e.preventDefault(); e.stopPropagation();
+        void (async () => {
+          const tree = await readDroppedTree(entries);
+          if (tree.dirs.length) await this.importDroppedFolders(tree.dirs, this.focusId);
+          if (tree.looseFiles.length) await importAndAppend(tree.looseFiles);
+        })();
+        return;
+      }
       if (files.length === 0) return;
       e.preventDefault(); e.stopPropagation();
       void importAndAppend(files);
@@ -19639,7 +19673,158 @@ export class StashpadView extends ItemView {
     return this.importAttachment(file);
   }
 
-  private async importAttachment(file: File): Promise<string | null> {
+  /** 0.371.0: open an attachment (from the media viewer's "Open in a new tab")
+   *  in a new tab AND, when the user later closes that tab, return focus to the
+   *  tab they came from — the Stashpad list — instead of letting Obsidian
+   *  activate whatever tab happens to sit to the right. Applies to every tab the
+   *  file-preview viewer spins out (PDF, image, broken-link fallback). */
+  private openAttachmentInTab(file: TFile): void {
+    const ws = this.app.workspace;
+    const prev = ws.activeLeaf;
+    const leaf = ws.getLeaf("tab");
+    void leaf.openFile(file).then(() => {
+      // If the setting hands focus straight back, the user never left `prev`, so
+      // closing the background tab already keeps them put — nothing to watch.
+      if (settleNewTab(ws, prev)) return;
+      if (!prev) return;
+      const leafOpen = (target: WorkspaceLeaf): boolean => {
+        let found = false;
+        ws.iterateAllLeaves((l) => { if (l === target) found = true; });
+        return found;
+      };
+      // When the spun-out tab disappears from the layout, restore focus to the
+      // originating tab (guarding that it wasn't itself closed meanwhile), then
+      // stop listening. registerEvent ties the listener's lifetime to the view.
+      const ref = ws.on("layout-change", () => {
+        if (leafOpen(leaf)) return;
+        ws.offref(ref);
+        if (leafOpen(prev)) ws.setActiveLeaf(prev, { focus: true });
+      });
+      this.registerEvent(ref);
+    });
+  }
+
+  /** 0.370.0: import one or more DROPPED FOLDERS as a note subtree — each folder
+   *  becomes a note (named after the folder), each file inside becomes a child
+   *  note whose body is the imported attachment's embed, and sub-folders nest
+   *  recursively. Desktop-only (the caller reads the dropped directory via the
+   *  File System entry API). Mirrors createNotesBatch: deferred render, drained
+   *  fmSync, a progress bar for large trees, and ONE grouped undo for the whole
+   *  import (which also trashes the imported attachments). */
+  async importDroppedFolders(dirs: DroppedDir[], destParent: StashpadId | null): Promise<{ folders: number; files: number }> {
+    const totalFiles = countTreeFiles(dirs);
+    const totalDirs = countTreeDirs(dirs);
+    const totalUnits = totalFiles + totalDirs;
+    const parent = destParent ?? this.focusId;
+    const collected: Array<{ path: string; content: string }> = [];
+    const attachments: Array<{ path: string; data: ArrayBuffer }> = [];
+    let madeFolders = 0;
+    let madeFiles = 0;
+
+    // Progress bar for large trees — short ones finish before it'd register.
+    const SHOW_BAR_AT = 8;
+    let bar: { notice: Notice; fill: HTMLElement; label: HTMLElement } | null = null;
+    if (totalUnits >= SHOW_BAR_AT) {
+      const notice = new Notice("", 0);
+      const el = notice.messageEl;
+      el.empty();
+      el.createDiv({ cls: "stashpad-split-progress-title", text: `Importing ${totalFiles} file${totalFiles === 1 ? "" : "s"}…` });
+      const wrap = el.createDiv({ cls: "stashpad-split-progress-bar" });
+      const fill = wrap.createDiv({ cls: "stashpad-split-progress-fill" });
+      const label = el.createDiv({ cls: "stashpad-split-progress-label", text: `0 / ${totalUnits}` });
+      bar = { notice, fill, label };
+    }
+    let done = 0;
+    const tick = async (): Promise<void> => {
+      done++;
+      if (bar) {
+        bar.label.setText(`${done} / ${totalUnits}`);
+        bar.fill.setCssStyles({ width: `${Math.round((done / totalUnits) * 100)}%` });
+        if (done % 5 === 0) await new Promise((r) => window.setTimeout(r, 0));
+      }
+    };
+
+    this.beginBulkRender();
+    try {
+      const walk = async (list: DroppedDir[], under: StashpadId | null): Promise<void> => {
+        for (const dir of list) {
+          const folderNoteId = await this.createNoteUnder(dir.name, under, {
+            deferRender: true, deferUndo: true, collectInto: collected,
+          });
+          madeFolders++;
+          await tick();
+          if (!folderNoteId) continue; // creation failed — skip its contents
+          for (const file of dir.files) {
+            const link = await this.importAttachment(file, attachments);
+            if (!link) continue;
+            await this.createNoteUnder(link, folderNoteId, {
+              deferRender: true, deferUndo: true, collectInto: collected,
+            });
+            madeFiles++;
+            await tick();
+          }
+          if (dir.dirs.length) await walk(dir.dirs, folderNoteId);
+        }
+      };
+      await walk(dirs, parent);
+    } finally {
+      bar?.notice.hide();
+      try { await this.fmSync.flush(); } catch { /* best effort */ }
+      this.endBulkRender();
+    }
+
+    // ONE grouped undo for the whole import: trash the created notes AND the
+    // imported attachments. Redo recreates both from the captured bytes, so the
+    // embeds resolve exactly as they did the first time.
+    if (collected.length) {
+      const createdNotes = collected.slice();
+      const createdFiles = attachments.slice();
+      const folder = this.noteFolder;
+      this.plugin.getUndoStack(folder).push({
+        label: `Import ${madeFolders} folder${madeFolders === 1 ? "" : "s"}`,
+        undo: async () => {
+          for (const { path } of createdNotes) {
+            const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          }
+          for (const { path } of createdFiles) {
+            const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
+            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          }
+          this.tree.rebuild(this.noteFolder);
+          this.render();
+        },
+        redo: async () => {
+          for (const { path, data } of createdFiles) {
+            if (!(await this.app.vault.adapter.exists(path))) {
+              try { await this.app.vault.createBinary(path, data); } catch { /* ignore */ }
+            }
+          }
+          for (const { path, content } of createdNotes) {
+            if (!(await this.app.vault.adapter.exists(path))) {
+              try { await this.app.vault.create(path, content); } catch { /* ignore */ }
+            }
+          }
+          this.tree.rebuild(this.noteFolder);
+          this.render();
+        },
+      });
+    }
+
+    if (madeFolders || madeFiles) {
+      const fBit = `${madeFolders} folder${madeFolders === 1 ? "" : "s"}`;
+      const nBit = `${madeFiles} file${madeFiles === 1 ? "" : "s"}`;
+      this.plugin.notifications.show({
+        message: `Imported ${fBit} (${nBit}) as notes.`,
+        kind: "success",
+        category: "create",
+        folder: this.noteFolder,
+      });
+    }
+    return { folders: madeFolders, files: madeFiles };
+  }
+
+  private async importAttachment(file: File, collectAttachments?: Array<{ path: string; data: ArrayBuffer }>): Promise<string | null> {
     try {
       const buf = await file.arrayBuffer();
       const folder = this.attachmentDirFor();
@@ -19652,12 +19837,18 @@ export class StashpadView extends ItemView {
       const leaf = buildAttachmentName(safeName, stamp);
       const path = folder ? `${folder}/${leaf}` : leaf;
       await this.app.vault.createBinary(path, buf);
+      // 0.370.0: a folder-drop import records each attachment so its grouped
+      // undo can trash the file (and redo can recreate it from these bytes).
+      collectAttachments?.push({ path, data: buf });
       // 0.213.0: remember that THIS composer staged this file, so a later send
       // to another folder knows it is safe to carry along (see
       // rehomeComposerAttachments). Cleared on submit.
       this.composerCreatedAttachments.add(path);
       await this.log.append({ type: "attachment_add", id: ROOT_ID, payload: { path, name: file.name, size: file.size } });
-      this.plugin.notifications.show({
+      // 0.370.0: a folder import (collectAttachments set) shows ONE summary
+      // notice at the end — a per-file "Attached …" for every file in the tree
+      // would be a notification storm.
+      if (!collectAttachments) this.plugin.notifications.show({
         message: `Attached ${file.name}`,
         kind: "success",
         category: "attachment",

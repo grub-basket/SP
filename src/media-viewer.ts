@@ -1,4 +1,4 @@
-import { App, Menu, Modal, Notice, Platform, TFile, setIcon } from "obsidian";
+import { App, Component, MarkdownRenderer, Menu, Modal, Notice, Platform, TFile, setIcon } from "obsidian";
 import { fileKindFor } from "./file-kinds";
 
 /** How the viewer presents the note's files.
@@ -79,6 +79,11 @@ export class MediaViewerModal extends Modal {
   private stageEl!: HTMLElement;
   private panEl!: HTMLElement;
   private mediaEl: HTMLElement | null = null;
+  /** 0.371.0: owns the secondary PDF render (Obsidian's own viewer, via a
+   *  markdown embed) when the primary app:// iframe can't read the file — e.g. a
+   *  Windows network-user drive where app:// resources come back empty. Unloaded
+   *  on the next slide / on close so PDF.js tears down. */
+  private pdfEmbedComponent: Component | null = null;
   private captionEl!: HTMLElement;
   private zoomLabelEl!: HTMLElement;
   private railEl!: HTMLElement;
@@ -207,7 +212,99 @@ export class MediaViewerModal extends Modal {
   }
 
   onClose(): void {
+    this.disposePdfEmbed();
     this.contentEl.empty();
+  }
+
+  /** Tear down the secondary Obsidian PDF embed (unloads PDF.js), if any. */
+  private disposePdfEmbed(): void {
+    if (this.pdfEmbedComponent) {
+      try { this.pdfEmbedComponent.unload(); } catch { /* ignore */ }
+      this.pdfEmbedComponent = null;
+    }
+  }
+
+  /** True when this item is still the one on screen — guards async work against
+   *  the user navigating to another slide mid-flight. Compare by file identity:
+   *  MediaItem.path is the LINK text (e.g. a basename), not the resolved file
+   *  path, so a path compare would never match. */
+  private stillShowing(file: TFile): boolean { return this.current()?.file === file; }
+
+  /** 0.371.0: PDF loading in three layers.
+   *   1. PRIMARY — point the iframe at the native `app://` resource (fast, and
+   *      the viewer's own title bar shows the real filename). Works everywhere
+   *      the resource handler can read the file.
+   *   2. SECONDARY — when a probe of that resource comes back empty / errors
+   *      (seen on a Windows network-USER drive, where `app://` serves nothing
+   *      even though the file is readable), fall back to Obsidian's OWN PDF
+   *      viewer via a markdown embed (`![[file]]`). That reads through
+   *      Obsidian's file layer — the same path its normal PDF tab uses, which
+   *      the user confirmed works on those drives.
+   *   3. TERTIARY — if even the embed can't resolve the file, show a fallback
+   *      card with "Open in a new tab" + "Retry" rather than a blank pane.
+   *  Guards throughout against the user navigating to another slide mid-flight. */
+  private async loadPdfFrame(frame: HTMLIFrameElement, file: TFile, ext: string, name: string): Promise<void> {
+    const rp = this.app.vault.getResourcePath(file);
+    frame.src = rp; // primary
+    let primaryOk = false;
+    try {
+      const resp = await fetch(rp);
+      primaryOk = resp.ok && (await resp.blob()).size > 0;
+    } catch { primaryOk = false; }
+    if (primaryOk || !this.stillShowing(file)) return;
+
+    // Secondary: Obsidian's own viewer.
+    if (await this.renderPdfViaObsidian(file)) return;
+    if (!this.stillShowing(file)) return;
+
+    // Tertiary: fallback card.
+    this.showPdfFallback(file, ext, name, "This PDF couldn't be loaded for preview. It may still be syncing to this device.");
+  }
+
+  /** Secondary PDF render: Obsidian's own PDF viewer, embedded via
+   *  MarkdownRenderer. Returns true when the embed resolved the file. */
+  private async renderPdfViaObsidian(file: TFile): Promise<boolean> {
+    try {
+      this.disposePdfEmbed();
+      this.panEl.empty();
+      this.panEl.removeClass("is-placeholder");
+      this.panEl.addClass("is-frame");
+      const host = this.panEl.createDiv({ cls: "stashpad-media-pdf-embed markdown-rendered" });
+      const comp = new Component();
+      comp.load();
+      this.pdfEmbedComponent = comp;
+      await MarkdownRenderer.render(this.app, `![[${file.path}]]`, host, file.path, comp);
+      // Embeds resolve asynchronously; give Obsidian a moment to populate.
+      await new Promise((r) => window.setTimeout(r, 300));
+      if (!this.stillShowing(file)) return true; // navigated away — treat as handled
+      const embed = host.querySelector(".internal-embed");
+      // Resolved (link found) and not marked unresolved → the PDF viewer will
+      // paint even if PDF.js hasn't finished its first page yet.
+      return !!embed && !embed.classList.contains("is-unresolved");
+    } catch {
+      return false;
+    }
+  }
+
+  /** Tertiary fallback card. */
+  private showPdfFallback(file: TFile, ext: string, name: string, hint: string): void {
+    this.disposePdfEmbed();
+    this.panEl.empty();
+    this.panEl.removeClass("is-frame");
+    const ph = this.panEl.createDiv({ cls: "stashpad-media-placeholder" });
+    this.renderFileFacts(ph, file, ext);
+    ph.createDiv({ cls: "stashpad-media-ph-name", text: name });
+    ph.createDiv({ cls: "stashpad-media-ph-hint", text: hint });
+    const actions = ph.createDiv({ cls: "stashpad-media-ph-actions" });
+    const openBtn = actions.createEl("button", { cls: "mod-cta", text: "Open in a new tab" });
+    openBtn.onclick = (e) => { e.stopPropagation(); this.close(); this.onOpenInTab(file); };
+    const retryBtn = actions.createEl("button", { text: "Retry" });
+    retryBtn.onclick = (e) => { e.stopPropagation(); this.show(); };
+    this.mediaEl = null;
+    this.sized = true;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.panEl.addClass("is-placeholder");
+    this.applyTransform();
   }
 
   /** 0.272.4: right-click menu for the (non-pdf) stage — Copy + Open. */
@@ -258,6 +355,7 @@ export class MediaViewerModal extends Modal {
 
   private show(): void {
     const item = this.current();
+    this.disposePdfEmbed();
     this.panEl.empty();
     this.panEl.removeClass("is-placeholder");
     this.panEl.removeClass("is-frame");
@@ -330,7 +428,6 @@ export class MediaViewerModal extends Modal {
       }
     } else if (VIEWER_PDF_EXT.has(ext)) {
       const frame = this.panEl.createEl("iframe", { cls: "stashpad-media-pdf" });
-      frame.src = this.app.vault.getResourcePath(item.file);
       frame.setAttr("title", name);
       // The embedded viewer owns its own scrolling, paging and zoom. Our
       // transform must stay at identity or we would be scaling a scaled
@@ -341,6 +438,15 @@ export class MediaViewerModal extends Modal {
       this.scale = 1; this.tx = 0; this.ty = 0;
       this.panEl.addClass("is-frame");
       this.applyTransform();
+      // 0.371.0: load the PDF through an in-memory blob rather than pointing the
+      // iframe straight at the `app://` resource path. Two payoffs: (1) it
+      // sidesteps a class of "renders in a tab but the preview is blank"
+      // failures seen on synced / network vaults, where the cache-busted
+      // resource URL serves an empty response even though the bytes are on disk;
+      // (2) when the bytes genuinely can't be read (still syncing, permission
+      // dropped), the fetch fails and we show a real fallback with an escape
+      // hatch instead of a silently blank pane.
+      void this.loadPdfFrame(frame, item.file, ext, name);
     } else if (VIEWER_TEXT_EXT.has(ext)) {
       void this.showTextPreview(item.file, ext);
     } else {

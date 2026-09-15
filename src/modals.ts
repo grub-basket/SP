@@ -1,6 +1,7 @@
 import type StashpadPlugin from "./main";
 import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, Setting, type SecretStorage } from "obsidian";
 import { normalisePastedPath } from "./paste-path";
+import { collectDropEntries, readDroppedTree, type DroppedTree } from "./dropped-folders";
 import { splitIntoChunks, splitByDelimiter, SPLIT_MODE_LABELS, setIconSafe, type SplitMode } from "./view-helpers";
 import { parseFormatSpans, FORMAT_KINDS, type FormatSpan } from "./formatting-toolbar";
 import { buildTimePickerInto } from "./time-picker";
@@ -4875,7 +4876,13 @@ export class EncryptAllModal extends Modal {
  *  the composer), or click the area to open the OS file picker. The zone is
  *  deliberately huge — the whole point is not having to aim. */
 export class DropzoneModal extends Modal {
-  constructor(app: App, private onFiles: (files: File[]) => void) { super(app); }
+  constructor(
+    app: App,
+    private onFiles: (files: File[]) => void,
+    /** 0.370.0: called when the drop contains at least one FOLDER, with the
+     *  already-read tree (dirs + any loose files dropped alongside). */
+    private onFolders?: (tree: DroppedTree) => void,
+  ) { super(app); }
 
   onOpen(): void {
     this.contentEl.empty();
@@ -4885,7 +4892,7 @@ export class DropzoneModal extends Modal {
     const zone = this.contentEl.createDiv({ cls: "stashpad-dropzone" });
     setIcon(zone.createDiv({ cls: "stashpad-dropzone-icon" }), "file-input");
     zone.createDiv({ cls: "stashpad-dropzone-title", text: "Drop files here" });
-    zone.createDiv({ cls: "stashpad-dropzone-sub", text: "…or click to browse. Files import as attachments and their links land in the composer." });
+    zone.createDiv({ cls: "stashpad-dropzone-sub", text: "…or click to browse. Files import as attachments and their links land in the composer. Drop a folder to turn it into a note with its files nested inside." });
 
     const take = (files: File[]): void => {
       if (files.length === 0) return;
@@ -4902,7 +4909,16 @@ export class DropzoneModal extends Modal {
     zone.addEventListener("dragleave", () => zone.removeClass("is-dropover"));
     zone.addEventListener("drop", (e) => {
       zone.removeClass("is-dropover");
+      // 0.370.0: collect folder entries SYNCHRONOUSLY (webkitGetAsEntry handles
+      // go stale after the event) before falling back to the plain-files path.
+      const { entries, hasDirectory } = collectDropEntries(e.dataTransfer);
       const files = Array.from(e.dataTransfer?.files ?? []);
+      if (hasDirectory && this.onFolders) {
+        e.preventDefault(); e.stopPropagation();
+        this.close();
+        void (async () => { this.onFolders?.(await readDroppedTree(entries)); })();
+        return;
+      }
       if (files.length === 0) return;
       e.preventDefault(); e.stopPropagation();
       take(files);

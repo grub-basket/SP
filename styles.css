@@ -8324,6 +8324,17 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   word-break: break-word;
   max-width: 40ch;
 }
+.stashpad-media-ph-hint {
+  font-size: var(--font-ui-smaller);
+  text-align: center;
+  max-width: 42ch;
+  color: var(--text-faint);
+}
+.stashpad-media-ph-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
 
 .stashpad-media-nav {
   position: absolute;
@@ -8454,6 +8465,21 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   border: none;
   display: block;
   background: var(--background-primary);
+}
+/* 0.371.0: secondary PDF render — Obsidian's own viewer embedded via markdown.
+   Fill the stage and let the embedded viewer own its scrolling. */
+.stashpad-media-pdf-embed {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  background: var(--background-primary);
+}
+.stashpad-media-pdf-embed .internal-embed,
+.stashpad-media-pdf-embed .pdf-embed,
+.stashpad-media-pdf-embed iframe {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 .stashpad-media-btn.is-hidden,
 .stashpad-media-zoom.is-hidden { display: none; }
