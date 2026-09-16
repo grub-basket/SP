@@ -1060,9 +1060,12 @@ export interface StashpadSettings {
    *  the draft, so binding a target then reloading doesn't silently turn the
    *  append into a new note. Cleared whenever the target is cleared. */
   draftAppendTargets: Record<string, { id: string; label?: string; path: string; folder: string; mode: "append" | "prepend" }>;
-  /** Per-folder: the text most recently sent via Enter, used to suppress
-   *  the "restore draft" suggestion if the saved draft happens to match. */
-  lastSubmitted: Record<string, string>;
+  /** Per-folder: the texts most recently SENT (via Enter) or EDIT-saved, newest
+   *  first (capped). Used to discard a composer draft whose text matches one of
+   *  them — the composer sometimes re-captures a note you just sent (blur/flush
+   *  race), and this keeps drafts precise instead of resurrecting sent text.
+   *  Legacy installs stored a single string; readers tolerate both shapes. */
+  lastSubmitted: Record<string, string | string[]>;
 }
 
 export const DEFAULT_SETTINGS: StashpadSettings = {

@@ -2954,7 +2954,7 @@ export class ComposerDraftsModal extends Modal {
         .sort((a, b) => (a.folder === b.folder ? b.modified - a.modified : a.folder.localeCompare(b.folder))),
     );
     if (!all.length) { c.createDiv({ cls: "stashpad-drafts-empty", text: "No drafts." }); return; }
-    c.createDiv({ cls: "stashpad-drafts-help", text: "Load puts a draft in that folder's composer (whatever is there now is kept as its own draft). Delete is immediate." });
+    c.createDiv({ cls: "stashpad-drafts-help", text: "Load puts a draft in that folder's composer (whatever is there now is kept as its own draft). Discard is immediate." });
     const me = this.plugin.deviceId();
     let lastFolder: string | null = null;
     for (const d of all) {
@@ -2977,8 +2977,8 @@ export class ComposerDraftsModal extends Modal {
       load.onclick = () => { void this.plugin.loadComposerDraft(d.id).then(() => this.close()); };
       const copy = actions.createEl("button", { text: "Copy" });
       copy.onclick = () => { void navigator.clipboard?.writeText(d.text).then(() => new Notice("Draft copied.")); };
-      const del = actions.createEl("button", { cls: "mod-warning", text: "Delete" });
-      del.onclick = () => { void this.plugin.deleteComposerDraft(d.id).then(() => { new Notice("Draft deleted."); this.render(); }); };
+      const del = actions.createEl("button", { cls: "mod-warning", text: "Discard" });
+      del.onclick = () => { void this.plugin.deleteComposerDraft(d.id).then(() => { new Notice("Draft discarded."); this.render(); }); };
     }
   }
 }

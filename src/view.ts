@@ -2573,6 +2573,9 @@ export class StashpadView extends ItemView {
     const removeIds: string[] = [];
     for (const d of all) {
       if (d.kind !== "edit" && !draftHasContent(d.text)) { if (d.id !== this.activeDraftId) removeIds.push(d.id); continue; }
+      // 0.388.0: drop a non-active draft that matches something recently sent/
+      // edited here — a leftover re-capture of already-committed text.
+      if (d.kind !== "edit" && d.id !== this.activeDraftId && this.draftMatchesRecent(folder, d.text)) { removeIds.push(d.id); continue; }
       const key = draftDedupKey(d);
       if (seen.has(key)) { if (d.id !== this.activeDraftId) removeIds.push(d.id); continue; }
       seen.add(key);
@@ -2658,12 +2661,22 @@ export class StashpadView extends ItemView {
       // 0.345.4: treat "effectively empty" text (an empty [[]] link, bare **, a
       // lone #, whitespace) the same as truly empty — don't persist it. This is
       // what let the toolbar's link button spawn a pile of empty `[[]]` drafts.
-      const empty = text.length === 0 || (cur?.kind !== "edit" && !draftHasContent(text));
+      // 0.388.0: a new draft whose text matches something just sent/edited in
+      // this folder is a stray re-capture (blur/flush race after submit), not a
+      // real draft — treat it as empty so it's discarded instead of resurrected.
+      // Edit drafts are exempt: their text intentionally mirrors the note.
+      const matchesRecent = cur?.kind !== "edit" && this.draftMatchesRecent(folder, text);
+      const empty = text.length === 0 || (cur?.kind !== "edit" && !draftHasContent(text)) || matchesRecent;
       if (empty) {
+        // 0.389.0: nothing is bound (no persisted draft to remove) AND the text is
+        // empty or a re-capture of a recent send — there is nothing to write.
+        // Return before touching settings so a matching draft doesn't churn a
+        // write on every keystroke/blur ("avoid constant matching").
+        if (!cur) return;
         // Cleared: a NEW draft disappears; an EDIT draft keeps its identity with
         // empty text (the edit itself is still in progress until saved/cancelled).
-        if (cur && cur.kind === "edit") next[cur.id] = { ...cur, text, modified: now };
-        else if (cur) { delete next[cur.id]; this.activeDraftId = null; this.setDraftPointer(null); }
+        if (cur.kind === "edit") next[cur.id] = { ...cur, text, modified: now };
+        else { delete next[cur.id]; this.activeDraftId = null; this.setDraftPointer(null); }
       } else {
         // Reuse an existing same-folder draft with identical (whitespace-normalized)
         // content instead of minting a new id — otherwise a post-send composer,
@@ -2862,10 +2875,49 @@ export class StashpadView extends ItemView {
     return true;
   }
 
+  /** Newest-first list of recent sends/edits for a folder, tolerant of the
+   *  legacy single-string shape. */
+  private recentSubmittedFor(folder: string): string[] {
+    const v = (this.plugin.settings.lastSubmitted ?? {})[folder];
+    if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string");
+    return typeof v === "string" && v ? [v] : [];
+  }
+
+  /** True when `text` is (effectively) something just sent/edited in `folder`, so
+   *  a draft of it should be discarded rather than resurrected. The draft EQUALS
+   *  a recent send, or is a leading portion of one — "the start of the text is a
+   *  100% match" — at ANY length (no length cap: real drafts are usually long,
+   *  and a perfect prefix overlap is signal enough). A draft that EXTENDS a sent
+   *  note (longer than it), or diverges anywhere, is UNIQUE and kept: that's
+   *  genuine writing, not a re-capture. Discarding only affects PERSISTENCE — the
+   *  composer keeps whatever you've typed — so a nascent draft that briefly
+   *  shadows a recent send is simply not saved until it becomes unique. */
+  private draftMatchesRecent(folder: string, text: string): boolean {
+    const d = text.trim();
+    if (!d) return false;
+    for (const raw of this.recentSubmittedFor(folder)) {
+      const s = raw.trim();
+      if (!s) continue;
+      if (d === s || s.startsWith(d)) return true;
+    }
+    return false;
+  }
+
+  private static readonly RECENT_SUBMIT_CAP = 8;
+
+  /** Record a send/edit so a later draft of the same text is discarded. An empty
+   *  `text` CLEARS the folder's history — the edit cancel/restore paths pass ""
+   *  precisely so a just-restored draft isn't then discarded by draftMatchesRecent. */
   private async recordLastSubmitted(text: string): Promise<void> {
     try {
+      const folder = this.noteFolder;
       const all = { ...(this.plugin.settings.lastSubmitted ?? {}) };
-      all[this.noteFolder] = text;
+      const t = text.trim();
+      if (!t) { delete all[folder]; }
+      else {
+        const prev = this.recentSubmittedFor(folder).filter((x) => x.trim() !== t);
+        all[folder] = [t, ...prev].slice(0, StashpadView.RECENT_SUBMIT_CAP);
+      }
       this.plugin.settings.lastSubmitted = all;
       await this.plugin.persistSettingsQuiet();
     } catch { /* ignore */ }
@@ -8292,7 +8344,7 @@ export class StashpadView extends ItemView {
         this.applyCalloutFold(textEl, node.id);
       }
       this.refreshStuckPreview(container, node, text);
-      if (attachments.length > 0) this.renderAttachmentRail(container, attachments);
+      if (attachments.length > 0) this.renderAttachmentRail(container, attachments, node);
       this.renderLinkRail(container, node);
       this.renderReplyCount(container, node);
       // Multiplayer footer: author / contributors / last-edit. Each
@@ -8589,7 +8641,7 @@ export class StashpadView extends ItemView {
     el.addEventListener("mouseleave", this.hideInstantTooltip);
   }
 
-  private renderAttachmentRail(parent: HTMLElement, paths: string[]): void {
+  private renderAttachmentRail(parent: HTMLElement, paths: string[], node?: TreeNode): void {
     const rail = parent.createDiv({ cls: "stashpad-rail" });
     const imageCount = paths.filter((p) => isImageExt(p.split(".").pop() ?? "")).length;
 
@@ -8681,6 +8733,13 @@ export class StashpadView extends ItemView {
         const st = getSettings();
         const siblingExts = paths.map((q) => q.split(".").pop() ?? "");
         const openViewer = (): void => {
+          // 0.389.0: unify the entry points — an attachment click opens the SAME
+          // note-preview viewer (note as slide 0 + all attachments), but STARTS on
+          // the clicked attachment. So the note isn't shown when you meant to open
+          // an attachment, yet it's still one slide away instead of absent. When
+          // the note node isn't available (defensive), fall back to the old
+          // attachments-only viewer.
+          if (node?.file) { void this.openNotePreview(node, p); return; }
           new MediaViewerModal(this.app, mediaItemsFor(this.app, paths), paths.indexOf(p), (f) => {
             this.openAttachmentInTab(f);
           }).open();
@@ -19774,7 +19833,13 @@ export class StashpadView extends ItemView {
     await this.openNotePreview(focused);
   }
 
-  private async openNotePreview(node: TreeNode): Promise<void> {
+  /** Open the unified note-preview viewer. `startAttachmentPath`, when given,
+   *  lands on that attachment (slide 1+) instead of the note (slide 0) — so
+   *  clicking an attachment opens THAT attachment, while the note is still one
+   *  slide away rather than absent. Every entry point (Shift+Space, the preview
+   *  button, an attachment click) now opens the SAME viewer; only the start slide
+   *  differs. */
+  private async openNotePreview(node: TreeNode, startAttachmentPath?: string): Promise<void> {
     if (!node.file) return;
     let raw = "";
     try { raw = await this.app.vault.cachedRead(node.file); } catch { /* ignore */ }
@@ -19804,7 +19869,14 @@ export class StashpadView extends ItemView {
       },
     };
     const attachItems = mediaItemsFor(this.app, this.extractAttachments(body));
-    modalRef = new MediaViewerModal(this.app, [noteItem, ...attachItems], 0, (f) => this.openAttachmentInTab(f));
+    // Slide 0 is the note; attachments follow. An attachment-click entry point
+    // passes its path so the viewer OPENS on that attachment, not the note.
+    let startIndex = 0;
+    if (startAttachmentPath) {
+      const ai = attachItems.findIndex((it) => it.path === startAttachmentPath);
+      if (ai >= 0) startIndex = ai + 1;
+    }
+    modalRef = new MediaViewerModal(this.app, [noteItem, ...attachItems], startIndex, (f) => this.openAttachmentInTab(f));
     modalRef.open();
   }
 

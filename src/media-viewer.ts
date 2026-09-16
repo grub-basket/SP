@@ -110,6 +110,14 @@ export class MediaViewerModal extends Modal {
   private readWidthBtn!: HTMLElement;     // NOTE SLIDE only (acts on the rendered note)
   private copyLinkBtn!: HTMLElement;      // note-LEVEL: copy a link to the note
   private jumpParentBtn!: HTMLElement;    // note-LEVEL: open the note's parent
+  private pdfSwitchBtn!: HTMLElement;     // PDF SLIDE only: switch render engine
+  /** 0.389.0: how to render a PDF slide. "auto" probes the native app:// resource
+   *  and falls back to Obsidian's embed; "native" forces the app:// iframe (its
+   *  browser PDF chrome allows text selection); "obsidian" forces Obsidian's own
+   *  PDF viewer (works where app:// serves blank, e.g. a Windows network-USER
+   *  drive). Sticky across slides within a viewer session; the switch button
+   *  cycles it. */
+  private pdfRenderMode: "auto" | "native" | "obsidian" = "auto";
   /** 0.377.1: the modal's note item (slide 0), if opened from a note — its
    *  note-level buttons (copy-link / jump-parent / relayed actions) persist on
    *  every slide, since the whole preview is about this one note. */
@@ -143,6 +151,10 @@ export class MediaViewerModal extends Modal {
 
   onOpen(): void {
     this.modalEl.addClass("stashpad-media-modal");
+    // (Mouse back/forward for prev/next was tried and dropped: Obsidian hijacks
+    // buttons 3/4 for tab-history navigation at a level a modal can't reliably
+    // preempt — the same reason the main view offers Alt+Arrow instead. The
+    // viewer already has ArrowLeft/ArrowRight for prev/next.)
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("stashpad-media-root");
@@ -210,6 +222,11 @@ export class MediaViewerModal extends Modal {
     this.fileBtns.push(act("download", "Save a copy…", () => void this.saveCurrent()));
     this.fileBtns.push(act("folder-open", "Show in the system file manager", () => this.revealInSystem()));
     this.fileBtns.push(act("panel-left", "Show in Obsidian's file explorer", () => this.revealInObsidian()));
+    // 0.389.0: switch how the current PDF renders — auto → native (browser PDF
+    // chrome, allows text selection) → Obsidian's own viewer (works where the
+    // native app:// resource comes back blank, e.g. a Windows network-user
+    // drive). PDF slides only. Sticky across slides.
+    this.pdfSwitchBtn = act("refresh-cw", "Switch PDF render", () => this.cyclePdfRender());
     // 0.377.0: immersive — hide the chrome for distraction-free reading.
     act("maximize", "Immersive (hide the chrome)", () => this.toggleImmersive());
 
@@ -383,9 +400,35 @@ export class MediaViewerModal extends Modal {
    *   3. TERTIARY — if even the embed can't resolve the file, show a fallback
    *      card with "Open in a new tab" + "Retry" rather than a blank pane.
    *  Guards throughout against the user navigating to another slide mid-flight. */
+  /** 0.389.0: cycle the PDF render engine (auto → native → obsidian → auto) and
+   *  re-render the current slide. A short notice names the mode picked. */
+  private cyclePdfRender(): void {
+    const order: Array<typeof this.pdfRenderMode> = ["auto", "native", "obsidian"];
+    this.pdfRenderMode = order[(order.indexOf(this.pdfRenderMode) + 1) % order.length];
+    const label = this.pdfRenderMode === "auto" ? "Auto" : this.pdfRenderMode === "native" ? "Native (selectable text)" : "Obsidian viewer";
+    new Notice(`PDF render: ${label}`);
+    this.show();
+  }
+
   private async loadPdfFrame(frame: HTMLIFrameElement, file: TFile, ext: string, name: string): Promise<void> {
     const rp = this.app.vault.getResourcePath(file);
-    frame.src = rp; // primary
+
+    // Forced Obsidian embed — skip the native iframe entirely (used where the
+    // app:// resource serves blank). Remove the empty iframe first.
+    if (this.pdfRenderMode === "obsidian") {
+      frame.remove();
+      if (await this.renderPdfViaObsidian(file)) return;
+      if (!this.stillShowing(file)) return;
+      this.showPdfFallback(file, ext, name, "Obsidian's PDF viewer couldn't resolve this file. It may still be syncing to this device.");
+      return;
+    }
+
+    frame.src = rp; // primary / native
+    // Forced native — the browser PDF chrome (which allows text selection). No
+    // probe, no fallback: the user chose this explicitly.
+    if (this.pdfRenderMode === "native") return;
+
+    // Auto: probe the native resource; fall back to Obsidian's viewer, then a card.
     let primaryOk = false;
     try {
       const resp = await fetch(rp);
@@ -534,6 +577,8 @@ export class MediaViewerModal extends Modal {
     this.readWidthBtn.toggleClass("is-hidden", !item?.note);
     // Save / reveal apply to the CURRENT file — note `.md` or attachment alike.
     for (const b of this.fileBtns) b.toggleClass("is-hidden", !item?.file);
+    // Switch-render is PDF-only; shown in the PDF branch below, hidden elsewhere.
+    this.pdfSwitchBtn.toggleClass("is-hidden", true);
 
     if (!item) return;
     const ext = (item.path.split(".").pop() ?? "").toLowerCase();
@@ -594,6 +639,7 @@ export class MediaViewerModal extends Modal {
         };
       }
     } else if (VIEWER_PDF_EXT.has(ext)) {
+      this.pdfSwitchBtn.toggleClass("is-hidden", false);
       const frame = this.panEl.createEl("iframe", { cls: "stashpad-media-pdf" });
       frame.setAttr("title", name);
       // The embedded viewer owns its own scrolling, paging and zoom. Our
