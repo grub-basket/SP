@@ -2859,6 +2859,10 @@ export default class StashpadPlugin extends Plugin {
         if (!shouldShowWelcome(this)) return;
         new WelcomeModal(this.app, this).open();
       }, 2500);
+      // 0.395.0: a short launch reminder that unsent composer drafts exist (drafts
+      // are no longer surfaced in the composer text). Setting-gated; skipped when
+      // the welcome modal is showing so a first-run user isn't double-notified.
+      window.setTimeout(() => { if (!shouldShowWelcome(this)) this.maybeShowDraftsReminder(); }, 3200);
       // Vault is fully indexed now — safe to reconcile locked placeholders
       // (drop entries whose blob is truly gone, add cross-device blobs).
       void this.reconcileLockedRegistry();
@@ -3968,6 +3972,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-reply-link", name: "Make note a reply to…", callback: () => call("cmdReplyLinkPicker") });
     this.addCommand({ id: "stashpad-reply-in-list", name: "Reply to… (pick in the list)", callback: () => call("cmdReplyInListPicker") });
     this.addCommand({ id: "stashpad-copy-links", name: "Copy link(s) from note (first / pick / all)", callback: () => call("cmdCopyLinks") });
+    this.addCommand({ id: "stashpad-cycle-search-scope", name: "Cycle search scope (all / in-list / in-parent)", callback: () => call("cmdCycleSearchScope") });
     this.addCommand({ id: "stashpad-preview-note", name: "Preview selected note", callback: () => call("cmdPreviewSelected") });
     this.addCommand({ id: "stashpad-preview-home", name: "Preview home (focused) note", callback: () => call("cmdPreviewHome") });
     this.addCommand({ id: "stashpad-composer-debug", name: "Debug: composer placeholder + autocomplete state", callback: () => call("cmdComposerDebug") });
@@ -5906,6 +5911,21 @@ export default class StashpadPlugin extends Plugin {
       this.app.saveLocalStorage("stashpad-device-id", id);
       return id;
     } catch { return "unknown"; }
+  }
+
+  /** 0.395.0: on launch, if unsent composer drafts exist, show a short notice
+   *  with a button to open the Drafts manager. Setting-gated (draftsLaunchReminder). */
+  maybeShowDraftsReminder(): void {
+    if (!this.settings.draftsLaunchReminder) return;
+    const n = Object.values(this.settings.composerDrafts ?? {})
+      .filter((d) => d.kind !== "edit" && (d.text ?? "").trim().length > 0).length;
+    if (n <= 0) return;
+    const frag = createFragment((f) => {
+      f.appendText(`Stashpad: ${n} unsent draft${n > 1 ? "s" : ""}. `);
+      const b = f.createEl("button", { text: "Open drafts", cls: "mod-cta" });
+      b.onclick = () => { this.openComposerDrafts(); notice.hide(); };
+    });
+    const notice = new Notice(frag, 12000);
   }
 
   /** 0.319.0: the drafts review modal (all folders, or one). */
@@ -10699,6 +10719,24 @@ export default class StashpadPlugin extends Plugin {
         this.settings.bindings.toggleTask.primary = "G";
       }
       this.settings.migratedToggleTaskG = true;
+      await this.saveSettings();
+    }
+    // 0.396.0: one-time clear of previewHome's old Mod+Shift+Space default — it
+    // collided with macOS / 1Password system shortcuts. Only clear a STILL-default
+    // binding so a deliberate rebind survives; then mark done so re-binding sticks.
+    if (!this.settings.migratedPreviewHomeChord) {
+      const ph = this.settings.bindings.previewHome;
+      if (ph && ph.primary === "Mod+Shift+Space" && !ph.secondary) ph.primary = "";
+      this.settings.migratedPreviewHomeChord = true;
+      await this.saveSettings();
+    }
+    // 0.402.0: upgrade a still-default previewHome to Alt+Shift+Space — covers
+    // both installs that never had a default and those the 0.396.0 clear left
+    // empty. A deliberately-set chord (anything else, or a secondary) survives.
+    if (!this.settings.migratedPreviewHomeChord2) {
+      const ph = this.settings.bindings.previewHome;
+      if (ph && (ph.primary === "" || ph.primary === "Mod+Shift+Space") && !ph.secondary) ph.primary = "Alt+Shift+Space";
+      this.settings.migratedPreviewHomeChord2 = true;
       await this.saveSettings();
     }
     // 0.363.0: one-time seed of the four built-in reorg submenus (Move, Pin,

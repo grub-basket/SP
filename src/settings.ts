@@ -158,7 +158,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "listPin",         label: "Pin / unpin to top of list",    desc: "Float the cursor row (or selection) to the TOP of its list — distinct from the sidebar pin. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
   { id: "listPinBottom",   label: "Pin / unpin to bottom of list", desc: "Float the cursor row (or selection) to the BOTTOM of its list. Pinned notes ignore the time filter. No default chord.", defaultPrimary: "" },
   { id: "previewNote",     label: "Preview selected note",         desc: "Default: Shift+Space — open the cursor row (or selection) in the note-preview viewer.", defaultPrimary: "Shift+Space" },
-  { id: "previewHome",     label: "Preview home note",             desc: "Default: Mod+Shift+Space — open the current list's home (focused) note in the note-preview viewer.", defaultPrimary: "Mod+Shift+Space" },
+  { id: "previewHome",     label: "Preview home note",             desc: "Default: Alt+Shift+Space (Option+Shift+Space on macOS) — open the current list's home (focused) note in the note-preview viewer. (The old Mod+Shift+Space default collided with macOS / 1Password system shortcuts.)", defaultPrimary: "Alt+Shift+Space" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: G — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "G" },
   { id: "reply",           label: "Reply to selection",            desc: "Default: R — start a reply to the cursor row (or selection): the composer's next send links back to it and shows a quote. Press R on another note to switch the reply target.", defaultPrimary: "R" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
@@ -386,6 +386,15 @@ export interface StashpadSettings {
    *  them, and hiding sticks. Holds leaf ids ("delete"), `submenu:<key>`, and
    *  `cmd:<id>`. Only the context menu honors it (not the star menu / item buttons). */
   contextMenuHidden: string[];
+  /** 0.395.0: folders (vault paths) whose composer shows the "N drafts" reminder
+   *  chip. Toggled per-folder by the composer's Drafts button. A composer draft is
+   *  NEVER auto-restored into the text box any more (that resurfaced already-sent
+   *  text); drafts are saved + reached via the Drafts manager, and this list just
+   *  controls the per-folder reminder chip. */
+  draftsSurfacedFolders: string[];
+  /** 0.395.0: on launch, if unsent drafts exist, show a short notice with a button
+   *  to open the Drafts manager. Default on; turn off to silence it. */
+  draftsLaunchReminder: boolean;
   /** 0.374.0: show the per-row "Preview" button that opens the note in the file
    *  preview modal (the note itself as slide 0, its attachments after). */
   showNotePreviewButton: boolean;
@@ -543,6 +552,12 @@ export interface StashpadSettings {
    *  still-default `H` to `G` once, then set this so it never re-flips (the user
    *  can rebind to H afterwards and it sticks). */
   migratedToggleTaskG: boolean;
+  /** 0.396.0: one-time clear of previewHome's old Mod+Shift+Space default, which
+   *  collided with macOS / 1Password system shortcuts. */
+  migratedPreviewHomeChord: boolean;
+  /** 0.402.0: one-time upgrade of a still-default previewHome (empty from the
+   *  0.396.0 clear, or the retired Mod+Shift+Space) to the new Alt+Shift+Space. */
+  migratedPreviewHomeChord2: boolean;
   /** 0.136.0: one-time move of legacy dedicated-archive folders' notes into
    *  each folder's own `archive/` subfolder (per-folder archive overhaul). */
   migratedArchiveToSubfolders: boolean;
@@ -624,6 +639,10 @@ export interface StashpadSettings {
    *  both same-folder and cross-Stashpad results. Folder-open picks always open
    *  a new tab regardless. */
   searchOpensInNewTab: boolean;
+  /** 0.405.0: which search the composer search button / Mod+F runs, cycled by the
+   *  scope button beside it and persisted. "all" = full search modal; "list" =
+   *  find-in-list (filter the current list); "parent" = search the focused subtree. */
+  searchScopeMode: "all" | "list" | "parent";
   /** 0.68.0: notes the user has pinned to the sidebar Pinned Notes
    *  panel. Cross-folder; rendered in array order. */
   pinnedNotes: Array<{ folder: string; id: string }>;
@@ -1100,6 +1119,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextMenuOrderRefreshedV2: false,
   contextMoveInListFirstV1: false,
   contextMenuHidden: [],
+  draftsSurfacedFolders: [],
+  draftsLaunchReminder: true,
   showNotePreviewButton: true,
   showExpandToggle: true,
   tableAssists: true,
@@ -1150,6 +1171,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   encryptTrash: false,
   encryptTrashFilenames: false,
   migratedToggleTaskG: false,
+  migratedPreviewHomeChord: false,
+  migratedPreviewHomeChord2: false,
   migratedArchiveToSubfolders: false,
   migratedTrashToSubfolders: false,
   reEncryptWatch: [],
@@ -1168,6 +1191,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   importExcludePrefixes: "_",
   lockedSubtrees: [],
   searchOpensInNewTab: true,
+  searchScopeMode: "all",
   pinnedNotes: [],
   hideMobileToolbarInStashpad: true,
   slugStopWords: [],  // empty → DEFAULT_STOPWORDS used at runtime
@@ -3306,6 +3330,10 @@ export class StashpadSettingTab extends PluginSettingTab {
       ));
     }
 
+    cats.composerCopy.push(toggle("Drafts reminder on launch",
+      "On by default. If you have unsent composer drafts, show a short notice on launch with a button to open the Drafts manager. Turn off to silence it. (Drafts are never auto-loaded into the composer any more — they resurfaced already-sent text; they're saved and reached via the Drafts manager, the composer's Drafts button, or the “Show composer drafts” command. The Drafts button also toggles a per-folder reminder chip.)",
+      () => this.plugin.settings.draftsLaunchReminder, (v) => { this.plugin.settings.draftsLaunchReminder = v; },
+      ["draft", "drafts", "reminder", "launch", "notice", "composer"]));
     cats.composerCopy.push(toggle("Add link previews automatically",
       "When a note containing a link is saved, fetch that link's title and description and add a preview to the note — without you running a command. Off by default: it turns typing a URL into a network request and a write to the note. Previews are still never overwritten, so anything you have edited by hand is safe. If the list feels jumpy while notes are being written, turn this off.",
       () => this.plugin.settings.linkPreviewAuto, (v) => { this.plugin.settings.linkPreviewAuto = v; },

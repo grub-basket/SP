@@ -9905,6 +9905,9 @@ button.stashpad-reaction-chip,
 /* ============================================================
    Quoted replies (teams, 0.281.0)
    ============================================================ */
+/* 0.397.0: the Drafts toolbar button lights up when the current folder surfaces
+   its drafts reminder chip. */
+.stashpad-composer-toolbar-btn.stashpad-toolbar-drafts.is-active { color: var(--interactive-accent); }
 .stashpad-reply-chip-host { display: none; }
 .stashpad-reply-chip-host.is-active { display: block; padding: 2px 2px 6px; }
 /* 0.298.0: two-line reply chip — "Reply to" label row + cancel, title beneath. */
@@ -10539,6 +10542,14 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 }
 .stashpad-findbar-clear:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
 .stashpad-findbar-clear .svg-icon { width: 14px; height: 14px; }
+/* 0.404.0: live result count in the find bar. */
+.stashpad-findbar-count {
+  flex: 0 0 auto; color: var(--text-muted); font-size: var(--font-ui-smaller);
+  white-space: nowrap; padding: 0 2px;
+}
+/* 0.404.0: on mobile, hide the composer formatting toolbar while finding so more
+   results are visible (find eats vertical space on a phone; desktop is fine). */
+.stashpad-view.is-mobile.is-finding .stashpad-composer-toolbar { display: none; }
 
 /* 0.322.0: recent / saved search rows in the search modal. */
 .stashpad-search-special-row { display: flex; align-items: center; gap: 7px; }

@@ -1421,7 +1421,7 @@ export class NoteWorkbench {
 
     const edit = this.buildSplitSection(this.host, "edit", this.surface === "edit" ? "Your edit" : "Your edit — the split uses this");
     const editWrap = edit.body.createDiv({ cls: "stashpad-edit-wrap" });
-    const ta = editWrap.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
+    const ta = editWrap.createEl("textarea", { cls: "stashpad-split-cursor-ta", attr: { spellcheck: "true" } });
     // Seed from the persisted (possibly edited) text so toggling modes doesn't
     // discard edits; the split acts on exactly what's shown here.
     ta.value = this.cursorText;
@@ -1490,7 +1490,7 @@ export class NoteWorkbench {
 
     // Edit panel (the live textarea).
     const editPanel = bodyHost.createDiv({ cls: "stashpad-split-tabpanel stashpad-split-tabpanel-edit" });
-    const ta = editPanel.createEl("textarea", { cls: "stashpad-split-cursor-ta" });
+    const ta = editPanel.createEl("textarea", { cls: "stashpad-split-cursor-ta", attr: { spellcheck: "true" } });
     ta.value = this.cursorText;
     ta.readOnly = false;
     this.cursorTextarea = ta;

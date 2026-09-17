@@ -236,6 +236,11 @@ export class ComposerAutocomplete {
     return !!this.state && this.items.length > 0;
   }
 
+  /** 0.403.0: public dismiss — close the suggestion popover WITHOUT tearing down
+   *  the autocomplete (unlike detach). Called on send so a lingering popover
+   *  (e.g. a new tag with no match) doesn't stay open over the emptied composer. */
+  dismiss(): void { this.close(); }
+
   detach(): void {
     this.close();
     this.ta.removeEventListener("input", this.onInput);
@@ -657,6 +662,14 @@ export class ComposerAutocomplete {
     // 0.338.0: espanso-style snippet auto-expand — when a snippet trigger is
     // committed by a following whitespace, replace it with the expanded value.
     if (this.tryExpandSnippet()) { this.close(); return; }
+    // 0.406.0: a tag can't contain a space, so as soon as whitespace follows the
+    // caret's token, dismiss the tag popover — robust on mobile, where the space
+    // arrives as an input event without the keydown that normally closes it. Tags
+    // only (links / @ legitimately contain spaces).
+    if (this.state?.kind === "tag") {
+      const caret = this.ta.selectionStart ?? this.ta.value.length;
+      if (/\s/.test(this.ta.value[caret - 1] ?? "")) { this.close(); return; }
+    }
     const state = this.detectTrigger();
     if (!state) { this.close(); return; }
     this.openFor(state);

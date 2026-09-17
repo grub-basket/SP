@@ -173,7 +173,7 @@ export interface ToolbarBuiltin {
   glyph: string;
   title: string;
   cls?: string;
-  gate?: "spoilers";
+  gate?: "spoilers" | "drafts";
   run?: (ta: HTMLTextAreaElement) => void;
   menu?: (e: MouseEvent, getTa: () => HTMLTextAreaElement | null) => void;
 }
@@ -206,6 +206,10 @@ export const TOOLBAR_BUILTINS: ToolbarBuiltin[] = [
   { id: "code", icon: "code", glyph: "</>", title: "Code", run: (ta) => wrapSelection(ta, "`") },
   { id: "checkbox", icon: "square-check-big", glyph: "☑", title: "Checkbox", run: (ta) => prefixLine(ta, "- [ ] ") },
   { id: "spoiler", icon: "eye-off", glyph: "\u{1F648}", title: "Spoiler (tap to reveal)", gate: "spoilers", run: (ta) => wrapSelection(ta, "||") },
+  // 0.397.0: Drafts — composer only (gated on opts.drafts). Toggles the per-folder
+  // drafts reminder chip; right-click opens the Drafts manager. Hideable/orderable
+  // like any other toolbar button. No `run` — it's wired specially in the renderer.
+  { id: "drafts", icon: "notebook-pen", glyph: "✎", title: "Drafts", cls: "stashpad-toolbar-drafts", gate: "drafts" },
 ];
 
 /** 0.351.0: resolve the effective built-in button list from a saved config —
@@ -246,6 +250,11 @@ export interface FormattingToolbarOpts {
   /** 0.351.0: user customization of the built-in buttons (order / hidden / icon).
    *  Undefined or empty = the default order from TOOLBAR_BUILTINS. */
   toolbarButtons?: ToolbarButtonConfig[];
+  /** 0.397.0: enables the composer-only "Drafts" button (gated builtin). Absent
+   *  in the edit modal, so the button never shows there. `active` drives its
+   *  highlight; left-click `toggle`s the per-folder chip; right-click `open`s the
+   *  Drafts manager. */
+  drafts?: { active: () => boolean; toggle: () => void; open: () => void };
 }
 
 /** Render the toolbar into `host`, acting on the textarea returned by `getTa`.
@@ -288,11 +297,25 @@ export function renderFormattingToolbar(
   for (const { def, hidden, icon } of resolveToolbarButtons(opts.toolbarButtons)) {
     if (hidden) continue;
     if (def.gate === "spoilers" && !opts.spoilers) continue;
+    if (def.gate === "drafts" && !opts.drafts) continue;
     const cls = "stashpad-composer-toolbar-btn" + (def.cls ? " " + def.cls : "");
     const b = bar.createEl("button", { cls, attr: { "aria-label": def.title, tabindex: "-1" } });
     setIconSafe(b, icon, def.glyph);
     b.title = def.title;
     b.addEventListener("mousedown", (e) => e.preventDefault()); // keep the textarea's focus + selection
+    if (def.gate === "drafts" && opts.drafts) {
+      const d = opts.drafts;
+      const paint = (): void => {
+        const on = d.active();
+        b.toggleClass("is-active", on);
+        b.title = `${on ? "Hide" : "Show"} the drafts chip for this folder · right-click to open the Drafts manager`;
+        b.setAttr("aria-label", b.title);
+      };
+      paint();
+      b.onclick = (e) => { e.preventDefault(); d.toggle(); paint(); };
+      b.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); d.open(); };
+      continue;
+    }
     b.onclick = (e) => {
       e.preventDefault();
       if (def.menu) { def.menu(e as MouseEvent, getTa); return; }

@@ -268,6 +268,7 @@ export class StashpadView extends ItemView {
   private findBodyMatches: Set<StashpadId> = new Set();
   private findBarEl: HTMLElement | null = null;
   private findInputEl: HTMLInputElement | null = null;
+  private findCountEl: HTMLElement | null = null;
   private findDebounce: number | null = null;
   /** 0.88.1: when true, show only notes that came in via import
    *  (frontmatter `imported: true`). Per-session, like tag/color. */
@@ -396,6 +397,10 @@ export class StashpadView extends ItemView {
    *  host of the "N drafts" / "Editing: …" chip. */
   private activeDraftId: string | null = null;
   private draftsChipHost: HTMLElement | null = null;
+  /** 0.398.0: the currently-open note-preview modal, so edit-in-composer (from ANY
+   *  entry point — ⋮ menu, command palette, star menu) can dismiss it first; the
+   *  composer sits underneath and would otherwise be hidden. */
+  private openPreviewModal: MediaViewerModal | null = null;
   /** 0.237.0: obscured notes the user has revealed in THIS view. Deliberately
    *  in-memory and per-view — "revealed" is a viewing state, not a property of
    *  the note, so it must never be written to the file or shared with another
@@ -2607,6 +2612,12 @@ export class StashpadView extends ItemView {
     // Edit drafts are never adopted implicitly — they're resumed from the
     // drafts modal — so a stopped edit can't hijack the composer.
     if (!id || !all[id] || all[id].folder !== this.noteFolder) id = this.folderDrafts().find((d) => d.kind === "new")?.id ?? null;
+    // 0.395.0: NEVER auto-restore a saved draft into the composer on open — that
+    // resurfaced text you'd already sent. The composer always starts empty;
+    // drafts are still saved (typing here mints one) and reached via the Drafts
+    // manager / the composer's Drafts button. (Edit-in-composer sets activeDraftId
+    // itself, via its command, so it's unaffected.)
+    id = null;
     this.activeDraftId = id;
     this.setDraftPointer(id);
     // 0.340.0: clean up exact-duplicate drafts accumulated across sessions/devices.
@@ -2631,6 +2642,9 @@ export class StashpadView extends ItemView {
       : null;
     this.refreshAppendButton();
     console.debug("[Stashpad] loadDrafts", { folder: this.noteFolder, bound: id, drafts: this.folderDrafts().length });
+    // 0.400.0: build the capped note-body cache for the draft-vs-existing-note
+    // dedup — off the hot path (don't block folder load on file reads).
+    void this.buildFolderNoteBlurbs();
   }
 
   /** A draft's saved reply target, only if the note still exists. */
@@ -2752,12 +2766,26 @@ export class StashpadView extends ItemView {
 
   /** Render (or clear) the composer's drafts chip: "Editing: <title> ✕" while an
    *  edit is bound, and/or "N drafts" when the folder holds more than the bound one. */
+  /** Add/remove the current folder from the drafts-surfaced set (persisted). */
+  private async toggleDraftsSurfaced(): Promise<void> {
+    const cur = new Set(getSettings().draftsSurfacedFolders ?? []);
+    if (cur.has(this.noteFolder)) cur.delete(this.noteFolder); else cur.add(this.noteFolder);
+    this.plugin.settings.draftsSurfacedFolders = [...cur];
+    try { await this.plugin.saveSettings(); } catch { /* ignore */ }
+    this.refreshDraftsChip();
+  }
+
   private refreshDraftsChip(): void {
     const host = this.draftsChipHost;
     if (!host) return;
     host.empty();
     const cur = this.activeDraft();
-    const others = this.folderDrafts().filter((d) => d.id !== cur?.id);
+    // 0.395.0: the "N drafts" reminder chip shows only for folders the user has
+    // toggled on (the composer's Drafts button). The Editing chip always shows —
+    // it's driven by the deliberate edit-in-composer command and is how you exit
+    // an edit. Drafts stay reachable via the Drafts manager regardless.
+    const showCount = getSettings().draftsSurfacedFolders?.includes(this.noteFolder) ?? false;
+    const others = showCount ? this.folderDrafts().filter((d) => d.id !== cur?.id) : [];
     const show = (cur?.kind === "edit") || others.length > 0;
     host.toggleClass("is-active", show);
     if (!show) return;
@@ -2793,6 +2821,11 @@ export class StashpadView extends ItemView {
   /** Put `node`'s body in the composer as an EDIT draft. The current composer
    *  text (if any) is flushed and kept as its own draft. */
   async beginComposerEdit(node?: TreeNode): Promise<void> {
+    // 0.398.0: edit-in-composer puts text in the COMPOSER, which sits beneath the
+    // note-preview modal — so close that modal first, whatever the entry point
+    // (⋮ menu, command palette, star menu). The ⋮ path already dismisses; this
+    // covers the others.
+    if (this.openPreviewModal) { this.openPreviewModal.close(); this.openPreviewModal = null; }
     const target = node ?? this.resolveActionTarget();
     if (!target?.file) { new Notice("Pick a note to edit."); return; }
     const file = target.file;
@@ -2906,10 +2939,47 @@ export class StashpadView extends ItemView {
       if (!s) continue;
       if (d === s || s.startsWith(d)) return true;
     }
+    // 0.400.0: also discard a draft that duplicates an EXISTING NOTE in this
+    // folder — equals it, or is a leading portion of it. Compared against a
+    // capped, pre-built cache of recent-note bodies (buildFolderNoteBlurbs) so
+    // the per-keystroke check stays cheap and doesn't read files.
+    if (this.folderNoteBlurbs && this.folderNoteBlurbs.folder === folder) {
+      for (const b of this.folderNoteBlurbs.blurbs) {
+        if (d === b || b.startsWith(d)) return true;
+      }
+    }
     return false;
   }
 
   private static readonly RECENT_SUBMIT_CAP = 8;
+  /** 0.400.0: how many of a folder's most-recent notes to scan for the draft
+   *  duplicate check. Capped so the scan/index stays fast on big folders. */
+  private static readonly NOTE_DEDUP_SCAN_CAP = 150;
+  /** 0.400.0: cached, normalized bodies of the folder's most-recent notes, for
+   *  the draft-vs-existing-note dedup. Rebuilt (fire-and-forget) on folder load. */
+  private folderNoteBlurbs: { folder: string; blurbs: string[] } | null = null;
+
+  /** 0.400.0: (re)build the capped note-body cache for the current folder, off
+   *  the hot path. Reads at most NOTE_DEDUP_SCAN_CAP of the folder's most-recently
+   *  modified notes (cachedRead — cheap after Obsidian has indexed them). */
+  private async buildFolderNoteBlurbs(): Promise<void> {
+    const folder = this.noteFolder;
+    const prefix = folder ? folder.replace(/\/+$/, "") + "/" : "";
+    try {
+      const files = this.app.vault.getMarkdownFiles()
+        .filter((f) => prefix ? f.path.startsWith(prefix) : true)
+        .sort((a, b) => b.stat.mtime - a.stat.mtime)
+        .slice(0, StashpadView.NOTE_DEDUP_SCAN_CAP);
+      const blurbs: string[] = [];
+      for (const f of files) {
+        try {
+          const body = this.stripFrontmatter(await this.app.vault.cachedRead(f)).trim();
+          if (body) blurbs.push(body);
+        } catch { /* skip unreadable */ }
+      }
+      if (this.noteFolder === folder) this.folderNoteBlurbs = { folder, blurbs };
+    } catch { /* leave the previous cache in place */ }
+  }
 
   /** Record a send/edit so a later draft of the same text is discarded. An empty
    *  `text` CLEARS the folder's history — the edit cancel/restore paths pass ""
@@ -3665,6 +3735,9 @@ export class StashpadView extends ItemView {
     this.findBodyMatches = new Set();
     this.refreshList();      // rebuilds the list; renderInner isn't hit, so mount here
     this.mountFindBar();
+    // 0.404.0: mark the view as finding so mobile can reclaim vertical space
+    // (hide the composer formatting toolbar) for more visible results.
+    this.viewRoot?.addClass("is-finding");
     this.findInputEl?.focus();
   }
 
@@ -3676,6 +3749,8 @@ export class StashpadView extends ItemView {
     this.findBarEl?.remove();
     this.findBarEl = null;
     this.findInputEl = null;
+    this.findCountEl = null;
+    this.viewRoot?.removeClass("is-finding");
     this.refreshList();
     this.restoreFindSavedScroll(true);
     this.findSavedScroll = null;
@@ -3707,11 +3782,15 @@ export class StashpadView extends ItemView {
     setIcon(icon, "list-filter");
     const input = bar.createEl("input", { cls: "stashpad-findbar-input", attr: { type: "text", placeholder: "Find in list…" } });
     input.value = this.findText;
+    // 0.404.0: live result count (matches in the current list).
+    const count = bar.createSpan({ cls: "stashpad-findbar-count" });
+    this.findCountEl = count;
     const clear = bar.createEl("button", { cls: "stashpad-findbar-clear", attr: { "aria-label": "Clear / close find" } });
     setIcon(clear, "x");
     input.addEventListener("input", () => {
       this.findText = input.value;
       this.refreshList();                    // instant title-level narrowing
+      this.updateFindCount();
       if (this.findDebounce != null) clearTimeout(this.findDebounce);
       this.findDebounce = window.setTimeout(() => { void this.recomputeFindBodyMatches(); }, 180);
     });
@@ -3724,6 +3803,17 @@ export class StashpadView extends ItemView {
     };
     this.findBarEl = bar;
     this.findInputEl = input;
+    this.updateFindCount();
+  }
+
+  /** 0.404.0: show the count of notes matching the current find text. Empty text
+   *  (bar open, showing everything) shows nothing. */
+  private updateFindCount(): void {
+    const el = this.findCountEl;
+    if (!el) return;
+    if (!this.findText || !this.findText.trim()) { el.setText(""); return; }
+    const n = this.currentChildren.length;
+    el.setText(`${n} ${n === 1 ? "result" : "results"}`);
   }
 
   /** 0.329.0: read the shown notes' bodies and record which match the find text,
@@ -3744,6 +3834,7 @@ export class StashpadView extends ItemView {
     if ((this.findText ? this.findText.trim() : "") !== text) return; // superseded
     this.findBodyMatches = next;
     this.refreshList();
+    this.updateFindCount();
   }
 
   // ---------- 0.335.0: per-folder filter-chip persistence ----------
@@ -8125,6 +8216,12 @@ export class StashpadView extends ItemView {
       app: this.app,
       snippets: getSettings().snippets,
       toolbarButtons: getSettings().toolbarButtons,
+      // 0.397.0: composer-only Drafts button (edit modal passes no `drafts`).
+      drafts: {
+        active: () => getSettings().draftsSurfacedFolders?.includes(this.noteFolder) ?? false,
+        toggle: () => void this.toggleDraftsSurfaced(),
+        open: () => this.plugin.openComposerDrafts(this.noteFolder),
+      },
     });
   }
 
@@ -8435,8 +8532,14 @@ export class StashpadView extends ItemView {
   ): void {
     const inHost = !!opts.toggleHost;
     const host = opts.toggleHost ?? container;
-    // Remove any old toggle the host may already have (re-renders).
-    host.querySelector(".stashpad-expand-toggle")?.remove();
+    // 0.401.0: remove EVERY existing toggle from both the toggle host AND the
+    // body container before creating one. A mouse click on the toggle re-renders
+    // the body, and the old single-querySelector cleanup (one host, first match)
+    // could leave a redundant toggle behind — one in the separate host and one
+    // inline, or an accumulated duplicate. querySelectorAll across both hosts
+    // guarantees exactly one after this runs.
+    host.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());
+    if (host !== container) container.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());
     // 0.374.0: the expand/collapse toggle is optional — a user who reads long
     // notes through the preview modal can hide it. (The body simply stays
     // clamped; the preview button / attachment chips still open the full note.)
@@ -8552,10 +8655,7 @@ export class StashpadView extends ItemView {
         menu.addItem((it: any) => it
           .setTitle(title.length > 60 ? title.slice(0, 60) + "…" : title)
           .setIcon("corner-down-right")
-          .onClick(() => {
-            const row = this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(r.id)}"]`);
-            if (row) this.flashRowIntoView(row); else this.navigateTo(r.id);
-          }));
+          .onClick(() => { this.revealAndSelectNote(r.id); }));
       }
       menu.showAtMouseEvent(ev);
     };
@@ -8894,12 +8994,24 @@ export class StashpadView extends ItemView {
     // 0.301.0: quick menu (recent/pinned + "search all") — mobile-relevant
     // composer button; the full picker opens from the menu's "Search all…".
     folderBtn.onclick = (e) => { e.preventDefault(); this.openQuickFolderMenu(e); };
-    // Search.
+    // Search — runs the current scope (all / in-list / in-parent).
     const searchBtn = nav.createEl("button", { cls: "stashpad-composer-btn" });
     setIconSafe(searchBtn, "search", "🔍");
-    searchBtn.title = "Search notes (Mod+F)";
     searchBtn.onmousedown = (e) => e.preventDefault();
-    searchBtn.onclick = (e) => { e.preventDefault(); this.openSearchModal(); };
+    searchBtn.onclick = (e) => { e.preventDefault(); this.cmdSearchScoped(); };
+    // 0.405.0: scope-cycle button — changes WHICH search the button (and Mod+F)
+    // runs: all → in-list → in-parent. State persists across sessions.
+    const scopeBtn = nav.createEl("button", { cls: "stashpad-composer-btn stashpad-search-scope" });
+    scopeBtn.onmousedown = (e) => e.preventDefault();
+    const paintScope = (): void => {
+      const m = getSettings().searchScopeMode;
+      setIconSafe(scopeBtn, m === "list" ? "list-filter" : m === "parent" ? "folder-search" : "globe", "◎");
+      scopeBtn.title = `Search scope: ${this.searchScopeLabel()} — click to change`;
+      scopeBtn.setAttr("aria-label", scopeBtn.title);
+      searchBtn.title = `${this.searchScopeLabel()} (Mod+F)`;
+    };
+    paintScope();
+    scopeBtn.onclick = (e) => { e.preventDefault(); void this.cmdCycleSearchScope().then(paintScope); };
     // 0.119.6: route (jump-to-level) moved to the actions cluster (after the
     // forward button) — see renderActionsCluster. The composer nav is now just
     // folder + search.
@@ -9082,33 +9194,72 @@ export class StashpadView extends ItemView {
   private async revealReplySource(node: TreeNode): Promise<void> {
     const resolved = this.resolveReplySourceFile(node);
     if (!resolved) { new Notice("Couldn't find the note this replies to."); return; }
-    if (resolved.folder === this.noteFolder) this.virtEnsureId(resolved.id); // 0.295.0
-    const row = resolved.folder === this.noteFolder
-      ? this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(resolved.id)}"]`)
-      : null;
-    if (row) { this.flashRowIntoView(row); return; }
+    // 0.406.0: same folder → reveal + cursor-select it in this list (handles an
+    // off-screen/virtualized reply too, instead of falling through to a new tab).
+    if (resolved.folder === this.noteFolder) { this.revealAndSelectNote(resolved.id as StashpadId); return; }
     await this.openNoteInNewTab(resolved.folder, resolved.id);
   }
 
-  /** Scroll a rendered row to the top of the list and briefly flash it. */
+  /** 0.406.0: reveal a note in THIS list and cursor/select it. If it's a row in
+   *  the current list (even off-screen/virtualized), scroll to it, flash it, and
+   *  single-select it. If it isn't in the current list, focus its parent so it
+   *  shows as a row and cursor to it there. */
+  revealAndSelectNote(id: StashpadId): void {
+    const idx = this.currentChildren.findIndex((n) => n.id === id);
+    if (idx >= 0) {
+      this.virtEnsureId(id);
+      this.cursorOnHeading = false;
+      this.cursorIdx = idx;
+      this.selectCursor(false); // single-select the cursor row (+ reveal)
+      const row = this.listEl?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(id)}"]`);
+      if (row) this.flashRowIntoView(row);
+      return;
+    }
+    // Not in the current list — focus its parent (so it's a row) and cursor to it.
+    const n = this.tree.get(id);
+    const parent = n?.parent && n.parent !== ROOT_ID ? n.parent : ROOT_ID;
+    this.pendingCursorId = id;
+    this.navigateTo(parent);
+  }
+
+  /** Scroll a rendered row to the top of the list (just below the sticky heading)
+   *  and briefly flash it. */
   private flashRowIntoView(row: HTMLElement): void {
-    // 0.392.1: align the row's top just BELOW the sticky heading row. A plain
-    // scrollIntoView({block:"start"}) parked it under the heading, so the jump
-    // landed partway down the target note. Re-align next frame too, in case a
-    // virtualized re-window shifted rows above it.
     const list = this.listEl;
+    const id = row.getAttribute("data-id");
     this.stickToListBottom = false;
+    // 0.394.0: align the row's top just below the sticky heading, and RE-DO it
+    // across several frames — in a virtualized list, setting scrollTop re-windows
+    // the rows (their real heights replace the estimate for everything above the
+    // target), which shifted the target down (~30% into the note on a reply jump).
+    // A single align/rAF wasn't enough; mirror revealCursorRow's multi-frame
+    // settle. Re-query the row by id each pass because the virt re-window can
+    // REPLACE the element. virtEnsureId keeps the row built while we converge.
+    const pad = 4;
+    const currentRow = (): HTMLElement | null =>
+      (id ? list?.querySelector<HTMLElement>(`.stashpad-note[data-id="${CSS.escape(id)}"]`) ?? null : null)
+      ?? (row.isConnected ? row : null);
     const align = (): void => {
-      if (!list || !row.isConnected) return;
-      const heading = list.querySelector<HTMLElement>(".stashpad-focused.is-heading-row");
-      const cover = heading && heading !== row ? heading.offsetHeight : 0;
-      const delta = row.getBoundingClientRect().top - list.getBoundingClientRect().top - cover;
+      if (!list) return;
+      if (id) this.virtEnsureId(id as StashpadId);
+      const cur = currentRow();
+      if (!cur) return;
+      const heading = list.querySelector<HTMLElement>(".is-heading-row");
+      const cover = heading && heading !== cur ? heading.getBoundingClientRect().height : 0;
+      const delta = cur.getBoundingClientRect().top - list.getBoundingClientRect().top - cover - pad;
       if (Math.abs(delta) > 1) list.scrollTop += delta;
     };
-    if (list) { align(); requestAnimationFrame(align); }
-    else row.scrollIntoView({ block: "start", behavior: "auto" });
-    row.classList.add("stashpad-row-flash");
-    window.setTimeout(() => row.classList.remove("stashpad-row-flash"), 1200);
+    if (list) {
+      align();
+      requestAnimationFrame(align);
+      window.setTimeout(align, 60);
+      window.setTimeout(align, 200);
+    } else {
+      row.scrollIntoView({ block: "start", behavior: "auto" });
+    }
+    const flashRow = currentRow() ?? row;
+    flashRow.classList.add("stashpad-row-flash");
+    window.setTimeout(() => (currentRow() ?? flashRow).classList.remove("stashpad-row-flash"), 1200);
   }
 
   cmdReply(node?: TreeNode): void {
@@ -10016,6 +10167,10 @@ export class StashpadView extends ItemView {
       // 0.363.11: normalize iOS smart-punctuation curly quotes to straight on send.
       if (getSettings().straightenCurlyQuotesOnSend) text = straightenCurlyQuotes(text);
       if (!text) return;
+      // 0.403.0: dismiss the composer autocomplete popover on send — otherwise a
+      // suggestion popup (most visibly a NEW tag that matched nothing) lingered
+      // over the now-empty composer on mobile. Do it for every send path.
+      this.composerAutocomplete?.dismiss();
       // 0.319.0: an EDIT draft is bound → Send saves that note instead of creating one.
       const bound = this.activeDraft();
       if (bound?.kind === "edit") {
@@ -11190,7 +11345,7 @@ export class StashpadView extends ItemView {
     //     and users expect them to work while composing too.
     if (matchBinding(e, b.toggleSplit)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.toggleSplit(); return; }
     if (matchBinding(e, b.pickDestination)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openDestinationPicker(); return; }
-    if (matchBinding(e, b.search)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openSearchModal(); return; }
+    if (matchBinding(e, b.search)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSearchScoped(); return; }
     if (matchBinding(e, b.commandPalette)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.openStashpadCommandPalette(); return; }
     if (matchBinding(e, b.lockSelection)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdLockSelection(); return; }
     if (matchBinding(e, b.unlockAll)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdUnlockAll(); return; }
@@ -11247,6 +11402,14 @@ export class StashpadView extends ItemView {
 
     // Esc always cancels the in-list picker, even when focus is in the composer
     // (the picker is a transient mode and should be dismissable from anywhere).
+    // 0.398.0: Escape closes find-in-list from anywhere in the view (the find
+    // input has its own Escape, but focus is often on the list). Checked before
+    // the selection-collapse so a first Escape exits find rather than deselecting.
+    if (this.findText !== null && e.key === "Escape") {
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+      this.closeFindInList();
+      return;
+    }
     if (this.inListPicker && e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -12819,8 +12982,18 @@ export class StashpadView extends ItemView {
       placeholder: `Search in "${this.titleForNode(this.tree.get(focusId) ?? this.tree.getRoot()).trim()}"…`,
       allowCreate: false,
       onPick: (item) => {
-        if (item.node && inSubtree(item.node.id)) this.navigateTo(item.node.id);
-        else if (item.node) this.navigateTo(item.node.id);
+        // 0.398.0: honor the same settings the main search does, instead of
+        // always navigating INTO the note. searchOpensInContext (default on) →
+        // focus the note's PARENT and cursor to it (it shows as a row in its
+        // list); off → focus into it. searchOpensInNewTab (default on) → new tab.
+        if (!item.node) return;
+        const ctx = this.plugin.settings.searchOpensInContext !== false;
+        const focusTarget = ctx ? (item.node.parent ?? ROOT_ID) : item.node.id;
+        const cursor = ctx ? item.node.id : undefined;
+        const newTab = this.plugin.settings.searchOpensInNewTab !== false;
+        if (newTab) { void this.openNoteInNewTab(this.noteFolder, focusTarget, cursor); return; }
+        if (cursor) this.pendingCursorId = cursor as StashpadId;
+        this.navigateTo(focusTarget);
       },
       // No cross-folder source — in-parent search is intentionally local.
     }).open();
@@ -12852,6 +13025,34 @@ export class StashpadView extends ItemView {
   private async deleteSavedSearch(name: string): Promise<void> {
     this.plugin.settings.savedSearches = (this.plugin.settings.savedSearches ?? []).filter((s) => s.name !== name);
     await this.plugin.saveSettings();
+  }
+
+  /** 0.405.0: the search scope's human label. */
+  searchScopeLabel(): string {
+    switch (getSettings().searchScopeMode) {
+      case "list": return "Find in list";
+      case "parent": return "Search in parent";
+      default: return "Search all";
+    }
+  }
+
+  /** 0.405.0: run the search matching the persisted scope. */
+  cmdSearchScoped(): void {
+    switch (getSettings().searchScopeMode) {
+      case "list": this.toggleFindInList(); break;
+      case "parent": this.openSearchInParentModal(); break;
+      default: this.openSearchModal(); break;
+    }
+  }
+
+  /** 0.405.0: cycle the search scope all → list → parent, persist, notify. */
+  async cmdCycleSearchScope(): Promise<void> {
+    const order = ["all", "list", "parent"] as const;
+    const cur = getSettings().searchScopeMode;
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    this.plugin.settings.searchScopeMode = next;
+    try { await this.plugin.saveSettings(); } catch { /* ignore */ }
+    new Notice(`Search: ${this.searchScopeLabel()}`);
   }
 
   openSearchModal(): void {
@@ -19922,7 +20123,7 @@ export class StashpadView extends ItemView {
     // list (you might need to move a note, select others, or edit in the
     // composer, all of which live underneath). `dismiss` closes this modal.
     let modalRef: MediaViewerModal | null = null;
-    const dismiss = (): void => { modalRef?.close(); modalRef = null; };
+    const dismiss = (): void => { modalRef?.close(); modalRef = null; this.openPreviewModal = null; };
     const noteItem: MediaItem = {
       path: node.file.path, file: node.file,
       note: {
@@ -19940,6 +20141,7 @@ export class StashpadView extends ItemView {
       if (ai >= 0) startIndex = ai + 1;
     }
     modalRef = new MediaViewerModal(this.app, [noteItem, ...attachItems], startIndex, (f) => this.openAttachmentInTab(f));
+    this.openPreviewModal = modalRef;
     modalRef.open();
   }
 
