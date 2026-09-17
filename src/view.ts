@@ -31,7 +31,7 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow} from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow, NestRepliesModal, QuickCaptureNestModal} from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import { AppImportModal } from "./stashpad-app-import-modal";
 import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
@@ -1219,6 +1219,11 @@ export class StashpadView extends ItemView {
     // for normal leaves. Captured so onClose removes it from the same one. 0.140.17
     this.keydownWindow = (this.containerEl?.ownerDocument?.defaultView ?? window) as Window;
     this.keydownWindow.addEventListener("keydown", this.onDocKeyDown, true);
+    // 0.409.0: a leaf can be MOVED between windows (drag a popout tab into the
+    // main window, or vice versa) after onOpen. The listener above stays bound to
+    // the OLD window, so hotkeys in the tab went dead until it was closed and
+    // reopened. Re-bind when the layout changes and our window has changed.
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.rebindKeydownWindow()));
     this.loadConfig();
     // 0.208.3: DEFER the bootstrap by one task. Do not make it eager again.
     //
@@ -3788,11 +3793,16 @@ export class StashpadView extends ItemView {
     const clear = bar.createEl("button", { cls: "stashpad-findbar-clear", attr: { "aria-label": "Clear / close find" } });
     setIcon(clear, "x");
     input.addEventListener("input", () => {
+      // 0.408.0: debounce the LIST re-render (and the body-match pass) until the
+      // user pauses, instead of re-rendering on every keystroke — much cheaper on
+      // a big list. findText updates immediately so the input stays live.
       this.findText = input.value;
-      this.refreshList();                    // instant title-level narrowing
-      this.updateFindCount();
       if (this.findDebounce != null) clearTimeout(this.findDebounce);
-      this.findDebounce = window.setTimeout(() => { void this.recomputeFindBodyMatches(); }, 180);
+      this.findDebounce = window.setTimeout(() => {
+        this.refreshList();
+        this.updateFindCount();
+        void this.recomputeFindBodyMatches();
+      }, 140);
     });
     input.addEventListener("keydown", (e) => {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); this.closeFindInList(); }
@@ -8609,6 +8619,107 @@ export class StashpadView extends ItemView {
   private replyIndex: Map<string, StashpadId[]> | null = null;
 
   /** 0.333.0: notes (in this folder's tree) whose `replyTo` resolves to `node`. */
+  /** 0.413.0: the same-folder note this note replies to (its reply target), or
+   *  null when it isn't a reply or its target lives in another folder (can't nest
+   *  across folders). */
+  private sameFolderReplyTargetId(node: TreeNode): StashpadId | null {
+    const r = this.resolveReplySourceFile(node);
+    if (!r || r.folder !== this.noteFolder) return null;
+    const t = this.tree.get(r.id as StashpadId);
+    return t && t.id !== node.id ? (r.id as StashpadId) : null;
+  }
+
+  /** 0.413.0: every descendant of `id` (depth-first), for the nest-all operation. */
+  private descendantsOf(id: StashpadId): TreeNode[] {
+    const out: TreeNode[] = [];
+    const walk = (pid: StashpadId): void => {
+      for (const c of this.tree.getChildren(pid)) { out.push(c); walk(c.id); }
+    };
+    walk(id);
+    return out;
+  }
+
+  /** 0.414.0: quick-capture a note under `parentId` (default nest) or, when the
+   *  toggle is off, under a note you pick with the composer's note picker. Used
+   *  from the file-preview modal's capture button and the command. */
+  quickCaptureUnder(parentId: StashpadId): void {
+    const parentNode = this.tree.get(parentId);
+    const label = parentNode && parentId !== ROOT_ID ? (this.titleForNode(parentNode).trim() || "this note") : "Home";
+    new QuickCaptureNestModal(this.app, {
+      defaultLabel: label,
+      onSave: (text, nestHere) => {
+        const body = text.trim();
+        if (!body) return;
+        if (nestHere) { void this.createNoteUnder(body, parentId).then(() => this.render()); return; }
+        // Off: pick a destination with the SAME note picker the composer uses.
+        new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+          mode: "pick", placeholder: "Nest the new note under which note?", allowCreate: false,
+          onPick: (item) => {
+            if (item.crossFolder) {
+              const tid = (item.crossId ?? item.id.replace(/^cross:/, "")) as StashpadId;
+              void this.createNoteUnder(body, tid, { targetFolder: item.crossFolder }).then(() => this.render());
+            } else {
+              void this.createNoteUnder(body, item.id as StashpadId).then(() => this.render());
+            }
+          },
+        }).open();
+      },
+    }).open();
+  }
+
+  /** Command entry: quick-capture under the cursored/selected note (else the
+   *  focused note). The preview modal wires its own button to quickCaptureUnder. */
+  cmdQuickCaptureUnder(): void {
+    const target = this.getActionTargets()[0] ?? this.headingNode() ?? this.tree.get(this.focusId) ?? null;
+    this.quickCaptureUnder((target?.id ?? this.focusId ?? ROOT_ID) as StashpadId);
+  }
+
+  /** 0.413.0: open the Nest Replies chooser. */
+  cmdNestReplies(): void {
+    new NestRepliesModal(this.app, {
+      onNestRepliesToSelection: () => void this.nestRepliesToSelection(),
+      onNestSelectionIntoTargets: () => void this.nestSelectionIntoTargets(),
+      onNestAllInSubtree: () => void this.nestAllRepliesInSubtree(),
+      subtreeLabel: this.titleForNode(this.tree.get(this.focusId) ?? this.tree.getRoot()).trim() || "this list",
+    }).open();
+  }
+
+  /** Nest every reply TO the cursored/selected note(s) INTO them. */
+  private async nestRepliesToSelection(): Promise<void> {
+    const targets = this.getActionTargets();
+    let moved = 0;
+    for (const t of targets) {
+      for (const r of this.repliesTo(t)) {
+        if (r.id === t.id || r.parent === t.id) continue;
+        if (await this.changeParent(r, t.id, { silentSuccess: true })) moved++;
+      }
+    }
+    new Notice(moved ? `Nested ${moved} repl${moved === 1 ? "y" : "ies"} under their note${targets.length === 1 ? "" : "s"}.` : "No replies to nest.");
+    this.render();
+  }
+
+  /** Nest the selected note(s) INTO the note(s) they're replying to. */
+  private async nestSelectionIntoTargets(): Promise<void> {
+    let moved = 0;
+    for (const x of this.getActionTargets()) {
+      const tid = this.sameFolderReplyTargetId(x);
+      if (tid && x.parent !== tid && await this.changeParent(x, tid, { silentSuccess: true })) moved++;
+    }
+    new Notice(moved ? `Nested ${moved} note${moved === 1 ? "" : "s"} into what they reply to.` : "None of the selection reply to a note in this folder.");
+    this.render();
+  }
+
+  /** Nest ALL replies in the focused subtree into the notes they reply to. */
+  private async nestAllRepliesInSubtree(): Promise<void> {
+    let moved = 0;
+    for (const n of this.descendantsOf(this.focusId)) {
+      const tid = this.sameFolderReplyTargetId(n);
+      if (tid && n.parent !== tid && await this.changeParent(n, tid, { silentSuccess: true })) moved++;
+    }
+    new Notice(moved ? `Nested ${moved} repl${moved === 1 ? "y" : "ies"} in this list into their targets.` : "No replies to nest in this list.");
+    this.render();
+  }
+
   private repliesTo(node: TreeNode): TreeNode[] {
     if (!node.file) return [];
     if (!this.replyIndex) {
@@ -9128,8 +9239,27 @@ export class StashpadView extends ItemView {
     const label = box.createDiv({ cls: "stashpad-reply-quote-label" });
     setIcon(label.createSpan({ cls: "stashpad-reply-quote-icon" }), "reply");
     label.createSpan({ cls: "stashpad-reply-quote-labeltext", text: "Reply to" });
+    // 0.409.0: an expand button opens the replied-to note in the file-preview
+    // modal \u2014 read it without scrolling to it in the list. stopPropagation so it
+    // doesn't also fire the box's jump-to-source click.
+    const expand = label.createEl("button", { cls: "stashpad-reply-quote-expand" });
+    setIcon(expand, "maximize-2");
+    expand.title = "Preview the replied-to note";
+    expand.setAttr("aria-label", expand.title);
+    expand.addEventListener("mousedown", (e) => e.stopPropagation());
+    expand.onclick = (e) => { e.preventDefault(); e.stopPropagation(); void this.previewReplySource(node); };
     box.createDiv({ cls: "stashpad-reply-quote-text", text: preview.length > 120 ? preview.slice(0, 120) + "\u2026" : preview });
     box.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); void this.revealReplySource(node); });
+  }
+
+  /** 0.409.0: open the replied-to note in the file-preview modal (no scroll). */
+  private async previewReplySource(node: TreeNode): Promise<void> {
+    const resolved = this.resolveReplySourceFile(node);
+    if (!resolved) { new Notice("Couldn't find the note this replies to."); return; }
+    const treeNode = resolved.folder === this.noteFolder ? this.tree.get(resolved.id as StashpadId) : null;
+    const previewNode: TreeNode = treeNode
+      ?? { id: resolved.id as StashpadId, parent: null, children: [], file: resolved.file, created: "" };
+    await this.openNotePreview(previewNode);
   }
 
   /** The human title from a `replyTo` value: the `[[path|Title]]` alias, or the
@@ -11316,6 +11446,18 @@ export class StashpadView extends ItemView {
   /** The window the keydown listener is bound to — the leaf's own (popout-aware).
    *  Defaults to the main window; set in onOpen. 0.140.17 */
   private keydownWindow: Window = window;
+
+  /** 0.409.0: move the keydown listener to this leaf's CURRENT window when the
+   *  leaf has been dragged between windows (popout ↔ main). No-op when unchanged. */
+  private rebindKeydownWindow(): void {
+    if (!this.viewRoot?.isConnected) return;
+    const win = (this.containerEl?.ownerDocument?.defaultView ?? window) as Window;
+    if (win === this.keydownWindow) return;
+    this.keydownWindow.removeEventListener("keydown", this.onDocKeyDown, true);
+    this.keydownWindow = win;
+    this.keydownWindow.addEventListener("keydown", this.onDocKeyDown, true);
+    this.plugin.trace("keydown:rebind", { moved: true });
+  }
   /** Last render-relevant settings signature this view acted on. Empty until the
    *  first broadcast, so the first one always renders. 0.268.13 */
   private settingsRenderSig = "";
@@ -20152,6 +20294,13 @@ export class StashpadView extends ItemView {
   private renderPreviewActions(host: HTMLElement, node: TreeNode, dismiss?: () => void): void {
     this.addReactionButton(host, node);
     this.maybeAddQuickButton(host, node);
+    // 0.414.0: quick-capture a nested note under THIS previewed note (or pick a
+    // destination). Doesn't dismiss the preview — the capture modal stacks over it.
+    const capture = host.createEl("button", { cls: "stashpad-pencil stashpad-note-capture" });
+    setIcon(capture, "plus");
+    capture.title = "Quick capture a note under this one";
+    capture.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
+    capture.onclick = (e) => { e.stopPropagation(); this.quickCaptureUnder(node.id); };
     const moreBtn = host.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
     rowIcon(moreBtn, "ellipsis-vertical");
     moreBtn.title = "More actions";

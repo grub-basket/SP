@@ -3287,6 +3287,19 @@ export default class StashpadPlugin extends Plugin {
       (this.app as unknown as { commands?: { executeCommandById?: (id: string) => void } })
         .commands?.executeCommandById?.("stashpad:stashpad-find-in-list");
     });
+    // 0.408.0: search ribbon entry — runs the CURRENT search scope (all /
+    // in-list / in-parent) on click; right-click cycles the scope. Mirrors the
+    // mobile composer search + scope buttons for desktop, where the composer's
+    // folder/search nav isn't shown.
+    const searchRibbon = this.addRibbonIcon("search", "Stashpad search — click to search (current scope), right-click to change scope", () => {
+      (this.app as unknown as { commands?: { executeCommandById?: (id: string) => void } })
+        .commands?.executeCommandById?.("stashpad:stashpad-search-scoped");
+    });
+    searchRibbon.addEventListener("contextmenu", (evt) => {
+      evt.preventDefault();
+      (this.app as unknown as { commands?: { executeCommandById?: (id: string) => void } })
+        .commands?.executeCommandById?.("stashpad:stashpad-cycle-search-scope");
+    });
     // 0.330.0: global quick-capture ribbon entry ("zap" — a quick, from-anywhere
     // note into a chosen Stashpad, with drag-drop + attach).
     this.addRibbonIcon("zap", "Stashpad quick capture", () => {
@@ -3973,6 +3986,9 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-reply-in-list", name: "Reply to… (pick in the list)", callback: () => call("cmdReplyInListPicker") });
     this.addCommand({ id: "stashpad-copy-links", name: "Copy link(s) from note (first / pick / all)", callback: () => call("cmdCopyLinks") });
     this.addCommand({ id: "stashpad-cycle-search-scope", name: "Cycle search scope (all / in-list / in-parent)", callback: () => call("cmdCycleSearchScope") });
+    this.addCommand({ id: "stashpad-search-scoped", name: "Search (current scope: all / in-list / in-parent)", callback: () => call("cmdSearchScoped") });
+    this.addCommand({ id: "stashpad-nest-replies", name: "Nest replies…", callback: () => call("cmdNestReplies") });
+    this.addCommand({ id: "stashpad-quick-capture-under", name: "Quick capture a nested note under the cursored note", callback: () => call("cmdQuickCaptureUnder") });
     this.addCommand({ id: "stashpad-preview-note", name: "Preview selected note", callback: () => call("cmdPreviewSelected") });
     this.addCommand({ id: "stashpad-preview-home", name: "Preview home (focused) note", callback: () => call("cmdPreviewHome") });
     this.addCommand({ id: "stashpad-composer-debug", name: "Debug: composer placeholder + autocomplete state", callback: () => call("cmdComposerDebug") });
@@ -6194,7 +6210,13 @@ export default class StashpadPlugin extends Plugin {
     if (own === true || own === false) return own;
     const folder = (file.parent?.path ?? "").replace(/\/+$/, "");
     const pf = this.settings.obscureFolders?.[folder];
-    return typeof pf === "boolean" ? pf : false;
+    if (typeof pf !== "boolean") return false;
+    // 0.407.0: honor the obscure SCHEDULE for folder-defaulted notes, exactly as
+    // the list does (view.isObscured) — outside the scheduled window a
+    // folder-obscured note stays CLEAR. The detail panel + aggregate index read
+    // this, so they were staying blurred off-hours while the list was clear.
+    if (pf && this.settings.obscureScheduleEnabled && !isWithinObscureSchedule(this.settings)) return false;
+    return pf;
   }
 
   getObscureAll(): boolean {

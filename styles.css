@@ -5651,6 +5651,27 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 .stashpad-detail-scroll.is-obscured .stashpad-detail-body :is(img, svg, video, canvas, iframe, .internal-embed) {
   filter: blur(10px);
 }
+/* 0.407.0: SOLID / shape conceal in the detail panel (parity with the list's
+   obscure-solid). Hide the text and draw a crisp bar instead of blurring. The
+   .obscure-solid class rides on the detail panel root. */
+.obscure-solid .stashpad-detail-scroll.is-obscured :is(.stashpad-detail-title, .stashpad-detail-body, .stashpad-detail-metarow) {
+  color: inherit;
+  text-shadow: none;
+  opacity: 1;
+  visibility: hidden;
+  position: relative;
+}
+.obscure-solid .stashpad-detail-scroll.is-obscured :is(.stashpad-detail-title, .stashpad-detail-body)::after {
+  content: "";
+  visibility: visible;
+  position: absolute;
+  inset: 0;
+  border-radius: 4px;
+  background: var(--background-modifier-border);
+}
+.obscure-solid .stashpad-detail-scroll.is-obscured .stashpad-detail-body :is(img, svg, video, canvas, iframe, .internal-embed) {
+  filter: none;
+}
 .stashpad-detail-footer-meta {
   display: flex;
   flex-direction: column;
@@ -8492,7 +8513,23 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
    the thin bottom toolbar stays so the toggle remains reachable. */
 .stashpad-media-modal.is-immersive .stashpad-media-header,
 .stashpad-media-modal.is-immersive .stashpad-media-rail { display: none; }
-.stashpad-media-railbadge.is-note { --stashpad-file-color: var(--text-accent); }
+/* 0.410.0: nicer rail badges — a coloured icon over the ext/label, centred. */
+.stashpad-media-railbadge {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
+  width: 100%; height: 100%;
+  color: var(--stashpad-file-color, var(--text-muted));
+}
+.stashpad-media-railbadge .svg-icon { width: 22px; height: 22px; }
+/* The note-itself badge: accent icon on a soft accent tint, so it reads clearly
+   as "the note" rather than a grey file glyph. */
+.stashpad-media-railbadge.is-note {
+  --stashpad-file-color: var(--interactive-accent);
+  background: color-mix(in srgb, var(--interactive-accent) 12%, var(--background-secondary));
+}
+.stashpad-media-railbadge.is-note .svg-icon { width: 24px; height: 24px; }
+.stashpad-media-railbadge.is-note .stashpad-media-railext {
+  color: var(--interactive-accent); font-weight: var(--font-bold); letter-spacing: 0.04em;
+}
 /* 0.376.1: the note's row action buttons, relayed to the END of the bottom
    toolbar so they line up with the other controls. The buttons keep their own
    `.stashpad-pencil` look (which renders the sprite icon correctly); we only
@@ -9980,6 +10017,15 @@ button.stashpad-reaction-chip,
   max-width: fit-content;
 }
 .stashpad-reply-quote-label { display: flex; align-items: center; gap: 5px; }
+/* 0.409.0: expand-to-preview button on the reply-quote block, pushed to the right. */
+.stashpad-reply-quote-expand {
+  margin-left: auto; flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; padding: 0; border: none; box-shadow: none;
+  background: transparent; color: var(--text-muted); cursor: pointer; border-radius: var(--radius-s);
+}
+.stashpad-reply-quote-expand:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-reply-quote-expand .svg-icon { width: 14px; height: 14px; }
 .stashpad-reply-quote-labeltext { font-weight: 600; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.03em; font-size: calc(var(--font-ui-smaller) - 1px); }
 .stashpad-reply-quote.is-clickable { cursor: pointer; }
 .stashpad-reply-quote.is-clickable:hover { background: var(--background-modifier-hover); color: var(--text-normal); }

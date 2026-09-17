@@ -118,6 +118,8 @@ export class MediaViewerModal extends Modal {
    *  drive). Sticky across slides within a viewer session; the switch button
    *  cycles it. */
   private pdfRenderMode: "auto" | "native" | "obsidian" = "auto";
+  private mouseNavHandler?: (e: MouseEvent) => void;
+  private mouseNavTarget?: Window;
   /** 0.377.1: the modal's note item (slide 0), if opened from a note — its
    *  note-level buttons (copy-link / jump-parent / relayed actions) persist on
    *  every slide, since the whole preview is about this one note. */
@@ -151,10 +153,21 @@ export class MediaViewerModal extends Modal {
 
   onOpen(): void {
     this.modalEl.addClass("stashpad-media-modal");
-    // (Mouse back/forward for prev/next was tried and dropped: Obsidian hijacks
-    // buttons 3/4 for tab-history navigation at a level a modal can't reliably
-    // preempt — the same reason the main view offers Alt+Arrow instead. The
-    // viewer already has ArrowLeft/ArrowRight for prev/next.)
+    // 0.415.0: mouse BACK / FORWARD buttons page the rail (prev / next slide)
+    // while the viewer is open. Registered on the modal's own window in the
+    // CAPTURE phase and torn down in onClose. preventDefault on the aux-button
+    // mousedown suppresses Chromium's native history navigation; the matching
+    // auxclick is swallowed too. (The viewer also has ArrowLeft/ArrowRight.)
+    this.mouseNavTarget = this.modalEl.ownerDocument.defaultView ?? window;
+    this.mouseNavHandler = (e: MouseEvent): void => {
+      if (e.button !== 3 && e.button !== 4) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (e.type === "mousedown") this.go(e.button === 3 ? -1 : 1);
+    };
+    for (const type of ["mousedown", "mouseup", "auxclick"]) {
+      this.mouseNavTarget.addEventListener(type, this.mouseNavHandler as EventListener, true);
+    }
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("stashpad-media-root");
@@ -204,6 +217,17 @@ export class MediaViewerModal extends Modal {
     act("external-link", "Open in a new tab", () => {
       const f = this.items[this.idx]?.file;
       if (f) { this.close(); this.onOpenInTab(f); }
+    });
+    // 0.412.0: open the current file in a NEW Obsidian window (popout), so it can
+    // sit alongside the list. Note or attachment alike.
+    act("picture-in-picture-2", "Open in a new window", () => {
+      const f = this.items[this.idx]?.file;
+      if (!f) return;
+      this.close();
+      try {
+        const leaf = this.app.workspace.openPopoutLeaf();
+        void leaf.openFile(f, { active: true });
+      } catch { this.onOpenInTab(f); } // fall back to a tab if popouts are unavailable
     });
     // 0.272.4: copy — the image itself to the clipboard for images, the
     // attachment link for anything else.
@@ -280,6 +304,13 @@ export class MediaViewerModal extends Modal {
   }
 
   onClose(): void {
+    if (this.mouseNavTarget && this.mouseNavHandler) {
+      for (const type of ["mousedown", "mouseup", "auxclick"]) {
+        this.mouseNavTarget.removeEventListener(type, this.mouseNavHandler as EventListener, true);
+      }
+    }
+    this.mouseNavHandler = undefined;
+    this.mouseNavTarget = undefined;
     this.disposePdfEmbed();
     this.disposeNoteRender();
     this.contentEl.empty();

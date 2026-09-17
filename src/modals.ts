@@ -2934,6 +2934,81 @@ export class ColorPickerModal extends Modal {
 /** 0.319.0: review every composer draft (or one folder's) — load into the
  *  composer or delete. Drafts from other devices arrive via settings sync and
  *  show their device label; an edit-in-progress shows the note it edits. */
+/** 0.413.0: the Nest Replies chooser — a few one-click options for tidying a
+ *  thread of replies into a nested structure. */
+export interface NestRepliesCallbacks {
+  onNestRepliesToSelection: () => void;
+  onNestSelectionIntoTargets: () => void;
+  onNestAllInSubtree: () => void;
+  subtreeLabel: string;
+}
+export class NestRepliesModal extends Modal {
+  constructor(app: App, private cbs: NestRepliesCallbacks) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText("Nest replies");
+    const c = this.contentEl;
+    c.empty();
+    c.createDiv({ cls: "stashpad-drafts-help", text: "Reorganize replies into a nested thread. Nesting moves notes (changes their parent); it's undoable." });
+    const opt = (title: string, desc: string, icon: string, fn: () => void): void => {
+      const row = new Setting(c).setName(title).setDesc(desc);
+      row.addButton((b) => b.setIcon(icon).setCta().setTooltip(title).onClick(() => { this.close(); fn(); }));
+    };
+    opt(
+      "Nest replies under the selected note(s)",
+      "Move every note replying to the cursored/selected note(s) so they become children of it.",
+      "corner-down-right",
+      this.cbs.onNestRepliesToSelection,
+    );
+    opt(
+      "Nest the selected note(s) into what they reply to",
+      "Move each selected reply under the note it replies to.",
+      "corner-left-up",
+      this.cbs.onNestSelectionIntoTargets,
+    );
+    opt(
+      `Nest all replies in “${this.cbs.subtreeLabel}”`,
+      "Move every reply in the current list under the note it replies to.",
+      "list-tree",
+      this.cbs.onNestAllInSubtree,
+    );
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.414.0: quick-capture a note from the file-preview modal (or a command). A
+ *  toggle (default on) nests the new note under the current note; off lets you
+ *  pick a destination via the composer's note picker on save. */
+export interface QuickCaptureNestOpts {
+  defaultLabel: string;
+  onSave: (text: string, nestHere: boolean) => void;
+}
+export class QuickCaptureNestModal extends Modal {
+  constructor(app: App, private opts: QuickCaptureNestOpts) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText("Quick capture");
+    const c = this.contentEl;
+    c.empty();
+    const ta = c.createEl("textarea", { cls: "stashpad-qc-input", attr: { placeholder: "Write a note…  (Ctrl/Cmd+Enter to save)", rows: "4", spellcheck: "true" } });
+    let nestHere = true;
+    new Setting(c)
+      .setName(`Nest under “${this.opts.defaultLabel}”`)
+      .setDesc("On: the note becomes a child of this note. Off: pick where it goes when you save.")
+      .addToggle((t) => t.setValue(true).onChange((v) => { nestHere = v; }));
+    const save = (): void => {
+      const text = ta.value;
+      if (!text.trim()) { new Notice("Nothing to capture."); return; }
+      this.close();
+      this.opts.onSave(text, nestHere);
+    };
+    const actions = c.createDiv({ cls: "stashpad-split-actions" });
+    actions.createEl("button", { text: "Cancel" }).onclick = () => this.close();
+    actions.createEl("button", { text: "Save", cls: "mod-cta" }).onclick = save;
+    ta.addEventListener("keydown", (e) => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); save(); } });
+    window.setTimeout(() => ta.focus(), 30);
+  }
+  onClose(): void { this.contentEl.empty(); }
+}
+
 export class ComposerDraftsModal extends Modal {
   constructor(app: App, private plugin: StashpadPlugin, private folder?: string) { super(app); }
   onOpen(): void {

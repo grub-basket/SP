@@ -246,6 +246,10 @@ export class StashpadDetailView extends ItemView {
     // 0.272.4: the detail panel obscures with the note, like the list does —
     // otherwise a blurred note is plainly readable the moment the cursor lands
     // on it. Tap to reveal (per file, in-memory); a different note re-blurs.
+    // 0.407.0: mirror the list's conceal METHOD so "solid / shape" conceal
+    // applies here too (the detail panel only ever blurred). The class rides on
+    // the panel root; the CSS has a solid variant scoped under it.
+    root.toggleClass("obscure-solid", this.plugin.settings.obscureStyle === "solid");
     if (this.plugin.isFileObscured(file) && this.detailObscureRevealed !== file.path) {
       scroll.addClass("is-obscured");
       scroll.addEventListener("click", (e) => {
