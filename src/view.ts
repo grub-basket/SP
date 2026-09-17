@@ -263,6 +263,8 @@ export class StashpadView extends ItemView {
    *  inactive; "" = bar open but empty (shows everything). Title matches live in
    *  filterChildren; body matches are precomputed async into findBodyMatches. */
   private findText: string | null = null;
+  /** 0.392.0: list position captured when find-in-list opened. */
+  private findSavedScroll: { anchor: { id: StashpadId; offsetFromListTop: number } | null; scrollTop: number; stick: boolean } | null = null;
   private findBodyMatches: Set<StashpadId> = new Set();
   private findBarEl: HTMLElement | null = null;
   private findInputEl: HTMLInputElement | null = null;
@@ -521,6 +523,10 @@ export class StashpadView extends ItemView {
   /** When true, the listResizeObserver re-pins scroll to the bottom each time
    *  the list grows. Set after scrollListToBottom; cleared on user scroll. */
   private stickToListBottom = false;
+  /** 0.392.0: performance.now() of the last Stashpad bottom-pin write. The
+   *  scroll-event unlatch ignores scroll-ups within 250ms of one (a virtualized
+   *  re-window right after a pin can shift scrollTop down). */
+  private lastPinWriteAt = 0;
   /** 0.295.2: rAF id of scrollListToBottom's pin watchdog, so onClose can cancel
    *  it. Without this the loop keeps a reference to the (detached) list element
    *  for up to 30s after the view closes. */
@@ -3645,6 +3651,16 @@ export class StashpadView extends ItemView {
   toggleFindInList(): void {
     if (this.findText !== null) { this.closeFindInList(); return; }
     if (!this.listEl) { this.render(); }
+    // 0.392.0: remember where the user was so close/clear can put them back
+    // (refreshList alone can't — the filtered list's scrollTop is meaningless
+    // for the full one). Drop the bottom latch while filtering so the results
+    // aren't pinned to the bottom.
+    this.findSavedScroll = {
+      anchor: this.captureScrollAnchor(),
+      scrollTop: this.listEl?.scrollTop ?? 0,
+      stick: this.stickToListBottom,
+    };
+    this.stickToListBottom = false;
     this.findText = "";
     this.findBodyMatches = new Set();
     this.refreshList();      // rebuilds the list; renderInner isn't hit, so mount here
@@ -3661,6 +3677,19 @@ export class StashpadView extends ItemView {
     this.findBarEl = null;
     this.findInputEl = null;
     this.refreshList();
+    this.restoreFindSavedScroll(true);
+    this.findSavedScroll = null;
+  }
+
+  /** 0.392.0: put the list back where it was when find opened. */
+  private restoreFindSavedScroll(closing: boolean): void {
+    const saved = this.findSavedScroll;
+    if (!saved || !this.listEl) return;
+    // Re-arm the bottom latch only when find is closing; a clear leaves the
+    // bar open, and a latched list would pin the next filtered results.
+    if (saved.stick && closing) this.scrollListToBottom();
+    else if (saved.stick) this.listEl.scrollTop = this.listEl.scrollHeight;
+    else this.restoreScrollAnchor(saved.anchor, saved.scrollTop);
   }
 
   /** 0.329.0: (re)create the find bar above the list when find is active. Called
@@ -3690,7 +3719,7 @@ export class StashpadView extends ItemView {
       if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); this.closeFindInList(); }
     });
     clear.onclick = () => {
-      if (input.value) { input.value = ""; this.findText = ""; this.findBodyMatches = new Set(); this.refreshList(); input.focus(); }
+      if (input.value) { input.value = ""; this.findText = ""; this.findBodyMatches = new Set(); this.refreshList(); this.restoreFindSavedScroll(false); input.focus(); }
       else this.closeFindInList();
     };
     this.findBarEl = bar;
@@ -4772,6 +4801,7 @@ export class StashpadView extends ItemView {
         if (Date.now() < this.keyboardTransitionUntil) return;
         // Sticky-to-bottom mode: every growth of the list jumps to the new bottom.
         if (this.stickToListBottom) {
+          this.lastPinWriteAt = performance.now();
           targetList.scrollTop = targetList.scrollHeight;
           settleTop = targetList.scrollTop;
           return;
@@ -4821,6 +4851,25 @@ export class StashpadView extends ItemView {
       targetList.addEventListener("keydown", () => {
         this.stickToListBottom = false;
       });
+      // 0.392.0: the listeners above miss scroll-ups that arrive without a
+      // wheel/touch/mouse/key event on the list (iOS status-bar tap, momentum,
+      // scrollbar drag, find-in-page), which left the flag latched and the next
+      // render re-pinned to the bottom ("jumps to bottom"). Clear it from the
+      // scroll event itself: scrollTop went DOWN and we're clearly off the
+      // bottom. Stashpad's own pin writes only move scrollTop up, and a
+      // content-shrink clamp lands AT the bottom, so neither trips this.
+      let lastScrollTop = targetList.scrollTop;
+      targetList.addEventListener("scroll", () => {
+        const top = targetList.scrollTop;
+        const gap = targetList.scrollHeight - top - targetList.clientHeight;
+        if (this.stickToListBottom && top < lastScrollTop - 2 && gap > 8
+            && Date.now() >= this.keyboardTransitionUntil
+            && performance.now() - this.lastPinWriteAt > 250) {
+          this.plugin.trace("r1:unlatch", { from: Math.round(lastScrollTop), to: Math.round(top), gap: Math.round(gap) });
+          this.stickToListBottom = false;
+        }
+        lastScrollTop = top;
+      }, { passive: true });
     }
   }
 
@@ -9043,7 +9092,21 @@ export class StashpadView extends ItemView {
 
   /** Scroll a rendered row to the top of the list and briefly flash it. */
   private flashRowIntoView(row: HTMLElement): void {
-    row.scrollIntoView({ block: "start", behavior: "auto" });
+    // 0.392.1: align the row's top just BELOW the sticky heading row. A plain
+    // scrollIntoView({block:"start"}) parked it under the heading, so the jump
+    // landed partway down the target note. Re-align next frame too, in case a
+    // virtualized re-window shifted rows above it.
+    const list = this.listEl;
+    this.stickToListBottom = false;
+    const align = (): void => {
+      if (!list || !row.isConnected) return;
+      const heading = list.querySelector<HTMLElement>(".stashpad-focused.is-heading-row");
+      const cover = heading && heading !== row ? heading.offsetHeight : 0;
+      const delta = row.getBoundingClientRect().top - list.getBoundingClientRect().top - cover;
+      if (Math.abs(delta) > 1) list.scrollTop += delta;
+    };
+    if (list) { align(); requestAnimationFrame(align); }
+    else row.scrollIntoView({ block: "start", behavior: "auto" });
     row.classList.add("stashpad-row-flash");
     window.setTimeout(() => row.classList.remove("stashpad-row-flash"), 1200);
   }
@@ -20978,6 +21041,7 @@ export class StashpadView extends ItemView {
     // let every settle loop bail the moment a newer pin supersedes it.
     const token = ++this.scrollPinToken;
     this.stickToListBottom = true;
+    this.lastPinWriteAt = performance.now();
     list.scrollTop = list.scrollHeight;
     this.plugin.trace("r1:scroll", {
       folder: this.noteFolder, mobile: Platform.isMobile, virt: !!this.virt,
@@ -21008,8 +21072,12 @@ export class StashpadView extends ItemView {
       let tries = 0;
       let lastH = -1;
       let stableStreak = 0;
+      // 0.392.0: refreshList() keeps the same list element, so isConnected
+      // never trips when find-in-list re-filters — bail when the find text changes.
+      const findAtStart = this.findText;
       const settle = (): void => {
-        if (this.scrollPinToken !== token || !list.isConnected || !this.stickToListBottom || tries >= 16) {
+        if (this.scrollPinToken !== token || !list.isConnected || !this.stickToListBottom || tries >= 16
+            || this.findText !== findAtStart) {
           // Bailing for any reason (superseded, detached, user scrolled, cap) —
           // never leave the list stuck hidden.
           this.revealSettlingList();
@@ -21025,7 +21093,7 @@ export class StashpadView extends ItemView {
         // and until it lands the rendered rows are the ones built for the OLD
         // scrollTop — pinned to the bottom of the scroll height but showing the
         // bottom spacer instead of the newest note. No-op for non-virt lists.
-        if (!kbd) { list.scrollTop = list.scrollHeight; this.virtUpdate(); }
+        if (!kbd) { this.lastPinWriteAt = performance.now(); list.scrollTop = list.scrollHeight; this.virtUpdate(); }
         const h = list.scrollHeight;
         const gap = h - list.scrollTop - list.clientHeight;
         this.plugin.trace("r1:settle", {
@@ -21107,6 +21175,7 @@ export class StashpadView extends ItemView {
       if (!list.isConnected) return;
       const h = list.scrollHeight;
       if (h !== lastH) {
+        this.lastPinWriteAt = performance.now();
         list.scrollTop = h;
         lastH = h;
       }
