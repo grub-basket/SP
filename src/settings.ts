@@ -936,6 +936,10 @@ export interface StashpadSettings {
   /** 0.332.0: show the formatting toolbar (bold/italic/highlight/code/link/
    *  checkbox/spoiler) at the top of the composer. On by default. */
   showComposerToolbar: boolean;
+  /** 0.419.0: on mobile the composer formatting toolbar is collapsed by default
+   *  (it eats vertical space on a phone); a toggle beneath the composer expand
+   *  button shows/hides it. Desktop always shows the toolbar. */
+  composerToolbarCollapsedMobile: boolean;
   /** 0.207.0: line-number gutter beside the edit/split editor (desktop). */
   showEditorLineNumbers: boolean;
   /** 0.73.14: when on, the row under the keyboard cursor temporarily
@@ -1271,6 +1275,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   tabIndentsProse: false,
   lastCaptureFolder: "",
   showComposerToolbar: true,
+  composerToolbarCollapsedMobile: true,
   showEditorLineNumbers: true,
   autoNavOnMoveOut: false,
   pinnedFilterMode: "all",

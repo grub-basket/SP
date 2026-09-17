@@ -8219,6 +8219,9 @@ export class StashpadView extends ItemView {
    *  or the selection from the textarea. */
   private renderComposerToolbar(composer: HTMLElement): void {
     if (!getSettings().showComposerToolbar) return;
+    // 0.419.0: on mobile the toolbar is collapsible (see the toggle button beside
+    // the composer expand control). The class only bites on mobile in CSS.
+    composer.toggleClass("is-toolbar-collapsed", getSettings().composerToolbarCollapsedMobile);
     // 0.336.0: shared with the edit modal (formatting-toolbar.ts). Tag +
     // internal-link lead the row (user request), then the inline-format buttons.
     renderFormattingToolbar(composer, () => this.composerInputEl, {
@@ -9734,6 +9737,29 @@ export class StashpadView extends ItemView {
     fsBtn.setAttr("aria-label", "Open in the full editor");
     fsBtn.onmousedown = (e) => e.preventDefault();
     fsBtn.onclick = (e) => { e.preventDefault(); this.cmdComposerFullscreen(); };
+
+    // 0.419.0: mobile-only toggle for the formatting toolbar (it eats vertical
+    // space on a phone). Sits just beneath the expand button. CSS hides it on
+    // desktop, where the toolbar is always shown.
+    if (Platform.isMobile && getSettings().showComposerToolbar) {
+      const tbToggle = taWrap.createEl("button", { cls: "stashpad-composer-toolbar-toggle" });
+      const syncToggle = () => {
+        const collapsed = getSettings().composerToolbarCollapsedMobile;
+        setIcon(tbToggle, collapsed ? "chevron-down" : "chevron-up");
+        tbToggle.title = collapsed ? "Show formatting toolbar" : "Hide formatting toolbar";
+        tbToggle.toggleClass("is-active", !collapsed);
+      };
+      syncToggle();
+      tbToggle.onmousedown = (e) => e.preventDefault();
+      tbToggle.onclick = (e) => {
+        e.preventDefault();
+        const next = !getSettings().composerToolbarCollapsedMobile;
+        this.plugin.settings.composerToolbarCollapsedMobile = next;
+        void this.plugin.saveSettings();
+        this.composerRootEl?.toggleClass("is-toolbar-collapsed", next);
+        syncToggle();
+      };
+    }
 
     // Debounce non-empty saves so fast typing doesn't queue a disk write
     // per keystroke (a real issue on slow / network drives). Empty/clear

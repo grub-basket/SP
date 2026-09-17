@@ -3009,6 +3009,46 @@ export class QuickCaptureNestModal extends Modal {
   onClose(): void { this.contentEl.empty(); }
 }
 
+/** 0.418.0: browse + restore the per-device settings backups (SettingsBackupStore
+ *  writes them to a sync-excluded vault folder). Restoring snapshots the current
+ *  settings first, so it's reversible. */
+export class SettingsBackupModal extends Modal {
+  constructor(app: App, private plugin: StashpadPlugin) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText("Restore settings from a backup");
+    void this.render();
+  }
+  onClose(): void { this.contentEl.empty(); }
+  private async render(): Promise<void> {
+    const c = this.contentEl;
+    c.empty();
+    c.createDiv({ cls: "stashpad-drafts-help", text: "Per-device snapshots of your settings (data.json), kept in a sync-excluded vault folder so another device overwriting your settings can't erase them. Restoring first snapshots your CURRENT settings (as “<device>-before-restore”), writes the chosen one, then asks you to reload." });
+    const groups = await this.plugin.settingsBackup.list();
+    if (!groups.length) { c.createDiv({ cls: "stashpad-drafts-empty", text: "No settings backups yet — they're written automatically (~every 90s while settings change)." }); return; }
+    const me = this.plugin.deviceId();
+    const mo = moment as unknown as (ms: number) => { format: (f: string) => string; fromNow: () => string };
+    for (const g of groups) {
+      c.createDiv({ cls: "stashpad-drafts-folder", text: g.device === me ? `${g.device} — this device` : g.device });
+      for (const b of g.backups) {
+        const row = c.createDiv({ cls: "stashpad-drafts-row" });
+        const meta = row.createDiv({ cls: "stashpad-drafts-meta" });
+        meta.createSpan({ text: `${mo(b.ts).format("MMM D, YYYY · h:mm A")}  ·  ${mo(b.ts).fromNow()}` });
+        const actions = row.createDiv({ cls: "stashpad-drafts-actions" });
+        const restore = actions.createEl("button", { cls: "mod-cta", text: "Restore" });
+        restore.onclick = () => {
+          new ConfirmModal(
+            this.app,
+            "Restore this settings backup?",
+            `This replaces your current settings with the ${g.device === me ? "this-device" : g.device} snapshot from ${mo(b.ts).format("MMM D, h:mm A")}. Your current settings are saved as a “before-restore” backup first, so you can undo it. You'll need to reload Obsidian to apply everywhere.`,
+            "Restore",
+            (ok) => { if (ok) { void this.plugin.restoreSettingsBackup(b.path).then(() => this.close()); } },
+          ).open();
+        };
+      }
+    }
+  }
+}
+
 export class ComposerDraftsModal extends Modal {
   constructor(app: App, private plugin: StashpadPlugin, private folder?: string) { super(app); }
   onOpen(): void {

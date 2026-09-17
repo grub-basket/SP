@@ -23,7 +23,7 @@ import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-vie
 import { ViewLauncherModal } from "./view-launcher";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
-import { ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult} from "./modals";
+import { ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult, SettingsBackupModal} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
 import { writeClipboardText } from "./cross-vault-clipboard";
@@ -52,6 +52,7 @@ import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { createAliasesForFolder } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
+import { setNotifySink } from "./notify";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
 const SHORTCUT_DIR = "Stashpad Shortcuts";
@@ -2582,6 +2583,9 @@ export default class StashpadPlugin extends Plugin {
     // loadSettings so the data.json move is in place when we read.
     await this.migrateLegacyPaths();
     await this.loadSettings();
+    // 0.416.0: point the notify() shorthand at the notification log, so every
+    // toast routed through it is recorded + persisted (see src/notify.ts).
+    setNotifySink(this.notifications);
     // Before perf.enabled is read from it: a diagnostic left on for over a
     // week switches itself back off here.
     await this.expireStaleDiagnostics();
@@ -3995,6 +3999,7 @@ export default class StashpadPlugin extends Plugin {
     // 0.319.0: drafts machinery (+ the edit-in-composer provision, deliberately
     // command-only until the UX is decided — see .claude/TODO.md "editing model").
     this.addCommand({ id: "stashpad-composer-drafts", name: "Show composer drafts", callback: () => this.openComposerDrafts() });
+    this.addCommand({ id: "stashpad-restore-settings-backup", name: "Restore settings from a backup…", callback: () => new SettingsBackupModal(this.app, this).open() });
     this.addCommand({ id: "stashpad-edit-in-composer", name: "Edit note in the composer (experimental)", callback: () => call("beginComposerEdit") });
     this.addCommand({ id: "stashpad-focus-list", name: "Focus the list (leave the composer)", callback: () => call("cmdFocusList") });
     this.addCommand({ id: "stashpad-toggle-obscured", name: "Obscure / reveal note (blur \u2014 visual only, not encryption)", callback: () => call("cmdToggleObscured") });

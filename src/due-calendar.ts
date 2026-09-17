@@ -218,7 +218,10 @@ export async function renderDueCalendar(
       const SHOWN = 3;
       for (const h of hits.slice(0, SHOWN)) chipFor(cell, h, opts);
       if (hits.length > SHOWN) {
-        const more = cell.createEl("button", { cls: "stashpad-cal-more", text: `+${hits.length - SHOWN} more` });
+        // 0.417.0: a month cell is ~50px wide on a phone, so "+62 more" truncated to
+        // "+62 mor". Mobile shows just "+62" (the count is the information).
+        const extra = hits.length - SHOWN;
+        const more = cell.createEl("button", { cls: "stashpad-cal-more", text: document.body.classList.contains("is-mobile") ? `+${extra}` : `+${extra} more` });
         more.onclick = () => { state.openDay = state.openDay === dayStr ? null : dayStr; rerender(); };
       }
       if (hits.length) cell.addClass("has-hits");

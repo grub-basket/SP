@@ -1,4 +1,5 @@
-import { App, Component, ItemView, MarkdownRenderer, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { App, Component, ItemView, MarkdownRenderer, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { renderCountBadge } from "./panels-view";
 import { ComposerAutocomplete } from "./composer-autocomplete";
@@ -385,7 +386,7 @@ export class StashpadDetailView extends ItemView {
     if (!text) return;
     const view = this.plugin.lastActiveStashpadLeaf?.view as any;
     if (!view || view.getViewType?.() !== STASHPAD_VIEW_TYPE || typeof view.createNoteUnder !== "function") {
-      new Notice("Open a Stashpad view to add notes.");
+      notify("Open a Stashpad view to add notes.");
       return;
     }
     // createNoteUnder is view-private but callable at runtime; the
@@ -394,7 +395,7 @@ export class StashpadDetailView extends ItemView {
     try {
       await view.createNoteUnder(text, sel.id);
     } catch (e) {
-      new Notice(`Couldn't add note: ${(e as Error).message}`);
+      notify(`Couldn't add note: ${(e as Error).message}`);
       return;
     }
     // Clear the draft + textarea, re-render to show the new child,
@@ -615,7 +616,7 @@ export class StashpadDetailView extends ItemView {
       const leaf = await this.plugin.activateViewForFolder(folder);
       if (id !== ROOT_ID) this.plugin.navigateLeafTo(leaf, folder, id);
     } catch (e) {
-      new Notice(`Couldn't open: ${(e as Error).message}`);
+      notify(`Couldn't open: ${(e as Error).message}`);
     }
   }
 }
@@ -630,7 +631,7 @@ export async function openStashpadDetailView(app: App): Promise<void> {
   }
   const leaf = app.workspace.getRightLeaf(false);
   if (!leaf) {
-    new Notice("Stashpad: couldn't open the detail panel.");
+    notify("Stashpad: couldn't open the detail panel.");
     return;
   }
   await leaf.setViewState({ type: STASHPAD_DETAIL_VIEW_TYPE, active: true });

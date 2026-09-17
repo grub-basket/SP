@@ -1,4 +1,5 @@
-import { App, Component, MarkdownRenderer, Menu, Modal, Notice, Platform, TFile, setIcon } from "obsidian";
+import { App, Component, MarkdownRenderer, Menu, Modal, Platform, TFile, setIcon } from "obsidian";
+import { notify } from "./notify";
 import { fileKindFor } from "./file-kinds";
 
 /** How the viewer presents the note's files.
@@ -357,8 +358,8 @@ export class MediaViewerModal extends Modal {
   private async copyNoteLink(): Promise<void> {
     const file = this.noteItem?.file;
     if (!file) return;
-    try { await navigator.clipboard.writeText(`[[${file.path}]]`); new Notice("Link copied."); }
-    catch { new Notice("Couldn't copy to the clipboard."); }
+    try { await navigator.clipboard.writeText(`[[${file.path}]]`); notify("Link copied."); }
+    catch { notify("Couldn't copy to the clipboard."); }
   }
 
   /** 0.377.0: save a copy of the current file to disk (a plain browser download,
@@ -375,7 +376,7 @@ export class MediaViewerModal extends Modal {
       a.click();
       window.setTimeout(() => URL.revokeObjectURL(url), 2000);
     } catch (e) {
-      new Notice(`Couldn't save the file: ${(e as Error).message}`);
+      notify(`Couldn't save the file: ${(e as Error).message}`);
     }
   }
 
@@ -386,7 +387,7 @@ export class MediaViewerModal extends Modal {
     const base = (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.();
     const shell = (window as unknown as { require?: (m: string) => { shell?: { showItemInFolder?: (p: string) => void } } }).require?.("electron")?.shell;
     if (base && shell?.showItemInFolder) shell.showItemInFolder(`${base}/${file.path}`);
-    else new Notice("Only available on the desktop app.");
+    else notify("Only available on the desktop app.");
   }
 
   /** 0.377.0: reveal the current file in Obsidian's own file-explorer sidebar. */
@@ -395,7 +396,7 @@ export class MediaViewerModal extends Modal {
     if (!file) return;
     const fe = (this.app as unknown as { internalPlugins?: { getPluginById?: (id: string) => { instance?: { revealInFolder?: (f: TFile) => void } } } }).internalPlugins?.getPluginById?.("file-explorer");
     if (fe?.instance?.revealInFolder) { this.close(); fe.instance.revealInFolder(file); }
-    else new Notice("The file explorer isn't available.");
+    else notify("The file explorer isn't available.");
   }
 
   /** 0.377.0: immersive mode — hide the header/toolbar/rail for a clean read. */
@@ -437,7 +438,7 @@ export class MediaViewerModal extends Modal {
     const order: Array<typeof this.pdfRenderMode> = ["auto", "native", "obsidian"];
     this.pdfRenderMode = order[(order.indexOf(this.pdfRenderMode) + 1) % order.length];
     const label = this.pdfRenderMode === "auto" ? "Auto" : this.pdfRenderMode === "native" ? "Native (selectable text)" : "Obsidian viewer";
-    new Notice(`PDF render: ${label}`);
+    notify(`PDF render: ${label}`);
     this.show();
   }
 
@@ -533,7 +534,7 @@ export class MediaViewerModal extends Modal {
    *  the attachment link for anything else. */
   private async copyCurrent(): Promise<void> {
     const file = this.items[this.idx]?.file;
-    if (!file) { new Notice("Nothing to copy."); return; }
+    if (!file) { notify("Nothing to copy."); return; }
     if (VIEWER_IMG_EXT.has(file.extension.toLowerCase()) && this.mediaEl instanceof HTMLImageElement && this.mediaEl.naturalWidth) {
       try {
         const canvas = document.createElement("canvas");
@@ -545,14 +546,14 @@ export class MediaViewerModal extends Modal {
         const blob: Blob = await new Promise((res, rej) =>
           canvas.toBlob((b) => (b ? res(b) : rej(new Error("could not encode the image"))), "image/png"));
         await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-        new Notice("Image copied to the clipboard.");
+        notify("Image copied to the clipboard.");
       } catch (err) {
-        new Notice(`Couldn't copy the image: ${(err as Error).message}`);
+        notify(`Couldn't copy the image: ${(err as Error).message}`);
       }
       return;
     }
-    try { await navigator.clipboard.writeText(`![[${file.path}]]`); new Notice("Attachment link copied."); }
-    catch { new Notice("Couldn't copy to the clipboard."); }
+    try { await navigator.clipboard.writeText(`![[${file.path}]]`); notify("Attachment link copied."); }
+    catch { notify("Couldn't copy to the clipboard."); }
   }
 
   // ---------- items ----------
