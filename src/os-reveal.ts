@@ -1,4 +1,5 @@
-import { Notice, Platform, type App } from "obsidian";
+import { Platform, type App } from "obsidian";
+import { notify } from "./notify";
 
 /** 0.215.0: revealing a vault file in the OS file manager, in one place.
  *
@@ -31,12 +32,12 @@ export function revealInOsFileManager(app: App, vaultPath: string): void {
       require?: (m: string) => { shell?: { showItemInFolder?: (p: string) => void } };
     }).require?.("electron")?.shell;
     if (!full || !shell?.showItemInFolder) {
-      new Notice(`Couldn't open ${name} on this platform.`);
+      notify(`Couldn't open ${name} on this platform.`);
       return;
     }
     shell.showItemInFolder(full);
   } catch (e) {
     console.warn("[Stashpad] showItemInFolder failed", vaultPath, e);
-    new Notice(`Couldn't open ${name}.`);
+    notify(`Couldn't open ${name}.`);
   }
 }

@@ -1,4 +1,5 @@
-import { App, Modal, Notice, Platform, setIcon } from "obsidian";
+import { App, Modal, Platform, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { renderFormattingToolbar } from "./formatting-toolbar";
@@ -154,8 +155,8 @@ export class QuickCaptureModal extends Modal {
   private async submit(): Promise<void> {
     if (this.submitting) return;
     const text = (this.textEl?.value ?? "").trim();
-    if (!text && this.staged.length === 0) { new Notice("Nothing to capture."); return; }
-    if (!this.folder) { new Notice("Pick a Stashpad to capture into."); return; }
+    if (!text && this.staged.length === 0) { notify("Nothing to capture."); return; }
+    if (!this.folder) { notify("Pick a Stashpad to capture into."); return; }
     this.submitting = true;
     try {
       const ok = await this.plugin.runQuickCapture(this.folder, text, this.staged, this.split);
@@ -167,7 +168,7 @@ export class QuickCaptureModal extends Modal {
         this.submitting = false;
       }
     } catch (e) {
-      new Notice(`Quick capture failed: ${(e as Error).message}`);
+      notify(`Quick capture failed: ${(e as Error).message}`);
       this.submitting = false;
     }
   }

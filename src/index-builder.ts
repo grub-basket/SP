@@ -1,4 +1,5 @@
 import { App, Modal, Notice, Setting, TFile, TFolder } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import type { StashpadSettings } from "./settings";
 import { bodyToSlug, buildFilename } from "./slug-service";
@@ -643,12 +644,12 @@ export class JdBuildConfirmModal extends Modal {
           try {
             const result = await buildJdIndexPreview(this.app, this.plugin, this.settings);
             if (result.error === "no-dest") {
-              new Notice("Set a Designated Stashpad folder for Index first.", 5000);
+              notify("Set a Designated Stashpad folder for Index first.", 5000);
               this.close();
               return;
             }
             if (result.error === "no-home") {
-              new Notice(
+              notify(
                 `"${this.settings.jdIndexStashpadFolder}" has no Stashpad home note. Open the folder in Stashpad first.`,
                 7000,
               );
@@ -663,7 +664,7 @@ export class JdBuildConfirmModal extends Modal {
             this.titleEl.empty();
             this.onOpen();
           } catch (err) {
-            new Notice(`Preview failed: ${(err as Error)?.message ?? err}`, 8000);
+            notify(`Preview failed: ${(err as Error)?.message ?? err}`, 8000);
           }
         });
       });

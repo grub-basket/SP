@@ -1,4 +1,5 @@
 import { MarkdownView, Notice, TFile } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import type { ReEncryptWatchEntry } from "./settings";
 
@@ -126,7 +127,7 @@ export class ReEncryptScheduler {
       // modal from a background timer (it may have locked during the countdown).
       if (!this.keyReady(folder)) { this.lastTouch.set(folder, Date.now()); return; }
       const ok = await this.plugin.lockNoteSubtree(e.folder, e.rootId as unknown as import("./types").StashpadId, null, { silent: true });
-      if (ok) new Notice(`Re-encrypted “${title}”.`);
+      if (ok) notify(`Re-encrypted “${title}”.`);
     }, 1000);
     // 0.140.1: track so dispose() clears it — a raw setInterval survived plugin
     // unload and wrote stale settings over the reloaded instance.

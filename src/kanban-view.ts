@@ -1,4 +1,5 @@
-import { ItemView, Notice, WorkspaceLeaf, setIcon, type ViewStateResult } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon, type ViewStateResult } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { STASHPAD_KANBAN_VIEW_TYPE, type StashpadId, fmAddTag, fmRemoveTag, writeCompletedFm } from "./types";
 import { collectIndexRows, type IndexRow } from "./aggregate-index";
@@ -162,7 +163,7 @@ export class StashpadKanbanView extends ItemView {
     const write = async (fn: (fm: Record<string, unknown>) => void): Promise<void> => {
       await this.app.fileManager.processFrontMatter(file, fn);
     };
-    try { await write(forward); } catch (e) { new Notice(`Stashpad: couldn't update note (${(e as Error).message})`); return; }
+    try { await write(forward); } catch (e) { notify(`Stashpad: couldn't update note (${(e as Error).message})`); return; }
     localFwd(); await this.render();
     // 0.365.1: undo/redo may run after a Refresh re-collected `rows`, leaving
     // the `card` this closure holds as an orphan — mutating it then changed

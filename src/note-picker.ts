@@ -1,6 +1,7 @@
 import { stripInlineMarkdown } from "./slug-service";
 import { parseNaturalDate } from "./natural-date";
-import { App, FuzzySuggestModal, Notice, Platform, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
+import { App, FuzzySuggestModal, Platform, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type { TreeIndex } from "./tree-index";
 import type { TreeNode } from "./types";
 import { ROOT_ID } from "./types";
@@ -1948,7 +1949,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // The candidate set is snapshotted on open; a note deleted while the picker
     // was up hands the caller a stale TFile. Guard the local-note case. 0.140.17
     if (item.node?.file && !this.app.vault.getAbstractFileByPath(item.node.file.path)) {
-      new Notice("That note no longer exists.");
+      notify("That note no longer exists.");
       return;
     }
     this.opts.onPick(item);

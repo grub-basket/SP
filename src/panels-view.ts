@@ -1,4 +1,5 @@
-import { App, ItemView, Menu, Notice, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { App, ItemView, Menu, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import {
   ROOT_ID,
@@ -1174,7 +1175,7 @@ export class StashpadPanelsView extends ItemView {
         writeCompletedFm(m, !(m.completed === true));
       });
     } catch (e) {
-      new Notice(`Couldn't update task: ${(e as Error).message}`);
+      notify(`Couldn't update task: ${(e as Error).message}`);
       return;
     }
     this.scheduleRender();
@@ -1204,7 +1205,7 @@ export async function openStashpadPanelsView(app: App): Promise<void> {
   }
   const leaf = app.workspace.getLeftLeaf(false);
   if (!leaf) {
-    new Notice("Stashpad: couldn't open the panels view.");
+    notify("Stashpad: couldn't open the panels view.");
     return;
   }
   await leaf.setViewState({ type: STASHPAD_PANELS_VIEW_TYPE, active: true });

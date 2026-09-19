@@ -1443,11 +1443,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-heading-stuck-line {
   display: block;
 }
-/* The attachment rail and anything else the body brought with it go too — the
-   collapsed heading is one line of text and nothing else. */
-.stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-attachment-rail {
-  display: none;
-}
+/* 0.420.0: the attachment rail STAYS visible while the heading is stuck/collapsed
+   (user request — attachments reachable without expanding). It now lives in
+   .stashpad-focused-rail-host, a sibling of the (hidden) .stashpad-focused-body,
+   so the body's display:none no longer takes it with it. The old rule that hid
+   .stashpad-attachment-rail here was removed. */
 /* Second lines, by definition — gone while collapsed. */
 .stashpad-focused.is-heading-row:is(.is-stuck, .is-heading-collapsed) .stashpad-note-authorship {
   display: none;
@@ -1532,6 +1532,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 .stashpad-focused-body > :first-child { margin-top: 0; }
 .stashpad-focused-body > :last-child { margin-bottom: 0; }
+/* 0.420.0: attachment-rail host for the focused heading — a full-width grid row
+   BELOW the body, so the rail survives the body's height cap / scroll window and
+   its display:none while the heading is stuck/collapsed. Collapses when empty. */
+.stashpad-focused-rail-host { grid-column: 1 / -1; min-width: 0; }
+.stashpad-focused-rail-host:empty { display: none; }
 .stashpad-focused-actions {
   display: flex;
   align-items: center;
@@ -2309,9 +2314,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 /* 0.419.0: mobile-only toggle for the composer formatting toolbar, tucked just
    beneath the expand button. Hidden on desktop (toolbar always shows there). */
 .stashpad-composer-toolbar-toggle { display: none; }
+/* 0.426.0: the hide/reveal toggle takes the TOP slot; the expand button drops
+   below it (they swap the 0.419 positions) when the toggle is present. */
+.is-mobile .stashpad-composer-input-wrap.has-toolbar-toggle .stashpad-composer-fullscreen { top: 35px; }
 .is-mobile .stashpad-composer-toolbar-toggle {
   position: absolute;
-  top: 35px;
+  top: 4px;
   right: 6px;
   width: 27px;
   height: 27px;
@@ -4512,6 +4520,13 @@ body.is-mobile .stashpad-okf-cta {
   background: var(--interactive-accent);
 }
 .stashpad-export-format { margin-top: 12px; display: flex; flex-direction: column; gap: 6px; }
+.stashpad-export-check { margin-top: 12px; display: flex; align-items: center; gap: 8px; }
+.stashpad-export-check label { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-export-actions { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; }
+/* Export documents embed this class set inline in the exported HTML (self-contained),
+ * but keeping the rules here documents the figure/asset-link contract. */
+.sp-export-figure { display: block; margin: .5rem 0; }
+.sp-export-asset-link { display: block; font-size: .8em; color: var(--text-muted); margin-top: 2px; }
 .stashpad-okf-formats { margin-top: 8px; }
 .stashpad-export-zipwarn {
   margin-top: 8px;
@@ -10436,6 +10451,9 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-snippet-import { width: 100%; min-height: 120px; resize: vertical; font-family: var(--font-monospace); font-size: 12px; }
 /* 0.346.0: deactivated snippet row in settings — muted but still legible. */
 .stashpad-snippet-off .setting-item-name { opacity: 0.55; }
+/* 0.431.0: the snippet's toolbar icon, shown at the start of its settings row. */
+.stashpad-snippet-row-icon { display: inline-flex; vertical-align: middle; margin-right: 6px; color: var(--text-muted); }
+.stashpad-snippet-row-icon .svg-icon { width: 15px; height: 15px; }
 .stashpad-snippet-off .setting-item-description { opacity: 0.55; }
 .stashpad-import-actions { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
 .stashpad-import-summary { margin-top: 6px; }
@@ -10637,6 +10655,85 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .is-mobile .modal.stashpad-split-modal,
 .is-mobile .modal.stashpad-dupes-modal { border-radius: 14px; }
 
+/* 0.424.0: view-in-context — a narrowed list (a note + its tree neighbourhood or
+   its reply thread) with a sticky bar carrying a Flat/Thread toggle. */
+.stashpad-context-bar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-context-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.stashpad-context-close:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-context-close .svg-icon { width: 16px; height: 16px; }
+.stashpad-context-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-normal);
+}
+.stashpad-context-seg {
+  flex: 0 0 auto;
+  display: inline-flex;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.stashpad-context-seg-btn {
+  padding: 4px 12px;
+  border: none;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+}
+.stashpad-context-seg-btn + .stashpad-context-seg-btn { border-left: 1px solid var(--background-modifier-border); }
+.stashpad-context-seg-btn.is-active { background: var(--interactive-accent); color: var(--text-on-accent); }
+.stashpad-note.is-context-target {
+  box-shadow: inset 0 0 0 2px var(--interactive-accent);
+  border-radius: 8px;
+}
+.stashpad-view.is-context-view .stashpad-note-grip { display: none; }
+/* 0.427.0: cross-folder thread member — a small folder chip in the row corner. */
+.stashpad-note.is-foreign-folder { position: relative; }
+.stashpad-context-folder-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 2px 0 0 10px;
+  padding: 1px 7px 1px 5px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  width: fit-content;
+}
+.stashpad-context-folder-chip-icon { display: inline-flex; }
+.stashpad-context-folder-chip-icon .svg-icon { width: 12px; height: 12px; }
+
 /* 0.329.0: find-in-list bar — sits above the list, narrows it as you type. */
 .stashpad-findbar {
   display: flex;
@@ -10681,6 +10778,11 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 /* 0.404.0: on mobile, hide the composer formatting toolbar while finding so more
    results are visible (find eats vertical space on a phone; desktop is fine). */
 .stashpad-view.is-mobile.is-finding .stashpad-composer-toolbar { display: none; }
+/* 0.434.0 (/dump): while finding on mobile, hide the whole composer — you're
+   searching, not composing, and reclaiming its height stops the find bar from
+   shoving the list content up (the "raises the UI too much" report). The find
+   bar (above the list) stays; the list gets the freed space. */
+.stashpad-view.is-mobile.is-finding .stashpad-composer { display: none; }
 /* 0.419.0: compact the find bar on mobile — Obsidian's default input chrome
    (min-height, border, radius) made the bar a tall capsule that shoved the list
    content up. Strip that chrome and tighten the padding so it's a slim row. */
@@ -10866,3 +10968,29 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
    not rendered) reads muted in settings, with its name struck through. */
 .stashpad-action-builder .setting-item.is-ctx-hidden .setting-item-name { opacity: 0.5; text-decoration: line-through; }
 .stashpad-action-builder .setting-item.is-ctx-hidden .stashpad-cmdicon-preview { opacity: 0.5; }
+
+/* 0.439.0: due-calendar loading indicator (shown while the index scan runs). */
+.stashpad-cal-loading {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 32px 16px; color: var(--text-muted); font-size: var(--font-ui-small);
+}
+.stashpad-cal-loading-icon { display: inline-flex; animation: stashpad-cal-spin 1s linear infinite; }
+.stashpad-cal-loading-icon .svg-icon { width: 16px; height: 16px; }
+@keyframes stashpad-cal-spin { to { transform: rotate(360deg); } }
+
+/* 0.441.0: route (jump-to-level) button at the left of the mobile breadcrumb. */
+.stashpad-breadcrumb .stashpad-crumb-route { flex: 0 0 auto; margin-right: 2px; }
+
+/* 0.444.0 (/dump): a left bar on rendered blockquotes so it's clear WHY the text
+   is indented (a ">" quote). Applies in note rows, the focused heading, previews. */
+.stashpad-note-text blockquote,
+.stashpad-focused-body blockquote {
+  margin: 4px 0;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--interactive-accent);
+  color: var(--text-muted);
+}
+.stashpad-note-text blockquote > :first-child,
+.stashpad-focused-body blockquote > :first-child { margin-top: 0; }
+.stashpad-note-text blockquote > :last-child,
+.stashpad-focused-body blockquote > :last-child { margin-bottom: 0; }

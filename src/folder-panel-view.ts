@@ -1,4 +1,5 @@
-import { App, ItemView, Menu, Modal, Notice, Platform, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
+import { App, ItemView, Menu, Modal, Platform, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type StashpadId } from "./types";
 import { renderCountBadge } from "./panels-view";
@@ -1066,9 +1067,9 @@ export class StashpadFolderPanelView extends ItemView {
 
   private revealFolder(folder: string): void {
     const tf = this.app.vault.getAbstractFileByPath(folder.replace(/\/+$/, ""));
-    if (!(tf instanceof TFolder)) { new Notice("Couldn't find that folder."); return; }
+    if (!(tf instanceof TFolder)) { notify("Couldn't find that folder."); return; }
     const leaf = this.app.workspace.getLeavesOfType("file-explorer")[0];
-    if (!leaf) { new Notice("File explorer isn't available."); return; }
+    if (!leaf) { notify("File explorer isn't available."); return; }
     this.app.workspace.revealLeaf(leaf);
     (leaf.view as any)?.revealInFolder?.(tf);
   }
@@ -1134,7 +1135,7 @@ export class StashpadFolderPanelView extends ItemView {
           const prefs = this.plugin.settings.folderEncPrefs ?? {};
           this.plugin.settings.folderEncPrefs = { ...prefs, [cleanF]: { ...(prefs[cleanF] ?? {}), encryptContent: !encOn } };
           await this.plugin.saveSettings();
-          new Notice(!encOn
+          notify(!encOn
             ? "Encryption on for this folder. Run “Encrypt (lock) all notes” or Encrypt-all to lock its existing notes."
             : "Encryption off for this folder.");
           this.render();
@@ -1165,26 +1166,26 @@ export class StashpadFolderPanelView extends ItemView {
   private renameFolder(folder: string): void {
     const cleaned = folder.replace(/\/+$/, "");
     const tf = this.app.vault.getAbstractFileByPath(cleaned);
-    if (!(tf instanceof TFolder)) { new Notice("Couldn't find that folder."); return; }
+    if (!(tf instanceof TFolder)) { notify("Couldn't find that folder."); return; }
     const current = tf.name;
     new RenameFolderModal(this.app, current, async (next) => {
       const safe = next.trim().replace(/[\\/:]+/g, "").trim();
       if (!safe || safe === current) return;
       const parent = tf.parent?.path && tf.parent.path !== "/" ? `${tf.parent.path}/` : "";
       const target = `${parent}${safe}`;
-      if (this.app.vault.getAbstractFileByPath(target)) { new Notice(`"${safe}" already exists.`); return; }
+      if (this.app.vault.getAbstractFileByPath(target)) { notify(`"${safe}" already exists.`); return; }
       // 0.140.3 (review): re-validate — the folder could've moved/been deleted
       // by sync while the rename modal sat open.
-      if (!(this.app.vault.getAbstractFileByPath(cleaned) instanceof TFolder)) { new Notice("That folder no longer exists."); return; }
+      if (!(this.app.vault.getAbstractFileByPath(cleaned) instanceof TFolder)) { notify("That folder no longer exists."); return; }
       try {
         await this.app.fileManager.renameFile(tf, target);
         // 0.140.3: carry ALL path-keyed settings (default folder + placement +
         // archive + per-folder prefs, incl. descendants) to the new path.
         await this.plugin.remapFolderPathInSettings(cleaned, target);
-        new Notice(`Renamed to "${safe}".`);
+        notify(`Renamed to "${safe}".`);
       } catch (err) {
         console.warn("[Stashpad] folder rename failed", err);
-        new Notice("Rename failed (see console).");
+        notify("Rename failed (see console).");
       }
     }).open();
   }
@@ -1192,7 +1193,7 @@ export class StashpadFolderPanelView extends ItemView {
   private deleteFolder(folder: string): void {
     const cleaned = folder.replace(/\/+$/, "");
     const tf = this.app.vault.getAbstractFileByPath(cleaned);
-    if (!(tf instanceof TFolder)) { new Notice("Couldn't find that folder."); return; }
+    if (!(tf instanceof TFolder)) { notify("Couldn't find that folder."); return; }
     const noteCount = this.app.vault.getMarkdownFiles()
       .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned
         || (f.path.startsWith(cleaned + "/"))).length;
@@ -1277,7 +1278,7 @@ export async function openFolderPanelView(app: App): Promise<void> {
   const existing = app.workspace.getLeavesOfType(STASHPAD_FOLDER_PANEL_VIEW_TYPE);
   if (existing.length > 0) { app.workspace.revealLeaf(existing[0]); return; }
   const leaf = app.workspace.getLeftLeaf(false);
-  if (!leaf) { new Notice("Stashpad: couldn't open the folder panel."); return; }
+  if (!leaf) { notify("Stashpad: couldn't open the folder panel."); return; }
   await leaf.setViewState({ type: STASHPAD_FOLDER_PANEL_VIEW_TYPE, active: true });
   app.workspace.revealLeaf(leaf);
 }

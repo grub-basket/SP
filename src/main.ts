@@ -52,7 +52,7 @@ import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { createAliasesForFolder } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
-import { setNotifySink } from "./notify";
+import { notify, setNotifySink } from "./notify";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
 const SHORTCUT_DIR = "Stashpad Shortcuts";
@@ -782,7 +782,7 @@ export default class StashpadPlugin extends Plugin {
       // Never silent: a setting that changes itself without saying so is worse
       // than one left on, because the next capture would come back empty and
       // the reason would be invisible.
-      new Notice(
+      notify(
         `Stashpad turned ${turnedOff.join(" and ")} back off — ${turnedOff.length === 1 ? "it had" : "they had"} been on for over a week. Turn ${turnedOff.length === 1 ? "it" : "them"} on again in Settings → Diagnostics if you still need ${turnedOff.length === 1 ? "it" : "them"}.`,
         0,
       );
@@ -868,7 +868,7 @@ export default class StashpadPlugin extends Plugin {
    *  data.json, and reloads settings. */
   async restoreSettingsBackup(path: string): Promise<boolean> {
     const snap = await this.settingsBackup.read(path);
-    if (!snap) { new Notice("Couldn't read that backup."); return false; }
+    if (!snap) { notify("Couldn't read that backup."); return false; }
     try {
       // Snapshot the live settings before overwriting them.
       const cur: Record<string, unknown> = {};
@@ -876,9 +876,9 @@ export default class StashpadPlugin extends Plugin {
       for (const [k, v] of Object.entries(this.settings as unknown as Record<string, unknown>)) if (!moved.has(k)) cur[k] = v;
       await this.settingsBackup.save(`${this.deviceId()}-before-restore`, cur);
       await this.saveData(snap);
-      new Notice("Settings restored. Reload Obsidian (Cmd/Ctrl+R) to apply everywhere.");
+      notify("Settings restored. Reload Obsidian (Cmd/Ctrl+R) to apply everywhere.");
       return true;
-    } catch (e) { new Notice(`Restore failed: ${(e as Error).message}`); return false; }
+    } catch (e) { notify(`Restore failed: ${(e as Error).message}`); return false; }
   }
 
   /** 0.337.0: capture a version when a genuine body edit is recorded (called
@@ -1329,7 +1329,7 @@ export default class StashpadPlugin extends Plugin {
   async repairFolderFromSnapshot(folder: string): Promise<{ repaired: number; scanned: number; skipped: number; undo: () => Promise<void> } | null> {
     const cleaned = folder.replace(/\/+$/, "");
     const snap = await this.structureStore.load(cleaned);
-    if (!snap) { new Notice(`No structure snapshot for "${cleaned}" yet — nothing to repair from.`); return null; }
+    if (!snap) { notify(`No structure snapshot for "${cleaned}" yet — nothing to repair from.`); return null; }
     const byPath = indexByPath(snap);
 
     const candidates: TFile[] = [];
@@ -1343,7 +1343,7 @@ export default class StashpadPlugin extends Plugin {
     }
     const scanned = byPath.size;
     if (!candidates.length) {
-      new Notice(`"${cleaned}": nothing to repair — every note still has its Stashpad frontmatter.`);
+      notify(`"${cleaned}": nothing to repair — every note still has its Stashpad frontmatter.`);
       return { repaired: 0, scanned, skipped: 0, undo: async () => { /* nothing changed */ } };
     }
 
@@ -1645,7 +1645,7 @@ export default class StashpadPlugin extends Plugin {
     } catch (e) {
       console.warn("[Stashpad] folder delete failed", e);
       this.suppressedFolderDeletes.delete(cleaned);
-      new Notice("Delete failed (see console).");
+      notify("Delete failed (see console).");
       return;
     }
 
@@ -1662,15 +1662,15 @@ export default class StashpadPlugin extends Plugin {
         label: "Undo",
         onClick: async () => {
           try {
-            if (await adapter.exists(cleaned)) { new Notice(`Can't undo — “${name}” already exists.`); return; }
+            if (await adapter.exists(cleaned)) { notify(`Can't undo — “${name}” already exists.`); return; }
             this.suppressedFolderDeletes.add(cleaned);
             window.setTimeout(() => this.suppressedFolderDeletes.delete(cleaned), 5000);
             await adapter.rename(dest, cleaned);
-            new Notice(`Restored “${name}”.`);
+            notify(`Restored “${name}”.`);
             void this.activateViewForFolder(cleaned);
           } catch (e) {
             console.warn("[Stashpad] folder undo failed", e);
-            new Notice("Undo failed (see console).");
+            notify("Undo failed (see console).");
           }
         },
       }],
@@ -1919,7 +1919,7 @@ export default class StashpadPlugin extends Plugin {
   async findDuplicateNoteIds(): Promise<void> {
     const perFolder = this.duplicateGroupsEverywhere();
     if (!perFolder.length) {
-      new Notice("No duplicate note ids found in any Stashpad folder.");
+      notify("No duplicate note ids found in any Stashpad folder.");
       return;
     }
     this.openDuplicatesModal(perFolder);
@@ -1939,11 +1939,11 @@ export default class StashpadPlugin extends Plugin {
    *  those would break the note being kept. */
   async discardDuplicateCopy(path: string, folder: string): Promise<boolean> {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!(file instanceof TFile)) { new Notice("That file is already gone."); return false; }
+    if (!(file instanceof TFile)) { notify("That file is already gone."); return false; }
     let content = "";
     try { content = await this.app.vault.read(file); }
     catch (e) {
-      new Notice(`Couldn't read ${path} — not discarding it: ${(e as Error).message}`);
+      notify(`Couldn't read ${path} — not discarding it: ${(e as Error).message}`);
       return false;
     }
     try {
@@ -1951,7 +1951,7 @@ export default class StashpadPlugin extends Plugin {
       // (system trash / vault .trash / permanent) rather than overriding it.
       await this.app.fileManager.trashFile(file);
     } catch (e) {
-      new Notice(`Couldn't discard ${path}: ${(e as Error).message}`);
+      notify(`Couldn't discard ${path}: ${(e as Error).message}`);
       return false;
     }
     const name = path.slice(path.lastIndexOf("/") + 1);
@@ -1993,10 +1993,10 @@ export default class StashpadPlugin extends Plugin {
   async mergeDuplicateCopy(sourcePath: string, targetPath: string, folder: string): Promise<boolean> {
     const src = this.app.vault.getAbstractFileByPath(sourcePath);
     const tgt = this.app.vault.getAbstractFileByPath(targetPath);
-    if (!(src instanceof TFile) || !(tgt instanceof TFile)) { new Notice("One of those files is already gone."); return false; }
+    if (!(src instanceof TFile) || !(tgt instanceof TFile)) { notify("One of those files is already gone."); return false; }
     let srcRaw = "", tgtRaw = "";
     try { srcRaw = await this.app.vault.read(src); tgtRaw = await this.app.vault.read(tgt); }
-    catch (e) { new Notice(`Couldn't read the notes: ${(e as Error).message}`); return false; }
+    catch (e) { notify(`Couldn't read the notes: ${(e as Error).message}`); return false; }
 
     const bodyOf = (raw: string): string => raw.replace(/^---\n[\s\S]*?\n---\n?/, "").trim();
     const srcBody = bodyOf(srcRaw), tgtBody = bodyOf(tgtRaw);
@@ -2020,7 +2020,7 @@ export default class StashpadPlugin extends Plugin {
       });
       await this.app.fileManager.trashFile(src);
     } catch (e) {
-      new Notice(`Merge failed: ${(e as Error).message}`);
+      notify(`Merge failed: ${(e as Error).message}`);
       return false;
     }
 
@@ -2054,7 +2054,7 @@ export default class StashpadPlugin extends Plugin {
    *  than a bare total, because "0 added" has three different meanings —
    *  nothing to do, everything already previewed, or everything failed. */
   async addLinkPreviews(files: TFile[], opts: { force?: boolean } = {}): Promise<void> {
-    if (!files.length) { new Notice("No notes selected."); return; }
+    if (!files.length) { notify("No notes selected."); return; }
     const totals = { added: 0, skipped: 0, failed: 0, cached: 0 };
     for (const f of files) {
       try {
@@ -2072,7 +2072,7 @@ export default class StashpadPlugin extends Plugin {
       }
     }
     if (!totals.added && !totals.skipped && !totals.failed) {
-      new Notice("No links found in " + (files.length === 1 ? "that note." : "those notes."));
+      notify("No links found in " + (files.length === 1 ? "that note." : "those notes."));
       return;
     }
     const bits = [`Added ${totals.added} preview${totals.added === 1 ? "" : "s"}`];
@@ -2160,13 +2160,13 @@ export default class StashpadPlugin extends Plugin {
     // a folder that holds no Stashpad notes would open an empty view and look
     // broken. Say what to do instead of just reporting the absence.
     if (!folders.length) {
-      new Notice("No Stashpad folders found yet — create one first, then run this again.");
+      notify("No Stashpad folders found yet — create one first, then run this again.");
       return;
     }
     try {
       if (!(await this.app.vault.adapter.exists(dir))) await this.app.vault.createFolder(dir);
     } catch (e) {
-      new Notice(`Couldn't create the shortcuts folder: ${(e as Error).message}`);
+      notify(`Couldn't create the shortcuts folder: ${(e as Error).message}`);
       return;
     }
     let made = 0, existing = 0;
@@ -2227,7 +2227,7 @@ export default class StashpadPlugin extends Plugin {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       return folders.has(dir) || [...folders].some((x) => dir.startsWith(x + "/"));
     });
-    if (!files.length) { new Notice("No Stashpad notes found."); return; }
+    if (!files.length) { notify("No Stashpad notes found."); return; }
 
     const scanning = new Notice(`Scanning ${files.length} notes for links…`, 0);
     const signal = { cancelled: false };
@@ -2235,7 +2235,7 @@ export default class StashpadPlugin extends Plugin {
     try { scan = await scanBackfill(this.app, this.previewCache, files, signal); }
     finally { scanning.hide(); }
 
-    if (!scan.linkCount) { new Notice("Every link already has a preview — nothing to backfill."); return; }
+    if (!scan.linkCount) { notify("Every link already has a preview — nothing to backfill."); return; }
     const secs = estimateSeconds(scan, this.settings.linkPreviewDelayMs);
     const toFetch = scan.linkCount - scan.cachedCount;
     const ok = await new Promise<boolean>((resolve) => {
@@ -2289,7 +2289,7 @@ export default class StashpadPlugin extends Plugin {
         for (const { folder, groups } of perFolder) {
           total += await this.repairDuplicateIds(folder, groups);
         }
-        new Notice(total
+        notify(total
           ? `Gave ${total} hidden note${total === 1 ? "" : "s"} a fresh id — they're visible now. Undo (in the list) reverses it per folder.`
           : "Nothing to repair — the remaining duplicates are home-note ids, which need a different fix.");
       },
@@ -2530,11 +2530,11 @@ export default class StashpadPlugin extends Plugin {
     for (let i = 2; await this.app.vault.adapter.exists(folder); i++) folder = `${base} ${i}`;
     try {
       const { created } = await seedDemoContent(this.app, this, folder);
-      new Notice(`Stashpad: created "${folder}" with ${created} example notes.`, 8000);
+      notify(`Stashpad: created "${folder}" with ${created} example notes.`, 8000);
       await this.openFolderInStashpad(folder);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      new Notice(`Stashpad: couldn't create the demo — ${msg}`, 0);
+      notify(`Stashpad: couldn't create the demo — ${msg}`, 0);
     }
   }
 
@@ -2890,7 +2890,7 @@ export default class StashpadPlugin extends Plugin {
         // migrated); moved here from onload with the walk it depends on.
         try {
           const n = await this.encryption.migrateKeyfileToStashKeys();
-          if (n > 0) new Notice(`Stashpad: moved ${n} folder key${n === 1 ? "" : "s"} to the new per-folder format.`);
+          if (n > 0) notify(`Stashpad: moved ${n} folder key${n === 1 ? "" : "s"} to the new per-folder format.`);
         } catch (e) { console.warn("[Stashpad] folder-key migration failed (keyfile still works)", e); }
       });
       // 0.136.0/0.137.0: one-time migrations to per-folder archive + trash
@@ -3354,7 +3354,7 @@ export default class StashpadPlugin extends Plugin {
       name: "Diagnose selection (select-all mismatch)",
       callback: () => {
         const view = getActiveView();
-        if (!view) { new Notice("Open a Stashpad view first, then run this right after the bad selection."); return; }
+        if (!view) { notify("Open a Stashpad view first, then run this right after the bad selection."); return; }
         const snap = view.selectionDiagnostics();
         const report = JSON.stringify(snap, null, 2);
         this.trace("selection-diagnostics", snap);
@@ -3747,7 +3747,7 @@ export default class StashpadPlugin extends Plugin {
       name: "Diagnostics: copy debug trace to clipboard",
       callback: () => {
         const text = this.getDebugTrace();
-        if (!text) { new Notice("Debug trace is empty — turn it on and reproduce the issue first."); return; }
+        if (!text) { notify("Debug trace is empty — turn it on and reproduce the issue first."); return; }
         navigator.clipboard.writeText(text).then(
           () => new Notice(`Debug trace copied (${text.split("\n").length} lines).`),
           () => new Notice("Couldn't access the clipboard."),
@@ -3763,7 +3763,7 @@ export default class StashpadPlugin extends Plugin {
       callback: () => {
         void this.getPreviousTrace().then((text) => {
           if (!text) {
-            new Notice("No trace from a previous session. One is kept only while BOTH the debug trace and \"Save the debug trace to disk\" are switched on.");
+            notify("No trace from a previous session. One is kept only while BOTH the debug trace and \"Save the debug trace to disk\" are switched on.");
             return;
           }
           navigator.clipboard.writeText(text).then(
@@ -3778,7 +3778,7 @@ export default class StashpadPlugin extends Plugin {
       name: "Diagnostics: copy captured errors to clipboard",
       callback: () => {
         void this.getCapturedErrors().then((text) => {
-          if (!text) { new Notice("No captured errors — nothing has thrown. 🎉"); return; }
+          if (!text) { notify("No captured errors — nothing has thrown. 🎉"); return; }
           navigator.clipboard.writeText(text).then(
             () => new Notice(`Captured errors copied (${text.split("\n").length} lines).`),
             () => new Notice("Couldn't access the clipboard."),
@@ -3800,7 +3800,7 @@ export default class StashpadPlugin extends Plugin {
       callback: () => {
         this.clearDebugTrace();
         perf.reset();
-        new Notice("Debug trace and performance profile cleared.");
+        notify("Debug trace and performance profile cleared.");
       },
     });
     this.addCommand({
@@ -3813,7 +3813,7 @@ export default class StashpadPlugin extends Plugin {
         // Switching it off removes the on-disk copies as well, so turning the
         // diagnostic off actually turns it off rather than leaving a file behind.
         if (!this.settings.debugTrace) void this.removeTraceFiles();
-        new Notice(this.settings.debugTrace
+        notify(this.settings.debugTrace
           ? "Debug trace ON — reproduce the issue, then copy the trace. It's also saved to disk, so it survives a force-quit."
           : "Debug trace OFF.");
       },
@@ -3828,7 +3828,7 @@ export default class StashpadPlugin extends Plugin {
       name: "Cover every note everywhere (global \u2014 visual only)",
       callback: () => {
         void this.setObscureAll(true);
-        new Notice("Stashpad: global cover ON \u2014 every note is covered. Tap one to peek at it.", 5000);
+        notify("Stashpad: global cover ON \u2014 every note is covered. Tap one to peek at it.", 5000);
       },
     });
     this.addCommand({
@@ -3836,7 +3836,7 @@ export default class StashpadPlugin extends Plugin {
       name: "Uncover every note everywhere (global \u2014 visual only)",
       callback: () => {
         void this.setObscureAll(false);
-        new Notice("Stashpad: global cover OFF \u2014 notes covered individually stay covered.", 5000);
+        notify("Stashpad: global cover OFF \u2014 notes covered individually stay covered.", 5000);
       },
     });
     this.addCommand({
@@ -3894,7 +3894,7 @@ export default class StashpadPlugin extends Plugin {
       callback: () => {
         const notices = Array.from(document.querySelectorAll(".notice"));
         for (const n of notices) n.parentElement?.removeChild(n);
-        new Notice(notices.length ? `Dismissed ${notices.length} notification${notices.length === 1 ? "" : "s"}.` : "No notifications to dismiss.");
+        notify(notices.length ? `Dismissed ${notices.length} notification${notices.length === 1 ? "" : "s"}.` : "No notifications to dismiss.");
       },
     });
     // 0.185.0: re-fire reminders for every incomplete, past-due task assigned to
@@ -3991,6 +3991,8 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-copy-links", name: "Copy link(s) from note (first / pick / all)", callback: () => call("cmdCopyLinks") });
     this.addCommand({ id: "stashpad-cycle-search-scope", name: "Cycle search scope (all / in-list / in-parent)", callback: () => call("cmdCycleSearchScope") });
     this.addCommand({ id: "stashpad-search-scoped", name: "Search (current scope: all / in-list / in-parent)", callback: () => call("cmdSearchScoped") });
+    this.addCommand({ id: "stashpad-view-in-context", name: "View in context (flat — parents, siblings, children)", callback: () => call("cmdViewInContext", undefined, "flat") });
+    this.addCommand({ id: "stashpad-view-in-context-thread", name: "View in context (thread — the reply conversation)", callback: () => call("cmdViewInContext", undefined, "thread") });
     this.addCommand({ id: "stashpad-nest-replies", name: "Nest replies…", callback: () => call("cmdNestReplies") });
     this.addCommand({ id: "stashpad-quick-capture-under", name: "Quick capture a nested note under the cursored note", callback: () => call("cmdQuickCaptureUnder") });
     this.addCommand({ id: "stashpad-preview-note", name: "Preview selected note", callback: () => call("cmdPreviewSelected") });
@@ -4025,19 +4027,19 @@ export default class StashpadPlugin extends Plugin {
       name: "Dump performance profile (copy to clipboard)",
       callback: async () => {
         if (!this.settings.enablePerfProfiling) {
-          new Notice("Enable “Performance profiling” in Stashpad settings first, then use the app and run this again.");
+          notify("Enable “Performance profiling” in Stashpad settings first, then use the app and run this again.");
           return;
         }
         const report = perf.report();
         console.debug(report); // debug, not log (store lint); the report is also copied to the clipboard
         try { await navigator.clipboard.writeText(report); } catch { /* ignore */ }
-        new Notice("Performance profile copied to clipboard (also in the console).");
+        notify("Performance profile copied to clipboard (also in the console).");
       },
     });
     this.addCommand({
       id: "stashpad-reset-perf",
       name: "Reset performance profile",
-      callback: () => { perf.reset(); new Notice("Performance profile reset."); },
+      callback: () => { perf.reset(); notify("Performance profile reset."); },
     });
     this.addCommand({ id: "stashpad-jump-to-top", name: "Jump to top of list", callback: () => call("jumpToTop") });
     this.addCommand({ id: "stashpad-jump-to-bottom", name: "Jump to bottom of list", callback: () => call("jumpToBottom") });
@@ -4240,9 +4242,9 @@ export default class StashpadPlugin extends Plugin {
         const folder = (v && (v).noteFolder) as string | undefined;
         if (!folder) return false;
         if (checking) return true;
-        new Notice(`Running integrity check on "${folder}"…`);
+        notify(`Running integrity check on "${folder}"…`);
         void this.runIntegrityCheckOnFolder(folder).then(() => {
-          new Notice(`Integrity check complete — see Stashpad log.`);
+          notify(`Integrity check complete — see Stashpad log.`);
         });
         return true;
       },
@@ -4291,7 +4293,7 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-rebuild-author-registry",
       name: "Rebuild author registry (scan authors + note frontmatter)",
       callback: async () => {
-        new Notice("Stashpad: rebuilding author registry…");
+        notify("Stashpad: rebuilding author registry…");
         try {
           const r = await this.rebuildAuthorRegistry();
           this.notifications.show({
@@ -4300,7 +4302,7 @@ export default class StashpadPlugin extends Plugin {
             category: "system",
           });
         } catch (e) {
-          new Notice(`Author registry rebuild failed: ${(e as Error).message}`);
+          notify(`Author registry rebuild failed: ${(e as Error).message}`);
         }
       },
     });
@@ -4310,7 +4312,7 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-restore-author-stubs",
       name: "Restore missing author stubs (from registry)",
       callback: async () => {
-        new Notice("Stashpad: restoring author stubs…");
+        notify("Stashpad: restoring author stubs…");
         try {
           const r = await this.restoreMissingAuthorStubs();
           this.notifications.show({
@@ -4321,7 +4323,7 @@ export default class StashpadPlugin extends Plugin {
             category: "system",
           });
         } catch (e) {
-          new Notice(`Restore author stubs failed: ${(e as Error).message}`);
+          notify(`Restore author stubs failed: ${(e as Error).message}`);
         }
       },
     });
@@ -4358,11 +4360,11 @@ export default class StashpadPlugin extends Plugin {
         if (checking) return true;
         void createAliasesForFolder(this.app, folder, (f) => this.isStashpadNoteFile(f))
           .then(({ scanned, written }) => {
-            new Notice(written > 0
+            notify(written > 0
               ? `Stashpad: added aliases to ${written} note${written === 1 ? "" : "s"} in "${folder}" (${scanned} checked).`
               : `Stashpad: every note in "${folder}" already had its alias (${scanned} checked).`);
           })
-          .catch((e) => { console.warn("[Stashpad] create aliases failed", e); new Notice("Stashpad: couldn't create aliases — see console."); });
+          .catch((e) => { console.warn("[Stashpad] create aliases failed", e); notify("Stashpad: couldn't create aliases — see console."); });
         return true;
       },
     });
@@ -4416,7 +4418,7 @@ export default class StashpadPlugin extends Plugin {
           const next = !(this.settings as any)[t.key];
           (this.settings as any)[t.key] = next;
           await this.saveSettings();
-          new Notice(`${t.label}: ${next ? "ON" : "OFF"}`);
+          notify(`${t.label}: ${next ? "ON" : "OFF"}`);
         },
       });
     }
@@ -4491,12 +4493,12 @@ export default class StashpadPlugin extends Plugin {
           const { buildJdIndexPreview } = await import("./index-builder");
           const result = await buildJdIndexPreview(this.app, this, this.settings);
           if (result.error === "no-dest") {
-            new Notice("Set a Designated Stashpad folder for Index in settings first.", 6000);
+            notify("Set a Designated Stashpad folder for Index in settings first.", 6000);
             openSettingsToJd();
             return;
           }
           if (result.error === "no-home") {
-            new Notice(
+            notify(
               `"${this.settings.jdIndexStashpadFolder}" has no Stashpad home note. Open the folder in Stashpad first to create one.`,
               7000,
             );
@@ -4506,7 +4508,7 @@ export default class StashpadPlugin extends Plugin {
           buildJdPreviewNotice(this.app, result);
         } catch (err) {
           console.error("[stashpad] preview failed", err);
-          new Notice(`Preview failed: ${(err as Error)?.message ?? err}`, 8000);
+          notify(`Preview failed: ${(err as Error)?.message ?? err}`, 8000);
         }
       },
     });
@@ -4518,9 +4520,9 @@ export default class StashpadPlugin extends Plugin {
       callback: async () => {
         await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
         // 0.295.2: one re-walk before believing "no keys at all" (see isConfiguredRechecked).
-        if (!(await this.encryption.isConfiguredRechecked())) { new Notice("Stashpad encryption isn't set up."); return; }
+        if (!(await this.encryption.isConfiguredRechecked())) { notify("Stashpad encryption isn't set up."); return; }
         const bundles = await listRawFolderBlobs(this.app);
-        if (!bundles.length) { new Notice("No encrypted folder bundles found in this vault."); return; }
+        if (!bundles.length) { notify("No encrypted folder bundles found in this vault."); return; }
         new FolderBundleSuggest(this.app, bundles, (b) => void this.decryptFolderFromExplorer(b.folder)).open();
       },
     });
@@ -4533,7 +4535,7 @@ export default class StashpadPlugin extends Plugin {
           const { buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal } = await import("./index-builder");
           const dest = (this.settings.jdIndexStashpadFolder ?? "").trim().replace(/^\/+|\/+$/g, "");
           if (!dest) {
-            new Notice("Set a Designated Stashpad folder for Index in settings first.", 6000);
+            notify("Set a Designated Stashpad folder for Index in settings first.", 6000);
             openSettingsToJd();
             return;
           }
@@ -4549,12 +4551,12 @@ export default class StashpadPlugin extends Plugin {
               try {
                 const result = await buildJdIndexNotes(this.app, this, this.settings);
                 if (result.error === "no-dest") {
-                  new Notice("Set a Designated Stashpad folder for Index in settings first.", 6000);
+                  notify("Set a Designated Stashpad folder for Index in settings first.", 6000);
                   openSettingsToJd();
                   return;
                 }
                 if (result.error === "dest-not-stashpad") {
-                  new Notice(
+                  notify(
                     `"${result.destFolder}" isn't a known Stashpad folder. Pick a real Stashpad folder in settings.`,
                     7000,
                   );
@@ -4563,20 +4565,20 @@ export default class StashpadPlugin extends Plugin {
                 }
                 this.settings.jdIndexHasBuilt = true;
                 await this.saveSettings();
-                new Notice(
+                notify(
                   `Index built: ${result.created} created, ${result.updated} updated, ${result.skipped} skipped → ${result.destFolder}`,
                   6000,
                 );
               } catch (err) {
                 console.error("[stashpad] build failed", err);
-                new Notice(`Build failed: ${(err as Error)?.message ?? err}`, 8000);
+                notify(`Build failed: ${(err as Error)?.message ?? err}`, 8000);
               }
             },
           );
           modal.open();
         } catch (err) {
           console.error("[stashpad] build failed", err);
-          new Notice(`Build failed: ${(err as Error)?.message ?? err}`, 8000);
+          notify(`Build failed: ${(err as Error)?.message ?? err}`, 8000);
         }
       },
     });
@@ -4901,7 +4903,7 @@ export default class StashpadPlugin extends Plugin {
     try {
       window.location.reload();
     } catch {
-      new Notice("Reload Obsidian (close + reopen) to apply the Stashpad update.");
+      notify("Reload Obsidian (close + reopen) to apply the Stashpad update.");
     }
   }
 
@@ -5206,7 +5208,7 @@ export default class StashpadPlugin extends Plugin {
         type: "parent_change", id,
         payload: { from: parent, to: ROOT_ID, reason: "rehome_cross_folder_move", path: file.path },
       });
-      new Notice(`Re-homed ${file.basename} → Home (its parent isn't in this folder)`);
+      notify(`Re-homed ${file.basename} → Home (its parent isn't in this folder)`);
     } catch (e) {
       console.warn("[Stashpad] re-home on cross-folder move failed", e);
     }
@@ -5374,7 +5376,7 @@ export default class StashpadPlugin extends Plugin {
       el.createDiv({ cls: "stashpad-progress-title", text: "✓ Rebootstrap complete" });
       el.createDiv({ cls: "stashpad-progress-sub", text: `${parts.join("; ")}.` });
       if (r.attachmentsSkipped > 0) {
-        new Notice(`Stashpad: ${r.attachmentsSkipped} attachment${r.attachmentsSkipped === 1 ? "" : "s"} need renaming, but skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links”, then rebootstrap again.`, 12000);
+        notify(`Stashpad: ${r.attachmentsSkipped} attachment${r.attachmentsSkipped === 1 ? "" : "s"} need renaming, but skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links”, then rebootstrap again.`, 12000);
       }
       return r;
     } catch (e) {
@@ -5967,7 +5969,7 @@ export default class StashpadPlugin extends Plugin {
    *  one if needed). */
   async loadComposerDraft(id: string): Promise<void> {
     const d = this.settings.composerDrafts?.[id];
-    if (!d) { new Notice("That draft is gone."); return; }
+    if (!d) { notify("That draft is gone."); return; }
     let view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
       .map((l) => l.view as unknown as { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> })
       .find((v) => v.noteFolder === d.folder);
@@ -5977,7 +5979,7 @@ export default class StashpadPlugin extends Plugin {
         .map((l) => l.view as unknown as { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> })
         .find((v) => v.noteFolder === d.folder);
     }
-    if (!view?.switchToDraft) { new Notice("Couldn't open a Stashpad view for that folder."); return; }
+    if (!view?.switchToDraft) { notify("Couldn't open a Stashpad view for that folder."); return; }
     await view.switchToDraft(id);
   }
 
@@ -5996,7 +5998,7 @@ export default class StashpadPlugin extends Plugin {
   /** 0.322.1: save the active view under a name (prompt) for the launcher. */
   saveCurrentView(): void {
     const state = this.captureViewState();
-    if (!state) { new Notice("Open a Stashpad view first."); return; }
+    if (!state) { notify("Open a Stashpad view first."); return; }
     const folder = (state.folderOverride as string | null) || this.settings.folder;
     const suggested = `${(folder.split("/").pop() || folder)}${state.tagFilter ? " #" + state.tagFilter : ""}${state.colorFilter ? " •color" : ""}`;
     new NamePromptModal(this.app, "Save this view", "View name", suggested, async (name) => {
@@ -6005,7 +6007,7 @@ export default class StashpadPlugin extends Plugin {
       list.push({ name: nm, state });
       this.settings.savedViews = list;
       await this.saveSettings();
-      new Notice(`Saved view "${nm}".`);
+      notify(`Saved view "${nm}".`);
     }).open();
   }
 
@@ -6563,7 +6565,7 @@ export default class StashpadPlugin extends Plugin {
             }
             await plugin.activateViewForFolder(properCased);
           } catch (e) {
-            new Notice(`Stashpad: couldn't create folder (${(e as Error).message})`);
+            notify(`Stashpad: couldn't create folder (${(e as Error).message})`);
           }
           return;
         }
@@ -6594,7 +6596,7 @@ export default class StashpadPlugin extends Plugin {
                 // top-level files / subfolders / .stash into notes now.
                 await plugin.runImportLooseFiles(folder);
               } catch (e) {
-                new Notice(`Stashpad: couldn't convert folder (${(e as Error).message})`);
+                notify(`Stashpad: couldn't convert folder (${(e as Error).message})`);
               }
             },
           ).open();
@@ -6624,7 +6626,7 @@ export default class StashpadPlugin extends Plugin {
     const compactMode = !!(active)?.compactMode;
     const popLeaf = (this.app.workspace as any).openPopoutLeaf?.();
     if (!popLeaf) {
-      new Notice("Stashpad: couldn't open popout window on this build.");
+      notify("Stashpad: couldn't open popout window on this build.");
       return;
     }
     await popLeaf.setViewState({
@@ -6820,7 +6822,7 @@ export default class StashpadPlugin extends Plugin {
     // NEGATIVE against disk (folder + ancestors, memoized ~5s) before telling the
     // user their encrypted folder "isn't encrypted".
     if (!(await this.encryption.recheckFolderKeyOnDisk(folder))) {
-      new Notice("This folder isn't encrypted. Give it a password in Settings → Stashpad → Encryption → Per-Folder Passwords.");
+      notify("This folder isn't encrypted. Give it a password in Settings → Stashpad → Encryption → Per-Folder Passwords.");
       return null;
     }
     if (this.encryption.isFolderUnlocked(folder)) return this.encryption.getFolderKey(folder);
@@ -7139,10 +7141,10 @@ export default class StashpadPlugin extends Plugin {
   async encryptEverythingApplicable(): Promise<void> {
     if (this.pruneReEncryptWatch()) await this.saveSettings(); // no ghosts in the sweep
     const cands = this.collectEncryptAllCandidates();
-    if (cands.length === 0) { new Notice("Nothing needs re-encrypting — everything applicable is already locked."); return; }
+    if (cands.length === 0) { notify("Nothing needs re-encrypting — everything applicable is already locked."); return; }
     new ReEncryptReviewModal(this.app, cands.map(({ label, detail }) => ({ label, detail })), async (chosen) => {
       let ok = 0, failed = 0;
-      const prog = chosen.length > 2 ? new Notice("", 0) : null;
+      const prog = chosen.length > 2 ? notify("", 0) : null;
       for (let i = 0; i < chosen.length; i++) {
         prog?.setMessage(`🔒 Re-encrypting ${i + 1}/${chosen.length}…`);
         try { (await cands[chosen[i]].run()) ? ok++ : failed++; }
@@ -7162,12 +7164,12 @@ export default class StashpadPlugin extends Plugin {
     await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
     // 0.295.2: re-walk once before believing "no keys at all".
     if (!(await this.encryption.isConfiguredRechecked()) && !this.encryption.hasAnyFolderKey()) {
-      new Notice("Set up encryption first — give a folder a password (Settings → Stashpad → Encryption).");
+      notify("Set up encryption first — give a folder a password (Settings → Stashpad → Encryption).");
       return;
     }
     if (this.pruneReEncryptWatch()) await this.saveSettings(); // no ghosts in the sweep
     const cands = this.collectEncryptAllCandidates();
-    if (cands.length === 0) { new Notice("Nothing needs encrypting — everything applicable is already locked."); return; }
+    if (cands.length === 0) { notify("Nothing needs encrypting — everything applicable is already locked."); return; }
     const exts = (this.settings.encryptCompanionExts ?? []).filter((e) => !!e?.trim());
     new EncryptAllModal(
       this.app,
@@ -7242,14 +7244,14 @@ export default class StashpadPlugin extends Plugin {
       if (r.unpurged.length > 0) {
         // The blob is good but readable plaintext is STILL on disk (delete
         // failed, or the file was edited mid-lock). Never report a clean lock.
-        new Notice(`⚠️ Locked, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the lock):\n${r.unpurged.join("\n")}`, 0);
+        notify(`⚠️ Locked, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the lock):\n${r.unpurged.join("\n")}`, 0);
       } else if (!opts.silent) {
         this.notifications.show({ message: `Locked ${r.title ? `“${r.title}”` : "a note"} (${r.noteCount} note${r.noteCount === 1 ? "" : "s"}).`, kind: "success", category: "system", folder });
       }
       return r;
     } catch (e) {
       console.warn("[Stashpad] lock failed", e);
-      new Notice(`Couldn't lock: ${(e as Error).message}`);
+      notify(`Couldn't lock: ${(e as Error).message}`);
       return null;
     }
   }
@@ -7298,7 +7300,7 @@ export default class StashpadPlugin extends Plugin {
       return true;
     } catch (e) {
       console.warn("[Stashpad] unlock failed", e);
-      new Notice(`Couldn't unlock: ${(e as Error).message}`);
+      notify(`Couldn't unlock: ${(e as Error).message}`);
       return false;
     }
   }
@@ -7327,13 +7329,13 @@ export default class StashpadPlugin extends Plugin {
     }
     const alreadyLocked = new Set((this.settings.lockedSubtrees ?? []).map((e) => e.rootId).filter((x): x is StashpadId => !!x));
     const todo = roots.filter((id) => !alreadyLocked.has(id));
-    if (todo.length === 0) { new Notice("Nothing to lock in this folder."); return 0; }
+    if (todo.length === 0) { notify("Nothing to lock in this folder."); return 0; }
     // Best-effort: read the explicit manual order so each stub keeps its slot.
     const order = new OrderStore(this.app);
     const rootOrder = (await order.load(cleaned))[ROOT_ID] ?? [];
     // Progress for big folders: a persistent Notice we update each step (a long
     // lock shouldn't look hung). Only for >3 items so small ops stay quiet.
-    const prog = todo.length > 3 ? new Notice("", 0) : null;
+    const prog = todo.length > 3 ? notify("", 0) : null;
     let count = 0;
     for (let i = 0; i < todo.length; i++) {
       const id = todo[i];
@@ -7356,8 +7358,8 @@ export default class StashpadPlugin extends Plugin {
     const blobs = this.app.vault.getFiles()
       .filter((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned)
       .map((f) => f.path);
-    if (blobs.length === 0) { new Notice("No locked notes in this folder."); return 0; }
-    const prog = blobs.length > 3 ? new Notice("", 0) : null;
+    if (blobs.length === 0) { notify("No locked notes in this folder."); return 0; }
+    const prog = blobs.length > 3 ? notify("", 0) : null;
     let count = 0;
     for (let i = 0; i < blobs.length; i++) {
       prog?.setMessage(`🔓 Decrypting ${i + 1}/${blobs.length}…`);
@@ -7375,7 +7377,7 @@ export default class StashpadPlugin extends Plugin {
   async unlockAllInVault(): Promise<number> {
     await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
     // 0.295.2: re-walk once before believing "no keys at all".
-    if (!(await this.encryption.isConfiguredRechecked())) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return 0; }
+    if (!(await this.encryption.isConfiguredRechecked())) { notify("Set up encryption first (Settings → Stashpad → Encryption)."); return 0; }
     // Exclude ALL trash stores (`_deleted/` + per-folder `<folder>/trash/`) —
     // those are DELETED notes, not locked ones; "unlocking" them would restore
     // them INTO the reserved trash dir (invisible to every view). Use the
@@ -7384,8 +7386,8 @@ export default class StashpadPlugin extends Plugin {
     const blobs = this.app.vault.getFiles()
       .filter((f) => f.extension === "stashenc" && !this.isTrashBlobPath(f.path))
       .map((f) => f.path);
-    if (blobs.length === 0) { new Notice("No locked notes anywhere in the vault."); return 0; }
-    const prog = blobs.length > 3 ? new Notice("", 0) : null;
+    if (blobs.length === 0) { notify("No locked notes anywhere in the vault."); return 0; }
+    const prog = blobs.length > 3 ? notify("", 0) : null;
     // Per-folder keys: each blob is decrypted with the key of the folder it RESIDES
     // in. Cache per folder so each key is attempted once. Folder-keyed folders
     // auto-unlock from the keychain only (no prompt storm mid-batch); the vault key
@@ -7432,7 +7434,7 @@ export default class StashpadPlugin extends Plugin {
     const folder = blobs[0].replace(/\/[^/]*$/, "");
     if (notes > 0) this.notifications.show({ message: `Unlocked ${notes} note${notes === 1 ? "" : "s"} across the vault.`, kind: "success", category: "system", folder });
     if (skippedFolders.size > 0) {
-      new Notice(`Skipped ${skippedFolders.size} locked folder${skippedFolders.size === 1 ? "" : "s"} (no key unlocked): ${[...skippedFolders].map((f) => f.split("/").pop() || f).join(", ")}. Open each to unlock it, then run this again.`, 0);
+      notify(`Skipped ${skippedFolders.size} locked folder${skippedFolders.size === 1 ? "" : "s"} (no key unlocked): ${[...skippedFolders].map((f) => f.split("/").pop() || f).join(", ")}. Open each to unlock it, then run this again.`, 0);
     }
     return notes;
   }
@@ -7513,7 +7515,7 @@ export default class StashpadPlugin extends Plugin {
     if (this.folderHasStashpadNotes(folder)) { await this.encryptStashpadFolder(folder, name); return; }
 
     // Already a raw bundle in there? Don't re-bundle — point the user at Decrypt.
-    if (await rawFolderBlobIn(this.app, folder)) { new Notice(`“${name}” is already encrypted as a Stashpad bundle. Use “Decrypt with Stashpad” to open it.`); return; }
+    if (await rawFolderBlobIn(this.app, folder)) { notify(`“${name}” is already encrypted as a Stashpad bundle. Use “Decrypt with Stashpad” to open it.`); return; }
     await this.encryptRawFolder(folder, name);
   }
 
@@ -7528,7 +7530,7 @@ export default class StashpadPlugin extends Plugin {
         if (!next) return "Enter a password.";
         try { await this.encryption.setupFolderKey(folder, next, label, remember); } catch (e) { return (e as Error).message; }
         const n = await this.lockFolder(folder);
-        new Notice(n > 0 ? `Encrypted ${n} note${n === 1 ? "" : "s"} in “${name}”.` : `“${name}” now has a Stashpad password — notes added here will use it.`);
+        notify(n > 0 ? `Encrypted ${n} note${n === 1 ? "" : "s"} in “${name}”.` : `“${name}” now has a Stashpad password — notes added here will use it.`);
         this.refreshFolderPanels?.();
         return null;
       },
@@ -7543,8 +7545,8 @@ export default class StashpadPlugin extends Plugin {
       const keyId = this.encryption.folderKeyEntry(folder)?.keyId;
       try {
         const r = await lockRawFolder(this.app, folder, dek, keyId, this.encStamp());
-        if (r.unpurged.length) new Notice(`Encrypted “${name}” (${r.fileCount} files) — but ${r.unpurged.length} file(s) changed mid-encrypt and were left in place.`);
-        else new Notice(`Encrypted “${name}” — ${r.fileCount} file(s) bundled into one encrypted file.`);
+        if (r.unpurged.length) notify(`Encrypted “${name}” (${r.fileCount} files) — but ${r.unpurged.length} file(s) changed mid-encrypt and were left in place.`);
+        else notify(`Encrypted “${name}” — ${r.fileCount} file(s) bundled into one encrypted file.`);
       } catch (e) { return (e as Error).message; }
       this.refreshFolderPanels?.();
       return null;
@@ -7565,7 +7567,7 @@ export default class StashpadPlugin extends Plugin {
             const dek = await this.ensureFolderUnlocked(folder);
             if (!dek) return; // prompts/notices on failure
             const err = await runBundle(dek);
-            if (err) new Notice(err);
+            if (err) notify(err);
           })();
           return;
         }
@@ -7589,14 +7591,14 @@ export default class StashpadPlugin extends Plugin {
    *  folder's key, then unzip the bundle back into the folder and remove the blob. */
   async decryptFolderFromExplorer(folder: string): Promise<void> {
     const blob = await rawFolderBlobIn(this.app, folder);
-    if (!blob) { new Notice("No Stashpad bundle found in this folder."); return; }
+    if (!blob) { notify("No Stashpad bundle found in this folder."); return; }
     const name = folder.split("/").pop() || folder;
     const dek = await this.ensureFolderUnlocked(folder);
     if (!dek) return; // ensureFolderUnlocked prompts/notices on failure
     try {
       const r = await unlockRawFolder(this.app, blob, dek);
-      new Notice(`Decrypted “${name}” — restored ${r.filesWritten} file(s).`);
-    } catch (e) { new Notice(`Couldn't decrypt: ${(e as Error).message}`); }
+      notify(`Decrypted “${name}” — restored ${r.filesWritten} file(s).`);
+    } catch (e) { notify(`Couldn't decrypt: ${(e as Error).message}`); }
     this.refreshFolderPanels?.();
   }
 
@@ -7633,12 +7635,12 @@ export default class StashpadPlugin extends Plugin {
       this.unwatchReEncrypt(folder, rootId);
       await this.saveSettings();
       if (r.unpurged.length > 0) {
-        new Notice(`⚠️ Sent to encrypted trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
+        notify(`⚠️ Sent to encrypted trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in plaintext (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
       }
       return r.blobPath;
     } catch (e) {
       console.warn("[Stashpad] encrypt-delete failed", e);
-      new Notice(`Couldn't encrypt-delete: ${(e as Error).message}`, 0);
+      notify(`Couldn't encrypt-delete: ${(e as Error).message}`, 0);
       return null;
     }
   }
@@ -7652,12 +7654,12 @@ export default class StashpadPlugin extends Plugin {
       const r = await deletePlaintextSubtree(this.app, folder, rootId, deletedAt, trashSubfolderOf(folder), this.settings.encryptCompanionExts ?? []);
       this.unwatchReEncrypt(folder, rootId); // no longer in the folder
       if (r.unpurged.length > 0) {
-        new Notice(`⚠️ Sent to trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in place (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
+        notify(`⚠️ Sent to trash, but ${r.unpurged.length} file${r.unpurged.length === 1 ? " is" : "s are"} still in place (couldn't be removed or changed during the delete):\n${r.unpurged.join("\n")}`, 0);
       }
       return r.blobPath;
     } catch (e) {
       console.warn("[Stashpad] plaintext trash delete failed", e);
-      new Notice(`Couldn't delete to trash: ${(e as Error).message}`, 0);
+      notify(`Couldn't delete to trash: ${(e as Error).message}`, 0);
       return null;
     }
   }
@@ -7705,7 +7707,7 @@ export default class StashpadPlugin extends Plugin {
         return true;
       } catch (e) {
         console.warn("[Stashpad] restore plaintext trash failed", e);
-        new Notice(`Couldn't restore: ${(e as Error).message}`, 0);
+        notify(`Couldn't restore: ${(e as Error).message}`, 0);
         return false;
       }
     }
@@ -7719,7 +7721,7 @@ export default class StashpadPlugin extends Plugin {
       const owner = this.encryption.folderPathByKeyId(meta.keyId);
       dek = owner ? await this.ensureFolderUnlocked(owner) : null;
     }
-    if (!dek) { if (!opts.silent) new Notice("Couldn't unlock the folder key this trashed note was encrypted with."); return false; }
+    if (!dek) { if (!opts.silent) notify("Couldn't unlock the folder key this trashed note was encrypted with."); return false; }
     // Backfill blobs are raw `.trash/` zips, not Stashpad bundles — different
     // restore path (plain unzip back into `.trash/`).
     if (meta?.kind === "rawtrash") {
@@ -7730,7 +7732,7 @@ export default class StashpadPlugin extends Plugin {
         return true;
       } catch (e) {
         console.warn("[Stashpad] trash-backfill restore failed", e);
-        new Notice(`Couldn't restore: ${(e as Error).message}`, 0);
+        notify(`Couldn't restore: ${(e as Error).message}`, 0);
         return false;
       }
     }
@@ -7763,7 +7765,7 @@ export default class StashpadPlugin extends Plugin {
       return true;
     } catch (e) {
       console.warn("[Stashpad] restore-from-trash failed", e);
-      new Notice(`Couldn't restore: ${(e as Error).message}`, 0);
+      notify(`Couldn't restore: ${(e as Error).message}`, 0);
       return false;
     }
   }
@@ -7777,7 +7779,7 @@ export default class StashpadPlugin extends Plugin {
       return true;
     } catch (e) {
       console.warn("[Stashpad] purge-from-trash failed", blobPath, e);
-      new Notice(`Couldn't delete: ${(e as Error).message}`, 0);
+      notify(`Couldn't delete: ${(e as Error).message}`, 0);
       return false;
     }
   }
@@ -7849,7 +7851,7 @@ export default class StashpadPlugin extends Plugin {
       this.notifications.show({ message: `Restored "${base}" to ${dest}/. If its parent lives in another folder, move it from there.`, kind: "success", category: "system", folder: dest, actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(dest) }] });
       return true;
     } catch (e) {
-      new Notice(`Couldn't restore: ${(e as Error).message}`);
+      notify(`Couldn't restore: ${(e as Error).message}`);
       return false;
     }
   }
@@ -7884,7 +7886,7 @@ export default class StashpadPlugin extends Plugin {
     const dest = archIdx > 0
       ? segs.slice(0, archIdx).join("/")
       : ((this.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad");
-    if ((file.parent?.path ?? "") === dest) { new Notice("Already in the default folder."); return false; }
+    if ((file.parent?.path ?? "") === dest) { notify("Already in the default folder."); return false; }
     try {
       if (!(await this.app.vault.adapter.exists(dest))) { try { await this.app.vault.createFolder(dest); } catch { /* race */ } }
       let target = `${dest}/${file.name}`;
@@ -7893,7 +7895,7 @@ export default class StashpadPlugin extends Plugin {
       this.notifications.show({ message: `Un-archived "${file.basename}" to ${dest}/.`, kind: "success", category: "system", folder: dest });
       return true;
     } catch (e) {
-      new Notice(`Couldn't un-archive: ${(e as Error).message}`);
+      notify(`Couldn't un-archive: ${(e as Error).message}`);
       return false;
     }
   }
@@ -7922,8 +7924,8 @@ export default class StashpadPlugin extends Plugin {
     // 0.145.0: include plaintext trash bundles (no key needed) so "Restore all"
     // doesn't silently skip default (encryption-off) deletes.
     const items = [...await this.listDeletedTrash(), ...await this.listPlaintextTrash()];
-    if (items.length === 0) { new Notice("Nothing to restore."); return 0; }
-    const prog = items.length > 3 ? new Notice("", 0) : null;
+    if (items.length === 0) { notify("Nothing to restore."); return 0; }
+    const prog = items.length > 3 ? notify("", 0) : null;
     let count = 0;
     for (let i = 0; i < items.length; i++) {
       prog?.setMessage(`🔓 Restoring ${i + 1}/${items.length}…`);
@@ -7952,9 +7954,9 @@ export default class StashpadPlugin extends Plugin {
   async openRestoreTrashPicker(): Promise<void> {
     await this.encryption.whenKeysReady();  // 0.294.0 (perf): index is deferred; don't read it half-built
     // 0.295.2: re-walk once before believing "no keys at all".
-    if (!(await this.encryption.isConfiguredRechecked())) { new Notice("Set up encryption first (Settings → Stashpad → Encryption)."); return; }
+    if (!(await this.encryption.isConfiguredRechecked())) { notify("Set up encryption first (Settings → Stashpad → Encryption)."); return; }
     const items = await this.listDeletedTrash();
-    if (items.length === 0) { new Notice("Encrypted trash is empty."); return; }
+    if (items.length === 0) { notify("Encrypted trash is empty."); return; }
     const entries = items.map(({ blob, meta }) => ({
       blob,
       label: meta?.title || blob.split("/").pop()?.replace(/\.stashenc$/, "") || "Locked note",
@@ -8091,10 +8093,10 @@ export default class StashpadPlugin extends Plugin {
       await this.saveSettings();
     } else {
       await this.saveSettings(); // persist any prefs.archive de-flags that DID complete
-      new Notice(`Stashpad archive update: ${totalFailed} note${totalFailed === 1 ? "" : "s"} couldn't be moved (see the developer console). Nothing was deleted — the migration will retry on the next launch. A recovery journal of every move is at ${this.pluginPrivatePath()}/archive-migration-journal.json.`, 0);
+      notify(`Stashpad archive update: ${totalFailed} note${totalFailed === 1 ? "" : "s"} couldn't be moved (see the developer console). Nothing was deleted — the migration will retry on the next launch. A recovery journal of every move is at ${this.pluginPrivatePath()}/archive-migration-journal.json.`, 0);
     }
     if (lines.length) {
-      new Notice(`Stashpad archive update: dedicated archive folders are now regular folders — archived notes moved into each folder's own "archive/" subfolder.\n\n${lines.join("\n")}\n\nFind everything in the aggregated Archived view. (This notice stays until dismissed.)`, 0);
+      notify(`Stashpad archive update: dedicated archive folders are now regular folders — archived notes moved into each folder's own "archive/" subfolder.\n\n${lines.join("\n")}\n\nFind everything in the aggregated Archived view. (This notice stays until dismissed.)`, 0);
     }
   }
 
@@ -8162,7 +8164,7 @@ export default class StashpadPlugin extends Plugin {
       await this.saveSettings();
     }
     if (moved > 0 || failed > 0) {
-      new Notice(`Stashpad trash update: ${moved} encrypted-trash item${moved === 1 ? "" : "s"} moved into per-folder "trash/" subfolders${left ? ` (${left} stayed in _deleted/ — unknown or missing origin)` : ""}${failed ? ` — ${failed} failed; will retry next launch` : ""}. Everything stays visible in the Trash view.`, 0);
+      notify(`Stashpad trash update: ${moved} encrypted-trash item${moved === 1 ? "" : "s"} moved into per-folder "trash/" subfolders${left ? ` (${left} stayed in _deleted/ — unknown or missing origin)` : ""}${failed ? ` — ${failed} failed; will retry next launch` : ""}. Everything stays visible in the Trash view.`, 0);
     }
   }
 
@@ -8439,7 +8441,7 @@ export default class StashpadPlugin extends Plugin {
       if (this._xvCutRemindedToken !== pending.token) {
         this._xvCutRemindedToken = pending.token;
         const n = pending.ids.length;
-        new Notice(`${n} note${n === 1 ? "" : "s"} cut for another vault — paste in that vault to finish the move. The originals stay here until then.`, 8000);
+        notify(`${n} note${n === 1 ? "" : "s"} cut for another vault — paste in that vault to finish the move. The originals stay here until then.`, 8000);
       }
       return;
     }
@@ -8502,7 +8504,7 @@ export default class StashpadPlugin extends Plugin {
     if (this.isArchiveFolder(cleanDest)) {
       // 0.134.4 (B4): archives default to plaintext now — the block stays (paste
       // bypasses the archive flow entirely) but the copy shouldn't claim encryption.
-      new Notice(`"${cleanDest.split("/").pop()}" is an archive folder, so cross-folder paste is disabled there. Use the "Move selection to archive" command instead — it runs the proper archive flow (and encrypts, if that folder encrypts its archive).`);
+      notify(`"${cleanDest.split("/").pop()}" is an archive folder, so cross-folder paste is disabled there. Use the "Move selection to archive" command instead — it runs the proper archive flow (and encrypts, if that folder encrypts its archive).`);
       return null;
     }
     // Gather source subtree(s) from DISK (authoritative; the source folder's view
@@ -8815,7 +8817,7 @@ export default class StashpadPlugin extends Plugin {
     // notes plaintext in an encrypted archive folder.
     if (!(await this.encryption.recheckFolderKeyOnDisk(cleaned))) return;
     if (!(await this.ensureFolderUnlocked(cleaned))) {
-      new Notice(`⚠️ Archive folder "${cleaned.split("/").pop()}": ${roots.length} arriving note${roots.length === 1 ? "" : "s"} NOT encrypted (couldn't unlock the folder password). Unlock it and lock them manually.`, 0);
+      notify(`⚠️ Archive folder "${cleaned.split("/").pop()}": ${roots.length} arriving note${roots.length === 1 ? "" : "s"} NOT encrypted (couldn't unlock the folder password). Unlock it and lock them manually.`, 0);
       return;
     }
     let count = 0;
@@ -8902,13 +8904,13 @@ export default class StashpadPlugin extends Plugin {
    *  the view's normal createNoteUnder / importAttachment paths. */
   async runQuickCapture(folder: string, text: string, files: File[], split = false): Promise<boolean> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
-    if (!cleaned) { new Notice("Pick a Stashpad to capture into."); return false; }
+    if (!cleaned) { notify("Pick a Stashpad to capture into."); return false; }
     let leaf = await this.findStashpadLeafForFolder(cleaned);
     if (!leaf) leaf = await this.activateViewForFolder(cleaned);
-    if (!leaf) { new Notice(`Couldn't open “${cleaned}”.`); return false; }
+    if (!leaf) { notify(`Couldn't open “${cleaned}”.`); return false; }
     try { await (leaf as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.(); } catch { /* reveal still works */ }
     const view = leaf.view;
-    if (!(view instanceof StashpadView)) { new Notice("Stashpad view not ready — try again."); return false; }
+    if (!(view instanceof StashpadView)) { notify("Stashpad view not ready — try again."); return false; }
     let body = text;
     for (const f of files) {
       const link = await view.captureImport(f);
@@ -9176,7 +9178,7 @@ export default class StashpadPlugin extends Plugin {
     const folder = file.parent?.path?.replace(/\/+$/, "") ?? "";
     const id = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
     if (!folder || typeof id !== "string" || !id) {
-      new Notice("That note isn't a Stashpad note.");
+      notify("That note isn't a Stashpad note.");
       return;
     }
     await this.revealNoteByRef(folder, id);
@@ -9258,7 +9260,7 @@ export default class StashpadPlugin extends Plugin {
    *  (the menu builder) already computed the matches. */
   async revealAttachmentInStashpad(file: TFile, preNotes?: TFile[]): Promise<void> {
     const notes = preNotes ?? this.findStashpadNotesEmbedding(file);
-    if (notes.length === 0) { new Notice("No Stashpad note references this attachment."); return; }
+    if (notes.length === 0) { notify("No Stashpad note references this attachment."); return; }
     if (notes.length === 1) { await this.revealNoteInStashpad(notes[0]); return; }
     new AttachmentParentPicker(this.app, notes, (note) => void this.revealNoteInStashpad(note)).open();
   }
@@ -9305,7 +9307,7 @@ export default class StashpadPlugin extends Plugin {
       if (Date.now() < deadline) { window.setTimeout(trySchedule, 80); return; }
       const file = this.resolveNoteFileInFolder(clean, id);
       if (file) void this.openFullDuePicker(file, clean);
-      else new Notice("Couldn’t open the scheduler for that task.");
+      else notify("Couldn’t open the scheduler for that task.");
     };
     trySchedule();
   }
@@ -9330,7 +9332,7 @@ export default class StashpadPlugin extends Plugin {
     const noteId = (params.note || "").trim();
     const viewName = ((params as { view?: string }).view || "").trim();
     const actions = parseRunActions(params);
-    const fail = (msg: string): boolean => { if (!opts.silent) new Notice(msg); return false; };
+    const fail = (msg: string): boolean => { if (!opts.silent) notify(msg); return false; };
 
     // 0.334.0: a saved-view link (`?view=<name>`) opens that view from settings —
     // the saved state carries its own folder/filter/focus. Only ever opens the
@@ -9433,7 +9435,7 @@ export default class StashpadPlugin extends Plugin {
       const items = candidates
         .map((c) => ({ raw: c, parsed: parseStashpadLink(c) }))
         .filter((x): x is { raw: string; parsed: NonNullable<ReturnType<typeof parseStashpadLink>> } => !!x.parsed);
-      if (items.length === 0) { new Notice("That doesn't look like a Stashpad link."); return; }
+      if (items.length === 0) { notify("That doesn't look like a Stashpad link."); return; }
       void this.openDeepLinks(items);
     }).open();
   }
@@ -9467,7 +9469,7 @@ export default class StashpadPlugin extends Plugin {
     if (opened) parts.push(`opened ${opened}`);
     if (handedOff) parts.push(`sent ${handedOff} to Obsidian (other vault)`);
     if (notFound) parts.push(`${notFound} not found`);
-    new Notice(`Stashpad link${items.length === 1 ? "" : "s"}: ${parts.join(" · ") || "nothing to open"}.`);
+    notify(`Stashpad link${items.length === 1 ? "" : "s"}: ${parts.join(" · ") || "nothing to open"}.`);
   }
 
   /** Hand a raw `obsidian://…` URL to Obsidian's own protocol handling (via the
@@ -10076,7 +10078,7 @@ export default class StashpadPlugin extends Plugin {
       if (assignees.length > 0 && !(myId && assignees.some((a) => a.id === myId))) continue;
       due.push({ id, folder: (f.parent?.path ?? "").replace(/\/+$/, ""), file: f, dueMs });
     }
-    if (due.length === 0) { new Notice("No incomplete tasks are due — your backlog is clear. 🎉"); return; }
+    if (due.length === 0) { notify("No incomplete tasks are due — your backlog is clear. 🎉"); return; }
     await this.showDueToasts(due);
   }
 
@@ -10087,8 +10089,8 @@ export default class StashpadPlugin extends Plugin {
     await this.rebuildAuthorRegistry(); // learn every author from the vault first
     const authors = this.collectKnownAuthors();
     const folders = this.discoverStashpadFolders();
-    if (!authors.length || !folders.length) { new Notice("No authors or Stashpad folders to sync."); return; }
-    const prog = folders.length * authors.length > 8 ? new Notice("", 0) : null;
+    if (!authors.length || !folders.length) { notify("No authors or Stashpad folders to sync."); return; }
+    const prog = folders.length * authors.length > 8 ? notify("", 0) : null;
     let created = 0;
     for (const folder of folders) {
       prog?.setMessage(`Syncing authors → ${folder.split("/").pop()}…`);
@@ -10325,7 +10327,7 @@ export default class StashpadPlugin extends Plugin {
    *  specific Stashpad folder. With a single folder, skip to the picker. */
   openImportPicker(): void {
     const folders = this.discoverStashpadFolders();
-    if (folders.length === 0) { new Notice("No Stashpad folders to import into."); return; }
+    if (folders.length === 0) { notify("No Stashpad folders to import into."); return; }
     if (folders.length === 1) { this.importService.pickFilesInto(folders[0]); return; }
     const def = this.importService.defaultDestination() ?? folders[0];
     new ImportTargetModal(this.app, def, folders, (folder) => this.importService.pickFilesInto(folder)).open();
@@ -11347,7 +11349,7 @@ export default class StashpadPlugin extends Plugin {
           curStr.delete("bindings"); // 0.292.0 (perf): re-merged in place — cached string is stale.
         }
         console.warn(`[Stashpad] settings collision: on-disk keys differ from our baseline (disk rev ${diskRev}, we knew ${this.lastSeenSettingsRev}); adopted: ${adopted.join(", ")}.`);
-        if (critical.length) new Notice(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${critical.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
+        if (critical.length) notify(`Stashpad: another Obsidian instance (or a synced machine) changed this vault's settings. Merged instead of overwriting (${critical.join(", ")}). If encryption behaves oddly, restart Obsidian.`, 10000);
         setSettings(this.settings);
         // Reflect adopted folder-panel placement immediately — no reload needed.
         if (adopted.some((k) => k.startsWith("folderPanel"))) this.refreshFolderPanels();
@@ -11458,7 +11460,7 @@ export default class StashpadPlugin extends Plugin {
   async fixOrphanParents(): Promise<void> {
     const stashpadFolders = new Set(this.discoverStashpadFolders());
     if (stashpadFolders.size === 0) {
-      new Notice("No Stashpad folders found.");
+      notify("No Stashpad folders found.");
       return;
     }
 
@@ -11505,7 +11507,7 @@ export default class StashpadPlugin extends Plugin {
     }
 
     if (plan.length === 0) {
-      new Notice("Nothing to fix — every note in a Stashpad folder already has id + parent + created.");
+      notify("Nothing to fix — every note in a Stashpad folder already has id + parent + created.");
       return;
     }
 
@@ -11647,7 +11649,7 @@ export default class StashpadPlugin extends Plugin {
         }
       });
     } catch (e) {
-      new Notice(`Adopt failed: ${(e as Error).message}`);
+      notify(`Adopt failed: ${(e as Error).message}`);
       return;
     }
 
@@ -11671,7 +11673,7 @@ export default class StashpadPlugin extends Plugin {
     }
 
     if (added.length === 0 && !renamed) {
-      new Notice(`Already a Stashpad note (${kept.join(", ")} present).`);
+      notify(`Already a Stashpad note (${kept.join(", ")} present).`);
       return;
     }
     const parts: string[] = [];

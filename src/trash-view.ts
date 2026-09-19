@@ -1,4 +1,5 @@
-import { ItemView, Notice, WorkspaceLeaf, moment, setIcon } from "obsidian";
+import { ItemView, WorkspaceLeaf, moment, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { STASHPAD_TRASH_VIEW_TYPE } from "./types";
 import { ConfirmModal } from "./modals";
@@ -135,7 +136,7 @@ export class StashpadTrashView extends ItemView {
           // so without this a key-locked item left behind reads as success. (0.140.7)
           let failed = 0;
           for (const b of [...this.selected]) { if (!(await this.plugin.restoreDeletedAt(b, { silent: true }))) failed++; }
-          if (failed > 0) new Notice(`${failed} item${failed === 1 ? "" : "s"} couldn't be restored (locked key?) — still in trash.`);
+          if (failed > 0) notify(`${failed} item${failed === 1 ? "" : "s"} couldn't be restored (locked key?) — still in trash.`);
           this.clearSelection();
           await this.render();
         };

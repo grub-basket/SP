@@ -1,4 +1,5 @@
-import { ItemView, Menu, Notice, Platform, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
+import { ItemView, Menu, Platform, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { perf } from "./perf";
 import { populateLockedMenu } from "./locked-menu";
@@ -387,7 +388,7 @@ export class StashpadAggregateView extends ItemView {
           try { path = (this.app.vault.adapter as unknown as { getFullPath?: (p: string) => string })?.getFullPath?.(f.path) || f.path; } catch { /* keep relative */ }
         }
         void navigator.clipboard.writeText(path);
-        new Notice("Path copied.");
+        notify("Path copied.");
       }));
       return menu;
     };

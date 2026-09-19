@@ -1,5 +1,6 @@
 import type { Plugin } from "obsidian";
-import { Notice } from "obsidian";
+import { notify } from "./notify";
+import {  } from "obsidian";
 import {
   CONFIG_FILES, CONFIG_KEYS, CONFIG_POINTER_KEY, CONFIG_SUBFOLDERS,
   CONFIG_SENTINEL, CONFIG_SENTINEL_BODY, CONFIG_BACKUP_FILE,
@@ -304,7 +305,7 @@ export class SettingsStore {
             // (that bug produced dozens of identical copies).
             const backup = `${dataPath}.corrupt-${SettingsStore.hash(raw)}`;
             try { if (!(await adapter.exists(backup))) await adapter.write(backup, raw); } catch { /* best effort */ }
-            new Notice(
+            notify(
               "Stashpad: your settings file (data.json) is damaged and could not be read.\n"
               + `A copy was saved as ${backup.split("/").pop()}.\n`
               + "Settings are showing defaults for now and Stashpad will NOT save over the "
@@ -338,7 +339,7 @@ export class SettingsStore {
       // guard skips writes to a missing folder — edits to these settings won't
       // persist until it returns. Tell the user rather than let that be silent;
       // no data is lost (the config files, once they arrive, are untouched).
-      new Notice(
+      notify(
         `Stashpad: the config folder "${this.configFolder}" isn't available yet.\n`
         + "Snippets, saved views, menus, templates and per-folder appearance are "
         + "showing defaults, and changes to them won't be saved until the folder "

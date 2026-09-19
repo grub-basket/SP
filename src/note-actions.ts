@@ -40,6 +40,7 @@ export const NOTE_ACTION_CATALOG: readonly NoteActionDef[] = [
   { id: "copyLevelMarkers", label: "Copy tree with level markers",  icon: "list-tree",                         group: "Copy" },
   { id: "copySubtree",      label: "Copy focused subtree",          icon: "list-tree",                         group: "Copy" },
   { id: "clone",            label: "Clone (duplicate)",             icon: "files",              button: true,  group: "Copy" },
+  { id: "exportHtml",       label: "Export to HTML / PDF…",         icon: "file-code",                         group: "Copy" },
   // Organize
   { id: "move",             label: "Move to…",                      icon: "move",               button: true,  group: "Organize" },
   { id: "moveHome",         label: "Move to Home",                  icon: "home",                              group: "Organize" },
@@ -81,6 +82,10 @@ export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
   // as `submenu:<key>` so they show up in the submenu editor and are renamable /
   // reorderable / nestable / deletable like any user submenu. See
   // DEFAULT_CONTEXT_SUBMENUS below + the seed migration in main.ts.
+  // 0.442.0 (/dump): Move ▸ promoted near the TOP (it leads with "Move in list",
+  // a common action the user didn't want to scroll for). Default order only;
+  // existing users keep their saved contextMenuOrder.
+  "submenu:move",
   "submenu:reactreply", "recurrenceSkip",
   // 0.357.0: clone + fork relocated INTO the "Copy ▸" submenu (view.ts, the
   // `copy` case of renderCtxLeaf) — they no longer sit at the top level in the
@@ -89,7 +94,7 @@ export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
   // 0.363.0: color + obscure + encrypt grouped into the "Appearance & privacy"
   // submenu (submenu:appearance); they no longer sit at the top level by default.
   "copy", "shareExport", "sep",
-  "submenu:move", "submenu:pin", "submenu:appearance",
+  "submenu:pin", "submenu:appearance",
   "taskSubmenu", "sep", "submenu:advanced", "delete", "moreCommands",
 ];
 /** Stateful/compound context-menu items that live only in the ⋮ menu (not the

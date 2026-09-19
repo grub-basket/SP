@@ -1,4 +1,5 @@
 import { App, Menu, Notice, Platform } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { buildStashpadLink } from "./deep-link";
 import { ConfirmModal } from "./modals";
@@ -32,7 +33,7 @@ export async function deleteLockedBundleWithUndo(
   let blobData: ArrayBuffer | null = null;
   let metaData: string | null = null;
   try { blobData = await adapter.readBinary(blobPath); } catch { blobData = null; }
-  if (!blobData) { new Notice("Couldn't read the encrypted file to delete it."); return; }
+  if (!blobData) { notify("Couldn't read the encrypted file to delete it."); return; }
   try { if (await adapter.exists(metaPath)) metaData = await adapter.read(metaPath); } catch { metaData = null; }
   const prevEntry = (plugin.settings.lockedSubtrees ?? []).find((x) => x.blob === blobPath) ?? null;
 
@@ -67,7 +68,7 @@ export async function deleteLockedBundleWithUndo(
     undo: doRestore,
     redo: doDelete,
   });
-  new Notice(d.count > 1 ? "Encrypted notes deleted — undo to restore." : "Encrypted note deleted — undo to restore.");
+  notify(d.count > 1 ? "Encrypted notes deleted — undo to restore." : "Encrypted note deleted — undo to restore.");
 }
 
 export interface LockedMenuConfig {
@@ -100,7 +101,7 @@ export function populateLockedMenu(menu: Menu, cfg: LockedMenuConfig): void {
   };
   const copyLink = (): void => {
     const link = buildStashpadLink({ vault: app.vault.getName(), folder: d.folder, note: d.rootId!, run: ["reveal"] });
-    void navigator.clipboard.writeText(link).then(() => new Notice("Stashpad link copied."), () => new Notice("Couldn't copy the link."));
+    void navigator.clipboard.writeText(link).then(() => notify("Stashpad link copied."), () => notify("Couldn't copy the link."));
   };
 
   // Shared item factories -----------------------------------------------------
@@ -134,7 +135,7 @@ export function populateLockedMenu(menu: Menu, cfg: LockedMenuConfig): void {
   const addCopyPath = (): void => {
     menu.addItem((i: any) => i.setTitle("Copy encrypted file path").setIcon("copy").onClick(() => {
       void navigator.clipboard.writeText(fullPathOf(d.blob));
-      new Notice("Path copied.");
+      notify("Path copied.");
     }));
   };
   const addDelete = (): void => {

@@ -51,7 +51,7 @@ interface DayHit { row: IndexRow; reasons: Set<Reason>; projected?: boolean; }
 const REASON_META: Record<Reason, { label: string; cls: string; icon: string; title: string }> = {
   created: { label: "Created", cls: "is-created", icon: "sparkles", title: "Notes created on this day" },
   due:     { label: "Due",     cls: "is-due",     icon: "flag",     title: "Tasks due on this day" },
-  link:    { label: "Links",   cls: "is-link",    icon: "link",     title: "Notes linking to this day" },
+  link:    { label: "Date links", cls: "is-link",  icon: "link",     title: "Notes linking to this day" },
   recurring: { label: "Recurring", cls: "is-recurring", icon: "repeat", title: "Projected future occurrences of repeating tasks" },
 };
 
@@ -60,6 +60,18 @@ export async function renderDueCalendar(
 ): Promise<void> {
   const token = ((host as unknown as { __sCalTok?: number }).__sCalTok ?? 0) + 1;
   (host as unknown as { __sCalTok?: number }).__sCalTok = token;
+  // 0.439.0 (/dump): collectIndexRows scans the vault index, which can take a
+  // few seconds on a big vault — during which the calendar was just BLANK. On the
+  // FIRST render (nothing built yet) show a loading indicator; a re-render (filter
+  // change) keeps its existing content up until the fresh rows arrive, so it never
+  // flashes this.
+  if (!host.querySelector(".stashpad-cal-bar")) {
+    host.addClass("stashpad-cal");
+    host.empty();
+    const loading = host.createDiv({ cls: "stashpad-cal-loading" });
+    setIcon(loading.createSpan({ cls: "stashpad-cal-loading-icon" }), "loader");
+    loading.createSpan({ text: "Building calendar…" });
+  }
   const rows = await collectIndexRows(app, plugin);
   if ((host as unknown as { __sCalTok?: number }).__sCalTok !== token) return; // superseded
   const rerender = (): void => { void renderDueCalendar(host, app, plugin, state, opts); };

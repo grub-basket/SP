@@ -1,4 +1,5 @@
-import { App, Notice, TFile, moment, setIcon } from "obsidian";
+import { App, TFile, moment, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, siftMatch, parseAuthorRef, writeCompletedFm } from "./types";
 import { stripInlineMarkdown } from "./slug-service";
@@ -481,7 +482,7 @@ export async function renderMasterIndex(
     const targets = selectedRows();
     let ok = 0, failed = 0;
     for (const r of targets) { try { await fn(r); ok++; } catch (e) { failed++; console.warn(`[Stashpad] bulk ${label} failed`, r.file.path, e); } }
-    new Notice(`${label}: ${ok} done${failed ? `, ${failed} failed` : ""}.`);
+    notify(`${label}: ${ok} done${failed ? `, ${failed} failed` : ""}.`);
     // 0.295.2 (perf): a bulk action MUTATED notes — this is the one in-view
     // path that must re-collect rather than repaint the cache.
     recollect();
@@ -509,7 +510,7 @@ export async function renderMasterIndex(
     act("Reopen", "rotate-ccw", () => void applyToSelected((r) => app.fileManager.processFrontMatter(r.file, (m) => writeCompletedFm(m as Record<string, unknown>, false)), "Reopen"));
     act("Copy links", "copy", () => {
       const md = selectedRows().map((r) => `[[${r.file.path.replace(/\.md$/, "")}|${r.title}]]`).join("\n");
-      void navigator.clipboard.writeText(md); new Notice(`Copied ${state.selected.size} link${state.selected.size === 1 ? "" : "s"}.`);
+      void navigator.clipboard.writeText(md); notify(`Copied ${state.selected.size} link${state.selected.size === 1 ? "" : "s"}.`);
     });
     act("Delete", "trash-2", () => {
       const targets = selectedRows();

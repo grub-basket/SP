@@ -12,7 +12,8 @@
  *  ONLY thing that writes to the vault on first run — nothing is created until
  *  the user picks "fresh" or "demo".
  */
-import { App, Modal, Notice, Setting } from "obsidian";
+import { App, Modal, Setting } from "obsidian";
+import { notify } from "./notify";
 import { seedDemoContent, DEMO_NOTE_COUNT } from "./demo-content";
 import { FolderSuggest } from "./folder-suggest";
 import type StashpadPlugin from "./main";
@@ -148,14 +149,14 @@ export class WelcomeModal extends Modal {
     try {
       if (choice === "demo") {
         const { created, skipped } = await seedDemoContent(this.app, this.plugin, folder);
-        new Notice(
+        notify(
           `Stashpad: created "${folder}" with ${created} example note${created === 1 ? "" : "s"}` +
             (skipped > 0 ? ` (${skipped} skipped — those files already existed)` : ""),
           8000,
         );
       } else {
         await this.plugin.createNewStashpad(folder);
-        new Notice(`Stashpad: created "${folder}".`, 6000);
+        notify(`Stashpad: created "${folder}".`, 6000);
       }
       this.choice = choice;
       this.close();
@@ -172,7 +173,7 @@ export class WelcomeModal extends Modal {
       const msg = e instanceof Error ? e.message : String(e);
       // Stay open on failure so the user can fix the name and retry, rather
       // than losing the modal and having to find it again.
-      new Notice(`Stashpad: couldn't create "${folder}" — ${msg}`, 0);
+      notify(`Stashpad: couldn't create "${folder}" — ${msg}`, 0);
     }
   }
 

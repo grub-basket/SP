@@ -1,4 +1,5 @@
-import { Notice, TFile, TFolder } from "obsidian";
+import { TFile, TFolder } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink } from "./types";
 import { formatDateOnly } from "./format";
@@ -231,7 +232,7 @@ export class ImportService {
           const dupSet = new Set(dupes.map((f) => f.path));
           importFiles = files.filter((f) => !dupSet.has(f.path));
           if (importFiles.length === 0 && folders.length === 0) {
-            new Notice(`Skipped ${dupes.length} duplicate file(s) — nothing new to import.`);
+            notify(`Skipped ${dupes.length} duplicate file(s) — nothing new to import.`);
             return;
           }
         } else if (choice === "replace") {
@@ -266,7 +267,7 @@ export class ImportService {
           "Import all",
         );
         if (!ok) {
-          new Notice(`Import cancelled — ${total} file(s) left as-is.`);
+          notify(`Import cancelled — ${total} file(s) left as-is.`);
           return;
         }
       }
@@ -477,7 +478,7 @@ export class ImportService {
     // renamed attachment can leave a note's ![[link]] pointing at the wrong
     // (pre-existing) file.
     if (renames.length) {
-      new Notice(`Stashpad: ${renames.length} attachment name collision(s) renamed on import — check ![[links]] in the imported notes.`);
+      notify(`Stashpad: ${renames.length} attachment name collision(s) renamed on import — check ![[links]] in the imported notes.`);
     }
     return { kind: "folder", folder: root, archivePath, notePaths, attachmentPaths: [], originalName: name };
   }
@@ -678,7 +679,7 @@ export class ImportService {
         console.warn("[Stashpad] import undo: couldn't restore replaced note", rep.path, e);
       }
     }
-    new Notice(`Undid import of ${records.length} file(s).`);
+    notify(`Undid import of ${records.length} file(s).`);
   }
 
   /** 0.79.4 / 0.80.1: open the OS file picker, copy the chosen files into

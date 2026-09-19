@@ -1,4 +1,5 @@
-import { App, Notice, setIcon } from "obsidian";
+import { App, setIcon } from "obsidian";
+import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { collectTasks, type TaskItem } from "./task-collect";
 import { writeCompletedFm } from "./types";
@@ -248,7 +249,7 @@ export function renderTaskTriage(
 
   const toggleCompleted = async (t: TaskItem): Promise<void> => {
     try { await app.fileManager.processFrontMatter(t.file, (m: any) => { writeCompletedFm(m, !(m.completed === true)); }); }
-    catch (e) { new Notice(`Couldn't update task: ${(e as Error).message}`); return; }
+    catch (e) { notify(`Couldn't update task: ${(e as Error).message}`); return; }
     rerender();
   };
   const snooze = (t: TaskItem): void => {

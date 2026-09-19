@@ -1,4 +1,5 @@
-import { App, Notice, TFile } from "obsidian";
+import { App, TFile } from "obsidian";
+import { notify } from "./notify";
 import { ConfirmModal } from "./modals";
 import type { TreeNode } from "./types";
 import type { TreeIndex } from "./tree-index";
@@ -177,13 +178,13 @@ export class AuthorshipTracker {
    *      real author that landed after the claim. */
   private async claimAuthorship(opts: { scope: "selection" | "folder"; contributorMode: boolean }): Promise<void> {
     const author = this.currentAuthorLink();
-    if (!author) { new Notice("Set your author name in Stashpad settings first."); return; }
+    if (!author) { notify("Set your author name in Stashpad settings first."); return; }
     const idTag = `-${author.id}`;
 
     const files = opts.scope === "selection"
       ? this.host.getActionTargets().map((n) => n.file).filter((f): f is TFile => !!f)
       : this.fileBackedNotesInFolder();
-    if (files.length === 0) { new Notice(opts.scope === "selection" ? "No notes selected." : "No notes in this folder."); return; }
+    if (files.length === 0) { notify(opts.scope === "selection" ? "No notes selected." : "No notes in this folder."); return; }
 
     const toAuthor: string[] = [];
     const toContributor: string[] = [];
@@ -199,7 +200,7 @@ export class AuthorshipTracker {
     }
 
     const total = toAuthor.length + toContributor.length;
-    if (total === 0) { new Notice("Nothing to claim — those notes are already authored by you."); return; }
+    if (total === 0) { notify("Nothing to claim — those notes are already authored by you."); return; }
 
     if (opts.scope === "folder") {
       const parts = [`Stamp yourself as author on ${toAuthor.length} unauthored note(s)`];
@@ -267,7 +268,7 @@ export class AuthorshipTracker {
     const bits: string[] = [];
     if (toAuthor.length) bits.push(`authored ${toAuthor.length}`);
     if (toContributor.length) bits.push(`contributing to ${toContributor.length}`);
-    new Notice(`Claimed authorship: ${bits.join(", ")}. Undo available.`);
+    notify(`Claimed authorship: ${bits.join(", ")}. Undo available.`);
     this.host.debouncedRender();
   }
 

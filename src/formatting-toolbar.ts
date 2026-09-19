@@ -205,6 +205,7 @@ export const TOOLBAR_BUILTINS: ToolbarBuiltin[] = [
   { id: "codeBlock", icon: "square-code", glyph: "{}", title: "Code block", run: (ta) => insertCodeBlock(ta) },
   { id: "code", icon: "code", glyph: "</>", title: "Code", run: (ta) => wrapSelection(ta, "`") },
   { id: "checkbox", icon: "square-check-big", glyph: "☑", title: "Checkbox", run: (ta) => prefixLine(ta, "- [ ] ") },
+  { id: "quote", icon: "quote", glyph: "”", title: "Quote (blockquote)", run: (ta) => prefixLine(ta, "> ") },
   { id: "spoiler", icon: "eye-off", glyph: "\u{1F648}", title: "Spoiler (tap to reveal)", gate: "spoilers", run: (ta) => wrapSelection(ta, "||") },
   // 0.397.0: Drafts — composer only (gated on opts.drafts). Toggles the per-folder
   // drafts reminder chip; right-click opens the Drafts manager. Hideable/orderable

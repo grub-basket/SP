@@ -1,5 +1,6 @@
 import type StashpadPlugin from "./main";
-import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, Notice, setIcon, Setting, type SecretStorage } from "obsidian";
+import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, setIcon, Setting, type SecretStorage } from "obsidian";
+import { notify } from "./notify";
 import { normalisePastedPath } from "./paste-path";
 import { collectDropEntries, readDroppedTree, type DroppedTree } from "./dropped-folders";
 import { splitIntoChunks, splitByDelimiter, SPLIT_MODE_LABELS, setIconSafe, type SplitMode } from "./view-helpers";
@@ -270,7 +271,7 @@ export class LogPanel {
       if (kind === "reveal") shell.showItemInFolder(full);
       else shell.openPath(full);
     } catch (e) {
-      new Notice(`Couldn't ${kind}: ${(e as Error).message}`);
+      notify(`Couldn't ${kind}: ${(e as Error).message}`);
     }
   }
 
@@ -283,10 +284,10 @@ export class LogPanel {
       const dir = this.jsonlPath.replace(/\/[^/]+$/, "") || "";
       const exportPath = dir ? `${dir}/${stamp}-log.jsonl` : `${stamp}-log.jsonl`;
       await this.app.vault.adapter.write(exportPath, this.text);
-      new Notice(`Exported log → ${exportPath}`);
+      notify(`Exported log → ${exportPath}`);
       return exportPath;
     } catch (e) {
-      new Notice(`Export failed: ${(e as Error).message}`);
+      notify(`Export failed: ${(e as Error).message}`);
       return null;
     }
   }
@@ -304,7 +305,7 @@ export class LogPanel {
         try {
           await this.app.vault.adapter.write(this.jsonlPath, "");
         } catch (e) {
-          new Notice(`Clear failed: ${(e as Error).message}`);
+          notify(`Clear failed: ${(e as Error).message}`);
           return;
         }
         this.text = "";
@@ -317,7 +318,7 @@ export class LogPanel {
         // refreshList renders the empty state and resets counts.
         this.refreshList();
         if (this.footerEl) this.footerEl.empty();
-        new Notice("Log cleared.");
+        notify("Log cleared.");
       },
       "Cancel",
       /*dangerous*/ true,
@@ -849,18 +850,28 @@ export class NoteWorkbench {
   }
 
   /** 0.168.3: single dispatch for the Split button + Mod+Enter. 0.169.3: awaits the
-   *  split, then calls onDone so the host can act once the job is complete. */
+   *  split, then calls onDone so the host can act once the job is complete.
+   *  0.437.0: re-entry guard — on a slow device a second tap before the first
+   *  split resolves would run the whole split again and DUPLICATE the output.
+   *  Ignore any commit while one is in flight. */
+  private committing = false;
   async commit(): Promise<void> {
-    if (this.surface === "edit") { await this.saveEdit(); return; }
-    if (this.mode === "line") await this.commitLine();
-    else if (this.mode === "cursor") await this.commitCursor();
-    else if (this.mode === "custom") await this.commitCustom();
-    else await this.commitPreset();
+    if (this.committing) return;
+    this.committing = true;
+    try {
+      if (this.surface === "edit") { await this.saveEdit(); return; }
+      if (this.mode === "line") await this.commitLine();
+      else if (this.mode === "cursor") await this.commitCursor();
+      else if (this.mode === "custom") await this.commitCustom();
+      else await this.commitPreset();
+    } finally {
+      this.committing = false;
+    }
   }
 
   private async commitCustom(): Promise<void> {
     const chunks = splitByDelimiter(this.body, this.customDelimiter, this.customRemove);
-    if (chunks.length < 2) { new Notice("That delimiter wouldn't split this note into more than one part."); return; }
+    if (chunks.length < 2) { notify("That delimiter wouldn't split this note into more than one part."); return; }
     await this.cb.onSplitMany(chunks, this.nest);
     this.cb.onDone();
   }
@@ -913,7 +924,7 @@ export class NoteWorkbench {
     if (!ta) return;
     const ch = ta.selectionStart;
     if (ch <= 0 || ch >= ta.value.length) {
-      new Notice("Move the cursor inside the text — neither end can be empty.");
+      notify("Move the cursor inside the text — neither end can be empty.");
       return;
     }
     // 0.168.0: split the CURRENT (possibly edited) textarea content at the cursor.
@@ -923,7 +934,7 @@ export class NoteWorkbench {
 
   private async commitPreset(): Promise<void> {
     const chunks = splitIntoChunks(this.body, this.presetMode);
-    if (chunks.length < 2) { new Notice("That delimiter wouldn't split this note."); return; }
+    if (chunks.length < 2) { notify("That delimiter wouldn't split this note."); return; }
     await this.cb.onSplitMany(chunks, this.nest);
     this.cb.onDone();
   }
@@ -980,7 +991,7 @@ export class NoteWorkbench {
     if (!this.cb.onOpenExternal) return;
     if (this.isDirty()) {
       try { await this.cb.onSave(this.cursorTextarea?.value ?? this.cursorText, this.pendingReply); }
-      catch (e) { console.warn("[Stashpad] save-before-open failed", e); new Notice("Couldn't save the edits — not opening. See console."); return; }
+      catch (e) { console.warn("[Stashpad] save-before-open failed", e); notify("Couldn't save the edits — not opening. See console."); return; }
     }
     this.cb.onOpenExternal();
     this.cb.onDone(); // committing close — the dirty guard must not fire
@@ -1390,8 +1401,8 @@ export class NoteWorkbench {
       e.stopPropagation();
       const text = getText();
       void navigator.clipboard?.writeText(text).then(
-        () => new Notice("Copied to clipboard."),
-        () => new Notice("Couldn't access the clipboard."),
+        () => notify("Copied to clipboard."),
+        () => notify("Couldn't access the clipboard."),
       );
     };
     return btn;
@@ -1811,7 +1822,7 @@ export class NoteWorkbenchView extends ItemView {
     // confirmed — warn AFTER the fact instead. Guarded closes set the flag so this
     // doesn't fire when the user already chose to discard / saved.
     if (!this.closingIntentionally && this.ui?.isDirty()) {
-      new Notice("Closed the Stashpad editor with unsaved changes — they were discarded. Use Save (⌘/Ctrl+Enter) next time.", 7000);
+      notify("Closed the Stashpad editor with unsaved changes — they were discarded. Use Save (⌘/Ctrl+Enter) next time.", 7000);
     }
     if (this.autoCloseTimer != null) { window.clearInterval(this.autoCloseTimer); this.autoCloseTimer = null; }
     if (this.expiredGrace != null) { window.clearTimeout(this.expiredGrace); this.expiredGrace = null; }
@@ -2001,15 +2012,15 @@ export class ExportStashModal extends Modal {
         if (inp.value.length === 0) {
           try {
             const txt = (await navigator.clipboard?.readText())?.trim();
-            if (!txt) { new Notice("Clipboard is empty."); return; }
+            if (!txt) { notify("Clipboard is empty."); return; }
             inp.value = txt;
             inp.dispatchEvent(new Event("input")); // → refresh (validation, meter, button sync)
-            new Notice("Pasted from clipboard.");
-          } catch { new Notice("Couldn't read the clipboard."); }
+            notify("Pasted from clipboard.");
+          } catch { notify("Couldn't read the clipboard."); }
         } else {
           void navigator.clipboard?.writeText(inp.value).then(
-            () => new Notice("Passphrase copied to clipboard."),
-            () => new Notice("Couldn't access the clipboard."),
+            () => notify("Passphrase copied to clipboard."),
+            () => notify("Couldn't access the clipboard."),
           );
         }
       };
@@ -2166,7 +2177,7 @@ export class ExportStashModal extends Modal {
       e.preventDefault();
       pw1.value = pw2.value = generatePassphrase();
       setShown(false);
-      new Notice("Passphrase generated (hidden) — Show to view, or Copy to save it.");
+      notify("Passphrase generated (hidden) — Show to view, or Copy to save it.");
       refresh();
     };
 
@@ -2349,13 +2360,13 @@ export class EncryptionPasswordModal extends Modal {
         if (i.value.length === 0) {
           try {
             const txt = (await navigator.clipboard?.readText())?.trim();
-            if (!txt) { new Notice("Clipboard is empty."); return; }
-            i.value = txt; i.dispatchEvent(new Event("input")); new Notice("Pasted from clipboard.");
-          } catch { new Notice("Couldn't read the clipboard."); }
+            if (!txt) { notify("Clipboard is empty."); return; }
+            i.value = txt; i.dispatchEvent(new Event("input")); notify("Pasted from clipboard.");
+          } catch { notify("Couldn't read the clipboard."); }
         } else {
           void navigator.clipboard?.writeText(i.value).then(
-            () => new Notice("Copied to clipboard."),
-            () => new Notice("Couldn't access the clipboard."),
+            () => notify("Copied to clipboard."),
+            () => notify("Couldn't access the clipboard."),
           );
         }
       };
@@ -2402,7 +2413,7 @@ export class EncryptionPasswordModal extends Modal {
         // copied to the clipboard below, and Copy works while masked.
         refresh();
         pwSyncers.forEach((s) => s()); // flip Copy/Paste buttons
-        new Notice("Generated — copy it somewhere safe; there's no recovery.");
+        notify("Generated — copy it somewhere safe; there's no recovery.");
         void navigator.clipboard?.writeText(pw).catch(() => {});
       };
       const showBtn = genRow.createEl("button", { cls: "stashpad-export-show", text: "Show" });
@@ -2594,7 +2605,7 @@ export class OpenDeepLinkModal extends Modal {
     pasteBtn.onclick = async () => {
       const t = (await readClipboardText(modalWin)).trim();
       if (t) { input.value = t; autoHint.hide(); }
-      else new Notice("Couldn't read the clipboard — paste manually.");
+      else notify("Couldn't read the clipboard — paste manually.");
       input.focus();
     };
     // A manual paste or edit means the field is no longer the auto-pasted link —
@@ -2996,7 +3007,7 @@ export class QuickCaptureNestModal extends Modal {
       .addToggle((t) => t.setValue(true).onChange((v) => { nestHere = v; }));
     const save = (): void => {
       const text = ta.value;
-      if (!text.trim()) { new Notice("Nothing to capture."); return; }
+      if (!text.trim()) { notify("Nothing to capture."); return; }
       this.close();
       this.opts.onSave(text, nestHere);
     };
@@ -3091,9 +3102,9 @@ export class ComposerDraftsModal extends Modal {
       const load = actions.createEl("button", { cls: "mod-cta", text: d.kind === "edit" ? "Resume editing" : "Load into composer" });
       load.onclick = () => { void this.plugin.loadComposerDraft(d.id).then(() => this.close()); };
       const copy = actions.createEl("button", { text: "Copy" });
-      copy.onclick = () => { void navigator.clipboard?.writeText(d.text).then(() => new Notice("Draft copied.")); };
+      copy.onclick = () => { void navigator.clipboard?.writeText(d.text).then(() => notify("Draft copied.")); };
       const del = actions.createEl("button", { cls: "mod-warning", text: "Discard" });
-      del.onclick = () => { void this.plugin.deleteComposerDraft(d.id).then(() => { new Notice("Draft discarded."); this.render(); }); };
+      del.onclick = () => { void this.plugin.deleteComposerDraft(d.id).then(() => { notify("Draft discarded."); this.render(); }); };
     }
   }
 }
@@ -3154,12 +3165,12 @@ export class SnippetEditModal extends Modal {
     const actions = new Setting(contentEl);
     actions.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
     actions.addButton((b) => b.setButtonText("Save").setCta().onClick(() => {
-      if (!this.draft.name.trim() && !this.draft.value.trim()) { new Notice("Give the snippet a name or a value."); return; }
+      if (!this.draft.name.trim() && !this.draft.value.trim()) { notify("Give the snippet a name or a value."); return; }
       if (!this.draft.name.trim()) this.draft.name = this.draft.value.slice(0, 24);
       // 0.346.0: block a save whose trigger collides with another snippet's
       // (respecting case-sensitivity) — a shadowed trigger would never expand.
       const clash = findTriggerCollision(this.draft, this.all);
-      if (clash) { new Notice(`Trigger “${this.draft.trigger}” already used by “${clash.name || "another snippet"}”. Change it or clear one.`); return; }
+      if (clash) { notify(`Trigger “${this.draft.trigger}” already used by “${clash.name || "another snippet"}”. Change it or clear one.`); return; }
       this.onSave(this.draft);
       this.close();
     }));
@@ -3193,7 +3204,7 @@ export class SnippetImportModal extends Modal {
       const f = fileInput.files?.[0];
       if (!f) return;
       try { const t = await f.text(); ta.value = t; this.text = t; this.updateSummary(); }
-      catch { new Notice("Couldn't read that file."); }
+      catch { notify("Couldn't read that file."); }
     };
 
     // Conflict handling.
@@ -3224,7 +3235,7 @@ export class SnippetImportModal extends Modal {
 
   private doImport(): void {
     const cands = this.candidates();
-    if (!cands.length) { new Notice("Nothing to import."); return; }
+    if (!cands.length) { notify("Nothing to import."); return; }
     const { result, added, skipped, conflicts } = mergeSnippets(this.existing, cands, this.mode);
     this.onImport(result, { added, skipped, conflicts });
     this.close();
@@ -3362,8 +3373,8 @@ export class HistoryModal extends Modal {
     const restore = actions.createEl("button", { cls: "mod-cta", text: "Restore end of this stretch" });
     restore.onclick = async () => {
       restore.disabled = true;
-      try { await this.opts.onRestore(sel.endBody); new Notice("Restored this version."); this.close(); }
-      catch (e) { new Notice(`Restore failed: ${(e as Error).message}`); restore.disabled = false; }
+      try { await this.opts.onRestore(sel.endBody); notify("Restored this version."); this.close(); }
+      catch (e) { notify(`Restore failed: ${(e as Error).message}`); restore.disabled = false; }
     };
   }
 
@@ -3439,8 +3450,8 @@ export class HistoryModal extends Modal {
       const restore = actions.createEl("button", { cls: "mod-cta", text: "Restore this version" });
       restore.onclick = async () => {
         restore.disabled = true;
-        try { await this.opts.onRestore(this.entries[this.selected].b); new Notice("Restored this version."); this.close(); }
-        catch (e) { new Notice(`Restore failed: ${(e as Error).message}`); restore.disabled = false; }
+        try { await this.opts.onRestore(this.entries[this.selected].b); notify("Restored this version."); this.close(); }
+        catch (e) { notify(`Restore failed: ${(e as Error).message}`); restore.disabled = false; }
       };
       const toggle = actions.createEl("button", { text: this.showDiff ? "Show full text" : "Show changes" });
       toggle.onclick = () => { this.showDiff = !this.showDiff; this.render(); };

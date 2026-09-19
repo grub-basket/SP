@@ -65,7 +65,7 @@ export interface ModShortcuts {
 export type CommandId =
   | "move" | "pickMove" | "merge" | "copy" | "copyTree" | "copyLink" | "openEditor" | "openTab"
   | "split" | "edit" | "editParent" | "copyOutline"
-  | "toggleSplit" | "pickDestination" | "search" | "searchInParent" | "delete" | "undo" | "redo"
+  | "toggleSplit" | "pickDestination" | "search" | "searchInParent" | "findInList" | "delete" | "undo" | "redo"
   | "toggleComplete" | "moveUp" | "moveDown" | "moveToTop" | "moveToBottom"
   | "outdent" | "setColor"
   | "clone" | "forkNote" | "insertTemplate"
@@ -128,6 +128,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "pickDestination", label: "Pick destination",              desc: "Default: Mod+D",                                                                          defaultPrimary: "Mod+D" },
   { id: "search",          label: "Search notes",                  desc: "Default: Mod+F",                                                                          defaultPrimary: "Mod+F" },
   { id: "searchInParent",  label: "Search in current parent",      desc: "Default: Mod+Alt+F (Mod+Shift+F is taken by Obsidian's global search).", defaultPrimary: "Mod+Alt+F" },
+  { id: "findInList",      label: "Find in the current list",      desc: "Toggle the type-to-filter bar over the current list. Each search command keeps its own hotkey — the search-scope toggle button changes only what the search BUTTON runs, never these. No default chord.", defaultPrimary: "" },
   { id: "delete",          label: "Delete selection",              desc: "Default: Mod+Backspace",                                                                  defaultPrimary: "Mod+Backspace" },
   { id: "undo",            label: "Undo",                          desc: "Default: Mod+Z (Stashpad-only — won't fire while typing in the composer).",                defaultPrimary: "Mod+Z" },
   { id: "redo",            label: "Redo",                          desc: "Default: Mod+Shift+Z",                                                                    defaultPrimary: "Mod+Shift+Z" },
@@ -964,6 +965,9 @@ export interface StashpadSettings {
    *  interpreted as "differs from this default"). Off = current behavior
    *  (bodies clamp by default, expand is opt-in). */
   expandBodiesByDefault: boolean;
+  /** 0.436.0: headings (drilled-in parent notes shown as a sticky row) start
+   *  EXPANDED instead of collapsed. Per-heading toggle then collapses them. */
+  headingsExpandedByDefault: boolean;
   /** 0.74.1: auto-open the right-sidebar detail panel whenever a
    *  Stashpad view becomes active. Off by default — opt in via this
    *  toggle or the matching palette command. */
@@ -1110,7 +1114,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   folderPanelPinnedGrouping: "pin-order",
   enablePerfProfiling: false,
   diagnosticsEnabledAt: { perf: 0, trace: 0 },
-  quickMenuActions: ["copy", "move", "blur", "largeText"],
+  quickMenuActions: ["edit", "moveInList", "copy", "move", "blur", "largeText"],
   quickMenuCustom: [],
   itemButtons: [],
   commandIcons: {},
@@ -1286,6 +1290,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   virtualizeLargeLists: true,
   favoriteReactions: [],
   expandBodiesByDefault: false,
+  headingsExpandedByDefault: false,
   autoOpenDetailPanel: false,
   doubleClickToFocus: true,
   enableSheetVersions: false,
@@ -2126,6 +2131,13 @@ export class StashpadSettingTab extends PluginSettingTab {
           const desc = [sn.trigger ? `trigger “${sn.trigger}”${sn.caseSensitive ? " (case-sensitive)" : ""}` : null, sn.button ? "toolbar button" : "in menu", off ? "disabled" : null].filter(Boolean).join(" · ");
           const row = new Setting(h).setName(`${sn.name || "(unnamed)"}${off ? " (off)" : ""}`).setDesc(desc);
           if (off) row.setClass("stashpad-snippet-off"); // 0.346.0: muted when deactivated
+          // 0.431.0: show the snippet's toolbar icon in its row (it was invisible
+          // here, unlike the built-in toolbar buttons which show their icon).
+          if (sn.button && sn.icon) {
+            const ic = createSpan({ cls: "stashpad-snippet-row-icon" });
+            setIcon(ic, sn.icon);
+            row.nameEl.prepend(ic);
+          }
           // 0.346.0: enable/disable without deleting.
           row.addToggle((t) => t.setValue(!off).setTooltip("Active").onChange(async (v) => {
             this.plugin.settings.snippets = (this.plugin.settings.snippets ?? []).map((x) => x.id === sn.id ? { ...x, enabled: v } : x);
@@ -3747,6 +3759,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.virtualizeLargeLists !== false, (v) => { this.plugin.settings.virtualizeLargeLists = v; }, ["virtual", "window", "large", "performance", "scroll", "rows"]));
     cats.listDisplay.push(toggle("Expand note bodies by default", "Show every note's full body by default instead of clamping long notes. The per-note 'Show more / show less' toggle and the Expand-all / Collapse-all commands then work in reverse — they let you collapse individual notes back down. Off = bodies clamp by default (expand is opt-in).",
       () => this.plugin.settings.expandBodiesByDefault, (v) => { this.plugin.settings.expandBodiesByDefault = v; }, ["expand", "collapse", "default", "body", "clamp"]));
+    cats.listDisplay.push(toggle("Expand headings by default", "When you drill into a note, show its full body in the sticky heading row by default instead of the one-line preview. The heading's expand/collapse chevron then works in reverse. Off = headings start collapsed (the default).",
+      () => this.plugin.settings.headingsExpandedByDefault, (v) => { this.plugin.settings.headingsExpandedByDefault = v; }, ["expand", "collapse", "heading", "default", "parent"]));
     cats.movingNotes.push(toggle("Confirm cross-parent drag-and-drop", "When dragging notes onto a note that has a different parent, ask before re-parenting (turn off to allow direct moves).",
       () => this.plugin.settings.confirmCrossParentDrag, (v) => { this.plugin.settings.confirmCrossParentDrag = v; }, ["confirm", "drag", "drop", "reparent"]));
     cats.deleting.push(toggle("Confirm bulk deletes", "Warn before deletes that affect more than one note — multi-selection delete OR deleting a note that has descendants. A single childless note with no attachments never prompts. Off = those deletes apply immediately (undo still recovers everything).",

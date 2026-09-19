@@ -65,6 +65,8 @@ export interface MediaItem {
     actions?: (host: HTMLElement) => void;
     /** 0.377.0: open the parent note in a new tab (undefined at the top level). */
     onJumpToParent?: () => void;
+    /** 0.444.0: reveal this note in the large-text overlay (the view owns it). */
+    onLargeText?: () => void;
   };
 }
 
@@ -109,6 +111,7 @@ export class MediaViewerModal extends Modal {
   /** 0.377.0: per-slide toolbar buttons (shown/hidden by slide in show()). */
   private fileBtns: HTMLElement[] = [];   // any file: save / reveal-in-fs / reveal-in-nav
   private readWidthBtn!: HTMLElement;     // NOTE SLIDE only (acts on the rendered note)
+  private largeTextBtn!: HTMLElement;     // NOTE SLIDE only (0.444.0)
   private copyLinkBtn!: HTMLElement;      // note-LEVEL: copy a link to the note
   private jumpParentBtn!: HTMLElement;    // note-LEVEL: open the note's parent
   private pdfSwitchBtn!: HTMLElement;     // PDF SLIDE only: switch render engine
@@ -229,6 +232,22 @@ export class MediaViewerModal extends Modal {
         const leaf = this.app.workspace.openPopoutLeaf();
         void leaf.openFile(f, { active: true });
       } catch { this.onOpenInTab(f); } // fall back to a tab if popouts are unavailable
+    });
+    // 0.443.0 (/dump): open the current file in the OS default app (desktop only —
+    // openWithDefaultApp doesn't exist on mobile).
+    if (!Platform.isMobile) {
+      act("app-window", "Open in the default app", () => {
+        const f = this.items[this.idx]?.file;
+        if (!f) return;
+        this.close();
+        try { (this.app as unknown as { openWithDefaultApp?: (p: string) => void }).openWithDefaultApp?.(f.path); } catch { /* ignore */ }
+      });
+    }
+    // 0.444.0 (/dump): reveal the current NOTE slide in the large-text overlay.
+    // Only meaningful on a note slide; the handler no-ops on attachment slides.
+    this.largeTextBtn = act("scan-text", "Reveal in large text", () => {
+      const n = this.current()?.note;
+      if (n?.onLargeText) { this.close(); n.onLargeText(); }
     });
     // 0.272.4: copy — the image itself to the clipboard for images, the
     // attachment link for anything else.
@@ -607,6 +626,7 @@ export class MediaViewerModal extends Modal {
     this.jumpParentBtn.toggleClass("is-hidden", !nc?.note?.onJumpToParent);
     // Reading width acts on the rendered note markdown → note SLIDE only.
     this.readWidthBtn.toggleClass("is-hidden", !item?.note);
+    this.largeTextBtn.toggleClass("is-hidden", !item?.note?.onLargeText);
     // Save / reveal apply to the CURRENT file — note `.md` or attachment alike.
     for (const b of this.fileBtns) b.toggleClass("is-hidden", !item?.file);
     // Switch-render is PDF-only; shown in the PDF branch below, hidden elsewhere.
