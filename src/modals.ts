@@ -16,6 +16,7 @@ import { dedupeDrafts } from "./drafts";
 import { IconSuggest } from "./icon-suggest";
 import { lineDiff } from "./note-history";
 import { parseDelimited, snippetsFromRows, mergeSnippets, findTriggerCollision } from "./snippets";
+import { isImageExt, fileKindFor } from "./file-kinds";
 import { readClipboardText } from "./cross-vault-clipboard";
 import { getSettings } from "./settings";
 import type { ExportContent } from "./stash-package";
@@ -1008,6 +1009,54 @@ export class NoteWorkbench {
     b.onclick = () => { void this.openExternalSaving(); };
   }
 
+  /** 0.450.0: import files as attachments and insert their ![[links]] at the
+   *  caret of the edit textarea — the same import hook (onImportFile) that drag &
+   *  drop and paste already use, exposed as a button so there's no dead-end. */
+  private async importAttachFilesAtCaret(files: File[]): Promise<void> {
+    const imp = this.cb.onImportFile;
+    const ta = this.cursorTextarea;
+    if (!imp || !ta || files.length === 0) return;
+    let chunk = "";
+    for (const f of files) { const link = await imp(f); if (link) chunk += (chunk ? "\n" : "") + link; }
+    if (!chunk) return;
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    const before = ta.value.slice(0, start), after = ta.value.slice(end);
+    const sep = before && !before.endsWith("\n") ? "\n" : "";
+    const inserted = sep + chunk + "\n";
+    ta.value = before + inserted + after;
+    this.cursorText = ta.value;
+    const caret = before.length + inserted.length;
+    ta.setSelectionRange(caret, caret);
+    ta.dispatchEvent(new Event("input"));
+    ta.focus();
+  }
+
+  /** 0.450.0: the Attach (paperclip) button on the edit surface — opens a native
+   *  file picker and inserts the chosen files as attachments at the caret. Only
+   *  shown when the import hook exists (the edit surface always passes one). */
+  private renderAttach(actions: HTMLElement): void {
+    if (!this.cb.onImportFile) return;
+    const b = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
+    setIcon(b.createSpan({ cls: "stashpad-split-popout-icon" }), "paperclip");
+    b.createSpan({ text: "Attach" });
+    b.setAttr("aria-label", "Attach files (also works via drag-and-drop or paste)");
+    b.onmousedown = (e) => e.preventDefault();
+    b.onclick = () => {
+      const doc = this.host.ownerDocument ?? document;
+      const input = doc.createElement("input");
+      input.type = "file";
+      input.multiple = true;
+      input.setCssStyles({ display: "none" });
+      input.onchange = () => {
+        const picked = Array.from(input.files ?? []);
+        input.remove();
+        if (picked.length) void this.importAttachFilesAtCaret(picked);
+      };
+      doc.body.appendChild(input);
+      input.click();
+    };
+  }
+
   /** 0.357.0: a "History" row/button that opens this note's edit history viewer.
    *  Rendered under the color row; omitted when no history callback was passed. */
   private renderHistoryButton(parent: HTMLElement = this.host): void {
@@ -1064,6 +1113,7 @@ export class NoteWorkbench {
     cancel.createSpan({ cls: "stashpad-split-esc-hint", text: " (Esc)" });
     cancel.onmousedown = (e) => e.preventDefault();
     cancel.onclick = () => this.cb.close();
+    this.renderAttach(actions); // 0.450.0
     this.renderPopOut(actions);
     this.renderOpenExternal(actions);
     const right = actions.createDiv({ cls: "stashpad-split-actions-right" });
@@ -5835,5 +5885,41 @@ export class LargeTextModal extends Modal {
     if (this.textEl) this.textEl.style.fontSize = `${this.size}px`;
   }
 
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.438.0 (/dump): a folder-wide grid of every attachment across a Stashpad
+ *  folder's notes — a Basecamp "all docs & files" view. Generic over the item so
+ *  the caller can carry its own source node; the modal only needs path/file/title
+ *  and hands the picked item back. */
+export interface AttachmentGridItem { path: string; file: TFile | null; title: string; }
+export class AttachmentsGridModal<T extends AttachmentGridItem> extends Modal {
+  constructor(app: App, private items: T[], private onPick: (item: T) => void) { super(app); }
+  onOpen(): void {
+    this.modalEl.addClass("stashpad-attgrid-modal");
+    this.titleEl.setText(`Attachments · ${this.items.length}`);
+    const grid = this.contentEl.createDiv({ cls: "stashpad-attgrid" });
+    for (const it of this.items) {
+      const card = grid.createDiv({ cls: "stashpad-attgrid-card" });
+      if (!it.file) card.addClass("is-missing");
+      const ext = (it.path.split(".").pop() ?? "").toLowerCase();
+      const thumb = card.createDiv({ cls: "stashpad-attgrid-thumb" });
+      if (it.file && isImageExt(ext)) {
+        const img = thumb.createEl("img", { cls: "stashpad-attgrid-img" });
+        img.src = this.app.vault.getResourcePath(it.file);
+        img.alt = it.path;
+      } else {
+        const kind = fileKindFor(ext);
+        const badge = thumb.createDiv({ cls: "stashpad-attgrid-badge" });
+        badge.style.setProperty("--stashpad-file-color", kind.color);
+        setIcon(badge, kind.icon);
+        badge.createSpan({ cls: "stashpad-attgrid-ext", text: (ext || "?").toUpperCase() });
+      }
+      const name = it.path.split("/").pop() ?? it.path;
+      card.createDiv({ cls: "stashpad-attgrid-name", text: name, attr: { title: name } });
+      card.createDiv({ cls: "stashpad-attgrid-src", text: it.title, attr: { title: `In: ${it.title}` } });
+      card.onclick = (): void => { this.close(); this.onPick(it); };
+    }
+  }
   onClose(): void { this.contentEl.empty(); }
 }

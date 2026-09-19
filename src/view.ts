@@ -32,7 +32,7 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow, NestRepliesModal, QuickCaptureNestModal} from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow, NestRepliesModal, QuickCaptureNestModal, AttachmentsGridModal} from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import { AppImportModal } from "./stashpad-app-import-modal";
 import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
@@ -5798,6 +5798,7 @@ export class StashpadView extends ItemView {
     menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
     menu.addItem((it: any) => it.setTitle("Merge").setIcon("merge").setDisabled(this.selection.size < 2).onClick(() => void this.cmdMerge()));
     menu.addItem((it: any) => it.setTitle("Merge with…").setIcon("merge").setDisabled(!hasTargets).onClick(() => this.cmdMergeWith()));
+    menu.addItem((it: any) => it.setTitle("Merge into parent").setIcon("merge").setDisabled(!hasTargets).onClick(() => void this.cmdMergeWithParent()));
     // Split only operates on a single note — the cmdSplit modal would
     // be ambiguous across a multi-selection. Disable when 2+ selected.
     menu.addItem((it: any) => it.setTitle("Split note…").setIcon("scissors").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdSplit()));
@@ -8944,6 +8945,31 @@ export class StashpadView extends ItemView {
         }).open();
       },
     }).open();
+  }
+
+  /** 0.438.0 (/dump): a folder-wide GRID of every attachment across this
+   *  folder's notes (Basecamp "all files" style). Each card opens the note
+   *  preview on that attachment. Collected from each note's `attachments`
+   *  frontmatter (Stashpad's canonical list), deduped by resolved path. */
+  cmdAttachmentsGrid(): void {
+    const items: { path: string; file: TFile | null; node: TreeNode; title: string }[] = [];
+    const seen = new Set<string>();
+    for (const node of this.tree.allNodes()) {
+      if (!node.file) continue;
+      const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter as any;
+      const atts = Array.isArray(fm?.attachments) ? fm.attachments : [];
+      for (const raw of atts) {
+        if (typeof raw !== "string" || !raw) continue;
+        const linktext = raw.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0].split("#")[0].trim();
+        const file = this.app.metadataCache.getFirstLinkpathDest(linktext, node.file.path);
+        const key = file?.path ?? linktext;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({ path: linktext, file, node, title: this.titleForNode(node) });
+      }
+    }
+    if (items.length === 0) { notify("No attachments in this folder's notes yet."); return; }
+    new AttachmentsGridModal(this.app, items, (it) => { void this.openNotePreview(it.node, it.path); }).open();
   }
 
   /** Command entry: quick-capture under the cursored/selected note (else the
@@ -14408,10 +14434,18 @@ export class StashpadView extends ItemView {
     setTimeout(tryReselect, 400);
   }
 
-  async cmdMerge(): Promise<void> {
-    const targets = this.getActionTargets();
+  async cmdMerge(opts?: { targets?: TreeNode[]; keepId?: StashpadId }): Promise<void> {
+    const targets = opts?.targets ? [...opts.targets] : this.getActionTargets();
     if (targets.length < 2) { notify("Select 2+ notes to merge."); return; }
     targets.sort((a, b) => (a.created || "").localeCompare(b.created || ""));
+    // 0.435.0: normally the OLDEST note is kept; `keepId` forces a specific note
+    // to be the survivor (used by "Merge with parent" to keep the parent even if
+    // a child happens to be older). Move it to index 0 so the trash loop below
+    // (targets.slice(1)) merges the rest away into it.
+    if (opts?.keepId) {
+      const i = targets.findIndex((t) => t.id === opts.keepId);
+      if (i > 0) { const [k] = targets.splice(i, 1); targets.unshift(k); }
+    }
     const oldest = targets[0];
     if (!oldest.file) return;
 
@@ -14421,6 +14455,16 @@ export class StashpadView extends ItemView {
     const deletedSnap = await this.snapshotNotes(targets.slice(1), false);
     // Capture parent reassignments so we can undo them.
     const reassignments: { childId: StashpadId; childPath: string; oldParent: StashpadId | null; newParent: StashpadId }[] = [];
+    // 0.435.0: notes that REPLY to a merged-away note would be orphaned (their
+    // replyTo points at a trashed note). Re-point them at the kept note instead,
+    // so the conversation survives the merge. Built vault-wide (a reply can live
+    // in another folder), recorded for undo. Repliers that are themselves being
+    // merged away are skipped (they're going too).
+    const mergedAwayPaths = new Set(targets.slice(1).map((t) => t.file?.path).filter(Boolean) as string[]);
+    const replyIdx = this.buildVaultReplyIndex();
+    const replyRepoints: { path: string; oldReplyTo: unknown; oldBlurb: unknown }[] = [];
+    const keptReplyPayload = (): { link: string; blurb: string } =>
+      this.buildReplyPayload({ id: oldest.id, title: this.titleForNode(oldest), path: oldestPath });
 
     const bodies: string[] = [];
     for (const t of targets) {
@@ -14471,6 +14515,14 @@ export class StashpadView extends ItemView {
           const cf = this.fileForNote(r.childId, r.childPath);
           if (cf) await this.app.fileManager.processFrontMatter(cf, (fm) => { fm.parent = r.oldParent; });
         }
+        // 0.435.0: restore the inbound replies' original reply targets.
+        for (const rp of replyRepoints) {
+          const rf = this.app.vault.getAbstractFileByPath(rp.path);
+          if (rf instanceof TFile) await this.app.fileManager.processFrontMatter(rf, (fm: any) => {
+            if (rp.oldReplyTo === undefined) delete fm.replyTo; else fm.replyTo = rp.oldReplyTo;
+            if (rp.oldBlurb === undefined) delete fm.replyToBlurb; else fm.replyToBlurb = rp.oldBlurb;
+          });
+        }
         this.pendingFocusIds = targets.map((t) => t.id);
         this.tree.rebuild(folder);
         this.render({ kind: "follow-cursor" });
@@ -14488,6 +14540,11 @@ export class StashpadView extends ItemView {
           // was a child of a merged-away target) was reparented to that target's
           // parent, so replaying oldest.id here would write parent:<self>. 0.140.9
           if (cf) await this.app.fileManager.processFrontMatter(cf, (fm) => { fm.parent = r.newParent; });
+        }
+        // 0.435.0: re-apply the inbound-reply repoints to the kept note.
+        for (const rp of replyRepoints) {
+          const rf = this.app.vault.getAbstractFileByPath(rp.path);
+          if (rf instanceof TFile) { const payload = keptReplyPayload(); await this.app.fileManager.processFrontMatter(rf, (fm: any) => { fm.replyTo = payload.link; fm.replyToBlurb = payload.blurb; }); }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -14513,6 +14570,16 @@ export class StashpadView extends ItemView {
         const dest = c.id === oldest.id ? (t.parent ?? ROOT_ID) : oldest.id;
         const moved = await this.changeParent(c, dest, { record: false });
         if (moved && c.file) reassignments.push({ childId: c.id, childPath: c.file.path, oldParent, newParent: dest });
+      }
+      // 0.435.0: re-point inbound replies from this merged-away note to the kept note.
+      for (const r of replyIdx.get(t.file.path) ?? []) {
+        const rf = this.app.vault.getAbstractFileByPath((this.tree.get(r.id)?.file ?? null)?.path ?? "");
+        const file = rf instanceof TFile ? rf : this.tree.get(r.id)?.file ?? null;
+        if (!file || mergedAwayPaths.has(file.path) || file.path === oldestPath) continue;
+        const priorFm = this.app.metadataCache.getFileCache(file)?.frontmatter as any;
+        replyRepoints.push({ path: file.path, oldReplyTo: priorFm?.replyTo, oldBlurb: priorFm?.replyToBlurb });
+        const payload = keptReplyPayload();
+        await this.app.fileManager.processFrontMatter(file, (fm: any) => { fm.replyTo = payload.link; fm.replyToBlurb = payload.blurb; });
       }
       await this.app.fileManager.trashFile(t.file);
       await this.log.append({ type: "delete", id: t.id, payload: { mergedInto: oldest.id } });
@@ -14591,9 +14658,24 @@ export class StashpadView extends ItemView {
         // Hand the union to the tested merge engine via the selection.
         this.selection.clear();
         for (const id of union) this.selection.add(id);
-        await this.cmdMerge();
+        // 0.435.0: "Merge INTO X" now actually keeps X (was: kept the oldest).
+        await this.cmdMerge({ keepId: targetId as StashpadId });
       },
     }).open();
+  }
+
+  /** 0.435.0 (/dump): fold a note into its PARENT — the parent is kept, the note's
+   *  body merges in, its children reparent to the grandparent-becomes-parent, and
+   *  inbound replies re-point to the parent. Reuses the merge engine with the
+   *  parent forced as the survivor. */
+  async cmdMergeWithParent(node?: TreeNode): Promise<void> {
+    const n = node ?? this.resolveActionTarget();
+    if (!n?.file) { notify("Select a note to merge into its parent."); return; }
+    const parentId = n.parent;
+    if (!parentId || parentId === ROOT_ID) { notify("This note has no parent to merge into."); return; }
+    const parent = this.tree.get(parentId);
+    if (!parent?.file) { notify("Couldn't find the parent note."); return; }
+    await this.cmdMerge({ targets: [parent, n], keepId: parentId });
   }
 
   // Clipboard commands — implementations live in commands/clipboard-cmds.ts.

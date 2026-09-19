@@ -42,11 +42,12 @@ export class ExportDocModal extends Modal {
     input.addClass("stashpad-export-name");
     input.value = this.opts.defaultBaseName;
 
-    // Format — PDF is desktop-only (Electron printToPDF); hidden on mobile.
+    // Format — PDF and PNG (image) are desktop-only (rendered via Electron); hidden
+    // on mobile, which only offers HTML.
     let format: ExportFormat = "html";
     const formatOpts = Platform.isMobile
       ? [{ id: "html", label: "HTML" }]
-      : [{ id: "html", label: "HTML" }, { id: "pdf", label: "PDF" }];
+      : [{ id: "html", label: "HTML" }, { id: "pdf", label: "PDF" }, { id: "png", label: "Image (PNG)" }];
     if (!Platform.isMobile) {
       this.segment(this.contentEl, "Format", formatOpts, format, (id) => { format = id as ExportFormat; });
     }

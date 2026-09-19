@@ -1,7 +1,7 @@
 import { Component, MarkdownRenderer, Notice, Platform, TFile, moment } from "obsidian";
 import type { StashpadId, TreeNode } from "../types";
 import type { StashpadView } from "../view";
-import { htmlToPdf } from "./pdf-generate";
+import { htmlToPdf, htmlToPng } from "./pdf-generate";
 import { ExportDocModal, type DocExportChoice } from "../export-doc-modal";
 import { DEFAULT_EXPORT_THEME } from "../export-theme";
 
@@ -13,7 +13,7 @@ import { DEFAULT_EXPORT_THEME } from "../export-theme";
  *  (HTML) and/or embedded as data URIs (PDF images). Rendering never touches the
  *  live view's row render cache. */
 
-export type ExportFormat = "html" | "pdf";
+export type ExportFormat = "html" | "pdf" | "png";
 /** selection = the selected notes only (flat); subtree = selected roots + all
  *  descendants (depth-nested); thread = the reply conversation for the anchor. */
 export type ExportScope = "selection" | "subtree" | "thread";
@@ -251,8 +251,14 @@ export function cmdExportDoc(view: StashpadView): void {
   const targets = view.getActionTargets();
   if (targets.length === 0) { new Notice("Nothing to export."); return; }
   const anchor = targets[0];
-  const folderTag = (view.noteFolder.split("/").pop() || view.noteFolder).trim();
-  const defaultBase = targets.length === 1 ? view.titleForNode(anchor) : `${folderTag}-${targets.length}notes`;
+  const folderTag = (view.noteFolder.split("/").pop() || view.noteFolder).trim() || "stashpad";
+  // Name from the COLLAPSED roots (what actually exports under the default subtree
+  // scope) — a parent+descendant selection is one root, siblings are many — so the
+  // default filename matches the output instead of the raw click count.
+  const roots = view.collapseNestedTargets(targets);
+  const defaultBase = roots.length === 1
+    ? (view.titleForNode(roots[0]).trim() || folderTag)
+    : `${folderTag}-${roots.length}notes`;
   const thread = view.contextThread(anchor.id);
   const hasThread = thread.upstream.length > 0 || thread.downstream.length > 0;
   new ExportDocModal(view.app, {
@@ -267,6 +273,24 @@ export function cmdExportDoc(view: StashpadView): void {
  *  pre-set to HTML for a one-tap flow is overkill — just open the dialog. */
 export function cmdExportHtml(view: StashpadView): void {
   cmdExportDoc(view);
+}
+
+/** Group rendered pieces into top-level chunks — each chunk starts at a depth-0
+ *  item and includes its nested descendants. Used for "split per item" PNG export
+ *  (one image per top-level note + its subtree). */
+function groupTopLevel(pieces: RenderedPiece[]): { title: string; pieces: RenderedPiece[] }[] {
+  const groups: { title: string; pieces: RenderedPiece[] }[] = [];
+  for (const p of pieces) {
+    if (p.depth === 0 || groups.length === 0) groups.push({ title: p.title, pieces: [p] });
+    else groups[groups.length - 1].pieces.push(p);
+  }
+  return groups;
+}
+
+/** Copy a Uint8Array's bytes into a standalone ArrayBuffer for vault.createBinary
+ *  (avoids passing a view over a larger/pooled buffer). */
+function toArrayBuffer(u: Uint8Array): ArrayBuffer {
+  return u.buffer.slice(u.byteOffset, u.byteOffset + u.byteLength) as ArrayBuffer;
 }
 
 async function runExport(view: StashpadView, c: DocExportChoice): Promise<void> {
@@ -292,30 +316,63 @@ async function runExport(view: StashpadView, c: DocExportChoice): Promise<void> 
       finishNotice(view, items[0].node.id, htmlPath, "html", items.length, assetCount);
       return;
     }
-    // PDF is desktop-only (Electron printToPDF of the assembled HTML). Images
-    // embed as data URIs (self-contained render); non-image attachments still
-    // copy to the helper folder + link. On mobile we don't offer PDF (the modal
-    // hides it) — guard anyway and point to HTML.
+    // PDF and PNG are desktop-only (rendered via a hidden Electron window). Images
+    // embed as data URIs (self-contained render); non-image attachments still copy
+    // to the helper folder + link. On mobile the modal hides these — guard anyway.
     if (Platform.isMobile) {
       view.plugin.notifications.show({
-        message: "PDF export is desktop-only — export to HTML on mobile (it opens/prints anywhere).",
+        message: "PDF / image export is desktop-only — export to HTML on mobile (it opens/prints anywhere).",
         kind: "warning", category: "export",
       });
       return;
     }
     const { pieces, assetCount } = await renderPieces(view, items, "datauri", assetsAbsFolder, assetsRelDir);
-    const pdf = await htmlToPdf(view, piecesToHtml(c.baseName, pieces, c.splitPerItem));
-    if (!pdf) {
-      view.plugin.notifications.show({
-        message: "Couldn't generate the PDF on this device. Export to HTML instead, or open it and print to PDF.",
-        kind: "warning", category: "export",
-      });
+
+    if (c.format === "pdf") {
+      const pdf = await htmlToPdf(view, piecesToHtml(c.baseName, pieces, c.splitPerItem));
+      if (!pdf) {
+        view.plugin.notifications.show({
+          message: "Couldn't generate the PDF on this device. Export to HTML instead, or open it and print to PDF.",
+          kind: "warning", category: "export",
+        });
+        return;
+      }
+      const pdfPath = `${exportFolder}/${outBase}.pdf`;
+      await view.app.vault.createBinary(pdfPath, toArrayBuffer(pdf));
+      await maybeSaveDialog(view, pdfPath, pdf, "pdf", c.saveDialog);
+      finishNotice(view, items[0].node.id, pdfPath, "pdf", items.length, assetCount);
       return;
     }
-    const pdfPath = `${exportFolder}/${outBase}.pdf`;
-    await view.app.vault.createBinary(pdfPath, pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength) as ArrayBuffer);
-    await maybeSaveDialog(view, pdfPath, pdf, "pdf", c.saveDialog);
-    finishNotice(view, items[0].node.id, pdfPath, "pdf", items.length, assetCount);
+
+    // PNG. Combined = one tall image; split = one image per top-level item.
+    const groups = c.splitPerItem ? groupTopLevel(pieces) : [{ title: c.baseName, pieces }];
+    const written: string[] = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      const png = await htmlToPng(view, piecesToHtml(g.title, g.pieces, false));
+      if (!png) {
+        view.plugin.notifications.show({
+          message: "Couldn't generate the image on this device. Export to HTML or PDF instead.",
+          kind: "warning", category: "export",
+        });
+        return;
+      }
+      const pngPath = groups.length === 1 ? `${exportFolder}/${outBase}.png` : `${exportFolder}/${outBase}-${i + 1}.png`;
+      await view.app.vault.createBinary(pngPath, toArrayBuffer(png));
+      written.push(pngPath);
+      if (groups.length === 1) await maybeSaveDialog(view, pngPath, png, "png", c.saveDialog);
+    }
+    if (written.length === 1) {
+      finishNotice(view, items[0].node.id, written[0], "png", items.length, assetCount);
+    } else {
+      await view.log.append({ type: "stash_export", id: items[0].node.id, payload: { paths: written, format: "png", noteCount: items.length, attachments: assetCount } });
+      view.plugin.notifications.show({
+        message: `Exported ${written.length} images (one per item) → \`${exportFolder}\``,
+        kind: "success", category: "export",
+        affectedPaths: written, folder: view.noteFolder,
+        actions: view.actionsForFile(written[0]), duration: 0,
+      });
+    }
   } catch (e) {
     view.plugin.notifications.show({
       message: `Stashpad: export failed\nError: ${(e as Error).message}\nCheck disk space + write permissions on the export folder.`,

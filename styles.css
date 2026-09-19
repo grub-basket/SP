@@ -10994,3 +10994,52 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-focused-body blockquote > :first-child { margin-top: 0; }
 .stashpad-note-text blockquote > :last-child,
 .stashpad-focused-body blockquote > :last-child { margin-bottom: 0; }
+/* 0.438.0: folder-wide attachments grid modal. */
+.stashpad-attgrid-modal { width: min(920px, 92vw); }
+.stashpad-attgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 12px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 4px 2px;
+}
+.stashpad-attgrid-card {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--background-secondary);
+  cursor: pointer;
+  transition: border-color 0.1s ease, transform 0.05s ease;
+}
+.stashpad-attgrid-card:hover { border-color: var(--interactive-accent); }
+.stashpad-attgrid-card:active { transform: scale(0.98); }
+.stashpad-attgrid-card.is-missing { opacity: 0.55; }
+.stashpad-attgrid-thumb {
+  aspect-ratio: 4 / 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-primary);
+  overflow: hidden;
+}
+.stashpad-attgrid-img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.stashpad-attgrid-badge { display: flex; flex-direction: column; align-items: center; gap: 4px; color: var(--stashpad-file-color, var(--text-muted)); }
+.stashpad-attgrid-badge .svg-icon { width: 30px; height: 30px; }
+.stashpad-attgrid-ext { font-size: var(--font-ui-smaller); font-weight: 600; letter-spacing: 0.04em; }
+.stashpad-attgrid-name {
+  padding: 6px 8px 0;
+  font-size: var(--font-ui-small);
+  font-weight: 500;
+  color: var(--text-normal);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.stashpad-attgrid-src {
+  padding: 1px 8px 8px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.is-mobile .stashpad-attgrid { grid-template-columns: repeat(2, 1fr); }

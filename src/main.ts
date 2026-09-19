@@ -3689,6 +3689,11 @@ export default class StashpadPlugin extends Plugin {
       callback: () => call("cmdMergeWith"),
     });
     this.addCommand({
+      id: "stashpad-merge-into-parent",
+      name: "Merge into parent (fold this note into its parent note)",
+      callback: () => call("cmdMergeWithParent"),
+    });
+    this.addCommand({
       id: "stashpad-copy",
       name: "Copy selection",
       callback: () => call("cmdCopy"),
@@ -3993,6 +3998,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-search-scoped", name: "Search (current scope: all / in-list / in-parent)", callback: () => call("cmdSearchScoped") });
     this.addCommand({ id: "stashpad-view-in-context", name: "View in context (flat — parents, siblings, children)", callback: () => call("cmdViewInContext", undefined, "flat") });
     this.addCommand({ id: "stashpad-view-in-context-thread", name: "View in context (thread — the reply conversation)", callback: () => call("cmdViewInContext", undefined, "thread") });
+    this.addCommand({ id: "stashpad-attachments-grid", name: "Attachments grid (all files in this folder)", callback: () => call("cmdAttachmentsGrid") });
     this.addCommand({ id: "stashpad-nest-replies", name: "Nest replies…", callback: () => call("cmdNestReplies") });
     this.addCommand({ id: "stashpad-quick-capture-under", name: "Quick capture a nested note under the cursored note", callback: () => call("cmdQuickCaptureUnder") });
     this.addCommand({ id: "stashpad-preview-note", name: "Preview selected note", callback: () => call("cmdPreviewSelected") });
