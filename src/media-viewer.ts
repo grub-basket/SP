@@ -40,6 +40,23 @@ export const VIEWER_TEXT_EXT = new Set([
  *  rendering. */
 export const VIEWER_EMBED_EXT = new Set(["base"]);
 
+/** JSONCanvas node — the subset the read-only preview reads (see renderCanvasSlide).
+ *  https://jsoncanvas.org */
+interface CanvasNode {
+  id: string;
+  type?: "text" | "file" | "link" | "group";
+  x: number; y: number; width?: number; height?: number;
+  color?: string;
+  text?: string; file?: string; url?: string; label?: string;
+}
+/** JSONCanvas edge — endpoints (by node id) + optional side/colour. */
+interface CanvasEdge {
+  id: string;
+  fromNode: string; toNode: string;
+  fromSide?: string; toSide?: string;
+  color?: string; label?: string;
+}
+
 /** True when the viewer can actually RENDER this extension (image, PDF, text, or
  *  an Obsidian embed) as opposed to only describing it on a card. */
 export function viewerRenders(ext: string): boolean {
@@ -435,6 +452,156 @@ export class MediaViewerModal extends Modal {
     this.applyTransform();
   }
 
+  /** 0.454.0: our OWN read-only canvas preview. Obsidian only renders an embedded
+   *  `![[x.canvas]]` as a title card (the node graph needs a live editor leaf), so
+   *  instead we parse the canvas JSON ourselves and draw a scaled, fit-to-stage
+   *  overview: each node in place (text rendered as markdown, files/links/groups
+   *  labelled, colours preserved) with edges as connecting lines. Read-only — the
+   *  "Open canvas" button on the badge is the way to the real, editable canvas.
+   *  Malformed JSON or an empty canvas falls back to the file-fact card. */
+  private async renderCanvasSlide(file: TFile, name: string): Promise<void> {
+    this.mediaEl = null;
+    this.sized = true;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.panEl.addClass("is-frame");
+    this.applyTransform();
+
+    let data: { nodes?: unknown; edges?: unknown };
+    try { data = JSON.parse(await this.app.vault.cachedRead(file)); }
+    catch { this.showFileCard(file, "canvas", name); return; }
+    const nodes = (Array.isArray(data?.nodes) ? data.nodes : []) as CanvasNode[];
+    const edges = (Array.isArray(data?.edges) ? data.edges : []) as CanvasEdge[];
+    const geom = (n: CanvasNode) => ({
+      x: n.x, y: n.y,
+      w: typeof n.width === "number" ? n.width : 250,
+      h: typeof n.height === "number" ? n.height : 60,
+    });
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of nodes) {
+      if (typeof n.x !== "number" || typeof n.y !== "number") continue;
+      const g = geom(n);
+      minX = Math.min(minX, g.x); minY = Math.min(minY, g.y);
+      maxX = Math.max(maxX, g.x + g.w); maxY = Math.max(maxY, g.y + g.h);
+    }
+    if (!isFinite(minX)) { this.showFileCard(file, "canvas", name); return; }
+
+    const PAD = 48;
+    const contentW = (maxX - minX) + PAD * 2;
+    const contentH = (maxY - minY) + PAD * 2;
+    const ox = -minX + PAD, oy = -minY + PAD;
+
+    const host = this.panEl.createDiv({ cls: "stashpad-canvas-preview" });
+    const space = host.createDiv({ cls: "stashpad-canvas-space" });
+    space.style.width = `${contentW}px`;
+    space.style.height = `${contentH}px`;
+
+    // Edges first (behind nodes), as one SVG in canvas coordinate space.
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.classList.add("stashpad-canvas-edges");
+    svg.setAttribute("width", `${contentW}`);
+    svg.setAttribute("height", `${contentH}`);
+    space.appendChild(svg);
+    const byId = new Map<string, CanvasNode>();
+    for (const n of nodes) if (typeof n.id === "string") byId.set(n.id, n);
+    const sidePoint = (n: CanvasNode, side?: string): { x: number; y: number } => {
+      const g = geom(n);
+      const cx = g.x + g.w / 2, cy = g.y + g.h / 2;
+      if (side === "top") return { x: cx, y: g.y };
+      if (side === "bottom") return { x: cx, y: g.y + g.h };
+      if (side === "left") return { x: g.x, y: cy };
+      if (side === "right") return { x: g.x + g.w, y: cy };
+      return { x: cx, y: cy };
+    };
+    for (const e of edges) {
+      const a = byId.get(e.fromNode), b = byId.get(e.toNode);
+      if (!a || !b || typeof a.x !== "number" || typeof b.x !== "number") continue;
+      const p1 = sidePoint(a, e.fromSide), p2 = sidePoint(b, e.toSide);
+      const line = document.createElementNS(NS, "line");
+      line.setAttribute("x1", `${p1.x + ox}`); line.setAttribute("y1", `${p1.y + oy}`);
+      line.setAttribute("x2", `${p2.x + ox}`); line.setAttribute("y2", `${p2.y + oy}`);
+      line.classList.add("stashpad-canvas-edge");
+      const col = this.canvasColor(e.color);
+      if (col) line.setAttribute("stroke", col);
+      svg.appendChild(line);
+    }
+
+    // Nodes: groups first so they sit behind the cards that live inside them.
+    const comp = new Component();
+    comp.load();
+    this.embedComponent = comp;
+    const MAX_MD = 60;
+    let mdCount = 0;
+    const ordered = [...nodes].sort((a, b) => (a.type === "group" ? 0 : 1) - (b.type === "group" ? 0 : 1));
+    for (const n of ordered) {
+      if (typeof n.x !== "number" || typeof n.y !== "number") continue;
+      const g = geom(n);
+      const el = space.createDiv({ cls: `stashpad-canvas-node type-${n.type || "text"}` });
+      el.style.left = `${g.x + ox}px`;
+      el.style.top = `${g.y + oy}px`;
+      el.style.width = `${g.w}px`;
+      el.style.height = `${g.h}px`;
+      const col = this.canvasColor(n.color);
+      if (col) { el.style.borderColor = col; if (n.type !== "group") el.style.setProperty("--sp-canvas-accent", col); }
+      if (n.type === "group") {
+        if (n.label) el.createDiv({ cls: "stashpad-canvas-grouplabel", text: String(n.label) });
+      } else if (n.type === "file") {
+        const row = el.createDiv({ cls: "stashpad-canvas-file" });
+        const ic = row.createSpan({ cls: "stashpad-canvas-fileicon" });
+        const fext = String(n.file || "").split(".").pop() || "";
+        setIcon(ic, fileKindFor(fext).icon);
+        row.createSpan({ text: String(n.file || "").split("/").pop() || "file" });
+      } else if (n.type === "link") {
+        el.createDiv({ cls: "stashpad-canvas-link", text: String(n.url || "") });
+      } else {
+        const body = el.createDiv({ cls: "stashpad-canvas-text markdown-rendered" });
+        const txt = String(n.text ?? "");
+        if (txt && mdCount < MAX_MD) {
+          mdCount++;
+          try { await MarkdownRenderer.render(this.app, txt, body, file.path, comp); }
+          catch { body.setText(txt); }
+        } else body.setText(txt);
+      }
+    }
+
+    // Fit the whole thing into the stage (scale from centre; never blow tiny
+    // canvases up past 1.25x). Re-run on the next frame in case the stage hadn't
+    // been laid out yet when we measured.
+    const fit = (): void => {
+      const availW = this.panEl.clientWidth || 800;
+      const availH = this.panEl.clientHeight || 600;
+      const s = Math.min(availW / contentW, availH / contentH, 1.25);
+      space.style.transform = `scale(${s})`;
+    };
+    fit();
+    window.requestAnimationFrame(fit);
+
+    // Read-only badge + the escape hatch to the real, editable canvas.
+    const badge = host.createDiv({ cls: "stashpad-canvas-badge" });
+    const nCount = nodes.length, eCount = edges.length;
+    badge.createSpan({ text: `Canvas · ${nCount} node${nCount === 1 ? "" : "s"}${eCount ? ` · ${eCount} edge${eCount === 1 ? "" : "s"}` : ""} · read-only` });
+    const openBtn = badge.createEl("button", { cls: "stashpad-canvas-open", text: "Open canvas" });
+    openBtn.onclick = (e) => {
+      e.stopPropagation();
+      const f = this.current()?.file;
+      if (f) { this.close(); this.onOpenInTab(f); }
+    };
+  }
+
+  /** JSONCanvas node/edge colour → a CSS colour. `"1".."6"` are Obsidian's canvas
+   *  presets; a `#hex` is used verbatim; anything else → null (theme default). */
+  private canvasColor(c: unknown): string | null {
+    if (typeof c !== "string" || !c) return null;
+    // Strict hex only — the value lands in inline styles / a CSS custom property,
+    // so never pass an arbitrary string from the (user-editable) canvas JSON.
+    if (/^#[0-9a-fA-F]{3,8}$/.test(c)) return c;
+    const presets: Record<string, string> = {
+      "1": "#fb464c", "2": "#e9973f", "3": "#e0de71",
+      "4": "#44cf6e", "5": "#53dfdd", "6": "#a882ff",
+    };
+    return presets[c] ?? null;
+  }
+
   /** 0.377.0: toggle the note slide between a readable width and full width. */
   private toggleReadingWidth(): void {
     this.noteNarrow = !this.noteNarrow;
@@ -782,6 +949,8 @@ export class MediaViewerModal extends Modal {
       // dropped), the fetch fails and we show a real fallback with an escape
       // hatch instead of a silently blank pane.
       void this.loadPdfFrame(frame, item.file, ext, name);
+    } else if (ext === "canvas") {
+      void this.renderCanvasSlide(item.file, name);
     } else if (VIEWER_EMBED_EXT.has(ext)) {
       void this.renderEmbedSlide(item.file, ext, name);
     } else if (VIEWER_TEXT_EXT.has(ext)) {

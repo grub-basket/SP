@@ -8555,6 +8555,101 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   background: var(--background-primary);
 }
 .stashpad-media-embed .internal-embed { display: block; }
+/* 0.454.0: our own read-only canvas preview — a scaled, fit-to-stage overview
+   parsed from the .canvas JSON (Obsidian only renders an embedded canvas as a
+   title card). */
+.stashpad-canvas-preview {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--background-secondary);
+}
+.stashpad-canvas-space {
+  position: relative;
+  transform-origin: center center;
+  flex: 0 0 auto;
+}
+.stashpad-canvas-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
+}
+.stashpad-canvas-edge {
+  stroke: var(--text-faint);
+  stroke-width: 2;
+  fill: none;
+}
+.stashpad-canvas-node {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-primary);
+  overflow: hidden;
+  font-size: 14px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+}
+.stashpad-canvas-node.type-group {
+  background: transparent;
+  border-style: dashed;
+  border-width: 2px;
+  box-shadow: none;
+}
+.stashpad-canvas-node.type-text { border-top: 3px solid var(--sp-canvas-accent, var(--background-modifier-border)); }
+.stashpad-canvas-grouplabel {
+  padding: 4px 8px;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.stashpad-canvas-text {
+  padding: 8px 10px;
+  height: 100%;
+  overflow: hidden;
+  user-select: text;
+  line-height: var(--line-height-tight);
+}
+.stashpad-canvas-text > :first-child { margin-top: 0; }
+.stashpad-canvas-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-weight: 500;
+}
+.stashpad-canvas-file .stashpad-canvas-fileicon { display: inline-flex; color: var(--text-muted); }
+.stashpad-canvas-link {
+  padding: 8px 10px;
+  color: var(--text-accent);
+  word-break: break-all;
+  font-size: 13px;
+}
+.stashpad-canvas-badge {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+  color: var(--text-muted);
+  z-index: 2;
+}
+.stashpad-canvas-open {
+  padding: 2px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
 /* 0.377.0: readable line length for the note slide (toggle in the toolbar). */
 .stashpad-media-note.is-narrow > * { max-width: 42rem; margin-inline: auto; }
 /* 0.377.0: immersive — hide the caption + rail for distraction-free reading;
