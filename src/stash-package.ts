@@ -54,6 +54,12 @@ export interface StashManifest {
    *  Only populated on encryption paths (notes carry a `companions` list); plain
    *  exports never set it. */
   companions?: { i: number; noteStem: string; name: string }[];
+  /** 0.451.0: companion sidecars for BUNDLED ATTACHMENTS (incl. embedded canvas/
+   *  base — a text file the history plugin versions too). Paired by the
+   *  attachment's zip BUNDLE name (`attName`, e.g. `diagram.svg`) rather than a
+   *  note stem, so unlock restores each next to the possibly-renamed attachment.
+   *  `name` is the companion's original filename; ext = name minus `attName`. */
+  attachmentCompanions?: { i: number; attName: string; name: string }[];
 }
 
 export interface ExportInput {
@@ -65,6 +71,11 @@ export interface ExportInput {
   allDescendants: { id: StashpadId; file: TFile; companions?: TFile[] }[];
   /** Folder the source notes live in (for the manifest). */
   sourceFolder: string;
+  /** 0.451.0: companion sidecars for the subtree's ATTACHMENTS, keyed by the
+   *  attachment's vault PATH (resolved by the caller — encryption paths only).
+   *  Bundled next to the attachment binary and restored beside it on unlock so an
+   *  attachment's edit history isn't left readable on disk. */
+  attachmentCompanionsByPath?: Map<string, TFile[]>;
 }
 
 export interface ImportSummary {
@@ -124,6 +135,11 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
   // the attachments so their `companions/<i>` indices are stable.
   const companionEntries: ZipEntry[] = [];
   const companionManifest: { i: number; noteStem: string; name: string }[] = [];
+  // 0.451.0: attachment companions, keyed by the attachment's BUNDLE name so the
+  // manifest stays stable if the same attachment is referenced by several notes.
+  const attCompanionManifest: { i: number; attName: string; name: string }[] = [];
+  const attCompanionsSeen = new Set<string>(); // bundle names already scanned
+  const attCompanionsByPath = input.attachmentCompanionsByPath ?? new Map<string, TFile[]>();
 
   for (const n of allNotes) {
     const md = await app.vault.read(n.file);
@@ -153,6 +169,18 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
       const basename = bundleNameFor(af);
       if (!collectedAtts.has(basename)) {
         collectedAtts.set(basename, await app.vault.readBinary(af));
+      }
+      // 0.451.0: bundle this attachment's plaintext companions ONCE (an attachment
+      // referenced by several notes is collected once; scan its companions once
+      // too). Keyed by the attachment's bundle name so unlock re-pairs it even if
+      // the attachment was renamed on a collision.
+      if (!attCompanionsSeen.has(basename)) {
+        attCompanionsSeen.add(basename);
+        for (const cf of attCompanionsByPath.get(af.path) ?? []) {
+          const idx = companionEntries.length;
+          companionEntries.push({ name: `companions/${idx}`, data: await app.vault.readBinary(cf) });
+          attCompanionManifest.push({ i: idx, attName: basename, name: cf.name });
+        }
       }
       // Rewrite: ![[some/path/foo.png]] -> ![[foo.png]] (or foo-2.png if another
       // file already claimed that name in this bundle).
@@ -194,6 +222,7 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
     noteCount: allNotes.length,
     rootIds: input.rootNotes.map((n) => n.id),
     ...(companionManifest.length ? { companions: companionManifest } : {}),
+    ...(attCompanionManifest.length ? { attachmentCompanions: attCompanionManifest } : {}),
   };
   entries.push({ name: "manifest.json", data: JSON.stringify(manifest, null, 2) });
 
@@ -410,6 +439,31 @@ export async function importFromFileMap(
     if (!folderEnsured) { await ensureFolder(app, attachmentsFolder); folderEnsured = true; }
     await app.vault.createBinary(destPath, zipBytes.buffer as ArrayBuffer);
     attachmentsWritten++;
+  }
+
+  // 0.451.0: restore ATTACHMENT companions next to the (possibly renamed / reused)
+  // attachment they belong to. `attRoute` maps a bundle name → the final vault
+  // path the note links now point at; the companion sits beside it as
+  // `<final attachment path><ext>`. ext = companion name minus its bundle
+  // `attName` (falls back to the file's own extension); reject a separator in the
+  // derived ext so a tampered manifest can't escape the attachment's folder.
+  if (Array.isArray(manifest.attachmentCompanions)) {
+    for (const c of manifest.attachmentCompanions) {
+      const data = zip[`companions/${c.i}`];
+      if (!data) continue;
+      const attName = String(c.attName ?? "");
+      const fullName = String(c.name ?? "");
+      if (!attName || !fullName) continue;
+      const finalPath = attRoute.get(attName);
+      if (!finalPath) continue; // its attachment wasn't written (missing/skip)
+      let ext = fullName.startsWith(attName) ? fullName.slice(attName.length) : fullName.slice(fullName.lastIndexOf("."));
+      if (!ext || ext.includes("/") || ext.includes("\\")) continue;
+      let compPath = `${finalPath}${ext}`;
+      // Never clobber: if a companion already sits there, uniquify before the ext.
+      for (let n = 1; await app.vault.adapter.exists(compPath); n++) compPath = `${finalPath}-${n}${ext}`;
+      try { await app.vault.createBinary(compPath, data.slice().buffer as ArrayBuffer); }
+      catch (e) { warnings.push(`Couldn't restore attachment companion for ${attName} — ${(e as Error).message}`); }
+    }
   }
 
   // 0.277.0: index companion sidecars by their owning note's entry stem, so each

@@ -5012,7 +5012,7 @@ export class EncryptAllModal extends Modal {
     if (this.companionExts.length) {
       contentEl.createEl("p", {
         cls: "setting-item-description",
-        text: `Companion sidecars (${this.companionExts.join(", ")}) next to each note — e.g. Edit History — are encrypted inside the same bundle and removed from plaintext, then restored when you unlock.`,
+        text: `Companion sidecars (${this.companionExts.join(", ")}) next to each note or its attachments — e.g. Edit History's version files, incl. embedded canvas/base — are encrypted inside the same bundle and removed from plaintext, then restored when you unlock.`,
       });
     }
     contentEl.createEl("p", {

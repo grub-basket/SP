@@ -33,6 +33,10 @@ const CODE = new Set([
 ]);
 const EBOOK = new Set(["epub", "mobi", "azw3"]);
 const FONT = new Set(["ttf", "otf", "woff", "woff2"]);
+// 0.453.0: Obsidian's own document types — a canvas (node graph) and a base
+// (database view). Distinct identities so they don't read as a generic file.
+const CANVAS = new Set(["canvas"]);
+const BASE = new Set(["base"]);
 
 const KINDS: Array<[Set<string>, FileKind]> = [
   [IMAGE, { icon: "image", color: "#2d8cf0", label: "Image" }],
@@ -46,6 +50,8 @@ const KINDS: Array<[Set<string>, FileKind]> = [
   [CODE, { icon: "code", color: "#0891b2", label: "Code" }],
   [EBOOK, { icon: "book", color: "#7c3aed", label: "E-book" }],
   [FONT, { icon: "type", color: "#475569", label: "Font" }],
+  [CANVAS, { icon: "layout-dashboard", color: "#0d9488", label: "Canvas" }],
+  [BASE, { icon: "database", color: "#7c3aed", label: "Base" }],
 ];
 
 const PDF: FileKind = { icon: "file-text", color: "#dc2626", label: "PDF" };

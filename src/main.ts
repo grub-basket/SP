@@ -7078,8 +7078,13 @@ export default class StashpadPlugin extends Plugin {
         const name = p.slice(p.lastIndexOf("/") + 1);
         const ext = extFor(name)!;
         const base = name.slice(0, name.length - ext.length);
-        const notePath = folder ? `${folder}/${base}.md` : `${base}.md`;
-        return !this.app.vault.getAbstractFileByPath(notePath);
+        // 0.451.0: an owner is present if EITHER convention resolves — `base` is
+        // the owner's FULL name (`Foo.md`, `diagram.svg` → Edit History style) OR
+        // `base.md` (a plugin that dropped the note's extension). Covers note AND
+        // attachment owners; only a companion with neither is a true orphan.
+        const ownerFull = folder ? `${folder}/${base}` : base;
+        const ownerNote = folder ? `${folder}/${base}.md` : `${base}.md`;
+        return !this.app.vault.getAbstractFileByPath(ownerFull) && !this.app.vault.getAbstractFileByPath(ownerNote);
       });
       if (orphans.length) out.push({ folder, orphans });
     }
@@ -7110,7 +7115,9 @@ export default class StashpadPlugin extends Plugin {
         const ext = exts.find((e) => lower.endsWith(e.toLowerCase()));
         if (!ext) continue;
         const base = f.name.slice(0, f.name.length - ext.length);
-        if (!this.app.vault.getAbstractFileByPath(`${cleaned}/${base}.md`)) out.push(f.path);
+        // 0.451.0: owner present if the full-name (`Foo.md`/`diagram.svg`) OR the
+        // dropped-extension (`base.md`) sibling exists — else it's a real orphan.
+        if (!this.app.vault.getAbstractFileByPath(`${cleaned}/${base}`) && !this.app.vault.getAbstractFileByPath(`${cleaned}/${base}.md`)) out.push(f.path);
       }
       return out;
     };

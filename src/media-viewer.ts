@@ -28,11 +28,23 @@ export const VIEWER_TEXT_EXT = new Set([
   "ini", "conf", "env", "srt", "vtt",
 ]);
 
-/** True when the viewer can actually RENDER this extension (image, PDF or
- *  text) as opposed to only describing it on a card. */
+/** 0.453.0: rendered via Obsidian's own embed (`![[file]]`) — a `.base` shows its
+ *  live table view on the stage. Notes (`.md`) have their own richer note slide,
+ *  so they're not here.
+ *
+ *  Canvas is deliberately NOT here: Obsidian renders `![[x.canvas]]` as a
+ *  file-embed TITLE card (not the node graph) in any MarkdownRenderer/embed
+ *  context — the real graph needs a live WorkspaceLeaf. So canvas would only ever
+ *  flash a title then fall back; instead it gets a proper identity card
+ *  immediately (see file-kinds.ts). Revisit if Obsidian gains leaf-free canvas
+ *  rendering. */
+export const VIEWER_EMBED_EXT = new Set(["base"]);
+
+/** True when the viewer can actually RENDER this extension (image, PDF, text, or
+ *  an Obsidian embed) as opposed to only describing it on a card. */
 export function viewerRenders(ext: string): boolean {
   const e = ext.toLowerCase().replace(/^\.+/, "");
-  return VIEWER_IMG_EXT.has(e) || VIEWER_PDF_EXT.has(e) || VIEWER_TEXT_EXT.has(e);
+  return VIEWER_IMG_EXT.has(e) || VIEWER_PDF_EXT.has(e) || VIEWER_TEXT_EXT.has(e) || VIEWER_EMBED_EXT.has(e);
 }
 
 /** How much text the preview shows before collapsing. Smaller on a phone:
@@ -101,6 +113,9 @@ export class MediaViewerModal extends Modal {
   /** 0.374.0: owns the note-slide markdown render (MarkdownRenderer child), so
    *  its embeds/widgets are torn down on the next slide / on close. */
   private noteComponent: Component | null = null;
+  /** 0.453.0: owns the canvas/base embed slide's MarkdownRenderer child so the
+   *  embed (and its canvas/base widgets) is torn down on the next slide / close. */
+  private embedComponent: Component | null = null;
   private captionEl!: HTMLElement;
   /** 0.376.1: per-slide host at the END of the bottom toolbar for the note's
    *  relayed row buttons (react / quick / custom / ⋮) — repopulated in show(). */
@@ -333,7 +348,16 @@ export class MediaViewerModal extends Modal {
     this.mouseNavTarget = undefined;
     this.disposePdfEmbed();
     this.disposeNoteRender();
+    this.disposeEmbed();
     this.contentEl.empty();
+  }
+
+  /** Tear down the canvas/base embed slide's render, if any. */
+  private disposeEmbed(): void {
+    if (this.embedComponent) {
+      try { this.embedComponent.unload(); } catch { /* ignore */ }
+      this.embedComponent = null;
+    }
   }
 
   /** Tear down the note-slide markdown render, if any. */
@@ -364,6 +388,51 @@ export class MediaViewerModal extends Modal {
     } catch {
       host.setText(note.body);
     }
+  }
+
+  /** 0.453.0: render a `.base` (its live table view) via Obsidian's own embed —
+   *  the same `![[file]]` mechanism a note uses, so it looks exactly like the base
+   *  embedded in a note. Read-only preview, scrollable (its own scroll, no
+   *  zoom/pan), consistent with the PDF/text slides. Falls back to the file-fact
+   *  card + open-in-tab hatch if the embed throws rather than leaving a blank pane. */
+  private async renderEmbedSlide(file: TFile, ext: string, name: string): Promise<void> {
+    this.mediaEl = null;
+    this.sized = true;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.panEl.addClass("is-frame");
+    this.applyTransform();
+    const host = this.panEl.createDiv({ cls: "stashpad-media-embed markdown-rendered" });
+    const comp = new Component();
+    comp.load();
+    this.embedComponent = comp;
+    try {
+      await MarkdownRenderer.render(this.app, `![[${file.path}]]`, host, file.path, comp);
+    } catch {
+      this.showFileCard(file, ext, name);
+    }
+  }
+
+  /** 0.453.0: replace the stage with the labelled file-fact card + an
+   *  open-in-a-new-tab escape hatch — the fallback when a slide can't render
+   *  (unpreviewable type, or a canvas/base embed that didn't paint). */
+  private showFileCard(file: TFile, ext: string, name: string): void {
+    this.disposeEmbed();
+    this.panEl.empty();
+    this.panEl.removeClass("is-frame");
+    const ph = this.panEl.createDiv({ cls: "stashpad-media-placeholder" });
+    this.renderFileFacts(ph, file, ext);
+    ph.createDiv({ cls: "stashpad-media-ph-name", text: name });
+    const open = ph.createEl("button", { cls: "mod-cta", text: "Open in a new tab" });
+    open.onclick = (e) => {
+      e.stopPropagation();
+      const f = this.current()?.file;
+      if (f) { this.close(); this.onOpenInTab(f); }
+    };
+    this.mediaEl = null;
+    this.sized = true;
+    this.scale = 1; this.tx = 0; this.ty = 0;
+    this.panEl.addClass("is-placeholder");
+    this.applyTransform();
   }
 
   /** 0.377.0: toggle the note slide between a readable width and full width. */
@@ -591,6 +660,7 @@ export class MediaViewerModal extends Modal {
     const item = this.current();
     this.disposePdfEmbed();
     this.disposeNoteRender();
+    this.disposeEmbed();
     this.panEl.empty();
     this.panEl.removeClass("is-placeholder");
     this.panEl.removeClass("is-frame");
@@ -712,26 +782,15 @@ export class MediaViewerModal extends Modal {
       // dropped), the fetch fails and we show a real fallback with an escape
       // hatch instead of a silently blank pane.
       void this.loadPdfFrame(frame, item.file, ext, name);
+    } else if (VIEWER_EMBED_EXT.has(ext)) {
+      void this.renderEmbedSlide(item.file, ext, name);
     } else if (VIEWER_TEXT_EXT.has(ext)) {
       void this.showTextPreview(item.file, ext);
     } else {
-      // Non-image, non-PDF, non-text: a labelled card plus the escape hatch.
-      const ph = this.panEl.createDiv({ cls: "stashpad-media-placeholder" });
-      this.renderFileFacts(ph, item.file, ext);
-      ph.createDiv({ cls: "stashpad-media-ph-name", text: name });
-      const open = ph.createEl("button", { cls: "mod-cta", text: "Open in a new tab" });
-      open.onclick = (e) => {
-        e.stopPropagation();
-        const f = this.current()?.file;
-        if (f) { this.close(); this.onOpenInTab(f); }
-      };
-      // Placeholders are laid out by flexbox inside a stage-sized box, so they
-      // need no transform of their own.
-      this.mediaEl = null;
-      this.sized = true;
-      this.scale = 1; this.tx = 0; this.ty = 0;
-      this.panEl.addClass("is-placeholder");
-      this.applyTransform();
+      // Non-image, non-PDF, non-text, non-embed: a labelled card plus the escape
+      // hatch. (Placeholders are laid out by flexbox inside a stage-sized box, so
+      // they need no transform of their own.)
+      this.showFileCard(item.file, ext, name);
     }
     this.paintRailSelection();
   }

@@ -595,10 +595,12 @@ export interface StashpadSettings {
    *  the action log noticeably; only turn on if you want view tracking. */
   logNoteOpens: boolean;
   /** 0.276.10: companion/sidecar file extensions (leading dot) that Stashpad
-   *  should encrypt ALONGSIDE a note when locking it, so plaintext history left
-   *  by other plugins doesn't linger. Default [".edtz"] (Edit History plugin).
-   *  See docs/security-findings.md (2026-08-29). The packaging/restore change
-   *  that consumes this is the focused next step; the setting is groundwork. */
+   *  should encrypt ALONGSIDE a note AND its attachments when locking it, so
+   *  plaintext history left by other plugins doesn't linger. Default [".edtz"]
+   *  (Edit History plugin). 0.451.0: matched against the owner's FULL filename
+   *  (`Foo.md.edtz`, `diagram.svg.edtz`) as well as its basename, and applied to
+   *  attachments (incl. embedded canvas/base), not just notes. See
+   *  docs/security-findings.md (2026-08-29). */
   encryptCompanionExts: string[];
   /** 0.98.25 (Phase 4): archive folders — notes MOVED into one of these Stashpad
    *  folders are automatically encrypted (locked). Opt-in per folder via the

@@ -126,28 +126,100 @@ export async function collectSubtree(app: App, folder: string, rootId: StashpadI
   return { rootNote: root, descendants, parentId: root.parent };
 }
 
-/** 0.277.0: resolve a note's plaintext companion/sidecar files — a third-party
- *  plugin writes `<basename><ext>` next to the note (e.g. Edit History's
- *  `.edtz`). Matched by exact basename in the SAME folder, for each configured
- *  extension. These ride inside the encrypted bundle and are purged alongside the
- *  note so encryption doesn't leave the note's history readable on disk. */
+/** 0.277.0: resolve a plaintext companion/sidecar file's siblings — a third-party
+ *  plugin writes a history file next to the note/attachment (e.g. Edit History's
+ *  `.edtz`). These ride inside the encrypted bundle and are purged alongside the
+ *  owner so encryption doesn't leave its history readable on disk.
+ *
+ *  0.451.0: match BOTH naming conventions in the SAME folder, per configured ext:
+ *    - `<file.name><ext>`      — Edit History et al. append after the FULL
+ *      filename, so `Foo.md` → `Foo.md.edtz`, `diagram.svg` → `diagram.svg.edtz`.
+ *      (The old code matched only `<basename><ext>` = `Foo.edtz`, which NEVER
+ *      matched Edit History's real output — the note-companion feature silently
+ *      caught nothing with the default `.edtz`.)
+ *    - `<file.basename><ext>`  — plugins that drop the source extension first.
+ *  Works for notes AND attachments (same-folder, owner-name-prefixed sidecar). */
 export function companionFilesFor(app: App, file: TFile, exts: string[]): TFile[] {
   if (!exts?.length) return [];
   const parent = file.parent?.path ?? "";
   const dir = parent === "/" ? "" : parent;
   const out: TFile[] = [];
   const seen = new Set<string>();
+  const stems = file.name === file.basename ? [file.name] : [file.name, file.basename];
   for (const raw of exts) {
     const ext = (raw ?? "").trim();
     if (!ext) continue;
     const withDot = ext.startsWith(".") ? ext : `.${ext}`;
-    const path = dir ? `${dir}/${file.basename}${withDot}` : `${file.basename}${withDot}`;
-    if (seen.has(path)) continue;
-    seen.add(path);
-    const af = app.vault.getAbstractFileByPath(path);
-    if (af instanceof TFile) out.push(af);
+    for (const stem of stems) {
+      const path = dir ? `${dir}/${stem}${withDot}` : `${stem}${withDot}`;
+      if (seen.has(path)) continue;
+      seen.add(path);
+      const af = app.vault.getAbstractFileByPath(path);
+      if (af instanceof TFile) out.push(af);
+    }
   }
   return out;
+}
+
+/** 0.451.0: gather every plaintext companion the subtree owns (notes AND their
+ *  attachments — incl. embedded canvas/base) plus mtime baselines, in ONE walk so
+ *  the three bundle builders (lock / delete-encrypt / delete-plaintext) stay in
+ *  lockstep. The bundle set === the purge set: a companion bundled but not purged
+ *  leaves the leak; one purged but not bundled loses the history.
+ *
+ *  Note companions are exclusive to their note by construction. Attachment
+ *  companions carry their owning attachment's path so the purge can honor the
+ *  SAME shared-attachment rule the attachment bytes get (a shared attachment stays
+ *  plaintext, so its history must stay too). */
+export async function gatherSubtreeCompanions(
+  app: App, allNodes: { file: TFile }[], companionExts: string[],
+): Promise<{
+  companionsByPath: Map<string, TFile[]>;
+  attachmentCompanionsByPath: Map<string, TFile[]>;
+  noteCompanions: TFile[];
+  attachmentCompanions: { file: TFile; attPath: string }[];
+  mtimes: Map<string, number>;
+}> {
+  const companionsByPath = new Map<string, TFile[]>();
+  const attachmentCompanionsByPath = new Map<string, TFile[]>();
+  const noteCompanions: TFile[] = [];
+  const attachmentCompanions: { file: TFile; attPath: string }[] = [];
+  const mtimes = new Map<string, number>();
+  const baseline = async (path: string): Promise<void> => {
+    try { const st = await app.vault.adapter.stat(path); if (st) mtimes.set(path, st.mtime); } catch { /* no baseline */ }
+  };
+  const attSeen = new Set<string>(); // an attachment referenced by N notes → scan once
+  // A companion path lands in exactly ONE list. Notes take precedence, so a rare
+  // ambiguous basename sidecar (e.g. `x.edtz` claimable by both a `x.md` note and
+  // an `x.svg` attachment) isn't bundled twice or double-deleted (a stale second
+  // delete would spuriously report the already-gone file as still-readable).
+  const claimed = new Set<string>();
+  for (const n of allNodes) {
+    await baseline(n.file.path);
+    const comps = companionFilesFor(app, n.file, companionExts);
+    const noteOwn: TFile[] = [];
+    for (const cf of comps) {
+      if (claimed.has(cf.path)) continue;
+      claimed.add(cf.path);
+      noteOwn.push(cf); noteCompanions.push(cf); await baseline(cf.path);
+    }
+    companionsByPath.set(n.file.path, noteOwn);
+  }
+  for (const n of allNodes) {
+    for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
+      await baseline(af.path);
+      if (attSeen.has(af.path)) continue;
+      attSeen.add(af.path);
+      const attOwn: TFile[] = [];
+      for (const cf of companionFilesFor(app, af, companionExts)) {
+        if (claimed.has(cf.path)) continue;
+        claimed.add(cf.path);
+        attOwn.push(cf); attachmentCompanions.push({ file: cf, attPath: af.path }); await baseline(cf.path);
+      }
+      if (attOwn.length) attachmentCompanionsByPath.set(af.path, attOwn);
+    }
+  }
+  return { companionsByPath, attachmentCompanionsByPath, noteCompanions, attachmentCompanions, mtimes };
 }
 
 /** Reject a sidecar/dest folder that could escape the vault (sidecars are
@@ -210,6 +282,11 @@ async function purgeSubtreePlaintext(
    *  but the same mid-op edit guard does (skip a companion changed since it was
    *  bundled; its newer bytes aren't in the blob). */
   companions: TFile[] = [],
+  /** 0.451.0: companions of the subtree's attachments. Purged with the SAME
+   *  shared-attachment rule as the attachment bytes — a companion of an attachment
+   *  we KEEP (because an external note also links it) must stay plaintext too, or
+   *  we'd destroy the still-present file's history. */
+  attachmentCompanions: { file: TFile; attPath: string }[] = [],
 ): Promise<{ unpurged: string[] }> {
   const subtreePaths = new Set(all.map((n) => n.file.path));
   const subtreeAtts = new Map<string, TFile>();
@@ -261,8 +338,13 @@ async function purgeSubtreePlaintext(
   }
   // Companion sidecars: same mid-op edit guard, then permanent delete (the blob
   // holds the recoverable copy). A companion we can't remove is still readable
-  // plaintext, so it's reported as unpurged like any other.
+  // plaintext, so it's reported as unpurged like any other. EXCEPTION (0.451.0):
+  // if it's ALREADY gone, that's success not failure — the history plugin itself
+  // (Edit History) deletes its `.edtz` as a side effect of the note delete above,
+  // so it's frequently gone before we get here; reporting it unpurged would wrongly
+  // claim readable plaintext remains.
   for (const cf of companions) {
+    if (!(await app.vault.adapter.exists(cf.path))) continue; // already removed = purged
     const baseline = mtimes?.get(cf.path);
     if (baseline != null) {
       try {
@@ -275,7 +357,33 @@ async function purgeSubtreePlaintext(
       } catch { /* stat failed — fall through and let delete try */ }
     }
     try { await app.vault.delete(cf); }
-    catch (e) { console.warn("[Stashpad] couldn't delete companion sidecar", cf.path, e); unpurged.push(cf.path); }
+    catch (e) {
+      // Lost a race with the history plugin between the exists check and here? If
+      // it's gone now, it's purged; only a still-present file is a real leak.
+      if (await app.vault.adapter.exists(cf.path)) { console.warn("[Stashpad] couldn't delete companion sidecar", cf.path, e); unpurged.push(cf.path); }
+    }
+  }
+  // 0.451.0: attachment companions — skip those whose attachment is shared with an
+  // external note (that attachment stays plaintext, so its history must too),
+  // otherwise same mid-op edit guard + permanent delete.
+  for (const { file: cf, attPath } of attachmentCompanions) {
+    if (sharedExternally.has(attPath)) continue;
+    if (!(await app.vault.adapter.exists(cf.path))) continue; // already removed = purged
+    const baseline = mtimes?.get(cf.path);
+    if (baseline != null) {
+      try {
+        const st = await app.vault.adapter.stat(cf.path);
+        if (st && st.mtime !== baseline) {
+          console.warn("[Stashpad] attachment companion changed since it was bundled — keeping plaintext", cf.path);
+          unpurged.push(cf.path);
+          continue;
+        }
+      } catch { /* stat failed — fall through and let delete try */ }
+    }
+    try { await app.vault.delete(cf); }
+    catch (e) {
+      if (await app.vault.adapter.exists(cf.path)) { console.warn("[Stashpad] couldn't delete attachment companion", cf.path, e); unpurged.push(cf.path); }
+    }
   }
   return { unpurged };
 }
@@ -294,31 +402,17 @@ export async function lockSubtree(
   // Baseline mtimes BEFORE bundling — purge skips any file edited after this
   // point (its newer content isn't in the blob and must not be destroyed).
   const allNodes = [rootNote, ...descendants];
-  // 0.277.0: resolve each note's companions ONCE so the bundle set === the purge
-  // set (a companion bundled but not purged would leave the leak; one purged but
-  // not bundled would lose the history).
-  const companionsByPath = new Map<string, TFile[]>();
-  const allCompanions: TFile[] = [];
-  const mtimes = new Map<string, number>();
-  for (const n of allNodes) {
-    try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline → delete proceeds unguarded */ }
-    // Baseline the note's exclusive attachments too, so purge skips one edited
-    // mid-lock (its newer bytes aren't in the blob). (0.140.8)
-    for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
-      try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
-    }
-    const comps = companionFilesFor(app, n.file, companionExts);
-    companionsByPath.set(n.file.path, comps);
-    for (const cf of comps) {
-      allCompanions.push(cf);
-      try { const st = await app.vault.adapter.stat(cf.path); if (st) mtimes.set(cf.path, st.mtime); } catch { /* no baseline */ }
-    }
-  }
+  // 0.277.0/0.451.0: resolve companions for the notes AND their attachments in one
+  // walk, with mtime baselines — purge skips any file edited after this point (its
+  // newer content isn't in the blob and must not be destroyed).
+  const { companionsByPath, attachmentCompanionsByPath, noteCompanions: allCompanions, attachmentCompanions, mtimes } =
+    await gatherSubtreeCompanions(app, allNodes, companionExts);
 
   const zip = await buildStashZip(app, {
     rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
     allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
+    attachmentCompanionsByPath,
   });
   const blob = await encryptWithKey(zip, dek);
 
@@ -381,7 +475,7 @@ export async function lockSubtree(
   // now PERMANENTLY delete the plaintext originals (notes + subtree-exclusive
   // attachments). The blob is the recoverable copy. See purgeSubtreePlaintext
   // for the why-not-trash rationale.
-  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions);
+  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions, attachmentCompanions);
 
   return { blobPath, noteCount: all.length, rootId, parentId, title: meta.title, created: rootNote.created, unpurged };
 }
@@ -512,26 +606,15 @@ export async function deleteEncryptSubtree(
   const { rootNote, descendants, parentId } = sub;
 
   const allNodes = [rootNote, ...descendants];
-  const companionsByPath = new Map<string, TFile[]>();
-  const allCompanions: TFile[] = [];
-  const mtimes = new Map<string, number>();
-  for (const n of allNodes) {
-    try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline */ }
-    for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
-      try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
-    }
-    const comps = companionFilesFor(app, n.file, companionExts);
-    companionsByPath.set(n.file.path, comps);
-    for (const cf of comps) {
-      allCompanions.push(cf);
-      try { const st = await app.vault.adapter.stat(cf.path); if (st) mtimes.set(cf.path, st.mtime); } catch { /* no baseline */ }
-    }
-  }
+  // 0.277.0/0.451.0: companions for the notes AND their attachments + mtime baselines.
+  const { companionsByPath, attachmentCompanionsByPath, noteCompanions: allCompanions, attachmentCompanions, mtimes } =
+    await gatherSubtreeCompanions(app, allNodes, companionExts);
 
   const zip = await buildStashZip(app, {
     rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
     allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
+    attachmentCompanionsByPath,
   });
   const blob = await encryptWithKey(zip, dek);
   // Byte-for-byte verify before deleting the only plaintext copy.
@@ -576,7 +659,7 @@ export async function deleteEncryptSubtree(
     throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
   }
 
-  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions);
+  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions, attachmentCompanions);
   return { blobPath, noteCount: all.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
 }
 
@@ -623,26 +706,15 @@ export async function deletePlaintextSubtree(
   const { rootNote, descendants, parentId } = sub;
 
   const allNodes = [rootNote, ...descendants];
-  const companionsByPath = new Map<string, TFile[]>();
-  const allCompanions: TFile[] = [];
-  const mtimes = new Map<string, number>();
-  for (const n of allNodes) {
-    try { const st = await app.vault.adapter.stat(n.file.path); if (st) mtimes.set(n.file.path, st.mtime); } catch { /* no baseline */ }
-    for (const af of await resolveNoteAttachmentFiles(app, n.file)) {
-      try { const st = await app.vault.adapter.stat(af.path); if (st) mtimes.set(af.path, st.mtime); } catch { /* no baseline */ }
-    }
-    const comps = companionFilesFor(app, n.file, companionExts);
-    companionsByPath.set(n.file.path, comps);
-    for (const cf of comps) {
-      allCompanions.push(cf);
-      try { const st = await app.vault.adapter.stat(cf.path); if (st) mtimes.set(cf.path, st.mtime); } catch { /* no baseline */ }
-    }
-  }
+  // 0.277.0/0.451.0: companions for the notes AND their attachments + mtime baselines.
+  const { companionsByPath, attachmentCompanionsByPath, noteCompanions: allCompanions, attachmentCompanions, mtimes } =
+    await gatherSubtreeCompanions(app, allNodes, companionExts);
 
   const zip = await buildStashZip(app, {
     rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
     allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
+    attachmentCompanionsByPath,
   });
 
   // dest may be nested (X/trash) — mkdir intermediates.
@@ -675,7 +747,7 @@ export async function deletePlaintextSubtree(
     throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
   }
 
-  const { unpurged } = await purgeSubtreePlaintext(app, allNodes, mtimes, allCompanions);
+  const { unpurged } = await purgeSubtreePlaintext(app, allNodes, mtimes, allCompanions, attachmentCompanions);
   return { blobPath, noteCount: allNodes.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
 }
 

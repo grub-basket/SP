@@ -8547,6 +8547,14 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   line-height: var(--line-height-normal);
 }
 .stashpad-media-note img { max-width: 100%; height: auto; }
+/* 0.453.0: base embed slide — own scroll, fills the stage with the base's table. */
+.stashpad-media-embed {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  background: var(--background-primary);
+}
+.stashpad-media-embed .internal-embed { display: block; }
 /* 0.377.0: readable line length for the note slide (toggle in the toolbar). */
 .stashpad-media-note.is-narrow > * { max-width: 42rem; margin-inline: auto; }
 /* 0.377.0: immersive — hide the caption + rail for distraction-free reading;
