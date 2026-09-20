@@ -868,6 +868,9 @@ export interface StashpadSettings {
    *  selectable and moves row dragging to the grip handle; OFF restores
    *  drag-from-anywhere-on-the-row (no text selection). Desktop only. */
   selectableNoteText: boolean;
+  /** 0.458.0: when a row IS whole-row draggable, holding Alt/Option during the
+   *  drag selects its text instead of reordering. Only bites on Alt-held drags. */
+  altDragSelectsText: boolean;
   /** 0.268.2: put the file's name in front of the link when you attach one.
    *
    *  On by default. An attachment on its own is a link and nothing else, so the
@@ -1262,6 +1265,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureScheduleTimezoneHistory: [],
   obscureScheduleWeekdays: [true, true, true, true, true, true, true],
   selectableNoteText: true,
+  altDragSelectsText: true,
   attachmentNamePrefix: false, // 0.279.1: default OFF — undoes the 0.268.2 filename prefix (user: "we'll survive without the clutter")
   attachmentsEmbedded: true,
   railShowOutgoing: false,
@@ -3503,6 +3507,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.duplicateHints, (v) => { this.plugin.settings.duplicateHints = v; this.plugin.refreshAllStashpadViews(); }, ["duplicate", "similar", "hint", "composer", "search", "discourse"]));
     cats.listDisplay.push(toggle("Select text in notes (desktop)", "Let you select and copy text inside a note in the list. On by default. With it on, you drag a note to reorder by its grip handle (a draggable row can't have selectable text); turn it off to drag a note from anywhere on the row again, with no text selection. Desktop only — mobile is always tap-first.",
       () => this.plugin.settings.selectableNoteText, (v) => { this.plugin.settings.selectableNoteText = v; this.plugin.refreshAllStashpadViews(); }, ["select", "text", "copy", "drag", "grip", "reorder"]));
+    cats.listDisplay.push(toggle("Alt-drag selects text (desktop)", "When a note row is whole-row draggable (i.e. 'Select text in notes' is off), hold Alt/Option while dragging over a note to select its text instead of reordering it. Only affects Alt-held drags, so normal drag-to-reorder is unchanged. On by default.",
+      () => this.plugin.settings.altDragSelectsText, (v) => { this.plugin.settings.altDragSelectsText = v; }, ["alt", "option", "drag", "select", "text", "reorder"]));
 
     cats.listDisplay.push(this.renderDef("How covered notes look", "\"Blur\" keeps the shape of the text. \"Solid bar\" paints over it — faster on a phone, because a blur has to be computed for every glyph every time the text is drawn, and it hides more, since a blur still leaks word shapes and lengths. Either way the text is untouched in the file.", (st) => {
       st.addDropdown((d) => {

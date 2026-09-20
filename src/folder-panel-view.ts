@@ -626,6 +626,14 @@ export class StashpadFolderPanelView extends ItemView {
     row.oncontextmenu = (e) => {
       e.preventDefault();
       const menu = new Menu();
+      // 0.455.0 (/dump): a vague pin is clearer when you can see/reach its parent.
+      // Resolve via parentLink (the recovery wikilink) — falls back to the id.
+      const parentFile = this.resolvePinnedParent(fm, file);
+      if (parentFile) {
+        const ptitle = this.titleFromFile(parentFile);
+        menu.addItem((it) => it.setTitle(`Go to parent: ${ptitle.length > 40 ? ptitle.slice(0, 40) + "…" : ptitle}`).setIcon("corner-left-up")
+          .onClick(() => { this.onNavigateAway(); void this.plugin.revealNoteInStashpad(parentFile); }));
+      }
       menu.addItem((it) => it.setTitle("Unpin from sidebar").setIcon("pin-off")
         .onClick(() => void this.plugin.unpinNote({ folder, id })));
       if (canRevealInOs()) {
@@ -676,6 +684,28 @@ export class StashpadFolderPanelView extends ItemView {
   }
 
   /** Children of an id within a folder (frontmatter.parent matches), created-asc. */
+  /** 0.455.0: resolve a pinned note's PARENT note file (or null at root /
+   *  unresolved). Prefers the `parentLink` [[wikilink]] recovery field; falls
+   *  back to scanning the same folder for the `parent` id. Runs on right-click
+   *  only, so the scan cost is fine. */
+  private resolvePinnedParent(fm: any, file: TFile): TFile | null {
+    const raw = typeof fm?.parentLink === "string" ? fm.parentLink : null;
+    if (raw) {
+      const linktext = raw.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0].split("#")[0].trim();
+      const dest = this.app.metadataCache.getFirstLinkpathDest(linktext, file.path);
+      if (dest instanceof TFile) return dest;
+    }
+    const pid = fm?.parent;
+    if (typeof pid === "string" && pid && pid !== "__root__") {
+      const folder = file.parent?.path?.replace(/\/+$/, "") ?? "";
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== folder) continue;
+        if ((this.app.metadataCache.getFileCache(f)?.frontmatter as any)?.id === pid) return f;
+      }
+    }
+    return null;
+  }
+
   private childrenOf(folder: string, parentId: StashpadId): TFile[] {
     const out: TFile[] = [];
     for (const f of this.app.vault.getMarkdownFiles()) {

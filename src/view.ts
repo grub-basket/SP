@@ -8273,6 +8273,15 @@ export class StashpadView extends ItemView {
       rowIcon(replyBtn, "reply");   // 0.296.0 (perf)
       replyBtn.title = "Reply to this note";
       replyBtn.onclick = (e) => { e.stopPropagation(); this.cmdReply(node); };
+      // 0.456.0 (/dump): in a FLATTENED view (Flat / Everything) the tree isn't
+      // visible, so offer a quick "make this a child of…" — the structural
+      // counterpart to Reply. Hidden in Nested view (drag/nest already obvious there).
+      if (this.currentViewMode() !== "nested") {
+        const childBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-makechild" });
+        rowIcon(childBtn, "corner-down-right");
+        childBtn.title = "Make this a child of another note…";
+        childBtn.onclick = (e) => { e.stopPropagation(); this.cmdMakeChildOf(node); };
+      }
       this.maybeAddPreviewButton(actions, node); // 0.374.0
       // 0.287.0 (teams): reaction button next to the quick/more menu buttons.
       this.addReactionButton(actions, node);
@@ -9001,6 +9010,25 @@ export class StashpadView extends ItemView {
     }
     notify(moved ? `Nested ${moved} repl${moved === 1 ? "y" : "ies"} under their note${targets.length === 1 ? "" : "s"}.` : "No replies to nest.");
     this.render();
+  }
+
+  /** 0.456.0 (/dump): pick a note to become this note's PARENT (reparent). The
+   *  flat-mode row button's action — reuses the fuzzy note picker + changeParent
+   *  (which guards cycles). "Similar to Reply but structural" (user). */
+  cmdMakeChildOf(node: TreeNode): void {
+    if (!node.file) return;
+    new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
+      mode: "pick",
+      placeholder: `Make "${this.titleForNode(node).slice(0, 30)}" a child of… (pick a note)`,
+      allowCreate: false,
+      onPick: async (item) => {
+        const target = item.id as StashpadId | undefined;
+        if (!target || target === node.id) return;
+        if (node.parent === target) { notify("Already a child of that note."); return; }
+        const ok = await this.changeParent(node, target, { silentSuccess: false });
+        if (ok) this.render();
+      },
+    }).open();
   }
 
   /** Nest the selected note(s) INTO the note(s) they're replying to. */
@@ -11326,10 +11354,21 @@ export class StashpadView extends ItemView {
     const disarm = (e: Event): void => {
       const row = (e.target as HTMLElement | null)?.closest?.(".stashpad-note[data-id]") as HTMLElement | null;
       if (row && row.parentElement === list && row.dataset.grab === "1") row.draggable = false;
+      // 0.458.0: restore any row we temporarily un-dragged for an Alt+drag select.
+      list.querySelectorAll<HTMLElement>(".stashpad-note[data-alt-sel]").forEach((r) => { r.draggable = true; delete r.dataset.altSel; });
     };
     list.addEventListener("mousedown", (e) => {
       const hit = this.rowFromEvent(list, e);
-      if (!hit || hit.row.dataset.grab !== "1") return;
+      if (!hit) return;
+      // 0.458.0 (/dump): Alt/Option + drag over a whole-row-draggable note selects
+      // its text instead of reordering. Un-draggable for this gesture; disarm
+      // restores it on mouseup/dragend.
+      if (getSettings().altDragSelectsText && (e as MouseEvent).altKey && hit.row.draggable) {
+        hit.row.draggable = false;
+        hit.row.dataset.altSel = "1";
+        return;
+      }
+      if (hit.row.dataset.grab !== "1") return;
       const t = e.target as HTMLElement | null;
       hit.row.draggable = !(t && t.closest(StashpadView.DRAG_RESERVED_SELECTOR));
     });

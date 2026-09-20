@@ -1,7 +1,7 @@
 import { App, setIcon } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
-import { collectTasks, type TaskItem } from "./task-collect";
+import { collectTasks, titleFromTaskFile, type TaskItem } from "./task-collect";
 import { writeCompletedFm } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
 
@@ -279,6 +279,23 @@ export function renderTaskTriage(
   if (!any) host.createDiv({ cls: "stashpad-tasks-empty" }).setText("Nothing in this view.");
 }
 
+/** 0.457.0 (/dump): the PARENT note's title for a task — context for the list —
+ *  or null when the task sits at the folder root (home) or can't be resolved.
+ *  Uses the `parentLink` recovery wikilink only (written for every note), so
+ *  there's no per-row vault scan. */
+function parentContextForTask(plugin: StashpadPlugin, t: TaskItem): string | null {
+  const app = plugin.app;
+  const fm = app.metadataCache.getFileCache(t.file)?.frontmatter as any;
+  const pid = fm?.parent;
+  if (!pid || pid === "__root__") return null; // at home — no parent to show
+  const raw = typeof fm?.parentLink === "string" ? fm.parentLink : null;
+  if (!raw) return null;
+  const lt = raw.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0].split("#")[0].trim();
+  const dest = app.metadataCache.getFirstLinkpathDest(lt, t.file.path);
+  if (!dest) return null;
+  return titleFromTaskFile(dest, (app.metadataCache.getFileCache(dest)?.frontmatter as any)?.id ?? null);
+}
+
 function renderRow(
   parent: HTMLElement, t: TaskItem, now: number, plugin: StashpadPlugin,
   acts: { toggleCompleted: (t: TaskItem) => void; snooze: (t: TaskItem) => void; onOpen: (folder: string, id: string) => void },
@@ -297,6 +314,15 @@ function renderRow(
   title.onclick = () => acts.onOpen(t.folder, t.id);
   const meta = main.createDiv({ cls: "stashpad-review-meta" });
   meta.createSpan({ cls: "stashpad-review-folder", text: t.folder.split("/").pop() || t.folder });
+  // 0.457.0 (/dump): show the PARENT note for context (skipped when the task is at
+  // the folder home), so a bare task title isn't ambiguous.
+  const pctx = parentContextForTask(plugin, t);
+  if (pctx) {
+    const p = meta.createSpan({ cls: "stashpad-review-parent" });
+    setIcon(p.createSpan({ cls: "stashpad-review-parent-icon" }), "corner-left-up");
+    p.createSpan({ text: pctx.length > 40 ? pctx.slice(0, 40) + "…" : pctx });
+    p.setAttr("title", `Under: ${pctx}`);
+  }
   // 0.131.1: show the author (creator) — most tasks have one but no assignee.
   if (t.author) meta.createSpan({ cls: "stashpad-review-author", text: `by ${t.author.name}` });
   if (t.due != null) {

@@ -11146,3 +11146,8 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .is-mobile .stashpad-attgrid { grid-template-columns: repeat(2, 1fr); }
+
+/* 0.457.0: parent-note context on a task row (tasks list / daily review). */
+.stashpad-review-parent { display: inline-flex; align-items: center; gap: 3px; color: var(--text-muted); }
+.stashpad-review-parent-icon { display: inline-flex; }
+.stashpad-review-parent-icon .svg-icon { width: 12px; height: 12px; }
