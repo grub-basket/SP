@@ -3,7 +3,7 @@ import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type StashpadId } from "./types";
 import { renderCountBadge } from "./panels-view";
-import { ConfirmModal } from "./modals";
+import { ConfirmModal, PinAliasModal } from "./modals";
 import { canRevealInOs, osFileManagerName, revealInOsFileManager } from "./os-reveal";
 
 /** 0.164.0: a pinned item in the folder panel's shared pin order — either a
@@ -618,7 +618,12 @@ export class StashpadFolderPanelView extends ItemView {
     const icon = row.createSpan({ cls: "stashpad-pinned-icon" });
     setIcon(icon, hasChildren ? "folder-tree" : "file-text");
     if (color) icon.style.color = color;
-    const label = row.createSpan({ cls: "stashpad-pinned-label", text: this.titleFromFile(file) });
+    // 0.461.0: show the pin's nickname (pinAlias) when set, so a vague pin reads
+    // clearly; the real title becomes the tooltip. No alias → title as before.
+    const title = this.titleFromFile(file);
+    const alias = typeof fm.pinAlias === "string" && fm.pinAlias.trim() ? fm.pinAlias.trim() : null;
+    const label = row.createSpan({ cls: "stashpad-pinned-label", text: alias ?? title });
+    if (alias) { label.addClass("has-alias"); label.title = title; }
     label.onclick = () => { this.onNavigateAway(); void this.plugin.revealNoteInStashpad(file); };
     // Folder subtitle is hidden by CSS (.stashpad-panel-pinned) but kept for the
     // group-by-folder mode where headers already supply context.
@@ -633,6 +638,13 @@ export class StashpadFolderPanelView extends ItemView {
         const ptitle = this.titleFromFile(parentFile);
         menu.addItem((it) => it.setTitle(`Go to parent: ${ptitle.length > 40 ? ptitle.slice(0, 40) + "…" : ptitle}`).setIcon("corner-left-up")
           .onClick(() => { this.onNavigateAway(); void this.plugin.revealNoteInStashpad(parentFile); }));
+      }
+      // 0.461.0: nickname a pin so a vague one reads clearly.
+      menu.addItem((it) => it.setTitle(alias ? "Rename nickname…" : "Set nickname…").setIcon("text-cursor-input")
+        .onClick(() => new PinAliasModal(this.app, title, alias ?? "", (v) => void this.plugin.setPinAlias({ folder, id }, v)).open()));
+      if (alias) {
+        menu.addItem((it) => it.setTitle("Clear nickname").setIcon("eraser")
+          .onClick(() => void this.plugin.setPinAlias({ folder, id }, "")));
       }
       menu.addItem((it) => it.setTitle("Unpin from sidebar").setIcon("pin-off")
         .onClick(() => void this.plugin.unpinNote({ folder, id })));
@@ -1312,3 +1324,4 @@ export async function openFolderPanelView(app: App): Promise<void> {
   await leaf.setViewState({ type: STASHPAD_FOLDER_PANEL_VIEW_TYPE, active: true });
   app.workspace.revealLeaf(leaf);
 }
+

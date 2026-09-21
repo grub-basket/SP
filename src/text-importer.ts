@@ -143,7 +143,42 @@ function takeCheckbox(s: string): { rest: string; task: "none" | "open" | "done"
 export function isAllCheckboxLines(text: string): boolean {
   const lines = text.replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "");
   if (lines.length < 2) return false;
-  return lines.every((l) => /^\s*(?:[-*+]\s+)?\[[ xX]?\]\s*\S/.test(l));
+  return lines.every((l) => isCheckboxLine(l));
+}
+
+/** True when a single line is a checkbox item ("- [ ] x", "[x] y", …). */
+export function isCheckboxLine(line: string): boolean {
+  return /^\s*(?:[-*+]\s+)?\[[ xX]?\]\s*\S/.test(line);
+}
+
+/** True when a block MIXES checkbox and non-checkbox lines — at least one of
+ *  each (ignoring blanks). This is the case `isAllCheckboxLines` deliberately
+ *  excludes; the composer uses it to still peel the checkbox lines out into their
+ *  own tasks while keeping the prose together. */
+export function hasMixedCheckboxLines(text: string): boolean {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "");
+  if (lines.length < 2) return false;
+  let checks = 0, plain = 0;
+  for (const l of lines) { if (isCheckboxLine(l)) checks++; else plain++; }
+  return checks > 0 && plain > 0;
+}
+
+/** Split a MIXED checkbox/prose block: each checkbox line becomes its own chunk
+ *  (its own task), while consecutive runs of non-checkbox lines stay grouped as a
+ *  single chunk (so a title + its checkboxes yields "title" + one task per box).
+ *  Blank lines are dropped. Order is preserved. */
+export function splitCheckboxAware(text: string): string[] {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  const chunks: string[] = [];
+  let buf: string[] = [];
+  const flush = (): void => { if (buf.length) { const j = buf.join("\n").trim(); if (j) chunks.push(j); buf = []; } };
+  for (const line of lines) {
+    if (line.trim() === "") continue;
+    if (isCheckboxLine(line)) { flush(); chunks.push(line.trim()); }
+    else buf.push(line);
+  }
+  flush();
+  return chunks;
 }
 
 /** Visual width of a line's leading whitespace, tabs expanded. Used only to

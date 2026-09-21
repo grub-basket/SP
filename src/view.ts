@@ -5,7 +5,7 @@ import {
   moment, sanitizeHTMLToDom, setIcon,
 } from "obsidian";
 import {
-  ROOT_ID, STASHPAD_VIEW_TYPE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
+  ROOT_ID, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
   archiveSubfolderOf, isArchiveSubfolderPath,
   isReservedSubfolderName,
   isInReservedSubfolder, writeCompletedFm,
@@ -32,12 +32,13 @@ import { buildStashpadLink } from "./deep-link";
 import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
+import { FloatingCaptureWindow } from "./floating-capture";
 import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow, NestRepliesModal, QuickCaptureNestModal, AttachmentsGridModal} from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import { AppImportModal } from "./stashpad-app-import-modal";
 import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
 import type { ImportNote } from "./text-importer";
-import { isAllCheckboxLines } from "./text-importer";
+import { isAllCheckboxLines, hasMixedCheckboxLines, splitCheckboxAware } from "./text-importer";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, matchBindingWithMods, humanCombo, parseModifierTokens, eventHasMods } from "./view-keys";
 import { renderReactionChips, openReactionPicker, type ReactionMap } from "./reactions";
@@ -411,6 +412,10 @@ export class StashpadView extends ItemView {
    *  host of the "N drafts" / "Editing: …" chip. */
   private activeDraftId: string | null = null;
   private draftsChipHost: HTMLElement | null = null;
+  /** 0.463.0: the floating quick-capture window (write while reading), if open.
+   *  Lives outside this view's DOM (on document.body), so it's torn down in
+   *  onClose rather than by a render. */
+  private floatingCapture: FloatingCaptureWindow | null = null;
   /** 0.398.0: the currently-open note-preview modal, so edit-in-composer (from ANY
    *  entry point — ⋮ menu, command palette, star menu) can dismiss it first; the
    *  composer sits underneath and would otherwise be hidden. */
@@ -1809,6 +1814,8 @@ export class StashpadView extends ItemView {
 
   async onClose(): Promise<void> {
     this.hideInstantTooltip();
+    this.floatingCapture?.close(); // 0.463.0: it lives on document.body, not our DOM
+    this.floatingCapture = null;
     this.endInListPickerBanner(); // 0.366.0: don't strand the picker's cancel banner
     if (this.initialRenderTimer != null) {
       window.clearTimeout(this.initialRenderTimer);
@@ -2823,7 +2830,14 @@ export class StashpadView extends ItemView {
     // it's driven by the deliberate edit-in-composer command and is how you exit
     // an edit. Drafts stay reachable via the Drafts manager regardless.
     const showCount = getSettings().draftsSurfacedFolders?.includes(this.noteFolder) ?? false;
-    const others = showCount ? this.folderDrafts().filter((d) => d.id !== cur?.id) : [];
+    // 0.459.0: count EXACTLY what the Drafts modal lists for this folder — the
+    // deduped folder drafts, minus the one already surfaced as the "Editing"
+    // chip. The old code was `others.filter(!=cur).length + (cur ? 1 : 0)`, which
+    // added one for `cur` on top of a list that had either already deduped `cur`
+    // away (an empty/`[[]]` active draft) or still contained it — so the chip read
+    // one higher than the modal actually showed ("2 drafts", then one row).
+    const listed = showCount ? this.folderDrafts() : [];
+    const others = listed.filter((d) => !(cur?.kind === "edit" && d.id === cur.id));
     const show = (cur?.kind === "edit") || others.length > 0;
     host.toggleClass("is-active", show);
     if (!show) return;
@@ -2847,7 +2861,7 @@ export class StashpadView extends ItemView {
       chip.createDiv({ cls: "stashpad-draft-chip-hint", text: "Send saves the note. R on another note makes it a reply." });
     }
     if (others.length > 0) {
-      const b = host.createEl("button", { cls: "stashpad-draft-count", text: `${others.length + (cur ? 1 : 0)} drafts` });
+      const b = host.createEl("button", { cls: "stashpad-draft-count", text: `${others.length} draft${others.length === 1 ? "" : "s"}` });
       b.title = "Review this folder's drafts";
       b.onmousedown = (e) => e.preventDefault();
       b.onclick = (e) => { e.preventDefault(); this.plugin.openComposerDrafts(this.noteFolder); };
@@ -8988,6 +9002,21 @@ export class StashpadView extends ItemView {
     this.quickCaptureUnder((target?.id ?? this.focusId ?? ROOT_ID) as StashpadId);
   }
 
+  /** 0.463.0 (/dump): open a small, NON-BLOCKING floating window bound to the
+   *  currently targeted note (cursor/selection → heading → focus), so you can
+   *  keep adding child notes to it while you scroll and read behind the window
+   *  ("write while reading"). Re-invoking re-binds the target and refocuses. */
+  openFloatingCapture(): void {
+    const target = this.getActionTargets()[0] ?? this.headingNode() ?? this.tree.get(this.focusId) ?? null;
+    const parentId = (target?.id ?? this.focusId ?? ROOT_ID) as StashpadId;
+    const label = target && parentId !== ROOT_ID ? (this.titleForNode(target).trim() || "this note") : "Home";
+    if (!this.floatingCapture) this.floatingCapture = new FloatingCaptureWindow(this.app);
+    this.floatingCapture.openFor(label, {
+      createNote: (text) => this.createNoteUnder(text, parentId).then(() => undefined),
+      onAfter: () => this.render(),
+    });
+  }
+
   /** 0.413.0: open the Nest Replies chooser. */
   cmdNestReplies(): void {
     new NestRepliesModal(this.app, {
@@ -10710,8 +10739,16 @@ export class StashpadView extends ItemView {
         if (getSettings().autofocusComposerAfterSend) this.composerInputEl?.focus();
         return;
       }
-      const allChecks = getSettings().splitCheckboxLines && isAllCheckboxLines(text);
-      const split = (this.modeSplit ?? getSettings().splitOnLines) || allChecks;
+      const lineSplit = this.modeSplit ?? getSettings().splitOnLines;
+      const checkboxSplit = getSettings().splitCheckboxLines;
+      const allChecks = checkboxSplit && isAllCheckboxLines(text);
+      // 0.464.0 (/dump, user's call "split only the checkbox lines"): a note that
+      // MIXES prose and checkbox lines peels each checkbox out as its own task
+      // while consecutive prose lines stay grouped as one note. Only when
+      // line-splitting is OFF (with it on, every line already splits) and it isn't
+      // an all-checkbox block (that path splits per line as before).
+      const mixedChecks = checkboxSplit && !allChecks && !lineSplit && hasMixedCheckboxLines(text);
+      const split = lineSplit || allChecks || mixedChecks;
       const dest = this.nextDestination;
       // 0.76.15: capture the cross-folder target (if any) before
       // resetting. A remote destination creates the note in that
@@ -10759,7 +10796,7 @@ export class StashpadView extends ItemView {
       // state). (User: "select multiple notes and create a new note → deselect".)
       if (this.selection.size) this.selection.clear();
       if (split) {
-        const lines = splitIntoChunks(sendText, getSettings().splitMode);
+        const lines = mixedChecks ? splitCheckboxAware(sendText) : splitIntoChunks(sendText, getSettings().splitMode);
         if (lines.length === 1) {
           await this.createNoteUnder(lines[0], parent, createOpts);
         } else if (lines.length > 1) {
@@ -11374,6 +11411,25 @@ export class StashpadView extends ItemView {
     });
     list.addEventListener("mouseup", disarm);
     list.addEventListener("dragend", disarm);
+    // 0.466.0 (/dump): Mod+hover a row → emit `hover-link` so the core Page
+    // Preview plugin shows a preview of that note's source. Gated on the Mod key
+    // (matching the registered source's defaultMod). Fires once per row entry;
+    // Page Preview owns the popover lifecycle from there.
+    list.addEventListener("mouseover", (e) => {
+      const me = e as MouseEvent;
+      if (!(me.metaKey || me.ctrlKey)) return;
+      const hit = this.rowFromEvent(list, me);
+      const file = hit?.node.file;
+      if (!file) return;
+      this.app.workspace.trigger("hover-link", {
+        event: me,
+        source: STASHPAD_HOVER_SOURCE,
+        hoverParent: this,
+        targetEl: hit.row,
+        linktext: file.path,
+        sourcePath: file.path,
+      });
+    });
   }
 
   /** 0.75.0: double-click / double-tap focuses (navigates into) the note —
@@ -18931,7 +18987,13 @@ export class StashpadView extends ItemView {
     });
     this.pendingFocusIds = validSources.slice();
     this.tree.rebuild(folder);
-    this.render();
+    // 0.468.0 (/dump): follow-cursor, NOT the default preserve. A same-parent
+    // DRAG reorder used a bare render() (= preserve), whose anchor restore fails
+    // to hold in the virtualized list when a row moves far (e.g. dragged to the
+    // bottom) — it landed the view at scrollTop 0 (the "dragging to reorder jumps
+    // me to the top" bug). follow-cursor keeps the moved row in view, matching the
+    // keyboard reorder (persistReorder) and the cross-parent path.
+    this.render({ kind: "follow-cursor" });
     const reorderedNodes = validSources.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
     this.plugin.notifications.show({
       message: this.bulkActionMessage({ verb: "Reordered", nodes: reorderedNodes }),
@@ -18959,7 +19021,7 @@ export class StashpadView extends ItemView {
         });
         this.pendingFocusIds = validSources.slice();
         this.tree.rebuild(folder);
-        this.render();
+        this.render({ kind: "follow-cursor" });
       },
       redo: async () => {
         this.order.setOrder(folder, parentId, newOrder);
@@ -18971,7 +19033,7 @@ export class StashpadView extends ItemView {
         });
         this.pendingFocusIds = validSources.slice();
         this.tree.rebuild(folder);
-        this.render();
+        this.render({ kind: "follow-cursor" });
       },
     });
   }

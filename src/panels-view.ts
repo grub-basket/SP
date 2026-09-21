@@ -12,6 +12,7 @@ import {
   type StashpadId,
 } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
+import { PinAliasModal } from "./modals";
 import { collectTasks as collectTasksShared, titleFromTaskFile, type TaskItem } from "./task-collect";
 import { isFailedTask } from "./task-render";
 import { TaskReviewModal } from "./task-review-modal";
@@ -423,16 +424,27 @@ export class StashpadPanelsView extends ItemView {
     // tell at a glance which entries have substructure.
     setIcon(icon, hasChildren ? "folder-tree" : "file-text");
     if (color) icon.style.color = color;
-    const label = row.createSpan({ cls: "stashpad-pinned-label", text: title });
+    // 0.461.0: pin nickname (pinAlias) — shown instead of the title, real title
+    // as tooltip. Mirrors the folder panel so both pinned surfaces agree.
+    const alias = typeof fm.pinAlias === "string" && fm.pinAlias.trim() ? fm.pinAlias.trim() : null;
+    const label = row.createSpan({ cls: "stashpad-pinned-label", text: alias ?? title });
+    if (alias) { label.addClass("has-alias"); label.title = title; }
     label.onclick = () => this.openPinFromPanel(pin);
     // Folder badge — small subtitle so the user knows which Stashpad
     // a pinned note lives in.
     const folderName = pin.folder.split("/").pop() || pin.folder;
     row.createSpan({ cls: "stashpad-pinned-folder", text: folderName });
-    // Context menu: Unpin / move within list (future).
     row.oncontextmenu = (e) => {
       e.preventDefault();
       const menu = new Menu();
+      menu.addItem((it: any) => it.setTitle(alias ? "Rename nickname…" : "Set nickname…").setIcon("text-cursor-input").onClick(() => {
+        new PinAliasModal(this.app, title, alias ?? "", (v) => void this.plugin.setPinAlias(pin, v)).open();
+      }));
+      if (alias) {
+        menu.addItem((it: any) => it.setTitle("Clear nickname").setIcon("eraser").onClick(() => {
+          void this.plugin.setPinAlias(pin, "");
+        }));
+      }
       menu.addItem((it: any) => it.setTitle("Unpin from sidebar").setIcon("pin-off").onClick(() => {
         void this.plugin.unpinNote(pin);
       }));

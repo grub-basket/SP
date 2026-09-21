@@ -1,6 +1,9 @@
 import type { TFile } from "obsidian";
 
 export const STASHPAD_VIEW_TYPE = "stashpad-view";
+/** 0.466.0: id for the 'hover-link' source registered with the Page Preview core
+ *  plugin, so a Stashpad row emits a note preview on Mod+hover. */
+export const STASHPAD_HOVER_SOURCE = "stashpad-note";
 /** 0.68.0: sidebar panels view (Pinned Notes + future panels). */
 export const STASHPAD_PANELS_VIEW_TYPE = "stashpad-panels";
 /** 0.86.0: left-sidebar folder picker (pinned notes + folders, split). */
@@ -144,7 +147,10 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   "obscured",
   // 0.86.3: sidebar pin state lives on the note (so it SYNCS with the note
   // across devices). Stashpad-managed; clones/templates must not inherit it.
-  "pinned", "pinnedAt",
+  // 0.461.0: `pinAlias` is an optional user nickname for the pin (shown in the
+  // sidebar instead of the note title, so a vague pin reads clearly). Reserved
+  // for the same reason — a clone shouldn't carry another note's pin nickname.
+  "pinned", "pinnedAt", "pinAlias",
   // 0.105.0: list pin — floats a note to the TOP of its sibling list (distinct
   // from the sidebar pin above). Stashpad-managed; not inherited by clones.
   "listPinned", "listPinnedAt",

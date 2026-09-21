@@ -137,6 +137,66 @@ export class ImportService {
     this.drainTimer = window.setTimeout(() => void this.drain(), ImportService.DEBOUNCE_MS);
   }
 
+  /** 0.465.0 (/dump, user's call): the designated import DROP subfolder is an
+   *  always-on import inbox — a place you deliberately put things to import — so a
+   *  LOOSE file dropped there imports into the parent Stashpad folder **regardless
+   *  of the `autoImport` setting**, mirroring how a `.stash` dropped there already
+   *  imports unconditionally. (Root auto-import stays gated on `autoImport`; this
+   *  is the deliberate exception for the one folder the user chose for imports.)
+   *
+   *  True when `file` is a loose (non-archive) importable file whose PARENT folder
+   *  is a discovered Stashpad folder's `importDropFolder` subfolder. */
+  isDropInboxLooseFile(file: TFile): boolean {
+    if (this.suspendDepth > 0 || !this.armed) return false;
+    if (this.suppressed.has(file.path)) return false;
+    // .stash / .edtz / .stashenc etc. are handled by their own paths, not this one.
+    if (NON_NOTE_EXTENSIONS.has(file.extension)) return false;
+    const dropSub = (this.plugin.settings.importDropFolder || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!dropSub) return false;
+    const parent = file.parent;
+    if (!parent || parent.name !== dropSub) return false;
+    const grand = parent.parent?.path?.replace(/\/+$/, "") ?? "";
+    return this.plugin.discoverStashpadFolders().includes(grand);
+  }
+
+  /** Import a loose file from the import drop subfolder into its PARENT Stashpad
+   *  folder, bypassing the `autoImport` gate. Moves it up to the folder root first
+   *  (the per-file importers target `file.parent`), then drains — so it reuses the
+   *  whole normal pipeline (dedup prompt, archiving, undo log, announce). */
+  async importDropInboxFile(file: TFile): Promise<void> {
+    const grand = file.parent?.parent?.path?.replace(/\/+$/, "") ?? "";
+    if (!grand) return;
+    const dest = this.uniqueVaultPath(`${grand}/${file.name}`);
+    try {
+      // Suppress the ORIGINAL path only; the moved file must stay importable.
+      this.suppress(file.path, 60000);
+      await this.app.fileManager.renameFile(file, dest);
+    } catch (e) {
+      console.warn("[Stashpad] drop-inbox move failed", file.path, e);
+      return;
+    }
+    const moved = this.app.vault.getAbstractFileByPath(dest);
+    if (!(moved instanceof TFile)) return;
+    // Drive the import ourselves — with autoImport off, the rename event's
+    // enqueue() no-ops, so this is the only thing that imports it.
+    this.pending.set(dest, Date.now());
+    this.arm();
+  }
+
+  /** `<base>` if free, else `<base-without-ext> 2.<ext>`, `… 3.<ext>`, … so a
+   *  moved drop-inbox file never clobbers an existing file in the folder root. */
+  private uniqueVaultPath(path: string): string {
+    if (!this.app.vault.getAbstractFileByPath(path)) return path;
+    const dot = path.lastIndexOf(".");
+    const stem = dot > path.lastIndexOf("/") ? path.slice(0, dot) : path;
+    const ext = dot > path.lastIndexOf("/") ? path.slice(dot) : "";
+    for (let n = 2; n < 10000; n++) {
+      const cand = `${stem} ${n}${ext}`;
+      if (!this.app.vault.getAbstractFileByPath(cand)) return cand;
+    }
+    return `${stem} ${Date.now()}${ext}`;
+  }
+
   /** Path-level eligibility (no content read): the file sits directly in a
    *  discovered Stashpad folder ROOT (not a reserved subfolder), and isn't
    *  a .stash archive (those have their own importer) or our own .edtz. */

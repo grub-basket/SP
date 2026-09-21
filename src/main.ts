@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId } from "./id-service";
-import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
+import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
 import { QuickCaptureModal } from "./quick-capture";
@@ -53,6 +53,7 @@ import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { createAliasesForFolder } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
 import { notify, setNotifySink } from "./notify";
+import { dedupeDrafts } from "./drafts";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
 const SHORTCUT_DIR = "Stashpad Shortcuts";
@@ -2934,6 +2935,12 @@ export default class StashpadPlugin extends Plugin {
       // to TRIGGER a re-render at the boundary. Cheap: no work unless it flips.
       this.checkObscureSchedule(); // seed baseline
       this.registerInterval(window.setInterval(() => this.checkObscureSchedule(), 60 * 1000));
+      // 0.469.0: scheduled "tidy tabs" — catch up shortly after launch (fires a
+      // run that came due while Obsidian was closed), then poll every 5 min.
+      // Both no-op unless a schedule is set; registerInterval auto-clears on
+      // unload. The startup delay lets the tab set settle first.
+      window.setTimeout(() => void this.maybeRunScheduledTidy(), 8000);
+      this.registerInterval(window.setInterval(() => void this.maybeRunScheduledTidy(), 5 * 60 * 1000));
       // 0.295.2: rediscover `.stashkey` files that arrive AFTER the startup walk.
       // They're dotfiles, so Obsidian's vault fires no create/delete event for
       // them — a folder password set on device A was invisible on device B until
@@ -3041,6 +3048,14 @@ export default class StashpadPlugin extends Plugin {
       APP_IMPORT_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new AppImportView(leaf),
     );
+    // 0.466.0 (/dump): register Stashpad rows as a 'hover-link' source so the
+    // core Page Preview plugin shows a note preview on Mod+hover over a row.
+    // `defaultMod: true` matches the user's "mod+hover" ask — the preview is
+    // gated on the Mod key (and by their Page Preview settings).
+    this.registerHoverLinkSource(STASHPAD_HOVER_SOURCE, {
+      display: "Stashpad note preview",
+      defaultMod: true,
+    });
     // Deep links: `obsidian://stashpad?folder=…&note=<id>&run=reveal[,open]`.
     // Routes into the Stashpad view, reveals a note, runs a small macro. See
     // `docs/deep-links-plan.md`. (Obsidian only allows an action under its own
@@ -4001,6 +4016,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-attachments-grid", name: "Attachments grid (all files in this folder)", callback: () => call("cmdAttachmentsGrid") });
     this.addCommand({ id: "stashpad-nest-replies", name: "Nest replies…", callback: () => call("cmdNestReplies") });
     this.addCommand({ id: "stashpad-quick-capture-under", name: "Quick capture a nested note under the cursored note", callback: () => call("cmdQuickCaptureUnder") });
+    this.addCommand({ id: "stashpad-floating-capture", name: "Floating quick capture (write while reading)", callback: () => call("openFloatingCapture") });
     this.addCommand({ id: "stashpad-preview-note", name: "Preview selected note", callback: () => call("cmdPreviewSelected") });
     this.addCommand({ id: "stashpad-preview-home", name: "Preview home (focused) note", callback: () => call("cmdPreviewHome") });
     this.addCommand({ id: "stashpad-composer-debug", name: "Debug: composer placeholder + autocomplete state", callback: () => call("cmdComposerDebug") });
@@ -4721,14 +4737,20 @@ export default class StashpadPlugin extends Plugin {
     // 0.79.1: auto-import — any file appearing directly in a Stashpad
     // folder root (not a reserved subfolder, not an existing note) gets
     // turned into a note. The service guards + debounces internally.
-    this.registerEvent(this.app.vault.on("create", (file) => {
-      if (file instanceof TFile) this.importService.enqueue(file);
-      else if (file instanceof TFolder) this.importService.enqueueFolder(file);
-    }));
-    this.registerEvent(this.app.vault.on("rename", (file) => {
-      if (file instanceof TFile) this.importService.enqueue(file);
-      else if (file instanceof TFolder) this.importService.enqueueFolder(file);
-    }));
+    // 0.465.0: a loose file dropped into the designated import DROP subfolder is
+    // an always-on inbox — import it into the parent folder regardless of the
+    // autoImport toggle (the deliberate exception the user asked for). Otherwise
+    // fall through to the normal root auto-import (gated on autoImport).
+    const onLooseFileEvent = (file: TAbstractFile): void => {
+      if (file instanceof TFile) {
+        if (this.importService.isDropInboxLooseFile(file)) { void this.importService.importDropInboxFile(file); return; }
+        this.importService.enqueue(file);
+      } else if (file instanceof TFolder) {
+        this.importService.enqueueFolder(file);
+      }
+    };
+    this.registerEvent(this.app.vault.on("create", onLooseFileEvent));
+    this.registerEvent(this.app.vault.on("rename", onLooseFileEvent));
 
     // Multiplayer: keep settings.authorName in sync with the on-disk
     // _authors stub file basenames. If the user renames their author
@@ -5907,6 +5929,21 @@ export default class StashpadPlugin extends Plugin {
     return this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned === true;
   }
 
+  /** 0.461.0: set (or clear, with "") a pin's nickname — a short label shown in
+   *  the sidebar instead of the note title, so a vague pin reads clearly. Stored
+   *  in the note's frontmatter (reserved) so it syncs with the note like the pin
+   *  state itself. */
+  async setPinAlias(pin: PinnedNoteRef, alias: string): Promise<void> {
+    const file = this.fileForPin(pin.folder, pin.id);
+    if (!file) return;
+    const trimmed = alias.trim();
+    await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+      if (trimmed) fm.pinAlias = trimmed;
+      else delete fm.pinAlias;
+    });
+    this.refreshPanelsView();
+  }
+
   /** All pinned notes across discovered Stashpad folders, ordered by `pinnedAt`
    *  (then path for stability). One metadata-cache scan — backs both the panels
    *  Pinned section and the folder panel. */
@@ -5946,15 +5983,24 @@ export default class StashpadPlugin extends Plugin {
    *  with a button to open the Drafts manager. Setting-gated (draftsLaunchReminder). */
   maybeShowDraftsReminder(): void {
     if (!this.settings.draftsLaunchReminder) return;
-    const n = Object.values(this.settings.composerDrafts ?? {})
-      .filter((d) => d.kind !== "edit" && (d.text ?? "").trim().length > 0).length;
+    // 0.459.0: count with the SAME dedup the Drafts modal uses (drop empty /
+    // `[[]]`-only drafts + collapse content duplicates) so the reminder's number
+    // matches what the manager actually lists. The old `.trim().length > 0` test
+    // counted empty-markup drafts and never deduped, inflating the number.
+    const n = dedupeDrafts(
+      Object.values(this.settings.composerDrafts ?? {})
+        .filter((d) => d.kind !== "edit")
+        .sort((a, b) => b.modified - a.modified),
+    ).length;
     if (n <= 0) return;
-    const frag = createFragment((f) => {
-      f.appendText(`Stashpad: ${n} unsent draft${n > 1 ? "s" : ""}. `);
-      const b = f.createEl("button", { text: "Open drafts", cls: "mod-cta" });
-      b.onclick = () => { this.openComposerDrafts(); notice.hide(); };
+    // 0.459.0: route through notify() so it gets the standard Stashpad toast
+    // styling, lands in the notification log, and is silenceable via the
+    // "Reminder" category — instead of a bespoke 12s Notice with a raw button.
+    notify(`${n} unsent draft${n === 1 ? "" : "s"}`, {
+      category: "reminder",
+      duration: 8000,
+      actions: [{ label: "Open drafts", onClick: () => this.openComposerDrafts() }],
     });
-    const notice = new Notice(frag, 12000);
   }
 
   /** 0.319.0: the drafts review modal (all folders, or one). */
@@ -9506,7 +9552,7 @@ export default class StashpadPlugin extends Plugin {
    *  on the same folder but DIFFERENT notes are intentional and both kept. The
    *  keeper is active > loaded > deferred but WOKEN + verified healthy first, so
    *  a corrupt tab is never the survivor when a healthy one exists. */
-  async closeDuplicateStashpadTabs(): Promise<number> {
+  async closeDuplicateStashpadTabs(opts?: { silent?: boolean }): Promise<number> {
     const leaves = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
     const active = this.app.workspace.activeLeaf;
 
@@ -9581,15 +9627,65 @@ export default class StashpadPlugin extends Plugin {
       for (const l of group) { if (l !== keeper) { l.detach(); closed++; } }
     }
 
-    // Multi-line summary tally, lingering a few seconds so it's readable.
-    const remaining = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE).length;
-    const frag = document.createDocumentFragment() as unknown as { createEl: (t: string, o?: { text?: string }) => HTMLElement };
-    frag.createEl("div", { text: closed + pruned > 0 ? "Stashpad tabs cleaned up:" : "Stashpad tabs - nothing to clean up:" });
-    frag.createEl("div", { text: `\u2022  ${closed} duplicate tab${closed === 1 ? "" : "s"} closed` });
-    frag.createEl("div", { text: `\u2022  ${pruned} orphaned tab${pruned === 1 ? "" : "s"} pruned (note no longer exists)` });
-    frag.createEl("div", { text: `\u2022  ${remaining} Stashpad tab${remaining === 1 ? "" : "s"} remaining` });
-    new Notice(frag as unknown as DocumentFragment, 7000);
+    // 0.469.0: stamp every run (manual OR scheduled) so the auto-tidy schedule
+    // measures the interval from the last actual tidy.
+    this.settings.tidyTabsLastRun = Date.now();
+    void this.saveSettings();
+
+    // Scheduled/background runs stay silent unless they actually closed
+    // something; the manual command always reports (including the no-op case),
+    // so the user gets confirmation when they explicitly invoke it.
+    const changed = closed + pruned > 0;
+    if (!opts?.silent || changed) {
+      // Multi-line summary tally, lingering a few seconds so it's readable.
+      const remaining = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE).length;
+      const frag = document.createDocumentFragment() as unknown as { createEl: (t: string, o?: { text?: string }) => HTMLElement };
+      frag.createEl("div", { text: changed ? "Stashpad tabs cleaned up:" : "Stashpad tabs - nothing to clean up:" });
+      frag.createEl("div", { text: `\u2022  ${closed} duplicate tab${closed === 1 ? "" : "s"} closed` });
+      frag.createEl("div", { text: `\u2022  ${pruned} orphaned tab${pruned === 1 ? "" : "s"} pruned (note no longer exists)` });
+      frag.createEl("div", { text: `\u2022  ${remaining} Stashpad tab${remaining === 1 ? "" : "s"} remaining` });
+      new Notice(frag as unknown as DocumentFragment, opts?.silent ? 5000 : 7000);
+    }
     return closed + pruned;
+  }
+
+  /** Re-entrancy guard for the scheduled tidy (it awaits tab loads, so a poll
+   *  tick must not start a second run over the first). */
+  private tidyRunning = false;
+
+  /** Interval in ms for an auto-tidy schedule, or 0 when off. */
+  private tidyIntervalMs(schedule: StashpadSettings["tidyTabsSchedule"]): number {
+    switch (schedule) {
+      case "hourly": return 60 * 60 * 1000;
+      case "daily": return 24 * 60 * 60 * 1000;
+      case "weekly": return 7 * 24 * 60 * 60 * 1000;
+      default: return 0; // "off"
+    }
+  }
+
+  /** 0.469.0: scheduled "Close duplicate & orphaned Stashpad tabs". No-op unless
+   *  a schedule is set. Runs when the interval has elapsed since the last tidy —
+   *  OR immediately when no last-run time is recorded (first arming, or a wiped
+   *  stamp), which (re)seeds the cadence from now. A tidy that already ran within
+   *  the interval waits out the remainder. Polled on a timer + once at launch, so
+   *  a run that came due while Obsidian was closed fires on the next launch. */
+  async maybeRunScheduledTidy(): Promise<void> {
+    const interval = this.tidyIntervalMs(this.settings.tidyTabsSchedule);
+    if (interval <= 0) return; // off
+    if (this.tidyRunning) return;
+    const last = this.settings.tidyTabsLastRun;
+    const now = Date.now();
+    // A future/garbage stamp (clock change, corrupt data) counts as due rather
+    // than blocking tidy forever. `!last` covers "never run".
+    const due = !last || last > now || now - last >= interval;
+    if (!due) return;
+    this.tidyRunning = true;
+    try {
+      await this.closeDuplicateStashpadTabs({ silent: true });
+    } catch { /* best-effort background maintenance */ }
+    finally {
+      this.tidyRunning = false;
+    }
   }
 
   /** Poll briefly for the folder's Stashpad view to have `id` in its tree, then

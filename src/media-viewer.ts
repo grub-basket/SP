@@ -1,5 +1,6 @@
 import { App, Component, MarkdownRenderer, Menu, Modal, Platform, TFile, setIcon } from "obsidian";
 import { notify } from "./notify";
+import { buildFileActions } from "./notifications";
 import { fileKindFor } from "./file-kinds";
 
 /** How the viewer presents the note's files.
@@ -168,6 +169,15 @@ export class MediaViewerModal extends Modal {
    *  a zero-height image that has not decoded yet. */
   private sized = false;
   private mode: ViewerMode = "view";
+  /** 0.460.0: image-crop overlay state. The crop frame lives in STAGE (screen)
+   *  coordinates and does NOT move when the image is panned/zoomed behind it —
+   *  iOS-Photos style — so pinch-zoom/pan stay live for framing and the frame is
+   *  mapped back through the current transform only at confirm time. */
+  private cropBtn!: HTMLElement;
+  private cropping = false;
+  private cropOverlayEl: HTMLElement | null = null;
+  private cropBoxEl: HTMLElement | null = null;
+  private cropRect: { x: number; y: number; w: number; h: number } | null = null;
   private bodyEl!: HTMLElement;
   private browseEl!: HTMLElement;
   private modeBtns: Partial<Record<ViewerMode, HTMLElement>> = {};
@@ -250,6 +260,10 @@ export class MediaViewerModal extends Modal {
     this.transformBtns.push(act("rotate-ccw", "Rotate left (Shift+R)", () => this.rotate(-90)));
     this.transformBtns.push(act("rotate-cw", "Rotate right (R)", () => this.rotate(90)));
     this.transformBtns.push(act("maximize", "Fit to window (0)", () => this.fit()));
+    // 0.460.0: crop — RASTER images only (svg/other slides hide it). Managed on
+    // its own, not in transformBtns, so show() can gate it per-slide by type.
+    this.cropBtn = act("crop", "Crop image", () => this.toggleCrop());
+    this.cropBtn.toggleClass("is-hidden", true);
     act("external-link", "Open in a new tab", () => {
       const f = this.items[this.idx]?.file;
       if (f) { this.close(); this.onOpenInTab(f); }
@@ -816,6 +830,8 @@ export class MediaViewerModal extends Modal {
   private current(): MediaItem | null { return this.items[this.idx] ?? null; }
 
   private go(dir: -1 | 1): void {
+    // Cropping is a modal sub-mode: paging away would silently drop the frame.
+    if (this.cropping) return;
     if (this.items.length < 2) return;
     // Wrap: a rail is a loop, and hitting a dead end on a 2-image note is worse
     // than wrapping.
@@ -868,6 +884,11 @@ export class MediaViewerModal extends Modal {
     for (const b of this.fileBtns) b.toggleClass("is-hidden", !item?.file);
     // Switch-render is PDF-only; shown in the PDF branch below, hidden elsewhere.
     this.pdfSwitchBtn.toggleClass("is-hidden", true);
+    // Crop is raster-image only; revealed in the image branch below. A slide
+    // change while cropping tears the frame down first (it lives in screen space
+    // and would otherwise hang over the next slide).
+    if (this.cropping) this.exitCrop();
+    this.cropBtn.toggleClass("is-hidden", true);
 
     if (!item) return;
     const ext = (item.path.split(".").pop() ?? "").toLowerCase();
@@ -905,6 +926,10 @@ export class MediaViewerModal extends Modal {
       // 0.272.4: right-click an image → Copy (a PDF is an iframe with its own
       // menu, so this is images / other non-pdf stage content only).
       img.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); if (item.file) this.openStageMenu(e, item.file); };
+      // 0.460.0: crop is offered for RASTER images only — cropping rasterizes via
+      // <canvas> + createImageBitmap, which is unreliable for SVG (and a GIF
+      // yields a single static frame, which is fine).
+      this.cropBtn.toggleClass("is-hidden", ext === "svg");
       const onReady = (): void => {
         this.naturalW = img.naturalWidth || img.clientWidth;
         this.naturalH = img.naturalHeight || img.clientHeight;
@@ -1163,9 +1188,10 @@ export class MediaViewerModal extends Modal {
       if (item.note) {
         // 0.374.0: the note-itself slide — a distinct badge + the note title, so
         // it reads as "the note" rather than a `.md` file in the rail.
+        // 0.467.0 (/dump): the accent file-text icon already reads as "the note",
+        // so the "NOTE" caps label under it was redundant — use the icon alone.
         const badge = cell.createDiv({ cls: "stashpad-media-railbadge is-note" });
         setIcon(badge, "file-text");
-        badge.createSpan({ cls: "stashpad-media-railext", text: "NOTE" });
         cell.title = item.note.title;
         cell.onclick = (e) => { e.stopPropagation(); this.idx = i; this.show(); };
         return;
@@ -1286,6 +1312,185 @@ export class MediaViewerModal extends Modal {
     // Re-fit after a quarter turn: the image now has to fit a different axis,
     // and leaving the old scale usually pushes it off-stage.
     this.fit();
+  }
+
+  // ---------- crop ----------
+
+  private toggleCrop(): void {
+    if (this.cropping) { this.exitCrop(); return; }
+    if (!this.mediaEl || !this.sized) return;
+    this.enterCrop();
+  }
+
+  private enterCrop(): void {
+    this.cropping = true;
+    this.stageEl.addClass("is-cropping");
+    this.cropBtn.addClass("is-active");
+    // Seed the frame from the image's on-screen footprint (inset ~8%), clamped to
+    // the stage — so it starts over the picture, not the letterboxed background.
+    // Rotation swaps the footprint's axes. You then drag/resize it, and pinch/pan
+    // the image behind it.
+    const r = this.stageEl.getBoundingClientRect();
+    const quarter = Math.abs(this.rotation % 180) === 90;
+    const imgW = (quarter ? this.naturalH : this.naturalW) * this.scale;
+    const imgH = (quarter ? this.naturalW : this.naturalH) * this.scale;
+    // Image is centered by centerInStage(); its footprint centers on the stage.
+    const fx = Math.max(0, (r.width - imgW) / 2);
+    const fy = Math.max(0, (r.height - imgH) / 2);
+    const fw = Math.min(imgW, r.width);
+    const fh = Math.min(imgH, r.height);
+    const w = Math.round(fw * 0.84);
+    const h = Math.round(fh * 0.84);
+    this.cropRect = {
+      x: Math.round(fx + (fw - w) / 2),
+      y: Math.round(fy + (fh - h) / 2),
+      w: Math.max(32, w),
+      h: Math.max(32, h),
+    };
+    this.buildCropOverlay();
+  }
+
+  private exitCrop(): void {
+    this.cropping = false;
+    this.stageEl.removeClass("is-cropping");
+    this.cropBtn.removeClass("is-active");
+    this.cropOverlayEl?.remove();
+    this.cropOverlayEl = null;
+    this.cropBoxEl = null;
+    this.cropRect = null;
+  }
+
+  private buildCropOverlay(): void {
+    const overlay = this.stageEl.createDiv({ cls: "stashpad-crop-overlay" });
+    this.cropOverlayEl = overlay;
+    const box = overlay.createDiv({ cls: "stashpad-crop-box" });
+    this.cropBoxEl = box;
+    box.createDiv({ cls: "stashpad-crop-grid" });
+    for (const corner of ["nw", "ne", "sw", "se"]) {
+      box.createDiv({ cls: `stashpad-crop-handle is-${corner}` });
+    }
+    // Action bar (bottom-center of the stage) — reachable on mobile, where the
+    // toolbar Crop button is a mode toggle and this is where you commit/cancel.
+    const bar = overlay.createDiv({ cls: "stashpad-crop-bar" });
+    const cancel = bar.createEl("button", { cls: "stashpad-crop-cancel", text: "Cancel" });
+    cancel.onmousedown = (e) => e.stopPropagation();
+    cancel.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this.exitCrop(); };
+    const done = bar.createEl("button", { cls: "mod-cta stashpad-crop-done", text: "Crop" });
+    done.onmousedown = (e) => e.stopPropagation();
+    done.onclick = (e) => { e.preventDefault(); e.stopPropagation(); void this.confirmCrop(); };
+    this.wireCropDrag(box);
+    this.layoutCropBox();
+  }
+
+  private layoutCropBox(): void {
+    const b = this.cropBoxEl, c = this.cropRect;
+    if (!b || !c) return;
+    b.style.left = `${c.x}px`;
+    b.style.top = `${c.y}px`;
+    b.style.width = `${c.w}px`;
+    b.style.height = `${c.h}px`;
+  }
+
+  /** Move the frame (drag its body) or resize it (drag a corner handle), both
+   *  clamped inside the stage with a minimum size. The frame is screen-space, so
+   *  none of this touches the image transform — pan/pinch stay live underneath. */
+  private wireCropDrag(box: HTMLElement): void {
+    const MIN = 32;
+    const start = (e: PointerEvent, corner: "" | "nw" | "ne" | "sw" | "se"): void => {
+      e.preventDefault();
+      e.stopPropagation();
+      const c0 = { ...(this.cropRect as { x: number; y: number; w: number; h: number }) };
+      const sx = e.clientX, sy = e.clientY;
+      const sr = this.stageEl.getBoundingClientRect();
+      const move = (ev: PointerEvent): void => {
+        const dx = ev.clientX - sx, dy = ev.clientY - sy;
+        let { x, y, w, h } = c0;
+        if (!corner) {
+          x = Math.max(0, Math.min(c0.x + dx, sr.width - c0.w));
+          y = Math.max(0, Math.min(c0.y + dy, sr.height - c0.h));
+        } else {
+          if (corner.includes("w")) { const nx = Math.max(0, Math.min(c0.x + dx, c0.x + c0.w - MIN)); w = c0.x + c0.w - nx; x = nx; }
+          if (corner.includes("e")) { w = Math.max(MIN, Math.min(c0.w + dx, sr.width - c0.x)); }
+          if (corner.includes("n")) { const ny = Math.max(0, Math.min(c0.y + dy, c0.y + c0.h - MIN)); h = c0.y + c0.h - ny; y = ny; }
+          if (corner.includes("s")) { h = Math.max(MIN, Math.min(c0.h + dy, sr.height - c0.y)); }
+        }
+        this.cropRect = { x, y, w, h };
+        this.layoutCropBox();
+      };
+      const up = (): void => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", up);
+    };
+    box.addEventListener("pointerdown", (e) => start(e, ""));
+    for (const h of Array.from(box.querySelectorAll<HTMLElement>(".stashpad-crop-handle"))) {
+      const corner = (h.className.match(/is-(nw|ne|sw|se)/)?.[1] ?? "") as "" | "nw" | "ne" | "sw" | "se";
+      h.addEventListener("pointerdown", (e) => start(e, corner));
+    }
+  }
+
+  /** Map the screen-space crop frame back through the CURRENT pan/zoom/rotation
+   *  and write the result as a NEW file next to the source (never overwriting the
+   *  original). Reads the source bytes (not the tainted app:// resource) so the
+   *  canvas stays exportable, and honors rotation by replaying the same transform
+   *  CSS applies. Output is full-resolution: the frame's natural-pixel size. */
+  private async confirmCrop(): Promise<void> {
+    const file = this.current()?.file;
+    const c = this.cropRect;
+    if (!file || !c || !this.mediaEl) { this.exitCrop(); return; }
+    try {
+      const buf = await this.app.vault.readBinary(file);
+      const bmp = await createImageBitmap(new Blob([buf]));
+      const scale = this.scale;
+      // The crop frame, in the pan element's LOCAL space (before pan/zoom) — the
+      // space the (rotated) image is painted in. `stage = t + scale * local`.
+      const plx = (c.x - this.tx) / scale;
+      const ply = (c.y - this.ty) / scale;
+      const ow = Math.max(1, Math.round(c.w / scale));
+      const oh = Math.max(1, Math.round(c.h / scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = ow;
+      canvas.height = oh;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("no 2d context");
+      // Offset so the frame's top-left maps to the canvas origin, then replay the
+      // CSS rotation (about the image's own center) before drawing the image.
+      ctx.translate(-plx, -ply);
+      const cx = bmp.width / 2, cy = bmp.height / 2;
+      ctx.translate(cx, cy);
+      ctx.rotate((this.rotation * Math.PI) / 180);
+      ctx.translate(-cx, -cy);
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close?.();
+      const outBlob = await new Promise<Blob | null>((res) => canvas.toBlob((b) => res(b), "image/png"));
+      if (!outBlob) throw new Error("toBlob returned null");
+      const outBuf = await outBlob.arrayBuffer();
+      const path = await this.uniqueCropPath(file);
+      const created = await this.app.vault.createBinary(path, outBuf);
+      this.exitCrop();
+      notify(`Cropped image saved — **${created.name}**`, {
+        category: "attachment",
+        affectedPaths: [created.path],
+        actions: buildFileActions(this.app, created.path, Platform.isMobile),
+      });
+    } catch (err) {
+      console.warn("[Stashpad] crop failed", err);
+      notify("Couldn't crop that image.", { kind: "error", category: "system" });
+    }
+  }
+
+  /** `<base>-crop.png` beside the source, disambiguated with `-2`, `-3`, … so a
+   *  repeat crop never clobbers an earlier one. */
+  private async uniqueCropPath(file: TFile): Promise<string> {
+    const dir = file.parent?.path && file.parent.path !== "/" ? `${file.parent.path}/` : "";
+    const mk = (n: number): string => `${dir}${file.basename}-crop${n <= 1 ? "" : `-${n}`}.png`;
+    let n = 1;
+    while (this.app.vault.getAbstractFileByPath(mk(n))) n += 1;
+    return mk(n);
   }
 
   // ---------- gestures ----------
@@ -1469,6 +1674,13 @@ export class MediaViewerModal extends Modal {
     });
 
     stage.addEventListener("keydown", (e: KeyboardEvent) => {
+      // While cropping: Enter commits, Escape cancels, arrows don't page slides.
+      // Zoom/rotate keys still fall through so you can frame with the keyboard.
+      if (this.cropping) {
+        if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); void this.confirmCrop(); return; }
+        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); this.exitCrop(); return; }
+        if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); e.stopPropagation(); return; }
+      }
       let handled = true;
       switch (e.key) {
         case "+": case "=": this.zoomBy(BUTTON_STEP); break;
@@ -1489,6 +1701,8 @@ export class MediaViewerModal extends Modal {
     // backdrop does not dismiss.
     stage.addEventListener("click", (e: MouseEvent) => {
       if (e.target !== stage) return;
+      // Cropping owns the stage — a backdrop click shouldn't dismiss the modal.
+      if (this.cropping) return;
       // A drag that happens to end over the backdrop must not dismiss.
       if (moved > 4) { moved = 0; return; }
       this.close();

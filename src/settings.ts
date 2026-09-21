@@ -9,6 +9,7 @@ import { FolderSuggest } from "./folder-suggest";
 import { isValidConfigFolder } from "./config-layout";
 import { IconSuggest } from "./icon-suggest";
 import { CommandSuggest } from "./command-suggest";
+import { QUICK_REACTIONS, firstEmojiForQuery, searchEmoji } from "./reactions";
 import type StashpadPlugin from "./main";
 import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
@@ -964,6 +965,11 @@ export interface StashpadSettings {
   /** 0.318.0: user-pinned reaction emoji, shown first in the picker (replaces
    *  the default presets once non-empty). Edited from the picker itself. */
   favoriteReactions: string[];
+  /** 0.459.0: the quick-pick presets shown at the top of the reaction picker
+   *  (before any favorites are pinned, and always visible in the picker's Edit
+   *  mode). `undefined` = the built-in QUICK_REACTIONS default; set explicitly
+   *  once the user customises them in Settings → Note Actions & Menus. */
+  presetReactions?: string[];
   /** When on, note bodies render fully expanded by default; the
    *  per-note "Show more / show less" toggle and the expand/collapse-all
    *  commands then act as a *collapse* opt-out (the expandedNotes Set is
@@ -1098,6 +1104,15 @@ export interface StashpadSettings {
    *  race), and this keeps drafts precise instead of resurrecting sent text.
    *  Legacy installs stored a single string; readers tolerate both shapes. */
   lastSubmitted: Record<string, string | string[]>;
+  /** 0.469.0: automatically run "Close duplicate & orphaned Stashpad tabs" on a
+   *  schedule. "off" disables it. On each due tick the tidy runs quietly and
+   *  `tidyTabsLastRun` is stamped, so a run that came due while Obsidian was
+   *  closed fires once on the next launch (catch-up), while a run that already
+   *  happened within the interval waits out the remainder. */
+  tidyTabsSchedule: "off" | "hourly" | "daily" | "weekly";
+  /** Epoch ms of the last tidy run (manual OR scheduled); 0 = never run. Drives
+   *  the catch-up-vs-wait decision for the schedule above. */
+  tidyTabsLastRun: number;
 }
 
 export const DEFAULT_SETTINGS: StashpadSettings = {
@@ -1320,6 +1335,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   },
   draftAppendTargets: {},
   lastSubmitted: {},
+  tidyTabsSchedule: "off",
+  tidyTabsLastRun: 0,
   bindings: buildDefaultBindings(),
 };
 
@@ -1510,10 +1527,13 @@ export const SETTINGS_TABS: Array<{ id: SettingsTabId; label: string }> = ([
   { id: "help",           label: "❓ Help & Getting started" },
   { id: "importExport",   label: "🔄 Import & Export" },
   { id: "datesTime",      label: "🕒 Dates & Time" },
-  // 0.121.9: the six toggle-only sections (List & Display, Moving Notes,
-  // Deleting, Composer & Copying, Windows & Tabs, Misc) are folded into one
-  // "Behavior" tab as sub-headings (see itemsForTab).
-  { id: "behaviors",      label: "🎛️ Behavior" },
+  // 0.121.9: the toggle-only sections are folded into one tab as sub-headings
+  // (see itemsForTab). 0.470.0: re-sorted into nine focused sub-headings
+  // (List & Display, Time Window & Pinning, Attachments & Media, Privacy &
+  // Obscuring, Composer & Editing, Link Previews, Moving Notes, Windows & Tabs,
+  // Deleting) and the tab renamed "Behavior & Display" — the old "Behavior"
+  // undersold that it also holds display, attachment, privacy and preview prefs.
+  { id: "behaviors",      label: "🎛️ Behavior & Display" },
   { id: "noteActions",    label: "🧩 Note Actions & Menus" },
   { id: "notifications",  label: "🔔 Notifications" },
   { id: "encryption",     label: "🔒 Encryption" },
@@ -1734,11 +1754,14 @@ export class StashpadSettingTab extends PluginSettingTab {
         const c = this.buildGeneralCategories();
         return [
           this.headingDef("📋 List & Display"), ...c.listDisplay,
+          this.headingDef("⏳ Time Window & Pinning"), ...c.timeWindow,
+          this.headingDef("📎 Attachments & Media"), ...c.attachmentsMedia,
+          this.headingDef("🙈 Privacy & Obscuring"), ...c.privacy,
+          this.headingDef("✍️ Composer & Editing"), ...c.composerCopy,
+          this.headingDef("🔗 Link Previews"), ...c.linkPreviews,
           this.headingDef("↕️ Moving Notes"), ...c.movingNotes,
-          this.headingDef("✍️ Composer & Copying"), ...c.composerCopy,
-          this.headingDef("🗑️ Deleting"), ...c.deleting,
           this.headingDef("🪟 Windows & Tabs"), ...c.windowsTabs,
-          this.headingDef("⚙️ Misc"), ...c.misc,
+          this.headingDef("🗑️ Deleting"), ...c.deleting,
         ];
       }
       // 0.121.9: "Organization Systems" merges JD Index + OKF as sub-sections.
@@ -2092,9 +2115,124 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.contextMenuBody(h, rebuild);
         this.iconRegistryBody(h, rebuild);
         this.composerActionButtonBody(h);
+        this.reactionsBody(h, rebuild);
       };
       buildAll(box);
-    }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu"])];
+    }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu", "reaction", "reactions", "emoji", "favorite", "favorites", "preset", "presets"])];
+  }
+
+  /** 0.459.0: manage the emoji reaction picker's Favorites (pinned emoji shown
+   *  first) and Presets (the default quick-pick row before any favorites exist,
+   *  and always visible in the picker's Edit mode). Both are also editable from
+   *  the picker itself; this is the discoverable home for them. */
+  private reactionsBody(host: HTMLElement, rebuild: () => void): void {
+    new Setting(host).setName("Emoji reactions").setHeading();
+    host.createDiv({ cls: "setting-item-description", text: "Customize the emoji reaction picker (the smile+ button on each note). Favorites are your pinned emoji, shown first. Presets are the default quick-pick row shown until you pin any favorites — and always shown in the picker's Edit mode so you can pin from them." });
+
+    const editorRow = (opts: {
+      label: string; desc: string;
+      get: () => string[]; set: (next: string[]) => Promise<void>;
+      resetLabel: string; reset: () => Promise<void>; resetEnabled: () => boolean;
+    }): void => {
+      const { label, desc, get, set, resetLabel, reset, resetEnabled } = opts;
+      new Setting(host).setName(label).setDesc(desc);
+      const wrap = host.createDiv({ cls: "stashpad-reaction-settings-editor" });
+      const chips = wrap.createDiv({ cls: "stashpad-reaction-settings-chips" });
+      // Forward-declared so renderChips/results can refresh the reset button's
+      // enabled state after every mutation (it's always shown, greyed when N/A).
+      let refreshReset = (): void => {};
+      const renderChips = (): void => {
+        chips.empty();
+        const list = get();
+        if (!list.length) { chips.createSpan({ cls: "setting-item-description", text: "None." }); return; }
+        list.forEach((emoji, i) => {
+          const chip = chips.createDiv({ cls: "stashpad-reaction-settings-chip" });
+          chip.createSpan({ cls: "stashpad-reaction-settings-glyph", text: emoji });
+          // reorder + remove controls
+          const mk = (icon: string, title: string, disabled: boolean, fn: () => Promise<void>): void => {
+            const b = chip.createEl("button", { cls: "stashpad-reaction-settings-chipbtn", title });
+            setIcon(b, icon);
+            if (disabled) b.disabled = true;
+            else b.onclick = async () => { await fn(); renderChips(); refreshReset(); };
+          };
+          mk("chevron-left", "Move left", i === 0, async () => { const n = get().slice(); [n[i - 1], n[i]] = [n[i], n[i - 1]]; await set(n); });
+          mk("chevron-right", "Move right", i === list.length - 1, async () => { const n = get().slice(); [n[i + 1], n[i]] = [n[i], n[i + 1]]; await set(n); });
+          mk("x", "Remove", false, async () => { await set(get().filter((_, j) => j !== i)); });
+        });
+      };
+      renderChips();
+
+      const add = new Setting(wrap).setClass("stashpad-reaction-settings-add");
+      // Live search results under the input — you can see which emoji match and
+      // click one to add it (Enter still adds the top match).
+      const results = wrap.createDiv({ cls: "stashpad-reaction-settings-results is-empty" });
+      let query = "";
+      const tryAdd = async (emoji: string, clearInput: () => void): Promise<boolean> => {
+        if (!emoji) { new Notice("No emoji matched that."); return false; }
+        if (get().includes(emoji)) { new Notice(`${emoji} is already in the list.`); return false; }
+        await set([...get(), emoji]);
+        clearInput(); query = "";
+        renderChips(); refreshReset(); renderResults();
+        return true;
+      };
+      const renderResults = (): void => {
+        results.empty();
+        const q = query.trim();
+        results.toggleClass("is-empty", q.length === 0);
+        if (!q) return;
+        const have = new Set(get());
+        const matches = searchEmoji(q, 24);
+        // A typed/pasted literal glyph that search wouldn't surface: offer it too.
+        const literal = firstEmojiForQuery(q);
+        const shown: Array<{ emoji: string; name: string }> = [];
+        if (literal && !matches.some((m) => m.emoji === literal)) shown.push({ emoji: literal, name: "typed emoji" });
+        for (const m of matches) shown.push({ emoji: m.emoji, name: m.name });
+        if (!shown.length) { results.createSpan({ cls: "setting-item-description", text: "No emoji match." }); return; }
+        for (const { emoji, name } of shown) {
+          const already = have.has(emoji);
+          const b = results.createEl("button", { cls: "stashpad-reaction-settings-result" + (already ? " is-added" : ""), text: emoji, title: already ? `${name} — already added` : name });
+          if (already) b.disabled = true;
+          else b.onclick = () => { void tryAdd(emoji, () => { const input = add.controlEl.querySelector("input"); if (input) (input as HTMLInputElement).value = ""; }); };
+        }
+      };
+      add.addText((t) => {
+        t.setPlaceholder("emoji, name or :code: (e.g. 🎯, rocket, :tada:)").onChange((v) => { query = v; renderResults(); });
+        t.inputEl.addEventListener("keydown", async (e) => {
+          if (e.key !== "Enter") return;
+          e.preventDefault();
+          await tryAdd(firstEmojiForQuery(query), () => t.setValue(""));
+        });
+      });
+      add.addButton((b) => b.setButtonText("Add").setCta().onClick(async () => {
+        await tryAdd(firstEmojiForQuery(query), () => { const input = add.controlEl.querySelector("input"); if (input) (input as HTMLInputElement).value = ""; });
+      }));
+      add.addExtraButton((b) => {
+        const apply = (): void => { b.setDisabled(!resetEnabled()); };
+        b.setIcon("rotate-ccw").setTooltip(resetLabel).onClick(async () => { await reset(); rebuild(); });
+        refreshReset = apply;
+        apply();
+      });
+    };
+
+    editorRow({
+      label: "Favorites",
+      desc: "Pinned emoji shown first in the picker. Empty = the presets are shown instead.",
+      get: () => this.plugin.settings.favoriteReactions ?? [],
+      set: async (next) => { this.plugin.settings.favoriteReactions = next; await this.plugin.saveSettings(); },
+      resetLabel: "Clear all favorites",
+      reset: async () => { this.plugin.settings.favoriteReactions = []; await this.plugin.saveSettings(); },
+      resetEnabled: () => (this.plugin.settings.favoriteReactions?.length ?? 0) > 0,
+    });
+
+    editorRow({
+      label: "Presets",
+      desc: "The default quick-pick row. Shown until you pin favorites, and always in the picker's Edit mode.",
+      get: () => this.plugin.settings.presetReactions ?? [...QUICK_REACTIONS],
+      set: async (next) => { this.plugin.settings.presetReactions = next; await this.plugin.saveSettings(); },
+      resetLabel: "Reset presets to defaults",
+      reset: async () => { delete this.plugin.settings.presetReactions; await this.plugin.saveSettings(); },
+      resetEnabled: () => this.plugin.settings.presetReactions !== undefined,
+    });
   }
 
   /** 0.363.2: the configurable composer action-bar button. Runs one Obsidian
@@ -3076,7 +3214,8 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  category goes to `misc`. */
   private buildGeneralCategories(): Record<
     "foldersStorage" | "importExport" | "datesTime" | "listDisplay"
-    | "movingNotes" | "deleting" | "composerCopy" | "windowsTabs" | "maintenance" | "misc",
+    | "timeWindow" | "attachmentsMedia" | "privacy" | "linkPreviews"
+    | "movingNotes" | "deleting" | "composerCopy" | "windowsTabs" | "maintenance",
     SettingDefinitionItem[]
   > {
     const set = async () => this.plugin.saveSettings();
@@ -3090,12 +3229,15 @@ export class StashpadSettingTab extends PluginSettingTab {
       importExport: [] as SettingDefinitionItem[],
       datesTime: [] as SettingDefinitionItem[],
       listDisplay: [] as SettingDefinitionItem[],
+      timeWindow: [] as SettingDefinitionItem[],
+      attachmentsMedia: [] as SettingDefinitionItem[],
+      privacy: [] as SettingDefinitionItem[],
+      linkPreviews: [] as SettingDefinitionItem[],
       movingNotes: [] as SettingDefinitionItem[],
       deleting: [] as SettingDefinitionItem[],
       composerCopy: [] as SettingDefinitionItem[],
       windowsTabs: [] as SettingDefinitionItem[],
       maintenance: [] as SettingDefinitionItem[],
-      misc: [] as SettingDefinitionItem[],
     };
 
     cats.foldersStorage.push(this.renderDef("Stashpad notes folder", "Vault-relative folder where Stashpad stores its notes and attachments. Created on demand.", (s) => {
@@ -3288,7 +3430,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     // working; settings is where you go to see them ALL at once, which the
     // menu cannot show — you would have to right-click every folder to learn
     // which ones are set.
-    cats.listDisplay.push(this.renderDef("Obscure notes by default, per folder", "Choose whether a folder's notes start blurred, when the vault-wide switch above is OFF. \"Follow global\" means no opinion; \"Always\" and \"Never\" are explicit answers for this folder, and a note with its own setting overrides its folder. While the vault-wide switch is ON it covers everything regardless. VISUAL ONLY.", (st) => {
+    cats.privacy.push(this.renderDef("Obscure notes by default, per folder", "Choose whether a folder's notes start blurred, when the vault-wide switch above is OFF. \"Follow global\" means no opinion; \"Always\" and \"Never\" are explicit answers for this folder, and a note with its own setting overrides its folder. While the vault-wide switch is ON it covers everything regardless. VISUAL ONLY.", (st) => {
       const folders = this.plugin.discoverStashpadFolders();
       if (folders.length === 0) { st.setDesc("No Stashpad folders found yet."); return; }
       if (!this.obscurePickFolder || !folders.includes(this.obscurePickFolder)) this.obscurePickFolder = folders[0];
@@ -3357,15 +3499,15 @@ export class StashpadSettingTab extends PluginSettingTab {
       "On by default. If you have unsent composer drafts, show a short notice on launch with a button to open the Drafts manager. Turn off to silence it. (Drafts are never auto-loaded into the composer any more — they resurfaced already-sent text; they're saved and reached via the Drafts manager, the composer's Drafts button, or the “Show composer drafts” command. The Drafts button also toggles a per-folder reminder chip.)",
       () => this.plugin.settings.draftsLaunchReminder, (v) => { this.plugin.settings.draftsLaunchReminder = v; },
       ["draft", "drafts", "reminder", "launch", "notice", "composer"]));
-    cats.composerCopy.push(toggle("Add link previews automatically",
+    cats.linkPreviews.push(toggle("Add link previews automatically",
       "When a note containing a link is saved, fetch that link's title and description and add a preview to the note — without you running a command. Off by default: it turns typing a URL into a network request and a write to the note. Previews are still never overwritten, so anything you have edited by hand is safe. If the list feels jumpy while notes are being written, turn this off.",
       () => this.plugin.settings.linkPreviewAuto, (v) => { this.plugin.settings.linkPreviewAuto = v; },
       ["link", "preview", "auto", "automatic", "unfurl", "url"]));
-    cats.composerCopy.push(toggle("Start link previews folded",
+    cats.linkPreviews.push(toggle("Start link previews folded",
       "Show preview callouts collapsed to just their title. Off by default — folding hides the description, which is the part worth keeping. Turn it on if notes with several links feel dominated by previews.",
       () => this.plugin.settings.linkPreviewCollapsed, (v) => { this.plugin.settings.linkPreviewCollapsed = v; },
       ["link", "preview", "collapsed", "folded", "callout"]));
-    cats.composerCopy.push(this.renderDef("Link preview callout style",
+    cats.linkPreviews.push(this.renderDef("Link preview callout style",
       'Which Obsidian callout type link previews use — "info", "quote", "abstract", "note" and so on. Cosmetic: it decides the icon and colour. Previews are always collapsed by default so a note with several links is not mostly preview.',
       (s) => s.addText((t) => t
         .setPlaceholder("info")
@@ -3374,7 +3516,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           this.plugin.settings.linkPreviewCallout = (v || "info").trim().replace(/[^a-z0-9-]/gi, "") || "info";
           await set();
         })), ["link", "preview", "callout", "unfurl", "url"]));
-    cats.composerCopy.push(this.renderDef("Pause between link fetches (ms)",
+    cats.linkPreviews.push(this.renderDef("Pause between link fetches (ms)",
       "How long to wait between fetching one link preview and the next. Backfilling an archive is thousands of requests, and hammering a site is both rude and a good way to get rate-limited. 300ms is a reasonable default; raise it if a host starts refusing.",
       (s) => s.addText((t) => t
         .setPlaceholder("300")
@@ -3403,6 +3545,27 @@ export class StashpadSettingTab extends PluginSettingTab {
       s.addToggle((t) => t.setValue(this.plugin.settings.writeRecoveryLinks).onChange(async (v) => {
         this.plugin.settings.writeRecoveryLinks = v; await set();
       })), ["recovery", "parentlink", "children", "frontmatter"]));
+
+    // 0.469.0: schedule the "Close duplicate & orphaned Stashpad tabs" tidy so
+    // it runs on its own. The desc shows the last-run time (computed at render).
+    const tidyLast = this.plugin.settings.tidyTabsLastRun;
+    const tidyLastTxt = tidyLast ? ` Last run: ${new Date(tidyLast).toLocaleString()}.` : " Not run yet.";
+    cats.maintenance.push(this.renderDef("Auto-tidy Stashpad tabs",
+      "Automatically run “Close duplicate & orphaned Stashpad tabs” on a schedule — collapsing duplicate tabs on the same note and pruning tabs whose note no longer exists (the same command available in the palette). Off by default. A run that comes due while Obsidian is closed fires once on the next launch; a run that already happened within the interval waits out the rest. Runs quietly — a brief notice only when it actually closes something." + tidyLastTxt,
+      (s) => s.addDropdown((d) => d
+        .addOption("off", "Off")
+        .addOption("hourly", "Hourly")
+        .addOption("daily", "Daily")
+        .addOption("weekly", "Weekly")
+        .setValue(this.plugin.settings.tidyTabsSchedule)
+        .onChange(async (v) => {
+          this.plugin.settings.tidyTabsSchedule = v as StashpadSettings["tidyTabsSchedule"];
+          await set();
+          // Re-evaluate right away: turning it ON with no prior run (or an
+          // overdue one) tidies now and seeds the cadence from this moment.
+          void this.plugin.maybeRunScheduledTidy();
+        })),
+      ["tidy", "duplicate", "tabs", "orphan", "schedule", "auto", "cleanup", "hourly", "daily", "weekly", "ghost"]));
 
     cats.maintenance.push(this.settingsBackupSection());
 
@@ -3486,13 +3649,13 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.movingNotes.push(toggle("Navigate into parent after moving a note IN", "When you move a note onto another note via the in-list move picker (drag-onto-sibling), automatically drill into the new parent so you can see the moved note in its new home. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
-    cats.listDisplay.push(toggle("Re-hide obscured notes when you leave", "An obscured note goes back to blurred when you navigate away, switch folders, or reload — revealing it is momentary, like Signal. Off keeps it revealed until you re-hide it or restart. On by default. Note: obscuring is VISUAL ONLY; see the description on the obscure command.",
+    cats.privacy.push(toggle("Re-hide obscured notes when you leave", "An obscured note goes back to blurred when you navigate away, switch folders, or reload — revealing it is momentary, like Signal. Off keeps it revealed until you re-hide it or restart. On by default. Note: obscuring is VISUAL ONLY; see the description on the obscure command.",
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
-    cats.listDisplay.push(toggle("Obscure every note, everywhere", "Blur every note in every Stashpad \u2014 for handing someone your screen, or working somewhere overlooked. This OVERRIDES everything else while it is on: a folder set to Never and a note set not to obscure are both covered. Nothing is rewritten, so they come back exactly as they were when you turn it off. Tapping a note still reveals it one at a time. VISUAL ONLY: the text is unchanged in the file and still turns up in search.",
+    cats.privacy.push(toggle("Obscure every note, everywhere", "Blur every note in every Stashpad \u2014 for handing someone your screen, or working somewhere overlooked. This OVERRIDES everything else while it is on: a folder set to Never and a note set not to obscure are both covered. Nothing is rewritten, so they come back exactly as they were when you turn it off. Tapping a note still reveals it one at a time. VISUAL ONLY: the text is unchanged in the file and still turns up in search.",
       () => this.plugin.getObscureAll(), (v) => { void this.plugin.setObscureAll(v); }, ["obscure", "blur", "hide", "all", "global", "privacy", "panic"]));
-    cats.listDisplay.push(toggle("Put the file name in front of an attachment", "When you attach a file, the note reads \"report.pdf\" followed by the file itself, separated by a space. Without it the note is a link and nothing else, so it shows up blank in the list and is hard to search for. On by default.",
+    cats.attachmentsMedia.push(toggle("Put the file name in front of an attachment", "When you attach a file, the note reads \"report.pdf\" followed by the file itself, separated by a space. Without it the note is a link and nothing else, so it shows up blank in the list and is hard to search for. On by default.",
       () => this.plugin.settings.attachmentNamePrefix, (v) => { this.plugin.settings.attachmentNamePrefix = v; }, ["attachment", "file", "name", "prefix", "title"]));
-    cats.listDisplay.push(toggle("Embed attached files", "Attach files as an embed, so images and PDFs preview in the note. Turn this off to insert a plain link instead, which keeps a note with several files readable as a list. On by default. Either way the file is in the rail.",
+    cats.attachmentsMedia.push(toggle("Embed attached files", "Attach files as an embed, so images and PDFs preview in the note. Turn this off to insert a plain link instead, which keeps a note with several files readable as a list. On by default. Either way the file is in the rail.",
       () => this.plugin.settings.attachmentsEmbedded, (v) => { this.plugin.settings.attachmentsEmbedded = v; }, ["attachment", "embed", "link", "preview", "file"]));
 
     cats.listDisplay.push(toggle("Show outgoing links in the rail", "List the notes this note links to, in a row under its files. Off by default: it earns its place on a hub note and is noise on everything else. Files are unaffected \u2014 they are always in the rail.",
@@ -3510,7 +3673,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     cats.listDisplay.push(toggle("Alt-drag selects text (desktop)", "When a note row is whole-row draggable (i.e. 'Select text in notes' is off), hold Alt/Option while dragging over a note to select its text instead of reordering it. Only affects Alt-held drags, so normal drag-to-reorder is unchanged. On by default.",
       () => this.plugin.settings.altDragSelectsText, (v) => { this.plugin.settings.altDragSelectsText = v; }, ["alt", "option", "drag", "select", "text", "reorder"]));
 
-    cats.listDisplay.push(this.renderDef("How covered notes look", "\"Blur\" keeps the shape of the text. \"Solid bar\" paints over it — faster on a phone, because a blur has to be computed for every glyph every time the text is drawn, and it hides more, since a blur still leaks word shapes and lengths. Either way the text is untouched in the file.", (st) => {
+    cats.privacy.push(this.renderDef("How covered notes look", "\"Blur\" keeps the shape of the text. \"Solid bar\" paints over it — faster on a phone, because a blur has to be computed for every glyph every time the text is drawn, and it hides more, since a blur still leaks word shapes and lengths. Either way the text is untouched in the file.", (st) => {
       st.addDropdown((d) => {
         d.addOption("blur", "Blur");
         d.addOption("solid", "Solid bar (faster)");
@@ -3523,7 +3686,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       });
     }, ["obscure", "blur", "solid", "redact", "style", "performance"]));
 
-    cats.listDisplay.push(this.renderDef("Where the global cover applies", "\"This device only\" keeps the switch on the screen you flipped it on \u2014 covering your phone leaves a desktop nobody is standing near untouched, and uncovering there later cannot uncover your phone. \"All devices\" syncs it with the rest of your settings, for when you want everything covered everywhere at once.", (st) => {
+    cats.privacy.push(this.renderDef("Where the global cover applies", "\"This device only\" keeps the switch on the screen you flipped it on \u2014 covering your phone leaves a desktop nobody is standing near untouched, and uncovering there later cannot uncover your phone. \"All devices\" syncs it with the rest of your settings, for when you want everything covered everywhere at once.", (st) => {
       st.addDropdown((d) => {
         d.addOption("device", "This device only");
         d.addOption("synced", "All devices (syncs)");
@@ -3540,7 +3703,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     }, ["obscure", "blur", "sync", "device", "local", "scope", "privacy"]));
     // 0.279.17: scheduled obscuring — a folder set to obscure-by-default only
     // covers during set hours; outside them (e.g. at home / off-hours) it's clear.
-    cats.listDisplay.push(this.sectionDef("Only blur folders during set hours", "", (host) => {
+    cats.privacy.push(this.sectionDef("Only blur folders during set hours", "", (host) => {
       const applied = (): void => { void this.plugin.saveSettings().then(() => this.plugin.reHideAndRefreshAllViews()); };
       // 0.319.4 (user): the toggle leads; the explanation follows it.
       new Setting(host)
@@ -3650,15 +3813,15 @@ export class StashpadSettingTab extends PluginSettingTab {
     }, ["obscure", "blur", "schedule", "hours", "time", "timezone", "privacy", "home", "work", "weekday", "weekend", "day", "saturday", "sunday"]));
     // 0.279.14: be explicit about the gaps, since obscure is glance-protection and
     // reads as more than it is otherwise.
-    cats.listDisplay.push(this.sectionDef("What obscuring does NOT cover", "", (host) => {
+    cats.privacy.push(this.sectionDef("What obscuring does NOT cover", "", (host) => {
       host.createEl("p", { cls: "setting-item-description", text: "Obscuring is glance-protection only — VISUAL, on this screen. It does not encrypt anything (for that, use per-folder encryption), and the text stays readable in the file, in search, in the editor, and to other plugins." });
       host.createEl("p", { cls: "setting-item-description", text: "A few things stay readable on purpose or by limitation: the tab title (it can lead with the focused note's title — Obsidian's tab bar can't be blurred), the note timestamps, and the \"by …\" / \"edited …\" labels. The author/contributor NAME is blurred; the labels and times around it are not. If a tab title showing a note name is a concern, keep that note's Stashpad in a set-aside folder." });
     }, ["obscure", "blur", "privacy", "limitation", "tab", "title", "not", "covered", "encryption"]));
-    cats.listDisplay.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
+    cats.privacy.push(toggle("Spoiler markup", "Render ||text|| in a note as blurred until you tap it. Uses the Discord/Telegram convention. Off leaves the pipes as plain text. On by default. Like obscuring, this is VISUAL ONLY — the text is still in the file and still turns up in search.",
       () => this.plugin.settings.spoilerMarkup, (v) => { this.plugin.settings.spoilerMarkup = v; }, ["spoiler", "blur", "hide", "markup", "reveal"]));
-    cats.listDisplay.push(toggle("Open every file type in the media viewer", "Open the preview even for files it can't display \u2014 a .docx or a .zip shows a card with its type, size and date, plus a button to open it properly. Off by default, because for those files the real app is usually the better answer. Either way, a file it can't display still opens the viewer when another attachment on the same note can be previewed, so you never lose the row of files.",
+    cats.attachmentsMedia.push(toggle("Open every file type in the media viewer", "Open the preview even for files it can't display \u2014 a .docx or a .zip shows a card with its type, size and date, plus a button to open it properly. Off by default, because for those files the real app is usually the better answer. Either way, a file it can't display still opens the viewer when another attachment on the same note can be previewed, so you never lose the row of files.",
       () => this.plugin.settings.mediaViewerAllFileTypes, (v) => { this.plugin.settings.mediaViewerAllFileTypes = v; }, ["media", "viewer", "all", "file type", "unsupported", "preview"]));
-    cats.listDisplay.push(this.renderDef("File types to keep out of the media viewer", "Comma-separated list of extensions that should always open in a new tab (or your default app) instead of the preview. Dots are optional \u2014 \u201cpdf, .zip, DOCX\u201d works. Leave blank to exclude nothing.", (row) => {
+    cats.attachmentsMedia.push(this.renderDef("File types to keep out of the media viewer", "Comma-separated list of extensions that should always open in a new tab (or your default app) instead of the preview. Dots are optional \u2014 \u201cpdf, .zip, DOCX\u201d works. Leave blank to exclude nothing.", (row) => {
       row.addText((t) => {
         t.setPlaceholder("e.g. pdf, zip");
         t.setValue(this.plugin.settings.mediaViewerExcludedExtensions);
@@ -3672,7 +3835,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         el.addEventListener("keydown", (e: KeyboardEvent) => { if (e.key === "Enter") el.blur(); });
       });
     }, ["media", "viewer", "exclude", "extension", "file type", "tab", "default app"]));
-    cats.listDisplay.push(this.renderDef("Attachment layout", "How a note's attachments are laid out. Auto picks per note: thumbnails when the files are mostly images and there is room to see them, a compact icon strip when they would be too small to recognise, and a named list when they are mostly non-images (a spreadsheet is identified by its name, not a preview).", (row) => {
+    cats.attachmentsMedia.push(this.renderDef("Attachment layout", "How a note's attachments are laid out. Auto picks per note: thumbnails when the files are mostly images and there is room to see them, a compact icon strip when they would be too small to recognise, and a named list when they are mostly non-images (a spreadsheet is identified by its name, not a preview).", (row) => {
       row.addDropdown((dd) => {
         dd.addOption("auto", "Auto");
         dd.addOption("thumbnail", "Thumbnails");
@@ -3685,7 +3848,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         });
       });
     }, ["attachment", "rail", "thumbnail", "compact", "layout", "view", "file", "icon"]));
-    cats.listDisplay.push(toggle("Open images in the media viewer", "Clicking an image attached to a note opens a large preview with zoom, rotation and a rail of the note's other files, instead of opening it in a new tab. Non-image files still open in a tab. The viewer has an \u201cOpen in a new tab\u201d button, so nothing is lost either way. On by default.",
+    cats.attachmentsMedia.push(toggle("Open images in the media viewer", "Clicking an image attached to a note opens a large preview with zoom, rotation and a rail of the note's other files, instead of opening it in a new tab. Non-image files still open in a tab. The viewer has an \u201cOpen in a new tab\u201d button, so nothing is lost either way. On by default.",
       () => this.plugin.settings.mediaViewerOnClick, (v) => { this.plugin.settings.mediaViewerOnClick = v; }, ["image", "media", "viewer", "lightbox", "preview", "zoom", "attachment"]));
     cats.composerCopy.push(toggle('Type "+" to append to an existing note', 'Typing + as the only character in an empty composer opens the note picker. Pick a note and what you send next is appended to the bottom of that note\'s body on a new line, instead of creating a new note. The target clears after one send. Dismissing the picker leaves the + as ordinary text, so markdown "+ " bullets still work. On by default.',
       () => this.plugin.settings.composerAppendTrigger, (v) => { this.plugin.settings.composerAppendTrigger = v; }, ["append", "plus", "existing", "composer", "add"]));
@@ -3697,7 +3860,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.openParentTabOnMoveIn, (v) => { this.plugin.settings.openParentTabOnMoveIn = v; }, ["background", "tab", "move", "in", "parent"]));
     cats.movingNotes.push(toggle("Navigate to destination after moving a note OUT", "When you outdent a note, move it via the cross-parent picker, or send it to Home, automatically drill into the destination parent. Off = stay focused where you were.",
       () => this.plugin.settings.autoNavOnMoveOut, (v) => { this.plugin.settings.autoNavOnMoveOut = v; }, ["navigate", "move", "out"]));
-    cats.listDisplay.push(this.renderDef("Pinned notes vs filters", "How much a pin outranks the filters. \"Never hide\" keeps a pinned note visible no matter what. \"Keep through time filters only\" holds it in place as you narrow the time window, but still hides it when it does not match a tag / colour / author filter. \"Filter like any note\" gives pins no special treatment. Applies to both pin kinds (pinned in the list, and pinned to the sidebar).", (s) => {
+    cats.timeWindow.push(this.renderDef("Pinned notes vs filters", "How much a pin outranks the filters. \"Never hide\" keeps a pinned note visible no matter what. \"Keep through time filters only\" holds it in place as you narrow the time window, but still hides it when it does not match a tag / colour / author filter. \"Filter like any note\" gives pins no special treatment. Applies to both pin kinds (pinned in the list, and pinned to the sidebar).", (s) => {
       s.addDropdown((d) => {
         d.addOption("all", "Never hide pinned notes");
         d.addOption("time", "Keep through time filters only");
@@ -3706,7 +3869,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         d.onChange(async (v) => { this.plugin.settings.pinnedFilterMode = v as "all" | "time" | "none"; await set(); });
       });
     }, ["pin", "pinned", "filter", "time", "hide", "tag", "colour", "color"]));
-    cats.listDisplay.push(this.renderDef("Time window mode", "How the “last N …” time filter reads its window. “Rolling” = the last N days / weeks / months counted back from right now — it slides forward as time passes (the default). “Calendar” = calendar boundaries, so the window starts at the beginning of the current day, week, month, or year (e.g. “1 week” means this week so far). This replaces the calendar/rolling toggle that used to sit on the filter bar.", (s) => {
+    cats.timeWindow.push(this.renderDef("Time window mode", "How the “last N …” time filter reads its window. “Rolling” = the last N days / weeks / months counted back from right now — it slides forward as time passes (the default). “Calendar” = calendar boundaries, so the window starts at the beginning of the current day, week, month, or year (e.g. “1 week” means this week so far). This replaces the calendar/rolling toggle that used to sit on the filter bar.", (s) => {
       s.addDropdown((d) => {
         d.addOption("rolling", "Rolling window (last N, moves with the clock)");
         d.addOption("calendar", "Calendar period (this day / week / month / year)");
@@ -3714,9 +3877,9 @@ export class StashpadSettingTab extends PluginSettingTab {
         d.onChange(async (v) => { this.plugin.settings.timeFilterMode = v as "rolling" | "calendar"; await set(); this.plugin.refreshAllStashpadViews(); });
       });
     }, ["time", "filter", "window", "rolling", "calendar", "period", "date", "mode"]));
-    cats.listDisplay.push(toggle("Freeze the time window", "When on, the time filter's cutoff is pinned at the moment you set the window, so it stops sliding — a fixed “since <that date>” instead of a moving “last N days”. Set a new window to re-pin it. Off by default (the window slides with the clock). This replaces the sliding/frozen toggle that used to sit on the filter bar.",
+    cats.timeWindow.push(toggle("Freeze the time window", "When on, the time filter's cutoff is pinned at the moment you set the window, so it stops sliding — a fixed “since <that date>” instead of a moving “last N days”. Set a new window to re-pin it. Off by default (the window slides with the clock). This replaces the sliding/frozen toggle that used to sit on the filter bar.",
       () => this.plugin.settings.timeFilterFreeze, (v) => { this.plugin.settings.timeFilterFreeze = v; this.plugin.refreshAllStashpadViews(); }, ["time", "filter", "freeze", "fixed", "anchor", "pin", "sliding", "frozen"]));
-    cats.listDisplay.push(toggle("Keep a pinned note's children too", "When a pin keeps a note visible through a filter, also keep its whole subtree (all descendants) visible — so the pinned note isn't left showing with its contents filtered away. Off by default; no effect when the setting above is \"Filter like any note\".",
+    cats.timeWindow.push(toggle("Keep a pinned note's children too", "When a pin keeps a note visible through a filter, also keep its whole subtree (all descendants) visible — so the pinned note isn't left showing with its contents filtered away. Off by default; no effect when the setting above is \"Filter like any note\".",
       () => this.plugin.settings.pinnedChildrenPersist, (v) => { this.plugin.settings.pinnedChildrenPersist = v; }, ["pin", "pinned", "children", "subtree", "descendants", "filter"]));
     cats.listDisplay.push(toggle("Double-click a note to open it", "Double-click (or double-tap on mobile) a note in the list to focus/open it — the same as pressing → or clicking the enter arrow. Single click still just selects. On by default.",
       () => this.plugin.settings.doubleClickToFocus, (v) => { this.plugin.settings.doubleClickToFocus = v; }, ["double", "click", "open", "focus"]));
@@ -3754,10 +3917,10 @@ export class StashpadSettingTab extends PluginSettingTab {
         }
       }, ["edit", "limit", "characters", "modal", "tab", plat]));
     }
-    cats.misc.push(this.renderDef("Composer drafts", "Review every unsent composer draft — this device's, other devices' (synced), stashed text and edits in progress — load one into the composer or delete it. 0.319.0.", (s) => {
+    cats.composerCopy.push(this.renderDef("Composer drafts", "Review every unsent composer draft — this device's, other devices' (synced), stashed text and edits in progress — load one into the composer or delete it. 0.319.0.", (s) => {
       s.addButton((b) => b.setButtonText("Open drafts").onClick(() => this.plugin.openComposerDrafts()));
     }, ["draft", "drafts", "composer", "unsent", "restore"]));
-    cats.misc.push(toggle("Sheet versions (alternate drafts)", "Treat notes that share a 'sheet-group' frontmatter id as alternate versions of one item: only the active version shows as a row, and its siblings collapse into a tab bar at the bottom of that row. Use \"Fork as version\" on a note to start. Off by default — when off, no note is ever hidden by this feature and the commands do nothing.",
+    cats.composerCopy.push(toggle("Sheet versions (alternate drafts)", "Treat notes that share a 'sheet-group' frontmatter id as alternate versions of one item: only the active version shows as a row, and its siblings collapse into a tab bar at the bottom of that row. Use \"Fork as version\" on a note to start. Off by default — when off, no note is ever hidden by this feature and the commands do nothing.",
       () => this.plugin.settings.enableSheetVersions, (v) => { this.plugin.settings.enableSheetVersions = v; }, ["sheet", "version", "draft", "alternate", "fork"]));
     cats.listDisplay.push(toggle("Auto-open the detail panel", "Open the right-sidebar Stashpad detail panel automatically whenever a Stashpad view becomes active. The panel shows the cursored note's body, metadata, and children. Off = open manually via ribbon or command palette.",
       () => this.plugin.settings.autoOpenDetailPanel, (v) => { this.plugin.settings.autoOpenDetailPanel = v; }, ["detail", "panel", "sidebar"]));

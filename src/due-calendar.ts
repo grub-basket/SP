@@ -156,6 +156,28 @@ export async function renderDueCalendar(
     b.onclick = () => { if (state.view !== v) { state.view = v; state.openDay = null; rerender(); } };
   });
 
+  // 0.462.0 (/dump): jump to a specific date — a day-picker button beside the
+  // Month/Week/Day switcher. Sets the anchor to the chosen day (navigating the
+  // current view to the period that contains it); in Month view it also opens
+  // that day's list. Uses a hidden native date input + showPicker() so we get
+  // the OS calendar without hand-building one.
+  const dateInput = nav.createEl("input", { cls: "stashpad-cal-dateinput", attr: { type: "date", "aria-hidden": "true", tabindex: "-1" } }) as HTMLInputElement;
+  dateInput.value = anchor.format("YYYY-MM-DD");
+  const dateBtn = nav.createEl("button", { cls: "stashpad-cal-navbtn stashpad-cal-datepick", attr: { "aria-label": "Jump to date…" } });
+  setIcon(dateBtn, "calendar-search");
+  dateBtn.onclick = () => {
+    try { (dateInput as unknown as { showPicker?: () => void }).showPicker?.(); }
+    catch { dateInput.focus(); dateInput.click(); }
+  };
+  dateInput.onchange = () => {
+    if (!dateInput.value) return;
+    const ms = M(dateInput.value, "YYYY-MM-DD").valueOf();
+    if (!Number.isFinite(ms)) return;
+    state.monthAnchor = ms;
+    state.openDay = state.view === "month" ? dateInput.value : null;
+    rerender();
+  };
+
   const folderSel = bar.createEl("select", { cls: "stashpad-index-select", attr: { "aria-label": "Folder" } });
   for (const o of [{ v: "all", label: "All folders" }, ...folders.map((f) => ({ v: f, label: f.split("/").pop() || f }))]) {
     const opt = folderSel.createEl("option", { text: o.label }); opt.value = o.v; if (o.v === state.folder) opt.selected = true;

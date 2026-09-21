@@ -5923,3 +5923,36 @@ export class AttachmentsGridModal<T extends AttachmentGridItem> extends Modal {
   }
   onClose(): void { this.contentEl.empty(); }
 }
+
+/** 0.461.0: a tiny single-field prompt for a pin's nickname (pinAlias). Enter or
+ *  Save commits, Escape/Cancel dismisses, an empty commit clears the nickname.
+ *  Lives here (not in a view) so both pinned surfaces — the folder panel and the
+ *  Pinned panel — can share it without a circular import. */
+export class PinAliasModal extends Modal {
+  constructor(app: App, private noteTitle: string, private initial: string, private onSave: (value: string) => void) {
+    super(app);
+  }
+  onOpen(): void {
+    const { contentEl, titleEl } = this;
+    titleEl.setText("Pin nickname");
+    contentEl.createEl("p", {
+      cls: "stashpad-pinalias-note",
+      text: `Shown in the sidebar instead of “${this.noteTitle}”. Leave blank to clear.`,
+    });
+    const input = contentEl.createEl("input", { cls: "stashpad-pinalias-input", type: "text" });
+    input.value = this.initial;
+    input.placeholder = this.noteTitle;
+    const commit = (): void => { this.onSave(input.value); this.close(); };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commit(); }
+      else if (e.key === "Escape") { e.preventDefault(); this.close(); }
+    });
+    const row = contentEl.createDiv({ cls: "stashpad-pinalias-actions" });
+    const cancel = row.createEl("button", { text: "Cancel" });
+    cancel.onclick = () => this.close();
+    const save = row.createEl("button", { cls: "mod-cta", text: "Save" });
+    save.onclick = () => commit();
+    window.setTimeout(() => { input.focus(); input.select(); }, 0);
+  }
+  onClose(): void { this.contentEl.empty(); }
+}

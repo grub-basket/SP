@@ -8282,6 +8282,11 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   display: flex;
   align-items: center;
   justify-content: center;
+  /* 0.459.0: wrap instead of overflowing — on a narrow (phone) modal the full
+     toolbar (zoom controls + render switch + relayed note actions) is wider than
+     the modal, and without wrapping the end buttons were clipped and unreachable.
+     `gap` already applies to the row axis, so wrapped rows keep the same spacing. */
+  flex-wrap: wrap;
   gap: 4px;
   flex: 0 0 auto;
   padding: 6px 10px;
@@ -8669,10 +8674,9 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   --stashpad-file-color: var(--interactive-accent);
   background: color-mix(in srgb, var(--interactive-accent) 12%, var(--background-secondary));
 }
-.stashpad-media-railbadge.is-note .svg-icon { width: 24px; height: 24px; }
-.stashpad-media-railbadge.is-note .stashpad-media-railext {
-  color: var(--interactive-accent); font-weight: var(--font-bold); letter-spacing: 0.04em;
-}
+/* 0.467.0: the note badge is icon-only now (no "NOTE" label), so give the lone
+   glyph a touch more presence. */
+.stashpad-media-railbadge.is-note .svg-icon { width: 28px; height: 28px; }
 /* 0.376.1: the note's row action buttons, relayed to the END of the bottom
    toolbar so they line up with the other controls. The buttons keep their own
    `.stashpad-pencil` look (which renders the sprite icon correctly); we only
@@ -8736,6 +8740,89 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
 }
 .stashpad-media-btn.is-hidden,
 .stashpad-media-zoom.is-hidden { display: none; }
+.stashpad-media-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+/* ============================================================
+   Image crop overlay (0.460.0)
+   The frame lives in the stage's screen space; the backdrop is
+   pointer-events:none so pinch/pan reach the image behind it, and
+   only the frame + handles + action bar capture pointers.
+   ============================================================ */
+.stashpad-crop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+}
+.stashpad-crop-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid var(--interactive-accent);
+  /* The huge spread box-shadow is the dim mask over everything outside the
+     frame — clipped to the stage (overflow:hidden). Visual only; it does not
+     capture pointer events, so drags outside the frame still pan the image. */
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+  cursor: move;
+  pointer-events: auto;
+  touch-action: none;
+}
+.stashpad-crop-grid { position: absolute; inset: 0; pointer-events: none; }
+.stashpad-crop-grid::before,
+.stashpad-crop-grid::after {
+  content: "";
+  position: absolute;
+}
+/* Rule-of-thirds guides. */
+.stashpad-crop-grid::before {
+  left: 33.33%;
+  right: 33.33%;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.3);
+  border-right: 1px solid rgba(255, 255, 255, 0.3);
+}
+.stashpad-crop-grid::after {
+  top: 33.33%;
+  bottom: 33.33%;
+  left: 0;
+  right: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.3);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+}
+.stashpad-crop-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  background: var(--interactive-accent);
+  border: 2px solid var(--background-primary);
+  border-radius: 50%;
+  pointer-events: auto;
+  touch-action: none;
+}
+.stashpad-crop-handle.is-nw { left: -7px; top: -7px; cursor: nwse-resize; }
+.stashpad-crop-handle.is-ne { right: -7px; top: -7px; cursor: nesw-resize; }
+.stashpad-crop-handle.is-sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
+.stashpad-crop-handle.is-se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+/* Bigger touch targets on mobile. */
+.is-mobile .stashpad-crop-handle { width: 22px; height: 22px; }
+.is-mobile .stashpad-crop-handle.is-nw { left: -11px; top: -11px; }
+.is-mobile .stashpad-crop-handle.is-ne { right: -11px; top: -11px; }
+.is-mobile .stashpad-crop-handle.is-sw { left: -11px; bottom: -11px; }
+.is-mobile .stashpad-crop-handle.is-se { right: -11px; bottom: -11px; }
+.stashpad-crop-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  pointer-events: auto;
+  z-index: 6;
+}
+.stashpad-crop-bar button { touch-action: manipulation; }
 
 /* ============================================================
    Obscure + spoiler (0.237.0)
@@ -9733,6 +9820,12 @@ input[class*="stashpad-"]:not([type="checkbox"]):not([type="radio"]) {
 .stashpad-cal-segbtn:not(:last-child) { border-right: 1px solid var(--background-modifier-border); }
 .stashpad-cal-segbtn.is-active { background: var(--interactive-accent); color: var(--text-on-accent); }
 
+/* 0.462.0: jump-to-date picker. The native input is only the OS calendar host —
+   the visible affordance is the icon button; keep the input in the layout (not
+   display:none) so showPicker() has a positioned anchor to attach the popup to. */
+.stashpad-cal-datepick { margin-left: 6px; }
+.stashpad-cal-dateinput { width: 0; height: 0; padding: 0; border: 0; opacity: 0; pointer-events: none; position: absolute; }
+
 /* Week / day agenda */
 .stashpad-cal-agenda { display: flex; gap: 6px; align-items: stretch; min-height: 0; }
 .stashpad-cal-agenda.is-day { display: block; }
@@ -10013,7 +10106,10 @@ button.stashpad-reaction-chip,
 .stashpad-reaction-picker { flex-direction: column; align-items: stretch; gap: 6px; min-width: 240px; }
 /* 0.316.2: spread the presets across the popover width so there's no dead
    space after the last one (the min-width made the row wider than the buttons). */
-.stashpad-reaction-pickgrid { display: flex; flex-wrap: wrap; gap: 2px; max-width: 260px; justify-content: space-between; }
+/* 0.459.0: pack the favorites/recent/preset rows from the left instead of
+   justifying (space-between spread a few pinned favorites across the whole
+   width with big gaps between them). */
+.stashpad-reaction-pickgrid { display: flex; flex-wrap: wrap; gap: 2px; max-width: 260px; justify-content: flex-start; }
 
 /* 0.316.3 (R1): a freshly opened/switched folder's list stays invisible (layout
    intact, so scrollHeight is measurable and the pin can land) until the first
@@ -10124,8 +10220,10 @@ button.stashpad-reaction-chip,
   box-shadow: none;
 }
 .stashpad-reaction-tab:hover { background: var(--background-modifier-hover); }
+/* 0.459.0: cap the All list at ~two emoji rows (plus a group title) on both
+   desktop and mobile so the picker stays compact and the grid scrolls. */
 .stashpad-reaction-all {
-  max-height: 220px;
+  max-height: 76px;
   overflow-y: auto;
   border-top: 1px solid var(--background-modifier-border);
   padding-top: 4px;
@@ -10137,10 +10235,45 @@ button.stashpad-reaction-chip,
 .stashpad-reaction-footer { display: flex; align-items: center; gap: 8px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--background-modifier-border); }
 .stashpad-reaction-done { margin-left: auto; padding: 2px 12px; min-height: 0; height: auto; line-height: 1.6; }
 .stashpad-reaction-modal .stashpad-reaction-sections { gap: 10px; }
-.stashpad-reaction-modal .stashpad-reaction-all { max-height: 50vh; }
+.stashpad-reaction-modal .stashpad-reaction-all { max-height: 104px; }
 .stashpad-reaction-modal .stashpad-reaction-tab { font-size: 22px; padding: 6px 8px; }
 .stashpad-reaction-modal .stashpad-reaction-pickgrid.is-all-grid { justify-content: flex-start; }
 .stashpad-reaction-modal .stashpad-reaction-done { padding: 8px 18px; }
+
+/* 0.459.0: Favorites/Presets editor in Settings → Note Actions & Menus. */
+.stashpad-reaction-settings-editor { padding: 0 14px 8px; }
+.stashpad-reaction-settings-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+.stashpad-reaction-settings-chip {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 2px 4px 2px 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+}
+.stashpad-reaction-settings-glyph { font-size: 18px; line-height: 1; margin-right: 2px; }
+.stashpad-reaction-settings-chipbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0;
+  border: none; background: transparent; color: var(--text-muted);
+  border-radius: 5px; cursor: pointer; box-shadow: none;
+}
+.stashpad-reaction-settings-chipbtn:hover:not(:disabled) { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-reaction-settings-chipbtn:disabled { opacity: 0.3; cursor: default; }
+.stashpad-reaction-settings-chipbtn .svg-icon { width: 14px; height: 14px; }
+.stashpad-reaction-settings-add.setting-item { border-top: none; padding-top: 0; }
+/* Greyed-out reset/clear extra button when there's nothing to reset. */
+.stashpad-reaction-settings-add .extra-setting-button.is-disabled,
+.stashpad-reaction-settings-add .extra-setting-button:disabled { opacity: 0.35; cursor: default; pointer-events: none; }
+/* Live search results under each add field. */
+.stashpad-reaction-settings-results { display: flex; flex-wrap: wrap; gap: 2px; margin: 2px 0 6px; max-height: 132px; overflow-y: auto; }
+.stashpad-reaction-settings-results.is-empty { display: none; }
+.stashpad-reaction-settings-result {
+  border: none; background: transparent; font-size: 18px; line-height: 1;
+  padding: 4px 5px; border-radius: 7px; cursor: pointer; box-shadow: none;
+  transition: background 0.06s ease, transform 0.06s ease;
+}
+.stashpad-reaction-settings-result:hover:not(:disabled) { background: var(--background-modifier-hover); transform: scale(1.15); }
+.stashpad-reaction-settings-result.is-added, .stashpad-reaction-settings-result:disabled { opacity: 0.3; cursor: default; }
 
 /* ============================================================
    Quoted replies (teams, 0.281.0)
@@ -11151,3 +11284,97 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-review-parent { display: inline-flex; align-items: center; gap: 3px; color: var(--text-muted); }
 .stashpad-review-parent-icon { display: inline-flex; }
 .stashpad-review-parent-icon .svg-icon { width: 12px; height: 12px; }
+
+/* Pin nickname prompt (0.461.0) */
+.stashpad-pinalias-note { margin: 0 0 10px; color: var(--text-muted); font-size: var(--font-ui-small); }
+.stashpad-pinalias-input { width: 100%; box-sizing: border-box; margin-bottom: 12px; }
+.stashpad-pinalias-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.stashpad-pinned-label.has-alias { font-style: italic; }
+
+/* ============================================================
+   Floating quick capture — "write while reading" (0.463.0)
+   Non-blocking: floats over the workspace (no backdrop) so the
+   note behind it stays visible + scrollable. Draggable by header.
+   ============================================================ */
+.stashpad-floatcap {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: var(--layer-popover, 30);
+  width: 320px;
+  max-width: calc(100vw - 24px);
+  display: flex;
+  flex-direction: column;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-l, 0 8px 24px rgba(0, 0, 0, 0.3));
+  overflow: hidden;
+}
+.stashpad-floatcap.is-hidden { display: none; }
+.stashpad-floatcap-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 6px 6px;
+  cursor: move;
+  touch-action: none;
+  background: var(--background-secondary);
+  border-bottom: 1px solid var(--background-modifier-border);
+  user-select: none;
+}
+.stashpad-floatcap-grip { display: inline-flex; color: var(--text-faint); }
+.stashpad-floatcap-grip .svg-icon { width: 16px; height: 16px; }
+.stashpad-floatcap-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stashpad-floatcap-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-s);
+  color: var(--text-muted);
+  cursor: pointer;
+  box-shadow: none;
+}
+.stashpad-floatcap-x:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-floatcap-x .svg-icon { width: 16px; height: 16px; }
+.stashpad-floatcap-input {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  resize: vertical;
+  min-height: 64px;
+  background: var(--background-primary);
+  font-size: var(--font-ui-small);
+}
+.stashpad-floatcap-input:focus { box-shadow: none; }
+.stashpad-floatcap-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+.stashpad-floatcap-flash {
+  flex: 1 1 auto;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-success, var(--interactive-accent));
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.stashpad-floatcap-flash.is-shown { opacity: 1; }
+.stashpad-floatcap-send { padding: 4px 14px; }
+.is-mobile .stashpad-floatcap { width: calc(100vw - 24px); }

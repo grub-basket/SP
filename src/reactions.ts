@@ -171,7 +171,7 @@ function reactionTooltip(view: StashpadView, ids: string[], me: string): string 
 /** 0.318.0: the search index spans the FULL bundled dataset (EMOJI_DATA,
  *  ~1900 glyphs with labels + tags) plus the GitHub/Slack shortcode names from
  *  EMOJI_SHORTCODES, merged per glyph so `:tada:` and "party popper" both find 🎉. */
-interface EmojiEntry { name: string; emoji: string; group: number; words: readonly string[] }
+export interface EmojiEntry { name: string; emoji: string; group: number; words: readonly string[] }
 const EMOJI_INDEX: readonly EmojiEntry[] = (() => {
   const byGlyph = new Map<string, { name: string; group: number; words: Set<string> }>();
   for (const [glyph, label, group, tags] of EMOJI_DATA) {
@@ -189,7 +189,7 @@ const EMOJI_INDEX: readonly EmojiEntry[] = (() => {
  *  all search "cat", and a partial like "ca" matches cat/cake/… Ranked exact
  *  name/shortcode > prefix > substring of a name > tag match; de-duped by glyph,
  *  capped so the grid stays light. 0.316.0; 0.318.0 over the full dataset. */
-function searchEmoji(query: string, limit = 60): EmojiEntry[] {
+export function searchEmoji(query: string, limit = 60): EmojiEntry[] {
   const q = query.trim().replace(/^:+|:+$/g, "").toLowerCase().replace(/_/g, " ");
   if (!q) return [];
   // Name/shortcode hits outrank tag hits at every tier — "rock" must list the
@@ -216,7 +216,7 @@ function searchEmoji(query: string, limit = 60): EmojiEntry[] {
 
 /** The emoji Enter should insert for the current query: a typed/pasted literal
  *  glyph wins; otherwise the top search result. "" when nothing matches. */
-function firstEmojiForQuery(raw: string): string {
+export function firstEmojiForQuery(raw: string): string {
   const v = raw.trim();
   if (!v) return "";
   // A pasted/typed literal emoji (non-ASCII, no colon) → use it directly.
@@ -263,6 +263,9 @@ function buildReactionPickerBody(
   let editing = false;
   const favorites = (): string[] => view.plugin.settings.favoriteReactions ?? [];
   const isFav = (e: string): boolean => favorites().includes(e);
+  // Presets are the built-in QUICK_REACTIONS unless the user has customised them
+  // in Settings → Note Actions & Menus (an empty list there means "no presets").
+  const presets = (): readonly string[] => view.plugin.settings.presetReactions ?? QUICK_REACTIONS;
 
   host.addClass("stashpad-reaction-body");
   const input = host.createEl("input", { cls: "stashpad-reaction-input", attr: { type: "text", placeholder: "Search emoji — name, tag or :code:" } });
@@ -331,7 +334,13 @@ function buildReactionPickerBody(
     const edit = favSec.head.createEl("button", { cls: "stashpad-reaction-editbtn", text: editing ? "Done editing" : "Edit" });
     edit.title = editing ? "Back to reacting" : "Pin or unpin favorites: tap any emoji";
     edit.onclick = (e) => { e.preventDefault(); e.stopPropagation(); editing = !editing; renderSections(); };
-    for (const emoji of (favs.length ? favs : QUICK_REACTIONS)) button(favSec.grid, emoji, "stashpad-reaction-pick");
+    // While editing, keep the presets visible alongside any pinned favorites so
+    // you can keep pinning — otherwise the preset row vanishes the moment you pin
+    // your first favorite. (is-fav marks which are currently pinned.)
+    const favRow = editing
+      ? Array.from(new Set([...presets(), ...favs]))
+      : (favs.length ? favs : presets());
+    for (const emoji of favRow) button(favSec.grid, emoji, "stashpad-reaction-pick");
     if (editing) sections.createDiv({ cls: "stashpad-reaction-hint", text: favs.length ? "Tap an emoji anywhere to pin or unpin it." : "Tap an emoji anywhere to pin it as a favorite (favorites replace these presets)." });
     // All — tab strip + grouped grids in one scroll container. The ~1900
     // buttons are built on the NEXT tick so the picker paints (favorites,

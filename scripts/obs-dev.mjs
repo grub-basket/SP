@@ -146,11 +146,21 @@ async function verifyVault(timeoutMs = 8000) {
     const f = app.vault.getAbstractFileByPath("${SENTINEL_FILE}");
     let sentinel = false;
     if (f) { try { sentinel = (await app.vault.cachedRead(f)).includes("${SENTINEL}"); } catch {} }
-    return { name: app.vault.getName(), sentinel };
+    // Enforce required vault settings (user pref 2026-09-20): automatic internal-link
+    // updating + all-file-type visibility. Self-heal any that are off so every vault
+    // (cloned or fresh) converges on them. app.json keys via getConfig/setConfig.
+    const fixed = [];
+    for (const key of ["alwaysUpdateLinks", "showUnsupportedFiles"]) {
+      if (app.vault.getConfig(key) !== true) { app.vault.setConfig(key, true); fixed.push(key); }
+    }
+    return { name: app.vault.getName(), sentinel, fixed };
   `, timeoutMs);
   let v; try { v = JSON.parse(raw); } catch { v = null; }
   if (!v || v.name !== VAULT_NAME || !v.sentinel) {
     throw new Error(`SAFETY ABORT — debug-port instance is NOT the Claude Dev Vault (got ${raw}). Refusing to drive.`);
+  }
+  if (Array.isArray(v.fixed) && v.fixed.length) {
+    console.error(`obs-dev: enabled required vault settings on ${v.name}: ${v.fixed.join(", ")}`);
   }
   return v;
 }
