@@ -109,8 +109,7 @@ export class FloatingCaptureWindow {
         const y = Math.max(0, Math.min(ev.clientY - offY, Math.max(0, maxY)));
         root.style.left = `${x}px`;
         root.style.top = `${y}px`;
-        root.style.right = "auto";
-        root.style.bottom = "auto";
+        root.addClass("is-positioned"); // clears the default bottom-right anchor via CSS
       };
       const up = (): void => {
         window.removeEventListener("pointermove", move);
@@ -135,8 +134,7 @@ export class FloatingCaptureWindow {
           const y = Math.max(0, Math.min(p.y, window.innerHeight - 40));
           root.style.left = `${x}px`;
           root.style.top = `${y}px`;
-          root.style.right = "auto";
-          root.style.bottom = "auto";
+          root.addClass("is-positioned"); // clears the default bottom-right anchor via CSS
           return;
         }
       }

@@ -11312,6 +11312,10 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   overflow: hidden;
 }
 .stashpad-floatcap.is-hidden { display: none; }
+/* Once the window has been dragged or a saved position restored, it anchors by
+ * left/top (set inline, dynamically) — this clears the default bottom-right
+ * anchor so the two don't fight. (Static right/bottom belong in CSS, not inline.) */
+.stashpad-floatcap.is-positioned { right: auto; bottom: auto; }
 .stashpad-floatcap-header {
   display: flex;
   align-items: center;
