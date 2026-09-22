@@ -297,7 +297,7 @@ export class MediaViewerModal extends Modal {
     });
     // 0.272.4: copy — the image itself to the clipboard for images, the
     // attachment link for anything else.
-    act("copy", "Copy (image to clipboard, else a link)", () => void this.copyCurrent());
+    act("copy", "Copy (note/text as text, image to clipboard, else a link)", () => void this.copyCurrent());
 
     // 0.377.0: reading-width (note slide) + copy-link (note-level).
     try { this.noteNarrow = window.localStorage.getItem("stashpad-preview-narrow") !== "0"; } catch { /* default true */ }
@@ -620,7 +620,9 @@ export class MediaViewerModal extends Modal {
   private toggleReadingWidth(): void {
     this.noteNarrow = !this.noteNarrow;
     try { window.localStorage.setItem("stashpad-preview-narrow", this.noteNarrow ? "1" : "0"); } catch { /* ignore */ }
+    // 0.474.2: applies to whichever text-like slide is current — note or text file.
     this.panEl.querySelector(".stashpad-media-note")?.toggleClass("is-narrow", this.noteNarrow);
+    this.panEl.querySelector(".stashpad-media-textwrap")?.toggleClass("is-narrow", this.noteNarrow);
   }
 
   /** 0.377.0: copy an Obsidian link to the note this preview is about. */
@@ -802,9 +804,19 @@ export class MediaViewerModal extends Modal {
   /** Copy the current item: the IMAGE itself to the clipboard for an image, or
    *  the attachment link for anything else. */
   private async copyCurrent(): Promise<void> {
-    const file = this.items[this.idx]?.file;
+    const item = this.items[this.idx];
+    // 0.474.1: the NOTE slide copies the note's TEXT (it used to copy a `![[…]]`
+    // link — the copy button only ever handled images/links). `note.body` is the
+    // already-frontmatter-stripped markdown shown on the slide.
+    if (item?.note) {
+      try { await navigator.clipboard.writeText(item.note.body ?? ""); notify("Note text copied."); }
+      catch { notify("Couldn't copy to the clipboard."); }
+      return;
+    }
+    const file = item?.file;
     if (!file) { notify("Nothing to copy."); return; }
-    if (VIEWER_IMG_EXT.has(file.extension.toLowerCase()) && this.mediaEl instanceof HTMLImageElement && this.mediaEl.naturalWidth) {
+    const ext = file.extension.toLowerCase();
+    if (VIEWER_IMG_EXT.has(ext) && this.mediaEl instanceof HTMLImageElement && this.mediaEl.naturalWidth) {
       try {
         const canvas = document.createElement("canvas");
         canvas.width = this.mediaEl.naturalWidth;
@@ -821,6 +833,15 @@ export class MediaViewerModal extends Modal {
       }
       return;
     }
+    // 0.474.1: text-based attachments (md/txt/csv/json/code/…) copy their
+    // CONTENTS, not a link — the button used to copy `![[file]]` for everything
+    // that wasn't an image, which was useless for a text file you wanted to grab.
+    if (VIEWER_TEXT_EXT.has(ext)) {
+      try { await navigator.clipboard.writeText(await this.app.vault.cachedRead(file)); notify("Text copied."); }
+      catch { notify("Couldn't copy the file text."); }
+      return;
+    }
+    // Everything else (PDF, other embeds, binaries): copy an embed link.
     try { await navigator.clipboard.writeText(`![[${file.path}]]`); notify("Attachment link copied."); }
     catch { notify("Couldn't copy to the clipboard."); }
   }
@@ -877,8 +898,11 @@ export class MediaViewerModal extends Modal {
     this.noteActionsEl.toggleClass("is-hidden", !nc);
     this.copyLinkBtn.toggleClass("is-hidden", !nc);
     this.jumpParentBtn.toggleClass("is-hidden", !nc?.note?.onJumpToParent);
-    // Reading width acts on the rendered note markdown → note SLIDE only.
-    this.readWidthBtn.toggleClass("is-hidden", !item?.note);
+    // 0.474.2: reading width now applies to the note slide AND text-file slides
+    // (both render prose/text that spans the whole stage otherwise).
+    const rwExt = item?.file?.extension.toLowerCase() ?? "";
+    const readWidthApplies = !!item?.note || (!item?.note && VIEWER_TEXT_EXT.has(rwExt));
+    this.readWidthBtn.toggleClass("is-hidden", !readWidthApplies);
     this.largeTextBtn.toggleClass("is-hidden", !item?.note?.onLargeText);
     // Save / reveal apply to the CURRENT file — note `.md` or attachment alike.
     for (const b of this.fileBtns) b.toggleClass("is-hidden", !item?.file);
@@ -999,6 +1023,7 @@ export class MediaViewerModal extends Modal {
   private async showTextPreview(file: TFile, ext: string): Promise<void> {
     const cap = textPreviewChars(Platform.isMobile);
     const wrap = this.panEl.createDiv({ cls: "stashpad-media-textwrap" });
+    wrap.toggleClass("is-narrow", this.noteNarrow); // 0.474.2: reading width for text files too
     this.renderFileFacts(wrap, file, ext);
     const pre = wrap.createEl("pre", { cls: "stashpad-media-text" });
     const code = pre.createEl("code");

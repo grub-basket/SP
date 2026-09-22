@@ -32,7 +32,7 @@ import {
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
-import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER } from "./note-actions";
+import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, DEFAULT_ROW_BUTTONS } from "./note-actions";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { writeXvClipboard, readXvAck, writeXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
@@ -6176,6 +6176,18 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
+  /** 0.469.0: push the note-text scale onto every open Stashpad view's root as a
+   *  CSS var — WITHOUT a full re-render, so dragging the settings slider updates
+   *  live and cheaply. The render() path sets the same var for fresh views. */
+  applyNoteFontScale(): void {
+    const scale = String(Math.max(50, Math.min(200, this.settings.noteFontScalePct ?? 100)) / 100);
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const root = (leaf.view as unknown as { viewRoot?: HTMLElement })?.viewRoot
+        ?? leaf.view?.containerEl?.querySelector<HTMLElement>(".stashpad-view");
+      root?.style.setProperty("--stashpad-note-font-scale", scale);
+    }
+  }
+
   /** 0.267.6: re-render every view AND drop the "I already peeked at this"
    *  state first.
    *
@@ -10749,6 +10761,18 @@ export default class StashpadPlugin extends Plugin {
     if (data && data.crossVaultAlwaysStampDefaultedOn !== true) {
       if (data.alwaysStampCrossVault === false) data.alwaysStampCrossVault = true;
       data.crossVaultAlwaysStampDefaultedOn = true;
+    }
+    // 0.475.0: item-buttons parity migration. Pre-upgrade installs had `itemButtons`
+    // as CUSTOM-only (edit/focus/reply/react were hardcoded on the row). Those
+    // built-ins now live IN the list so they can be hidden/reordered — prepend them
+    // ONCE (dedup against anything already present), then mark seeded so a user who
+    // later removes a built-in isn't re-seeded on the next load.
+    if (data && data.itemButtonsSeeded !== true) {
+      const existing: string[] = Array.isArray(data.itemButtons)
+        ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string")
+        : [];
+      data.itemButtons = [...DEFAULT_ROW_BUTTONS, ...existing.filter((id) => !DEFAULT_ROW_BUTTONS.includes(id))];
+      data.itemButtonsSeeded = true;
     }
     if (data?.shortcuts && data.shortcuts.openEditor === "E") data.shortcuts.openEditor = "Mod+Shift+E";
     if (data?.bindings?.openEditor && data.bindings.openEditor.primary === "E") data.bindings.openEditor.primary = "Mod+Shift+E";

@@ -68,6 +68,13 @@ export const QUICK_MENU_MORE = { label: "More commands…", icon: "ellipsis" };
 /** Actions eligible to appear as row buttons (icon-only). */
 export const BUTTON_ACTION_CATALOG = NOTE_ACTION_CATALOG.filter((a) => a.button);
 
+/** 0.475.0: the built-in DESKTOP row buttons, as the default `settings.itemButtons`
+ *  order — so the item-buttons settings editor lists them and the user can hide or
+ *  reorder them (parity with the other menu editors). Existing installs are
+ *  migrated to prepend these (see main.ts). Mobile keeps its own minimal row and
+ *  ignores these ids. `react` is rendered specially (it opens the picker). */
+export const DEFAULT_ROW_BUTTONS: readonly string[] = ["edit", "focus", "reply", "react"];
+
 /** 0.320.0: the LARGE context menu's reorderable top block. Only these plain,
  *  non-stateful actions are user-reorderable; the stateful items below them in
  *  the menu (obscure, pin, task submenu, share/export, encrypt, delete) always

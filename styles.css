@@ -1487,6 +1487,16 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   width: 14px;
   height: 14px;
 }
+/* 0.476.1: the focused heading reflects the note's colour — a 14×14 swatch in the
+   grip slot (matching a list row's grip dot) plus a colour-tinted heading border. */
+.stashpad-focused-grip-spacer.has-color {
+  background-color: var(--stashpad-note-color);
+  background-clip: content-box;
+  border-radius: 3px;
+}
+.stashpad-focused.has-color {
+  border-bottom-color: var(--stashpad-note-color);
+}
 .stashpad-focused-time {
   white-space: pre-line;
   font-variant-numeric: tabular-nums;
@@ -1502,6 +1512,13 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
      the cap for the full note. */
   max-height: calc(var(--font-text-size, 16px) * 1.5 * 10);
   overflow-y: auto;
+}
+/* 0.474.0: in its collapsed (non-expanded) state the focused header is acting as
+   a heading for the note you're inside, so give its text a slightly larger size
+   than list rows for a clearer "you are here" read. Drops back to the normal
+   body size once expanded (it's then just the note being read in full). */
+.stashpad-focused-body:not(.is-body-expanded) {
+  font-size: 1.08em;
 }
 /* The collapsed body's text is a scroll window, NOT a 2-line truncate+fade — so
    you can scroll to read it in place. The Show more toggle still fully expands. */
@@ -1942,6 +1959,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-note-body > :last-child { margin-bottom: 0; }
 .stashpad-note-text > :first-child { margin-top: 0; }
 .stashpad-note-text > :last-child { margin-bottom: 0; }
+/* 0.469.0: user "Note text size" setting. The scale var is set on .stashpad-view
+   by the view render, so this is view-scoped — the rest of Obsidian's UI font
+   size is untouched. Note text scales relative to its own inherited size (1em),
+   so 100% is a no-op; child headings/lists use em and scale with it. */
+.stashpad-note-text { font-size: calc(1em * var(--stashpad-note-font-scale, 1)); }
 /* 0.118.8: code blocks / inline code in note bodies WRAP instead of bleeding
    off the right edge (a fenced ```code``` defaults to white-space:pre, which
    doesn't wrap → it overflowed horizontally). Wrapping also gives the block
@@ -2027,6 +2049,23 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   text-overflow: ellipsis;
   position: relative;
 }
+/* 0.473.2: a body with a code block can't be line-clamped — `-webkit-line-clamp`
+   collapses the <pre> to ~0 height, which clips Obsidian's copy button and lets
+   the row footer overlap its hit area, so clicking it does nothing. Clamp by
+   max-height instead: block layout is preserved, the <pre> lays out normally and
+   its copy button (top-right of the block) stays visible and clickable. The
+   expand toggle still appears via the generic scrollHeight overflow measure.
+   Scoped to LIST ROWS (.stashpad-note) — the focused-header body already uses a
+   block max-height scroll window (never had the -webkit-line-clamp bug), so it
+   must not be overridden by this (equal-specificity, later) rule. */
+.stashpad-note .stashpad-note-text.is-clamped.has-block-content {
+  display: block;
+  -webkit-line-clamp: unset;
+  -webkit-box-orient: unset;
+  max-height: calc(1.5em * 6);
+  overflow: hidden;
+  text-overflow: clip;
+}
 /* 0.73.14: transient un-clamp for the row under the keyboard cursor.
    Settings toggle: "Expand the cursor row's body automatically".
    CSS-only — moving the cursor away flips .is-cursor-expanded off
@@ -2036,6 +2075,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   -webkit-line-clamp: unset;
   overflow: visible;
   text-overflow: clip;
+  max-height: none; /* 0.473.2: also drop the has-block-content max-height cap */
 }
 /* 0.177.0 (#26): an EXPANDED list note is capped to a scroll window so a very long
    note doesn't take over the list — scroll within it to read the rest. Only the
@@ -9115,6 +9155,13 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
   box-sizing: border-box;
   min-height: 0;
 }
+/* 0.474.2: reading width for a text-file preview — cap + centre so a plain-text
+   file doesn't span the whole window. Matches the note slide's 42rem. Toggled by
+   the toolbar's reading-width button (shared with the note slide). */
+.stashpad-media-textwrap.is-narrow {
+  max-width: 42rem;
+  margin-inline: auto;
+}
 
 /* Identity strip: what this file IS, above whatever preview follows. */
 .stashpad-media-facts {
@@ -11392,3 +11439,20 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-floatcap-flash.is-shown { opacity: 1; }
 .stashpad-floatcap-send { padding: 4px 14px; }
 .is-mobile .stashpad-floatcap { width: calc(100vw - 24px); }
+
+/* 0.474.0 (branch): body-slice rail — code blocks / tables / callouts surfaced as
+   attachment-style chips, and the pop-out preview modal they open. The chips
+   reuse .stashpad-att / .stashpad-att-badge; only the separation + modal are new. */
+.stashpad-slice-rail { margin-top: 4px; }
+.stashpad-slice .stashpad-att-badge { cursor: pointer; }
+.stashpad-slice-modal .stashpad-slice-body {
+  max-height: 60vh;
+  overflow: auto;
+  padding: 4px 2px;
+}
+.stashpad-slice-modal .stashpad-slice-body pre { white-space: pre; }
+.stashpad-slice-modal .stashpad-slice-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}

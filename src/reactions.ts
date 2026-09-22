@@ -429,9 +429,19 @@ function positionPopover(pop: HTMLElement, anchor: HTMLElement): void {
   // left/top, which the rule allows.
   const doc = anchor.ownerDocument;
   const r = anchor.getBoundingClientRect();
-  pop.style.top = `${Math.round(r.bottom + 4)}px`;
   const pr = pop.getBoundingClientRect();
   const vw = doc.defaultView?.innerWidth ?? pr.right;
+  const vh = doc.defaultView?.innerHeight ?? pr.bottom;
+  // 0.474.2: VERTICAL flip. Default below the anchor, but when the picker would
+  // spill off the bottom (e.g. the reaction button in the file-preview modal's
+  // bottom toolbar) AND there's more room above, open UPWARD like the ⋮/star
+  // menu — otherwise most of the picker renders out of view. Clamp to a gutter
+  // either way so a tall picker in a short window still fits.
+  const below = Math.round(r.bottom + 4);
+  const flipUp = below + pr.height > vh && r.top > vh - r.bottom;
+  let top = flipUp ? Math.round(r.top - pr.height - 4) : below;
+  top = Math.min(top, Math.round(vh - pr.height - 4));
+  pop.style.top = `${Math.max(4, top)}px`;
   // Anchor to the trigger, flip in from the right edge if it would overflow,
   // then clamp to a 4px gutter — all in one computed value (no literal "4px").
   let left = Math.round(r.left);

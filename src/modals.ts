@@ -5956,3 +5956,36 @@ export class PinAliasModal extends Modal {
   }
   onClose(): void { this.contentEl.empty(); }
 }
+
+/** 0.474.0 (branch): preview one "slice" of a note body — a code block, table or
+ *  callout — surfaced from the body-slice rail as though it were its own object.
+ *  Renders a CLONE of the already-rendered block (so tables/callouts look exactly
+ *  as they do in the note) and offers a one-click copy of its text. */
+export class BodySliceModal extends Modal {
+  constructor(
+    app: App,
+    private sliceTitle: string,
+    private buildInto: (host: HTMLElement) => void,
+    private copyText: string | null,
+  ) { super(app); }
+
+  onOpen(): void {
+    this.modalEl.addClass("stashpad-slice-modal");
+    this.titleEl.setText(this.sliceTitle);
+    const host = this.contentEl.createDiv({ cls: "stashpad-slice-body markdown-rendered" });
+    this.buildInto(host);
+    if (this.copyText != null && this.copyText.trim().length > 0) {
+      const bar = this.contentEl.createDiv({ cls: "stashpad-slice-actions" });
+      const btn = bar.createEl("button", { cls: "mod-cta", text: "Copy" });
+      btn.onclick = async (): Promise<void> => {
+        try {
+          await navigator.clipboard.writeText(this.copyText!);
+          btn.setText("Copied ✓");
+          window.setTimeout(() => btn.setText("Copy"), 1200);
+        } catch { notify("Couldn't copy."); }
+      };
+    }
+  }
+
+  onClose(): void { this.contentEl.empty(); }
+}

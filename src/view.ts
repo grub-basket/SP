@@ -33,7 +33,7 @@ import { populateLockedMenu } from "./locked-menu";
 import { StashpadCommandPalette } from "./command-palette";
 import { setActiveView, clearActiveView } from "./active-view";
 import { FloatingCaptureWindow } from "./floating-capture";
-import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow, NestRepliesModal, QuickCaptureNestModal, AttachmentsGridModal} from "./modals";
+import { BreadcrumbLevelsModal, type BreadcrumbLevel, ColorPickerModal, ConfirmDeleteModal, ConfirmModal, DropzoneModal, DueDatePickerModal, NoteWorkbenchModal, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, LargeTextModal, HistoryModal, FolderSavedByPersonModal, type FolderSavedRow, NestRepliesModal, QuickCaptureNestModal, AttachmentsGridModal, BodySliceModal} from "./modals";
 import { TextImportModal } from "./text-import-modal";
 import { AppImportModal } from "./stashpad-app-import-modal";
 import type { AppImportNote, HelperNote } from "./stashpad-app-importer";
@@ -43,7 +43,7 @@ import { ComposerAutocomplete } from "./composer-autocomplete";
 import { matchBinding, matchBindingWithMods, humanCombo, parseModifierTokens, eventHasMods } from "./view-keys";
 import { renderReactionChips, openReactionPicker, type ReactionMap } from "./reactions";
 // 0.296.0 (perf): per-document SVG sprite for the repeated note-row icons.
-import { rowIcon, refreshIconSprite, ensureIconSprite } from "./icon-sprite";
+import { rowIcon, refreshIconSprite, ensureIconSprite, type RowIconName } from "./icon-sprite";
 import { openAggregateView } from "./aggregate-view";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
@@ -80,7 +80,7 @@ import { collectDropEntries, readDroppedTree, countTreeFiles, countTreeDirs, typ
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS } from "./note-actions";
+import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import { dedupeDrafts, draftHasContent, draftDedupKey } from "./drafts";
@@ -460,6 +460,11 @@ export class StashpadView extends ItemView {
    *  this grace window the collapse is skipped so the selection survives the
    *  round-trip; a deliberate, later Escape still deselects as before. */
   private composerExitAt = 0;
+  /** 0.473.1: timestamp of the FIRST Escape of a two-Escape "exit composer mode"
+   *  gesture (edit-in-composer → cancel, reply → discard). Both Escapes land in
+   *  the composer; the second within ~900ms exits. Reset to 0 on any composer
+   *  input so typing between the two Escapes cancels the gesture. */
+  private composerEscapeArmedAt = 0;
   /** public: read by ViewDnD (the host interface). */
   listEl: HTMLElement | null = null;
   private composerInputEl: HTMLTextAreaElement | null = null;
@@ -2961,6 +2966,13 @@ export class StashpadView extends ItemView {
     if (!node?.file) { notify("The note being edited is gone — the text stays in the composer."); return false; }
     const ok = await this.writeEditedBody(node, edit.openMd, text);
     if (!ok) return false;
+    // 0.472.0: mirror the normal-send guard (0.298.0). A dup-search debounce
+    // armed by the last keystroke while editing would otherwise fire ~350ms
+    // AFTER save — landing after rebindToNextDraft cleared the panel — and
+    // surface the just-edited note as its own "Similar note" on the now-empty
+    // composer. The edit-submit path returned early and skipped that cleanup;
+    // cancelling here lets rebindToNextDraft's refresh be the final word.
+    this.debouncedDupSearch?.cancel();
     if (this.replyTarget) { await this.setReplyLink(node, this.replyTarget); this.replyTarget = null; this.refreshReplyChip(); }
     const all = { ...(this.plugin.settings.composerDrafts ?? {}) };
     delete all[draft.id];
@@ -4647,6 +4659,11 @@ export class StashpadView extends ItemView {
     // sticky toggle + expand button instead.
     root.toggleClass("is-tiny", this.tinyMode);
     root.toggleClass("is-compact", this.compactMode);
+    // 0.469.0 (/dump): view-scoped note text scale — the CSS below multiplies the
+    // note body + composer font size by this, so the rest of Obsidian's UI is
+    // untouched. Clamped so a stray value can't make the text unusable.
+    const fontScale = Math.max(50, Math.min(200, getSettings().noteFontScalePct ?? 100)) / 100;
+    root.style.setProperty("--stashpad-note-font-scale", String(fontScale));
     // 0.267.12: how covered notes are drawn — one class on the root so the
     // choice costs a class toggle rather than per-row work.
     root.toggleClass("obscure-solid", getSettings().obscureStyle === "solid");
@@ -7642,6 +7659,11 @@ export class StashpadView extends ItemView {
     if (!node.file) return;
     const file = node.file;
     const wrap = parent.createDiv({ cls: "stashpad-focused" });
+    // 0.476.1: reflect the note's own color on the pinned heading — a swatch on
+    // its grip + a colored ring — the same signal list rows carry. Without this,
+    // coloring the note you're currently inside left its heading uncolored.
+    const headingColor = this.colorForNode(node);
+    if (headingColor) { wrap.addClass("has-color"); wrap.style.setProperty("--stashpad-note-color", headingColor); }
     // 0.122.2 (#9): the focused-note header gets the same right-click menu as a
     // list row (it IS a note — Copy/Cut/Move/Task/Delete all apply to it).
     // 0.266.3: right-click / long-press PUTS THE CURSOR ON THE HEADING before
@@ -7720,7 +7742,8 @@ export class StashpadView extends ItemView {
     // note you are actually looking at is the only one without it.
     if (this.isObscured(node)) this.addObscureBadge(metaTop, node);
     metaTop.createSpan({ cls: "stashpad-focused-time stashpad-note-time", text: this.formatTime(node.created) });
-    metaTop.createDiv({ cls: "stashpad-focused-grip-spacer" });
+    const gripSpacer = metaTop.createDiv({ cls: "stashpad-focused-grip-spacer" });
+    if (headingColor) { gripSpacer.addClass("has-color"); gripSpacer.style.setProperty("--stashpad-note-color", headingColor); }
     // 0.201.4: when the FOCUSED note is a task, show its completion checkbox in
     // the header too — the drilled-in parent's task state was invisible (and
     // untoggleable) unless you climbed back out to its list row.
@@ -8279,22 +8302,13 @@ export class StashpadView extends ItemView {
       this.maybeAddItemButtons(actions, body, node, moreBtn);
       toggleAnchor = moreBtn;
     } else {
-      const pencil = actions.createEl("button", { cls: "stashpad-pencil" });
-      rowIcon(pencil, "pencil");   // 0.296.0 (perf)
-      // 0.187.0: pencil opens Stashpad's own editor (default edit action).
-      pencil.title = "Edit in Stashpad";
-      pencil.onclick = (e) => { e.stopPropagation(); void this.cmdEdit(node); };
-      const enterBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-enter-btn" });
-      rowIcon(enterBtn, "arrow-right");   // 0.296.0 (perf)
-      enterBtn.title = "Open in Stashpad view";
-      enterBtn.onclick = (e) => { e.stopPropagation(); this.navigateTo(node.id); };
-      // 0.286.0 (teams): a dedicated per-item Reply button (was menu/palette only).
-      // "reply" is the left-curving arrow the user asked for; starts a quoted
-      // reply to this note (the composer's next send links back to it).
-      const replyBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-reply" });
-      rowIcon(replyBtn, "reply");   // 0.296.0 (perf)
-      replyBtn.title = "Reply to this note";
-      replyBtn.onclick = (e) => { e.stopPropagation(); this.cmdReply(node); };
+      // 0.475.0: the primary row buttons (edit / focus / reply / react by
+      // default) now come from the configurable `itemButtons` list — hideable and
+      // reorderable in Settings → Note Actions & Menus → Item buttons. This
+      // replaces the hardcoded pencil / arrow / reply / react buttons (whose
+      // behaviors still run via runQuickAction). child / preview / quick / ⋮ keep
+      // their own (gated) slots after it.
+      const firstBtn = this.renderConfiguredRowButtons(actions, body, node);
       // 0.456.0 (/dump): in a FLATTENED view (Flat / Everything) the tree isn't
       // visible, so offer a quick "make this a child of…" — the structural
       // counterpart to Reply. Hidden in Nested view (drag/nest already obvious there).
@@ -8305,18 +8319,17 @@ export class StashpadView extends ItemView {
         childBtn.onclick = (e) => { e.stopPropagation(); this.cmdMakeChildOf(node); };
       }
       this.maybeAddPreviewButton(actions, node); // 0.374.0
-      // 0.287.0 (teams): reaction button next to the quick/more menu buttons.
-      this.addReactionButton(actions, node);
+      this.maybeAddQuickButton(actions, node);
       // "More actions" button — opens the same context menu as right-click
       // (Copy Stashpad link, Delete, Split, Move, …). One menu button keeps the
       // row uncluttered as the action set grows, instead of a button per action.
-      this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
       rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "More actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
-      this.maybeAddItemButtons(actions, body, node, moreBtn);
-      toggleAnchor = pencil;
+      // Show-More toggle anchors before the first configured button (or the ⋮
+      // when the user has hidden every row button).
+      toggleAnchor = firstBtn ?? moreBtn;
     }
 
     // Now the actions cluster exists, render the body and route the
@@ -8668,6 +8681,16 @@ export class StashpadView extends ItemView {
         textEl.append(sanitizeHTMLToDom(html));
         this.applySpoilers(textEl);
         this.applyCalloutFold(textEl, node.id);
+        // 0.473.2: a `-webkit-line-clamp` container mangles block children — a
+        // code block collapses to ~0 height and Obsidian's copy button ends up
+        // clipped by the clamp's overflow AND overlapped by the row footer, so a
+        // real click lands on the footer and the copy button does nothing. Mark
+        // bodies that contain a code block so CSS clamps them by max-height
+        // (normal block layout) instead, keeping the `<pre>` and its copy button
+        // laid out, visible and clickable. 0.474.0: tables and callouts are the
+        // same class of block content that `-webkit-line-clamp` collapses/mangles,
+        // so they get the same max-height clamp.
+        if (textEl.querySelector("pre, table, .callout")) textEl.addClass("has-block-content");
       }
       this.refreshStuckPreview(container, node, text);
       // 0.420.0: the focused heading passes a railHost OUTSIDE .stashpad-focused-body
@@ -8677,6 +8700,10 @@ export class StashpadView extends ItemView {
       const railParent = opts.railHost ?? container;
       if (railParent !== container) railParent.empty();
       if (attachments.length > 0) this.renderAttachmentRail(railParent, attachments, node);
+      // 0.474.0 (branch): surface each code block / table / callout in the body as
+      // its own chip in the rail — an "object" you can pop out and copy, like an
+      // attachment. Skipped in compact/tiny (is-plain) modes (no rendered blocks).
+      if (!this.compactMode && !this.tinyMode) this.renderBodySliceRail(railParent, node, textEl);
       this.renderLinkRail(container, node);
       this.renderReplyCount(container, node);
       // Multiplayer footer: author / contributors / last-edit. Each
@@ -9270,6 +9297,53 @@ export class StashpadView extends ItemView {
     el.addEventListener("mouseenter", place);
     el.addEventListener("mousemove", place);
     el.addEventListener("mouseleave", this.hideInstantTooltip);
+  }
+
+  /** 0.474.0 (branch): a rail of the note's own "body slices" — each top-level
+   *  code block, table or callout rendered as an attachment-style chip. Clicking
+   *  one pops it out in a preview modal with a Copy button, so a heavy block is a
+   *  first-class object you can grab without scrolling/expanding the row. */
+  private renderBodySliceRail(parent: HTMLElement, node: TreeNode, textEl: HTMLElement): void {
+    if (!getSettings().bodySliceRail) return;
+    const all = Array.from(textEl.querySelectorAll<HTMLElement>("pre, table, .callout"));
+    // Only TOP-LEVEL blocks: a `pre` inside a callout belongs to that callout's
+    // chip, not its own, so it isn't double-counted.
+    const blocks = all.filter((el) => !all.some((o) => o !== el && o.contains(el)));
+    if (!blocks.length) return;
+    const rail = parent.createDiv({ cls: "stashpad-rail stashpad-slice-rail is-compact" });
+    blocks.forEach((el, i) => {
+      const info = this.sliceInfo(el, i);
+      const box = rail.createDiv({ cls: "stashpad-att stashpad-slice" });
+      box.setAttribute("aria-label", info.tip);
+      this.attachInstantTooltip(box, info.tip);
+      const badge = box.createDiv({ cls: "stashpad-att-badge" });
+      badge.style.setProperty("--stashpad-file-color", info.color);
+      setIcon(badge, info.icon);
+      badge.createSpan({ cls: "stashpad-att-badge-ext", text: info.ext });
+      box.onclick = (e): void => {
+        e.stopPropagation();
+        const clone = el.cloneNode(true) as HTMLElement;
+        // Drop the code-block copy button from the clone — the modal has its own.
+        clone.querySelectorAll(".copy-code-button").forEach((b) => b.remove());
+        new BodySliceModal(this.app, info.title, (host) => host.append(clone), info.copyText).open();
+      };
+    });
+  }
+
+  /** Label / icon / copy-text for one body slice. */
+  private sliceInfo(el: HTMLElement, idx: number): { title: string; tip: string; icon: string; ext: string; color: string; copyText: string } {
+    if (el.tagName === "PRE") {
+      const code = el.querySelector("code");
+      const lang = (Array.from(code?.classList ?? []).find((c) => c.startsWith("language-")) ?? "").replace("language-", "");
+      return { title: lang ? `Code (${lang})` : "Code block", tip: `Code block${lang ? " · " + lang : ""}`, icon: "code", ext: (lang || "CODE").toUpperCase().slice(0, 4), color: "var(--color-purple, #a882ff)", copyText: code?.textContent ?? "" };
+    }
+    if (el.tagName === "TABLE") {
+      const rows = el.querySelectorAll("tr").length;
+      return { title: `Table (${rows} row${rows === 1 ? "" : "s"})`, tip: `Table · ${rows} row${rows === 1 ? "" : "s"}`, icon: "table", ext: "TBL", color: "var(--color-cyan, #4cc4c4)", copyText: el.innerText };
+    }
+    const type = el.getAttribute("data-callout") ?? "note";
+    const titleInner = el.querySelector(".callout-title-inner")?.textContent?.trim();
+    return { title: titleInner || `Callout (${type})`, tip: `Callout · ${type}`, icon: "message-square", ext: type.toUpperCase().slice(0, 4), color: "var(--color-orange, #e6a44c)", copyText: el.innerText };
   }
 
   private renderAttachmentRail(parent: HTMLElement, paths: string[], node?: TreeNode): void {
@@ -9961,6 +10035,11 @@ export class StashpadView extends ItemView {
     const q = text.trim();
     if (q.length < 3) return [];
     const ql = q.toLowerCase();
+    // 0.472.0: a note must never appear as its own "Similar note." While editing
+    // a note in the composer, the composer holds that note's own body, so without
+    // this it Sift-matches itself. Exclude the note currently being edited.
+    const cur = this.activeDraft();
+    const editingId = cur?.kind === "edit" ? cur.edit?.id ?? null : null;
     const rank = (title: string): number => {
       const tl = title.toLowerCase();
       return tl === ql ? 0 : tl.startsWith(ql) ? 1 : tl.includes(ql) ? 2 : 3;
@@ -9970,6 +10049,7 @@ export class StashpadView extends ItemView {
     const out: Array<DupHit & { score: number; len: number }> = [];
     for (const n of this.tree.all()) {
       if (!n.file || n.id === ROOT_ID) continue;
+      if (editingId && n.id === editingId) continue; // 0.472.0: don't match the note being edited
       const title = this.titleForNode(n).trim();
       if (!title || !siftMatch(q, title)) continue;
       out.push({ id: n.id, title, folder: this.noteFolder, crossFolder: false, file: n.file, score: rank(title), len: title.length });
@@ -10211,6 +10291,32 @@ export class StashpadView extends ItemView {
       if (composerScope) return;
       composerScope = new Scope((this.app as any).scope);
       composerScope.register([], "Escape", () => {
+        // 0.473.1: two Escapes IN the composer exit the current composer MODE.
+        // Both keypresses must land in the composer (the user's spec), so when
+        // editing-in-composer or replying, the FIRST Escape does NOT blur — it
+        // arms and is consumed; the SECOND Escape within the window exits:
+        // editing → cancelComposerEdit (changed text kept in Drafts, untouched
+        // dropped); replying → clear the reply. A single Escape in either mode
+        // shows a one-shot hint so the two-step is discoverable.
+        const cur = this.activeDraft();
+        const inEdit = cur?.kind === "edit";
+        const inReply = !inEdit && !!this.replyTarget;
+        if (inEdit || inReply) {
+          if (Date.now() - this.composerEscapeArmedAt < 900) {
+            this.composerEscapeArmedAt = 0;
+            if (inEdit) { void this.cancelComposerEdit(); }
+            else { this.replyTarget = null; this.refreshReplyChip(); void this.persistDraftMeta(); }
+            // Exit fully to the list, matching the single-Escape "get out" feel.
+            this.composerExitAt = Date.now();
+            ta.blur();
+            this.viewRoot?.focus({ preventScroll: true });
+            return false;
+          }
+          this.composerEscapeArmedAt = Date.now();
+          notify(inEdit ? "Press Escape again to stop editing" : "Press Escape again to discard the reply", 1400);
+          return false; // consume the first Escape; stay in the composer
+        }
+        // Normal composer (no mode): a single Escape blurs to the list.
         // 0.92.3: mark that Escape just took us OUT of the composer, so a quick
         // follow-up Escape doesn't collapse the multi-selection (see the
         // composerExitAt guard in the list-level Escape handlers).
@@ -10237,6 +10343,10 @@ export class StashpadView extends ItemView {
     };
     ta.addEventListener("focus", pushComposerScope);
     ta.addEventListener("blur", popComposerScope);
+    // 0.473.1: typing between the two Escapes cancels the "exit mode" gesture —
+    // if you keep editing, a later single Escape shouldn't be treated as the
+    // second of a pair.
+    ta.addEventListener("input", () => { this.composerEscapeArmedAt = 0; });
     // If the textarea was already focused when this code runs (e.g. the
     // composer just rendered with focus restored), push immediately.
     if (document.activeElement === ta) pushComposerScope();
@@ -12539,6 +12649,29 @@ export class StashpadView extends ItemView {
         if (color) enter.style.color = color;
         else enter.style.removeProperty("color");
       }
+    }
+    // 0.476.1: the pinned focused heading isn't a `.stashpad-note` row, so the
+    // loop above skips it — repaint its color in place too, or coloring the note
+    // you're inside shows nothing on its heading until a full re-render.
+    this.repaintFocusedHeaderColor();
+  }
+
+  /** 0.476.1: live-repaint the focused heading's color swatch + ring (the loop in
+   *  repaintRowColors only covers `.stashpad-note` rows). */
+  private repaintFocusedHeaderColor(): void {
+    const wrap = this.viewRoot?.querySelector<HTMLElement>(".stashpad-focused");
+    if (!wrap) return;
+    const node = this.tree.get((wrap.dataset.headingId ?? "") as StashpadId);
+    if (!node) return;
+    const color = this.colorForNode(node);
+    wrap.classList.toggle("has-color", !!color);
+    if (color) wrap.style.setProperty("--stashpad-note-color", color);
+    else wrap.style.removeProperty("--stashpad-note-color");
+    const grip = wrap.querySelector<HTMLElement>(".stashpad-focused-grip-spacer");
+    if (grip) {
+      grip.classList.toggle("has-color", !!color);
+      if (color) grip.style.setProperty("--stashpad-note-color", color);
+      else grip.style.removeProperty("--stashpad-note-color");
     }
   }
 
@@ -14863,7 +14996,10 @@ export class StashpadView extends ItemView {
   async cmdSkipOccurrence(node?: TreeNode): Promise<void> {
     const targets = node ? [node] : this.getActionTargets();
     const skipped: Array<{ title: string; when: number }> = [];
-    const prior: Array<{ path: string; due: unknown }> = [];
+    // 0.474.3: capture EVERY field the skip mutates — not just `due` — so undo is
+    // exact. Skipping a task that was already `missed`/`completed` clears those
+    // flags; a partial undo (due only) would silently drop them.
+    const prior: Array<{ path: string; due: unknown; completed: unknown; missed: unknown; missedAt: unknown }> = [];
     for (const t of targets) {
       if (!t.file) continue;
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter;
@@ -14871,7 +15007,7 @@ export class StashpadView extends ItemView {
       if (!rec) continue;
       const oldDue = fm?.due != null ? Date.parse(String(fm.due)) : NaN;
       const next = nextDueOnComplete(rec, Number.isFinite(oldDue) ? oldDue : null, Date.now());
-      prior.push({ path: t.file.path, due: fm?.due });
+      prior.push({ path: t.file.path, due: fm?.due, completed: fm?.completed, missed: fm?.missed, missedAt: fm?.missedAt });
       this.markFmSelfWrite(t.file.path);
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
         m.due = new Date(next).toISOString();
@@ -14895,11 +15031,37 @@ export class StashpadView extends ItemView {
     this.plugin.getUndoStack(folder).push({
       label: `Skip occurrence (${skipped.length})`,
       undo: async () => {
+        const restore = (m: Record<string, unknown>, key: string, val: unknown): void => {
+          if (val === undefined) delete m[key]; else m[key] = val;
+        };
         for (const p of prior) {
           const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
           if (!f) continue;
+          this.markFmSelfWrite(p.path);
           await this.app.fileManager.processFrontMatter(f, (m) => {
-            if (p.due === undefined) delete m.due; else m.due = p.due;
+            // Restore EVERY field the skip touched to exactly its pre-skip value.
+            restore(m, "due", p.due);
+            restore(m, "completed", p.completed);
+            restore(m, "missed", p.missed);
+            restore(m, "missedAt", p.missedAt);
+          });
+        }
+        this.tree.rebuild(folder);
+        this.render();
+      },
+      // 0.474.1: redo re-applies the skip (undo/redo parity — the command had
+      // only an undo before). `prior` and `skipped` are pushed in lockstep, so
+      // prior[i].path ↔ skipped[i].when.
+      redo: async () => {
+        for (let i = 0; i < prior.length; i++) {
+          const f = this.app.vault.getAbstractFileByPath(prior[i].path) as TFile | null;
+          if (!f) continue;
+          this.markFmSelfWrite(prior[i].path);
+          await this.app.fileManager.processFrontMatter(f, (m) => {
+            m.due = new Date(skipped[i].when).toISOString();
+            delete m.completed;
+            delete m.missed;
+            delete m.missedAt;
           });
         }
         this.tree.rebuild(folder);
@@ -22302,7 +22464,11 @@ export class StashpadView extends ItemView {
    *  overflow spills to a full-width bar at the bottom of the note that wraps.
    *  `inlineMax` is platform-aware (a phone row has less room). */
   private maybeAddItemButtons(actions: HTMLElement, body: HTMLElement, node: TreeNode, before: HTMLElement): void {
-    const ids = getSettings().itemButtons ?? [];
+    // 0.475.0: the built-in row buttons (edit/focus/reply/react) now live in
+    // `itemButtons` too, but they are the DESKTOP row's job (renderConfiguredRowButtons).
+    // Here — mobile + the preview modal — render only the CUSTOM ids, so those
+    // surfaces stay exactly as they were (they have their own react/⋮/etc.).
+    const ids = (getSettings().itemButtons ?? []).filter((id) => !DEFAULT_ROW_BUTTONS.includes(id));
     if (!ids.length) return;
     const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const resolve = (id: string): { icon: string; label: string } | null => {
@@ -22335,6 +22501,54 @@ export class StashpadView extends ItemView {
       bar.setAttr("aria-label", "More note actions");
       for (const { id, meta } of overflow) mkBtn(bar, id, meta);
     }
+  }
+
+  /** 0.475.0: the DESKTOP row's primary buttons, driven by the configurable
+   *  `itemButtons` list (built-ins edit/focus/reply/react + any custom ids) so
+   *  they can be hidden and reordered in settings — parity with the other menu
+   *  editors. `react` renders as the reaction-picker button (its old dedicated
+   *  slot); every other id renders like a custom item button and dispatches via
+   *  runQuickAction. Inline up to a cap, the rest wrap to a bar under the note.
+   *  Returns the first inline button, for the Show-More toggle's anchor. */
+  private renderConfiguredRowButtons(actions: HTMLElement, body: HTMLElement, node: TreeNode): HTMLElement | null {
+    const ids = getSettings().itemButtons ?? [];
+    if (!ids.length) return null;
+    const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
+    const resolve = (id: string): { icon: string; label: string } | null => {
+      if (id === "react") return { icon: "smile-plus", label: "Add reaction" }; // rendered specially
+      if (id.startsWith("cmd:")) {
+        const cid = id.slice(4);
+        if (!cmdRegistry[cid]) return null; // uninstalled/disabled
+        const custom = (getSettings().commandIcons ?? {})[id];
+        const nm = cmdRegistry[cid]?.name || cid;
+        return { icon: custom || guessCommandIcon(nm, getSettings().slugStopWords), label: nm };
+      }
+      const def = noteAction(id);
+      return def ? { icon: this.actionIcon(id), label: def.label } : null;
+    };
+    const resolved = ids.map((id) => ({ id, meta: resolve(id) })).filter((x): x is { id: string; meta: { icon: string; label: string } } => x.meta != null);
+    if (!resolved.length) return null;
+    const inlineMax = 8; // a desktop row fits the four built-ins + a few customs
+    const render = (host: HTMLElement, id: string, meta: { icon: string; label: string }): HTMLElement => {
+      if (id === "react") { this.addReactionButton(host, node); return host.lastElementChild as HTMLElement; }
+      const b = host.createEl("button", { cls: "stashpad-pencil stashpad-note-itembtn" });
+      rowIcon(b, meta.icon as RowIconName); // sprite when registered, setIcon fallback otherwise
+      b.title = meta.label;
+      b.setAttr("aria-label", meta.label);
+      b.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
+      b.onclick = (e) => { e.stopPropagation(); this.runQuickAction(id, node, e); };
+      return b;
+    };
+    const inline = resolved.slice(0, inlineMax);
+    const overflow = resolved.slice(inlineMax);
+    let first: HTMLElement | null = null;
+    for (const { id, meta } of inline) { const el = render(actions, id, meta); if (!first) first = el; }
+    if (overflow.length) {
+      const bar = body.createDiv({ cls: "stashpad-note-extra-actions" });
+      bar.setAttr("aria-label", "More note actions");
+      for (const { id, meta } of overflow) render(bar, id, meta);
+    }
+    return first;
   }
 
   /** 0.272.0: the short, user-curated quick menu opened by the star button.

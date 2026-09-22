@@ -14,7 +14,7 @@ import type StashpadPlugin from "./main";
 import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
-import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS } from "./note-actions";
+import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
 import { guessCommandIcon } from "./icon-guess";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal } from "./modals";
@@ -333,9 +333,16 @@ export interface StashpadSettings {
    *  catalog picks, in this order. */
   quickMenuCustom: { commandId: string; label?: string; icon?: string }[];
   /** 0.320.0: per-note action BUTTONS on the row (catalog ids or `cmd:<obsidian
-   *  command id>`), left-to-right after the hardcoded buttons; overflow wraps to
-   *  a row at the bottom of the note. Empty = none. */
+   *  command id>`), left-to-right; overflow wraps to a row at the bottom of the
+   *  note. 0.475.0: this now ALSO holds the built-in desktop row buttons (edit /
+   *  focus / reply / react) so they can be hidden + reordered — DEFAULT_ROW_BUTTONS
+   *  seeds it. Empty = no buttons (just the ⋮). Mobile ignores the built-in ids. */
   itemButtons: string[];
+  /** 0.475.0: one-time migration flag — existing installs had `itemButtons` as
+   *  CUSTOM-only (built-ins were hardcoded). On first load after the upgrade the
+   *  built-ins are prepended (see main.ts) and this is set, so we never re-seed
+   *  over a user who has since removed them. */
+  itemButtonsSeeded: boolean;
   /** 0.320.0: user icon overrides for catalog actions, keyed by action id →
    *  lucide icon name. Missing = the catalog default (so "reset" = delete key).
    *  Custom Obsidian commands are keyed `cmd:<id>`. */
@@ -872,6 +879,11 @@ export interface StashpadSettings {
   /** 0.458.0: when a row IS whole-row draggable, holding Alt/Option during the
    *  drag selects its text instead of reordering. Only bites on Alt-held drags. */
   altDragSelectsText: boolean;
+  /** 0.469.0: percentage scale for the note TEXT in the list, applied as a
+   *  view-scoped CSS var (`--stashpad-note-font-scale`) so the rest of Obsidian's
+   *  UI font size — and Stashpad's own chrome — is untouched. 100 = default;
+   *  the slider offers 70–160, the view clamps 50–200. */
+  noteFontScalePct: number;
   /** 0.268.2: put the file's name in front of the link when you attach one.
    *
    *  On by default. An attachment on its own is a link and nothing else, so the
@@ -1109,6 +1121,9 @@ export interface StashpadSettings {
    *  `tidyTabsLastRun` is stamped, so a run that came due while Obsidian was
    *  closed fires once on the next launch (catch-up), while a run that already
    *  happened within the interval waits out the remainder. */
+  /** 0.474.0: show a rail of "body slices" — each code block / table / callout in
+   *  a note surfaced as an attachment-style chip you can pop out + copy. */
+  bodySliceRail: boolean;
   tidyTabsSchedule: "off" | "hourly" | "daily" | "weekly";
   /** Epoch ms of the last tidy run (manual OR scheduled); 0 = never run. Drives
    *  the catch-up-vs-wait decision for the schedule above. */
@@ -1136,7 +1151,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   diagnosticsEnabledAt: { perf: 0, trace: 0 },
   quickMenuActions: ["edit", "moveInList", "copy", "move", "blur", "largeText"],
   quickMenuCustom: [],
-  itemButtons: [],
+  itemButtons: [...DEFAULT_ROW_BUTTONS],
+  itemButtonsSeeded: true,
   commandIcons: {},
   contextMenuOrder: [],
   // 0.363.0: seed the four built-in reorg submenus so the default order's
@@ -1281,6 +1297,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureScheduleWeekdays: [true, true, true, true, true, true, true],
   selectableNoteText: true,
   altDragSelectsText: true,
+  noteFontScalePct: 100,
   attachmentNamePrefix: false, // 0.279.1: default OFF — undoes the 0.268.2 filename prefix (user: "we'll survive without the clutter")
   attachmentsEmbedded: true,
   railShowOutgoing: false,
@@ -1335,6 +1352,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   },
   draftAppendTargets: {},
   lastSubmitted: {},
+  bodySliceRail: true,
   tidyTabsSchedule: "off",
   tidyTabsLastRun: 0,
   bindings: buildDefaultBindings(),
@@ -2446,7 +2464,7 @@ export class StashpadSettingTab extends PluginSettingTab {
 
   /** 0.320.0: item-button builder — user command buttons ON each note row. */
   private itemButtonsBody(host: HTMLElement, rebuild: () => void): void {
-        this.sectionHeader(host, "🔘 Item buttons (on every note row)", "Add your own icon buttons to each note's action row, alongside the built-in Edit / Reply / ⋮ buttons. The first few sit inline; any extras drop to a bar under the note. Great for one-tap Copy, Move, or a custom command.");
+        this.sectionHeader(host, "🔘 Item buttons (on every note row)", "The icon buttons on each note's action row (desktop). The built-in Edit / Focus / Reply / React buttons are listed here too now — reorder them, hide any you don't use, or add your own (a catalog action or any command) for one-tap Copy, Move, etc. The first several sit inline; extras drop to a bar under the note. The ⋮ menu is always last. (Mobile keeps its own compact row.)");
         this.actionListBuilder(host,
           () => this.plugin.settings.itemButtons ?? [],
           (ids) => { this.plugin.settings.itemButtons = ids; },
@@ -3657,6 +3675,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.attachmentNamePrefix, (v) => { this.plugin.settings.attachmentNamePrefix = v; }, ["attachment", "file", "name", "prefix", "title"]));
     cats.attachmentsMedia.push(toggle("Embed attached files", "Attach files as an embed, so images and PDFs preview in the note. Turn this off to insert a plain link instead, which keeps a note with several files readable as a list. On by default. Either way the file is in the rail.",
       () => this.plugin.settings.attachmentsEmbedded, (v) => { this.plugin.settings.attachmentsEmbedded = v; }, ["attachment", "embed", "link", "preview", "file"]));
+    cats.attachmentsMedia.push(toggle("Code blocks, tables & callouts in the rail", "Surface each code block, table and callout in a note as its own chip in the rail — like an attachment. Tap a chip to pop the block out in a preview with a one-click Copy. On by default.",
+      () => this.plugin.settings.bodySliceRail, (v) => { this.plugin.settings.bodySliceRail = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "code", "table", "callout", "slice", "block", "copy", "attachment"]));
 
     cats.listDisplay.push(toggle("Show outgoing links in the rail", "List the notes this note links to, in a row under its files. Off by default: it earns its place on a hub note and is noise on everything else. Files are unaffected \u2014 they are always in the rail.",
       () => this.plugin.settings.railShowOutgoing, (v) => { this.plugin.settings.railShowOutgoing = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "links", "outgoing", "backlinks"]));
@@ -3672,6 +3692,24 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.selectableNoteText, (v) => { this.plugin.settings.selectableNoteText = v; this.plugin.refreshAllStashpadViews(); }, ["select", "text", "copy", "drag", "grip", "reorder"]));
     cats.listDisplay.push(toggle("Alt-drag selects text (desktop)", "When a note row is whole-row draggable (i.e. 'Select text in notes' is off), hold Alt/Option while dragging over a note to select its text instead of reordering it. Only affects Alt-held drags, so normal drag-to-reorder is unchanged. On by default.",
       () => this.plugin.settings.altDragSelectsText, (v) => { this.plugin.settings.altDragSelectsText = v; }, ["alt", "option", "drag", "select", "text", "reorder"]));
+
+    cats.listDisplay.push(this.renderDef("Note text size", "Scale the text of your notes in the list, bigger or smaller, without changing the rest of Obsidian's UI font size. Only the note text scales — toolbars, filters and the composer keep their size. 100% is the default.", (st) => {
+      st.addSlider((sl) => sl
+        .setLimits(70, 160, 5)
+        .setValue(Math.max(70, Math.min(160, this.plugin.settings.noteFontScalePct ?? 100)))
+        .setDynamicTooltip()
+        .onChange(async (v) => {
+          this.plugin.settings.noteFontScalePct = v;
+          this.plugin.applyNoteFontScale();          // live, no full re-render
+          await this.plugin.saveSettings();
+        }));
+      st.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset to 100%").onClick(async () => {
+        this.plugin.settings.noteFontScalePct = 100;
+        this.plugin.applyNoteFontScale();
+        await this.plugin.saveSettings();
+        this.display();                              // reflect 100% on the slider
+      }));
+    }, ["font", "size", "text", "scale", "bigger", "smaller", "zoom", "accessibility", "readability", "large text"]));
 
     cats.privacy.push(this.renderDef("How covered notes look", "\"Blur\" keeps the shape of the text. \"Solid bar\" paints over it — faster on a phone, because a blur has to be computed for every glyph every time the text is drawn, and it hides more, since a blur still leaks word shapes and lengths. Either way the text is untouched in the file.", (st) => {
       st.addDropdown((d) => {
