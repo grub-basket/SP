@@ -1764,6 +1764,10 @@ export class StashpadView extends ItemView {
       // 0.86.6: plugin-wide suppression — the folder panel sets this before
       // revealing a leaf so tapping a pinned note doesn't pop the keyboard.
       if (Date.now() < this.plugin.suppressComposerAutofocusUntil) return;
+      // 0.470.2: never focus under an open drawer / modal / menu — the retries
+      // here (rAF/50/200ms) could re-summon the mobile caret after the
+      // caret guard had just blurred it for exactly that overlay.
+      if (this.composerObscured()) return;
       const ae = document.activeElement as HTMLElement | null;
       // Don't steal from another input/modal that the user is intentionally in.
       if (ae && (ae.tagName === "INPUT" || ae.tagName === "TEXTAREA") && ae !== this.composerInputEl) return;
@@ -4807,8 +4811,12 @@ export class StashpadView extends ItemView {
       // Synchronously focus when the textarea is already in the DOM —
       // avoids the one-frame focus-blur flicker the RAF path produced
       // when multiple renders fired in quick succession.
+      // 0.470.2: but never under an overlay (open drawer / modal / menu) or
+      // inside the caret-guard suppression window — that is the race that put
+      // the caret back above the mobile sidebar after the guard had blurred it.
       const ta = this.composerInputEl;
-      if (ta && ta.isConnected) {
+      const allowed = !this.composerObscured() && Date.now() >= this.suppressComposerFocusUntil;
+      if (ta && ta.isConnected && allowed) {
         ta.focus({ preventScroll: true });
         if (caret != null) {
           const c = Math.min(caret, ta.value.length);
@@ -9517,10 +9525,36 @@ export class StashpadView extends ItemView {
   }
 
   /** Blur the composer if it currently holds focus — kills the native caret so
-   *  it can't paint above an overlay. Cheap no-op when the composer isn't focused. */
+   *  it can't paint above an overlay. Cheap no-op when the composer isn't focused.
+   *
+   *  0.470.2: the blur is now AUTHORITATIVE. It used to lose a race: a render
+   *  queued while the composer was focused (a draft save while typing sets
+   *  `focusComposerOnNextRender` at queue time — L~1230) would land AFTER this
+   *  blur and re-focus the composer under the open drawer, and `focusComposer()`'s
+   *  rAF/50/200ms retries could do the same. iOS then paints the native caret
+   *  above the drawer and keeps the keyboard up, which shrinks the visual
+   *  viewport so the fixed drawer stops short and the composer shows beneath its
+   *  bottom edge. So: drop any pending focus restore and open a short suppression
+   *  window that outlasts the retry chain + render debounce. */
   private blurComposerCaret(): void {
+    this.focusComposerOnNextRender = false;
+    this.pendingComposerCaret = null;
+    this.suppressComposerFocusUntil = Math.max(this.suppressComposerFocusUntil, Date.now() + 800);
     const ta = this.composerInputEl;
     if (ta && ta.ownerDocument.activeElement === ta) ta.blur();
+  }
+
+  /** 0.470.2 (mobile): true while something is drawn over the composer that a
+   *  native caret would bleed through — an open sidebar drawer, a modal, or a
+   *  menu. Focus-restoring paths consult this so they never re-summon the caret
+   *  (and the keyboard) under an overlay. Desktop: always false — the drawers are
+   *  docked panes there, not overlays, and the caret is not a native layer. */
+  private composerObscured(): boolean {
+    if (!Platform.isMobile) return false;
+    const ws = this.app.workspace as unknown as { leftSplit?: { collapsed?: boolean }; rightSplit?: { collapsed?: boolean } };
+    if (ws.leftSplit?.collapsed === false || ws.rightSplit?.collapsed === false) return true;
+    const doc = this.containerEl?.ownerDocument ?? document;
+    return !!doc.body.querySelector(".modal-container, .menu");
   }
 
   /** 0.278.2 (mobile): set up the two triggers that make the composer's native
@@ -10254,6 +10288,21 @@ export class StashpadView extends ItemView {
       // what the user just typed.
       this.composerDraft = text;
       void this.saveDraft(text);
+    }, {
+      // 0.471.0: the typed `>` destination trigger. Lists EXISTING Stashpad
+      // folders only (discoverStashpadFolders never invents one), so `>` cannot
+      // create a folder. Picking one mirrors the destination menu exactly: send
+      // to the folder's HOME (ROOT_ID), record MRU, refresh the chip.
+      list: () => this.plugin.discoverStashpadFolders()
+        .map((folder) => ({ folder, name: folder.split("/").pop() || folder })),
+      set: (folder) => {
+        this.nextDestination = ROOT_ID;
+        this.nextDestinationFolder = folder;
+        this.nextDestinationLabel = folder.split("/").pop() || folder;
+        this.plugin.recordFolderUsed(folder, { opened: false }); // MRU only — must not change the launch folder
+        this.refreshDestButton();
+        this.composerInputEl?.focus();
+      },
     });
     this.composerAutocomplete.attach();
 

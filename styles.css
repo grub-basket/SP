@@ -3603,6 +3603,16 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   right: calc(4px + var(--sp-safe-right));
   bottom: 2px;
   z-index: 10;
+  /* LOAD-BEARING GEOMETRY (do not casually close this gap). On iOS dictation,
+   * the OS mic bubble rides on the composer's caret. When the caret's resting
+   * spot (empty composer / line start, bottom-left of the field) sat under this
+   * Send button, the mic overlay overlapped Send and the OS ate the first tap —
+   * "Send doesn't work until I cancel dictation." Today Send sits far enough from
+   * that resting caret that they don't collide, which is why it currently works.
+   * This was incidental, not a deliberate fix: if a future layout change moves
+   * Send back toward the composer's bottom-left caret (or the caret toward Send),
+   * the dictation-tap bug can silently return. The mic UI is OS-rendered and not
+   * ours to move — keeping Send clear of the resting caret is the only lever. */
   pointer-events: auto;
   /* No double-tap-zoom delay, and an explicit statement that touches here are a
      press — not the start of a pan or a browser gesture. */

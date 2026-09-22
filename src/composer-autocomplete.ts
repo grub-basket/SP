@@ -158,6 +158,15 @@ export class ComposerAutocomplete {
      *  draft — so without this flush, running a command within a moment of
      *  typing can restore an older draft over what you just wrote. */
     private onBeforeCommand: ((text: string) => void) | null = null,
+    /** 0.471.0: the typed `>` destination trigger. `list()` returns the EXISTING
+     *  Stashpad folders (path + display name + optional icon) to offer — there is
+     *  no create path, so `>` can never make a new folder — and `set(folder)`
+     *  routes the next send there (same effect as the destination menu/picker).
+     *  Null disables the `>` trigger entirely. */
+    private destinations: {
+      list: () => Array<{ folder: string; name: string }>;
+      set: (folder: string) => void;
+    } | null = null,
   ) {}
 
   attach(): void {
@@ -379,14 +388,15 @@ export class ComposerAutocomplete {
     // auto-closing the moment the query outgrows one. The bare `@` opens
     // immediately (NLD-style); the popup self-closes once the query matches
     // neither a date nor any note.
-    // 0.254.0: slash commands. `/` at the very start of a line (not merely
-    // after any whitespace) then an optional query. Start-of-line is the
-    // deliberate restriction: `/` is ordinary text mid-sentence — dates,
-    // paths, and/or — and a popup that appeared on every one of those would
-    // be a nuisance rather than a feature. Bounded to 32 chars so a long
-    // path-ish line closes the popup instead of leaving it hanging.
+    // 0.254.0: slash commands. `/` then an optional query.
+    // 0.471.0: fires at ANY word boundary (start-of-line OR after whitespace),
+    // not just start-of-line — same rule as `#` and `@`. The `(?:^|\s)` guard is
+    // what keeps ordinary mid-word `/` out (URLs `http://`, `and/or`, `24/7`,
+    // `9/22` all have no space before the slash, so none of them trigger); only a
+    // `/` a user deliberately starts a token with does. Bounded to 32 chars so a
+    // long path-ish run closes the popup instead of leaving it hanging.
     const slashMatch = getSettings().slashCommands
-      ? before.match(/(?:^|\n)\/([^\n]{0,32})$/)
+      ? before.match(/(?:^|\s)\/([^\n]{0,32})$/)
       : null;
     if (slashMatch) {
       const query = slashMatch[1];
@@ -394,6 +404,26 @@ export class ComposerAutocomplete {
         kind: "command",
         query,
         replaceStart: caret - query.length - 1, // include the `/`
+        replaceEnd: caret,
+      };
+    }
+
+    // 0.471.0: destination trigger. `>` (at a word boundary) then a folder query,
+    // routing the next send into an EXISTING Stashpad folder — no folder is ever
+    // created. The char right after `>` must be non-space, so `> quote` (Markdown
+    // blockquote, space after `>`) and a bare `>` never open the popup; only
+    // `>name` does. The query MAY contain spaces (folders like "Bases Toolbox")
+    // and self-closes when it matches no folder, so a `>word` that isn't a folder
+    // just stays literal text. Gated on the API being wired.
+    const destMatch = this.destinations
+      ? before.match(/(?:^|\s)>([^\s\n][^\n]{0,32})$/)
+      : null;
+    if (destMatch) {
+      const query = destMatch[1];
+      return {
+        kind: "dest",
+        query,
+        replaceStart: caret - query.length - 1, // include the `>`
         replaceEnd: caret,
       };
     }
@@ -609,6 +639,23 @@ export class ComposerAutocomplete {
       this.tagListIsFallback = state.query !== "" && matched.length === 0;
       const list = this.tagListIsFallback ? this.tagIndex.slice(0, 30) : matched;
       return list.map((t) => ({ label: t, insert: t, subtitle: "" }));
+    }
+    if (state.kind === "dest") {
+      // 0.471.0: existing Stashpad folders, Sift-matched on the display name (and
+      // path, so a nested folder is reachable by its parent). Picking one REMOVES
+      // the `>query` and routes the next send — it never inserts text and never
+      // creates a folder. No fallback list: an empty result closes the popup, so
+      // a `>word` that isn't a folder is left as plain text.
+      const folders = this.destinations?.list() ?? [];
+      return folders
+        .filter((f) => matchesAll(f.name.toLowerCase()) || matchesAll(f.folder.toLowerCase()))
+        .slice(0, 30)
+        .map((f) => ({
+          label: f.name,
+          insert: "",
+          subtitle: f.folder,
+          run: () => this.destinations?.set(f.folder),
+        }));
     }
     // 0.186.0: unified `@` — natural-language dates (via NLD) blended with
     // note links. Dates rank first so Enter on `@today` inserts the date.
@@ -1061,7 +1108,7 @@ interface SuggestItem {
 }
 
 interface AutocompleteState {
-  kind: "tag" | "link" | "at" | "command" | "highlight";
+  kind: "tag" | "link" | "at" | "command" | "highlight" | "dest";
   /** 0.199.2: the trigger sits inside `[[ ]]` — every insert must be a link. */
   inLink?: boolean;
   query: string;
