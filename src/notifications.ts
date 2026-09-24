@@ -70,6 +70,7 @@ export type NotificationCategory =
   | "multiplayer"
   | "reminder"
   | "team"
+  | "link"
   | "system";
 
 /** Human-readable labels for each category, used by the settings UI
@@ -93,6 +94,7 @@ export const CATEGORY_LABELS: Record<NotificationCategory, { label: string; desc
   multiplayer: { label: "Multiplayer",   desc: "Cross-author activity (someone else touched your notes or vice versa)." },
   reminder:    { label: "Reminder",      desc: "Task due-date reminders — surfaced when a task comes due (fired at launch / periodically)." },
   team:        { label: "Team activity",  desc: "When a teammate creates a note in a Stashpad folder you follow." },
+  link:        { label: "Links",         desc: "Receipts for `obsidian://stashpad` deep links — which note a clicked link opened, and where. Mute this if you'd rather links open quietly." },
   system:      { label: "System",        desc: "Plumbing toasts: backfill progress, integrity warnings, errors not tied to a verb." },
 };
 

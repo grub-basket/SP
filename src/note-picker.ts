@@ -287,6 +287,30 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     super(app);
     this.setPlaceholder(opts.placeholder ?? (opts.mode === "search" ? "Search notes…" : "Pick a note…"));
     this.loadAll();
+    // 0.478.0 (/dump): Shift+Enter FORCE-creates from the current query text even
+    // when there ARE matches — normally the "Create new: …" row only appears when
+    // nothing matched, and Enter opens the highlighted result. Matches Obsidian's
+    // own quick-switcher convention. Only armed when this picker allows creation.
+    if (opts.allowCreate && opts.onCreate) {
+      this.scope.register(["Shift"], "Enter", (e) => {
+        if (this.createFromQuery()) { e.preventDefault(); this.close(); return false; }
+        return true;
+      });
+      this.setInstructions([{ command: "shift ↵", purpose: "create from text" }]);
+    }
+  }
+
+  /** 0.478.0: create a note/item from the RAW query text — shared by the
+   *  "Create new: …" pick and the Shift+Enter force-create. Strips filter
+   *  qualifiers (in:/before:/after:/on:) so `in: [work] meeting notes` creates
+   *  "meeting notes", not the literal query. Returns true if it created. */
+  private createFromQuery(): boolean {
+    if (!this.opts.allowCreate || !this.opts.onCreate) return false;
+    const rawTitle = ((this as any).inputEl as HTMLInputElement | undefined)?.value ?? "";
+    if (!rawTitle.trim()) return false;
+    const cleanTitle = rawTitle.replace(/(?<![\w-])(in|before|after|on):\s*(?:\[[^\]]*\]|[^]*?(?=\s+(?:in|before|after|on):|$))/gi, " ").replace(/\s+/g, " ").trim();
+    this.opts.onCreate(cleanTitle || rawTitle);
+    return true;
   }
 
   private loadAll(): void {
@@ -1883,12 +1907,9 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       if (q) try { this.opts.onRunQuery?.(q); } catch { /* ignore */ }
     }
     if (item.kind === "create" && this.opts.onCreate) {
-      // Strip filter qualifiers (in:/before:/after:/on:) so a query like
-      // `in: [work] meeting notes` creates a note titled "meeting notes", not the
-      // literal query. Case preserved (unlike parseSearchQuery's tokens). 0.140.14
-      const rawTitle = (this as any).inputEl?.value ?? "";
-      const cleanTitle = rawTitle.replace(/(?<![\w-])(in|before|after|on):\s*(?:\[[^\]]*\]|[^]*?(?=\s+(?:in|before|after|on):|$))/gi, " ").replace(/\s+/g, " ").trim();
-      this.opts.onCreate(cleanTitle || rawTitle);
+      // Shared with Shift+Enter force-create (createFromQuery): strips filter
+      // qualifiers so `in: [work] meeting notes` creates "meeting notes". 0.140.14
+      this.createFromQuery();
       return;
     }
     // 0.69.3: collapsed folder-open entry → open a sub-picker of every

@@ -101,7 +101,16 @@ export function populateLockedMenu(menu: Menu, cfg: LockedMenuConfig): void {
   };
   const copyLink = (): void => {
     const link = buildStashpadLink({ vault: app.vault.getName(), folder: d.folder, note: d.rootId!, run: ["reveal"] });
-    void navigator.clipboard.writeText(link).then(() => notify("Stashpad link copied."), () => notify("Couldn't copy the link."));
+    void navigator.clipboard.writeText(link).then(
+      () => {
+        notify("Stashpad link copied.");
+        // A locked note has no readable title (that is the point of it), so the
+        // log carries the folder and the link and nothing it would have to
+        // decrypt to know.
+        void plugin.recordLink({ kind: "shared", url: link, folder: d.folder, noteId: d.rootId!, view: null, title: null, outcome: "copied" });
+      },
+      () => notify("Couldn't copy the link."),
+    );
   };
 
   // Shared item factories -----------------------------------------------------

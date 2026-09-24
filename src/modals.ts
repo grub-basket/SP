@@ -21,6 +21,7 @@ import { readClipboardText } from "./cross-vault-clipboard";
 import { getSettings } from "./settings";
 import type { ExportContent } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
+import { LINK_KIND_LABELS, LINK_OUTCOME_LABELS, type LinkLog, type LinkLogEntry } from "./link-log";
 
 export interface AssigneeRef { id: string; name: string }
 export interface DuePickResult {
@@ -2623,7 +2624,14 @@ export class TypeToConfirmModal extends Modal {
  *  URLs as clickable links. Prefills from the clipboard when it holds a Stashpad
  *  link so the common case is just Enter. */
 export class OpenDeepLinkModal extends Modal {
-  constructor(app: App, private onSubmit: (raw: string) => void) { super(app); }
+  constructor(
+    app: App,
+    private onSubmit: (raw: string) => void,
+    /** 0.483.0: where the user currently IS, when a Stashpad view is open —
+     *  so the modal answers both halves of the question it raises. Null when
+     *  no view is open, in which case the copy row simply isn't rendered. */
+    private currentTarget?: { url: string; label: string; copy: () => Promise<boolean> } | null,
+  ) { super(app); }
   onOpen(): void {
     this.contentEl.empty();
     this.modalEl.addClass("stashpad-export-modal");
@@ -2669,6 +2677,45 @@ export class OpenDeepLinkModal extends Modal {
     setIcon(autoHint.createSpan({ cls: "stashpad-open-link-autohint-icon" }), "clipboard-check");
     autoHint.createSpan({ text: "Link automatically pasted from your clipboard." });
     autoHint.hide();
+
+    // 0.483.0: the other half of the same question. A modal about Stashpad
+    // links is exactly where someone thinks "…and how do I GET one?", and the
+    // answer used to live somewhere else entirely (a note's context menu). The
+    // row is omitted rather than disabled when no view is open — a dead button
+    // explaining itself is worse than no button.
+    if (this.currentTarget) {
+      const target = this.currentTarget;
+      const copyRow = this.contentEl.createDiv({ cls: "stashpad-open-link-copyrow" });
+      const label = copyRow.createDiv({ cls: "stashpad-open-link-copylabel" });
+      label.createSpan({ cls: "stashpad-open-link-copylead", text: "Link to where you are:" });
+      label.createSpan({ cls: "stashpad-open-link-copytarget", text: target.label });
+      const copyBtn = copyRow.createEl("button", { cls: "stashpad-open-link-copybtn" });
+      setIcon(copyBtn.createSpan({ cls: "stashpad-open-link-paste-icon" }), "link");
+      copyBtn.createSpan({ text: "Copy" });
+      copyBtn.title = target.url;
+      copyBtn.onclick = () => {
+        // Delegates rather than writing the clipboard itself, so this copy goes
+        // through the SAME path as every other "Copy Stashpad link" — including
+        // being recorded as `shared` in the link log. Copying here and logging
+        // nowhere left one of three copy routes invisible in Recent links.
+        void target.copy().then((ok) => {
+          if (!ok) return;
+          // Confirm IN PLACE as well as by toast: the toast can be muted, and
+          // the button is where the user is looking.
+          copyBtn.addClass("is-copied");
+          const done = copyBtn.querySelector("span:last-child");
+          if (done) done.textContent = "Copied";
+          window.setTimeout(() => {
+            copyBtn.removeClass("is-copied");
+            if (done) done.textContent = "Copy";
+          }, 2000);
+        });
+      };
+      copyRow.createDiv({
+        cls: "stashpad-open-link-copyhint",
+        text: "Right-click any breadcrumb for a link to that level of the path instead.",
+      });
+    }
 
     const footer = this.contentEl.createDiv({ cls: "stashpad-export-footer" });
     footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
@@ -4902,6 +4949,139 @@ export class ImportLogModal extends Modal {
       row.createSpan({ cls: "stashpad-import-log-meta", text: meta.join(" · ") });
     }
   }
+  onClose(): void { this.contentEl.empty(); }
+}
+
+/** 0.481.0: every Stashpad link this vault has copied, received or found on
+ *  the clipboard — newest first.
+ *
+ *  The point is the question a deep link can't otherwise answer: *did that
+ *  link do anything?* A receipt answers it while the toast is up; this answers
+ *  it a day later, and — because a dropped link leaves no entry at all —
+ *  distinguishes "it opened and I missed it" from "it never arrived".
+ *
+ *  Retention lives here as well as in Settings (same stored value, edited from
+ *  wherever you happen to be looking at the consequences of it). */
+export class RecentLinksModal extends Modal {
+  private query = "";
+  private kindFilter: "all" | LinkLogEntry["kind"] = "all";
+  private listEl: HTMLElement | null = null;
+  private countEl: HTMLElement | null = null;
+
+  constructor(
+    app: App,
+    private log: LinkLog,
+    private onOpenLink: (entry: LinkLogEntry) => void | Promise<void>,
+    private onLimitChange: (limit: number) => void | Promise<void>,
+  ) { super(app); }
+
+  onOpen(): void {
+    this.contentEl.empty();
+    this.modalEl.addClass("stashpad-export-modal");
+    this.modalEl.addClass("stashpad-link-log-modal");
+    this.titleEl.setText("Recent links");
+
+    const controls = this.contentEl.createDiv({ cls: "stashpad-link-log-controls" });
+    const search = controls.createEl("input", { cls: "stashpad-export-name", attr: { type: "text", placeholder: "Filter by note, folder or link…" } });
+    search.addEventListener("input", () => { this.query = search.value; this.renderList(); });
+    const kind = controls.createEl("select", { cls: "dropdown" });
+    for (const [value, label] of [["all", "All"], ["received", LINK_KIND_LABELS.received], ["shared", LINK_KIND_LABELS.shared], ["clipboard", LINK_KIND_LABELS.clipboard]] as const) {
+      kind.createEl("option", { value, text: label });
+    }
+    kind.addEventListener("change", () => { this.kindFilter = kind.value as typeof this.kindFilter; this.renderList(); });
+
+    this.listEl = this.contentEl.createDiv({ cls: "stashpad-link-log-list" });
+
+    const footer = this.contentEl.createDiv({ cls: "stashpad-link-log-footer" });
+    this.countEl = footer.createSpan({ cls: "stashpad-link-log-count" });
+    const retention = footer.createDiv({ cls: "stashpad-link-log-retention" });
+    retention.createSpan({ text: "Keep last" });
+    const limitInput = retention.createEl("input", { cls: "stashpad-link-log-limit", attr: { type: "number", min: "0", step: "100" } });
+    limitInput.value = String(this.log.getLimit());
+    retention.createSpan({ cls: "stashpad-link-log-hint", text: "0 = keep everything" });
+    // Commit on blur/Enter rather than per keystroke: typing "500" passes
+    // through 5, and setLimit TRIMS — a per-keystroke commit would throw away
+    // everything but the last five entries on the way to the number you meant.
+    const commit = (): void => {
+      const n = parseInt(limitInput.value, 10);
+      if (!Number.isFinite(n) || n < 0) { limitInput.value = String(this.log.getLimit()); return; }
+      void this.onLimitChange(n);
+      this.renderList();
+    };
+    limitInput.addEventListener("blur", commit);
+    limitInput.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") commit(); });
+
+    const clear = footer.createEl("button", { cls: "mod-warning", text: "Clear log" });
+    clear.onclick = () => {
+      // Two-step rather than a confirm modal: the log is a record, and losing
+      // it to a stray click is exactly the kind of small irreversible thing
+      // worth one extra beat.
+      if (clear.hasClass("is-armed")) {
+        void this.log.clear().then(
+          () => notify(`Link log cleared. The old entries were kept as \`${this.log.archiveHint()}\`.`),
+          () => notify("Couldn’t clear the link log."),
+        );
+        this.renderList();
+        clear.removeClass("is-armed");
+        clear.setText("Clear log");
+        return;
+      }
+      clear.addClass("is-armed");
+      clear.setText("Clear log — click again");
+      window.setTimeout(() => { clear.removeClass("is-armed"); clear.setText("Clear log"); }, 4000);
+    };
+
+    // LAST, not beside the list it fills: renderList writes the entry count into
+    // the footer, so painting before the footer exists left the count blank
+    // until the first filter keystroke (it did).
+    this.renderList();
+  }
+
+  private renderList(): void {
+    const list = this.listEl;
+    if (!list) return;
+    list.empty();
+    const all = this.log.recent();
+    const rows = all.filter((e) => {
+      if (this.kindFilter !== "all" && e.kind !== this.kindFilter) return false;
+      if (!this.query.trim()) return true;
+      return siftMatch(this.query, [e.title ?? "", e.folder, e.view ?? "", e.url].join(" "));
+    });
+    if (this.countEl) {
+      const total = all.length;
+      const cap = this.log.getLimit();
+      this.countEl.setText(
+        `${rows.length === total ? total : `${rows.length} of ${total}`} link${total === 1 ? "" : "s"}`
+        + (cap > 0 ? ` · capped at ${cap}` : total > 10000 ? " · consider a cap" : ""),
+      );
+    }
+    if (rows.length === 0) {
+      list.createDiv({ cls: "stashpad-log-empty", text: all.length === 0 ? "No links yet. Copy a Stashpad link, or click one." : "No links match that filter." });
+      return;
+    }
+    for (const e of rows) {
+      const row = list.createDiv({ cls: "stashpad-link-log-row" });
+      row.createSpan({ cls: "stashpad-link-log-when", text: (moment as unknown as (v: string) => { format: (f: string) => string })(e.ts).format("YYYY-MM-DD HH:mm") });
+      row.createSpan({ cls: `stashpad-link-log-kind is-${e.kind}`, text: LINK_KIND_LABELS[e.kind] });
+      const name = e.view ? `View: ${e.view}` : (e.title || e.folder.split("/").pop() || e.folder);
+      row.createSpan({ cls: "stashpad-link-log-name", text: name });
+      const meta: string[] = [];
+      if (!e.view && e.folder) meta.push(e.folder.split("/").pop() || e.folder);
+      meta.push(LINK_OUTCOME_LABELS[e.outcome]);
+      if (e.detail) meta.push(e.detail);
+      row.createSpan({ cls: `stashpad-link-log-outcome is-${e.outcome}`, text: meta.join(" · ") });
+      const open = row.createEl("button", { cls: "stashpad-link-log-btn", text: "Open" });
+      open.onclick = () => void this.onOpenLink(e);
+      const copy = row.createEl("button", { cls: "stashpad-link-log-btn", text: "Copy" });
+      copy.onclick = () => {
+        void navigator.clipboard.writeText(e.url).then(
+          () => notify("Stashpad link copied."),
+          () => notify("Couldn't copy the link."),
+        );
+      };
+    }
+  }
+
   onClose(): void { this.contentEl.empty(); }
 }
 

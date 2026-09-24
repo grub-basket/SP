@@ -7589,6 +7589,11 @@ export class StashpadView extends ItemView {
     // "Open in new tab" listed first (user preference, 2026-07-14).
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").onClick(() => { onAction?.(); this.cmdOpenInNewStashpadTab(node); }));
     menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => { onAction?.(); this.navigateTo(id); }));
+    // 0.483.0: a link to THIS level of the path, not to wherever the view
+    // happens to be focused. Every crumb is an ancestor, so the breadcrumb is
+    // the natural place to ask for "a link to that bit of the path" — one
+    // right-click instead of navigating there, copying, and navigating back.
+    menu.addItem((it: any) => it.setTitle("Copy Stashpad link").setIcon("link").onClick(() => { onAction?.(); void this.cmdCopyCrumbLink(id); }));
     if (node.file) {
       menu.addItem((it: any) => it.setTitle("React…").setIcon("smile-plus").onClick(() => { onAction?.(); this.cmdReact(node); }));
       menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => { onAction?.(); this.cmdReply(node); }));
@@ -7664,6 +7669,16 @@ export class StashpadView extends ItemView {
     // coloring the note you're currently inside left its heading uncolored.
     const headingColor = this.colorForNode(node);
     if (headingColor) { wrap.addClass("has-color"); wrap.style.setProperty("--stashpad-note-color", headingColor); }
+    else {
+      // 0.476.2: no own colour → show the faint inherited-branch stripe, same as a
+      // row whose nearest coloured ancestor is above it.
+      const inh = this.inheritedColorForNode(node);
+      if (inh && inh.depth > 0) {
+        wrap.addClass("has-inherited-color");
+        wrap.style.setProperty("--stashpad-inherited-color", inh.hex);
+        wrap.style.setProperty("--stashpad-inherited-depth", String(inh.depth));
+      }
+    }
     // 0.122.2 (#9): the focused-note header gets the same right-click menu as a
     // list row (it IS a note — Copy/Cut/Move/Task/Delete all apply to it).
     // 0.266.3: right-click / long-press PUTS THE CURSOR ON THE HEADING before
@@ -12412,6 +12427,10 @@ export class StashpadView extends ItemView {
       // the event first or "E" would swallow it. (The shifted-key trap.)
       if (matchBinding(e, sb.editParent)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdEditParent(); return; }
       if (matchBinding(e, sb.edit)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdEditQueue(); return; }
+      // 0.477.0: edit-in-composer as a bindable slot (no default chord; the user
+      // can assign one in Stashpad's keybind settings). The command palette entry
+      // in main.ts drives the same beginComposerEdit.
+      if (matchBinding(e, sb.editInComposer)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.beginComposerEdit(); return; }
       if (matchBinding(e, sb.clone)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdClone(); return; }
       if (matchBinding(e, sb.forkNote)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdForkNote(); return; }
       if (matchBinding(e, sb.insertTemplate)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdInsertTemplate(); return; }
@@ -12672,6 +12691,17 @@ export class StashpadView extends ItemView {
       grip.classList.toggle("has-color", !!color);
       if (color) grip.style.setProperty("--stashpad-note-color", color);
       else grip.style.removeProperty("--stashpad-note-color");
+    }
+    // 0.476.2: inherited-branch stripe when the heading has no colour of its own.
+    const inh = color ? null : this.inheritedColorForNode(node);
+    const showInh = !!inh && inh.depth > 0;
+    wrap.classList.toggle("has-inherited-color", showInh);
+    if (showInh && inh) {
+      wrap.style.setProperty("--stashpad-inherited-color", inh.hex);
+      wrap.style.setProperty("--stashpad-inherited-depth", String(inh.depth));
+    } else {
+      wrap.style.removeProperty("--stashpad-inherited-color");
+      wrap.style.removeProperty("--stashpad-inherited-depth");
     }
   }
 
@@ -17396,13 +17426,13 @@ export class StashpadView extends ItemView {
   /** Copy an `obsidian://stashpad?…` deep link to the cursor row (or first
    *  selected note). Paste it anywhere — clicking it lands back on this exact
    *  note. Uses the note's stable frontmatter `id`, so it survives renames. */
-  async cmdCopyStashpadLink(node?: TreeNode): Promise<void> {
+  async cmdCopyStashpadLink(node?: TreeNode): Promise<boolean> {
     // A specific node (right-click) links just that note; otherwise link EVERY
     // action target — so a multi-selection (⚡ menu / hotkey) copies one deep
     // link per selected note, newline-separated, rather than only the first.
     const targets = node ? [node] : this.getActionTargets();
     const valid = targets.filter((t) => !!t?.id);
-    if (valid.length === 0) { notify("No note selected to link to."); return; }
+    if (valid.length === 0) { notify("No note selected to link to."); return false; }
     const links = valid.map((t) => buildStashpadLink({
       vault: this.app.vault.getName(),
       folder: this.noteFolder,
@@ -17412,9 +17442,69 @@ export class StashpadView extends ItemView {
     try {
       await navigator.clipboard.writeText(links.join("\n"));
       notify(links.length > 1 ? `${links.length} Stashpad links copied.` : "Stashpad link copied.");
+      // 0.481.0: log the SENDING side too. "I sent someone a link to that note
+      // last week" is otherwise unrecoverable — the link left the vault and
+      // nothing here remembered it. Logged only after the clipboard write
+      // actually succeeded, so the log never claims a copy that didn't happen.
+      for (let i = 0; i < valid.length; i++) {
+        void this.plugin.recordLink({
+          kind: "shared", url: links[i], folder: this.noteFolder, noteId: valid[i].id,
+          view: null, title: this.titleForNode(valid[i]) || null, outcome: "copied",
+        });
+      }
+      return true;
     } catch {
       notify("Couldn't copy the link to the clipboard.");
+      return false;
     }
+  }
+
+  /** 0.483.0: copy a deep link to ONE level of the current path — the crumb
+   *  that was right-clicked, not the note the view is focused on.
+   *
+   *  Home is a FOLDER link (no `note=`): it is shorter, it is what "the top of
+   *  this Stashpad" actually means, and it still resolves if the home note is
+   *  ever missing or renamed — whereas `note=__root__` depends on that one file
+   *  carrying that id. Every other crumb is a real note, so it goes through the
+   *  existing copier (which also logs it as `shared` in the link log). */
+  async cmdCopyCrumbLink(id: StashpadId): Promise<boolean> {
+    if (id !== ROOT_ID) {
+      const node = this.tree.get(id);
+      if (!node) { notify("That level is no longer in the path."); return false; }
+      return await this.cmdCopyStashpadLink(node);
+    }
+    const link = buildStashpadLink({ vault: this.app.vault.getName(), folder: this.noteFolder, run: ["reveal"] });
+    try {
+      await navigator.clipboard.writeText(link);
+      notify("Stashpad link copied — the top of this Stashpad.");
+      void this.plugin.recordLink({ kind: "shared", url: link, folder: this.noteFolder, noteId: null, view: null, title: null, outcome: "copied" });
+      return true;
+    } catch {
+      notify("Couldn't copy the link to the clipboard.");
+      return false;
+    }
+  }
+
+  /** 0.483.0: the link for where this view is RIGHT NOW — the focused note, or
+   *  the folder when sitting at the top. Feeds the "Open Stashpad link" modal's
+   *  copy row; returns the link plus a human label for it, or null when there
+   *  is nothing sensible to link to. */
+  currentPathLink(): { url: string; label: string } | null {
+    const folder = this.noteFolder;
+    if (!folder) return null;
+    const vault = this.app.vault.getName();
+    if (this.focusId === ROOT_ID) {
+      return {
+        url: buildStashpadLink({ vault, folder, run: ["reveal"] }),
+        label: folder.split("/").pop() || folder,
+      };
+    }
+    const node = this.tree.get(this.focusId);
+    if (!node) return null;
+    return {
+      url: buildStashpadLink({ vault, folder, note: node.id, run: ["reveal"] }),
+      label: this.titleForNode(node),
+    };
   }
 
   /** Open the focused-parent note in a new editor tab — useful when

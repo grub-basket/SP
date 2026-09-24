@@ -20,6 +20,11 @@ export const VIEWER_IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg
  *  browser's own PDF chrome (its page controls and zoom), so the viewer's zoom
  *  and rotate do not apply and are hidden for PDFs. */
 export const VIEWER_PDF_EXT = new Set(["pdf"]);
+
+/** 0.476.2: the reading-column width (42rem) the preview's reading-width toggle
+ *  caps text AND images to. Images are transform-scaled, so this feeds fitScale
+ *  rather than a CSS max-width. */
+const READING_WIDTH_PX = 42 * 16;
 /** Rendered as text. A LIST rather than byte-sniffing: wrongly painting a
  *  binary as text is far more jarring than showing a file card. */
 export const VIEWER_TEXT_EXT = new Set([
@@ -162,7 +167,8 @@ export class MediaViewerModal extends Modal {
    *  every slide, since the whole preview is about this one note. */
   private noteItem: MediaItem | null = null;
   private immersive = false;
-  private noteNarrow = true;              // note slide starts at a readable width
+  private noteNarrow = true;              // note / text slide starts at a readable width
+  private imgNarrow = false;              // 0.476.2: images start fit-to-window; toggle narrows them
   private naturalW = 0;
   private naturalH = 0;
   /** Set once the current item has been sized, so "fit" is not computed against
@@ -301,7 +307,8 @@ export class MediaViewerModal extends Modal {
 
     // 0.377.0: reading-width (note slide) + copy-link (note-level).
     try { this.noteNarrow = window.localStorage.getItem("stashpad-preview-narrow") !== "0"; } catch { /* default true */ }
-    this.readWidthBtn = act("text", "Toggle reading width", () => this.toggleReadingWidth());
+    try { this.imgNarrow = window.localStorage.getItem("stashpad-preview-img-narrow") === "1"; } catch { /* default false */ }
+    this.readWidthBtn = act("text", "Toggle reading width / stretch", () => this.toggleReadingWidth());
     this.copyLinkBtn = act("link", "Copy a link to this note", () => void this.copyNoteLink());
     this.jumpParentBtn = act("corner-left-up", "Open the parent note in a new tab", () => {
       const jump = this.noteItem?.note?.onJumpToParent;
@@ -616,11 +623,20 @@ export class MediaViewerModal extends Modal {
     return presets[c] ?? null;
   }
 
-  /** 0.377.0: toggle the note slide between a readable width and full width. */
+  /** 0.377.0: toggle the current slide between reading width and full width.
+   *  0.476.2: images have their OWN state (`imgNarrow`, default full so a photo
+   *  still opens fit-to-window) so stretching a photo doesn't also widen your
+   *  text preview, and vice-versa. The button acts on whichever is current. */
   private toggleReadingWidth(): void {
+    if (this.mediaEl instanceof HTMLImageElement) {
+      this.imgNarrow = !this.imgNarrow;
+      try { window.localStorage.setItem("stashpad-preview-img-narrow", this.imgNarrow ? "1" : "0"); } catch { /* ignore */ }
+      this.fit(); // re-fit to (or away from) the reading-column cap
+      return;
+    }
     this.noteNarrow = !this.noteNarrow;
     try { window.localStorage.setItem("stashpad-preview-narrow", this.noteNarrow ? "1" : "0"); } catch { /* ignore */ }
-    // 0.474.2: applies to whichever text-like slide is current — note or text file.
+    // Applies to whichever text-like slide is current — note or text file.
     this.panEl.querySelector(".stashpad-media-note")?.toggleClass("is-narrow", this.noteNarrow);
     this.panEl.querySelector(".stashpad-media-textwrap")?.toggleClass("is-narrow", this.noteNarrow);
   }
@@ -898,10 +914,10 @@ export class MediaViewerModal extends Modal {
     this.noteActionsEl.toggleClass("is-hidden", !nc);
     this.copyLinkBtn.toggleClass("is-hidden", !nc);
     this.jumpParentBtn.toggleClass("is-hidden", !nc?.note?.onJumpToParent);
-    // 0.474.2: reading width now applies to the note slide AND text-file slides
-    // (both render prose/text that spans the whole stage otherwise).
+    // 0.474.2 / 0.476.2: reading width applies to the note slide, text-file slides
+    // AND images — all otherwise span the whole stage.
     const rwExt = item?.file?.extension.toLowerCase() ?? "";
-    const readWidthApplies = !!item?.note || (!item?.note && VIEWER_TEXT_EXT.has(rwExt));
+    const readWidthApplies = !!item?.note || VIEWER_TEXT_EXT.has(rwExt) || VIEWER_IMG_EXT.has(rwExt);
     this.readWidthBtn.toggleClass("is-hidden", !readWidthApplies);
     this.largeTextBtn.toggleClass("is-hidden", !item?.note?.onLargeText);
     // Save / reveal apply to the CURRENT file — note `.md` or attachment alike.
@@ -1277,9 +1293,16 @@ export class MediaViewerModal extends Modal {
     const quarterTurned = Math.abs(this.rotation % 180) === 90;
     const w = quarterTurned ? this.naturalH : this.naturalW;
     const h = quarterTurned ? this.naturalW : this.naturalH;
+    // 0.476.2: the reading-width toggle constrains IMAGES too — cap the fit WIDTH
+    // to the reading column so a photo doesn't span the whole window. Toggle off
+    // (noteNarrow=false) restores full fit-to-window. Images only; a note/text
+    // slide has no mediaEl and narrows via CSS instead.
+    const fitW = (this.mediaEl instanceof HTMLImageElement && this.imgNarrow)
+      ? Math.min(r.width, READING_WIDTH_PX)
+      : r.width;
     // Never scale a small image UP to fill the stage — blowing a 40px icon up
     // to full screen is not "fit", it is a blurry mess.
-    return Math.min(r.width / w, r.height / h, 1);
+    return Math.min(fitW / w, r.height / h, 1);
   }
 
   /** Fit AND centre. Centring is separate from scaling on purpose: the pan

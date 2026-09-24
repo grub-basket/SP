@@ -65,7 +65,7 @@ export interface ModShortcuts {
  *  descriptions live in COMMAND_META below. */
 export type CommandId =
   | "move" | "pickMove" | "merge" | "copy" | "copyTree" | "copyLink" | "openEditor" | "openTab"
-  | "split" | "edit" | "editParent" | "copyOutline"
+  | "split" | "edit" | "editParent" | "editInComposer" | "copyOutline"
   | "toggleSplit" | "pickDestination" | "search" | "searchInParent" | "findInList" | "delete" | "undo" | "redo"
   | "toggleComplete" | "moveUp" | "moveDown" | "moveToTop" | "moveToBottom"
   | "outdent" | "setColor"
@@ -124,6 +124,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "split",           label: "Split note",                    desc: "Split the cursor row (or focused note) into two notes at a chosen line.",                defaultPrimary: "S" },
   { id: "edit",            label: "Edit note in Stashpad",         desc: "Edit the cursor row (or focused note) in Stashpad's own editor (with a Split toggle) instead of a full Obsidian tab.", defaultPrimary: "E" },
   { id: "editParent",      label: "Edit parent note in Stashpad",  desc: "Edit the focused parent note in Stashpad's own editor.",                                 defaultPrimary: "Shift+E" },
+  { id: "editInComposer",  label: "Edit note in the composer",     desc: "Edit the cursor row (or focused note) in the COMPOSER — its text loads there so you can revise it inline; Send saves. Esc twice exits. No default chord — bind one here if you want it.", defaultPrimary: "" },
   { id: "copyOutline",     label: "Copy as outline",               desc: "Copy selection (or cursor row) as a nested ![[embed]] outline.",                         defaultPrimary: "L" },
   { id: "toggleSplit",     label: "Toggle split-on-newlines",      desc: "Default: Mod+/",                                                                          defaultPrimary: "Mod+/" },
   { id: "pickDestination", label: "Pick destination",              desc: "Default: Mod+D",                                                                          defaultPrimary: "Mod+D" },
@@ -778,6 +779,24 @@ export interface StashpadSettings {
    *  0.55.5 wires this up). Stored as a string array on disk so future
    *  categories load gracefully. */
   mutedNotificationCategories: string[];
+  /** 0.480.0: deep-link receipts ("Opened X from a link") stay on screen until
+   *  dismissed. On by default, because the receipt exists to answer "did the
+   *  link work?" for someone who wasn't watching the screen when it arrived —
+   *  and a toast that has already faded answers nothing. Off gives it the
+   *  ordinary few-second life of every other toast. Either way it's recorded in
+   *  the notification history and in the link log. */
+  deepLinkReceiptSticky: boolean;
+  /** 0.481.0: retention for the link log behind "Recent links". **0 = keep
+   *  everything**, the default — the log's whole value is answering "did that
+   *  link I sent last month ever open?", and a silent cap is the one thing
+   *  that could make it answer wrongly. Set a number to cap it; the viewer
+   *  edits the same value and reports the entry count so growth is visible. */
+  linkLogLimit: number;
+  /** 0.482.0: at startup, if the clipboard holds a Stashpad link for this vault
+   *  that nothing has acted on before, open it and offer to close it again.
+   *  The fallback for a link dispatched before the plugin existed to receive
+   *  it. Desktop only; at most one tab per unique link, ever. */
+  openClipboardLinkOnLaunch: boolean;
   /** 0.72.6: navigate INTO the destination parent automatically after
    *  moving a note via the in-parent picker (drag-onto-sibling). When
    *  off (default), the picker just reparents in place and selects the
@@ -1275,6 +1294,9 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   hideCompletedNotes: {},
   attachmentsOnlyNotes: {},
   mutedNotificationCategories: [],
+  deepLinkReceiptSticky: true,
+  linkLogLimit: 0,
+  openClipboardLinkOnLaunch: true,
   notificationHistoryLimit: 5000,
   notifiedDueKeys: [],
   trustedXvSources: [],
@@ -2031,6 +2053,35 @@ export class StashpadSettingTab extends PluginSettingTab {
     ];
     return [
       ...teamGroup,
+      this.renderDef("Link receipts stay until dismissed",
+        "When an obsidian://stashpad link opens a note, the confirmation toast stays on screen until you dismiss it, instead of fading after a few seconds. On by default: the receipt is there to prove the link worked for someone who wasn’t watching the screen — especially with “new tabs open in the background” on, where a working link and a dropped one look identical. Turn it off for an ordinary short toast; either way it’s recorded in the notification history and in Recent links. Silence receipts entirely with the “Links” category below.",
+        (s) => s.addToggle((t) => t.setValue(s0.deepLinkReceiptSticky).onChange(async (v) => { s0.deepLinkReceiptSticky = v; await this.plugin.saveSettings(); })),
+        ["link", "deep link", "receipt", "sticky", "persistent", "toast", "notification"]),
+      this.renderDef("Open a clipboard link at startup",
+        "When Obsidian starts, if the clipboard holds an obsidian://stashpad link for this vault that hasn’t been acted on before, open it — and show a notification with a “Close it” button in case it wasn’t wanted. This is the fallback for a link clicked while Obsidian was closed, which the app can dispatch before Stashpad exists to receive it. It cannot nag: each link is acted on once ever (the link log remembers), a link you copied yourself is never re-opened, and it stands down entirely if a link already opened this session. Desktop only — reading the clipboard on a phone is a visible, permissioned act, and doing it unprompted at every launch isn’t worth a fallback.",
+        (s) => s.addToggle((t) => t.setValue(s0.openClipboardLinkOnLaunch).onChange(async (v) => { s0.openClipboardLinkOnLaunch = v; await this.plugin.saveSettings(); })),
+        ["link", "clipboard", "startup", "launch", "deep link", "paste", "open"]),
+      this.renderDef("Recent links",
+        "Every obsidian://stashpad link this vault has copied, received, or found on the clipboard — with what became of each one: opened, revealed an already-open tab, not found here, or never used. This is where to look when a link seems not to have worked: a link that arrived leaves an entry, so an absence means it never reached Stashpad at all.",
+        (s) => s.addButton((b) => b.setButtonText("View recent links").onClick(() => void this.plugin.openRecentLinks())),
+        ["link", "deep link", "history", "log", "recent", "clipboard"]),
+      this.renderDef("Link history limit",
+        "How many link-log entries to keep. 0 (the default) keeps everything — the log answers questions about links you sent weeks ago, so it doesn’t discard by default. The same value can be edited inside the Recent links view, which also shows the current entry count.",
+        (s) => s.addText((t) => {
+          t.setValue(String(this.plugin.settings.linkLogLimit ?? 0)).setPlaceholder("0");
+          // Commit on blur/Enter, not per keystroke: setLimit TRIMS, so typing
+          // "500" would pass through 5 and throw away everything but the last
+          // five entries on the way to the number meant.
+          const commit = async (): Promise<void> => {
+            const n = parseInt(t.getValue(), 10);
+            if (!Number.isFinite(n) || n < 0) { t.setValue(String(this.plugin.settings.linkLogLimit ?? 0)); return; }
+            this.plugin.settings.linkLogLimit = n;
+            this.plugin.linkLog.setLimit(n);
+            await this.plugin.saveSettings();
+          };
+          t.inputEl.addEventListener("blur", () => void commit());
+          t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
+        }), ["link", "history", "limit", "retention", "log"]),
       this.renderDef("Notification history limit", "Maximum number of notifications kept in the persistent history. Set to 0 for unlimited (the file size grows with usage; expect a few hundred KB per ~5000 entries). Default: 5000.", (s) =>
         s.addText((t) => {
           t.setValue(String(this.plugin.settings.notificationHistoryLimit ?? 5000)).setPlaceholder("5000");
@@ -2823,6 +2874,36 @@ export class StashpadSettingTab extends PluginSettingTab {
   private actionListBuilder(host: HTMLElement, getIds: () => string[], setIds: (ids: string[]) => void, emptyText: string, opts?: { allowCustom?: boolean; catalogIds?: readonly string[]; defaultOrder?: readonly string[]; ctxHide?: boolean }): void {
     const wrap = host.createDiv({ cls: "stashpad-action-builder" });
     const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
+    // 0.476.2: drag-to-reorder (the ▲▼ buttons still work). Listeners live on the
+    // wrapper (persist across rebuilds) and read the CURRENT ids via effective().
+    let dragFrom = -1;
+    const rowFrom = (e: Event): HTMLElement | null => (e.target as HTMLElement | null)?.closest?.(".stashpad-action-row") ?? null;
+    wrap.addEventListener("dragstart", (e) => {
+      const r = rowFrom(e); if (!r) return;
+      dragFrom = Number(r.dataset.idx);
+      r.addClass("is-dragging");
+      (e as DragEvent).dataTransfer?.setData("text/plain", String(dragFrom));
+    });
+    wrap.addEventListener("dragend", () => { wrap.querySelectorAll(".stashpad-action-row.is-dragging, .stashpad-action-row.is-drop-target").forEach((el) => { el.removeClass("is-dragging"); el.removeClass("is-drop-target"); }); dragFrom = -1; });
+    wrap.addEventListener("dragover", (e) => {
+      if (dragFrom < 0) return;
+      e.preventDefault();
+      const r = rowFrom(e);
+      wrap.querySelectorAll(".stashpad-action-row.is-drop-target").forEach((el) => el.removeClass("is-drop-target"));
+      if (r && Number(r.dataset.idx) !== dragFrom) r.addClass("is-drop-target");
+    });
+    wrap.addEventListener("drop", (e) => {
+      if (dragFrom < 0) return;
+      e.preventDefault();
+      const r = rowFrom(e); const from = dragFrom; dragFrom = -1;
+      if (!r) return;
+      const to = Number(r.dataset.idx);
+      if (Number.isNaN(to) || to === from) return;
+      const n = effective().slice();
+      const [moved] = n.splice(from, 1);
+      n.splice(to, 0, moved);
+      void rerender(true, n);
+    });
     const rerender = async (persist: boolean, ids: string[]) => {
       setIds(ids);
       if (persist) await this.plugin.saveSettings();
@@ -2844,6 +2925,13 @@ export class StashpadSettingTab extends PluginSettingTab {
       ids.forEach((id, i) => {
         const { icon, name } = label(id);
         const row = new Setting(wrap).setName(name);
+        // 0.476.2: drag-reorder affordance + hooks (handlers live on `wrap`).
+        row.settingEl.addClass("stashpad-action-row");
+        row.settingEl.draggable = true;
+        row.settingEl.dataset.idx = String(i);
+        const grip = createSpan({ cls: "stashpad-action-grip" });
+        setIcon(grip, "grip-vertical");
+        row.settingEl.prepend(grip);
         const ic = row.nameEl.createSpan({ cls: "stashpad-cmdicon-preview" });
         setIcon(ic, icon); row.nameEl.prepend(ic);
         row.addExtraButton((b) => b.setIcon("arrow-up").setTooltip("Move up").setDisabled(i === 0).onClick(async () => {
