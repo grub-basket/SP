@@ -1,5 +1,6 @@
-import { App, ItemView, Menu, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { App, ItemView, Menu, TFile, WorkspaceLeaf, setIcon, type EventRef } from "obsidian";
 import { notify } from "./notify";
+import { returnToOriginOnClose } from "./leaf-return";
 import type StashpadPlugin from "./main";
 import {
   ROOT_ID,
@@ -1228,7 +1229,12 @@ export async function openStashpadPanelsView(app: App): Promise<void> {
  *  MAIN editor area — reuses an existing one on the same panel if present, else
  *  a new tab. Backs the launcher entries; the step toward deprecating the
  *  combined sidebar panel by giving each panel its own view. */
-export async function openStashpadSinglePanel(app: App, panel: PanelId): Promise<void> {
+export async function openStashpadSinglePanel(
+  app: App, panel: PanelId,
+  // 0.486.0: optional so existing callers keep working; passed by main.ts so the
+  // return-on-close listener is OWNED by the plugin and cleaned on unload.
+  register?: (ref: EventRef) => void,
+): Promise<void> {
   const existing = app.workspace.getLeavesOfType(STASHPAD_PANELS_VIEW_TYPE)
     .find((l) => (l.view as StashpadPanelsView)?.getState?.()?.singlePanel === panel);
   if (existing) {
@@ -1236,7 +1242,9 @@ export async function openStashpadSinglePanel(app: App, panel: PanelId): Promise
     app.workspace.setActiveLeaf(existing, { focus: true });
     return;
   }
+  const prev = app.workspace.activeLeaf;
   const leaf = app.workspace.getLeaf("tab");
   await leaf.setViewState({ type: STASHPAD_PANELS_VIEW_TYPE, active: true, state: { singlePanel: panel, activePanel: panel } });
   app.workspace.revealLeaf(leaf);
+  returnToOriginOnClose(app.workspace, leaf, prev, register);
 }

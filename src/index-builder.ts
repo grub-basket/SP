@@ -568,6 +568,9 @@ export function buildJdPreviewNotice(
     ev.stopPropagation();
     if (result.previewPath) {
       const af = app.vault.getAbstractFileByPath(result.previewPath);
+      // tab-return: n/a — fired from a transient Notice with no plugin handle to
+      // own the listener, and returnToOriginOnClose's `register` exists precisely
+      // so a never-closed tab cannot leak one. Revisit if this gains a plugin ref.
       if (af instanceof TFile) await app.workspace.getLeaf("tab").openFile(af);
     }
     notice?.hide();

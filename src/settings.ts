@@ -1147,7 +1147,118 @@ export interface StashpadSettings {
   /** Epoch ms of the last tidy run (manual OR scheduled); 0 = never run. Drives
    *  the catch-up-vs-wait decision for the schedule above. */
   tidyTabsLastRun: number;
+  /** 0.485.0 — the MAINTENANCE WINDOW. One gate that every background vault
+   *  sweep can consult, so an expensive sweep can be held back on a slow /
+   *  network drive instead of firing while you're trying to work.
+   *
+   *  `maintenanceWindowMode` sets the window; `maintenanceWindowSweeps` decides,
+   *  PER SWEEP, whether that sweep obeys it. Every sweep defaults to `false` =
+   *  "run as it always has", so this whole feature is pure opt-in and nobody's
+   *  vault changes behaviour on upgrade.
+   *
+   *  Scope is MAINTENANCE ONLY — derived/recovery data that can be rebuilt (key
+   *  discovery, tab tidying, author stubs, auto-import sweeps). It must never
+   *  gate a user-initiated action, a note write, `data.json`, or undo state:
+   *  deferring real user data would turn a performance feature into a data-loss
+   *  feature. */
+  maintenanceWindowMode: MaintenanceWindowMode;
+  /** Start/end of your WORKING hours (0–23 / 0–24), read in
+   *  `maintenanceWindowTimezone`. In `outside-hours` mode maintenance is blocked
+   *  DURING these hours and allowed outside them — the inverse of the obscure
+   *  schedule, which runs inside its window. `end < start` is an overnight shift
+   *  (e.g. 22→6). start === end means "no working hours" → always allowed. */
+  maintenanceWorkStart: number;
+  maintenanceWorkEnd: number;
+  /** IANA zone the working hours are anchored to; empty = follow this device.
+   *  Same shape (and same helpers) as `obscureScheduleTimezone`. */
+  maintenanceWindowTimezone: string;
+  /** Recently-used zones for the chips, most-recent first (see
+   *  `obscureScheduleTimezoneHistory`). */
+  maintenanceWindowTimezoneHistory: string[];
+  /** Length 7, index 0 = Sunday … 6 = Saturday. `true` = a WORKING day, so the
+   *  hours above apply. A day set to false is a day off → maintenance is allowed
+   *  all day. Read defensively: a missing/short entry counts as a working day. */
+  maintenanceWorkWeekdays: boolean[];
+  /** `idle-only` mode: minutes of no keyboard/pointer input before maintenance is
+   *  allowed. A backgrounded Obsidian window counts as idle immediately. */
+  maintenanceIdleMinutes: number;
+  /** Per-sweep sub-switch. `true` = this sweep obeys the window above; `false`
+   *  (the default for every sweep) = it runs exactly as it does today. Keyed by
+   *  `MaintenanceSweepId`; read through `maintenanceSweepObeysWindow()` so a key
+   *  missing from stored data is treated as `false`. */
+  maintenanceWindowSweeps: Partial<Record<MaintenanceSweepId, boolean>>;
 }
+
+/** 0.485.0 — how the maintenance window is decided.
+ *  • `always` — run whenever due. Today's behaviour, and the default.
+ *  • `outside-hours` — block during the configured working hours/days.
+ *  • `idle-only` — run only after N minutes of no input, or while the window is
+ *    in the background.
+ *  • `manual` — never run automatically; only via the "Run deferred background
+ *    maintenance now" command. */
+export type MaintenanceWindowMode = "always" | "outside-hours" | "idle-only" | "manual";
+
+/** 0.485.0 — the background vault sweeps that can be put behind the maintenance
+ *  window. Ids are PERSISTED keys in `maintenanceWindowSweeps` — renaming one
+ *  silently resets that user's choice, so treat them as a wire format. */
+export type MaintenanceSweepId =
+  | "stashKeyIndex"
+  | "scheduledTidy"
+  | "autoImport"
+  | "authorStubs"
+  | "excludedArchives";
+
+export interface MaintenanceSweepMeta {
+  id: MaintenanceSweepId;
+  name: string;
+  /** Current cadence, shown in the UI so the cost is legible. */
+  cadence: string;
+  desc: string;
+  /** True when the sweep has its own recurring interval, so a skipped tick is
+   *  retried by that interval on its own. False = startup-only, which means a
+   *  skipped run must be picked up by the deferred-maintenance drain or it never
+   *  happens in that session. */
+  selfRetries: boolean;
+}
+
+/** Catalog order = the order the sub-switches render in: most expensive first. */
+export const MAINTENANCE_SWEEPS: MaintenanceSweepMeta[] = [
+  {
+    id: "stashKeyIndex",
+    name: "Re-scan for folder passwords",
+    cadence: "every 10 minutes, plus after each sync burst",
+    desc: "Looks for `.stashkey` files that arrived since the last scan. This is BY FAR the most expensive sweep on a network drive — it lists every directory in the vault, so a department share with 10,000 folders can take minutes, and it repeats. What you give up by deferring it: a folder password you set on ANOTHER device and synced over won't be noticed until the window opens or you restart Obsidian, so that folder stays locked here in the meantime. The scan Stashpad does at startup is never deferred, so nothing is ever missed at launch.",
+    selfRetries: true,
+  },
+  {
+    id: "scheduledTidy",
+    name: "Auto-tidy Stashpad tabs",
+    cadence: "every 5 minutes",
+    desc: "Closes duplicate and orphaned Stashpad tabs on the schedule you set under \"Auto-tidy Stashpad tabs\". No-op unless that schedule is on.",
+    selfRetries: true,
+  },
+  {
+    id: "autoImport",
+    name: "Auto-import sweep",
+    cadence: "every 5 minutes",
+    desc: "Catches files copied into an import folder by Finder/Explorer, which fire no vault event. No-op unless auto-import is on.",
+    selfRetries: true,
+  },
+  {
+    id: "authorStubs",
+    name: "Seed author files",
+    cadence: "once, ~4s after launch",
+    desc: "Makes sure your author stub exists in every Stashpad folder so your name shows on notes you edit.",
+    selfRetries: false,
+  },
+  {
+    id: "excludedArchives",
+    name: "Register archives as excluded files",
+    cadence: "once, ~4.5s after launch",
+    desc: "Adds each Stashpad folder's `_archive` to Obsidian's \"Excluded files\" so native search de-prioritises import originals.",
+    selfRetries: false,
+  },
+];
 
 export const DEFAULT_SETTINGS: StashpadSettings = {
   folder: "Stashpad",
@@ -1377,6 +1488,16 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   bodySliceRail: true,
   tidyTabsSchedule: "off",
   tidyTabsLastRun: 0,
+  // 0.485.0: maintenance window. `always` + every sub-switch off === today's
+  // behaviour, so an upgrade changes nothing until the user opts a sweep in.
+  maintenanceWindowMode: "always",
+  maintenanceWorkStart: 9,
+  maintenanceWorkEnd: 17,
+  maintenanceWindowTimezone: "",
+  maintenanceWindowTimezoneHistory: [],
+  maintenanceWorkWeekdays: [false, true, true, true, true, true, false],
+  maintenanceIdleMinutes: 5,
+  maintenanceWindowSweeps: {},
   bindings: buildDefaultBindings(),
 };
 
@@ -1435,6 +1556,113 @@ function currentHourInTz(tz: string | undefined, now: Date): number {
     return (hh % 24) + mm / 60; // "24:00" midnight → 0
   } catch {
     return local; // invalid tz id → device local
+  }
+}
+
+/** 0.485.0 — the settings slice the maintenance gate reads. Narrow on purpose:
+ *  the gate is a pure function of settings + clock + idle state, so it can be
+ *  reasoned about (and unit-checked) without a plugin instance. */
+export type MaintenanceWindowSettings = Pick<
+  StashpadSettings,
+  "maintenanceWindowMode" | "maintenanceWorkStart" | "maintenanceWorkEnd"
+  | "maintenanceWindowTimezone" | "maintenanceWorkWeekdays" | "maintenanceIdleMinutes"
+>;
+
+/** Live inputs the gate can't get from settings. `idleMs` = ms since the last
+ *  keyboard/pointer input in this window; `hidden` = the Obsidian window is in
+ *  the background (counts as idle immediately — nobody is waiting on it). */
+export interface MaintenanceRuntimeState { idleMs: number; hidden: boolean }
+
+/** 0.485.0 — is NOW inside the user's configured WORKING hours?
+ *
+ *  Deliberately the INVERSE relationship to `isWithinObscureSchedule`: that one's
+ *  window is when the feature ENGAGES, this one's window is when maintenance must
+ *  stay OUT of the way. The hour/weekday/timezone arithmetic is otherwise
+ *  identical and shares the same `currentHourInTz` / `currentWeekdayInTz` helpers,
+ *  so the two can't disagree about what "9" or "Tuesday" means.
+ *
+ *  `start === end` means "no working hours configured" → false (never blocking),
+ *  which makes a half-configured window fail OPEN to today's behaviour rather
+ *  than silently freezing every sweep. */
+export function isWithinWorkingHours(s: MaintenanceWindowSettings, now: Date = new Date()): boolean {
+  const wd = s.maintenanceWorkWeekdays;
+  // A day switched OFF is a day off: the hours don't apply, so we're never "at
+  // work". A missing/short entry counts as a working day (the conservative
+  // reading — it keeps maintenance deferred rather than letting it loose).
+  if (Array.isArray(wd) && wd[currentWeekdayInTz(s.maintenanceWindowTimezone, now)] === false) return false;
+  const h = currentHourInTz(s.maintenanceWindowTimezone, now);
+  const start = Math.max(0, Math.min(23, s.maintenanceWorkStart));
+  const end = Math.max(0, Math.min(24, s.maintenanceWorkEnd));
+  if (start === end) return false;
+  if (start < end) return h >= start && h < end;
+  return h >= start || h < end; // overnight shift (e.g. 22→6)
+}
+
+/** 0.485.0 — may background maintenance run right now?
+ *
+ *  This answers the WINDOW question only. Whether a given sweep consults the
+ *  window at all is `maintenanceSweepObeysWindow()`; callers go through
+ *  `StashpadPlugin.maintenanceAllowed()`, which combines the two.
+ *
+ *  An unrecognised mode falls through to `true` — a bad stored value must not be
+ *  able to permanently disable key discovery or auto-import. */
+export function isWithinMaintenanceWindow(
+  s: MaintenanceWindowSettings,
+  runtime: MaintenanceRuntimeState,
+  now: Date = new Date(),
+): boolean {
+  switch (s.maintenanceWindowMode) {
+    case "manual": return false;
+    case "outside-hours": return !isWithinWorkingHours(s, now);
+    case "idle-only": {
+      if (runtime.hidden) return true;
+      const mins = Math.max(0, Math.min(240, s.maintenanceIdleMinutes));
+      return runtime.idleMs >= mins * 60 * 1000;
+    }
+    case "always":
+    default: return true;
+  }
+}
+
+/** 0.485.0 — does this sweep consult the window? Default FALSE for every sweep:
+ *  an absent key (a fresh install, or a sweep added in a later version than the
+ *  stored data) means "behave exactly as before". Only an explicit `true` opts a
+ *  sweep in. */
+export function maintenanceSweepObeysWindow(
+  s: Pick<StashpadSettings, "maintenanceWindowSweeps">,
+  id: MaintenanceSweepId,
+): boolean {
+  return s.maintenanceWindowSweeps?.[id] === true;
+}
+
+/** 0.485.0 — one human sentence describing when maintenance will actually run,
+ *  shown live under the mode dropdown. The point is to close the inversion trap:
+ *  the user configures WORKING hours but cares about the COMPLEMENT, so spell the
+ *  complement out rather than making them do the arithmetic. */
+export function describeMaintenanceWindow(s: MaintenanceWindowSettings): string {
+  const hh = (n: number): string => `${String(Math.max(0, Math.min(24, Math.trunc(n)))).padStart(2, "0")}:00`;
+  const zone = s.maintenanceWindowTimezone ? ` (${s.maintenanceWindowTimezone})` : "";
+  switch (s.maintenanceWindowMode) {
+    case "manual":
+      return "Opted-in sweeps will NOT run on their own. Use the command \"Stashpad: Run deferred background maintenance now\".";
+    case "idle-only": {
+      const mins = Math.max(0, Math.min(240, s.maintenanceIdleMinutes));
+      return `Opted-in sweeps run after ${mins === 1 ? "1 minute" : `${mins} minutes`} without typing or clicking, or any time the Obsidian window is in the background.`;
+    }
+    case "outside-hours": {
+      const start = Math.max(0, Math.min(23, s.maintenanceWorkStart));
+      const end = Math.max(0, Math.min(24, s.maintenanceWorkEnd));
+      const wd = Array.isArray(s.maintenanceWorkWeekdays) ? s.maintenanceWorkWeekdays : [];
+      const offDays = WEEKDAY_ABBR.filter((_, i) => wd[i] === false);
+      const allDaysOff = offDays.length === 7;
+      if (allDaysOff) return "No working days are set, so opted-in sweeps run whenever they're due.";
+      if (start === end) return "No working hours are set (start and end match), so opted-in sweeps run whenever they're due.";
+      const offNote = offDays.length ? ` All day on ${offDays.join(", ")}.` : "";
+      return `Opted-in sweeps run between ${hh(end)} and ${hh(start)}${zone} — outside your ${hh(start)}–${hh(end)} working hours.${offNote}`;
+    }
+    case "always":
+    default:
+      return "Opted-in sweeps run whenever they're due — the same as having no window at all.";
   }
 }
 /** 0.268.13: keys whose change cannot affect how a list RENDERS.
@@ -1888,6 +2116,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         "Import from and export to plain markdown, plus a portable .stash bundle.",
         "Optional per-folder encryption for notes you'd rather not leave in plaintext.",
         "Sidebar panels: folders, a detail pane, and aggregate archive/trash views.",
+        "On a slow or network drive: a background maintenance window (Maintenance tab) that holds Stashpad's whole-vault sweeps outside your working hours.",
       ]) ul.createEl("li", { text: line });
     }, ["features", "what can it do"]));
 
@@ -2463,6 +2692,214 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.341.0: device-local settings backups — a toggle + a per-device list of
    *  snapshots you can restore. Guards against a synced device overwriting this
    *  vault's settings (the snapshots live in a dot folder Sync doesn't carry). */
+  /** 0.485.0 — the maintenance window: ONE window at the top, then one checkbox
+   *  per background sweep saying whether that sweep obeys it.
+   *
+   *  Shape chosen by the user (2026-09-25): a single place to say "when", rather
+   *  than a separate schedule bolted onto each feature — so you can defer the
+   *  expensive `.stashkey` walk while leaving auto-import live. Every sub-switch
+   *  defaults to OFF (= today's behaviour), so this ships as pure opt-in.
+   *
+   *  Rendered as a sectionDef rather than per-setting renderDefs because the mode
+   *  dropdown, the hours, the weekday chips and the live "here's when it'll
+   *  actually run" line are one coupled control — splitting them would let native
+   *  settings search surface an hour dropdown with no context. The sweep list is
+   *  still searchable via the aliases. */
+  private maintenanceWindowSection(): SettingDefinitionItem {
+    return this.sectionDef(
+      "Background maintenance window",
+      "Choose WHEN Stashpad's background vault sweeps are allowed to run, and which ones obey that window. Made for slow or network drives, where re-scanning the whole vault mid-workday is the thing that makes Stashpad feel stuck.",
+      (host) => {
+        const s = this.plugin.settings;
+        // Two update paths, deliberately:
+        //  • `restructured()` — a full re-render, for changes that add/remove whole
+        //    control GROUPS (the mode dropdown, the sweep toggles' ⏳ markers).
+        //  • `applied()` — save + refresh the live "here's when it'll run" line in
+        //    place, for changes that only alter values. A full re-render here would
+        //    be heavier and, per the 0.302.0 note on the obscure-schedule chips
+        //    below, does NOT reliably repaint a chip button — so chips must always
+        //    restyle themselves rather than lean on it.
+        let refreshDesc: () => void = () => { /* set once the mode row exists */ };
+        const applied = (): void => { void this.plugin.saveSettings(); refreshDesc(); };
+        const restructured = (): void => { void this.plugin.saveSettings().then(() => this.display()); };
+
+        new Setting(host).setName("Background maintenance window").setHeading();
+        host.createEl("p", {
+          cls: "setting-item-description",
+          text: "Stashpad runs a few background sweeps over the whole vault. On a local disk they're invisible. On a network share or a department drive they can take minutes — and some repeat every few minutes — which is what makes the plugin feel frozen while you're trying to work. Set a window here and pick which sweeps should wait for it.",
+        });
+        host.createEl("p", {
+          cls: "setting-item-description",
+          text: "This only ever delays BACKGROUND maintenance — work that can be rebuilt later (finding folder passwords, tidying tabs, seeding author files, sweeping for dropped imports). It never delays saving a note, anything you just asked for, or your settings. Nothing is skipped permanently; it's postponed to the window.",
+        });
+
+        const modeRow = new Setting(host)
+          .setName("When may background maintenance run?")
+          .setDesc(describeMaintenanceWindow(s))
+          .addDropdown((d) => d
+            .addOption("always", "Whenever it's due (default)")
+            .addOption("outside-hours", "Only outside my working hours")
+            .addOption("idle-only", "Only when I'm idle")
+            .addOption("manual", "Never automatically — I'll run it myself")
+            .setValue(s.maintenanceWindowMode)
+            // Changing the mode shows/hides whole control groups below, so this one
+            // genuinely needs the full re-render.
+            .onChange((v) => { s.maintenanceWindowMode = v as MaintenanceWindowMode; restructured(); }));
+        // Every value change re-derives this sentence, so the user never has to work
+        // out the complement of their working hours themselves.
+        refreshDesc = (): void => { modeRow.setDesc(describeMaintenanceWindow(this.plugin.settings)); };
+
+        // ---- mode-specific controls -------------------------------------
+        if (s.maintenanceWindowMode === "outside-hours") {
+          host.createEl("p", {
+            cls: "setting-item-description",
+            text: "Enter the hours you're WORKING. Maintenance is blocked during them and runs outside them. An end earlier than the start is an overnight shift (e.g. 22 to 6). The line above always spells out the hours it will actually run in, so you don't have to do the arithmetic.",
+          });
+          const hourDropdown = (setting: Setting, get: () => number, put: (n: number) => void): void => {
+            setting.addDropdown((d) => {
+              for (let h = 0; h < 24; h++) d.addOption(String(h), `${String(h).padStart(2, "0")}:00`);
+              d.setValue(String(Math.max(0, Math.min(23, get()))));
+              d.onChange((v) => { put(parseInt(v, 10) || 0); applied(); });
+            });
+          };
+          hourDropdown(new Setting(host).setName("Working hours start"), () => s.maintenanceWorkStart, (n) => { s.maintenanceWorkStart = n; });
+          hourDropdown(new Setting(host).setName("Working hours end"), () => s.maintenanceWorkEnd, (n) => { s.maintenanceWorkEnd = n; });
+
+          // Home timezone — same shape as the obscure schedule's, and it reads the
+          // hours through the SAME helpers, so the two can't disagree about what
+          // "9" means. Empty = follow the device.
+          const deviceTz = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch { return ""; } })();
+          const setTz = (tz: string): void => {
+            const prev = s.maintenanceWindowTimezone;
+            const hist = s.maintenanceWindowTimezoneHistory ?? [];
+            s.maintenanceWindowTimezoneHistory = [...new Set([prev, tz, ...hist].filter((z) => !!z))].slice(0, 6);
+            s.maintenanceWindowTimezone = tz;
+            // Structural: this adds a chip and can add/remove the "Follow device"
+            // button, so the section has to be rebuilt — the in-place desc refresh
+            // isn't enough here.
+            restructured();
+          };
+          const tzSetting = new Setting(host)
+            .setName("Home timezone")
+            .setDesc(s.maintenanceWindowTimezone
+              ? `Working hours are read in ${s.maintenanceWindowTimezone}.`
+              : `Following this device (${deviceTz || "local"}). Lock it in so the window stays in home time when you travel.`);
+          tzSetting.addButton((b) => b.setButtonText("Use current").onClick(() => setTz(deviceTz)));
+          if (s.maintenanceWindowTimezone) {
+            tzSetting.addButton((b) => b.setButtonText("Follow device").onClick(() => {
+              s.maintenanceWindowTimezone = "";
+              restructured(); // removes this button + unmarks the active chip
+            }));
+          }
+          const activeTz = s.maintenanceWindowTimezone;
+          const chips = (s.maintenanceWindowTimezoneHistory ?? []).filter((z) => !!z);
+          if (chips.length) {
+            const row = host.createDiv({ cls: "stashpad-tz-chips" });
+            row.createSpan({ cls: "setting-item-description", text: "Recent: " });
+            for (const z of chips) {
+              const chip = row.createEl("button", { cls: "stashpad-tz-chip" + (z === activeTz ? " is-active" : ""), text: z });
+              if (z === activeTz) { chip.disabled = true; chip.title = "Current home zone"; }
+              else chip.onclick = () => setTz(z);
+            }
+          }
+
+          // Working DAYS. A day switched off is a day off, so the hours don't apply
+          // and maintenance may run all day. Same chip UI as the obscure schedule.
+          host.createEl("p", { cls: "setting-item-description", text: "Your working days — the hours above only apply on these. Turn a day off (e.g. the weekend) and maintenance may run all day. (Read in the home timezone above.)" });
+          const dayRow = host.createDiv({ cls: "stashpad-weekday-chips" });
+          const DAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
+          const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+          for (let i = 0; i < 7; i++) {
+            const chip = dayRow.createEl("button", { cls: "stashpad-weekday-chip", text: DAY_LABELS[i] });
+            // Restyle IN PLACE, exactly like the obscure-schedule chips (0.302.0):
+            // a settings re-render does not repaint these buttons, so a chip that
+            // relied on one looked dead when clicked. `on` is re-derived from the
+            // live setting each call, so it's also robust to a missing/short array.
+            // The CSS hook is `.is-on` — NOT `.is-active`, which is the tz chips'.
+            const setState = (): void => {
+              const arr = this.plugin.settings.maintenanceWorkWeekdays;
+              const on = !Array.isArray(arr) || arr[i] !== false;
+              chip.toggleClass("is-on", on);
+              chip.title = `${DAY_NAMES[i]} — ${on ? "a working day (maintenance waits)" : "a day off (maintenance may run all day)"}`;
+              chip.setAttr("aria-label", chip.title);
+              chip.setAttr("aria-pressed", String(on));
+            };
+            setState();
+            chip.onclick = () => {
+              const arr = this.plugin.settings.maintenanceWorkWeekdays;
+              const on = !Array.isArray(arr) || arr[i] !== false;
+              const next = Array.isArray(arr) ? arr.slice() : DEFAULT_SETTINGS.maintenanceWorkWeekdays.slice();
+              next[i] = !on;
+              this.plugin.settings.maintenanceWorkWeekdays = next;
+              setState();
+              applied(); // save + refresh the "runs between …" sentence
+            };
+          }
+        }
+
+        if (s.maintenanceWindowMode === "idle-only") {
+          new Setting(host)
+            .setName("Minutes idle before maintenance runs")
+            .setDesc("Counted from your last keystroke or click in this window. A backgrounded Obsidian window counts as idle straight away — that's the cheapest possible moment for a slow sweep.")
+            .addDropdown((d) => {
+              for (const m of [1, 2, 5, 10, 15, 30, 60]) d.addOption(String(m), m === 1 ? "1 minute" : `${m} minutes`);
+              d.setValue(String(Math.max(0, Math.min(240, s.maintenanceIdleMinutes))));
+              d.onChange((v) => { s.maintenanceIdleMinutes = parseInt(v, 10) || 5; applied(); });
+            });
+        }
+
+        // ---- the per-sweep sub-switches ---------------------------------
+        new Setting(host).setName("Which sweeps obey the window").setHeading();
+        const gated = s.maintenanceWindowMode !== "always";
+        host.createEl("p", {
+          cls: "setting-item-description",
+          text: gated
+            ? "Turn a sweep ON to make it wait for the window above. Anything left off keeps running exactly as it does today — so you can defer the expensive folder-password scan and leave the cheap ones alone."
+            : "These decide which sweeps wait for the window. They have no effect while the window is set to \"Whenever it's due\" — pick another option above first.",
+        });
+        const deferred = new Set(this.plugin.deferredMaintenanceSweeps());
+        for (const meta of MAINTENANCE_SWEEPS) {
+          const obeys = s.maintenanceWindowSweeps?.[meta.id] === true;
+          const waiting = obeys && gated && deferred.has(meta.id);
+          const row = new Setting(host)
+            .setName(meta.name)
+            .setDesc(`${meta.desc} Currently runs ${meta.cadence}.${waiting ? " ⏳ Waiting for the window right now." : ""}`);
+          row.addToggle((t) => t.setValue(obeys).onChange(async (v) => {
+            // Write only explicit `true`s; deleting the key restores the default
+            // reading ("runs as always") rather than persisting a false.
+            const next = { ...(s.maintenanceWindowSweeps ?? {}) };
+            if (v) next[meta.id] = true; else delete next[meta.id];
+            s.maintenanceWindowSweeps = next;
+            await this.plugin.saveSettings();
+            this.display();
+          }));
+        }
+
+        host.createEl("p", {
+          cls: "setting-item-description",
+          text: "A sweep that's waiting isn't lost. The repeating ones retry on their own next tick once the window opens; the launch-time ones are picked up within five minutes. To force all of them right now — the only way anything runs in \"Never automatically\" mode — use the command \"Stashpad: Run deferred background maintenance now\".",
+        });
+        new Setting(host)
+          .setName("Run background maintenance now")
+          .setDesc("Runs every sweep above immediately, ignoring the window. On a slow network drive this can take a while — the folder-password scan alone touches every folder in the vault.")
+          .addButton((b) => b.setButtonText("Run now").onClick(async () => {
+            b.setDisabled(true).setButtonText("Running…");
+            try {
+              await this.plugin.drainDeferredMaintenance(true);
+            } finally {
+              // The tab may have been closed mid-run; guard the re-render.
+              if (host.isConnected) this.display();
+            }
+          }));
+      },
+      [
+        "maintenance", "window", "schedule", "background", "sweep", "performance", "slow",
+        "network", "drive", "share", "defer", "idle", "working hours", "off-hours",
+        "stashkey", "folder password", "auto-import", "tidy", "author", "excluded",
+      ],
+    );
+  }
+
   private settingsBackupSection(): SettingDefinitionItem {
     return this.sectionDef("Settings backups", "settings backup restore sync conflict device overwrite data.json", (host) => {
       this.sectionHeader(host, "💾 Settings backups (per device)", "Snapshots of this vault's settings are saved on THIS device (in “.stashpad-settings-backups/”, which Obsidian Sync doesn't carry between devices). If a synced device overwrites your settings, restore a good version here. Restoring backs up the current settings first, then reload Obsidian to apply.");
@@ -3672,6 +4109,29 @@ export class StashpadSettingTab extends PluginSettingTab {
           void this.plugin.maybeRunScheduledTidy();
         })),
       ["tidy", "duplicate", "tabs", "orphan", "schedule", "auto", "cleanup", "hourly", "daily", "weekly", "ghost"]));
+
+    cats.maintenance.push(this.maintenanceWindowSection());
+
+    // 0.487.0: the key-folder registry's escape hatch, in Maintenance rather than
+    // Encryption because it's a repair action, not a key-management one — and
+    // because someone hunting "Stashpad can't find my folder password" is looking
+    // for a fix, not for the encryption setup flow.
+    cats.maintenance.push(this.renderDef(
+      "Search the whole vault for folder passwords",
+      "Stashpad remembers which folders hold an encryption key, so starting up only has to check those — instead of listing every folder in your vault, which is what made large network drives crawl. Run this if a folder that should be encrypted says its key can't be found: it happens when a key arrives somewhere Stashpad wasn't watching, like a restored backup or a synced folder copied in from outside. It checks every folder, so on a network drive expect it to take a while.",
+      (s) => s.addButton((b) => b.setButtonText("Search now").onClick(async () => {
+        b.setDisabled(true).setButtonText("Searching…");
+        try {
+          const n = await this.plugin.encryption.forceFullKeyScan();
+          new Notice(n === 0
+            ? "[Stashpad] Full scan complete — no folder encryption keys found in this vault."
+            : `[Stashpad] Full scan complete — found ${n} folder encryption key${n === 1 ? "" : "s"}.`);
+        } finally {
+          b.setDisabled(false).setButtonText("Search now");
+        }
+      })),
+      ["encryption", "key", "stashkey", "folder password", "scan", "search", "missing", "repair", "not found", "recover"],
+    ));
 
     cats.maintenance.push(this.settingsBackupSection());
 

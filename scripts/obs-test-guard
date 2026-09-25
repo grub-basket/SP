@@ -91,8 +91,8 @@ port_up() { curl -s -m 2 "http://localhost:$1/json/version" >/dev/null 2>&1; }
 # GUARD_PORT is "" when nothing is listening — that's what triggers the crisp
 # "start scripts/obs-dev first" abort instead of a confusing downstream failure.
 # WANT_PORTS is only for the message, so it names the port(s) actually checked.
-# Slot-parametrized expectations, mirroring the SLOTS table in
-# scripts/obs-dev.mjs. Keep the two in sync — the guard does its OWN verify
+# Slot-parametrized expectations, mirroring slotCfg() in the SHARED driver
+# (_obs-dev/scripts/obs-dev.mjs; scripts/obs-dev.mjs here is only a shim). Keep the two in sync — the guard does its OWN verify
 # (belt and braces: obs-dev verifies too) so the cli driver is covered as well.
 # Slot c is the FIRST-RUN vault: deliberately empty of Stashpad folders, which
 # is the only way to exercise the welcome-modal gate.
@@ -104,9 +104,17 @@ slot_cfg() {
     c) SLOT_PORT=9224; EXPECT_VAULT="Claude Dev Vault C"
        SENTINEL_FILE="CLAUDE-DEV-VAULT-C-SENTINEL.md"
        SENTINEL_TOKEN="claude-dev-vault-c-9b2e5d31-do-not-delete" ;;
-    *) SLOT_PORT=9222; EXPECT_VAULT="Claude Dev Vault"
+    [d-z]) # Auto-derived slots — same convention as the shared driver
+       # (_obs-dev/scripts/obs-dev.mjs slotCfg): port 9222+index, "Claude Dev Vault <L>".
+       _u=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+       _i=$(( $(printf '%d' "'$1") - 97 ))
+       SLOT_PORT=$((9222 + _i)); EXPECT_VAULT="Claude Dev Vault $_u"
+       SENTINEL_FILE="CLAUDE-DEV-VAULT-$_u-SENTINEL.md"
+       SENTINEL_TOKEN="claude-dev-vault-$1-do-not-delete" ;;
+    a|"") SLOT_PORT=9222; EXPECT_VAULT="Claude Dev Vault"
        SENTINEL_FILE="CLAUDE-DEV-VAULT-SENTINEL.md"
        SENTINEL_TOKEN="claude-dev-vault-7f3a9c2e-do-not-delete" ;;
+    *) echo "obs-test-guard: unknown OBS_DEV_SLOT=\"$1\" (expected a single letter a-z)" >&2; exit 2 ;;
   esac
 }
 

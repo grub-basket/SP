@@ -182,6 +182,10 @@ export class WelcomeModal extends Modal {
     // has seen the offer, and re-asking every launch would be nagging. They can
     // always reopen it from Settings → Help & Getting started.
     void this.plugin.markOnboardingAnswered(this.choice ?? "later");
+    // 0.484.1: release the single-instance slot so the welcome can be reopened
+    // later (Settings -> Help, command palette). Guarded so a stale instance
+    // can't clear a newer one's claim.
+    if (this.plugin.welcomeModal === this) this.plugin.welcomeModal = null;
     this.contentEl.empty();
   }
 }

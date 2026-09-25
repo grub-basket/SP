@@ -26,10 +26,12 @@ import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResul
 import { RecentLinksModal, ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult, SettingsBackupModal} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
+import { preferredStashpadLeaf, preferredStashpadLeafOnFolder, anyStashpadLeafOnFolder } from "./leaf-lookup";
 import { readClipboardText, writeClipboardText } from "./cross-vault-clipboard";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
+  isWithinMaintenanceWindow, maintenanceSweepObeysWindow, MAINTENANCE_SWEEPS, type MaintenanceSweepId,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
 import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, DEFAULT_ROW_BUTTONS } from "./note-actions";
@@ -118,6 +120,14 @@ interface DeepLinkLanding {
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
+  /** 0.488.0 (perf): Stashpad folders whose on-disk infrastructure (the folder, its
+   *  Home note, the import/export subfolders, the null-parent migration) has been
+   *  ensured in THIS session. The work is idempotent and folder-scoped, but the
+   *  view's own `bootstrappedFolders` is per-view, so a second tab on the same
+   *  folder used to repeat every disk op — free on an SSD, seconds on a network
+   *  share. Invalidated when the folder is deleted or renamed (see onload), so a
+   *  folder that goes away is genuinely re-created on the next open. */
+  folderInfraReady = new Set<string>();
   /** 0.276.0: per-file timestamp of the last logged "open", for 60s dedupe. */
   private lastOpenLogged = new Map<string, number>();
   private reEncryptScheduler: ReEncryptScheduler | null = null;
@@ -1858,9 +1868,11 @@ export default class StashpadPlugin extends Plugin {
       const arr = byId.get(id);
       if (arr) arr.push(f.path); else byId.set(id, [f.path]);
     }
-    const view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-      .map((l) => l.view as unknown as { noteFolder?: string; tree?: { get(i: string): { file?: { path: string } | null } | undefined } })
-      .find((v) => v.noteFolder === folder);
+    // Order-insensitive on purpose: this only asks a TreeIndex which FILE an id
+    // resolves to, and TreeIndex keys by id, so every tab on the folder answers
+    // identically. `anyStashpadLeafOnFolder` says that out loud.
+    const view = anyStashpadLeafOnFolder(this.app, folder)?.view as unknown as
+      { noteFolder?: string; tree?: { get(i: string): { file?: { path: string } | null } | undefined } } | undefined;
     const groups: DuplicateIdGroup[] = [];
     for (const [id, paths] of byId) {
       if (paths.length < 2) continue;
@@ -2559,10 +2571,24 @@ export default class StashpadPlugin extends Plugin {
     await openStashpadPanelsView(this.app);
   }
 
+  /** 0.484.1: the one open WelcomeModal, so a second one cannot stack on top.
+   *  Cleared by the modal's own `onClose`. */
+  welcomeModal: WelcomeModal | null = null;
+
   /** Open the first-run welcome on demand (command palette / settings button),
-   *  regardless of whether it has already been answered. */
+   *  regardless of whether it has already been answered.
+   *
+   *  0.484.1: SINGLE INSTANCE. This is now the only place a WelcomeModal is
+   *  constructed — the first-run `onLayoutReady` timer calls through here too.
+   *  Before, that timer and this method each did `new WelcomeModal(...).open()`
+   *  with no guard, so opening Stashpad within ~2.5s of launch on a fresh vault
+   *  put TWO stacked copies of the setup dialog on screen (confirmed live: two
+   *  full sets of "Set up later / Set up fresh / Set up with demo content"). */
   showWelcome(): void {
-    new WelcomeModal(this.app, this).open();
+    if (this.welcomeModal) return; // already on screen — don't stack a second
+    const modal = new WelcomeModal(this.app, this);
+    this.welcomeModal = modal;
+    modal.open();
   }
 
   /** Seed the example content into a fresh folder and open it. Used by the
@@ -2738,6 +2764,23 @@ export default class StashpadPlugin extends Plugin {
     const irrelevantFile = (f: TAbstractFile): boolean =>
       f instanceof TFile && f.extension !== "md" && f.extension !== "trynalist";
     this.registerEvent(this.app.vault.on("delete", (f) => { if (!irrelevantFile(f)) dropFolderMemo(); }));
+    // 0.488.0: a deleted folder must un-memoise its bootstrap, or a Stashpad tab
+    // opened afterwards would trust `folderInfraReady` and skip re-creating the
+    // folder + Home note it needs. Matches on the path itself and on any ancestor,
+    // since deleting a parent takes the Stashpad folder with it.
+    this.registerEvent(this.app.vault.on("delete", (f) => {
+      const p = f.path.replace(/\/+$/, "");
+      for (const folder of [...this.folderInfraReady]) {
+        if (folder === p || folder.startsWith(`${p}/`)) this.folderInfraReady.delete(folder);
+      }
+    }));
+    // Same for a rename/move: the folder is no longer where the memo says it is.
+    this.registerEvent(this.app.vault.on("rename", (_f, oldPath) => {
+      const p = String(oldPath).replace(/\/+$/, "");
+      for (const folder of [...this.folderInfraReady]) {
+        if (folder === p || folder.startsWith(`${p}/`)) this.folderInfraReady.delete(folder);
+      }
+    }));
     // A rename that keeps the file in the same already-listed folder (the slug
     // rename after every create/edit) cannot change the set either.
     this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
@@ -2922,7 +2965,9 @@ export default class StashpadPlugin extends Plugin {
       // existing user and greet them as if they were new.
       window.setTimeout(() => {
         if (!shouldShowWelcome(this)) return;
-        new WelcomeModal(this.app, this).open();
+        // 0.484.1: via showWelcome() so the single-instance guard applies — this
+        // timer racing a user-initiated open is exactly how two stacked.
+        this.showWelcome();
       }, 2500);
       // 0.395.0: a short launch reminder that unsent composer drafts exist (drafts
       // are no longer surfaced in the composer text). Setting-gated; skipped when
@@ -3000,8 +3045,12 @@ export default class StashpadPlugin extends Plugin {
       // run that came due while Obsidian was closed), then poll every 5 min.
       // Both no-op unless a schedule is set; registerInterval auto-clears on
       // unload. The startup delay lets the tab set settle first.
-      window.setTimeout(() => void this.maybeRunScheduledTidy(), 8000);
-      this.registerInterval(window.setInterval(() => void this.maybeRunScheduledTidy(), 5 * 60 * 1000));
+      // 0.485.0: every sweep below is wrapped in `maintenanceAllowed(<id>)`. That
+      // returns true unless the user has explicitly opted THAT sweep into the
+      // maintenance window, so the default cadences here are unchanged.
+      this.setupMaintenanceWindow();
+      window.setTimeout(() => { if (this.maintenanceAllowed("scheduledTidy")) void this.maybeRunScheduledTidy(); }, 8000);
+      this.registerInterval(window.setInterval(() => { if (this.maintenanceAllowed("scheduledTidy")) void this.maybeRunScheduledTidy(); }, 5 * 60 * 1000));
       // 0.295.2: rediscover `.stashkey` files that arrive AFTER the startup walk.
       // They're dotfiles, so Obsidian's vault fires no create/delete event for
       // them — a folder password set on device A was invisible on device B until
@@ -3013,20 +3062,24 @@ export default class StashpadPlugin extends Plugin {
       // The walk is the parallel one from 0.294.0 and publishes on completion
       // (epoch-guarded), so the index is never blanked mid-walk. It also drops a
       // `.stashkey` DELETED on another device, since the new set REPLACES the old.
-      this.registerInterval(window.setInterval(() => void this.encryption.refreshStashKeyIndex(), 10 * 60 * 1000));
+      // 0.485.0: BOTH stashkey re-walk triggers consult the window. This is the
+      // expensive one — one adapter.list per vault DIRECTORY — so it's the whole
+      // reason the gate exists. The startup walk in EncryptionService is NOT gated:
+      // key discovery must be complete before anything can read an encrypted note.
+      this.registerInterval(window.setInterval(() => { if (this.maintenanceAllowed("stashKeyIndex")) void this.encryption.refreshStashKeyIndex(); }, 10 * 60 * 1000));
       let stashKeyRewalkTimer = 0;
       this.register(() => window.clearTimeout(stashKeyRewalkTimer));
       this.registerEvent(
         this.app.metadataCache.on("resolved", () => {
           window.clearTimeout(stashKeyRewalkTimer);
-          stashKeyRewalkTimer = window.setTimeout(() => void this.encryption.refreshStashKeyIndex(), 60 * 1000);
+          stashKeyRewalkTimer = window.setTimeout(() => { if (this.maintenanceAllowed("stashKeyIndex")) void this.encryption.refreshStashKeyIndex(); }, 60 * 1000);
         }),
       );
-      window.setTimeout(() => { void this.seedLocalAuthorStubsEverywhere(); }, 4000);
+      window.setTimeout(() => { if (this.maintenanceAllowed("authorStubs")) void this.seedLocalAuthorStubsEverywhere(); }, 4000);
       // 0.79.12: register each Stashpad folder's _archive in Obsidian's
       // "Excluded files" so native search / quick switcher / graph / link
       // suggestions de-prioritise the import-originals graveyard.
-      window.setTimeout(() => this.syncObsidianExcludedArchives(), 4500);
+      window.setTimeout(() => { if (this.maintenanceAllowed("excludedArchives")) this.syncObsidianExcludedArchives(); }, 4500);
       // 0.79.15: arm auto-import only AFTER the startup create-storm has
       // passed (Obsidian replays a create event for every existing file on
       // load). Until armed, enqueue() ignores events — so opening the vault
@@ -3038,8 +3091,8 @@ export default class StashpadPlugin extends Plugin {
       // interval so external Finder copies that never fired a vault event are
       // eventually caught. Both no-op unless autoImport is on. registerInterval
       // is auto-cleared on unload.
-      window.setTimeout(() => void this.runAutoImportSweep(), 5000);
-      this.registerInterval(window.setInterval(() => void this.runAutoImportSweep(), 5 * 60 * 1000));
+      window.setTimeout(() => { if (this.maintenanceAllowed("autoImport")) void this.runAutoImportSweep(); }, 5000);
+      this.registerInterval(window.setInterval(() => { if (this.maintenanceAllowed("autoImport")) void this.runAutoImportSweep(); }, 5 * 60 * 1000));
       // 0.86.3: migrate legacy per-device pinned list → note frontmatter (so
       // pins sync). After the metadata cache has settled so fileForPin resolves.
       window.setTimeout(() => void this.migratePinnedNotesToFrontmatter(), 3000);
@@ -4224,12 +4277,12 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({
       id: "stashpad-open-pinned-view",
       name: "Open Pinned notes (view)",
-      callback: () => void openStashpadSinglePanel(this.app, "pinned"),
+      callback: () => void openStashpadSinglePanel(this.app, "pinned", (ref) => this.registerEvent(ref)),
     });
     this.addCommand({
       id: "stashpad-open-shared-view",
       name: "Open Shared notes (view)",
-      callback: () => void openStashpadSinglePanel(this.app, "shared"),
+      callback: () => void openStashpadSinglePanel(this.app, "shared", (ref) => this.registerEvent(ref)),
     });
     // 0.310.0: open the action log from a command (was panel-button only), so it
     // can live in the launcher too.
@@ -4371,6 +4424,39 @@ export default class StashpadPlugin extends Plugin {
       name: "Set missing parents to Home (orphan fix)",
       callback: () => void this.fixOrphanParents(),
     });
+    // 0.485.0: the escape hatch for the maintenance window — and the ONLY way
+    // opted-in sweeps run in `manual` mode. Forces every sweep regardless of the
+    // window, because the user explicitly asked for it right now.
+    this.addCommand({
+      id: "stashpad-run-deferred-maintenance",
+      name: "Run deferred background maintenance now (folder passwords, tidy, auto-import, author files)",
+      callback: () => void (async () => {
+        notify("Running background maintenance…");
+        const ran = await this.drainDeferredMaintenance(true);
+        const names = ran
+          .map((id) => MAINTENANCE_SWEEPS.find((m) => m.id === id)?.name ?? id)
+          .join(", ");
+        notify(ran.length ? `Background maintenance complete: ${names}.` : "Background maintenance complete.");
+      })(),
+    });
+    // 0.487.0: the "search the whole vault" escape hatch for the key-folder
+    // registry. Normal startup verifies the remembered key folders instead of
+    // listing every directory, so this is the answer to "Stashpad can't find the
+    // key for this folder" — e.g. a `.stashkey` restored from a backup or arriving
+    // by `git pull`, which no vault event announces. Expensive by design: on a
+    // network share it lists every directory, which is the cost the registry exists
+    // to avoid, so it is user-initiated and never automatic.
+    this.addCommand({
+      id: "stashpad-scan-vault-for-folder-keys",
+      name: "Search the whole vault for folder passwords (slow — use if a folder key can't be found)",
+      callback: () => void (async () => {
+        notify("Searching every folder for encryption keys… this can take a while on a network drive.");
+        const n = await this.encryption.forceFullKeyScan();
+        notify(n === 0
+          ? "Full scan complete — no folder encryption keys found in this vault."
+          : `Full scan complete — found ${n} folder encryption key${n === 1 ? "" : "s"}.`);
+      })(),
+    });
     // 0.206.0: rebuild wiped frontmatter from the folder's structure snapshot.
     this.addCommand({
       id: "stashpad-repair-from-snapshot",
@@ -4462,11 +4548,11 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-create-aliases-folder",
       name: "Create aliases from titles for THIS folder's notes (append-only)",
       checkCallback: (checking) => {
-        const view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-          .map((l) => l.view as unknown as { noteFolder?: string })
-          .find((v) => v === (this.app.workspace.activeLeaf?.view as unknown))
-          ?? this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-            .map((l) => l.view as unknown as { noteFolder?: string })[0];
+        // Was a hand-rolled "the active leaf's view, else leaves[0]". Same
+        // intent as preferredStashpadLeaf, minus the bug where a closed-but-
+        // remembered tab still won.
+        const view = preferredStashpadLeaf(this.app, this)?.view as unknown as
+          { noteFolder?: string } | undefined;
         const folder = view?.noteFolder;
         if (!folder) return false;
         if (checking) return true;
@@ -6107,19 +6193,37 @@ export default class StashpadPlugin extends Plugin {
     await this.saveSettings();
   }
 
+  /** 0.484.0: pick the Stashpad view to load a draft into — the tab the user is
+   *  actually LOOKING AT.
+   *
+   *  Was: `getLeavesOfType(...).find(v => v.noteFolder === d.folder)` — `find`
+   *  returns the FIRST match, and leaf order is tab order, so with two tabs open
+   *  on the same folder the draft always landed in the leftmost one while the
+   *  focused tab sat there unchanged. It looked like the button did nothing.
+   *
+   *  Same class of bug (and the same fix) as 0.68.1 for the sidebar panel's
+   *  Search / Home buttons: prefer `lastActiveStashpadLeaf` — via
+   *  `activeStashpadLeafIfOpen()`, which also drops the reference if that tab
+   *  has since been closed — and fall back to first-match only when the
+   *  last-active tab is gone or is on a different folder. */
+  private stashpadViewForFolder(folder: string): { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> } | undefined {
+    // normalize stays OFF: `switchToDraft` re-checks `d.folder !==
+    // this.noteFolder` and bails with "That draft belongs to another folder", so
+    // a leniently-matched view would pass this picker and fail that guard.
+    return preferredStashpadLeafOnFolder(this.app, this, folder)?.view as unknown as
+      { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> } | undefined;
+  }
+
   /** 0.319.0: load a draft into the composer of a view on its folder (opening
-   *  one if needed). */
+   *  one if needed). 0.484.0: targets the focused tab — see
+   *  `stashpadViewForFolder`. */
   async loadComposerDraft(id: string): Promise<void> {
     const d = this.settings.composerDrafts?.[id];
     if (!d) { notify("That draft is gone."); return; }
-    let view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-      .map((l) => l.view as unknown as { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> })
-      .find((v) => v.noteFolder === d.folder);
+    let view = this.stashpadViewForFolder(d.folder);
     if (!view) {
       await this.activateViewForFolder(d.folder);
-      view = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-        .map((l) => l.view as unknown as { noteFolder?: string; switchToDraft?: (id: string) => Promise<void> })
-        .find((v) => v.noteFolder === d.folder);
+      view = this.stashpadViewForFolder(d.folder);
     }
     if (!view?.switchToDraft) { notify("Couldn't open a Stashpad view for that folder."); return; }
     await view.switchToDraft(id);
@@ -6155,9 +6259,13 @@ export default class StashpadPlugin extends Plugin {
 
   /** 0.322.1: open a saved view in a new Stashpad tab. */
   async openSavedView(state: Record<string, unknown>): Promise<void> {
-    const leaf = this.app.workspace.getLeaf("tab");
+    const ws = this.app.workspace;
+    const prev = ws.activeLeaf; // 0.486.0: see activateView — return-on-close was missing here too
+    const leaf = ws.getLeaf("tab");
     await leaf.setViewState({ type: STASHPAD_VIEW_TYPE, state, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    ws.revealLeaf(leaf);
+    settleNewTab(ws, prev);
+    returnToOriginOnClose(ws, leaf, prev, (ref) => this.registerEvent(ref));
   }
   async deleteSavedView(name: string): Promise<void> {
     this.settings.savedViews = (this.settings.savedViews ?? []).filter((x) => x.name !== name);
@@ -6336,6 +6444,127 @@ export default class StashpadPlugin extends Plugin {
       } catch { /* Intl unavailable — skip */ }
     }
     if (flipped || tzChanged) this.reHideAndRefreshAllViews();
+  }
+
+  // ---- 0.485.0: the maintenance window ----------------------------------
+  // One gate for every background vault sweep, so an expensive sweep can be held
+  // off a slow / network drive while the user is working. See the block comment on
+  // `maintenanceWindowMode` in settings.ts for the scope rule: MAINTENANCE ONLY —
+  // derived data that can be rebuilt. Never a note write, never `data.json`, never
+  // undo state, never anything the user just asked for.
+
+  /** Epoch ms of the last keyboard/pointer input in this window. Seeded to load
+   *  time so a freshly-opened Obsidian isn't instantly "idle for hours". */
+  private lastUserInputAt = Date.now();
+  /** Sweeps that wanted to run but were held back by the window. Only the ones
+   *  with `selfRetries: false` actually need this — the interval-driven sweeps
+   *  re-attempt on their own tick — but every deferral is recorded so the drain
+   *  and the settings UI can report honestly on what is waiting. */
+  private maintenanceDeferred = new Set<MaintenanceSweepId>();
+
+  /** Wire up idle tracking + the drain timer. Called from onload's deferred block.
+   *  The listeners are capture-phase and passive and do nothing but stamp a
+   *  number, so they're safe to attach to every input event. */
+  private setupMaintenanceWindow(): void {
+    const stamp = (): void => { this.lastUserInputAt = Date.now(); };
+    for (const ev of ["keydown", "mousedown", "wheel", "touchstart", "pointerdown"] as const) {
+      this.registerDomEvent(document, ev, stamp, { capture: true, passive: true });
+    }
+    // KNOWN LIMIT: this listens on the MAIN window's document only, so typing in a
+    // popped-out Stashpad tab doesn't reset the idle clock (popouts have their own
+    // document — the recurring trap in this codebase). Worst case in `idle-only`
+    // mode is that a sweep runs while you're working in a popout, i.e. exactly the
+    // ungated behaviour — never the reverse, and never a correctness problem. Not
+    // worth per-window bookkeeping unless someone actually reports it. Note
+    // `document.hidden` does NOT cover it either: a visible-but-unfocused main
+    // window is not "hidden", so a focused popout doesn't read as idle.
+    // A sweep skipped at STARTUP has no second chance of its own, so re-check on a
+    // timer. 5 min matches the cheapest existing sweep interval; the drain itself
+    // is a few boolean reads when nothing is pending.
+    this.registerInterval(window.setInterval(() => void this.drainDeferredMaintenance(), 5 * 60 * 1000));
+  }
+
+  /** Live inputs the pure gate can't read from settings. A hidden window counts as
+   *  idle immediately — nobody is waiting on the UI, which is exactly when a slow
+   *  sweep is cheapest. */
+  private maintenanceRuntimeState(): { idleMs: number; hidden: boolean } {
+    return {
+      idleMs: Math.max(0, Date.now() - this.lastUserInputAt),
+      hidden: typeof document !== "undefined" && document.hidden === true,
+    };
+  }
+
+  /** THE gate. `true` = run the sweep now.
+   *
+   *  Two independent questions, in this order:
+   *    1. Does this sweep obey the window at all? Default NO for every sweep, so
+   *       an install that has never touched these settings behaves exactly as it
+   *       did before — the feature is pure opt-in.
+   *    2. If it does: are we inside the window?
+   *
+   *  A blocked sweep is recorded in `maintenanceDeferred` so `drainDeferredMaintenance`
+   *  can pick up the startup-only ones once the window opens. */
+  maintenanceAllowed(id: MaintenanceSweepId): boolean {
+    if (!maintenanceSweepObeysWindow(this.settings, id)) return true;
+    if (isWithinMaintenanceWindow(this.settings, this.maintenanceRuntimeState())) {
+      this.maintenanceDeferred.delete(id);
+      return true;
+    }
+    this.maintenanceDeferred.add(id);
+    return false;
+  }
+
+  /** Which sweeps are currently waiting on the window (for the settings UI). */
+  deferredMaintenanceSweeps(): MaintenanceSweepId[] {
+    return MAINTENANCE_SWEEPS.filter((m) => this.maintenanceDeferred.has(m.id)).map((m) => m.id);
+  }
+
+  /** Run the sweeps that were deferred and are now allowed.
+   *
+   *  `force` bypasses the window entirely — that's the "Run deferred background
+   *  maintenance now" command, and it's the only escape hatch in `manual` mode.
+   *
+   *  IMPORTANT: only sweeps with `selfRetries: false` are run from here on the
+   *  timer path. The interval-driven ones (key index, tidy, auto-import) re-fire on
+   *  their own schedule, and running the `.stashkey` walk from here too would
+   *  double the single most expensive operation on the share — the exact cost this
+   *  feature exists to avoid. `force` DOES run everything, because the user asked.
+   *
+   *  Returns the sweeps it actually started. */
+  async drainDeferredMaintenance(force = false): Promise<MaintenanceSweepId[]> {
+    const ran: MaintenanceSweepId[] = [];
+    for (const meta of MAINTENANCE_SWEEPS) {
+      if (!force) {
+        if (!this.maintenanceDeferred.has(meta.id)) continue;
+        if (meta.selfRetries) continue; // its own interval will retry it
+        if (!this.maintenanceAllowed(meta.id)) continue;
+      }
+      // Clear BEFORE awaiting: if the sweep throws, we don't want it stuck in the
+      // set retrying forever, and its own trigger (interval or next launch) is
+      // still there. A sweep that is genuinely still due will re-add itself via
+      // maintenanceAllowed on its next attempt.
+      this.maintenanceDeferred.delete(meta.id);
+      ran.push(meta.id);
+      try {
+        await this.runMaintenanceSweep(meta.id);
+      } catch (e) {
+        console.error(`[Stashpad] deferred maintenance sweep "${meta.id}" failed:`, e);
+      }
+    }
+    return ran;
+  }
+
+  /** Dispatch one sweep by id. Kept as an exhaustive switch so adding a
+   *  MaintenanceSweepId without wiring it up is a compile error rather than a
+   *  silently-never-run sweep. */
+  private async runMaintenanceSweep(id: MaintenanceSweepId): Promise<void> {
+    switch (id) {
+      case "stashKeyIndex": await this.encryption.refreshStashKeyIndex(); return;
+      case "scheduledTidy": await this.maybeRunScheduledTidy(); return;
+      case "autoImport": await this.runAutoImportSweep(); return;
+      case "authorStubs": await this.seedLocalAuthorStubsEverywhere(); return;
+      case "excludedArchives": this.syncObsidianExcludedArchives(); return;
+    }
   }
 
   /** Repaint open folder panels — e.g. after a settings change flips a folder's
@@ -6809,13 +7038,25 @@ export default class StashpadPlugin extends Plugin {
     if (opts.reveal) {
       const existing = workspace.getLeavesOfType(STASHPAD_VIEW_TYPE);
       if (existing.length > 0) {
-        workspace.revealLeaf(existing[0]);
+        // 0.484.1: reveal the Stashpad tab the user last worked in, not
+        // `existing[0]` — leaf order is TAB order, so with several Stashpad tabs
+        // open "Reveal or open Stashpad" always jumped to the leftmost one.
+        // Same bug as 0.68.1 (sidebar buttons) and 0.484.0 (drafts);
+        // `focusLastStashpadTab` two methods below already did it correctly.
+        const active = this.activeStashpadLeafIfOpen();
+        workspace.revealLeaf(active && existing.includes(active) ? active : existing[0]);
         return;
       }
     }
+    // 0.486.0: capture where we came from BEFORE getLeaf("tab") fronts the new
+    // one, so closing this tab lands back here instead of on the neighbour.
+    // Every other Stashpad opener already did this; this one was missed.
+    const prev = workspace.activeLeaf;
     const leaf = workspace.getLeaf("tab");
     await leaf.setViewState({ type: STASHPAD_VIEW_TYPE, active: true });
     workspace.revealLeaf(leaf);
+    settleNewTab(workspace, prev);
+    returnToOriginOnClose(workspace, leaf, prev, (ref) => this.registerEvent(ref));
   }
 
   /** 0.95.3: snap focus to the Stashpad tab you were last working in — the
@@ -7616,6 +7857,9 @@ export default class StashpadPlugin extends Plugin {
   /** 0.193.0: pop the paste-text importer out into a full tab, carrying whatever was
    *  already typed so nothing is lost on the way out of the modal. */
   async openTextImporter(ctx: Omit<ImporterViewContext, "prevLeaf">): Promise<void> {
+    // tab-return: n/a — this view owns its own return. `prevLeaf` is handed to
+    // the view via setContext and the importer refocuses it on close, so
+    // returnToOriginOnClose would be a second, competing listener.
     const prevLeaf = this.app.workspace.getMostRecentLeaf();
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({ type: TEXT_IMPORT_VIEW_TYPE, active: true });
@@ -7626,6 +7870,7 @@ export default class StashpadPlugin extends Plugin {
   /** 0.216.0: same pop-out for the Stashpad desktop-app importer, carrying the
    *  already-loaded files across so they don't have to be dropped again. */
   async openAppImporter(ctx: Omit<AppImporterViewContext, "prevLeaf">): Promise<void> {
+    // tab-return: n/a — same as openTextImporter; the view refocuses prevLeaf itself.
     const prevLeaf = this.app.workspace.getMostRecentLeaf();
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({ type: APP_IMPORT_VIEW_TYPE, active: true });
@@ -7634,7 +7879,8 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async openWorkbench(body: string, cbs: WorkbenchCommandCallbacks, init: Partial<WorkbenchState>): Promise<void> {
-    // Remember the tab we came from so the split tab can hand focus back on close.
+    // tab-return: n/a — the workbench view hands focus back itself via prevLeaf
+    // in its context (that is what the line below is for).
     const prevLeaf = this.app.workspace.getMostRecentLeaf();
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({ type: WORKBENCH_VIEW_TYPE, active: true });
@@ -9640,9 +9886,16 @@ export default class StashpadPlugin extends Plugin {
       if (token === "open") {
         // A deep link that asks for the EDITOR gets the editor, routing or not.
         if (file) {
-          const leaf = this.app.workspace.getLeaf("tab");
+          // 0.486.0: a deep link that spawns an editor tab returns focus to the
+          // tab it was followed FROM when that editor closes, like every other
+          // Stashpad-spawned tab.
+          const ws = this.app.workspace;
+          const prev = ws.activeLeaf;
+          const leaf = ws.getLeaf("tab");
           this.markEditorBypass(leaf, file);
           await leaf.openFile(file);
+          settleNewTab(ws, prev);
+          returnToOriginOnClose(ws, leaf, prev, (ref) => this.registerEvent(ref));
         }
         continue;
       }
@@ -10199,8 +10452,13 @@ export default class StashpadPlugin extends Plugin {
    *  navigate. One-click open for a not-yet-open folder. */
   private navigateWhenReady(folder: string, id: string, attempts = 15): void {
     const clean = folder.replace(/\/+$/, "");
-    const view = (this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-      .find((l) => (((l.view as any)?.noteFolder ?? "").replace(/\/+$/, "")) === clean)?.view
+    // 0.484.1: precedence was backwards. It took the FIRST tab on the folder
+    // (leaf order = tab order) and only fell back to the last-active leaf, so
+    // with two tabs on one folder a deep link / index row navigated the leftmost
+    // tab while the user watched the focused one sit still. The last-active leaf
+    // wins when it is on the right folder; the first-match scan and the
+    // any-folder fallback are unchanged behind it.
+    const view = (preferredStashpadLeafOnFolder(this.app, this, clean, { normalize: true })?.view
       ?? this.lastActiveStashpadLeaf?.view) as any;
     if (view && typeof view.navigateTo === "function") {
       const treeReady = !view.tree || typeof view.tree.get !== "function" || !!view.tree.get(id);
@@ -11305,6 +11563,34 @@ export default class StashpadPlugin extends Plugin {
       hideCompletedNotes: (data?.hideCompletedNotes && typeof data.hideCompletedNotes === "object" && !Array.isArray(data.hideCompletedNotes))
         ? data.hideCompletedNotes
         : {},
+      // 0.485.0: maintenance window. The top-level spread is SHALLOW, so stored
+      // data would otherwise replace the whole sweeps object — a sweep id added in
+      // a later version would then be `undefined` rather than defaulted. Rebuild it
+      // from the catalog instead, keeping only explicit `true`s: an absent or
+      // malformed entry means "run as always", which is the safe direction (a bad
+      // data.json can never freeze key discovery).
+      maintenanceWindowMode: (["always", "outside-hours", "idle-only", "manual"] as const)
+        .includes(data?.maintenanceWindowMode) ? data.maintenanceWindowMode : "always",
+      maintenanceWindowSweeps: Object.fromEntries(
+        MAINTENANCE_SWEEPS
+          .filter((m) => (data?.maintenanceWindowSweeps as Record<string, unknown> | undefined)?.[m.id] === true)
+          .map((m) => [m.id, true]),
+      ) as Partial<Record<MaintenanceSweepId, boolean>>,
+      // Length-7 boolean array, like obscureScheduleWeekdays. A short/garbled array
+      // would make `wd[day]` undefined, which isWithinWorkingHours reads as a
+      // WORKING day — correct but confusing, so normalise the shape here.
+      maintenanceWorkWeekdays: (() => {
+        const src = data?.maintenanceWorkWeekdays;
+        const def = DEFAULT_SETTINGS.maintenanceWorkWeekdays;
+        if (!Array.isArray(src)) return def.slice();
+        return def.map((d, i) => (typeof src[i] === "boolean" ? src[i] : d));
+      })(),
+      maintenanceWindowTimezoneHistory: Array.isArray(data?.maintenanceWindowTimezoneHistory)
+        ? data.maintenanceWindowTimezoneHistory.filter((z: unknown): z is string => typeof z === "string" && !!z).slice(0, 6)
+        : [],
+      maintenanceIdleMinutes: (typeof data?.maintenanceIdleMinutes === "number" && Number.isFinite(data.maintenanceIdleMinutes))
+        ? Math.max(0, Math.min(240, Math.trunc(data.maintenanceIdleMinutes)))
+        : DEFAULT_SETTINGS.maintenanceIdleMinutes,
       mutedNotificationCategories: Array.isArray(data?.mutedNotificationCategories)
         ? data.mutedNotificationCategories.filter((x: unknown): x is string => typeof x === "string")
         : [],

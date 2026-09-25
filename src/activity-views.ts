@@ -2,6 +2,7 @@ import { ItemView, WorkspaceLeaf } from "obsidian";
 import type StashpadPlugin from "./main";
 import { LogPanel, NotificationHistoryPanel } from "./modals";
 import { STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE } from "./types";
+import { returnToOriginOnClose } from "./leaf-return";
 
 /** 0.315.0: the per-folder action log as a dedicated tab. Mounts the shared
  *  LogPanel (extracted from LogModal) into the view's contentEl. The log file
@@ -67,16 +68,24 @@ export class StashpadNotificationsView extends ItemView {
 export async function openStashpadLogView(plugin: StashpadPlugin): Promise<void> {
   const { workspace } = plugin.app;
   const existing = workspace.getLeavesOfType(STASHPAD_LOG_VIEW_TYPE);
-  const leaf = existing[0] ?? workspace.getLeaf("tab");
+  const prev = workspace.activeLeaf;
+  const reused = existing[0];
+  const leaf = reused ?? workspace.getLeaf("tab");
   await leaf.setViewState({ type: STASHPAD_LOG_VIEW_TYPE, active: true });
   workspace.revealLeaf(leaf);
+  // 0.486.0: only a NEWLY spawned tab owes a return — revealing a tab that was
+  // already open did not displace the user from anywhere.
+  if (!reused) returnToOriginOnClose(workspace, leaf, prev, (ref) => plugin.registerEvent(ref));
 }
 
 /** Reveal the notifications tab, reusing an existing one if open. */
 export async function openStashpadNotificationsView(plugin: StashpadPlugin): Promise<void> {
   const { workspace } = plugin.app;
   const existing = workspace.getLeavesOfType(STASHPAD_NOTIFICATIONS_VIEW_TYPE);
-  const leaf = existing[0] ?? workspace.getLeaf("tab");
+  const prev = workspace.activeLeaf;
+  const reused = existing[0];
+  const leaf = reused ?? workspace.getLeaf("tab");
   await leaf.setViewState({ type: STASHPAD_NOTIFICATIONS_VIEW_TYPE, active: true });
   workspace.revealLeaf(leaf);
+  if (!reused) returnToOriginOnClose(workspace, leaf, prev, (ref) => plugin.registerEvent(ref));
 }

@@ -1,17 +1,20 @@
 {
 	"name": "stashpad-obsidian",
-	"version": "0.483.0",
+	"version": "0.490.0",
 	"private": true,
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
-		"build": "node esbuild.config.mjs production && node scripts/validate-release.mjs",
+		"build": "node esbuild.config.mjs production && node scripts/validate-release.mjs && node scripts/check-leaf-lookup.mjs && node scripts/check-tab-openers.mjs && node scripts/check-version-collision.mjs",
 		"validate": "node scripts/validate-release.mjs",
 		"deploy:files": "node scripts/deploy.mjs",
 		"deploy": "pnpm run build && node scripts/deploy.mjs",
 		"typecheck": "tsc --noEmit",
 		"lint": "eslint src",
 		"lint:store": "eslint src --max-warnings 0",
-		"test": "node scripts/tests/run.mjs"
+		"test": "node scripts/tests/run.mjs",
+		"lint:leaf": "node scripts/check-leaf-lookup.mjs",
+		"lint:tabs": "node scripts/check-tab-openers.mjs",
+		"lint:version": "node scripts/check-version-collision.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^20.10.0",

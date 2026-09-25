@@ -30,7 +30,32 @@ export interface EncryptionConfig {
   /** Every keychain id this device has ever written (folder keys + parked
    *  `-r<stamp>`/`-d<slotId>` copies). Without it, parked entries are unreachable. */
   knownKeychainIds?: string[];
+  /** 0.487.0 (perf) — the KEY-FOLDER REGISTRY: folders known to hold a
+   *  `.stashkey`, remembered so startup can verify N keys with N reads instead of
+   *  listing every directory in the vault.
+   *
+   *  `.stashkey` is a dotfile, so Obsidian's in-memory tree never indexes it and
+   *  the only way to DISCOVER one is `adapter.list` per directory. On a department
+   *  network share (measured: 3,389 lists for 3,385 dirs, 1:1) that walk costs
+   *  minutes and repeats. Remembering where the keys are turns discovery into a
+   *  lookup for the overwhelmingly common case.
+   *
+   *  SAFETY: this list is only ever trusted as a fast PATH, never as proof of
+   *  absence. `registryEpoch` must equal `KEY_REGISTRY_EPOCH` for it to be used at
+   *  all, a startup reconciliation pass cross-checks it against every `.stashenc`
+   *  Obsidian DOES index, `recheckFolderKeyOnDisk()` still probes the ancestor
+   *  chain before any negative is believed, and the full walk remains available.
+   *  See `loadKeyFolderRegistry`. */
+  keyFolders?: string[];
+  /** Schema epoch the `keyFolders` list was written under. A mismatch (including
+   *  absent — every install that predates the registry) forces ONE full walk,
+   *  which then persists the list. Bump `KEY_REGISTRY_EPOCH` to invalidate every
+   *  device's registry after any change to what the walk covers. */
+  keyFolderRegistryEpoch?: number;
 }
+
+/** Bump to force every device to re-walk once and rebuild its registry. */
+export const KEY_REGISTRY_EPOCH = 1;
 
 export function defaultEncryptionConfig(): EncryptionConfig {
   return {};
@@ -110,7 +135,13 @@ export class EncryptionService {
     if (this.unloaded) return Promise.resolve();        // 0.295.2: no walks after dispose()
     if (this.stashKeysIndexed) return Promise.resolve();
     if (!this.indexPromise) {
-      this.indexPromise = this.indexStashKeys().finally(() => { this.indexPromise = null; });
+      // 0.487.0: try the key-folder registry first — N reads instead of one
+      // `adapter.list` per vault directory. It returns false (and we walk) whenever
+      // it cannot prove completeness; see the guards documented on the registry.
+      this.indexPromise = (async () => {
+        if (!this.skipRegistryOnce && await this.indexFromRegistry()) return;
+        await this.indexStashKeys();
+      })().finally(() => { this.indexPromise = null; });
     }
     return this.indexPromise;
   }
@@ -169,7 +200,258 @@ export class EncryptionService {
   invalidateStashKeyIndex(): void {
     this.stashKeysIndexed = false; this.indexEpoch++;
     this.negativeProbes.clear();                       // 0.295.2: don't carry stale "no key here" past a re-walk
+    // NOT cleared: the key-folder registry. It records WHERE keys were last seen,
+    // which an invalidation doesn't make wrong — and clearing it would throw away
+    // the only thing that lets the next index skip the full walk.
   }
+
+  // ---- 0.487.0 (perf): the key-folder registry -------------------------------
+  // The walk lists every directory in the vault because `.stashkey` is a dotfile
+  // that Obsidian's in-memory tree never indexes. Measured on a 3,385-directory
+  // vault: 3,389 `adapter.list` calls, 1:1 with directories, ~12s at 25ms/list and
+  // minutes on a department share — repeated at startup, every 10 minutes, and
+  // after every sync burst, even when encryption was never configured.
+  //
+  // The registry replaces DISCOVERY with a LOOKUP: remember which folders hold a
+  // key, then verify them with one `read()` each. A typical vault has 0-5 keys, so
+  // startup goes from thousands of round trips to a handful.
+  //
+  // THE RISK, stated plainly: a registry that is missing a key produces a FALSE
+  // NEGATIVE, and the code comment on `indexStashKeys` is explicit that discovery
+  // must stay COMPLETE — "no folder with a `.stashkey` may be missed" — because a
+  // trusted negative is how Stashpad would write plaintext into a folder the user
+  // believes is encrypted. Four independent guards, any one of which is enough:
+  //
+  //   1. EPOCH GATE. `keyFolderRegistryEpoch` must equal `KEY_REGISTRY_EPOCH`.
+  //      Every install that predates the registry, and every install after a bump,
+  //      does one full walk before the fast path is ever eligible.
+  //   2. RECONCILIATION against data Obsidian DOES index. `.stashenc`/`.stashmeta`
+  //      are ordinary files in the vault tree, so "which folders hold encrypted
+  //      content" is a FREE in-memory question. Any such folder whose ancestor
+  //      chain the registry can't account for forces the full walk. That is the
+  //      case that actually matters: a key the registry missed is only dangerous if
+  //      there is encrypted content relying on it, and that content is visible.
+  //   3. THE ANCESTOR PROBE (0.295.2, `recheckFolderKeyOnDisk`). Every negative on
+  //      a user-facing path is still verified against disk, folder then ancestors,
+  //      before it is believed. The registry never gets to answer "no" on its own.
+  //   4. DEGRADED-VAULT BAIL-OUT. If every registry entry fails to read (an
+  //      unmounted share, a sync stall), the registry is treated as unusable rather
+  //      than as proof the keys are gone, and nothing is pruned.
+  //
+  // Rejected alternative, for the record: scoping the walk to Stashpad folders.
+  // `encryptFolderFromExplorer` offers "Encrypt with Stashpad" on an ARBITRARY
+  // folder via `encryptRawFolder`, so a `.stashkey` can legitimately live anywhere
+  // in the vault. Scoping would silently break key discovery.
+
+  /** Folders whose `.stashkey` we have seen, persisted across sessions. Seeded from
+   *  the config on first use so a read can't race the plugin's settings load. */
+  private keyFolderRegistry: Set<string> | null = null;
+  /** Debounce handle for the persist — key mutations can arrive in bursts
+   *  (`migrateKeyfileToStashKeys` walks every legacy entry). */
+  private registryPersistTimer = 0;
+
+  private registry(): Set<string> {
+    if (!this.keyFolderRegistry) {
+      const cfg = this.load();
+      const listed = Array.isArray(cfg.keyFolders) ? cfg.keyFolders : [];
+      this.keyFolderRegistry = new Set(
+        listed.filter((f): f is string => typeof f === "string").map((f) => this.cleanFolder(f)),
+      );
+    }
+    return this.keyFolderRegistry;
+  }
+
+  /** Record a discovered key BOTH in the live index and in the registry. Every
+   *  `folderKeyFiles` write goes through here so the registry cannot drift from the
+   *  index — verified by grep: no bare `folderKeyFiles.set` survives outside the
+   *  walk's atomic publish. */
+  private rememberKeyFolder(folder: string, sk: StashKey): void {
+    const f = this.cleanFolder(folder);
+    this.folderKeyFiles.set(f, sk);
+    if (!this.registry().has(f)) { this.registry().add(f); this.schedulePersist(); }
+  }
+
+  /** Drop a folder from the live index and the registry (its key was removed). */
+  private forgetKeyFolder(folder: string): void {
+    const f = this.cleanFolder(folder);
+    this.folderKeyFiles.delete(f);
+    if (this.registry().delete(f)) this.schedulePersist();
+  }
+
+  /** Encryption was removed vault-wide: drop the live index AND the registry, then
+   *  persist so the next session doesn't go looking for keys that no longer exist. */
+  private forgetAllKeyFolders(): void {
+    this.folderKeyFiles.clear();
+    this.keyFolderRegistry = new Set();
+    void this.persistKeyFolderRegistry();
+  }
+
+  private schedulePersist(): void {
+    window.clearTimeout(this.registryPersistTimer);
+    this.registryPersistTimer = window.setTimeout(() => { void this.persistKeyFolderRegistry(); }, 250);
+  }
+
+  /** Write the registry + the current epoch into the plugin config. Best-effort:
+   *  a failed persist costs one extra walk next session, never correctness. */
+  private async persistKeyFolderRegistry(): Promise<void> {
+    if (this.unloaded) return;
+    window.clearTimeout(this.registryPersistTimer);
+    try {
+      const cfg = this.load();
+      await this.save({
+        ...cfg,
+        keyFolders: [...this.registry()].sort(),
+        keyFolderRegistryEpoch: KEY_REGISTRY_EPOCH,
+      });
+    } catch (e) {
+      console.error("[Stashpad] could not persist the key-folder registry:", e);
+    }
+  }
+
+  /** Distinct folders that contain encrypted artifacts, from Obsidian's in-memory
+   *  file list. FREE — no adapter calls — because `.stashenc`/`.stashmeta` are not
+   *  dotfiles and so ARE indexed (unlike `.stashkey`, which is the whole reason the
+   *  walk exists). This is what makes the registry safe: it bounds "which keys
+   *  could possibly matter" without touching the disk. */
+  private encryptedContentFolders(): Set<string> {
+    const out = new Set<string>();
+    try {
+      for (const f of this.app.vault.getFiles()) {
+        if (f.extension !== "stashenc" && f.extension !== "stashmeta") continue;
+        const i = f.path.lastIndexOf("/");
+        out.add(this.cleanFolder(i < 0 ? "" : f.path.slice(0, i)));
+      }
+    } catch { /* vault not ready — caller falls back to the walk */ }
+    return out;
+  }
+
+  /** Is `folder` (or one of its ancestors) a known key folder? Mirrors
+   *  `owningFolder()`'s inheritance rule: a subfolder uses its nearest keyed
+   *  ancestor's key. */
+  private chainCoveredBy(folder: string, known: Set<string>): boolean {
+    let p = this.cleanFolder(folder);
+    for (;;) {
+      if (known.has(p)) return true;
+      const i = p.lastIndexOf("/");
+      if (i < 0) return known.has("");
+      p = p.slice(0, i);
+    }
+  }
+
+  /** The fast path. Returns true when the index is COMPLETE without a walk.
+   *  Returning false means "walk instead" and is always safe. */
+  private async indexFromRegistry(): Promise<boolean> {
+    // Same publish discipline as `indexStashKeys`: snapshot the epoch, and refuse to
+    // publish if anything invalidated the index while we were reading. Without this
+    // the fast path would mark a result set authoritative even though a key was
+    // created/removed (or a full scan forced) mid-read — the exact hazard the
+    // 0.294.0 epoch guard exists for, and which a fast path is MORE prone to
+    // because it completes in milliseconds and so overlaps startup more often.
+    const epoch = this.indexEpoch;
+    const cfg = this.load();
+    // Guard 1 — epoch gate. Absent (pre-registry install) or stale ⇒ must walk.
+    if (cfg.keyFolderRegistryEpoch !== KEY_REGISTRY_EPOCH) return false;
+    if (!Array.isArray(cfg.keyFolders)) return false;
+
+    const listed = [...this.registry()];
+    const found = new Map<string, StashKey>();
+    /** Proven gone: `hasFile()` says no file is there. Only these are pruned. */
+    const absentProven = new Set<string>();
+    let unreadable = 0;
+    for (const folder of listed) {
+      if (this.unloaded) return false;
+      const sk = await this.folderKeystore.read(folder);
+      if (sk) { found.set(folder, sk); continue; }
+      // `read()` returns null for absent AND corrupt/unreadable, so ask `hasFile()`
+      // which distinguishes them. Present-but-unreadable must NOT be pruned — the
+      // key may simply be mid-sync, and forgetting where to look for it is
+      // unrecoverable information loss.
+      if (await this.folderKeystore.hasFile(folder)) unreadable++;
+      else absentProven.add(folder);
+    }
+
+    // Guard 4 — degraded vault. Everything we expected to find is gone: far more
+    // likely an unmounted share or a sync stall than the user deleting every key.
+    // Do not prune, do not claim completeness; let the walk decide.
+    if (listed.length > 0 && found.size === 0 && unreadable === 0 && absentProven.size === listed.length) {
+      console.warn(`[Stashpad] key-folder registry listed ${listed.length} folder(s) but none are present — falling back to a full scan rather than assuming the keys are gone.`);
+      return false;
+    }
+
+    // Guard 2 — reconciliation. Any folder holding encrypted content whose chain we
+    // can't account for means the registry is incomplete in the one way that is
+    // dangerous. Probe those chains on disk first (cheap, bounded by the number of
+    // distinct encrypted folders); only escalate to the full walk if a probe still
+    // can't find the key.
+    const covered = new Set(found.keys());
+    for (const folder of this.encryptedContentFolders()) {
+      if (this.chainCoveredBy(folder, covered)) continue;
+      const hit = await this.readKeyUpChain(folder);
+      if (!hit) {
+        console.warn(`[Stashpad] encrypted content in "${folder}" has no key in the registry or its ancestors — running a full key scan.`);
+        return false;
+      }
+      found.set(hit.folder, hit.sk);
+      covered.add(hit.folder);
+    }
+
+    if (this.unloaded) return false;
+    // Invalidated while we read — returning false sends the caller to the full walk,
+    // which is the correct response to "something changed under us".
+    if (epoch !== this.indexEpoch) return false;
+    this.folderKeyFiles = found;
+    this.stashKeysIndexed = true;
+    // Converge the persisted list on what we actually found: adds from the
+    // reconciliation, and prunes only folders proven ABSENT (never merely
+    // unreadable — those stay listed so we keep looking for them).
+    const next = new Set(found.keys());
+    for (const f of listed) if (!next.has(f) && !absentProven.has(f)) next.add(f);
+    const changed = next.size !== this.registry().size || [...next].some((f) => !this.registry().has(f));
+    this.keyFolderRegistry = next;
+    if (changed) await this.persistKeyFolderRegistry();
+    else if (cfg.keyFolderRegistryEpoch !== KEY_REGISTRY_EPOCH) await this.persistKeyFolderRegistry();
+    return true;
+  }
+
+  /** Read the nearest `.stashkey` at or above `folder`. Bounded by path depth. */
+  private async readKeyUpChain(folder: string): Promise<{ folder: string; sk: StashKey } | null> {
+    let p = this.cleanFolder(folder);
+    for (;;) {
+      const sk = await this.folderKeystore.read(p);
+      if (sk) return { folder: p, sk };
+      const i = p.lastIndexOf("/");
+      if (i < 0) {
+        if (p === "") return null;
+        p = "";
+        continue;
+      }
+      p = p.slice(0, i);
+    }
+  }
+
+  /** User-consented full re-scan — the "search the whole vault" escape hatch for
+   *  "Stashpad can't find the key for this folder". Discards the registry's
+   *  completeness claim and re-walks, then rewrites the registry from the result. */
+  async forceFullKeyScan(): Promise<number> {
+    if (this.unloaded) return 0;
+    // Join any index already in flight FIRST, for the same reason
+    // `refreshStashKeyIndex` does: bumping the epoch makes that one publish nothing,
+    // and `startStashKeyIndex()` would otherwise hand back the doomed promise
+    // instead of starting a fresh walk — so a "force" during startup would silently
+    // do nothing and report a stale count. Order matters: invalidate, await the old
+    // one, THEN set the skip flag so the fresh index is the one that sees it.
+    const inFlight = this.indexPromise;
+    this.stashKeysIndexed = false;
+    this.indexEpoch++;
+    this.negativeProbes.clear();
+    if (inFlight) { try { await inFlight; } catch { /* its failure is not ours */ } }
+    this.skipRegistryOnce = true;
+    await this.startStashKeyIndex();
+    return this.folderKeyFiles.size;
+  }
+  /** Set by `forceFullKeyScan` so the next index ignores the fast path exactly
+   *  once; cleared by `indexStashKeys` whether or not the walk publishes. */
+  private skipRegistryOnce = false;
 
   // ---- 0.295.2: rediscovering `.stashkey` files that arrive AFTER the walk ----
   // `.stashkey` is a dotfile, so Obsidian's vault fires NO create/modify/delete
@@ -226,7 +508,7 @@ export class EncryptionService {
         // in-flight walk (which started without this key) can't publish a result
         // set that drops it again.
         this.indexEpoch++;
-        this.folderKeyFiles.set(p, sk);
+        this.rememberKeyFolder(p, sk);
         this.negativeProbes.delete(f);
         return true;
       }
@@ -285,7 +567,7 @@ export class EncryptionService {
         // Verify the primary wrap round-tripped byte-for-byte before trusting it.
         if (!back || back.slots[0]?.wrapped !== sk.slots[0].wrapped) { await this.folderKeystore.remove(f); continue; }
         this.indexEpoch++;                             // 0.294.0 (perf): see setupFolderKey
-        this.folderKeyFiles.set(f, sk); // keyfile entry LEFT IN PLACE (backup)
+        this.rememberKeyFolder(f, sk); // keyfile entry LEFT IN PLACE (backup)
         migrated++;
       } catch { /* leave the keyfile entry as the working fallback */ }
     }
@@ -311,6 +593,9 @@ export class EncryptionService {
   private static readonly LIST_CONCURRENCY = 8;
 
   private async indexStashKeys(): Promise<void> {
+    // Consumed here rather than in startStashKeyIndex so it clears even if the walk
+    // bails early — a stuck flag would mean every future index skipped the fast path.
+    this.skipRegistryOnce = false;
     const epoch = this.indexEpoch;
     const found = new Map<string, StashKey>();
     const SKIP = new Set([".git", ".obsidian", "node_modules"]);
@@ -353,6 +638,12 @@ export class EncryptionService {
     if (this.unloaded) return;
     this.folderKeyFiles = found;
     this.stashKeysIndexed = true;
+    // 0.487.0: a COMPLETE walk is the authoritative answer, so it replaces the
+    // registry outright (not a merge — a merge would resurrect folders whose key
+    // the walk proved gone) and stamps the current epoch, which is what makes the
+    // fast path eligible from here on.
+    this.keyFolderRegistry = new Set(found.keys());
+    void this.persistKeyFolderRegistry();
   }
 
   /** Present a `.stashkey` as a FolderKeyEntry so the existing unlock/session code
@@ -526,7 +817,7 @@ export class EncryptionService {
     // 0.294.0 (perf): membership change — invalidate any walk in flight so its
     // (older) result set can't overwrite this brand-new key. See indexEpoch.
     this.indexEpoch++;
-    this.folderKeyFiles.set(f, sk);
+    this.rememberKeyFolder(f, sk);
     this.folderSessionKeys.set(f, dek);
     if (remember) await this.rememberFolder(this.folderKcId(f, sk.keyId), password);
   }
@@ -607,7 +898,7 @@ export class EncryptionService {
     if (skNow) {
       const next = await this.folderKeystore.changePassword(skNow, dek, newPassword);
       await this.folderKeystore.write(owner, next);
-      this.folderKeyFiles.set(owner, next);
+      this.rememberKeyFolder(owner, next);
       const kcId2 = this.folderKcId(owner, next.keyId);
       if (remember || this.isFolderRemembered(kcId2)) await this.rememberFolder(kcId2, newPassword);
       return;
@@ -672,7 +963,7 @@ export class EncryptionService {
     if (!dek) throw new Error("Unlock this folder first.");
     const next = await this.folderKeystore.setRecovery(sk, dek, recoveryPassword);
     await this.folderKeystore.write(owner, next);
-    this.folderKeyFiles.set(owner, next);
+    this.rememberKeyFolder(owner, next);
   }
 
   /** Drop the folder's recovery slot (keeps only the primary password). No unlock
@@ -687,7 +978,7 @@ export class EncryptionService {
     if (!sk || !this.folderKeystore.hasRecovery(sk)) return;
     const next = this.folderKeystore.removeRecovery(sk);
     await this.folderKeystore.write(owner, next);
-    this.folderKeyFiles.set(owner, next);
+    this.rememberKeyFolder(owner, next);
   }
 
   // --- per-folder keychain helpers (one slot PER folder key — no clobbering) ---
@@ -777,7 +1068,11 @@ export class EncryptionService {
       await this.whenKeysReady();
       for (const folder of this.folderKeyFiles.keys()) { try { await this.folderKeystore.remove(folder); } catch { /* best-effort */ } }
       this.indexEpoch++;                               // 0.294.0 (perf): see setupFolderKey
-      this.folderKeyFiles.clear();
+      // 0.487.0: clear the REGISTRY too, not just the live index. A bare
+      // `folderKeyFiles.clear()` here would leave the persisted list naming folders
+      // whose `.stashkey` we just deleted, and the next persist would write those
+      // ghosts straight back.
+      this.forgetAllKeyFolders();
     } catch { /* best-effort */ }
     this.kf = null;
   }
@@ -788,7 +1083,7 @@ export class EncryptionService {
     const f = this.cleanFolder(folder);
     await this.folderKeystore.remove(f);
     this.indexEpoch++;                                 // 0.294.0 (perf): see setupFolderKey
-    this.folderKeyFiles.delete(f);
+    this.forgetKeyFolder(f);
     this.folderSessionKeys.get(f)?.fill(0);
     this.folderSessionKeys.delete(f);
   }
@@ -892,5 +1187,13 @@ export class EncryptionService {
   /** 0.295.2: set by dispose(). An in-flight re-walk that finishes after unload
    *  publishes nothing, and no new walk is started. */
   private unloaded = false;
-  dispose(): void { this.unloaded = true; this.indexEpoch++; this.negativeProbes.clear(); this.lock(); }
+  dispose(): void {
+    this.unloaded = true; this.indexEpoch++; this.negativeProbes.clear(); this.lock();
+    // 0.487.0: a debounced registry persist must not fire after unload — it would
+    // write through a `save` closure whose plugin is gone. `persistKeyFolderRegistry`
+    // also re-checks `unloaded`, so this is belt-and-braces, but a pending timer on a
+    // disposed service is exactly the kind of thing that survives a reload and
+    // clobbers the NEXT instance's settings.
+    window.clearTimeout(this.registryPersistTimer);
+  }
 }

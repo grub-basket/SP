@@ -3192,6 +3192,9 @@ export class ComposerDraftsModal extends Modal {
       const parts = [d.device === me ? "This device" : d.device, `edited ${ago(d.modified)}`];
       if (Math.abs(d.created - d.modified) > 60_000) parts.push(`started ${ago(d.created)}`);
       if (d.replyTo?.title) parts.push(`reply to \u201c${d.replyTo.title}\u201d`);
+      // 0.484.2: where it was composed, so two same-folder drafts are tellable
+      // apart and you know where loading it will put you.
+      if (d.origin?.title) parts.push(`under \u201c${d.origin.title}\u201d`);
       meta.createSpan({ text: parts.join("  \u00b7  ") });
       const preview = (d.text.trim() || "(empty)").split(/\r?\n/).slice(0, 3).join(" ⏎ ");
       row.createDiv({ cls: "stashpad-drafts-preview", text: preview.length > 220 ? preview.slice(0, 220) + "…" : preview });

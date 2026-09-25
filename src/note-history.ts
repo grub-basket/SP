@@ -69,18 +69,71 @@ export class NoteHistoryStore {
     return `${this.trashDir(folder)}/${id}.jsonl`;
   }
 
-  private async ensureDir(folder: string): Promise<void> {
-    await this.mkdirp(this.dir(folder));
+  // (0.489.0: the old `ensureDir(folder)` wrapper is gone — every writer now goes
+  // through `writeEnsuringDir`, which ensures the directory AND recovers from a
+  // stale memo. A bare "ensure then write" is the shape that lost a version.)
+
+  /** 0.489.0 (perf): directories this store has already created or confirmed this
+   *  session. `mkdirp` ran its full `exists`-then-`mkdir` ladder on EVERY capture —
+   *  measured at 3 adapter ops per note create, for a directory chain that cannot
+   *  have gone away since the last note a moment earlier. Free on an SSD; at the
+   *  300-600ms/op measured on the user's network share, ~1-2s of dead time per note.
+   *
+   *  Same shape as `StashpadLog`'s existing `dirOk` flag (log.ts) — that store
+   *  already solved this; the pattern is copied rather than invented, widened to a
+   *  Set because this one writes into several directories (per-folder history plus
+   *  each folder's `_trashed`).
+   *
+   *  A stale entry is NOT harmless, and the first version of this memo got it wrong:
+   *  if the history directory is deleted underneath us, skipping the `mkdir` makes
+   *  `adapter.write` fail into `capture`'s best-effort catch and the version is
+   *  SILENTLY LOST. A live test proved it (delete the dir, capture, no file). Obsidian
+   *  fires no vault events for dotfolders — the same reason `.stashkey` needs a walk —
+   *  so the memo cannot be invalidated reactively. Every write therefore goes through
+   *  `writeEnsuringDir`, which on failure drops the memo, re-creates the chain and
+   *  retries once. That makes the memo genuinely self-correcting: the fast path costs
+   *  nothing, and the slow path is only ever taken when something really did vanish.
+   *  Nothing about WHAT gets written changes. */
+  private ensuredDirs = new Set<string>();
+
+  /** Write into a directory this store owns, ensuring the directory first and
+   *  RECOVERING if the memo turned out to be stale. Retries exactly once — a second
+   *  failure is a real error (permissions, full disk, read-only share) and is
+   *  rethrown so the caller's own error handling decides, rather than being hidden
+   *  behind an infinite retry. */
+  private async writeEnsuringDir(dir: string, path: string, data: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    await this.mkdirp(dir);
+    try {
+      await adapter.write(path, data);
+      return;
+    } catch (first) {
+      // The directory we believed in is gone. Forget it (and its descendants, since
+      // a parent delete takes them too), rebuild, and try again.
+      for (const d of [...this.ensuredDirs]) {
+        if (d === dir || d.startsWith(`${dir}/`) || dir.startsWith(`${d}/`)) this.ensuredDirs.delete(d);
+      }
+      await this.mkdirp(dir);
+      try {
+        await adapter.write(path, data);
+      } catch {
+        throw first;
+      }
+    }
   }
 
   /** 0.355.0: mkdir -p for an arbitrary vault-relative directory path. */
   private async mkdirp(dir: string): Promise<void> {
+    if (this.ensuredDirs.has(dir)) return;
     const adapter = this.app.vault.adapter;
     const parts = dir.split("/");
     let cur = "";
     for (const p of parts) {
       cur = cur ? `${cur}/${p}` : p;
       try { if (!(await adapter.exists(cur))) await adapter.mkdir(cur); } catch { /* concurrent create */ }
+      // Remember each ANCESTOR too, so ensuring `<f>/.stashpad/history/_trashed`
+      // after `<f>/.stashpad/history` costs one step rather than the whole ladder.
+      this.ensuredDirs.add(cur);
     }
   }
 
@@ -99,8 +152,7 @@ export class NoteHistoryStore {
       let next = [...prev, entry];
       const cap = Math.max(2, this.cap());
       if (next.length > cap) next = next.slice(next.length - cap);
-      await this.ensureDir(folder);
-      await this.app.vault.adapter.write(this.path(folder, id), next.map((e) => JSON.stringify(e)).join("\n") + "\n");
+      await this.writeEnsuringDir(this.dir(folder), this.path(folder, id), next.map((e) => JSON.stringify(e)).join("\n") + "\n");
       this.lastBody.set(key, body); // 0.346.0: remember what we just wrote
     } catch { /* history is best-effort */ }
   }
@@ -165,10 +217,12 @@ export class NoteHistoryStore {
       const adapter = this.app.vault.adapter;
       if (!(await adapter.exists(src))) return;              // nothing to trash
       const raw = await adapter.read(src);
-      await this.mkdirp(this.trashDir(folder));
       const dest = this.trashPath(folder, id);
+      // mkdirp FIRST so the `exists(dest)` below can't be answered by a missing
+      // parent, then write through the recovering helper (see `ensuredDirs`).
+      await this.mkdirp(this.trashDir(folder));
       if (await adapter.exists(dest)) await adapter.remove(dest); // overwrite
-      await adapter.write(dest, raw);
+      await this.writeEnsuringDir(this.trashDir(folder), dest, raw);
       await adapter.remove(src);
       this.lastBody.delete(this.bodyKey(folder, id));         // active is gone
     } catch { /* best-effort */ }
@@ -187,8 +241,7 @@ export class NoteHistoryStore {
       const active = this.path(folder, id);
       if (await adapter.exists(active)) return false;         // don't clobber live history
       const raw = await adapter.read(trashed);
-      await this.ensureDir(folder);
-      await adapter.write(active, raw);
+      await this.writeEnsuringDir(this.dir(folder), active, raw);
       await adapter.remove(trashed);
       this.lastBody.delete(this.bodyKey(folder, id));         // reseed lazily on next read
       return true;
@@ -224,8 +277,7 @@ export class NoteHistoryStore {
       const src = this.path(fromFolder, id);
       if (!(await this.app.vault.adapter.exists(src))) return;
       const raw = await this.app.vault.adapter.read(src);
-      await this.ensureDir(toFolder);
-      await this.app.vault.adapter.write(this.path(toFolder, id), raw);
+      await this.writeEnsuringDir(this.dir(toFolder), this.path(toFolder, id), raw);
       await this.app.vault.adapter.remove(src);
       // 0.346.0: carry the cached last-body to the new folder key.
       const from = this.bodyKey(fromFolder, id), to = this.bodyKey(toFolder, id);

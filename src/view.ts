@@ -23,6 +23,7 @@ import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatte
 import { buildFileActions, boldFragment } from "./notifications";
 import { newId } from "./id-service";
 import { seedDemoContent } from "./demo-content";
+import { preferredStashpadLeafOnFolder } from "./leaf-lookup";
 import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, stripInlineMarkdown, DEFAULT_STOPWORDS } from "./slug-service";
 import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
@@ -354,6 +355,10 @@ export class StashpadView extends ItemView {
   // the list (which rebuilds every row — no virtualization) must not repaint.
   private bulkSuppressedRenders = 0;
   private bootstrappedFolders = new Set<string>();
+  /** 0.488.0: set when THIS view's bootstrap is the one that created the folder, so
+   *  the "Stashpad created the folder" notice fires exactly once even though the
+   *  creation itself is now memoised plugin-wide. Cleared as soon as it is shown. */
+  private bootstrapNoticeFor: string | null = null;
 
   /** public: read by ViewDnD (the host interface). */
   selection = new Set<StashpadId>();
@@ -2651,6 +2656,17 @@ export class StashpadView extends ItemView {
     this.plugin.settings.composerDrafts = next;
     return true;
   }
+  /** 0.484.2: the note the composer is focused on right now, for a new draft's
+   *  `origin`. Null at the folder root (there is nothing to navigate back TO) or
+   *  when the focused id no longer resolves. */
+  private captureDraftOrigin(): { id: string; title: string } | null {
+    const id = this.focusId;
+    if (!id || id === ROOT_ID) return null;
+    const node = this.tree.get(id);
+    if (!node) return null;
+    return { id, title: this.titleForNode(node).trim().slice(0, 80) || "(untitled)" };
+  }
+
   activeDraft(): ComposerDraft | null {
     return this.activeDraftId ? (this.plugin.settings.composerDrafts?.[this.activeDraftId] ?? null) : null;
   }
@@ -2763,6 +2779,11 @@ export class StashpadView extends ItemView {
           created: cur?.created ?? now,
           device: cur?.device ?? this.plugin.deviceId(),
           kind: cur?.kind ?? "new",
+          // 0.484.2: remember where this was composed, ONCE, when the draft is
+          // first minted. Never re-captured on later keystrokes — the origin is
+          // where you STARTED writing, and re-reading focusId on every save would
+          // quietly rewrite it if you navigated away mid-draft.
+          origin: cur ? (cur.origin ?? null) : this.captureDraftOrigin(),
           ...(cur?.edit ? { edit: cur.edit } : {}),
           replyTo: this.replyTarget ? { id: this.replyTarget.id, title: this.replyTarget.title, path: this.replyTarget.path } : null,
         };
@@ -2799,6 +2820,14 @@ export class StashpadView extends ItemView {
     this.activeDraftId = id;
     this.setDraftPointer(id);
     this.composerDraft = d.text;
+    // 0.484.2: go back to the note this draft was started under, so it lands
+    // where it was meant to rather than under whatever you happen to be viewing.
+    // BEFORE touching the textarea on purpose: navigateTo re-renders, which can
+    // swap the composer element out from under a value we had already written.
+    const origin = d.origin;
+    if (origin?.id && origin.id !== this.focusId && this.tree.get(origin.id)) {
+      this.navigateTo(origin.id);
+    }
     if (this.composerInputEl) this.composerInputEl.value = d.text;
     this.replyTarget = this.resolveDraftReply(d);
     this.refreshReplyChip();
@@ -9475,7 +9504,11 @@ export class StashpadView extends ItemView {
           siblingExts,
         })) { openViewer(); return; }
         const ws = this.app.workspace; const prev = ws.activeLeaf;
-        void ws.getLeaf("tab").openFile(file).then(() => { settleNewTab(ws, prev); });
+        const attLeaf = ws.getLeaf("tab");
+        void attLeaf.openFile(file).then(() => {
+          settleNewTab(ws, prev);
+          returnToOriginOnClose(ws, attLeaf, prev, (ref) => this.plugin.registerEvent(ref));
+        });
       };
       box.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); this.openAttachmentMenu(e, p, file, ext); };
     }
@@ -9488,7 +9521,7 @@ export class StashpadView extends ItemView {
       menu.addItem((it: any) => it.setTitle("Copy image").setIcon("copy").onClick(() => void this.copyAttachmentImage(file)));
     }
     if (file) {
-      menu.addItem((it: any) => it.setTitle("Open in new tab").setIcon("external-link").onClick(() => { const ws = this.app.workspace; const prev = ws.activeLeaf; void ws.getLeaf("tab").openFile(file).then(() => { settleNewTab(ws, prev); }); }));
+      menu.addItem((it: any) => it.setTitle("Open in new tab").setIcon("external-link").onClick(() => { const ws = this.app.workspace; const prev = ws.activeLeaf; const l = ws.getLeaf("tab"); void l.openFile(file).then(() => { settleNewTab(ws, prev); returnToOriginOnClose(ws, l, prev, (ref) => this.plugin.registerEvent(ref)); }); }));
       for (const a of buildFileActions(this.app, file.path, Platform.isMobile)) {
         menu.addItem((it: any) => it.setTitle(a.label).setIcon(a.label.startsWith("Reveal") ? "folder-open" : "arrow-up-right").onClick(() => void a.onClick()));
       }
@@ -13896,6 +13929,7 @@ export class StashpadView extends ItemView {
             if (!parentId) return;
             const settingsFolder = (this.plugin.settings.folder || "Stashpad").trim().replace(/^\/+|\/+$/g, "") || "Stashpad";
             const ws = this.app.workspace;
+            const prev = ws.activeLeaf; // 0.486.0: return-on-close was missing here
             const leaf = ws.getLeaf("tab");
             await leaf.setViewState({
               type: STASHPAD_VIEW_TYPE,
@@ -13905,6 +13939,8 @@ export class StashpadView extends ItemView {
                 folderOverride: folder === settingsFolder ? null : folder,
               },
             });
+            settleNewTab(ws, prev);
+            returnToOriginOnClose(ws, leaf, prev, (ref) => this.plugin.registerEvent(ref));
             ws.revealLeaf(leaf);
             // The freshly-mounted view rebuilt its tree during
             // setViewState. Reach into it to create the note + navigate.
@@ -15195,9 +15231,7 @@ export class StashpadView extends ItemView {
                 // already opened one if none existed).
                 const v = (this.noteFolder === folder && this.viewRoot?.isConnected)
                   ? this
-                  : (this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-                      .map((l) => l.view as StashpadView | undefined)
-                      .find((x) => x?.noteFolder === folder));
+                  : (preferredStashpadLeafOnFolder(this.app, this.plugin, folder)?.view as StashpadView | undefined);
                 if (!v) return;
                 v.selection.clear();
                 for (const id of importedIds) v.selection.add(id);
@@ -15247,9 +15281,7 @@ export class StashpadView extends ItemView {
       let target: StashpadView = this;
       if (destination && destination !== this.noteFolder) {
         await this.plugin.openFolderInStashpad(destination);
-        const found = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-          .map((l) => l.view as StashpadView | undefined)
-          .find((v) => v?.noteFolder === destination);
+        const found = preferredStashpadLeafOnFolder(this.app, this.plugin, destination)?.view as StashpadView | undefined;
         if (!found) {
           notify(`Could not open "${destination}" - nothing was imported.`);
           return;
@@ -15564,9 +15596,7 @@ export class StashpadView extends ItemView {
                 const target = importedIds[0];
                 const v = (this.noteFolder === folder && this.viewRoot?.isConnected)
                   ? this
-                  : (this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)
-                      .map((l) => l.view as StashpadView | undefined)
-                      .find((x) => x?.noteFolder === folder));
+                  : (preferredStashpadLeafOnFolder(this.app, this.plugin, folder)?.view as StashpadView | undefined);
                 if (!v) return;
                 v.selection.clear();
                 for (const id of importedIds) v.selection.add(id);
@@ -17084,19 +17114,37 @@ export class StashpadView extends ItemView {
 
   private async bootstrapFolder(): Promise<void> {
     if (this.bootstrappedFolders.has(this.noteFolder)) return;
-    // Opening the view CREATES the folder, a Home note and two subfolders if
-    // they don't exist. That used to happen with no prompt and no notice — a
-    // plugin writing four things into someone's vault while they were still
-    // working out what it does. Check first so we can say so afterwards.
-    const preexisting = await this.app.vault.adapter.exists(this.noteFolder);
-    await this.ensureFolder(this.noteFolder);
-    await this.ensureHomeNote();
-    await this.migrateNullParents();
-    // Pre-create the import + export subfolders so users have an obvious target.
-    const importSub = (this.plugin.settings.importDropFolder || "").trim().replace(/^\/+|\/+$/g, "");
-    const exportSub = (this.plugin.settings.exportFolder || "").trim().replace(/^\/+|\/+$/g, "");
-    if (importSub) await this.ensureFolder(`${this.noteFolder}/${importSub}`);
-    if (exportSub) await this.ensureFolder(`${this.noteFolder}/${exportSub}`);
+    // 0.488.0 (perf): the folder-INFRASTRUCTURE half of bootstrap is idempotent and
+    // scoped to the FOLDER, not to this view — but `bootstrappedFolders` above is a
+    // per-view Set, so opening a second Stashpad tab on the same folder re-ran every
+    // one of its disk ops. Invisible on an SSD; on a network share each
+    // `adapter.exists` is 300-600ms, so a second tab cost seconds for provably
+    // nothing. The plugin-level memo below runs the vault work ONCE per folder per
+    // session. The store loads underneath it stay per-view, because `order` and
+    // `sortStore` are per-view instances with their own caches.
+    const infraDone = this.plugin.folderInfraReady.has(this.noteFolder);
+    if (!infraDone) {
+      // Opening the view CREATES the folder, a Home note and two subfolders if
+      // they don't exist. That used to happen with no prompt and no notice — a
+      // plugin writing four things into someone's vault while they were still
+      // working out what it does. Check first so we can say so afterwards.
+      const preexisting = await this.app.vault.adapter.exists(this.noteFolder);
+      // Reuse that answer: `ensureFolder` would otherwise `exists` the same path
+      // again, immediately, which was a measured duplicate round trip.
+      await this.ensureFolder(this.noteFolder, preexisting);
+      await this.ensureHomeNote();
+      await this.migrateNullParents();
+      // Pre-create the import + export subfolders so users have an obvious target.
+      const importSub = (this.plugin.settings.importDropFolder || "").trim().replace(/^\/+|\/+$/g, "");
+      const exportSub = (this.plugin.settings.exportFolder || "").trim().replace(/^\/+|\/+$/g, "");
+      if (importSub) await this.ensureFolder(`${this.noteFolder}/${importSub}`);
+      if (exportSub) await this.ensureFolder(`${this.noteFolder}/${exportSub}`);
+      // Mark ready only after the vault work actually succeeded — an exception above
+      // must leave the folder un-memoised so the next open retries rather than
+      // assuming infrastructure that was never created.
+      this.plugin.folderInfraReady.add(this.noteFolder);
+      this.bootstrapNoticeFor = preexisting ? null : this.noteFolder;
+    }
     // Pre-load the order map for this folder so the first rebuild has it.
     await this.order.load(this.noteFolder);
     // Same for the per-parent sort modes (`.stashpad-sort.json`). Reads
@@ -17106,7 +17154,11 @@ export class StashpadView extends ItemView {
     this.bootstrappedFolders.add(this.noteFolder);
     // Tell the user what just appeared in their vault. Only when we actually
     // created the folder — reopening an existing Stashpad must stay silent.
-    if (!preexisting) {
+    // 0.488.0: carried on `bootstrapNoticeFor` because the creation now happens
+    // inside the plugin-level infra block above, so a SECOND view must not
+    // re-announce a folder that this session already created.
+    if (this.bootstrapNoticeFor === this.noteFolder) {
+      this.bootstrapNoticeFor = null;
       const n = new Notice("", 10000);
       n.noticeEl.createSpan({
         text: `Stashpad created the folder "${this.noteFolder}" with a Home note. It's ordinary markdown — move or delete it whenever.`,
@@ -17291,6 +17343,9 @@ export class StashpadView extends ItemView {
     if (existing) return;
     const active = ws.activeLeaf;
     try {
+      // tab-return: n/a — opened with active:false and focus handed straight
+      // back below, so the user never leaves `active`; there is no spawned-tab
+      // focus to return when it closes.
       const leaf = ws.getLeaf("tab");
       await leaf.setViewState({
         type: STASHPAD_VIEW_TYPE,
@@ -20876,12 +20931,25 @@ export class StashpadView extends ItemView {
   }
 
   /** public: called by AuthorshipTracker (the host interface). */
-  async ensureFolder(path: string): Promise<void> {
+  /** `alreadyExists` (0.488.0) lets a caller that JUST checked this exact path skip
+   *  the round trip. Only pass `true` for a check made moments ago in the same
+   *  logical operation — on a network share each `adapter.exists` is 300-600ms, and
+   *  `bootstrapFolder` was paying for the same path twice in a row. The in-memory
+   *  type check below still runs, so the "exists but is a file" error is unaffected. */
+  async ensureFolder(path: string, alreadyExists = false): Promise<void> {
+    // 0.489.0 (perf): a Stashpad folder whose infrastructure we ensured earlier this
+    // session is known to exist, so skip the round trip. Deliberately keyed on
+    // `folderInfraReady` rather than a new "dirs I've seen" cache: that set is
+    // already invalidated on vault delete AND rename (see main.ts onload), so this
+    // inherits correct invalidation instead of adding a second thing to keep honest.
+    // Arbitrary paths — attachment dirs, move targets — are unaffected and still
+    // checked, which is why this is keyed on the folder set and not on `path` alone.
+    if (!alreadyExists && this.plugin.folderInfraReady.has(path)) alreadyExists = true;
     // 0.71.35: prefer the adapter (authoritative for on-disk state)
     // over getAbstractFileByPath, which races the metadataCache on
     // plugin reload — returning null for folders that actually exist,
     // which then makes createFolder throw "Folder already exists."
-    if (await this.app.vault.adapter.exists(path)) {
+    if (alreadyExists || await this.app.vault.adapter.exists(path)) {
       const existing = this.app.vault.getAbstractFileByPath(path);
       if (existing && !(existing instanceof TFolder)) {
         throw new Error(`${path} exists and is not a folder`);
@@ -21055,6 +21123,9 @@ export class StashpadView extends ItemView {
    *  activate whatever tab happens to sit to the right. Applies to every tab the
    *  file-preview viewer spins out (PDF, image, broken-link fallback). */
   private openAttachmentInTab(file: TFile): void {
+    // tab-return: n/a — this one implements the same behaviour INLINE (see the
+    // doc comment above), including the settleNewTab short-circuit that
+    // returnToOriginOnClose does not model.
     const ws = this.app.workspace;
     const prev = ws.activeLeaf;
     const leaf = ws.getLeaf("tab");

@@ -209,6 +209,11 @@ export interface ComposerDraft {
   kind: "new" | "edit";
   edit?: { id: string; path: string; title: string; openMd: string };
   replyTo?: { id: string; title: string; path: string } | null;
+  /** 0.484.2: the note the composer was focused on when this draft was started,
+   *  so loading it later can put you back where it was meant to go. Null when it
+   *  was composed at the folder root (nothing to return to). Absent on drafts
+   *  written before 0.484.2 — treated the same as null. */
+  origin?: { id: string; title: string } | null;
 }
 
 export const RESERVED_SUBFOLDER_NAMES: ReadonlySet<string> = new Set([
