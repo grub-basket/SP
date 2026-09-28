@@ -98,16 +98,43 @@ export class StructureSnapshotStore {
   /** Read a folder's snapshot. Null when absent/unreadable/wrong schema —
    *  callers must treat every one of those as "no snapshot", never an error. */
   async load(folder: string): Promise<StructureSnapshot | null> {
+    return (await this.readLive(folder)).parsed;
+  }
+
+  /** 0.491.0 (perf): ONE read of the live snapshot, returning both the raw bytes and
+   *  the parsed value.
+   *
+   *  A flush has two consumers for the very same file: `mergeWithPrevious` needs it
+   *  PARSED (for the retention set) and the rotation needs it RAW (to copy verbatim
+   *  into `.prev.json`). Each used to do its own `exists` + `read`, so every snapshot
+   *  write cost 6 adapter ops where 4 do — measured, and on a network share at
+   *  300-600ms/op that is ~0.6-1.2s of pure duplication per write.
+   *
+   *  This is NOT a cache: nothing is retained across operations, so there is no
+   *  staleness window to reason about. It is strictly more correct than reading
+   *  twice — the old code could read different bytes for the merge and the rotation
+   *  if the file changed in between (a sync landing mid-flush), and then rotate a
+   *  generation that did not match what the merge was based on.
+   *
+   *  Contract, unchanged from the old `load()`: `parsed` is null for absent AND for
+   *  unreadable/wrong-schema alike. `raw` distinguishes them — null means the file is
+   *  genuinely absent, a string means it exists but did not parse, which is what the
+   *  rotation needs in order to refuse to rotate garbage. */
+  private async readLive(folder: string): Promise<{ raw: string | null; parsed: StructureSnapshot | null }> {
+    const path = this.pathFor(folder);
+    const adapter = this.app.vault.adapter;
     try {
-      const path = this.pathFor(folder);
-      const adapter = this.app.vault.adapter;
-      if (!(await adapter.exists(path))) return null;
-      const parsed = JSON.parse(await adapter.read(path)) as StructureSnapshot;
-      if (!parsed || parsed.schema !== SCHEMA || !parsed.notes) return null;
-      return parsed;
+      if (!(await adapter.exists(path))) return { raw: null, parsed: null };
+      const raw = await adapter.read(path);
+      try {
+        const p = JSON.parse(raw) as StructureSnapshot;
+        return { raw, parsed: (p && p.schema === SCHEMA && p.notes) ? p : null };
+      } catch {
+        return { raw, parsed: null };          // exists, but corrupt — do NOT rotate it
+      }
     } catch (e) {
       console.warn("[Stashpad] structure snapshot load failed", e);
-      return null;
+      return { raw: null, parsed: null };
     }
   }
 
@@ -193,21 +220,25 @@ export class StructureSnapshotStore {
           // snapshot would be indistinguishable from "everything was deleted"
           // and is exactly what you don't want to restore FROM.
           if (!Object.keys(snap.notes).length) return;
-          const merged = await this.mergeWithPrevious(key, snap);
           const adapter = this.app.vault.adapter;
           const path = this.pathFor(key);
+          // 0.491.0 (perf): read the live snapshot ONCE and serve both consumers from
+          // it — the merge wants it parsed, the rotation wants it verbatim. This used
+          // to be two independent `exists` + `read` pairs on the same file (6 ops per
+          // write instead of 4), and they could see different bytes if a sync landed
+          // between them.
+          const live = await this.readLive(key);
+          const merged = await this.mergeWithPrevious(key, snap, live.parsed);
           // Rotate before overwriting: one intact generation behind us.
           try {
-            if (await adapter.exists(path)) {
-              const current = await adapter.read(path);
-              // 0.211.8: only rotate a snapshot that actually PARSES. Rotating an
-              // unreadable one overwrites the last good generation with garbage, so a
-              // single corrupt write would cost both copies — and `.prev.json` is the
-              // fallback mergeWithPrevious now relies on precisely when the live file
-              // is unreadable. A corrupt current file is simply replaced below.
-              let ok = false;
-              try { const p = JSON.parse(current) as StructureSnapshot; ok = !!p && p.schema === SCHEMA && !!p.notes; } catch { ok = false; }
-              if (ok) await adapter.write(this.prevPathFor(key), current);
+            // 0.211.8: only rotate a snapshot that actually PARSES. Rotating an
+            // unreadable one overwrites the last good generation with garbage, so a
+            // single corrupt write would cost both copies — and `.prev.json` is the
+            // fallback mergeWithPrevious relies on precisely when the live file is
+            // unreadable. A corrupt current file is simply replaced below.
+            // `raw !== null` means the file EXISTS; `parsed` means it also parsed.
+            if (live.raw !== null) {
+              if (live.parsed) await adapter.write(this.prevPathFor(key), live.raw);
               else console.warn("[Stashpad] not rotating an unreadable structure snapshot — keeping the previous generation", path);
             }
           } catch { /* rotation is best-effort; never block the write */ }
@@ -242,7 +273,10 @@ export class StructureSnapshotStore {
    *  the tree no longer knows about are kept while their file still exists on
    *  disk (damaged, not deleted) and pruned once it's gone. This is what stops
    *  a frontmatter wipe from erasing its own recovery record. */
-  private async mergeWithPrevious(folder: string, next: StructureSnapshot): Promise<StructureSnapshot> {
+  /** `live` is the already-read live snapshot (0.491.0) — passed in rather than
+   *  re-read here, so a flush touches the file once. Pass `undefined` from any caller
+   *  that has not read it, and this falls back to reading it itself. */
+  private async mergeWithPrevious(folder: string, next: StructureSnapshot, live?: StructureSnapshot | null): Promise<StructureSnapshot> {
     // 0.211.8: `load()` returns null for "absent" AND for "unreadable/wrong schema"
     // alike, and returning `next` on null threw away the RETENTION set — the entries
     // for notes whose file still exists but which have dropped out of the tree, i.e.
@@ -251,7 +285,8 @@ export class StructureSnapshotStore {
     // permanently discarded the recovery data. Fall back to the rotated generation:
     // it's one write behind, and its retention entries are re-validated against disk
     // below anyway, so a stale one costs nothing.
-    const prev = await this.load(folder) ?? await this.loadPrevGeneration(folder);
+    const prev = (live !== undefined ? live : await this.load(folder))
+      ?? await this.loadPrevGeneration(folder);
     if (!prev) return next;
     const adapter = this.app.vault.adapter;
     const now = new Date().toISOString();

@@ -11454,6 +11454,23 @@ export default class StashpadPlugin extends Plugin {
     // performs the one-time split migration (backing data.json up first). Callers
     // downstream see exactly the object they always did.
     const data = (await this.store.loadAll()) ?? {};
+    // 0.492.0: the collision guard's baseline must be WHAT DISK SAID, captured
+    // before the migrations below rewrite `data`. Snapshotting it after them (from
+    // the merged settings, as the load-time call used to) made every load-time
+    // migration look like somebody else's edit: our value equalled the baseline, so
+    // `guardedSave` read it as "we didn't change this key, the disk did" and adopted
+    // the stale disk value straight back — silently undoing the migration on the
+    // first save of the session. That is how every item button disappeared: the
+    // 0.475.0 seed put edit/focus/reply/react in memory, an install whose data.json
+    // already carried an explicit `itemButtons: []` (the 0.320.0-era default) had
+    // that `[]` adopted back on the next save, and `itemButtonsSeeded` — a key
+    // ABSENT from disk, so the guard skipped it — stuck at true, blocking the
+    // re-seed for good. One stringify pass at load only; saves keep their own cache.
+    const diskAtLoad: Record<string, string> = {};
+    for (const k of Object.keys(data)) {
+      const s = JSON.stringify((data as Record<string, unknown>)[k]);
+      if (s !== undefined) diskAtLoad[k] = s;
+    }
     // 0.137.3: collision guard — remember the on-disk write generation we
     // loaded from, so a save can detect that another instance wrote since.
     this.lastSeenSettingsRev = typeof data?.settingsRev === "number" ? data.settingsRev : 0;
@@ -11526,6 +11543,20 @@ export default class StashpadPlugin extends Plugin {
         : [];
       data.itemButtons = [...DEFAULT_ROW_BUTTONS, ...existing.filter((id) => !DEFAULT_ROW_BUTTONS.includes(id))];
       data.itemButtonsSeeded = true;
+    }
+    // 0.492.0: ONE-TIME repair of the "every row button vanished" state. An
+    // already-seeded install whose `itemButtons` is empty or absent lost the list
+    // rather than chose it: the 0.475.0 seed can't re-run (seeded === true) and the
+    // settings section only listed ids that were IN the list, so the four built-ins
+    // were invisible there too — no way to notice or undo it from the UI. Restore
+    // the defaults once, guarded by its own flag so a user who deliberately clears
+    // every button afterwards (now visible + reversible via the eye toggles in
+    // Settings → Note actions & menus → Item buttons) is never re-seeded.
+    if (data && data.itemButtonsRepairedV1 !== true) {
+      if (!Array.isArray(data.itemButtons) || data.itemButtons.length === 0) {
+        data.itemButtons = [...DEFAULT_ROW_BUTTONS];
+      }
+      data.itemButtonsRepairedV1 = true;
     }
     if (data?.shortcuts && data.shortcuts.openEditor === "E") data.shortcuts.openEditor = "Mod+Shift+E";
     if (data?.bindings?.openEditor && data.bindings.openEditor.primary === "E") data.bindings.openEditor.primary = "Mod+Shift+E";
@@ -11618,7 +11649,16 @@ export default class StashpadPlugin extends Plugin {
       commandIcons: (data?.commandIcons && typeof data.commandIcons === "object" && !Array.isArray(data.commandIcons))
         ? Object.fromEntries(Object.entries(data.commandIcons).filter(([, v]) => typeof v === "string")) as Record<string, string>
         : {},
-      itemButtons: Array.isArray(data?.itemButtons) ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string") : [],
+      // 0.492.0: a MISSING key falls back to the DEFAULTS, not to `[]`. An empty
+      // list legitimately means "no row buttons", but *absent* means "never
+      // written / lost" — and `[]` here silently overrode DEFAULT_SETTINGS, so any
+      // path that dropped the key (the config-folder strip in settings-store, a
+      // hand-edited data.json, an older build that round-tripped the file) wiped
+      // every row button for good: `itemButtonsSeeded` stays true, so the 0.475.0
+      // seed below could never repair it.
+      itemButtons: Array.isArray(data?.itemButtons)
+        ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string")
+        : [...DEFAULT_ROW_BUTTONS],
       contextMenuOrder: Array.isArray(data?.contextMenuOrder) ? data.contextMenuOrder.filter((x: unknown): x is string => typeof x === "string") : [],
       customCommandIds: Array.isArray(data?.customCommandIds) ? data.customCommandIds.filter((x: unknown): x is string => typeof x === "string") : [],
       savedSearches: Array.isArray(data?.savedSearches) ? data.savedSearches.filter((x: any) => x && typeof x.query === "string").map((x: any) => ({ name: typeof x.name === "string" && x.name ? x.name : x.query, query: x.query })) : [],
@@ -11652,7 +11692,21 @@ export default class StashpadPlugin extends Plugin {
     setSettings(this.settings);
     // 0.137.3: collision guard — baseline what the protected keys looked like
     // at load, so a later save can tell "we changed it" from "someone else did".
-    this.snapshotSettingsBaseline();
+    // 0.492.0: hand the baseline the DISK value for exactly the keys the migrations
+    // above rewrote — computed by diffing the bag against its pre-migration
+    // snapshot, so a future migration is covered without having to remember to
+    // register itself here. Deliberately NOT every key on disk: the merge that built
+    // `this.settings` also NORMALIZES values (bindings gain defaults, `drafts` is
+    // cleared, invalid savedSearches are dropped), and baselining those against disk
+    // would make us look like the editor of keys we only re-derived — flipping the
+    // "another machine changed it while we were loaded, take theirs" rule that
+    // 0.211.1 exists for. A migration is a genuine local edit; a normalization isn't.
+    const migratedAtLoad: Record<string, string> = {};
+    for (const k of Object.keys(diskAtLoad)) {
+      const now = JSON.stringify((data as Record<string, unknown>)[k]);
+      if (now !== diskAtLoad[k]) migratedAtLoad[k] = diskAtLoad[k];
+    }
+    this.snapshotSettingsBaseline(undefined, migratedAtLoad);
     // 0.124.1: one-time migration of the "Toggle task" default H → G. Installs
     // persist the FULL bindings map, so changing the default alone never reaches
     // existing users. Flip a still-default `H` to `G` once, then mark it done so
@@ -12144,12 +12198,21 @@ export default class StashpadPlugin extends Plugin {
    *  saveSplit can adopt a moved key from disk after the cache was built, so
    *  those are always re-stringified here. Any miss falls back to stringifying,
    *  so the baseline is byte-identical to the uncached version. */
-  private snapshotSettingsBaseline(cur?: Map<string, string>): void {
+  /** 0.492.0: `diskRaw` (load only) is the JSON of each key AS READ FROM DISK,
+   *  captured before load-time migrations rewrite it. A key present there uses the
+   *  disk string, so a migration we just applied reads as OUR change (ours ≠
+   *  baseline, disk = baseline) and wins the save instead of being adopted back.
+   *  Keys absent from disk keep the in-memory value — `guardedSave` skips them
+   *  anyway (`disk[k] === undefined`). Post-save callers pass nothing: by then
+   *  memory IS what disk says, which is what the baseline should mean. */
+  private snapshotSettingsBaseline(cur?: Map<string, string>, diskRaw?: Record<string, string>): void {
     const all = this.settings as unknown as Record<string, unknown>;
     const moved = cur ? this.store.movedKeys() : null; // 0.378.0: dynamic
     this.settingsBaseline = {};
     for (const k of Object.keys(all)) {
       if (k === "settingsRev") continue; // bookkeeping, never adopted
+      const fromDisk = diskRaw?.[k];
+      if (fromDisk !== undefined) { this.settingsBaseline[k] = fromDisk; continue; }
       const cached = moved && !moved.has(k) ? cur?.get(k) : undefined;
       this.settingsBaseline[k] = cached ?? JSON.stringify(all[k]);
     }

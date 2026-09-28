@@ -344,6 +344,11 @@ export interface StashpadSettings {
    *  built-ins are prepended (see main.ts) and this is set, so we never re-seed
    *  over a user who has since removed them. */
   itemButtonsSeeded: boolean;
+  /** 0.492.0: one-time repair flag for the "all row buttons vanished" state —
+   *  an already-seeded install whose `itemButtons` came back empty/absent gets the
+   *  defaults restored ONCE (see main.ts). Set thereafter, so deliberately hiding
+   *  every button sticks. */
+  itemButtonsRepairedV1: boolean;
   /** 0.320.0: user icon overrides for catalog actions, keyed by action id →
    *  lucide icon name. Missing = the catalog default (so "reset" = delete key).
    *  Custom Obsidian commands are keyed `cmd:<id>`. */
@@ -1283,6 +1288,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   quickMenuCustom: [],
   itemButtons: [...DEFAULT_ROW_BUTTONS],
   itemButtonsSeeded: true,
+  itemButtonsRepairedV1: true,
   commandIcons: {},
   contextMenuOrder: [],
   // 0.363.0: seed the four built-in reorg submenus so the default order's
@@ -2952,12 +2958,18 @@ export class StashpadSettingTab extends PluginSettingTab {
 
   /** 0.320.0: item-button builder — user command buttons ON each note row. */
   private itemButtonsBody(host: HTMLElement, rebuild: () => void): void {
-        this.sectionHeader(host, "🔘 Item buttons (on every note row)", "The icon buttons on each note's action row (desktop). The built-in Edit / Focus / Reply / React buttons are listed here too now — reorder them, hide any you don't use, or add your own (a catalog action or any command) for one-tap Copy, Move, etc. The first several sit inline; extras drop to a bar under the note. The ⋮ menu is always last. (Mobile keeps its own compact row.)");
+        this.sectionHeader(host, "🔘 Item buttons (on every note row)", "The icon buttons on each note's action row (desktop). The built-in Edit / Focus / Reply / React buttons are listed here too — reorder them, use the eye to hide or show one, or add your own (a catalog action or any command) for one-tap Copy, Move, etc. A hidden built-in stays listed below the others so you can always bring it back. The first several sit inline; extras drop to a bar under the note. The ⋮ menu is always last. (Mobile keeps its own compact row.)");
         this.actionListBuilder(host,
           () => this.plugin.settings.itemButtons ?? [],
           (ids) => { this.plugin.settings.itemButtons = ids; },
-          "No item buttons yet. Add one below.",
-          { catalogIds: BUTTON_ACTION_CATALOG.map((a) => a.id) });
+          "Every button is hidden — only the ⋮ menu shows on a note row. Click an eye below to bring one back.",
+          {
+            catalogIds: BUTTON_ACTION_CATALOG.map((a) => a.id),
+            // 0.492.0: the four built-ins stay on screen even when switched off,
+            // and "Restore the default buttons" writes them back in one click.
+            alwaysList: DEFAULT_ROW_BUTTONS,
+            resetTo: DEFAULT_ROW_BUTTONS,
+          });
   }
 
   /** 0.320.0: the large context-menu top-block builder (reorderable leaf
@@ -3308,7 +3320,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.320.0: a reorderable list of note-action ids (catalog ids or
    *  `cmd:<obsidian id>`), with add / remove / move up / move down. Shared by the
    *  star menu and the item-button builders. Re-renders `host` in place. */
-  private actionListBuilder(host: HTMLElement, getIds: () => string[], setIds: (ids: string[]) => void, emptyText: string, opts?: { allowCustom?: boolean; catalogIds?: readonly string[]; defaultOrder?: readonly string[]; ctxHide?: boolean }): void {
+  private actionListBuilder(host: HTMLElement, getIds: () => string[], setIds: (ids: string[]) => void, emptyText: string, opts?: { allowCustom?: boolean; catalogIds?: readonly string[]; defaultOrder?: readonly string[]; ctxHide?: boolean; alwaysList?: readonly string[]; resetTo?: readonly string[] }): void {
     const wrap = host.createDiv({ cls: "stashpad-action-builder" });
     const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     // 0.476.2: drag-to-reorder (the ▲▼ buttons still work). Listeners live on the
@@ -3381,12 +3393,39 @@ export class StashpadSettingTab extends PluginSettingTab {
         // of deleting (which the seed would undo); user items keep ✕.
         if (opts?.ctxHide) {
           this.ctxRowRemoveControl(row, id, async () => { const n = ids.slice(); n.splice(i, 1); await rerender(true, n); }, () => { void rerender(false, ids); });
+        } else if ((opts?.alwaysList ?? []).includes(id)) {
+          // 0.492.0: a built-in that stays listed when off — so it HIDES rather
+          // than disappearing. Same splice, honest label.
+          row.addExtraButton((b) => b.setIcon("eye").setTooltip("Hide from the note row").onClick(async () => {
+            const n = ids.slice(); n.splice(i, 1); await rerender(true, n);
+          }));
         } else {
           row.addExtraButton((b) => b.setIcon("x").setTooltip("Remove").onClick(async () => {
             const n = ids.slice(); n.splice(i, 1); await rerender(true, n);
           }));
         }
       });
+      // 0.492.0: ids that are ALWAYS listed, even when switched off — otherwise a
+      // built-in you turned off disappears from this editor entirely and there's
+      // nothing left to click to get it back (that's how every row button went
+      // missing with an empty-looking section). Shown greyed, with an eye to
+      // restore; clicking it appends the id back onto the end of the order.
+      for (const offId of (opts?.alwaysList ?? [])) {
+        if (ids.includes(offId)) continue;
+        const { icon, name } = label(offId);
+        const row = new Setting(wrap).setName(name);
+        // Deliberately NOT `.stashpad-action-row`: that class is the drag hook, and
+        // a hidden row has no index in the order — it would light up as a drop
+        // target and then silently do nothing. The greying is its own class.
+        row.settingEl.addClass("is-ctx-hidden");
+        const ic = row.nameEl.createSpan({ cls: "stashpad-cmdicon-preview" });
+        setIcon(ic, icon); row.nameEl.prepend(ic);
+        row.setDesc("Hidden");
+        row.addExtraButton((b) => b
+          .setIcon("eye-off")
+          .setTooltip("Hidden from the note row — click to show")
+          .onClick(async () => { await rerender(true, [...ids, offId]); }));
+      }
       const addRow = new Setting(wrap);
       addRow.addButton((b) => b.setButtonText("Add action…").onClick((e) => {
         const cur = effective();
@@ -3410,6 +3449,19 @@ export class StashpadSettingTab extends PluginSettingTab {
       }));
       if (opts?.defaultOrder) {
         addRow.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset to default order").onClick(async () => { await rerender(true, []); }));
+      }
+      // 0.492.0: an EXPLICIT reset — writes the default ids rather than clearing
+      // the list. `defaultOrder` above can reset by emptying because those builders
+      // treat empty as "use the defaults"; item buttons don't (empty genuinely
+      // means no buttons), so they need the ids written out. It RESTORES rather than
+      // replaces: a command you added stays, appended after the built-ins. Wiping
+      // someone's custom buttons to fix a missing built-in would trade one silent
+      // loss for another, and there's no undo on a settings row.
+      if (opts?.resetTo) {
+        addRow.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Restore the default buttons (keeps any you added)").onClick(async () => {
+          const keep = ids.filter((id) => !opts.resetTo!.includes(id));
+          await rerender(true, [...opts.resetTo!, ...keep]);
+        }));
       }
     };
     build(getIds());
