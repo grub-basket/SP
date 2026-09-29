@@ -10874,18 +10874,42 @@ export class StashpadView extends ItemView {
     // Obsidian listens for the drawer gesture. The textarea case PROVED that
     // handler is bubble-phase and bound above us, so stopping propagation at the
     // button keeps a press that begins on Send from ever reaching it.
-    // `stopPropagation` only, never `preventDefault` — the button's own
-    // `touchend` handler below is on this same element and is unaffected
-    // (`stopPropagation` does not silence same-element listeners).
+    // `stopPropagation` only on `touchmove` — the button's own `touchend`
+    // handler below is on this same element and is unaffected (`stopPropagation`
+    // does not silence same-element listeners).
+    //
+    // 0.493.0: `touchstart` ALSO calls `preventDefault` now, and is bound
+    // NON-passive so it can. This is the fix for the mobile keyboard being
+    // dismissed on send. The earlier guards (0.216.0 `onmousedown` +
+    // 0.267.10 `touchend`) both fire too late: on iOS the focus shift that
+    // blurs the textarea — and so tears down the keyboard — happens at the
+    // START of the tap gesture, before the synthesised mousedown and before
+    // touchend. Cancelling the default on `touchstart` is the only point early
+    // enough to stop the button ever becoming the focus target, so the caret
+    // (and the keyboard) stay on the composer through the send. It also
+    // subsumes the drawer-gesture guard (a defaultless touch can't be read as a
+    // swipe) and suppresses the synthesised click, which is harmless: on mobile
+    // the `touchend` handler is what fires the submit (`onclick` is the
+    // desktop/fallback path). `touchmove` stays passive — never preventDefault
+    // a move (it would kill native scrolling if a press turns into a drag).
+    // 0.493.1: capture whether the composer had focus at the START of the tap,
+    // BEFORE any native blur. The touchend handler uses it to decide whether to
+    // keep the keyboard up (see the C-path comment there).
+    let composerFocusedAtTouch = false;
     if (Platform.isMobile) {
-      for (const evt of ["touchstart", "touchmove"]) {
-        sendBtn.addEventListener(evt, (e) => { e.stopPropagation(); }, { passive: true });
-      }
+      sendBtn.addEventListener("touchstart", (e) => {
+        composerFocusedAtTouch = document.activeElement === ta;
+        e.stopPropagation();
+        e.preventDefault();
+      }, { passive: false });
+      sendBtn.addEventListener("touchmove", (e) => { e.stopPropagation(); }, { passive: true });
     }
     // 0.216.0: every sibling button already guards mousedown (destBtn's comment
     // documents why: stealing focus dismisses the mobile keyboard). Send was
     // the ONE button without it, so a tap on Send blurred the textarea at
-    // gesture time — dismissing the keyboard before submit even ran.
+    // gesture time — dismissing the keyboard before submit even ran. (Kept as
+    // the desktop guard + a belt-and-braces backstop; 0.493.0's touchstart
+    // preventDefault is the one that holds on iOS.)
     sendBtn.onmousedown = (e) => e.preventDefault();
     sendBtn.title = "Send (Enter)";
     setIcon(sendBtn, "arrow-up");
@@ -11081,7 +11105,27 @@ export class StashpadView extends ItemView {
         // not a press, and multi-touch is not either.
         if (e.changedTouches.length !== 1) return;
         e.preventDefault();
-        if (wasHolding) fireSubmit(); // released before the hold fired → normal send
+        if (!wasHolding) return; // the hold already fired the destination menu
+        // 0.493.1: two mobile after-send behaviours, chosen by the
+        // "focus composer after send" setting (autofocusComposerAfterSend):
+        //
+        //  B (default, setting OFF): do nothing here. The tap has already
+        //    blurred the textarea, so the keyboard settles closed and STAYS
+        //    closed — no dismiss-then-reopen bounce, no list reflow flicker.
+        //    (The submit() path also skips its post-render refocus when the
+        //    setting is off, so nothing pulls the keyboard back up.)
+        //
+        //  C (setting ON + the composer actually had focus): keep the keyboard
+        //    up across the send. iOS only shows the keyboard from a focus()
+        //    called INSIDE a user gesture — the refocus submit() queues for the
+        //    post-send render fires too late to count. So refocus HERE, synchronously,
+        //    while we're still in the touchend gesture. reuseComposer keeps this
+        //    same textarea across the send, so the focus set now survives into
+        //    the emptied composer and the keyboard never drops.
+        if (composerFocusedAtTouch && getSettings().autofocusComposerAfterSend) {
+          this.composerInputEl?.focus({ preventScroll: true });
+        }
+        fireSubmit(); // released before the hold fired → normal send
       });
     }
 
@@ -23618,8 +23662,8 @@ export class DeletedTrashSuggestModal extends SuggestModal<{ blob: string; label
     this.setPlaceholder("Restore which deleted note?");
   }
   getSuggestions(query: string): { blob: string; label: string; folder: string }[] {
-    const q = query.toLowerCase();
-    return this.entries.filter((e) => `${e.label} ${e.folder}`.toLowerCase().includes(q));
+    // 0.494.0: Sift (docs/sift.md) instead of a single substring.
+    return this.entries.filter((e) => siftMatch(query, `${e.label} ${e.folder}`));
   }
   renderSuggestion(e: { blob: string; label: string; folder: string }, el: HTMLElement): void {
     el.createDiv({ text: e.label });

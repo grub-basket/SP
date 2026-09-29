@@ -10,6 +10,7 @@ import { join } from "node:path";
 const ENTRIES = [
   "scripts/tests/config-layout.test.ts",
   "scripts/tests/md-tables.test.ts",
+  "scripts/tests/suggest-match.test.ts",
 ];
 
 let passed = 0;

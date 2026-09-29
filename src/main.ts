@@ -45,7 +45,7 @@ import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { buildStashpadLink, parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
 import { LinkLog, type LinkLogEntry } from "./link-log";
-import { ROOT_ID, parseAssignees, writeCompletedFm } from "./types";
+import { ROOT_ID, parseAssignees, writeCompletedFm, siftMatch } from "./types";
 import { removeIconSprites } from "./icon-sprite";
 import { parseRecurrence, nextDueOnComplete, parseDuration, parseRepeatMode } from "./recurrence";
 import { spawnNextOccurrence, claimOccurrenceMissed } from "./recurrence-spawn";
@@ -12808,11 +12808,11 @@ class ImportTargetModal extends SuggestModal<ImportTarget> {
     this.setPlaceholder("Choose a Stashpad folder to import into…");
   }
   getSuggestions(query: string): ImportTarget[] {
-    const q = query.toLowerCase();
     // Current folder first, then the rest (deduped), filtered by query.
+    // 0.494.0: Sift (docs/sift.md) instead of a single substring.
     const ordered = [this.def, ...this.folders.filter((f) => f !== this.def)];
     return ordered
-      .filter((f) => f.toLowerCase().includes(q))
+      .filter((f) => siftMatch(query, f))
       .map((f) => ({ label: f, folder: f, current: f === this.def }));
   }
   renderSuggestion(item: ImportTarget, el: HTMLElement): void {
@@ -12837,8 +12837,8 @@ class FolderBundleSuggest extends SuggestModal<{ folder: string; blobPath: strin
     this.setPlaceholder("Choose an encrypted folder bundle to decrypt…");
   }
   getSuggestions(query: string): { folder: string; blobPath: string }[] {
-    const q = query.toLowerCase();
-    return this.bundles.filter((b) => b.folder.toLowerCase().includes(q));
+    // 0.494.0: Sift (docs/sift.md) instead of a single substring.
+    return this.bundles.filter((b) => siftMatch(query, b.folder));
   }
   renderSuggestion(item: { folder: string; blobPath: string }, el: HTMLElement): void {
     el.createDiv({ text: item.folder || "(vault root)" });

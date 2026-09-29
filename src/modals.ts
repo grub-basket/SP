@@ -14,6 +14,8 @@ import { ComposerAutocomplete } from "./composer-autocomplete";
 import { renderFormattingToolbar, wrapSelection } from "./formatting-toolbar";
 import { dedupeDrafts } from "./drafts";
 import { IconSuggest } from "./icon-suggest";
+import { vaultTagEntries } from "./input-suggest";
+import { siftRank } from "./suggest-match";
 import { lineDiff } from "./note-history";
 import { parseDelimited, snippetsFromRows, mergeSnippets, findTriggerCollision } from "./snippets";
 import { isImageExt, fileKindFor } from "./file-kinds";
@@ -4461,7 +4463,20 @@ export class DueDatePickerModal extends Modal {
     sec.createDiv({ cls: "stashpad-tagsec-label", text: "Tags" });
     const chipsRow = sec.createDiv({ cls: "stashpad-tagsec-chips" });
     const quick = (this.opts.tagChips ?? []).map(norm).filter(Boolean);
-    const suggestPool = [...new Set([...quick, ...(this.opts.tagSuggestions ?? []).map(norm)])].filter(Boolean);
+    const configured = [...new Set([...quick, ...(this.opts.tagSuggestions ?? []).map(norm)])].filter(Boolean);
+    // 0.494.0: the type-to-add list also offers every tag already used in the
+    // vault (after the configured chips/suggestions, most-used first). Built
+    // LAZILY on the first keystroke — never at modal open — and cached for the
+    // modal's life.
+    let pool: string[] | null = null;
+    const suggestPool = (): string[] => {
+      if (!pool) {
+        const have = new Set(configured.map((t) => t.toLowerCase()));
+        const vault = vaultTagEntries(this.app).map((e) => norm(e.value)).filter((t) => t && !have.has(t.toLowerCase()));
+        pool = [...configured, ...vault];
+      }
+      return pool;
+    };
 
     const add = (t: string): void => { const v = norm(t); if (v && !this.tags.includes(v)) { this.tags.push(v); repaint(); } };
     const remove = (t: string): void => { this.tags = this.tags.filter((x) => x !== t); repaint(); };
@@ -4494,10 +4509,10 @@ export class DueDatePickerModal extends Modal {
       const q = input.value.trim();
       sugg.empty();
       if (!q) { sugg.toggleClass("is-open", false); return; }
-      const matches = suggestPool.filter((t) => !this.tags.includes(t) && siftMatch(q, t)).slice(0, 8);
+      const matches = siftRank(q, suggestPool().filter((t) => !this.tags.includes(t)), (t) => t).slice(0, 8);
       const rows: Array<{ label: string; pick: () => void }> = matches.map((t) => ({ label: `#${t}`, pick: () => { add(t); input.value = ""; repaintSuggest(); input.focus(); } }));
       const exact = norm(q);
-      if (exact && !suggestPool.includes(exact) && !this.tags.includes(exact)) rows.push({ label: `Add “#${exact}”`, pick: () => { add(exact); input.value = ""; repaintSuggest(); input.focus(); } });
+      if (exact && !suggestPool().includes(exact) && !this.tags.includes(exact)) rows.push({ label: `Add “#${exact}”`, pick: () => { add(exact); input.value = ""; repaintSuggest(); input.focus(); } });
       if (rows.length === 0) { sugg.toggleClass("is-open", false); return; }
       sugg.toggleClass("is-open", true);
       for (const r of rows) {

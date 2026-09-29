@@ -364,34 +364,9 @@
   width: 100%;
   box-sizing: border-box;
 }
-.stashpad-note-template-suggest {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: calc(100% + 2px);
-  background: var(--background-primary);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 6px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
-  z-index: 30;
-  max-height: 240px;
-  overflow-y: auto;
-  font-size: var(--font-ui-smaller);
-}
-.stashpad-note-template-suggest-item {
-  padding: 5px 10px;
-  cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.stashpad-note-template-suggest-item:hover,
-.stashpad-note-template-suggest-item.is-active {
-  background: var(--background-modifier-hover);
-}
-.stashpad-note-template-suggest-item.is-active {
-  background: var(--background-modifier-active-hover, var(--background-modifier-hover));
-}
+/* 0.494.0: the template-path popover is now Obsidian's AbstractInputSuggest
+   (StringSuggest), styled by Obsidian — the hand-rolled .stashpad-note-template-suggest
+   rules were removed with it. */
 .stashpad-note-template-warn {
   flex: 1 0 100%;
   font-size: var(--font-ui-smaller);
@@ -1131,6 +1106,12 @@
 .stashpad-icon-suggest-icon .svg-icon { width: 18px; height: 18px; }
 .stashpad-icon-suggest-label {
   font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+/* 0.494.0: muted second line in StringSuggest rows (tag/extension counts). */
+.stashpad-input-suggest-detail {
+  display: block;
   font-size: var(--font-ui-smaller);
   color: var(--text-muted);
 }

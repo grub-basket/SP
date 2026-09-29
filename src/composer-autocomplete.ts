@@ -6,6 +6,7 @@ import { HIGHLIGHT_COLORS, takeLeadingColor } from "./highlight-colors";
 import { getSettings, getTemplatesFormats } from "./settings";
 import { expandSnippet } from "./snippets";
 import { MarkdownInput, type MarkdownInputOptions } from "./markdown-input";
+import { siftRank } from "./suggest-match";
 
 /**
  * Composer autocomplete: a lightweight popup attached to a plain
@@ -351,12 +352,19 @@ export class ComposerAutocomplete {
       // matcher, no note contains a "|", and typing an alias link killed the
       // suggestions at the moment you pressed `|`.
       const pipeIdx = query.indexOf("|");
+      // 0.494.0: the alias may sit AFTER the caret — the user wrote
+      // "[[|alias]]" first, then went back inside to search for the target.
+      // replaceEnd already swallows that tail (see 0.199.2 above), so without
+      // reading the alias out of it, picking a note erased the "|alias".
+      const tail = rest ? rest[1] : "";
+      const tailPipe = pipeIdx < 0 ? tail.indexOf("|") : -1;
       return {
         kind: "link",
         query: pipeIdx >= 0 ? query.slice(0, pipeIdx) : query,
         // null = user never typed a pipe; "" = typed it but hasn't typed the
         // alias yet. The two insert differently, so they can't be collapsed.
-        aliasPart: pipeIdx >= 0 ? query.slice(pipeIdx + 1) : null,
+        aliasPart: pipeIdx >= 0 ? query.slice(pipeIdx + 1)
+          : tailPipe >= 0 ? tail.slice(tailPipe + 1) : null,
         replaceStart: caret - query.length - 2,
         replaceEnd,
       };
@@ -598,25 +606,36 @@ export class ComposerAutocomplete {
     // notes insert as [[basename]]; non-md files keep their extension because
     // Obsidian only resolves [[image.png]] WITH the ext.
     const typedAlias = state.kind === "link" ? state.aliasPart ?? null : null;
-    const fileMatches = (limit: number): SuggestItem[] => this.fileIndex
-      .filter((f) => matchesAll(f.lower))
+    // 0.494.0: a `[[` query containing "/" is a PATH-style link ("[[Projects/Q3/Pl").
+    // Basenames never contain "/", so matching it against the basename (as below)
+    // gave NO suggestions at all — the logged "path-type internal link, no
+    // suggestions … inside the edit modal" bug (every ComposerAutocomplete surface
+    // had it). Match the vault path instead (Sift + rank, path-prefix first), skip
+    // alias rows (they'd duplicate their note), and insert the path form the user
+    // was typing (`.md` dropped, other extensions kept — how Obsidian writes them).
+    const pathQuery = state.kind === "link" && q.includes("/");
+    const fileMatches = (limit: number): SuggestItem[] => (pathQuery
+      ? siftRank(q, this.fileIndex.filter((f) => !f.alias), (f) => f.file.path)
+      : this.fileIndex.filter((f) => matchesAll(f.lower)))
       .slice(0, limit)
       .map((f) => {
+        const target = !pathQuery ? f.insertText
+          : f.file.extension === "md" ? f.file.path.slice(0, -3) : f.file.path;
         // What the user typed after `|` wins; otherwise an alias ROW carries its
         // own alias, so picking "ADR-7" writes [[Architecture Decision 7|ADR-7]]
         // — resolves by real name, reads as the alias.
         const alias = typedAlias !== null ? typedAlias : f.alias ?? null;
         if (alias === null) {
-          return { label: f.label, insert: `[[${f.insertText}]]`, subtitle: f.file.path };
+          return { label: f.label, insert: `[[${target}]]`, subtitle: f.file.path };
         }
         if (alias === "") {
           // Pipe typed but no alias yet: leave the caret between | and ]] so the
           // user just keeps typing, instead of landing after the brackets.
-          return { label: f.label, insert: `[[${f.insertText}|]]`, subtitle: f.file.path, caretBack: 2 };
+          return { label: f.label, insert: `[[${target}|]]`, subtitle: f.file.path, caretBack: 2 };
         }
         return {
           label: f.alias ? f.label : `${f.label} | ${alias}`,
-          insert: `[[${f.insertText}|${alias}]]`,
+          insert: `[[${target}|${alias}]]`,
           subtitle: f.alias ? `${f.insertText} · ${f.file.path}` : f.file.path,
         };
       });

@@ -6,6 +6,8 @@ function osFileManagerName(): string {
 }
 import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal, buildJdPreviewNotice } from "./index-builder";
 import { FolderSuggest } from "./folder-suggest";
+import { StringSuggest, vaultTagEntries, vaultExtensionEntries, timezoneNames, CALLOUT_TYPES } from "./input-suggest";
+import { siftRank } from "./suggest-match";
 import { isValidConfigFolder } from "./config-layout";
 import { IconSuggest } from "./icon-suggest";
 import { CommandSuggest } from "./command-suggest";
@@ -2258,6 +2260,8 @@ export class StashpadSettingTab extends PluginSettingTab {
             (s) => s.addText((t) => {
               t.setValue((s0.watchedFolders ?? []).join(", ")).setPlaceholder("Team, Projects/Q3");
               const commit = async () => { s0.watchedFolders = parseCsv(t.getValue()); await this.plugin.saveSettings(); };
+              // 0.494.0: suggest Stashpad folders for the item under the caret.
+              new StringSuggest(this.app, t.inputEl, () => this.plugin.discoverStashpadFolders(), { list: /,/, onPick: () => void commit() });
               t.inputEl.addEventListener("blur", () => void commit());
               t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
             }),
@@ -2267,6 +2271,8 @@ export class StashpadSettingTab extends PluginSettingTab {
             (s) => s.addText((t) => {
               t.setValue((s0.mutedFolders ?? []).join(", ")).setPlaceholder("Scratch, Archive");
               const commit = async () => { s0.mutedFolders = parseCsv(t.getValue()); await this.plugin.saveSettings(); };
+              // 0.494.0: suggest Stashpad folders for the item under the caret.
+              new StringSuggest(this.app, t.inputEl, () => this.plugin.discoverStashpadFolders(), { list: /,/, onPick: () => void commit() });
               t.inputEl.addEventListener("blur", () => void commit());
               t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
             }),
@@ -4104,13 +4110,16 @@ export class StashpadSettingTab extends PluginSettingTab {
       ["link", "preview", "collapsed", "folded", "callout"]));
     cats.linkPreviews.push(this.renderDef("Link preview callout style",
       'Which Obsidian callout type link previews use — "info", "quote", "abstract", "note" and so on. Cosmetic: it decides the icon and colour. Previews are always collapsed by default so a note with several links is not mostly preview.',
-      (s) => s.addText((t) => t
-        .setPlaceholder("info")
-        .setValue(this.plugin.settings.linkPreviewCallout)
-        .onChange(async (v) => {
-          this.plugin.settings.linkPreviewCallout = (v || "info").trim().replace(/[^a-z0-9-]/gi, "") || "info";
-          await set();
-        })), ["link", "preview", "callout", "unfurl", "url"]));
+      (s) => s.addText((t) => {
+        // 0.494.0: suggest Obsidian's built-in callout types.
+        new StringSuggest(this.app, t.inputEl, () => CALLOUT_TYPES);
+        t.setPlaceholder("info")
+          .setValue(this.plugin.settings.linkPreviewCallout)
+          .onChange(async (v) => {
+            this.plugin.settings.linkPreviewCallout = (v || "info").trim().replace(/[^a-z0-9-]/gi, "") || "info";
+            await set();
+          });
+      }), ["link", "preview", "callout", "unfurl", "url"]));
     cats.linkPreviews.push(this.renderDef("Pause between link fetches (ms)",
       "How long to wait between fetching one link preview and the next. Backfilling an archive is thousands of requests, and hammering a site is both rude and a good way to get rate-limited. 300ms is a reasonable default; raise it if a host starts refusing.",
       (s) => s.addText((t) => t
@@ -4218,6 +4227,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       }, ["templates", "date", "time", "format"]));
       cats.datesTime.push(this.renderDef("Display timezone", "IANA timezone name (e.g. America/New_York, Europe/London, Asia/Kolkata). Leave blank to use your system timezone.", (s) => {
         s.addText((t) => {
+          // 0.494.0: suggest the IANA zone names the runtime knows.
+          new StringSuggest(this.app, t.inputEl, timezoneNames, { browseLimit: 1000 });
           t.setPlaceholder("(system timezone)");
           t.setValue(this.plugin.settings.dateDisplayTimezone ?? "");
           t.onChange(async (v) => { this.plugin.settings.dateDisplayTimezone = (v || "").trim(); await set(); refreshSample(); });
@@ -4241,6 +4252,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       const parseTags = (v: string): string[] => [...new Set(v.split(",").map((x) => x.trim().replace(/^#+/, "").replace(/\s+/g, "-")).filter(Boolean))];
       cats.datesTime.push(this.renderDef("Task tag chips", "Comma-separated tags shown as one-tap chips in the due-date / assign picker, so you can label a task (e.g. events, saga, outage) without typing. Plain names, no # needed.", (s) => {
         s.addText((t) => {
+          // 0.494.0: suggest vault tags (no #) for the item under the caret.
+          new StringSuggest(this.app, t.inputEl, () => vaultTagEntries(this.app), { list: /,/ });
           t.setPlaceholder("events, saga, outage");
           t.setValue((this.plugin.settings.taskTagChips ?? []).join(", "));
           t.onChange(async (v) => { this.plugin.settings.taskTagChips = parseTags(v); await set(); });
@@ -4248,6 +4261,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       }, ["tag", "tags", "chip", "task", "due", "assign", "event", "saga"]));
       cats.datesTime.push(this.renderDef("Task tag suggestions", "Extra tags offered in the type-to-add autocomplete in the due-date / assign picker (the chips above are always suggested too). You can still type any tag not listed here.", (s) => {
         s.addText((t) => {
+          new StringSuggest(this.app, t.inputEl, () => vaultTagEntries(this.app), { list: /,/ });
           t.setPlaceholder("incident, review, blocked");
           t.setValue((this.plugin.settings.taskTagSuggestions ?? []).join(", "));
           t.onChange(async (v) => { this.plugin.settings.taskTagSuggestions = parseTags(v); await set(); });
@@ -4466,11 +4480,16 @@ export class StashpadSettingTab extends PluginSettingTab {
         // Persist on COMMIT (blur/Enter), not per keystroke — a half-typed
         // list is full of half-written extensions.
         const el = (t as any).inputEl as HTMLInputElement;
-        el.addEventListener("blur", async () => {
+        const commit = async (): Promise<void> => {
           this.plugin.settings.mediaViewerExcludedExtensions = el.value;
           await set();
-        });
-        el.addEventListener("keydown", (e: KeyboardEvent) => { if (e.key === "Enter") el.blur(); });
+        };
+        // 0.494.0: suggest extensions found in the vault for the item under the
+        // caret. Enter picks while the popover is open (onPick commits); it only
+        // blurs-to-commit once the popover is closed.
+        const extSuggest = new StringSuggest(this.app, el, () => vaultExtensionEntries(this.app), { list: /,/, onPick: () => void commit() });
+        el.addEventListener("blur", () => void commit());
+        el.addEventListener("keydown", (e: KeyboardEvent) => { if (e.key === "Enter" && !extSuggest.popoverShown) el.blur(); });
       });
     }, ["media", "viewer", "exclude", "extension", "file type", "tab", "default app"]));
     cats.attachmentsMedia.push(this.renderDef("Attachment layout", "How a note's attachments are laid out. Auto picks per note: thumbnails when the files are mostly images and there is room to see them, a compact icon strip when they would be too small to recognise, and a named list when they are mostly non-images (a spreadsheet is identified by its name, not a preview).", (row) => {
@@ -4816,8 +4835,11 @@ export class StashpadSettingTab extends PluginSettingTab {
             t.setValue(cleaned.join(", ")); // reflect the normalized value
             if (rejected.length) new Notice(`Ignored invalid companion extension${rejected.length === 1 ? "" : "s"}: ${rejected.join(", ")}${rejected.includes(".md") ? " (a note can't be its own companion)" : ""}.`);
           };
+          // 0.494.0: suggest vault extensions (with the dot, minus .md) for the
+          // item under the caret; the pick commits (which normalizes the list).
+          const extSuggest = new StringSuggest(this.app, t.inputEl, () => vaultExtensionEntries(this.app, true).filter((e) => e.value !== ".md"), { list: /[\s,]/, onPick: () => void commit() });
           t.inputEl.addEventListener("blur", () => void commit());
-          t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
+          t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && !extSuggest.popoverShown) { e.preventDefault(); void commit(); } });
         });
 
       // 0.277.0: one-click Encrypt-all — confirm (naming what it sweeps) → a
@@ -5837,24 +5859,6 @@ export class StashpadSettingTab extends PluginSettingTab {
       });
       input.value = (this.plugin.settings.noteTemplates ?? {})[key] ?? "";
 
-      // Lightweight inline autocomplete: drop a popover beneath the input
-      // listing matching markdown file paths. Uses Obsidian's vault
-      // file list rather than AbstractInputSuggest so this works on every
-      // Obsidian version that ships with the plugin.
-      const sugg = inputWrap.createDiv({ cls: "stashpad-note-template-suggest" });
-      sugg.setCssStyles({ display: "none" });
-      let currentMatches: string[] = [];
-      let itemEls: HTMLElement[] = [];
-      let activeIdx = -1;
-      const isOpen = (): boolean => sugg.style.display !== "none" && currentMatches.length > 0;
-      const highlight = (i: number): void => {
-        activeIdx = i;
-        itemEls.forEach((el, idx) => el.toggleClass("is-active", idx === i));
-        if (i >= 0 && itemEls[i]) itemEls[i].scrollIntoView({ block: "nearest" });
-      };
-      const closeSugg = (): void => { sugg.setCssStyles({ display: "none" }); activeIdx = -1; };
-      const choose = async (m: string): Promise<void> => { input.value = m; await save(); closeSugg(); };
-
       // Inline warning area — surfaces overlap with Stashpad's
       // auto-managed frontmatter so the user can fix the template before
       // it produces surprising notes.
@@ -5869,30 +5873,6 @@ export class StashpadSettingTab extends PluginSettingTab {
           // templates.
           .filter((p) => !/\/(_imports|_exports|_attachments|\.stashpad)\//.test(p))
           .sort();
-
-      const renderSuggestions = (): void => {
-        sugg.empty();
-        itemEls = [];
-        // 0.76.26: Sift — all-tokens, any-order match (see docs/sift.md).
-        const tokens = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
-        const sift = (p: string): boolean => {
-          const h = p.toLowerCase();
-          return tokens.every((t) => h.includes(t));
-        };
-        currentMatches = allMd().filter((p) => sift(p)).slice(0, 12);
-        if (currentMatches.length === 0) { closeSugg(); return; }
-        sugg.setCssStyles({ display: "" });
-        currentMatches.forEach((m, idx) => {
-          const item = sugg.createDiv({ cls: "stashpad-note-template-suggest-item", text: m });
-          itemEls.push(item);
-          item.addEventListener("mousemove", () => highlight(idx));
-          // mousedown (not click) so the input's blur doesn't close the
-          // popover before the click registers.
-          item.addEventListener("mousedown", async (ev) => { ev.preventDefault(); await choose(m); });
-        });
-        activeIdx = activeIdx >= 0 && activeIdx < currentMatches.length ? activeIdx : -1;
-        if (activeIdx >= 0) highlight(activeIdx);
-      };
 
       const save = async (): Promise<void> => {
         const v = input.value.trim();
@@ -5937,45 +5917,36 @@ export class StashpadSettingTab extends PluginSettingTab {
         );
       };
 
-      input.addEventListener("focus", renderSuggestions);
-      input.addEventListener("input", () => { activeIdx = -1; renderSuggestions(); });
-      input.addEventListener("blur", () => { setTimeout(closeSugg, 150); });
+      // 0.494.0: Obsidian's AbstractInputSuggest (StringSuggest) replaces the
+      // hand-rolled popover this field had since 0.102.8 — popout-window safe,
+      // same Sift matching, arrow/Enter/Escape handled by the suggester. A pick
+      // saves immediately (onPick), as the old popover's click did.
+      const tplSuggest = new StringSuggest(this.app, input, allMd, { onPick: () => void save() });
       input.addEventListener("change", () => { void save(); });
       input.addEventListener("keydown", (e) => {
-        if (e.key === "ArrowDown") {
+        // Per-segment ("per word") Tab completion, kept from 0.102.8: extend the
+        // input toward the highlighted (else best) match by one path segment,
+        // narrowing the list. Only swallow Tab when it actually completes —
+        // otherwise Tab moves focus as usual.
+        if (e.key !== "Tab" || e.shiftKey || !tplSuggest.popoverShown) return;
+        const selected = input.ownerDocument
+          .querySelector(".suggestion-container .suggestion-item.is-selected")
+          ?.firstElementChild?.textContent ?? null;
+        const target = selected ?? siftRank(input.value, allMd(), (p) => p)[0];
+        if (!target) return;
+        const cur = input.value;
+        let next: string;
+        if (target.toLowerCase().startsWith(cur.toLowerCase())) {
+          const slash = target.indexOf("/", cur.length);
+          next = slash >= 0 ? target.slice(0, slash + 1) : target;
+        } else {
+          next = target; // token (non-prefix) match — complete it fully
+        }
+        if (next && next !== cur) {
           e.preventDefault();
-          if (!isOpen()) { renderSuggestions(); if (currentMatches.length) highlight(0); }
-          else highlight((activeIdx + 1) % currentMatches.length);
-        } else if (e.key === "ArrowUp") {
-          if (!isOpen()) return;
-          e.preventDefault();
-          highlight((activeIdx - 1 + currentMatches.length) % currentMatches.length);
-        } else if (e.key === "Enter") {
-          if (isOpen() && activeIdx >= 0) { e.preventDefault(); void choose(currentMatches[activeIdx]); }
-        } else if (e.key === "Escape") {
-          if (isOpen()) { e.preventDefault(); closeSugg(); }
-        } else if (e.key === "Tab" && !e.shiftKey) {
-          // Per-segment ("per word") completion: extend the input toward the
-          // active (or first) match by one path segment, narrowing the list.
-          // Only swallow Tab when we actually complete — otherwise let it move
-          // focus as usual.
-          if (!isOpen()) return;
-          const target = currentMatches[activeIdx >= 0 ? activeIdx : 0];
-          const cur = input.value;
-          let next: string;
-          if (target.toLowerCase().startsWith(cur.toLowerCase())) {
-            const slash = target.indexOf("/", cur.length);
-            next = slash >= 0 ? target.slice(0, slash + 1) : target;
-          } else {
-            next = target; // token (non-prefix) match — complete it fully
-          }
-          if (next && next !== cur) {
-            e.preventDefault();
-            input.value = next;
-            activeIdx = -1;
-            renderSuggestions();
-            if (currentMatches.length === 1) highlight(0);
-          }
+          input.value = next;
+          // Re-run the suggester against the extended value.
+          input.dispatchEvent(new Event("input", { bubbles: true }));
         }
       });
       // Initial validation on render so existing saved templates show
@@ -6159,7 +6130,9 @@ export class StashpadSettingTab extends PluginSettingTab {
       "Type a vault-relative folder path. The folder is created (with intermediates) and seeded with a Home note so Stashpad recognizes it.",
       (s) => {
         let nameInput: HTMLInputElement | null = null;
-        s.addText((t) => { t.setPlaceholder("my-stashpad"); nameInput = (t as any).inputEl as HTMLInputElement; })
+        // 0.494.0: suggest existing folders, same as the first-run welcome's
+        // field (an existing folder becomes a Stashpad once its Home note lands).
+        s.addText((t) => { t.setPlaceholder("my-stashpad"); nameInput = (t as any).inputEl as HTMLInputElement; new FolderSuggest(this.app, t.inputEl); })
           .addButton((b) => b.setButtonText("Create").setCta().onClick(async () => {
             const raw = (nameInput?.value ?? "").trim().replace(/^\/+|\/+$/g, "");
             if (!raw) { new Notice("Enter a folder name first."); return; }
