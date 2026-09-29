@@ -87,6 +87,7 @@ import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arra
 import { dedupeDrafts, draftHasContent, draftDedupKey } from "./drafts";
 import { fixDuplicatedEmphasisOpeners, straightenCurlyQuotes } from "./markdown-input";
 import { renderFormattingToolbar } from "./formatting-toolbar";
+import { clipboardToMarkdownTable } from "./excel-paste";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -10589,6 +10590,20 @@ export class StashpadView extends ItemView {
       const out: File[] = [];
       const data = e.clipboardData;
       if (!data) return;
+      // Excel/Sheets/Numbers/LibreOffice put a rendered IMAGE of the cells on the
+      // clipboard alongside the actual data (HTML <table> + TSV). Left to the file
+      // branch below, that image wins and the table is lost. Detect the
+      // spreadsheet payload first and drop in a Markdown table instead. Also
+      // converts an HTML table copied from a web page. (See excel-paste.ts.)
+      const table = clipboardToMarkdownTable(data);
+      if (table) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.insertIntoComposer(table + "\n");
+        this.composerInputEl?.dispatchEvent(new Event("input", { bubbles: true }));
+        this.composerInputEl?.focus();
+        return;
+      }
       for (const f of Array.from(data.files ?? [])) out.push(f);
       if (out.length === 0) {
         for (const it of Array.from(data.items ?? [])) {

@@ -174,6 +174,13 @@ Stashpad is a homage to **Stashpad Notes**, a lovely app discontinued in 2024. T
 plugin brings its chat-style, jot-it-down feeling into Obsidian. Sincere thanks to
 its founders, **Cara and Theo, and the rest of the Stashpad team**, for the original that inspired it.
 
+Pasting a range of cells from Excel, Google Sheets, Numbers or LibreOffice drops a
+clean Markdown table into your note. That conversion is adapted from the
+[Excel to Markdown Table](https://github.com/ganesshkumar/obsidian-excel-to-markdown-table)
+plugin by **Ganessh Kumar R P** (MIT) — including the optional `^l`/`^c`/`^r`
+header-cell prefix for per-column alignment — with the robust quoted / multi-line
+cell parsing borrowed from our sibling plugin **GridSense**. Thanks to both.
+
 ## License
 
 [MIT](LICENSE) © grub-basket.

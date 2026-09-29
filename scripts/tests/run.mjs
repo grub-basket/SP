@@ -11,6 +11,7 @@ const ENTRIES = [
   "scripts/tests/config-layout.test.ts",
   "scripts/tests/md-tables.test.ts",
   "scripts/tests/suggest-match.test.ts",
+  "scripts/tests/excel-paste.test.ts",
 ];
 
 let passed = 0;

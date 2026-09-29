@@ -102,6 +102,7 @@ export function parseAdjustMinutes(raw: string): number | null {
 }
 import { renderInlineMarkup } from "./notifications";
 import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
+import { clipboardToMarkdownTable } from "./excel-paste";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
 const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
@@ -739,6 +740,25 @@ export class NoteWorkbench {
     ta.addEventListener("paste", (e) => {
       const data = e.clipboardData;
       if (!data) return;
+      // Spreadsheet paste (Excel/Sheets/Numbers/LibreOffice) carries a rendered
+      // image alongside the data; the file branch below would import that image
+      // and drop the table. Convert the HTML <table>/TSV to Markdown at the caret
+      // instead. (Shared with the composer — see excel-paste.ts.)
+      const table = clipboardToMarkdownTable(data);
+      if (table) {
+        e.preventDefault();
+        e.stopPropagation();
+        const start = ta.selectionStart ?? ta.value.length;
+        const end = ta.selectionEnd ?? ta.value.length;
+        const insert = table + "\n";
+        ta.value = ta.value.slice(0, start) + insert + ta.value.slice(end);
+        this.cursorText = ta.value;
+        const caret = start + insert.length;
+        try { ta.setSelectionRange(caret, caret); } catch { /* detached */ }
+        ta.dispatchEvent(new Event("input"));
+        ta.focus();
+        return;
+      }
       const out: File[] = [];
       for (const f of Array.from(data.files ?? [])) out.push(f);
       if (out.length === 0) {
