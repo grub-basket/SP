@@ -88,6 +88,7 @@ import { dedupeDrafts, draftHasContent, draftDedupKey } from "./drafts";
 import { fixDuplicatedEmphasisOpeners, straightenCurlyQuotes } from "./markdown-input";
 import { renderFormattingToolbar } from "./formatting-toolbar";
 import { clipboardToMarkdownTable } from "./excel-paste";
+import { richClipboardToMarkdown } from "./rich-paste";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -10666,7 +10667,21 @@ export class StashpadView extends ItemView {
           }
         }
       }
-      if (out.length === 0) return; // pure text paste — let it through
+      if (out.length === 0) {
+        // No files/images: rich text from a chat, web page, or document.
+        // Convert the HTML clipboard flavor to Markdown so formatting
+        // survives. Returns null → fall through to the native plain-text
+        // paste (nothing to preserve). 0.497.0
+        const md = richClipboardToMarkdown(data);
+        if (md) {
+          e.preventDefault();
+          e.stopPropagation();
+          this.insertIntoComposer(md);
+          this.composerInputEl?.dispatchEvent(new Event("input", { bubbles: true }));
+          this.composerInputEl?.focus();
+        }
+        return; // handled as markdown, or let plain text through natively
+      }
       e.preventDefault();
       e.stopPropagation();
       void importAndAppend(out);

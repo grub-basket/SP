@@ -103,6 +103,7 @@ export function parseAdjustMinutes(raw: string): number | null {
 import { renderInlineMarkup } from "./notifications";
 import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
 import { clipboardToMarkdownTable } from "./excel-paste";
+import { richClipboardToMarkdown } from "./rich-paste";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
 const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
@@ -766,7 +767,26 @@ export class NoteWorkbench {
           if (it.kind === "file") { const f = it.getAsFile(); if (f) out.push(f); }
         }
       }
-      if (out.length === 0) return; // pure text paste — let it through natively
+      if (out.length === 0) {
+        // No files/images: rich text from a chat, web page, or document —
+        // convert the HTML clipboard flavor to Markdown at the caret so
+        // formatting survives. null → let the native plain-text paste run.
+        // Kept in sync with the composer handler (view.ts). 0.497.0
+        const md = richClipboardToMarkdown(data);
+        if (md) {
+          e.preventDefault();
+          e.stopPropagation();
+          const start = ta.selectionStart ?? ta.value.length;
+          const end = ta.selectionEnd ?? ta.value.length;
+          ta.value = ta.value.slice(0, start) + md + ta.value.slice(end);
+          this.cursorText = ta.value;
+          const caret = start + md.length;
+          try { ta.setSelectionRange(caret, caret); } catch { /* detached */ }
+          ta.dispatchEvent(new Event("input"));
+          ta.focus();
+        }
+        return; // handled as markdown, or let plain text through natively
+      }
       e.preventDefault();
       e.stopPropagation();
       void insertLinks(out);

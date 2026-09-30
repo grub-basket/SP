@@ -1,6 +1,6 @@
 import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
-import { freshId } from "./id-service";
+import { freshId, newId } from "./id-service";
 import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
@@ -63,7 +63,7 @@ const SHORTCUT_DIR = "Stashpad Shortcuts";
 
 import { PreviewCache } from "./link-preview/store";
 import { enrichFile, scanBackfill, estimateSeconds, humanDuration } from "./link-preview/service";
-import { AuthorRegistry } from "./author-registry";
+import { AuthorRegistry, type AuthorRecord } from "./author-registry";
 import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
 import { perf } from "./perf";
@@ -3085,7 +3085,7 @@ export default class StashpadPlugin extends Plugin {
       // load). Until armed, enqueue() ignores events — so opening the vault
       // never looks like a mass "drop".
       window.setTimeout(() => this.importService.setArmed(true), 2500);
-      window.setTimeout(() => { this.teamNotifyArmed = true; }, 3000);
+      window.setTimeout(() => { this.teamNotifyArmed = true; this.startTeamNotifyPoll(); }, 3000);
       // 0.84.11: retroactive auto-import — a startup sweep (after arming) so
       // items added while Obsidian was closed get imported, plus a 5-min
       // interval so external Finder copies that never fired a vault event are
@@ -5250,9 +5250,13 @@ export default class StashpadPlugin extends Plugin {
     const id = (this.settings.authorId ?? "").trim();
     if (!id || parsed.id !== id) return;
     const newName = parsed.name.trim();
-    if (!newName || newName === (this.settings.authorName ?? "").trim()) return;
+    const oldName = (this.settings.authorName ?? "").trim();
+    if (!newName || newName === oldName) return;
     this.settings.authorName = newName;
     await this.saveSettings();
+    // saveSettings records the registry name silently (0.497.0); a vault
+    // rename of the stub is a deliberate rename, so log the single event.
+    this.authorRegistry.noteRename(id, oldName, newName);
     await this.syncAuthorFilesToName();
   }
 
@@ -9494,6 +9498,11 @@ export default class StashpadPlugin extends Plugin {
   // double-fires (path -> last-notified ms).
   private teamNotifyArmed = false;
   private teamNotifySeen = new Map<string, number>();
+  // 0.500.0: note ids we've already notified about OR baselined at startup.
+  // Shared by the file-event path and the network-drive poll so neither
+  // re-notifies the other's finds, and pre-existing notes never notify.
+  private teamNotifiedIds = new Set<string>();
+  private teamPollTimer: number | null = null;
 
   private queueTeamNotify(file: TFile): void {
     if (!this.teamNotifyArmed || !this.settings.teamNotifications) return;
@@ -9501,7 +9510,54 @@ export default class StashpadPlugin extends Plugin {
     window.setTimeout(() => this.handleTeamNotify(file, 0), 400);
   }
 
-  private handleTeamNotify(file: TFile, attempt: number): void {
+  /** All Stashpad note files (frontmatter-backed, non-stub) under `dirs`. */
+  private teamNotifyCandidateFiles(dirs: string[]): TFile[] {
+    const roots = dirs.map((d) => d.replace(/\/+$/, ""));
+    return this.app.vault.getMarkdownFiles().filter((f) => {
+      if (f.path.includes("/_authors/")) return false;
+      const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+      return roots.includes(dir);
+    });
+  }
+
+  /** Start (or restart) the network-drive fallback poll. File-change events
+   *  don't cross machines on a shared network drive, so a coworker's note
+   *  written on another Mac never fires vault.on("create"); this scans for
+   *  notes new since the last pass and notifies for them. Baselines the
+   *  current note set as "already seen" so it never floods on first run. */
+  /** Public: re-baseline and restart the poll after a settings change. */
+  restartTeamNotifyPoll(): void { if (this.teamNotifyArmed) this.startTeamNotifyPoll(); }
+
+  private startTeamNotifyPoll(): void {
+    if (this.teamPollTimer != null) { window.clearInterval(this.teamPollTimer); this.teamPollTimer = null; }
+    // Baseline: every note that already exists is "seen" (don't notify for
+    // the backlog — same philosophy as teamNotifyArmed suppressing the
+    // startup create-storm).
+    for (const f of this.teamNotifyCandidateFiles(this.discoverStashpadFolders())) {
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id === "string" && id) this.teamNotifiedIds.add(id);
+    }
+    const secs = this.settings.teamNotifyPollSeconds;
+    if (!this.settings.teamNotifications || !secs || secs <= 0) return;
+    this.teamPollTimer = window.setInterval(() => this.pollTeamNotify(), Math.max(15, secs) * 1000);
+    this.registerInterval(this.teamPollTimer);
+  }
+
+  /** One poll pass: notify for notes new-to-us in watched/Stashpad folders,
+   *  regardless of their created time (a network-synced note can surface
+   *  long after it was created). Dedupe is by note id via teamNotifiedIds. */
+  private pollTeamNotify(): void {
+    if (!this.settings.teamNotifications) return;
+    const watched = (this.settings.watchedFolders ?? []).map((f) => f.replace(/\/+$/, "")).filter(Boolean);
+    const dirs = watched.length ? watched : this.discoverStashpadFolders();
+    for (const f of this.teamNotifyCandidateFiles(dirs)) {
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id !== "string" || !id || this.teamNotifiedIds.has(id)) continue;
+      this.handleTeamNotify(f, 0, { ignoreRecency: true });
+    }
+  }
+
+  private handleTeamNotify(file: TFile, attempt: number, opts?: { ignoreRecency?: boolean }): void {
     if (!this.settings.teamNotifications) return;
     const cur = this.app.vault.getAbstractFileByPath(file.path);
     if (!(cur instanceof TFile)) return; // already gone / renamed
@@ -9515,6 +9571,9 @@ export default class StashpadPlugin extends Plugin {
       if (attempt < 1) window.setTimeout(() => this.handleTeamNotify(file, attempt + 1), 1200);
       return;
     }
+
+    // Cross-path dedupe with the poll (and with a prior notify for this note).
+    if (this.teamNotifiedIds.has(fm.id)) return;
 
     const now = Date.now();
     if (now - (this.teamNotifySeen.get(cur.path) ?? 0) < 60000) return; // recent dupe
@@ -9531,9 +9590,13 @@ export default class StashpadPlugin extends Plugin {
     if (!author || !author.id || author.id === myId) return;
 
     // Recency guard: a bulk sync can replay old notes as `create`. Only notify
-    // for notes created within the last 30 minutes.
-    const created = typeof fm.created === "string" ? Date.parse(fm.created) : NaN;
-    if (Number.isFinite(created) && now - created > 30 * 60 * 1000) return;
+    // for notes created within the last 30 minutes. Skipped for the poll path,
+    // where "new to teamNotifiedIds" already means genuinely-new-to-us — a
+    // note synced late from a network drive is often >30 min old on arrival.
+    if (!opts?.ignoreRecency) {
+      const created = typeof fm.created === "string" ? Date.parse(fm.created) : NaN;
+      if (Number.isFinite(created) && now - created > 30 * 60 * 1000) return;
+    }
 
     // Watch / mute scope.
     const s = this.settings;
@@ -9544,6 +9607,7 @@ export default class StashpadPlugin extends Plugin {
     if (watched.length && !watched.includes(dir)) return;
 
     this.teamNotifySeen.set(cur.path, now);
+    this.teamNotifiedIds.add(fm.id);
     const known = this.authorRegistry.get(author.id);
     const who = (known?.name || author.name || "A teammate").trim();
     const title = this.deriveNoteTitle(cur, fm);
@@ -11131,6 +11195,244 @@ export default class StashpadPlugin extends Plugin {
     return { created, folders: folders.length };
   }
 
+  // ===== 0.499.0: identity actions + author-registry management =====
+  // Two distinct operations the old single name field conflated:
+  //   - RENAME (name field): keep your id, change your display name,
+  //     propagate to your notes (syncAuthorFilesToName). Unchanged.
+  //   - SWITCH IDENTITY: become a DIFFERENT author. Two flavours below —
+  //     "New identity" (mint a fresh id; for a cloned config that's now a
+  //     different person) and "Adopt existing" (take an id already in the
+  //     registry). Neither rewrites existing notes; they only change what
+  //     YOU get stamped as going forward.
+  // Plus registry maintenance: merge (reassign one id→another across the
+  // vault), delete (forget a cached entry), clear rename history.
+
+  /** Open a fuzzy picker over registry authors (minus excluded ids). */
+  private pickAuthor(placeholder: string, excludeIds: string[], onPick: (a: AuthorRecord) => void): void {
+    const list = this.authorRegistry.all().filter((a) => !excludeIds.includes(a.id));
+    if (!list.length) { new Notice("No other authors in the registry — try Rebuild first."); return; }
+    new AuthorSuggestModal(this.app, placeholder, list, onPick).open();
+  }
+
+  /** "New identity" flow: prompt for a name, warn, then mint a fresh id. */
+  promptNewIdentity(onDone?: () => void): void {
+    const curName = (this.settings.authorName ?? "").trim();
+    const curId = (this.settings.authorId ?? "").trim();
+    new NamePromptModal(this.app, "New author identity", "Your name", curName, (raw) => {
+      const name = raw.trim();
+      if (!name) { new Notice("Enter a name."); return; }
+      new ConfirmModal(this.app, "Create a new identity?",
+        `You'll get a **new author id** and be stamped as **${name}** from now on.\n\nExisting notes stay under your current identity (**${curName || "unset"}**${curId ? ` · id ${curId}` : ""}) — they are NOT rewritten. Use this after cloning a coworker's config folder so you don't inherit their identity.`,
+        "Create new identity",
+        async (ok) => {
+          if (!ok) return;
+          await this.switchToNewIdentity(name);
+          new Notice(`New identity: ${name} (id ${this.settings.authorId}).`);
+          onDone?.();
+        }).open();
+    }).open();
+  }
+
+  /** Mint a brand-new authorId under `name`. Existing notes untouched. */
+  async switchToNewIdentity(name: string): Promise<void> {
+    this.settings.authorId = newId();
+    this.settings.authorName = name.trim();
+    await this.saveSettings();
+    await this.syncAuthorFilesToName();      // make the stub for the new id
+    await this.restoreMissingAuthorStubs();
+  }
+
+  /** "Adopt existing" flow: pick an author already in the registry and
+   *  become them going forward. */
+  promptAdoptIdentity(onDone?: () => void): void {
+    this.pickAuthor("Adopt an existing author…", [(this.settings.authorId ?? "").trim()], (a) => {
+      new ConfirmModal(this.app, "Adopt this identity?",
+        `You'll be stamped as **${a.name || "(unnamed)"}** (id ${a.id}) from now on. Existing notes are not rewritten.`,
+        "Adopt identity",
+        async (ok) => {
+          if (!ok) return;
+          await this.adoptIdentity(a.id, a.name);
+          new Notice(`Adopted identity: ${a.name || a.id}.`);
+          onDone?.();
+        }).open();
+    });
+  }
+
+  /** Confirm + adopt a SPECIFIC author (from a Known Authors row). */
+  promptAdoptAuthor(id: string, name: string, onDone?: () => void): void {
+    new ConfirmModal(this.app, "Adopt this identity?",
+      `You'll be stamped as **${name || "(unnamed)"}** (id ${id}) from now on. Existing notes are not rewritten.`,
+      "Adopt identity",
+      async (ok) => {
+        if (!ok) return;
+        await this.adoptIdentity(id, name);
+        new Notice(`Adopted identity: ${name || id}.`);
+        onDone?.();
+      }).open();
+  }
+
+  /** Take over an existing author id/name for the local user. */
+  async adoptIdentity(id: string, name: string): Promise<void> {
+    this.settings.authorId = id.trim();
+    this.settings.authorName = name.trim();
+    await this.saveSettings();
+    await this.syncAuthorFilesToName();
+    await this.restoreMissingAuthorStubs();
+  }
+
+  /** Delete an author from the registry (rebuildable cache — notes keep
+   *  their id; Rebuild re-adds anyone still referenced). */
+  promptDeleteAuthor(id: string, onDone?: () => void): void {
+    const rec = this.authorRegistry.get(id);
+    const label = rec?.name || id;
+    new ConfirmModal(this.app, "Delete author from registry?",
+      `Forget **${label}** (id ${id}). The registry is a rebuildable cache, so this only drops the cached name/role/rename-history — notes keep their author id, and **Rebuild** re-adds anyone still referenced in the vault. Their author page files are left in place.`,
+      "Forget author",
+      (ok) => {
+        if (!ok) return;
+        this.authorRegistry.remove(id);
+        new Notice(`Removed ${label} from the registry.`);
+        onDone?.();
+      }, "Cancel", true).open();
+  }
+
+  /** Clear an author's rename history (keeps the record + current name). */
+  clearAuthorRenameHistory(id: string, onDone?: () => void): void {
+    if (this.authorRegistry.clearRenames(id)) { new Notice("Rename history cleared."); onDone?.(); }
+    else new Notice("No rename history to clear.");
+  }
+
+  /** Merge flow: pick a target, confirm the note count, reassign. */
+  promptMergeAuthor(fromId: string, onDone?: () => void): void {
+    const fromRec = this.authorRegistry.get(fromId);
+    const fromLabel = fromRec?.name || fromId;
+    this.pickAuthor(`Merge "${fromLabel}" into…`, [fromId], (to) => {
+      const count = this.notesReferencingAuthor(fromId).length;
+      new ConfirmModal(this.app, "Merge authors?",
+        `Reassign **${count}** note reference${count === 1 ? "" : "s"} from **${fromLabel}** (id ${fromId}) to **${to.name || to.id}** (id ${to.id}), then remove ${fromLabel} from the registry.\n\nThis rewrites author / contributor / assignee links in those notes. Undoable from the Stashpad list (Undo) immediately after.`,
+        "Merge",
+        async (ok) => {
+          if (!ok) return;
+          const r = await this.mergeAuthors(fromId, to.id, to.name || to.id);
+          new Notice(`Merged: ${r.notes} note${r.notes === 1 ? "" : "s"} reassigned to ${to.name || to.id}.`);
+          onDone?.();
+        }, "Cancel", true).open();
+    });
+  }
+
+  /** Rewrite a single author wikilink ref from one id to another,
+   *  preserving the note-folder prefix so the link still resolves. Returns
+   *  null when `raw` doesn't reference `fromId`. */
+  private rewriteAuthorRef(raw: string, fromId: string, toId: string, toName: string): string | null {
+    const parsed = parseAuthorRef(raw);
+    if (!parsed || parsed.id !== fromId) return null;
+    const m = raw.match(/^\s*\[\[(.*_authors\/)/);        // every author ref has _authors/
+    const prefix = m ? m[1] : "_authors/";
+    const safe = this.authorNameToSafe(toName);
+    const aliasSafe = toName.replace(/[\[\]|]/g, "").trim() || safe;   // 0.77.11 escaping
+    return `[[${prefix}${safe}-${toId}.md|${aliasSafe}]]`;
+  }
+
+  /** Capture the before-state of every note referencing `id` in author /
+   *  contributors / assignedTo frontmatter (skipping _authors stubs). Used
+   *  for the merge count, the rewrite, and the undo snapshot. */
+  private notesReferencingAuthor(id: string): Array<{ path: string; author: any; contributors: any; assignedTo: any }> {
+    const out: Array<{ path: string; author: any; contributors: any; assignedTo: any }> = [];
+    const refsId = (v: any) => typeof v === "string" && parseAuthorRef(v)?.id === id;
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      if (file.path.includes("/_authors/")) continue;
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as any;
+      if (!fm) continue;
+      const contribs = Array.isArray(fm.contributors) ? fm.contributors : [];
+      const assigns = Array.isArray(fm.assignedTo) ? fm.assignedTo : (fm.assignedTo != null ? [fm.assignedTo] : []);
+      if (refsId(fm.author) || contribs.some(refsId) || assigns.some(refsId)) {
+        out.push({
+          path: file.path,
+          author: fm.author,
+          contributors: Array.isArray(fm.contributors) ? [...fm.contributors] : fm.contributors,
+          assignedTo: Array.isArray(fm.assignedTo) ? [...fm.assignedTo] : fm.assignedTo,
+        });
+      }
+    }
+    return out;
+  }
+
+  /** Reassign every author/contributor/assignee ref for `fromId` to
+   *  `toId`/`toName` across the vault, remove the source from the registry,
+   *  and register an Undo. Returns the note count changed. */
+  async mergeAuthors(fromId: string, toId: string, toName: string): Promise<{ notes: number }> {
+    if (!fromId || !toId || fromId === toId) return { notes: 0 };
+    const fromRec = this.authorRegistry.get(fromId);
+    const changes = this.notesReferencingAuthor(fromId);
+    const remap = (arr: any[]) => arr.map((x) => typeof x === "string" ? (this.rewriteAuthorRef(x, fromId, toId, toName) ?? x) : x);
+    for (const c of changes) {
+      const f = this.app.vault.getAbstractFileByPath(c.path);
+      if (!(f instanceof TFile)) continue;
+      try {
+        await this.app.fileManager.processFrontMatter(f, (m: any) => {
+          if (typeof m.author === "string") { const r = this.rewriteAuthorRef(m.author, fromId, toId, toName); if (r) m.author = r; }
+          if (Array.isArray(m.contributors)) {
+            const authorId = parseAuthorRef(m.author)?.id;
+            const seen = new Set<string>();
+            // Remap, then drop contributors that now duplicate each other or
+            // the (possibly just-merged) author — merging A→B on a note that
+            // listed both would otherwise leave B twice.
+            m.contributors = remap(m.contributors).filter((x: any) => {
+              const cid = typeof x === "string" ? parseAuthorRef(x)?.id : null;
+              if (!cid) return true;                    // keep non-author entries as-is
+              if (cid === authorId || seen.has(cid)) return false;
+              seen.add(cid);
+              return true;
+            });
+          }
+          if (Array.isArray(m.assignedTo)) m.assignedTo = remap(m.assignedTo);
+          else if (typeof m.assignedTo === "string") { const r = this.rewriteAuthorRef(m.assignedTo, fromId, toId, toName); if (r) m.assignedTo = r; }
+        });
+      } catch (e) { console.warn("[Stashpad] mergeAuthors: write failed", c.path, e); }
+    }
+    this.authorRegistry.remove(fromId);
+    if (changes.length) {
+      const root = this.stashpadRootForUndo(changes.map((c) => c.path));
+      this.refreshOpenViewsForFolder(root);        // re-render footers with the new author
+      this.getUndoStack(root).push({
+        label: `Merge author (${changes.length} note${changes.length === 1 ? "" : "s"})`,
+        undo: async () => {
+          for (const c of changes) {
+            const f = this.app.vault.getAbstractFileByPath(c.path);
+            if (!(f instanceof TFile)) continue;
+            try {
+              await this.app.fileManager.processFrontMatter(f, (m: any) => {
+                if (c.author === undefined) delete m.author; else m.author = c.author;
+                if (c.contributors === undefined) delete m.contributors; else m.contributors = c.contributors;
+                if (c.assignedTo === undefined) delete m.assignedTo; else m.assignedTo = c.assignedTo;
+              });
+            } catch (e) { console.warn("[Stashpad] mergeAuthors undo failed", c.path, e); }
+          }
+          if (fromRec) this.authorRegistry.restore(fromRec);
+          this.refreshOpenViewsForFolder(root);
+        },
+        redo: async () => { await this.mergeAuthors(fromId, toId, toName); },
+      });
+    }
+    return { notes: changes.length };
+  }
+
+  /** Pick the Stashpad root that holds the most of `paths` — the bucket for
+   *  a cross-folder merge's single Undo entry (the undo closure itself spans
+   *  folders regardless). */
+  private stashpadRootForUndo(paths: string[]): string {
+    const roots = this.discoverStashpadFolders();
+    const tally = new Map<string, number>();
+    for (const p of paths) {
+      const root = roots.find((r) => p.startsWith(r.replace(/\/+$/, "") + "/"));
+      if (root) tally.set(root, (tally.get(root) ?? 0) + 1);
+    }
+    let best = roots[0] ?? "";
+    let n = -1;
+    for (const [r, c] of tally) if (c > n) { best = r; n = c; }
+    return best;
+  }
+
   /** 0.79.18: convert plain-text `attachments` frontmatter entries to
    *  internal links (`[[path]]`) across all notes. Idempotent — only
    *  rewrites notes that have at least one non-link entry, and
@@ -12389,12 +12691,15 @@ export default class StashpadPlugin extends Plugin {
     // _authors stubs are later deleted.
     const id = (this.settings.authorId ?? "").trim();
     if (id) {
+      // silent: saveSettings fires on every keystroke of the settings name
+      // field; a rename is recorded once on commit (see authorshipItems'
+      // blur/Enter handler → authorRegistry.noteRename). 0.497.0
       this.authorRegistry.record({
         id,
         name: this.settings.authorName,
         role: this.settings.authorRole,
         department: this.settings.authorDepartment,
-      });
+      }, { silent: true });
     }
     console.debug("[Stashpad] saveSettings", {
       shortcuts: this.settings.shortcuts,
@@ -12848,6 +13153,23 @@ class FolderBundleSuggest extends SuggestModal<{ folder: string; blobPath: strin
 }
 
 /** 0.322.1: a one-field name prompt (saved views). */
+/** 0.499.0: fuzzy picker over registry authors (adopt identity / merge target). */
+class AuthorSuggestModal extends FuzzySuggestModal<AuthorRecord> {
+  constructor(app: App, placeholder: string, private authors: AuthorRecord[], private onPick: (a: AuthorRecord) => void) {
+    super(app);
+    this.setPlaceholder(placeholder);
+  }
+  getItems(): AuthorRecord[] { return this.authors; }
+  getItemText(a: AuthorRecord): string {
+    const bits = [a.name || "(unnamed)"];
+    if (a.role) bits.push(a.role);
+    if (a.department) bits.push(a.department);
+    bits.push(a.id);
+    return bits.join(" ");
+  }
+  onChooseItem(a: AuthorRecord): void { this.onPick(a); }
+}
+
 class NamePromptModal extends Modal {
   constructor(app: App, private title: string, private label: string, private initial: string, private onSubmit: (name: string) => void) { super(app); }
   onOpen(): void {

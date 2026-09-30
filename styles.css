@@ -3827,6 +3827,18 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   color: var(--text-faint);
   font-size: 0.8em;
 }
+/* 0.499.0: per-author maintenance actions (merge / set as me / clear history / forget). */
+.stashpad-known-author-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.stashpad-known-author-action {
+  font-size: 0.8em;
+  padding: 2px 8px;
+  cursor: pointer;
+}
 /* 0.76.33: glyph shown when an icon name isn't in the device's
    bundled Lucide set (older iPad/iOS app) so the button isn't blank.
    Sized to read like the icon it replaces. */

@@ -93,8 +93,16 @@ export class AuthorRegistry {
   /** Upsert an author. If the display name changed, appends a rename
    *  event to the history. Updates lastSeen. Persists in the background.
    *  Returns true if anything changed (so callers can skip a redundant
-   *  save when nothing did). */
-  record(info: { id: string; name?: string; role?: string; department?: string; at?: string }): boolean {
+   *  save when nothing did).
+   *
+   *  `opts.silent` updates the stored name WITHOUT appending a rename
+   *  event — used by `saveSettings()`, which fires on every keystroke of
+   *  the settings name field. Recording a rename there produced a
+   *  per-character trail (J → Jo → Joh → John) in the history. The real
+   *  rename is recorded once, on commit (blur/Enter), via `noteRename`.
+   *  (0.497.0 — the 0.140.11 fix deferred the file rename but missed this
+   *  registry path.) */
+  record(info: { id: string; name?: string; role?: string; department?: string; at?: string }, opts?: { silent?: boolean }): boolean {
     const id = (info.id ?? "").trim();
     if (!id) return false;
     const now = info.at ?? new Date().toISOString();
@@ -115,7 +123,7 @@ export class AuthorRegistry {
       changed = true;
     } else {
       if (name && name !== existing.name) {
-        existing.renames.push({ from: existing.name, to: name, at: now });
+        if (!opts?.silent) existing.renames.push({ from: existing.name, to: name, at: now });
         existing.name = name;
         changed = true;
       }
@@ -131,6 +139,55 @@ export class AuthorRegistry {
     }
     if (changed) void this.save();
     return changed;
+  }
+
+  /** Record a DELIBERATE rename as a single history event. Called on
+   *  commit (blur/Enter) so the settings name field logs one entry per
+   *  real rename instead of one per keystroke. No-op if the names are
+   *  empty or identical, or the author isn't known yet. */
+  noteRename(id: string, from: string, to: string, at?: string): boolean {
+    id = (id ?? "").trim();
+    from = (from ?? "").trim();
+    to = (to ?? "").trim();
+    if (!id || !from || !to || from === to) return false;
+    const existing = this.data.authors[id];
+    if (!existing) return false;
+    existing.renames.push({ from, to, at: at ?? new Date().toISOString() });
+    existing.name = to;
+    existing.lastSeen = at ?? new Date().toISOString();
+    void this.save();
+    return true;
+  }
+
+  /** Forget an author's rename history (keeps the record + current name).
+   *  Lets the user clear a junk trail — e.g. the pre-0.497.0 per-character
+   *  history — without losing the author. Returns true if anything cleared. */
+  clearRenames(id: string): boolean {
+    id = (id ?? "").trim();
+    const existing = this.data.authors[id];
+    if (!existing || !existing.renames.length) return false;
+    existing.renames = [];
+    void this.save();
+    return true;
+  }
+
+  /** Remove an author record entirely. The registry is a rebuildable
+   *  cache, so this only forgets the cached name/role/dept + history; it
+   *  does NOT touch notes or stub files (callers handle those). */
+  remove(id: string): boolean {
+    id = (id ?? "").trim();
+    if (!id || !this.data.authors[id]) return false;
+    delete this.data.authors[id];
+    void this.save();
+    return true;
+  }
+
+  /** Put a full author record back (used by merge's Undo to restore a
+   *  source author that was removed). */
+  restore(rec: AuthorRecord): void {
+    if (!rec?.id) return;
+    this.data.authors[rec.id] = rec;
+    void this.save();
   }
 
   /** Replace the entire author set (used by rebuild()). Preserves

@@ -736,6 +736,12 @@ export interface StashpadSettings {
   /** Only notify for these folders (empty = every Stashpad folder). The "watch"
    *  list — livestream someone working in a specific place. */
   watchedFolders: string[];
+  /** 0.500.0: poll interval (seconds) for the network-drive fallback. Obsidian's
+   *  file-change events don't cross machines on a shared network drive, so the
+   *  create-driven notifier never sees a coworker's note written on another Mac.
+   *  This periodically scans watched/Stashpad folders for notes new since the
+   *  last scan and notifies for them. 0 = off (rely on file events only). */
+  teamNotifyPollSeconds: number;
   /** Never notify for these author ids / folder names — the mute list. */
   mutedAuthors: string[];
   mutedFolders: string[];
@@ -1401,6 +1407,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   teamNotifications: true,
   teamNotificationsDesktop: true,
   watchedFolders: [],
+  teamNotifyPollSeconds: 90,
   mutedAuthors: [],
   mutedFolders: [],
   showAuthor: true,
@@ -2249,7 +2256,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         items: [
           this.renderDef("Notify me about teammates’ notes",
             "When a teammate creates a note in a Stashpad folder, show a notification. Detected from the note’s author, so your own notes never notify.",
-            (s) => s.addToggle((t) => t.setValue(s0.teamNotifications).onChange(async (v) => { s0.teamNotifications = v; await this.plugin.saveSettings(); })),
+            (s) => s.addToggle((t) => t.setValue(s0.teamNotifications).onChange(async (v) => { s0.teamNotifications = v; await this.plugin.saveSettings(); this.plugin.restartTeamNotifyPoll(); })),
             ["team", "notify", "teammate", "activity", "multiplayer"]),
           this.renderDef("Also send desktop notifications",
             "In addition to the in-app toast, raise an operating-system notification so activity reaches you when Obsidian is in the background. Asks for permission the first time.",
@@ -2266,6 +2273,22 @@ export class StashpadSettingTab extends PluginSettingTab {
               t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
             }),
             ["team", "watch", "folder", "livestream", "follow"]),
+          this.renderDef("Network-drive check interval (seconds)",
+            "For shared vaults on a network drive: Obsidian's file-change events don't cross machines, so a teammate's note written on another computer isn't detected live. Stashpad periodically re-scans your watched/Stashpad folders to catch those. 90 is a good default; raise it to reduce scanning, or set 0 to turn the scan off (file events only — fine for a purely local vault).",
+            (s) => s.addText((t) => {
+              t.setValue(String(s0.teamNotifyPollSeconds ?? 90)).setPlaceholder("90");
+              const commit = async () => {
+                const n = parseInt(t.getValue(), 10);
+                s0.teamNotifyPollSeconds = Number.isFinite(n) && n >= 0 ? n : 90;
+                t.setValue(String(s0.teamNotifyPollSeconds));
+                await this.plugin.saveSettings();
+                this.plugin.restartTeamNotifyPoll();
+              };
+              t.inputEl.type = "number";
+              t.inputEl.addEventListener("blur", () => void commit());
+              t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") void commit(); });
+            }),
+            ["team", "network", "drive", "poll", "interval", "scan", "shared"]),
           this.renderDef("Mute these folders",
             "Comma-separated folder paths that should never notify, even when watched.",
             (s) => s.addText((t) => {
@@ -5455,6 +5478,11 @@ export class StashpadSettingTab extends PluginSettingTab {
     items.push(this.renderDef("Author name",
       "Your display name. Used in the note footer + as the author/contributor link target. Leave blank to opt out (notes won't be stamped).",
       (s) => s.addText((t) => {
+        // Baseline the name at field creation so commit can log a SINGLE
+        // rename event (from this baseline → the final value) instead of one
+        // per keystroke. saveSettings records the registry name silently
+        // (0.497.0); the commit below owns the rename-history entry.
+        let priorName = this.plugin.settings.authorName;
         t.setValue(this.plugin.settings.authorName).onChange(async (v) => {
           // Persist the name per keystroke (cheap) so it's saved even if the
           // settings close before blur — but DON'T run the vault-wide stub
@@ -5465,13 +5493,26 @@ export class StashpadSettingTab extends PluginSettingTab {
           if (this.plugin.settings.authorName && !this.plugin.settings.authorId) this.plugin.settings.authorId = newId();
           await this.plugin.saveSettings();
         });
-        const commit = () => void this.plugin.syncAuthorFilesToName();
+        const commit = () => {
+          const cur = this.plugin.settings.authorName;
+          if (cur && priorName && cur !== priorName) {
+            this.plugin.authorRegistry.noteRename(this.plugin.settings.authorId, priorName, cur);
+          }
+          priorName = cur;
+          void this.plugin.syncAuthorFilesToName();
+        };
         t.inputEl.addEventListener("blur", commit);
         t.inputEl.addEventListener("keydown", (e) => { if ((e as KeyboardEvent).key === "Enter") commit(); });
       }), ["author", "name", "identity", "stamp"]));
     items.push(this.renderDef("Author id (auto-assigned)",
       "Stable id appended to your name on links so coworkers with the same name don't collide. Generated once and shouldn't change. To reset it, clear and retype your author name.",
       (s) => s.addText((t) => t.setValue(this.plugin.settings.authorId).setDisabled(true)), ["author", "id"]));
+    items.push(this.renderDef("Switch identity",
+      "Editing the name above RENAMES you (keeps your id, updates your notes). To become a DIFFERENT author instead — e.g. after cloning a coworker's config folder — use these. Neither rewrites existing notes; they only change who you're stamped as going forward.",
+      (s) => {
+        s.addButton((b) => b.setButtonText("New identity…").onClick(() => this.plugin.promptNewIdentity(() => this.display())));
+        s.addButton((b) => b.setButtonText("Adopt existing…").onClick(() => this.plugin.promptAdoptIdentity(() => this.display())));
+      }, ["identity", "switch", "new", "adopt", "author", "clone", "coworker"]));
     items.push(this.renderDef("Title / role",
       "Optional. Shown on your author page (e.g. \"Engineer\", \"PM\", \"Designer\").",
       (s) => s.addText((t) => {
@@ -5825,6 +5866,25 @@ export class StashpadSettingTab extends PluginSettingTab {
         const trail = a.renames.map((r) => `${r.from} → ${r.to}`).join(", ");
         hist.setText(`Renamed: ${trail}`);
       }
+      // Per-author maintenance. Merge reassigns this author's note refs onto
+      // another; Forget drops the cached entry; Clear history wipes a junk
+      // rename trail; Set as me adopts this identity locally.
+      const actions = row.createDiv({ cls: "stashpad-known-author-actions" });
+      const mkBtn = (label: string, title: string, onClick: () => void, danger = false) => {
+        const btn = actions.createEl("button", { cls: "stashpad-known-author-action", text: label });
+        btn.setAttr("title", title);
+        if (danger) btn.addClass("mod-warning");
+        btn.addEventListener("click", onClick);
+      };
+      const isMe = a.id === (this.plugin.settings.authorId ?? "").trim();
+      mkBtn("Merge…", "Reassign this author's note references onto another author",
+        () => this.plugin.promptMergeAuthor(a.id, () => this.display()));
+      if (!isMe) mkBtn("Set as me", "Adopt this identity for yourself going forward",
+        () => this.plugin.promptAdoptAuthor(a.id, a.name, () => this.display()));
+      if (a.renames && a.renames.length > 0) mkBtn("Clear history", "Forget this author's rename history",
+        () => this.plugin.clearAuthorRenameHistory(a.id, () => this.display()));
+      mkBtn("Forget", "Remove this author from the rebuildable registry (notes untouched)",
+        () => this.plugin.promptDeleteAuthor(a.id, () => this.display()), true);
     }
   }
 
