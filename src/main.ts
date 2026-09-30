@@ -56,7 +56,7 @@ import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { createAliasesForFolder, deriveCleanTitle } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
 import { notify, setNotifySink } from "./notify";
-import { dedupeDrafts } from "./drafts";
+import { visibleDrafts } from "./drafts";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
 const SHORTCUT_DIR = "Stashpad Shortcuts";
@@ -3784,6 +3784,12 @@ export default class StashpadPlugin extends Plugin {
       name: "Search Stashpad notes",
       callback: () => call("openSearchModal"),
     });
+    // 0.506.0: manual duplicate check — search with the current composer draft.
+    this.addCommand({
+      id: "stashpad-check-duplicates",
+      name: "Check for duplicate notes (search with current draft)",
+      callback: () => call("cmdCheckDuplicates"),
+    });
     // 0.329.0: find-in-list — incremental type-to-filter of the current list,
     // distinct from the global Search modal above.
     this.addCommand({
@@ -6165,15 +6171,13 @@ export default class StashpadPlugin extends Plugin {
    *  with a button to open the Drafts manager. Setting-gated (draftsLaunchReminder). */
   maybeShowDraftsReminder(): void {
     if (!this.settings.draftsLaunchReminder) return;
-    // 0.459.0: count with the SAME dedup the Drafts modal uses (drop empty /
-    // `[[]]`-only drafts + collapse content duplicates) so the reminder's number
-    // matches what the manager actually lists. The old `.trim().length > 0` test
-    // counted empty-markup drafts and never deduped, inflating the number.
-    const n = dedupeDrafts(
-      Object.values(this.settings.composerDrafts ?? {})
-        .filter((d) => d.kind !== "edit")
-        .sort((a, b) => b.modified - a.modified),
-    ).length;
+    // 0.508.0: count via the SAME helper the Drafts manager lists from
+    // (`visibleDrafts`) so the toast number can NEVER disagree with the manager.
+    // Previously this filtered out edit-drafts (kind !== "edit") while the
+    // manager listed them, so the two could show different counts (the "+1"
+    // report). Now both are the identical deduped set. (0.459.0 first aligned the
+    // dedup; this closes the remaining edit-draft gap.)
+    const n = visibleDrafts(this.settings.composerDrafts).length;
     if (n <= 0) return;
     // 0.459.0: route through notify() so it gets the standard Stashpad toast
     // styling, lands in the notification log, and is silenceable via the

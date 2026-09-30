@@ -173,7 +173,7 @@ export interface ToolbarBuiltin {
   glyph: string;
   title: string;
   cls?: string;
-  gate?: "spoilers" | "drafts";
+  gate?: "spoilers" | "drafts" | "checkDup";
   run?: (ta: HTMLTextAreaElement) => void;
   menu?: (e: MouseEvent, getTa: () => HTMLTextAreaElement | null) => void;
 }
@@ -211,6 +211,9 @@ export const TOOLBAR_BUILTINS: ToolbarBuiltin[] = [
   // drafts reminder chip; right-click opens the Drafts manager. Hideable/orderable
   // like any other toolbar button. No `run` — it's wired specially in the renderer.
   { id: "drafts", icon: "notebook-pen", glyph: "✎", title: "Drafts", cls: "stashpad-toolbar-drafts", gate: "drafts" },
+  // 0.506.0: composer-only manual duplicate check (gated on opts.checkDup). Loads
+  // the current draft into search so you can eyeball whether the note already exists.
+  { id: "checkDup", icon: "search-check", glyph: "🔍", title: "Check for duplicate notes (search with this draft)", cls: "stashpad-toolbar-checkdup", gate: "checkDup" },
 ];
 
 /** 0.351.0: resolve the effective built-in button list from a saved config —
@@ -256,6 +259,10 @@ export interface FormattingToolbarOpts {
    *  highlight; left-click `toggle`s the per-folder chip; right-click `open`s the
    *  Drafts manager. */
   drafts?: { active: () => boolean; toggle: () => void; open: () => void };
+  /** 0.506.0: enables the composer-only "Check for duplicates" button (gated
+   *  builtin). Absent in the edit modal, so the button never shows there. Clicking
+   *  it loads the current draft into search. */
+  checkDup?: () => void;
 }
 
 /** Render the toolbar into `host`, acting on the textarea returned by `getTa`.
@@ -299,6 +306,7 @@ export function renderFormattingToolbar(
     if (hidden) continue;
     if (def.gate === "spoilers" && !opts.spoilers) continue;
     if (def.gate === "drafts" && !opts.drafts) continue;
+    if (def.gate === "checkDup" && !opts.checkDup) continue;
     const cls = "stashpad-composer-toolbar-btn" + (def.cls ? " " + def.cls : "");
     const b = bar.createEl("button", { cls, attr: { "aria-label": def.title, tabindex: "-1" } });
     setIconSafe(b, icon, def.glyph);
@@ -315,6 +323,11 @@ export function renderFormattingToolbar(
       paint();
       b.onclick = (e) => { e.preventDefault(); d.toggle(); paint(); };
       b.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); d.open(); };
+      continue;
+    }
+    if (def.gate === "checkDup" && opts.checkDup) {
+      const run = opts.checkDup;
+      b.onclick = (e) => { e.preventDefault(); run(); };
       continue;
     }
     b.onclick = (e) => {

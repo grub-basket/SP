@@ -8497,14 +8497,14 @@ export class StashpadView extends ItemView {
    *  matters most on mobile where those markers are awkward to type. Each button
    *  is tabindex -1 and preventDefaults mousedown so clicking never steals focus
    *  or the selection from the textarea. */
-  private renderComposerToolbar(composer: HTMLElement): void {
-    if (!getSettings().showComposerToolbar) return;
+  private renderComposerToolbar(composer: HTMLElement): HTMLElement | null {
+    if (!getSettings().showComposerToolbar) return null;
     // 0.419.0: on mobile the toolbar is collapsible (see the toggle button beside
     // the composer expand control). The class only bites on mobile in CSS.
     composer.toggleClass("is-toolbar-collapsed", getSettings().composerToolbarCollapsedMobile);
     // 0.336.0: shared with the edit modal (formatting-toolbar.ts). Tag +
     // internal-link lead the row (user request), then the inline-format buttons.
-    renderFormattingToolbar(composer, () => this.composerInputEl, {
+    return renderFormattingToolbar(composer, () => this.composerInputEl, {
       spoilers: getSettings().spoilerMarkup,
       app: this.app,
       snippets: getSettings().snippets,
@@ -8515,6 +8515,8 @@ export class StashpadView extends ItemView {
         toggle: () => void this.toggleDraftsSurfaced(),
         open: () => this.plugin.openComposerDrafts(this.noteFolder),
       },
+      // 0.506.0: composer-only manual duplicate check (edit modal passes no `checkDup`).
+      checkDup: () => this.cmdCheckDuplicates(),
     });
   }
 
@@ -10256,7 +10258,7 @@ export class StashpadView extends ItemView {
     // 0.332.0: formatting toolbar — a full-width row at the TOP of the composer
     // column (above the textarea row), so it never shrinks the text box. On
     // mobile it sits above the input, clear of the bottom-right Send button.
-    this.renderComposerToolbar(composer);
+    const composerToolbarBar = this.renderComposerToolbar(composer);
 
     const composerRow = composer.createDiv({ cls: "stashpad-composer-row" });
     // Wrap the textarea so we can absolutely-position the clear-X over it.
@@ -10699,7 +10701,10 @@ export class StashpadView extends ItemView {
     // jump-to-level (route) controls live here at the bottom-left of the
     // composer (moved out of the top toolbar / breadcrumb).
     if (Platform.isMobile) this.renderComposerNavCluster(btnRail);
-    this.renderComposerBotButton(btnRail); // 0.501.0: tag notes as AI-assisted
+    // 0.506.0: the bot (AI-contributor) button now lives at the END of the
+    // formatting toolbar when the toolbar is shown; falls back to the button rail
+    // when the toolbar is hidden so it never disappears.
+    this.renderComposerBotButton(composerToolbarBar ?? btnRail);
     // Mobile: secondary buttons (split/dest/enter/clip) live inside a
     // collapsible group. A chevron-left button at the head of the rail
     // toggles their visibility — collapsed at rest to keep the composer
@@ -14036,12 +14041,19 @@ export class StashpadView extends ItemView {
     notify(`Search: ${this.searchScopeLabel()}`);
   }
 
-  openSearchModal(): void {
+  /** 0.506.0: `preset` seeds the search box with a query (used by the manual
+   *  duplicate check, which loads the current draft) and populates results
+   *  immediately. Omitted for the plain Mod+F search. */
+  openSearchModal(preset?: string): void {
     // If a search modal is already open, focus its input + select all
     // so the next keystroke replaces the query. Don't stack a new modal.
     if (this.openSearchInstance) {
       const existing = (this.openSearchInstance as any).inputEl as HTMLInputElement | undefined;
       if (existing) {
+        if (preset != null) {
+          existing.value = preset;
+          existing.dispatchEvent(new Event("input"));
+        }
         existing.focus();
         existing.select();
       }
@@ -14177,6 +14189,27 @@ export class StashpadView extends ItemView {
       if (this.openSearchInstance === instance) this.openSearchInstance = null;
     };
     instance.open();
+    // 0.506.0: seed the query + populate results (SuggestModal refreshes on an
+    // `input` event — the same mechanism note-picker relies on).
+    if (preset != null) {
+      const inputEl = (instance as any).inputEl as HTMLInputElement | undefined;
+      if (inputEl) {
+        inputEl.value = preset;
+        inputEl.dispatchEvent(new Event("input"));
+        inputEl.select();
+      }
+    }
+  }
+
+  /** 0.506.0: manual duplicate check — load a copy of the current composer draft
+   *  into search so the user can eyeball whether the note already exists. (The
+   *  automatic "Similar notes" panel is setting-gated separately.) Draft newlines
+   *  are collapsed to spaces because the search box is single-line; Sift then
+   *  requires every word to appear in a title. Editable once open. */
+  cmdCheckDuplicates(): void {
+    const draft = (this.composerInputEl?.value ?? this.composerDraft ?? "").trim();
+    if (!draft) { new Notice("Nothing to check — the composer is empty."); return; }
+    this.openSearchModal(draft.replace(/\s+/g, " "));
   }
 
   /** Walk the vault for every Stashpad note that lives in a folder

@@ -10751,6 +10751,28 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 0.507.0: per-draft duplicate-match badge in the Drafts manager. */
+.stashpad-drafts-dup-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 8px;
+  padding: 0 7px;
+  border-radius: 9px;
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.stashpad-drafts-dup-badge.is-checking { color: var(--text-faint); }
+.stashpad-drafts-dup-badge.is-none { color: var(--text-muted); font-weight: 400; }
+.stashpad-drafts-dup-badge.is-hit {
+  cursor: pointer;
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+.stashpad-drafts-dup-badge.is-hit:hover { filter: brightness(1.1); }
+.stashpad-drafts-dup-icon { display: inline-flex; }
+.stashpad-drafts-dup-icon svg { width: 13px; height: 13px; }
 .stashpad-drafts-preview {
   font-size: var(--font-ui-medium);
   line-height: 1.4;

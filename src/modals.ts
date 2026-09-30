@@ -6,13 +6,13 @@ import { collectDropEntries, readDroppedTree, type DroppedTree } from "./dropped
 import { splitIntoChunks, splitByDelimiter, SPLIT_MODE_LABELS, setIconSafe, type SplitMode } from "./view-helpers";
 import { parseFormatSpans, FORMAT_KINDS, type FormatSpan } from "./formatting-toolbar";
 import { buildTimePickerInto } from "./time-picker";
-import { siftMatch, ROOT_ID } from "./types";
+import { siftMatch, ROOT_ID, type ComposerDraft } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL, parseRecurrence, parseDuration } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { renderFormattingToolbar, wrapSelection } from "./formatting-toolbar";
-import { dedupeDrafts } from "./drafts";
+import { visibleDrafts } from "./drafts";
 import { IconSuggest } from "./icon-suggest";
 import { vaultTagEntries } from "./input-suggest";
 import { siftRank } from "./suggest-match";
@@ -22,6 +22,7 @@ import { isImageExt, fileKindFor } from "./file-kinds";
 import { readClipboardText } from "./cross-vault-clipboard";
 import { getSettings } from "./settings";
 import type { ExportContent } from "./stash-package";
+import { splitFrontmatter } from "./stash-package";
 import type { ImportLogEntry } from "./import-log";
 import { LINK_KIND_LABELS, LINK_OUTCOME_LABELS, type LinkLog, type LinkLogEntry } from "./link-log";
 
@@ -3199,8 +3200,81 @@ export class SettingsBackupModal extends Modal {
   }
 }
 
+/** 0.507.0: normalize a line to a comparable "title" for duplicate matching —
+ *  strip a leading markdown marker (`#`, `>`, `-`/`*`/`+`) and a task checkbox so
+ *  a draft "- [ ] Buy milk" matches a saved note titled "Buy milk". Applied to
+ *  BOTH the draft's first line and each note's first line so they compare alike. */
+function draftDupTitle(line: string): string {
+  return line.replace(/^[#>\-*+\s]+/, "").replace(/^\[[ xX]?\]\s*/, "").trim();
+}
+
 export class ComposerDraftsModal extends Modal {
   constructor(app: App, private plugin: StashpadPlugin, private folder?: string) { super(app); }
+
+  /** 0.507.0: per-folder note-title index, built lazily + cached for the modal's
+   *  lifetime so several drafts in the same folder share one scan. Reads files
+   *  (titles are the first body line, not in the metadata cache), so it's capped. */
+  private titleCache = new Map<string, Promise<{ title: string; id: string }[]>>();
+  private static readonly TITLE_SCAN_CAP = 400;
+
+  private folderTitles(folder: string): Promise<{ title: string; id: string }[]> {
+    const cached = this.titleCache.get(folder);
+    if (cached) return cached;
+    const p = (async (): Promise<{ title: string; id: string }[]> => {
+      const files = this.app.vault.getMarkdownFiles()
+        .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === folder)
+        .slice(0, ComposerDraftsModal.TITLE_SCAN_CAP);
+      const out: { title: string; id: string }[] = [];
+      for (const f of files) {
+        const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: string } | undefined;
+        const id = typeof fm?.id === "string" ? fm.id : "";
+        if (!id) continue; // not a Stashpad note
+        let title = "";
+        try {
+          const body = splitFrontmatter(await this.app.vault.cachedRead(f)).body;
+          const line = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+          if (line) title = draftDupTitle(line);
+        } catch { /* fall through to filename */ }
+        if (!title) title = f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+        out.push({ title, id });
+      }
+      return out;
+    })();
+    this.titleCache.set(folder, p);
+    return p;
+  }
+
+  /** Render the duplicate-match badge for one draft: count of existing notes in
+   *  its folder whose title matches the draft's first line; click to open them. */
+  private renderMatchBadge(host: HTMLElement, d: ComposerDraft): void {
+    const firstLine = (d.text || "").split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+    const query = draftDupTitle(firstLine);
+    if (query.length < 3) return; // too short to be a meaningful match
+    const badge = host.createSpan({ cls: "stashpad-drafts-dup-badge is-checking", text: "checking…" });
+    void this.folderTitles(d.folder).then((titles) => {
+      const matches = titles.filter((t) => t.title && siftMatch(query, t.title));
+      badge.removeClass("is-checking");
+      badge.empty();
+      if (!matches.length) {
+        badge.addClass("is-none");
+        badge.setText("no duplicates");
+        return;
+      }
+      badge.addClass("is-hit");
+      setIcon(badge.createSpan({ cls: "stashpad-drafts-dup-icon" }), "copy-check");
+      badge.createSpan({ text: ` ${matches.length} match${matches.length === 1 ? "" : "es"}` });
+      badge.setAttr("aria-label", `${matches.length} existing note${matches.length === 1 ? "" : "s"} match this draft — click to open`);
+      badge.onclick = (e): void => {
+        e.preventDefault(); e.stopPropagation();
+        const menu = new Menu();
+        for (const m of matches.slice(0, 15)) {
+          menu.addItem((it) => it.setTitle(m.title.slice(0, 60) || "(untitled)").setIcon("file-text")
+            .onClick(() => { void this.plugin.openDeepLinkTarget(d.folder, m.id, { forceNewTab: true }); }));
+        }
+        menu.showAtMouseEvent(e as MouseEvent);
+      };
+    });
+  }
   onOpen(): void {
     this.titleEl.setText(this.folder ? `Drafts — ${this.folder.split("/").pop() ?? this.folder}` : "Composer drafts");
     this.modalEl.addClass("stashpad-drafts-modal");
@@ -3213,11 +3287,7 @@ export class ComposerDraftsModal extends Modal {
     // 0.345.4: dedupe with the SAME helper the chip uses (drop effectively-empty
     // drafts + collapse whitespace/content duplicates), so the modal list and the
     // chip count can't diverge (was: chip "2", modal ~10 empty `[[]]` entries).
-    const all = dedupeDrafts(
-      Object.values(this.plugin.settings.composerDrafts ?? {})
-        .filter((d) => !this.folder || d.folder === this.folder)
-        .sort((a, b) => (a.folder === b.folder ? b.modified - a.modified : a.folder.localeCompare(b.folder))),
-    );
+    const all = visibleDrafts(this.plugin.settings.composerDrafts, this.folder);
     if (!all.length) { c.createDiv({ cls: "stashpad-drafts-empty", text: "No drafts." }); return; }
     c.createDiv({ cls: "stashpad-drafts-help", text: "Load puts a draft in that folder's composer (whatever is there now is kept as its own draft). Discard is immediate." });
     const me = this.plugin.deviceId();
@@ -3238,6 +3308,10 @@ export class ComposerDraftsModal extends Modal {
       // apart and you know where loading it will put you.
       if (d.origin?.title) parts.push(`under \u201c${d.origin.title}\u201d`);
       meta.createSpan({ text: parts.join("  \u00b7  ") });
+      // 0.507.0: per-draft duplicate badge — how many saved notes in this draft's
+      // folder already match it (by title). Only for real drafts (an edit draft
+      // trivially matches the note it's editing). Click to open the matches.
+      if (d.kind !== "edit") this.renderMatchBadge(meta, d);
       const preview = (d.text.trim() || "(empty)").split(/\r?\n/).slice(0, 3).join(" ⏎ ");
       row.createDiv({ cls: "stashpad-drafts-preview", text: preview.length > 220 ? preview.slice(0, 220) + "…" : preview });
       const actions = row.createDiv({ cls: "stashpad-drafts-actions" });
