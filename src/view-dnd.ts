@@ -37,11 +37,15 @@ export class ViewDnD {
   // one `getBoundingClientRect()` per row on EVERY dragover event (~60/s, up to
   // ~400 forced layout reads per event on a big list), plus a whole-list query
   // in `clearDropIndicators()`. Now: the row geometry is cached once per drag in
-  // list coordinates, the hit test is a binary search, the indicator element is
-  // tracked in a field, and the work runs at most once per animation frame.
+  // list coordinates, the gap hit test is a binary search, the indicator element
+  // is tracked in a field, and the work runs at most once per animation frame.
   private rowCache: RowGeom[] | null = null;
-  /** Element → geometry, so the row-level hit test is O(1) rather than a scan. */
-  private rowCacheByEl = new Map<HTMLElement, RowGeom>();
+  // 0.496.0: a companion Map (element -> geometry) lived here to give the
+  // ROW-level hit test an O(1) lookup. That hit test now latches the row's own
+  // rect when the cursor enters it (see `zoneAnchor`), so nothing read the Map
+  // any more — it was one Map write per row on every cache rebuild, i.e. up to
+  // once per frame mid-drag, feeding nothing. Removed. `rowCache` (the sorted
+  // array) is still live: the LIST-level gap hit test binary searches it.
   /** Constant offset between the list's border-box top and the origin
    *  `offsetTop` is measured from (border/padding, or a positioned ancestor). */
   private cacheOrigin = 0;
@@ -64,14 +68,12 @@ export class ViewDnD {
    *  `offsetTop`/`offsetHeight` reads + two rects, done at most once per frame. */
   private buildRowCache(list: HTMLElement): void {
     const rows: RowGeom[] = [];
-    this.rowCacheByEl.clear();
     for (const child of Array.from(list.children)) {
       if (!child.classList.contains("stashpad-note")) continue;
       const el = child as HTMLElement;
       const top = el.offsetTop;
       const geom = { el, top, bottom: top + el.offsetHeight };
       rows.push(geom);
-      this.rowCacheByEl.set(el, geom);
     }
     this.rowCache = rows;
     this.cacheChildCount = list.childElementCount;
@@ -195,7 +197,22 @@ export class ViewDnD {
       this.cancelPendingOver();
       this.rowCache = null;
       this.dropIntoEl = null;
+      // 0.496.0: the latched zone bands belong to ONE drag over ONE row —
+      // carrying them into the next drag would hit-test against a row position
+      // that no longer exists.
+      this.zoneAnchor = null;
       this.clearAllDropIndicators();
+      // 0.496.0: a drag is in flight, so no row is prose to read — suppress row
+      // text selection for the duration (see `.is-dragging-rows` in styles.css)
+      // and drop any selection the press itself started.
+      //
+      // Both halves are needed and neither substitutes for the other: the class
+      // stops a NEW selection extending across rows as the cursor sweeps, while
+      // `removeAllRanges` clears one that was ALREADY made — `user-select: none`
+      // does not retract an existing selection, so without this a stray
+      // highlight from the mousedown survived the whole drag and the drop.
+      this.host.listEl?.addClass("is-dragging-rows");
+      this.clearStrayTextSelection();
       // Pre-create the placeholder once per drag (kept detached until first dragover).
       if (this.host.listEl) {
         this.dragPlaceholder = this.host.listEl.createDiv({ cls: "stashpad-drop-placeholder" });
@@ -250,7 +267,8 @@ export class ViewDnD {
       this.clearDropIndicators();
       this.removeDragPlaceholder();
       this.rowCache = null;
-      this.rowCacheByEl.clear();
+      this.zoneAnchor = null;
+      this.host.listEl?.removeClass("is-dragging-rows");
       this.dragSourceIds = null;
     });
     row.addEventListener("dragover", (e: DragEvent) => {
@@ -276,7 +294,10 @@ export class ViewDnD {
       this.cancelPendingOver();
       const sources = this.dragSourceIds.slice();
       this.dragSourceIds = null;
-      const zone = this.dropZone(e, row);
+      // 0.496.0: the SAME latched bands the highlight used, so what you saw is
+      // what you get. (Was a separate live-rect `dropZone`, which could
+      // disagree by a zone once the placeholder had displaced the row.)
+      const zone = this.dropZoneAtY(row, e.clientY);
       this.clearDropIndicators();
       this.removeDragPlaceholder();
       row.removeClass("is-dragging");
@@ -362,37 +383,71 @@ export class ViewDnD {
     setTimeout(() => { if (ph.parentElement) ph.remove(); }, 150);
   }
 
-  /** Three-zone hit test for drop position relative to a row's vertical bounds:
-   *  top 30% → drop-above, middle 40% → drop-into, bottom 30% → drop-below. */
-  private dropZone(e: DragEvent, row: HTMLElement): "drop-above" | "drop-into" | "drop-below" {
+  /** 0.496.0: the three-zone bands for the row the cursor is currently over,
+   *  LATCHED in viewport coordinates when the cursor entered that row.
+   *
+   *  THIS IS THE FIX FOR "the green nest highlight never appears". The drop
+   *  placeholder is a full-height item inserted INTO the list, and the dragged
+   *  row stays in the flow (just dimmed) — so mounting the placeholder makes
+   *  the list one row TALLER and shoves every row below it down by a whole row
+   *  height. Hit-testing against the row's LIVE position then feeds the zone
+   *  decision back into the layout it depends on:
+   *
+   *    cursor enters the row's top 30% ("insert above")
+   *      → we mount the placeholder above the row
+   *      → the row drops ~a full row height
+   *      → the cursor is now above the row's top 30% again
+   *      → still "insert above" … forever.
+   *
+   *  The row outruns the cursor, so `.drop-into` is never applied and a drop
+   *  meant to nest silently reorders instead. Latching the bands on entry
+   *  breaks the loop: our own placeholder can move the row, but it cannot move
+   *  the bands, so walking the cursor down a row passes through all three zones
+   *  exactly once.
+   *
+   *  Why it looked intermittent, and why it reproduced in one vault but not
+   *  another: the size of the push depended on vertical slack. Before the
+   *  `flex: 0 0 auto` fix in styles.css the placeholder was the only shrinkable
+   *  item in the flex column, so on a list whose content already filled the
+   *  pane it collapsed to its 4px borders — a ~10px push, which merely made
+   *  the band narrow (measured: green reachable at 0.44–0.68 of the row instead
+   *  of 0.30–0.70). Give the same 5-note folder a taller pane and the
+   *  placeholder opened to its full 79px and the green highlight became
+   *  reachable NOWHERE. Same notes, same code, different pane height.
+   *
+   *  Latched in VIEWPORT coordinates, and re-latched whenever the list's
+   *  `scrollTop` moves, which is what makes this correct under Chromium's
+   *  scroll anchoring. When the list is already scrollable, inserting content
+   *  above the viewport bumps `scrollTop` to compensate and the row does NOT
+   *  move on screen — so there is no push to correct for. Predicting the push
+   *  arithmetically (placeholder height + row gap) got this backwards and broke
+   *  the scrollable case; measuring the row's real position cannot. The
+   *  `scrollTop` guard also keeps the bands tracking the row during drag
+   *  auto-scroll, where the row really does move under a stationary cursor. */
+  private zoneAnchor: { row: HTMLElement; top: number; height: number; scrollTop: number } | null = null;
+
+  private anchorFor(row: HTMLElement, scrollTop: number): { top: number; height: number } {
+    const a = this.zoneAnchor;
+    if (a && a.row === row && a.scrollTop === scrollTop) return a;
     const rect = row.getBoundingClientRect();
-    const y = e.clientY - rect.top;
-    if (y < rect.height * 0.3) return "drop-above";
-    if (y > rect.height * 0.7) return "drop-below";
-    return "drop-into";
+    const next = { row, top: rect.top, height: rect.height, scrollTop };
+    this.zoneAnchor = next;
+    return next;
   }
 
-  /** Same three-zone thresholds as `dropZone`, but resolved from the cached row
-   *  geometry (falling back to a live rect if this row isn't in the cache). */
+  /** Three-zone hit test for drop position relative to a row's latched bands:
+   *  top 30% → drop-above, middle 40% → drop-into, bottom 30% → drop-below.
+   *
+   *  One implementation, used for BOTH the dragover highlight and the drop
+   *  itself (they used to be two near-identical methods, `dropZone` reading a
+   *  live rect and `dropZoneAtY` reading the row cache). Sharing it is not just
+   *  tidier: if the two disagreed by a zone, a drop could nest a note that the
+   *  green highlight had said would be inserted above it. */
   private dropZoneAtY(row: HTMLElement, clientY: number): "drop-above" | "drop-into" | "drop-below" {
-    const list = this.host.listEl;
-    let top: number, height: number, y: number;
-    if (list) {
-      this.ensureRowCache(list);
-      const hit = this.rowCacheByEl.get(row);
-      if (hit) {
-        top = hit.top;
-        height = hit.bottom - hit.top;
-        y = this.toListY(list, clientY) - top;
-        if (y < height * 0.3) return "drop-above";
-        if (y > height * 0.7) return "drop-below";
-        return "drop-into";
-      }
-    }
-    const rect = row.getBoundingClientRect();
-    y = clientY - rect.top;
-    if (y < rect.height * 0.3) return "drop-above";
-    if (y > rect.height * 0.7) return "drop-below";
+    const { top, height } = this.anchorFor(row, this.host.listEl?.scrollTop ?? 0);
+    const y = clientY - top;
+    if (y < height * 0.3) return "drop-above";
+    if (y > height * 0.7) return "drop-below";
     return "drop-into";
   }
 
@@ -404,6 +459,22 @@ export class ViewDnD {
       this.dropIntoEl.removeClass("drop-into");
       this.dropIntoEl = null;
     }
+  }
+
+  /** 0.496.0: drop a text selection that lives inside this list.
+   *
+   *  Scoped on purpose. A drag must not wipe a selection the user has somewhere
+   *  else entirely — an open editor pane, another view, the composer — so this
+   *  checks the selection's anchor is actually inside our list before clearing.
+   *  A blanket `removeAllRanges()` would have been a silent data-loss-adjacent
+   *  annoyance for anyone mid-edit in a split. */
+  private clearStrayTextSelection(): void {
+    const list = this.host.listEl;
+    if (!list) return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+    const anchor = sel.anchorNode;
+    if (anchor && list.contains(anchor)) sel.removeAllRanges();
   }
 
   private clearAllDropIndicators(): void {

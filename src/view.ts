@@ -446,6 +446,20 @@ export class StashpadView extends ItemView {
   private nextDestinationFolder: string | null = null;
   private nextDestinationLabel: string | null = null;
   private inListPicker: { activeIdx: number; mode: "nest" | "reply"; sourceIds: StashpadId[] } | null = null;
+  /** 0.496.0: the ONLY place `inListPicker` is assigned, so the list's
+   *  `.is-picking` marker cannot drift from whether a picker is actually open.
+   *  There are eight assignment sites (open nest, open reply, Escape, the
+   *  confirm chord, two cleanup paths, …) and a marker maintained at even one
+   *  of them by hand would eventually be left on — which would silently make
+   *  every note body unselectable for the rest of the session.
+   *
+   *  While a picker IS open every row is a destination being chosen, not prose
+   *  to read, so row text stops being selectable (see styles.css). Mutating
+   *  `activeIdx` in place is unaffected and stays as-is. */
+  private setInListPicker(next: { activeIdx: number; mode: "nest" | "reply"; sourceIds: StashpadId[] } | null): void {
+    this.inListPicker = next;
+    this.listEl?.classList.toggle("is-picking", !!next);
+  }
   /** 0.366.0: persistent on-screen banner for the in-list picker, so it can be
    *  cancelled on mobile — there is no Esc key on a soft keyboard, and the picker
    *  otherwise had no tap-to-cancel. Cleared whenever the picker ends. */
@@ -632,8 +646,13 @@ export class StashpadView extends ItemView {
    *   - .stashpad-note-enter : the children-count / expand arrow.
    *   - .stashpad-note-authorship : the author footer (its link is also `a`).
    *   - input, textarea, select, [contenteditable] : any real form field. */
-  static readonly DRAG_RESERVED_SELECTOR = [
-    ".stashpad-note-text",
+  /** 0.496.0: every reserved zone EXCEPT the body text. Split out so that
+   *  `DRAG_RESERVED_SELECTOR` and `DRAG_RESERVED_SELECTOR_MULTI` are built from
+   *  one list and the "same set, minus the body" relationship is structural.
+   *  It used to be two hand-maintained copies, which meant a new reserved
+   *  control added to one and forgotten in the other would silently make that
+   *  control un-clickable on a multi-selected row. */
+  private static readonly DRAG_RESERVED_CONTROLS = [
     "a", ".internal-link", ".tag",
     "button",
     ".stashpad-note-task-checkbox",
@@ -641,7 +660,27 @@ export class StashpadView extends ItemView {
     ".stashpad-note-enter",
     ".stashpad-note-authorship",
     "input", "textarea", "select", "[contenteditable]",
+  ];
+  static readonly DRAG_RESERVED_SELECTOR = [
+    ".stashpad-note-text",
+    ...StashpadView.DRAG_RESERVED_CONTROLS,
   ].join(", ");
+  /** 0.496.0: the reserved set MINUS `.stashpad-note-text`, used only while a
+   *  MULTI-selection is being grabbed by one of its own selected rows.
+   *
+   *  Why: with "Select text in notes" on (the default), the body is reserved, so
+   *  the only way to drag was to find the timestamp / grip / meta whitespace.
+   *  That is a fine trade for one note — you are usually reading it — but once
+   *  you have deliberately selected several notes, the intent is "move this
+   *  set", and hunting for a sliver of dead space on a row you already selected
+   *  is busywork. So a selected row in a multi-selection drags from ANYWHERE,
+   *  body text included; `.is-multi-grab` (below) turns that row's text
+   *  unselectable to match, so the two can't disagree.
+   *
+   *  Real controls stay reserved — you can still click Edit / a link / the
+   *  checkbox / a reaction on a selected row. Only text selection yields.
+   *  Alt (when "Alt+drag selects text" is on) is the escape hatch. */
+  static readonly DRAG_RESERVED_SELECTOR_MULTI = StashpadView.DRAG_RESERVED_CONTROLS.join(", ");
   /** 0.293.0 (perf): `stickyRowObserver` (a ResizeObserver wired to EVERY
    *  list row during scrollListToBottom) was removed — see the comment in
    *  scrollListToBottom. Content growth is caught by that method's rAF
@@ -997,7 +1036,7 @@ export class StashpadView extends ItemView {
         // then Escape would fall through to the collapse-below and drop every
         // selected note but one — the exact repro the user reported.
         if (this.inListPicker) {
-          this.inListPicker = null;
+          this.setInListPicker(null);
           this.endInListPickerBanner();
           this.pickerEscapeAt = Date.now();
           this.repaintSelectionClasses(); // clears the pick-target highlight
@@ -4775,6 +4814,10 @@ export class StashpadView extends ItemView {
 
     const list = chrome.createDiv({ cls: "stashpad-list" });
     this.listEl = list;
+    // 0.496.0: every full render makes a NEW list el, so the interaction-mode
+    // markers have to be re-applied — a picker left open across a render would
+    // otherwise get its rows' text selectable again mid-pick.
+    if (this.inListPicker) list.addClass("is-picking");
     // 0.316.3 (R1): keep a fresh open/switch's list hidden across its
     // empty→partial→full paints; revealSettlingList() (settle or safety timeout)
     // lifts it. Re-applied here because every full render makes a NEW list el.
@@ -8259,6 +8302,16 @@ export class StashpadView extends ItemView {
       // AND selectable text), so a row in Flat/Everything mode (which also
       // carries `is-text-selectable`) is never armed.
       row.dataset.grab = "1";
+      // 0.496.0: a row built while a multi-selection is live carries the
+      // whole-row-grab marker from birth — virtualization rebuilds rows as you
+      // scroll, so a row scrolling into view mid-selection must not come back
+      // with selectable text while its neighbours are grabbable.
+      //
+      // Deliberately INSIDE the data-grab branch: the marker only means
+      // anything on a row that can actually be grabbed. In Flat / Everything
+      // mode (no drag-reorder) or with "Select text in notes" off, marking the
+      // row would cost text selection and buy nothing.
+      if (this.isMultiGrabRow(node.id)) row.addClass("is-multi-grab");
     }
     if (color) grip.style.setProperty("--stashpad-note-color", color);
     // 0.267.6: the hide/reveal chip sits AFTER the timestamp and the grip, so
@@ -11673,7 +11726,22 @@ export class StashpadView extends ItemView {
       }
       if (hit.row.dataset.grab !== "1") return;
       const t = e.target as HTMLElement | null;
-      hit.row.draggable = !(t && t.closest(StashpadView.DRAG_RESERVED_SELECTOR));
+      // 0.496.0: pressing a row that belongs to a MULTI-selection grabs the
+      // whole set from anywhere on the row — the body text is no longer a
+      // reserved zone. See DRAG_RESERVED_SELECTOR_MULTI. Note this deliberately
+      // reads the row's own selected-ness rather than just `selection.size > 1`:
+      // pressing an UNSELECTED row still selects its text as before, because
+      // that press is about that one note, not about moving the set.
+      //
+      // Alt is still the escape hatch. The 0.458.0 branch above can't cover
+      // this case — it only fires on an already-draggable row, and a
+      // selectable-text row starts NON-draggable — so the opt-out is repeated
+      // here rather than inherited.
+      const altEscape = getSettings().altDragSelectsText && (e as MouseEvent).altKey;
+      const reserved = !altEscape && this.isMultiGrabRow(hit.node.id)
+        ? StashpadView.DRAG_RESERVED_SELECTOR_MULTI
+        : StashpadView.DRAG_RESERVED_SELECTOR;
+      hit.row.draggable = !(t && t.closest(reserved));
     });
     list.addEventListener("mouseup", disarm);
     list.addEventListener("dragend", disarm);
@@ -12253,7 +12321,7 @@ export class StashpadView extends ItemView {
     if (this.inListPicker && e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
-      this.inListPicker = null;
+      this.setInListPicker(null);
       this.endInListPickerBanner();
       this.pickerEscapeAt = Date.now(); // 0.91.2: suppress the sibling collapse handler
       // Pin scroll across the cancel-render so dismissing the highlight near
@@ -12312,7 +12380,7 @@ export class StashpadView extends ItemView {
       // binding, not a hard-coded "M".
       if (this.inListPicker.mode === "nest" && matchBinding(e, getSettings().bindings.move)) {
         e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-        this.inListPicker = null;
+        this.setInListPicker(null);
         this.endInListPickerBanner();
         this.repaintSelectionClasses(); // drop the pick-target highlight
         this.cmdMovePicker();
@@ -12912,6 +12980,15 @@ export class StashpadView extends ItemView {
     return true;
   }
 
+  /** 0.496.0: is this row part of a multi-selection, and therefore a whole-row
+   *  grab handle for the set? Single source of truth for both the mousedown
+   *  reserved-zone choice and the `.is-multi-grab` class that turns its body
+   *  text unselectable — they must never disagree, or the row would look
+   *  draggable while the browser started a text selection under the cursor. */
+  private isMultiGrabRow(id: string): boolean {
+    return this.selection.size > 1 && this.selection.has(id);
+  }
+
   private repaintSelectionClasses(): void {
     if (!this.listEl) return;
     // 0.258.0: the heading row participates in the fast class-toggle path too.
@@ -12933,6 +13010,12 @@ export class StashpadView extends ItemView {
       const isCursor = idx === this.cursorIdx;
       row.classList.toggle("is-cursor", isCursor);
       row.classList.toggle("is-selected", this.selection.has(id));
+      // 0.496.0: keep the whole-row-grab marker in step with the selection on
+      // the FAST path too — arrow-key/click selection changes here without a
+      // full render, and a stale marker would leave a row's text unselectable
+      // after the set collapsed back to one note. `data-grab` gates it to rows
+      // that can actually be grabbed, matching the render path.
+      row.classList.toggle("is-multi-grab", row.dataset.grab === "1" && this.isMultiGrabRow(id));
       // 0.73.14: transient auto-expand. CSS-only — flips off the
       // clamp on the cursor row's text without mutating the
       // expandedNotes Set, so moving away naturally re-collapses.
@@ -14667,7 +14750,7 @@ export class StashpadView extends ItemView {
   /** 0.366.0: cancel the in-list picker (the mobile Cancel button + a shared exit). */
   private cancelInListPicker(): void {
     if (!this.inListPicker) { this.endInListPickerBanner(); return; }
-    this.inListPicker = null;
+    this.setInListPicker(null);
     this.endInListPickerBanner();
     this.render();
   }
@@ -14683,7 +14766,7 @@ export class StashpadView extends ItemView {
       const up = this.nextPickableIdx(start, -1);
       start = up !== start ? up : this.nextPickableIdx(start, 1);
     }
-    this.inListPicker = { activeIdx: start, mode: "nest", sourceIds: this.getActionTargets().map((t) => t.id) };
+    this.setInListPicker({ activeIdx: start, mode: "nest", sourceIds: this.getActionTargets().map((t) => t.id) });
     // 0.91.0: surface the "switch to the full move picker" shortcut, using the
     // user's actual Move binding (default M) so the hint stays accurate.
     const moveBind = getSettings().bindings.move;
@@ -14717,7 +14800,7 @@ export class StashpadView extends ItemView {
       const up = this.nextPickableIdx(start, -1);
       start = up !== start ? up : this.nextPickableIdx(start, 1);
     }
-    this.inListPicker = { activeIdx: start, mode: "reply", sourceIds: [src.id] };
+    this.setInListPicker({ activeIdx: start, mode: "reply", sourceIds: [src.id] });
     this.showInListPickerBanner(Platform.isMobile
       ? "Tap the note to reply to, or Cancel."
       : "Arrows to pick the note to reply to, Enter confirms, Esc cancels (“Make a reply to…” in the ⋮ menu searches all folders).");
@@ -14766,7 +14849,7 @@ export class StashpadView extends ItemView {
     if (this.inListPicker.mode === "reply") {
       const picker = this.inListPicker;
       const target = this.currentChildren[picker.activeIdx];
-      this.inListPicker = null;
+      this.setInListPicker(null);
       this.endInListPickerBanner();
       if (!target) { this.render(); return; }
       await this.commitReplyPicker(picker.sourceIds, target);
@@ -14774,7 +14857,7 @@ export class StashpadView extends ItemView {
     }
     const picker = this.inListPicker;
     const target = this.currentChildren[picker.activeIdx];
-    this.inListPicker = null;
+    this.setInListPicker(null);
     this.endInListPickerBanner();
     if (!target) { this.render(); return; }
     // 0.366.1: move the notes CAPTURED when the picker started (picker.sourceIds),

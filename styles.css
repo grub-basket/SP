@@ -1826,6 +1826,16 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   box-sizing: border-box;
   margin: 0;
   overflow: hidden;
+  /* 0.496.0: NEVER let the list shrink this. `.stashpad-list` is a flex column,
+     so every child is a flex item with the default `flex-shrink: 1`. The note
+     rows can't actually shrink (min-height:auto floors them at their content),
+     but this placeholder is EMPTY with overflow:hidden — its min-content height
+     is 0 — so it was the only shrinkable item in the list and absorbed ALL the
+     overflow whenever the content was at or over the pane height. The JS set
+     `height: 79px` and the computed height came back `4px` (just the borders):
+     the insert gap silently never opened. Measured on a 5-note folder whose
+     content overflowed the pane by 10px. */
+  flex: 0 0 auto;
   /* Height is animated via JS (set to 0 on insert, then to dragRowHeight)
      so the rows above and below smoothly slide apart instead of snapping. */
   transition: height 0.14s ease, opacity 0.14s ease, border-width 0.14s ease;
@@ -1955,6 +1965,68 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-note.is-text-selectable .stashpad-note-text {
   -webkit-user-select: text;
   user-select: text;
+}
+/* ── TEXT SELECTION YIELDS TO A PENDING ACTION (0.496.0) ───────────────────
+   Every rule below this header turns the note body UNselectable for as long as
+   some state makes a press on the row mean "act on this row" rather than
+   "select its text". They all override `.is-text-selectable` above purely by
+   SOURCE ORDER — both sides are three-class selectors, so they tie on
+   specificity. Keep them after that rule; reordering this sheet, or adding a
+   class to the winning side, silently flips the behavior back. */
+
+/* 0.496.0: this row is part of a MULTI-selection, so it is a grab handle for
+   the whole set. Paired with DRAG_RESERVED_SELECTOR_MULTI in view.ts — the two
+   must agree, or the row would drag while a text selection started under the
+   cursor. Only SELECTED rows are marked: pressing an unselected row still
+   selects its text, because that press is about that one note. */
+.stashpad-note.is-multi-grab .stashpad-note-body,
+.stashpad-note.is-multi-grab .stashpad-note-text {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 0.496.0: an in-list destination picker is open (nest / reply). Every row is
+   a target being chosen, so none of them is prose to read — dragging a text
+   selection across rows while picking is pure noise. Set on the list by
+   setInListPicker() (the single write point for the picker state) and
+   re-applied on render, since each render builds a new list element. */
+.stashpad-list.is-picking .stashpad-note .stashpad-note-body,
+.stashpad-list.is-picking .stashpad-note .stashpad-note-text {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 0.496.0: a row drag is in flight anywhere in this list, so a sweep across
+   rows must not paint a text selection behind the cursor. Set on dragstart and
+   removed on dragend by ViewDnD, which also clears any selection the press
+   itself had already started (this property does not retract an existing one).
+   Not re-applied on render: a full render mid-drag would end the drag anyway,
+   and dragend clears the marker regardless. */
+.stashpad-list.is-dragging-rows .stashpad-note .stashpad-note-body,
+.stashpad-list.is-dragging-rows .stashpad-note .stashpad-note-text {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 0.496.0: this row is sitting on a pending cut/copy (the note clipboard) and
+   is about to move on paste, so it reads as in-flight rather than as prose.
+   Driven by the existing `.is-cut-pending` / `.is-copy-pending` classes that
+   renderRow already applies — no new JS.
+
+   CAVEAT, deliberately recorded: this is the WEAKEST of the four rules here.
+   The other three protect a real gesture conflict (grab the set / pick a
+   target / drag in flight) and are momentary. A pending cut/copy has no
+   competing press on the row, and `plugin.noteClipboard` persists until a paste
+   or another cut/copy — so cutting three notes and never pasting leaves their
+   text unselectable for the rest of the session, and wanting to copy a snippet
+   OUT of a note you just copied is a plausible thing to do. If that bites,
+   delete this one rule; nothing else depends on it. */
+.stashpad-note.is-cut-pending .stashpad-note-body,
+.stashpad-note.is-cut-pending .stashpad-note-text,
+.stashpad-note.is-copy-pending .stashpad-note-body,
+.stashpad-note.is-copy-pending .stashpad-note-text {
+  -webkit-user-select: none;
+  user-select: none;
 }
 .stashpad-note-body > :first-child { margin-top: 0; }
 .stashpad-note-body > :last-child { margin-bottom: 0; }
