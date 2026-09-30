@@ -3839,6 +3839,11 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   padding: 2px 8px;
   cursor: pointer;
 }
+/* 0.501.0: composer "tag as AI-assisted" button — lit when a bot is pending. */
+.stashpad-composer-bot-btn.is-active {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+}
 /* 0.76.33: glyph shown when an icon name isn't in the device's
    bundled Lucide set (older iPad/iOS app) so the button isn't blank.
    Sized to read like the icon it replaces. */
@@ -11590,16 +11595,70 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
    reuse .stashpad-att / .stashpad-att-badge; only the separation + modal are new. */
 .stashpad-slice-rail { margin-top: 4px; }
 .stashpad-slice .stashpad-att-badge { cursor: pointer; }
+/* 0.503.0: the preview expands toward the window width so wide tables / long code
+   lines have room (capped so it isn't absurd on an ultrawide).
+   0.504.0: resizable — drag the bottom-right corner; a flex column so the body
+   grows/shrinks with the modal and keeps its own scroll. */
+.stashpad-slice-modal {
+  width: 90vw;
+  max-width: 1400px;
+  /* height fits the content by default (short snippets stay compact); capped so a
+     huge block scrolls rather than overflowing. Dragging the corner sets an
+     explicit height and takes over from here. */
+  min-width: min(360px, 90vw);
+  min-height: 200px;
+  max-height: 85vh;
+  resize: both;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.stashpad-slice-modal .modal-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
 .stashpad-slice-modal .stashpad-slice-body {
-  max-height: 60vh;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
   padding: 4px 2px;
 }
+/* 0.503.0: default = horizontal scroll (white-space: pre); the `is-wrapped` class
+   (driven by the bodySlicePreviewWrap setting + the in-preview toggle, default on)
+   wraps long lines to the modal width instead. */
 .stashpad-slice-modal .stashpad-slice-body pre { white-space: pre; }
+.stashpad-slice-modal .stashpad-slice-body.is-wrapped pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+/* 0.504.0: a GIANT Copy button, centered; the Wrap toggle is parked at the right
+   edge (absolute) so Copy stays truly centered. */
 .stashpad-slice-modal .stashpad-slice-actions {
+  position: relative;
   display: flex;
-  justify-content: flex-end;
+  justify-content: center;
+  align-items: center;
   margin-top: 12px;
+  flex: 0 0 auto;
+}
+.stashpad-slice-modal .stashpad-slice-actions .mod-cta {
+  font-size: 1.15em;
+  font-weight: 600;
+  padding: 12px 40px;
+  min-width: 50%;
+}
+.stashpad-slice-wrap-toggle {
+  position: absolute;
+  right: 0;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.stashpad-slice-wrap-toggle.is-active {
+  color: var(--text-on-accent);
+  background-color: var(--interactive-accent);
 }
 
 /* 0.476.2: drag-to-reorder in the action-list settings builders (item buttons,

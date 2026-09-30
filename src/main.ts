@@ -64,6 +64,7 @@ const SHORTCUT_DIR = "Stashpad Shortcuts";
 import { PreviewCache } from "./link-preview/store";
 import { enrichFile, scanBackfill, estimateSeconds, humanDuration } from "./link-preview/service";
 import { AuthorRegistry, type AuthorRecord } from "./author-registry";
+import { DEFAULT_BOTS, type BotDef } from "./bots";
 import { ImportService } from "./import-service";
 import { ImportLog } from "./import-log";
 import { perf } from "./perf";
@@ -4179,6 +4180,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-toggle-task", name: "Toggle task (todo)", callback: () => call("cmdToggleTask") });
     this.addCommand({ id: "stashpad-set-due", name: "Set due date…", callback: () => call("cmdSetDue") });
     this.addCommand({ id: "stashpad-reply", name: "Reply to selection", callback: () => call("cmdReply") });
+    this.addCommand({ id: "stashpad-attribute-bot", name: "Attribute to AI author / bot (Claude, ChatGPT…) as contributor", callback: () => call("cmdAttributeBot") });
     // 0.81.1: performance profiling — dump / reset the timing report.
     this.addCommand({
       id: "stashpad-dump-perf",
@@ -9588,6 +9590,8 @@ export default class StashpadPlugin extends Plugin {
     const author = parseAuthorRef(fm.author);
     const myId = (this.settings.authorId ?? "").trim();
     if (!author || !author.id || author.id === myId) return;
+    // 0.501.0: bot authors (Claude, ChatGPT, …) are not teammates — never notify.
+    if (this.authorRegistry.get(author.id)?.bot) return;
 
     // Recency guard: a bulk sync can replay old notes as `create`. Only notify
     // for notes created within the last 30 minutes. Skipped for the poll path,
@@ -11083,7 +11087,7 @@ export default class StashpadPlugin extends Plugin {
    *  rename history for ids already in the registry. Returns a summary. */
   async rebuildAuthorRegistry(): Promise<{ total: number; fromStubs: number; fromNotes: number }> {
     const stashpads = this.discoverStashpadFolders();
-    const byId = new Map<string, { id: string; name?: string; role?: string; department?: string; fromStub: boolean }>();
+    const byId = new Map<string, { id: string; name?: string; role?: string; department?: string; bot?: boolean; fromStub: boolean }>();
 
     // Pass 1: author wikilinks across all note frontmatter.
     let fromNotes = 0;
@@ -11117,6 +11121,7 @@ export default class StashpadPlugin extends Plugin {
         const name = (aliasName || (typeof fm?.name === "string" ? fm.name : "") || parsed.name).trim();
         const role = typeof fm?.role === "string" ? fm.role : undefined;
         const department = typeof fm?.department === "string" ? fm.department : undefined;
+        const bot = fm?.bot === true || fm?.bot === "true";
         const existing = byId.get(parsed.id);
         if (!existing) fromStubs++;
         byId.set(parsed.id, {
@@ -11124,6 +11129,7 @@ export default class StashpadPlugin extends Plugin {
           name: name || existing?.name,
           role: role ?? existing?.role,
           department: department ?? existing?.department,
+          bot: bot || existing?.bot,
           fromStub: true,
         });
       }
@@ -11140,7 +11146,7 @@ export default class StashpadPlugin extends Plugin {
    *  resolves to the stub and it surfaces in quick switcher) plus role/
    *  department + a created stamp + an H1. Stashpad-owned; safe to
    *  regenerate. */
-  buildAuthorStub(rec: { id: string; name: string; role?: string; department?: string }, created: string): string {
+  buildAuthorStub(rec: { id: string; name: string; role?: string; department?: string; bot?: boolean }, created: string): string {
     // Collapse any newlines (defensive — a pasted value could contain one)
     // so YAML scalars + the H1 stay single-line, and escape backslashes
     // before quotes for a valid double-quoted YAML string. Without the
@@ -11152,6 +11158,7 @@ export default class StashpadPlugin extends Plugin {
     const lines = ["---", `authorId: ${rec.id}`, `aliases:`, `  - "${esc(rec.name)}"`];
     if (rec.role) lines.push(`role: "${esc(rec.role)}"`);
     if (rec.department) lines.push(`department: "${esc(rec.department)}"`);
+    if (rec.bot) lines.push(`bot: true`);
     lines.push(`created: ${created}`, "---", `# ${name}`);
     return lines.join("\n");
   }
@@ -11278,6 +11285,43 @@ export default class StashpadPlugin extends Plugin {
     await this.saveSettings();
     await this.syncAuthorFilesToName();
     await this.restoreMissingAuthorStubs();
+  }
+
+  // ===== 0.501.0: AI bot authors =====
+
+  /** Bots to offer in the picker: every bot already in the registry, plus the
+   *  default suggestions not yet added (deduped by id). */
+  availableBots(): BotDef[] {
+    const byId = new Map<string, BotDef>();
+    for (const b of DEFAULT_BOTS) byId.set(b.id, { id: b.id, name: b.name });
+    for (const r of this.authorRegistry.bots()) byId.set(r.id, { id: r.id, name: r.name || r.id });
+    return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Register a bot in the registry (idempotent). Stub files are created
+   *  per-folder when the bot is actually stamped (see attributeToBot). */
+  ensureBotAuthor(id: string, name: string): BotDef {
+    id = (id ?? "").trim();
+    name = (name ?? "").trim() || id;
+    this.authorRegistry.record({ id, name, bot: true });
+    return { id, name };
+  }
+
+  /** Open the bot picker; `onPick` gets a registered bot (custom bots are
+   *  prompted for a name and minted with a bot-prefixed id). */
+  pickBot(onPick: (bot: BotDef) => void): void {
+    const CUSTOM: BotDef = { id: "__custom__", name: "➕ Add a custom bot…" };
+    new BotPickerModal(this.app, [...this.availableBots(), CUSTOM], (chosen) => {
+      if (chosen.id === "__custom__") {
+        new NamePromptModal(this.app, "Custom AI bot", "Bot name", "", (raw) => {
+          const name = raw.trim();
+          if (!name) { new Notice("Enter a bot name."); return; }
+          onPick(this.ensureBotAuthor("bot" + newId(5), name));
+        }).open();
+        return;
+      }
+      onPick(this.ensureBotAuthor(chosen.id, chosen.name));
+    }).open();
   }
 
   /** Delete an author from the registry (rebuildable cache — notes keep
@@ -13168,6 +13212,17 @@ class AuthorSuggestModal extends FuzzySuggestModal<AuthorRecord> {
     return bits.join(" ");
   }
   onChooseItem(a: AuthorRecord): void { this.onPick(a); }
+}
+
+/** 0.501.0: fuzzy picker over bot authors + a "custom" entry. */
+class BotPickerModal extends FuzzySuggestModal<BotDef> {
+  constructor(app: App, private items: BotDef[], private onPick: (b: BotDef) => void) {
+    super(app);
+    this.setPlaceholder("Attribute to which AI?");
+  }
+  getItems(): BotDef[] { return this.items; }
+  getItemText(b: BotDef): string { return b.name; }
+  onChooseItem(b: BotDef): void { this.onPick(b); }
 }
 
 class NamePromptModal extends Modal {

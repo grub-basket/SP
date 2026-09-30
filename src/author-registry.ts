@@ -17,6 +17,9 @@ export interface AuthorRecord {
   name: string;
   role?: string;
   department?: string;
+  /** 0.501.0: an AI "bot" author (Claude, ChatGPT, …) rather than a person.
+   *  Flagged in the UI and excluded from team notifications. */
+  bot?: boolean;
   /** ISO timestamp first observed by the registry. */
   firstSeen: string;
   /** ISO timestamp last observed/updated. */
@@ -102,7 +105,7 @@ export class AuthorRegistry {
    *  rename is recorded once, on commit (blur/Enter), via `noteRename`.
    *  (0.497.0 — the 0.140.11 fix deferred the file rename but missed this
    *  registry path.) */
-  record(info: { id: string; name?: string; role?: string; department?: string; at?: string }, opts?: { silent?: boolean }): boolean {
+  record(info: { id: string; name?: string; role?: string; department?: string; bot?: boolean; at?: string }, opts?: { silent?: boolean }): boolean {
     const id = (info.id ?? "").trim();
     if (!id) return false;
     const now = info.at ?? new Date().toISOString();
@@ -116,12 +119,14 @@ export class AuthorRegistry {
         name,
         role: info.role?.trim() || undefined,
         department: info.department?.trim() || undefined,
+        bot: info.bot || undefined,
         firstSeen: now,
         lastSeen: now,
         renames: [],
       };
       changed = true;
     } else {
+      if (info.bot !== undefined && !!info.bot !== !!existing.bot) { existing.bot = info.bot || undefined; changed = true; }
       if (name && name !== existing.name) {
         if (!opts?.silent) existing.renames.push({ from: existing.name, to: name, at: now });
         existing.name = name;
@@ -190,9 +195,12 @@ export class AuthorRegistry {
     void this.save();
   }
 
+  /** All known bot authors, newest-activity first. */
+  bots(): AuthorRecord[] { return this.all().filter((a) => a.bot); }
+
   /** Replace the entire author set (used by rebuild()). Preserves
    *  firstSeen + rename history for ids that already existed. */
-  replaceAll(records: Array<{ id: string; name?: string; role?: string; department?: string }>, at?: string): void {
+  replaceAll(records: Array<{ id: string; name?: string; role?: string; department?: string; bot?: boolean }>, at?: string): void {
     const now = at ?? new Date().toISOString();
     const next: Record<string, AuthorRecord> = {};
     for (const rec of records) {
@@ -209,6 +217,7 @@ export class AuthorRegistry {
         name,
         role: rec.role?.trim() || prior?.role || undefined,
         department: rec.department?.trim() || prior?.department || undefined,
+        bot: rec.bot || prior?.bot || undefined,
         firstSeen: prior?.firstSeen ?? now,
         lastSeen: now,
         renames,

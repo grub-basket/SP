@@ -29,18 +29,55 @@ export const SPLIT_MODE_LABELS: Record<SplitMode, string> = {
  *               any preamble before the first heading is its own chunk. */
 export function splitIntoChunks(text: string, mode: SplitMode): string[] {
   const norm = text.replace(/\r\n/g, "\n");
+  // 0.497.0: every mode keeps a fenced code block (``` … ```) ATOMIC — a block's
+  // interior newlines / blank lines / `#` lines are body text, not split points,
+  // so pasting a large code block never shreds into one note per line. A `` ``` ``
+  // line toggles fence state (same loose rule the paste importer uses); an
+  // unterminated fence runs to the end and stays one block.
+  const isFence = (line: string) => /^\s*```/.test(line);
+
   if (mode === "lines") {
-    return norm.split("\n").map((s) => s.trim()).filter(Boolean);
+    const chunks: string[] = [];
+    let fence: string[] | null = null;
+    const flushFence = (): void => {
+      if (fence) { const j = fence.join("\n").trim(); if (j) chunks.push(j); fence = null; }
+    };
+    for (const line of norm.split("\n")) {
+      if (fence) {
+        fence.push(line);
+        if (isFence(line)) flushFence(); // closing fence ends the block
+        continue;
+      }
+      if (isFence(line)) { fence = [line]; continue; }
+      const t = line.trim();
+      if (t) chunks.push(t);
+    }
+    flushFence(); // unterminated fence
+    return chunks;
   }
+
   if (mode === "paragraphs") {
-    return norm.split(/\n[ \t]*\n+/).map((s) => s.trim()).filter(Boolean);
+    const chunks: string[] = [];
+    let buf: string[] = [];
+    let inFence = false;
+    const flush = (): void => { const j = buf.join("\n").trim(); if (j) chunks.push(j); buf = []; };
+    for (const line of norm.split("\n")) {
+      if (isFence(line)) { inFence = !inFence; buf.push(line); continue; }
+      if (!inFence && line.trim() === "") { flush(); continue; } // blank line = paragraph break (outside fences only)
+      buf.push(line);
+    }
+    flush();
+    return chunks;
   }
+
   // headings
   const chunks: string[] = [];
   let cur: string[] = [];
+  let inFence = false;
   const isHeading = (line: string) => /^#{1,6}\s/.test(line);
   for (const line of norm.split("\n")) {
-    if (isHeading(line) && cur.some((l) => l.trim())) {
+    if (isFence(line)) { inFence = !inFence; cur.push(line); continue; }
+    if (!inFence && isHeading(line) && cur.some((l) => l.trim())) { // `#` inside a fence is a comment, not a heading
       chunks.push(cur.join("\n").trim());
       cur = [];
     }

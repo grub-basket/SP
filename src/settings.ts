@@ -85,6 +85,7 @@ export type CommandId =
   | "copyForOtherVault" | "cutForOtherVault"
   | "commandPalette"
   | "focusList"
+  | "attributeBot"
   | "toggleObscured";
 
 /** Per-command bindings: up to two chord strings ("S" or "Mod+Enter").
@@ -180,6 +181,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "copyForOtherVault", label: "Copy for another vault",         desc: "Copy the selected note(s) AND prepare the cross-vault payload, so they can be pasted into a DIFFERENT vault. Slower than plain copy — it reads every note and attachment in the selection — which is why it is its own command.", defaultPrimary: "" },
   { id: "cutForOtherVault",  label: "Cut for another vault",          desc: "Cut the selected note(s) for a DIFFERENT vault. After the other vault confirms the paste, Stashpad offers to delete the originals here. Nothing is deleted until then.", defaultPrimary: "" },
   { id: "pasteNotes",      label: "Paste notes",                    desc: "Paste previously copied/cut notes at the cursor row (after it, same parent). Does nothing if the note clipboard is empty.", defaultPrimary: "Mod+V" },
+  { id: "attributeBot",    label: "Attribute to AI (bot author)",   desc: "Pick an AI (Claude, ChatGPT, …) and add it as a contributor on the selection (or cursor row). Add author attribution from the right-click menu. No default chord.", defaultPrimary: "" },
 ];
 
 export function buildDefaultBindings(): CommandBindingMap {
@@ -1156,6 +1158,9 @@ export interface StashpadSettings {
   /** 0.474.0: show a rail of "body slices" — each code block / table / callout in
    *  a note surfaced as an attachment-style chip you can pop out + copy. */
   bodySliceRail: boolean;
+  /** 0.503.0: wrap long lines in the body-slice preview modal (vs. horizontal
+   *  scroll). Default on; also toggleable live from the preview's action bar. */
+  bodySlicePreviewWrap: boolean;
   tidyTabsSchedule: "off" | "hourly" | "daily" | "weekly";
   /** Epoch ms of the last tidy run (manual OR scheduled); 0 = never run. Drives
    *  the catch-up-vs-wait decision for the schedule above. */
@@ -1501,6 +1506,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   draftAppendTargets: {},
   lastSubmitted: {},
   bodySliceRail: true,
+  bodySlicePreviewWrap: true,
   tidyTabsSchedule: "off",
   tidyTabsLastRun: 0,
   // 0.485.0: maintenance window. `always` + every sub-switch off === today's
@@ -4314,6 +4320,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.attachmentsEmbedded, (v) => { this.plugin.settings.attachmentsEmbedded = v; }, ["attachment", "embed", "link", "preview", "file"]));
     cats.attachmentsMedia.push(toggle("Code blocks, tables & callouts in the rail", "Surface each code block, table and callout in a note as its own chip in the rail — like an attachment. Tap a chip to pop the block out in a preview with a one-click Copy. On by default.",
       () => this.plugin.settings.bodySliceRail, (v) => { this.plugin.settings.bodySliceRail = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "code", "table", "callout", "slice", "block", "copy", "attachment"]));
+    cats.attachmentsMedia.push(toggle("Wrap long lines in the block preview", "When you pop out a code block, table or callout from the rail, wrap long lines to the window instead of scrolling sideways. On by default. You can also flip it from the preview itself, and the choice sticks.",
+      () => this.plugin.settings.bodySlicePreviewWrap, (v) => { this.plugin.settings.bodySlicePreviewWrap = v; }, ["rail", "code", "preview", "wrap", "line", "scroll", "slice", "block"]));
 
     cats.listDisplay.push(toggle("Show outgoing links in the rail", "List the notes this note links to, in a row under its files. Off by default: it earns its place on a hub note and is noise on everything else. Files are unaffected \u2014 they are always in the rail.",
       () => this.plugin.settings.railShowOutgoing, (v) => { this.plugin.settings.railShowOutgoing = v; this.plugin.refreshAllStashpadViews(); }, ["rail", "links", "outgoing", "backlinks"]));
@@ -5855,9 +5863,10 @@ export class StashpadSettingTab extends PluginSettingTab {
     for (const a of authors) {
       const row = list.createDiv({ cls: "stashpad-known-author-row" });
       const main = row.createDiv({ cls: "stashpad-known-author-main" });
-      main.createSpan({ cls: "stashpad-known-author-name", text: a.name || "(unnamed)" });
+      main.createSpan({ cls: "stashpad-known-author-name", text: `${a.bot ? "🤖 " : ""}${a.name || "(unnamed)"}` });
       const meta: string[] = [];
-      if (a.role) meta.push(a.role);
+      if (a.bot) meta.push("AI");
+      if (a.role && a.role !== "AI") meta.push(a.role);
       if (a.department) meta.push(a.department);
       meta.push(`id ${a.id}`);
       main.createSpan({ cls: "stashpad-known-author-meta", text: ` · ${meta.join(" · ")}` });

@@ -126,6 +126,102 @@ export class AuthorshipTracker {
     return { link, path, name, id };
   }
 
+  // --- 0.501.0: attribute a note to an AI bot author ---
+
+  /** The wikilink + stub path for a bot author in THIS view's folder,
+   *  shaped like currentAuthorLink but for an arbitrary {id,name}. */
+  private botAuthorLink(bot: { id: string; name: string }): { link: string; path: string; name: string; id: string } {
+    const name = bot.name.trim() || bot.id;
+    const safe = name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "bot";
+    const path = `${this.host.noteFolder}/_authors/${safe}-${bot.id}.md`;
+    const aliasSafe = name.replace(/[\[\]|]/g, "").trim() || safe;   // 0.77.11 escaping
+    return { link: `[[${path}|${aliasSafe}]]`, path, name, id: bot.id };
+  }
+
+  /** Ensure a bot's stub exists in this folder's _authors (with bot: true). */
+  private async ensureBotStub(link: { path: string; name: string; id: string }): Promise<void> {
+    try {
+      this.host.plugin.authorRegistry.record({ id: link.id, name: link.name, bot: true });
+      await this.host.ensureFolder(`${this.host.noteFolder}/_authors`);
+      if (await this.host.app.vault.adapter.exists(link.path)) return;
+      const content = this.host.plugin.buildAuthorStub(
+        { id: link.id, name: link.name, role: "AI", bot: true },
+        new Date().toISOString(),
+      );
+      await this.host.app.vault.create(link.path, content);
+    } catch (e) { console.warn("[Stashpad] ensureBotStub failed", link.path, e); }
+  }
+
+  /** Stamp `bot` onto `files` as a contributor (default) or the author.
+   *  Additive + Undo-backed. As author: an existing DIFFERENT author is moved
+   *  to contributors rather than lost. */
+  async attributeToBot(files: TFile[], bot: { id: string; name: string }, opts: { asAuthor: boolean }): Promise<void> {
+    if (!files.length) { notify("No notes selected."); return; }
+    const link = this.botAuthorLink(bot);
+    const idTag = `-${bot.id}`;
+    await this.ensureBotStub(link);
+
+    // Capture before-state for a faithful undo.
+    const before = new Map<string, { author: any; contributors: any }>();
+    for (const f of files) {
+      const fm = this.host.app.metadataCache.getFileCache(f)?.frontmatter as any;
+      before.set(f.path, {
+        author: fm?.author,
+        contributors: Array.isArray(fm?.contributors) ? [...fm.contributors] : fm?.contributors,
+      });
+    }
+
+    const paths = files.map((f) => f.path);
+    let changed = 0;
+    const apply = async () => {
+      changed = 0;
+      for (const p of paths) {
+        const f = this.host.app.vault.getAbstractFileByPath(p);
+        if (!(f instanceof TFile)) continue;
+        await this.host.app.fileManager.processFrontMatter(f, (m: any) => {
+          const contribs: string[] = Array.isArray(m.contributors)
+            ? m.contributors.filter((c: any) => typeof c === "string") : [];
+          if (opts.asAuthor) {
+            const cur = typeof m.author === "string" ? m.author : "";
+            if (cur.includes(idTag)) return;                 // already this bot
+            if (cur.trim()) { if (!contribs.some((c) => c === cur)) contribs.push(cur); } // demote prior author
+            m.author = link.link;
+            m.contributors = contribs.filter((c) => !c.includes(idTag));
+            if (!m.contributors.length) delete m.contributors;
+          } else {
+            if (typeof m.author === "string" && m.author.includes(idTag)) return; // already author
+            if (contribs.some((c) => c.includes(idTag))) return;                  // already contributor
+            contribs.push(link.link);
+            m.contributors = contribs;
+          }
+          changed++;
+        });
+      }
+    };
+    await apply();
+    if (!changed) { notify(`Already attributed to ${link.name}.`); return; }
+
+    this.host.plugin.getUndoStack(this.host.noteFolder).push({
+      label: `Attribute to ${link.name} (${changed} note${changed === 1 ? "" : "s"})`,
+      undo: async () => {
+        for (const [p, snap] of before) {
+          const f = this.host.app.vault.getAbstractFileByPath(p);
+          if (!(f instanceof TFile)) continue;
+          try {
+            await this.host.app.fileManager.processFrontMatter(f, (m: any) => {
+              if (snap.author === undefined) delete m.author; else m.author = snap.author;
+              if (snap.contributors === undefined) delete m.contributors; else m.contributors = snap.contributors;
+            });
+          } catch (e) { console.warn("[Stashpad] attributeToBot undo failed", p, e); }
+        }
+        this.host.debouncedRender();
+      },
+      redo: async () => { await apply(); this.host.debouncedRender(); },
+    });
+    notify(`Attributed ${changed} note${changed === 1 ? "" : "s"} to ${link.name} (${opts.asAuthor ? "author" : "contributor"}). Undo available.`);
+    this.host.debouncedRender();
+  }
+
   // --- 0.77.8: Claim authorship (retroactive stamping) ---
 
   /** Public entry points (called from main.ts command palette via the

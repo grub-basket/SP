@@ -6202,6 +6202,7 @@ export class PinAliasModal extends Modal {
 export class BodySliceModal extends Modal {
   constructor(
     app: App,
+    private plugin: StashpadPlugin,
     private sliceTitle: string,
     private buildInto: (host: HTMLElement) => void,
     private copyText: string | null,
@@ -6211,9 +6212,17 @@ export class BodySliceModal extends Modal {
     this.modalEl.addClass("stashpad-slice-modal");
     this.titleEl.setText(this.sliceTitle);
     const host = this.contentEl.createDiv({ cls: "stashpad-slice-body markdown-rendered" });
+    // 0.503.0: line wrapping, default on (setting-backed). `is-wrapped` switches
+    // the preview's <pre> from horizontal scroll to wrapping (see styles.css).
+    const applyWrap = (on: boolean): void => host.toggleClass("is-wrapped", on);
+    applyWrap(getSettings().bodySlicePreviewWrap);
     this.buildInto(host);
+
+    // 0.503.0: one action bar, left-aligned (styles.css). Copy on the left; the
+    // Wrap toggle next to it. The bar is shown even without copyText so the wrap
+    // control is always available for code previews.
+    const bar = this.contentEl.createDiv({ cls: "stashpad-slice-actions" });
     if (this.copyText != null && this.copyText.trim().length > 0) {
-      const bar = this.contentEl.createDiv({ cls: "stashpad-slice-actions" });
       const btn = bar.createEl("button", { cls: "mod-cta", text: "Copy" });
       btn.onclick = async (): Promise<void> => {
         try {
@@ -6223,6 +6232,20 @@ export class BodySliceModal extends Modal {
         } catch { notify("Couldn't copy."); }
       };
     }
+    const wrapBtn = bar.createEl("button", { cls: "stashpad-slice-wrap-toggle", text: "Wrap" });
+    const syncWrapBtn = (on: boolean): void => {
+      wrapBtn.toggleClass("is-active", on);
+      wrapBtn.setAttr("aria-pressed", on ? "true" : "false");
+      wrapBtn.setAttr("aria-label", on ? "Line wrapping on — click to turn off" : "Line wrapping off — click to turn on");
+    };
+    syncWrapBtn(getSettings().bodySlicePreviewWrap);
+    wrapBtn.onclick = async (): Promise<void> => {
+      const on = !getSettings().bodySlicePreviewWrap;
+      this.plugin.settings.bodySlicePreviewWrap = on;
+      applyWrap(on);
+      syncWrapBtn(on);
+      await this.plugin.saveSettings();
+    };
   }
 
   onClose(): void { this.contentEl.empty(); }

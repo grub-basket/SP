@@ -472,7 +472,28 @@ export class MarkdownInput {
 
     if (e.key in SIMPLE) {
       if (e.key === "[" && prev === "[" && v[start - 2] === "[") return; // 3rd bracket is literal
-      if (e.key === "`" && prev === "`") return;                          // ``` fences
+      if (e.key === "`" && prev === "`") {
+        // 0.497.0: the THIRD consecutive backtick opening a line completes a
+        // fenced code block — insert the closing ``` on its own line and drop
+        // the caret onto an empty line between them (VS Code / Obsidian
+        // convention). Gated tight so nothing else changes: only when the two
+        // ticks before the caret are the start of the line (whitespace-only
+        // lead) AND the caret is at end-of-line, so inline `` `code` `` and any
+        // mid-line/mid-run backticks stay literal (fall through to the return).
+        const thirdTick = v[start - 2] === "`";
+        const { start: ls } = this.lineBounds(start);
+        const lead = v.slice(ls, start - 2);        // text before the two ticks
+        const atLineEnd = next === undefined || next === "\n";
+        if (thirdTick && lead.trim() === "" && atLineEnd) {
+          e.preventDefault();
+          // third tick + newline + empty content line + newline + closing fence
+          // (closing fence matches the opener's indent). Caret lands at the
+          // start of the empty content line (start + "`\n".length).
+          this.splice(start, start, "`\n\n" + lead + "```", start + 2);
+          return;
+        }
+        return; // 2nd backtick, or a ``` not opening a line → literal
+      }
       // Quotes pair only at a WORD START, so apostrophes ("don't") and a
       // hand-typed closing quote insert plainly.
       if (QUOTE_OPENERS.has(e.key) && !(prev === undefined || /[\s([{"'‘“]/.test(prev))) return;

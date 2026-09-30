@@ -141,9 +141,28 @@ function takeCheckbox(s: string): { rest: string; task: "none" | "open" | "done"
  *  per line rather than making a single note with checkbox-looking text in it.
  *  Requires 2+ lines — a single "[ ] foo" is just one task and needs no splitting. */
 export function isAllCheckboxLines(text: string): boolean {
+  // 0.497.0: text containing a ``` fenced block is never a pure task list — the
+  // code is non-checkbox content — so don't let it trigger the all-checkbox split.
+  if (/^\s*```/m.test(text)) return false;
   const lines = text.replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "");
   if (lines.length < 2) return false;
   return lines.every((l) => isCheckboxLine(l));
+}
+
+/** 0.497.0: the non-blank lines that sit OUTSIDE fenced code blocks. The mixed-
+ *  checkbox detector scans these so a ``` block whose BODY happens to contain
+ *  "- [ ] …" (or any checkbox-looking line) is not mistaken for a task list and
+ *  split with the split toggle off — the bug where a large pasted code block
+ *  still got shredded into many notes. A `` ``` `` line toggles fence state. */
+function nonFencedLines(text: string): string[] {
+  const out: string[] = [];
+  let inFence = false;
+  for (const l of text.replace(/\r\n?/g, "\n").split("\n")) {
+    if (/^\s*```/.test(l)) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    if (l.trim() !== "") out.push(l);
+  }
+  return out;
 }
 
 /** True when a single line is a checkbox item ("- [ ] x", "[x] y", …). */
@@ -156,7 +175,7 @@ export function isCheckboxLine(line: string): boolean {
  *  excludes; the composer uses it to still peel the checkbox lines out into their
  *  own tasks while keeping the prose together. */
 export function hasMixedCheckboxLines(text: string): boolean {
-  const lines = text.replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "");
+  const lines = nonFencedLines(text); // 0.497.0: ``` code bodies don't count as checkbox/plain lines
   if (lines.length < 2) return false;
   let checks = 0, plain = 0;
   for (const l of lines) { if (isCheckboxLine(l)) checks++; else plain++; }
@@ -172,7 +191,12 @@ export function splitCheckboxAware(text: string): string[] {
   const chunks: string[] = [];
   let buf: string[] = [];
   const flush = (): void => { if (buf.length) { const j = buf.join("\n").trim(); if (j) chunks.push(j); buf = []; } };
+  let inFence = false;
   for (const line of lines) {
+    // 0.497.0: a ``` fenced block stays grouped with its surrounding prose run
+    // and is never peeled as a checkbox, even if its body contains "- [ ] …".
+    if (/^\s*```/.test(line)) { inFence = !inFence; buf.push(line); continue; }
+    if (inFence) { buf.push(line); continue; }
     if (line.trim() === "") continue;
     if (isCheckboxLine(line)) { flush(); chunks.push(line.trim()); }
     else buf.push(line);

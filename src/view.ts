@@ -89,6 +89,7 @@ import { fixDuplicatedEmphasisOpeners, straightenCurlyQuotes } from "./markdown-
 import { renderFormattingToolbar } from "./formatting-toolbar";
 import { clipboardToMarkdownTable } from "./excel-paste";
 import { richClipboardToMarkdown } from "./rich-paste";
+import type { BotDef } from "./bots";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -9424,7 +9425,7 @@ export class StashpadView extends ItemView {
         const clone = el.cloneNode(true) as HTMLElement;
         // Drop the code-block copy button from the clone — the modal has its own.
         clone.querySelectorAll(".copy-code-button").forEach((b) => b.remove());
-        new BodySliceModal(this.app, info.title, (host) => host.append(clone), info.copyText).open();
+        new BodySliceModal(this.app, this.plugin, info.title, (host) => host.append(clone), info.copyText).open();
       };
     });
   }
@@ -10698,6 +10699,7 @@ export class StashpadView extends ItemView {
     // jump-to-level (route) controls live here at the bottom-left of the
     // composer (moved out of the top toolbar / breadcrumb).
     if (Platform.isMobile) this.renderComposerNavCluster(btnRail);
+    this.renderComposerBotButton(btnRail); // 0.501.0: tag notes as AI-assisted
     // Mobile: secondary buttons (split/dest/enter/clip) live inside a
     // collapsible group. A chevron-left button at the head of the rail
     // toggles their visibility — collapsed at rest to keep the composer
@@ -11112,12 +11114,14 @@ export class StashpadView extends ItemView {
       if (split) {
         const lines = mixedChecks ? splitCheckboxAware(sendText) : splitIntoChunks(sendText, getSettings().splitMode);
         if (lines.length === 1) {
-          await this.createNoteUnder(lines[0], parent, createOpts);
+          const nid = await this.createNoteUnder(lines[0], parent, createOpts);
+          this.applyPendingBotToNoteId(nid);
         } else if (lines.length > 1) {
           await this.createNotesBatch(lines, parent, createOpts, sendText, remote ? destFolder : this.noteFolder);
         }
       } else {
-        await this.createNoteUnder(sendText, parent, createOpts);
+        const nid = await this.createNoteUnder(sendText, parent, createOpts);
+        this.applyPendingBotToNoteId(nid);
       }
       // 0.281.0 (teams): a reply is a one-shot — clear the reply target and its chip.
       if (this.replyTarget) { this.replyTarget = null; this.refreshReplyChip(); }
@@ -12620,6 +12624,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
       // 0.300.0: R replies to the cursor row; pressing R on another note switches the target.
       if (matchBinding(e, sb.reply)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdReply(); return; }
+      if (matchBinding(e, sb.attributeBot)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdAttributeBot(); return; }
     }
     // Jump to top/bottom: no selection required — only a non-empty list.
     if (this.currentChildren.length > 0) {
@@ -20681,6 +20686,49 @@ export class StashpadView extends ItemView {
 
   // --- Note creation ---
 
+  // ===== 0.501.0: attribute notes to AI bot authors =====
+  /** Sticky: when set (via the composer 🤖 button), each note sent from the
+   *  composer is stamped with this bot as a contributor. */
+  private pendingComposerBot: BotDef | null = null;
+  private composerBotBtn: HTMLElement | null = null;
+
+  /** Command / menu entry: pick a bot, stamp it onto the selected note(s). */
+  attributeSelectionToBot(asAuthor: boolean): void {
+    const files = this.getActionTargets().map((n) => n.file).filter((f): f is TFile => !!f);
+    if (!files.length) { new Notice("No notes selected."); return; }
+    this.plugin.pickBot((bot) => void this.authorship.attributeToBot(files, bot, { asAuthor }));
+  }
+  cmdAttributeBot(): void { this.attributeSelectionToBot(false); }
+
+  private renderComposerBotButton(rail: HTMLElement): void {
+    const btn = rail.createEl("button", { cls: "clickable-icon stashpad-composer-bot-btn" });
+    this.composerBotBtn = btn;
+    setIcon(btn, "bot");
+    btn.addEventListener("mousedown", (e) => e.preventDefault()); // don't blur the textarea
+    btn.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (this.pendingComposerBot) { this.pendingComposerBot = null; this.updateComposerBotButton(); return; }
+      this.plugin.pickBot((bot) => { this.pendingComposerBot = bot; this.updateComposerBotButton(); });
+    });
+    this.updateComposerBotButton();
+  }
+  private updateComposerBotButton(): void {
+    const btn = this.composerBotBtn; if (!btn) return;
+    const on = !!this.pendingComposerBot;
+    btn.toggleClass("is-active", on);
+    btn.setAttr("aria-label", on
+      ? `New notes tagged with 🤖 ${this.pendingComposerBot!.name} — click to stop`
+      : "Tag notes you write as AI-assisted");
+  }
+  /** After a composer send, stamp the pending bot onto the new note. The
+   *  metadata cache lags file creation, so fileByFrontmatterId is retried. */
+  private applyPendingBotToNoteId(id: StashpadId | null, attempt = 0): void {
+    if (!id || !this.pendingComposerBot) return;
+    const f = this.plugin.fileByFrontmatterId(this.noteFolder, id);
+    if (f) { void this.authorship.attributeToBot([f], this.pendingComposerBot, { asAuthor: false }); return; }
+    if (attempt < 4) window.setTimeout(() => this.applyPendingBotToNoteId(id, attempt + 1), 300);
+  }
+
   private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string; deferRender?: boolean; deferUndo?: boolean; replyTo?: { link: string; blurb: string }; collectInto?: Array<{ path: string; content: string }> } = { record: true }): Promise<StashpadId | null> {
     // 0.76.15: targetFolder lets the destination picker SHIP a note to
     // another Stashpad folder without switching this view there. When
@@ -22736,6 +22784,7 @@ export class StashpadView extends ItemView {
       case "setColor":         this.cmdSetColor(); break;
       case "blur":             void this.cmdToggleObscured(); break;
       case "setDue":           this.cmdSetDue(); break;
+      case "attributeBot":     this.attributeSelectionToBot(false); break;
       case "archive":          void this.cmdMoveToArchive(); break;
       case "largeText":        this.cmdRevealLargeText(node); break;
       case "edit":             void this.cmdEdit(node); break;
@@ -22993,6 +23042,18 @@ export class StashpadView extends ItemView {
       case "clone":        A("Clone (duplicate / copy)", this.actionIcon("clone"), () => { focusClicked(); void this.cmdClone(); }); break;
       case "fork":         A("Fork into a separate note…", this.actionIcon("fork"), () => { focusClicked(); this.cmdForkNote(); }); break;
       case "setDue":       A("Set due date…", this.actionIcon("setDue"), () => { focusClicked(); this.cmdSetDue(); }); break;
+      case "attributeBot":
+        menu.addItem((it: any) => {
+          it.setTitle("Attribute to AI…").setIcon(this.actionIcon("attributeBot") || "bot");
+          const sub = it.setSubmenu?.();
+          if (sub) {
+            sub.addItem((s: any) => s.setTitle("As contributor").setIcon("bot").onClick(() => { focusClicked(); this.attributeSelectionToBot(false); }));
+            sub.addItem((s: any) => s.setTitle("As author").setIcon("user-pen").onClick(() => { focusClicked(); this.attributeSelectionToBot(true); }));
+          } else {
+            it.onClick(() => { focusClicked(); this.attributeSelectionToBot(false); });
+          }
+        });
+        break;
       case "largeText":    A("Reveal in large text", this.actionIcon("largeText"), () => this.cmdRevealLargeText(node)); break;
       case "archive":      A("Move to archive", this.actionIcon("archive"), () => { focusClicked(); void this.cmdMoveToArchive(); }); break;
       case "moveInList":   A("Move in list", this.actionIcon("moveInList"), () => { focusClicked(); this.cmdInListPicker(); }); break;

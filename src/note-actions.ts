@@ -32,6 +32,7 @@ export const NOTE_ACTION_CATALOG: readonly NoteActionDef[] = [
   { id: "reply",            label: "Reply",                         icon: "reply",              button: true,  group: "Compose" },
   { id: "replyLink",        label: "Make a reply to…",              icon: "corner-up-left",                    group: "Compose" },
   { id: "react",            label: "React…",                        icon: "smile-plus",         button: true,  group: "Compose" },
+  { id: "attributeBot",     label: "Attribute to AI…",              icon: "bot",                               group: "Compose" },
   { id: "split",            label: "Split note…",                   icon: "split",              button: true,  group: "Compose" },
   { id: "fork",             label: "Fork into a separate note…",    icon: "git-branch",                        group: "Compose" },
   // Copy
@@ -93,7 +94,7 @@ export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
   // a common action the user didn't want to scroll for). Default order only;
   // existing users keep their saved contextMenuOrder.
   "submenu:move",
-  "submenu:reactreply", "recurrenceSkip",
+  "submenu:reactreply", "recurrenceSkip", "attributeBot",
   // 0.357.0: clone + fork relocated INTO the "Copy ▸" submenu (view.ts, the
   // `copy` case of renderCtxLeaf) — they no longer sit at the top level in the
   // default order. Their catalog leaves survive, so a user who had reordered
@@ -140,7 +141,7 @@ const BY_ID = new Map<string, NoteActionDef>(
  *  above + a few catalog actions not in the default order. */
 export const CONTEXT_LEAF_IDS: readonly string[] = [
   "edit", "focus", "openNewTab", "openObsidian",
-  "react", "reply", "replyLink", "split",
+  "react", "reply", "replyLink", "split", "attributeBot",
   "copy", "clone", "fork", "setColor", "move", "moveHome", "outdent", "setDue", "largeText", "archive", "pinSidebar",
   ...CONTEXT_EXTRA_ACTIONS.map((a) => a.id),
 ];
