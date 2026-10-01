@@ -1,6 +1,7 @@
 import { App, Menu } from "obsidian";
 import { setIconSafe } from "./view-helpers";
 import { type Snippet, expandSnippet } from "./snippets";
+import { MultiInsert } from "./multi-insert";
 
 /** 0.336.0: the composer/edit-modal formatting toolbar, shared so every textarea
  *  surface gets the same buttons. Buttons wrap the selection (or insert at the
@@ -173,7 +174,7 @@ export interface ToolbarBuiltin {
   glyph: string;
   title: string;
   cls?: string;
-  gate?: "spoilers" | "drafts" | "checkDup";
+  gate?: "spoilers" | "drafts" | "checkDup" | "multiInsert";
   run?: (ta: HTMLTextAreaElement) => void;
   menu?: (e: MouseEvent, getTa: () => HTMLTextAreaElement | null) => void;
 }
@@ -214,6 +215,10 @@ export const TOOLBAR_BUILTINS: ToolbarBuiltin[] = [
   // 0.506.0: composer-only manual duplicate check (gated on opts.checkDup). Loads
   // the current draft into search so you can eyeball whether the note already exists.
   { id: "checkDup", icon: "search-check", glyph: "🔍", title: "Check for duplicate notes (search with this draft)", cls: "stashpad-toolbar-checkdup", gate: "checkDup" },
+  // 0.510.0: insert the same text at several points at once. Gated on
+  // opts.multiInsert (composer + edit modal). No `run` — wired specially in the
+  // renderer, since it drives a stateful MultiInsert session on the textarea.
+  { id: "multiInsert", icon: "text-cursor-input", glyph: "⌖", title: "Insert text at multiple points", cls: "stashpad-toolbar-multiinsert", gate: "multiInsert" },
 ];
 
 /** 0.351.0: resolve the effective built-in button list from a saved config —
@@ -263,6 +268,10 @@ export interface FormattingToolbarOpts {
    *  builtin). Absent in the edit modal, so the button never shows there. Clicking
    *  it loads the current draft into search. */
   checkDup?: () => void;
+  /** 0.510.0: enables the "Insert at multiple points" button (gated builtin).
+   *  Set on the composer + edit-modal toolbars. The button drives a MultiInsert
+   *  session on the current textarea. */
+  multiInsert?: boolean;
 }
 
 /** Render the toolbar into `host`, acting on the textarea returned by `getTa`.
@@ -307,6 +316,7 @@ export function renderFormattingToolbar(
     if (def.gate === "spoilers" && !opts.spoilers) continue;
     if (def.gate === "drafts" && !opts.drafts) continue;
     if (def.gate === "checkDup" && !opts.checkDup) continue;
+    if (def.gate === "multiInsert" && !opts.multiInsert) continue;
     const cls = "stashpad-composer-toolbar-btn" + (def.cls ? " " + def.cls : "");
     const b = bar.createEl("button", { cls, attr: { "aria-label": def.title, tabindex: "-1" } });
     setIconSafe(b, icon, def.glyph);
@@ -328,6 +338,16 @@ export function renderFormattingToolbar(
     if (def.gate === "checkDup" && opts.checkDup) {
       const run = opts.checkDup;
       b.onclick = (e) => { e.preventDefault(); run(); };
+      continue;
+    }
+    if (def.gate === "multiInsert" && opts.multiInsert) {
+      b.onclick = (e) => {
+        e.preventDefault();
+        const ta = getTa();
+        if (!ta) return;
+        ta.focus();
+        MultiInsert.toggle(ta, (active) => b.toggleClass("is-active", active));
+      };
       continue;
     }
     b.onclick = (e) => {

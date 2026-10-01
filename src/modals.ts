@@ -530,6 +530,11 @@ export interface WorkbenchState {
   nest: boolean;
   cursorText: string;
   lineCursorIdx: number;
+  /** 0.509.0: multi-marker line split — every split point (each = "split BEFORE
+   *  this line index", 1..lines-1). The line surface draws a divider at each and
+   *  carves the note into N segments. `lineCursorIdx` stays the "active" marker
+   *  that ↑/↓ nudges. Round-tripped through pop-out so markers survive the hop. */
+  splitLines?: number[];
   /** 0.317.1: an UNSAVED reply-link change on the edit surface (null = remove
    *  the link; absent = untouched). Carried across pop-out; written on Save. */
   pendingReply?: WorkbenchReplyTarget | null;
@@ -597,6 +602,9 @@ function applyCase(s: string, form: "lower" | "upper" | "title" | "sentence"): s
 export class NoteWorkbench {
   private lines: string[];
   private lineCursorIdx: number;
+  /** 0.509.0: the full set of line-split markers (see WorkbenchState.splitLines).
+   *  `lineCursorIdx` is always a member and marks the active (arrow-nudged) one. */
+  private splitLines = new Set<number>();
   private surface: "edit" | "split" = "split";
   private mode: "line" | "cursor" | "preset" | "custom" = "line";
   private presetMode: SplitMode = "paragraphs";
@@ -630,6 +638,18 @@ export class NoteWorkbench {
     this.collapsed = { orig: Platform.isMobile, changes: Platform.isMobile, edit: false };
     this.lines = body.replace(/\r\n/g, "\n").split("\n");
     this.lineCursorIdx = init.lineCursorIdx ?? Math.max(1, Math.min(this.lines.length - 1, Math.floor(this.lines.length / 2)));
+    // 0.509.0: seed the multi-marker set from a popped-out state if present, else
+    // the single default divider. Only meaningful when there are ≥2 lines (the
+    // line surface is hidden otherwise).
+    if (this.lines.length >= 2) {
+      const seed = init.splitLines?.length ? init.splitLines : [this.lineCursorIdx];
+      for (const n of seed) {
+        const c = Math.max(1, Math.min(this.lines.length - 1, Math.round(n)));
+        if (Number.isFinite(c)) this.splitLines.add(c);
+      }
+      if (this.splitLines.size === 0) this.splitLines.add(this.lineCursorIdx);
+      if (!this.splitLines.has(this.lineCursorIdx)) this.lineCursorIdx = Math.min(...this.splitLines);
+    }
     if (init.mode) this.mode = init.mode;
     else if (this.lines.length < 2) this.mode = "cursor"; // single-line → cursor only
     if (init.presetMode) this.presetMode = init.presetMode;
@@ -666,6 +686,7 @@ export class NoteWorkbench {
       mode: this.mode, presetMode: this.presetMode, nest: this.nest,
       cursorText: this.cursorTextarea?.value ?? this.cursorText,
       lineCursorIdx: this.lineCursorIdx,
+      splitLines: [...this.splitLines].sort((a, b) => a - b),
       ...(this.pendingReply !== undefined ? { pendingReply: this.pendingReply } : {}),
     };
   }
@@ -712,6 +733,7 @@ export class NoteWorkbench {
         app: this.app,
         snippets: getSettings().snippets,
         toolbarButtons: getSettings().toolbarButtons,
+        multiInsert: true, // 0.510.0: insert text at multiple points
         titleFor: () => (this.cursorTextarea?.value ?? this.body).split(/\r?\n/).find((l) => l.trim())?.trim(),
       });
       host.insertBefore(bar, anchor);
@@ -954,13 +976,39 @@ export class NoteWorkbench {
   moveDivider(delta: number): boolean {
     if (this.surface !== "split") return false;
     if (this.mode !== "line") return false;
-    this.lineCursorIdx = Math.max(1, Math.min(this.lines.length - 1, this.lineCursorIdx + delta));
+    // 0.509.0: ↑/↓ nudge the ACTIVE marker; the other markers stay put. Refuse to
+    // step onto a line that already holds a marker (it would silently merge two).
+    const next = Math.max(1, Math.min(this.lines.length - 1, this.lineCursorIdx + delta));
+    if (next === this.lineCursorIdx) return true;
+    if (this.splitLines.has(next)) return true;
+    this.splitLines.delete(this.lineCursorIdx);
+    this.splitLines.add(next);
+    this.lineCursorIdx = next;
     this.render();
     return true;
   }
 
+  /** 0.509.0: the body carved into segments by the current markers. Each segment
+   *  is the run of lines between two adjacent markers (0 and lines.length cap the
+   *  ends); trimmed, empties dropped. */
+  private lineSegments(): string[] {
+    const cuts = [...this.splitLines]
+      .filter((n) => n >= 1 && n <= this.lines.length - 1)
+      .sort((a, b) => a - b);
+    const bounds = [0, ...cuts, this.lines.length];
+    const segs: string[] = [];
+    for (let i = 0; i < bounds.length - 1; i++) {
+      segs.push(this.lines.slice(bounds[i], bounds[i + 1]).join("\n").replace(/^\s+|\s+$/g, ""));
+    }
+    return segs.filter((s) => s.trim().length > 0);
+  }
+
   private async commitLine(): Promise<void> {
-    await this.cb.onSplitAtLine(this.lineCursorIdx, this.nest);
+    // 0.509.0: every marker is honored at once — the segments route through the
+    // one onSplitMany path, so nest applies per-segment exactly like preset/custom.
+    const segs = this.lineSegments();
+    if (segs.length < 2) { notify("Mark at least one split line to divide the note."); return; }
+    await this.cb.onSplitMany(segs, this.nest);
     this.cb.onDone();
   }
 
@@ -1309,13 +1357,17 @@ export class NoteWorkbench {
       // false-button by the ×; Tab now just cycles focus). Nest phrased by result.
       if (Platform.isPhone) { help.setCssStyles({ display: "none" }); return; }
       help.setCssStyles({ display: "" });
-      const nest1 = this.nest ? "New part nested under the original." : "New part added as a sibling.";
-      const nestN = this.nest ? "New parts nested under the original." : "New parts added as siblings.";
+      // 0.509.0: nest now DECOMPOSES each part — its first line becomes the note,
+      // its other lines become that note's children (never pulling in the next
+      // part). Same phrasing for a single cut or many.
+      const nest = this.nest
+        ? "Each part's first line becomes a note; its other lines nest beneath it."
+        : "Each part becomes one note.";
       const confirm = "⌘/Ctrl+Enter or Split to confirm";
       help.setText(
-        this.mode === "line" ? `↑/↓ or click to pick the split line  ·  ${confirm}  ·  ${nest1}`
-        : this.mode === "cursor" ? `Click or arrow to position the cursor  ·  ${confirm}  ·  ${nest1}`
-        : `Preview of the resulting parts  ·  ${confirm}  ·  ${nestN}`);
+        this.mode === "line" ? `Click lines to add/remove split points (${this.splitLines.size})  ·  ↑/↓ nudge the last  ·  ${confirm}  ·  ${nest}`
+        : this.mode === "cursor" ? `Click or arrow to position the cursor  ·  ${confirm}  ·  ${nest}`
+        : `Preview of the resulting parts  ·  ${confirm}  ·  ${nest}`);
     };
     setHelp();
 
@@ -1337,15 +1389,17 @@ export class NoteWorkbench {
     const nestWrap = right.createEl("label", { cls: "stashpad-split-nest" });
     const nestCb = nestWrap.createEl("input", { type: "checkbox" });
     nestCb.checked = this.nest;
-    nestWrap.createSpan({ text: "Nest under original" });
+    nestWrap.createSpan({ text: "Nest lines under each part" });
+    nestWrap.setAttr("aria-label", "Nest lines under each part: each part's first line becomes a note and its remaining lines become that note's children");
     // Update just the help line — a full re-render would drop the cursor caret.
     nestCb.onchange = () => { this.nest = nestCb.checked; setHelp(); };
 
     const splitCount = this.mode === "preset" ? splitIntoChunks(this.body, this.presetMode).length
-      : this.mode === "custom" ? splitByDelimiter(this.body, this.customDelimiter, this.customRemove).length : 0;
+      : this.mode === "custom" ? splitByDelimiter(this.body, this.customDelimiter, this.customRemove).length
+      : this.mode === "line" ? this.lineSegments().length : 0;
     const splitBtn = right.createEl("button", { cls: "stashpad-split-confirm-btn mod-cta" });
     setIcon(splitBtn.createSpan({ cls: "stashpad-split-btn-icon" }), "split");
-    splitBtn.createSpan({ text: (this.mode === "preset" || this.mode === "custom") && splitCount >= 2 ? `Split into ${splitCount}` : "Split" });
+    splitBtn.createSpan({ text: (this.mode === "preset" || this.mode === "custom" || this.mode === "line") && splitCount >= 2 ? `Split into ${splitCount}` : "Split" });
     splitBtn.onmousedown = (e) => e.preventDefault(); // don't blur the textarea
     splitBtn.onclick = () => this.commit();
   }
@@ -1408,29 +1462,46 @@ export class NoteWorkbench {
 
   private renderLineMode(): void {
     const list = this.host.createDiv({ cls: "stashpad-split-list" });
-    let divider: HTMLElement | null = null;
+    let activeDivider: HTMLElement | null = null;
     for (let i = 0; i < this.lines.length; i++) {
-      if (i === this.lineCursorIdx) {
-        divider = list.createDiv({ cls: "stashpad-split-divider", text: "── split here ──" });
+      // 0.509.0: a divider is drawn BEFORE every line that holds a marker (a
+      // marker "splits before line i"). Any number of markers can be set at once.
+      if (this.splitLines.has(i)) {
+        const d = list.createDiv({ cls: "stashpad-split-divider", text: "── split here ──" });
+        const isActive = i === this.lineCursorIdx;
+        d.toggleClass("is-active", isActive);
+        if (isActive) activeDivider = d;
+        d.setAttr("aria-label", "Remove this split point");
+        // Click a divider to clear just that split point.
+        d.onclick = (e) => {
+          e.stopPropagation();
+          this.splitLines.delete(i);
+          if (this.lineCursorIdx === i && this.splitLines.size) this.lineCursorIdx = Math.min(...this.splitLines);
+          this.render();
+        };
       }
       const ln = list.createDiv({ cls: "stashpad-split-line" });
       ln.createSpan({ cls: "stashpad-split-lineno", text: String(i + 1) });
       ln.createSpan({ cls: "stashpad-split-text", text: this.lines[i] || " " });
-      // Tap-to-position: clicking a line puts the divider BELOW it — the
-      // clicked line ends the first part, so the second part starts at the
-      // next line (i + 1). Nicer than only arrows on desktop, and the natural
-      // reading on mobile ("split after this line").
+      // Tap-to-toggle: clicking a line toggles a marker BELOW it — the clicked
+      // line ends a segment, so the next one starts at the following line (i + 1).
+      // Clicking again removes it. Natural reading: "split after this line".
       ln.onclick = () => {
-        const target = Math.max(1, Math.min(this.lines.length - 1, i + 1));
-        if (target === this.lineCursorIdx) return;
-        this.lineCursorIdx = target;
+        const target = i + 1;
+        if (target < 1 || target > this.lines.length - 1) return; // can't split after the last line
+        if (this.splitLines.has(target)) {
+          this.splitLines.delete(target);
+          if (this.lineCursorIdx === target && this.splitLines.size) this.lineCursorIdx = Math.min(...this.splitLines);
+        } else {
+          this.splitLines.add(target);
+          this.lineCursorIdx = target; // the just-added marker becomes the active one
+        }
         this.render();
       };
     }
-    // Center the divider in the list after a (re)render so you see context both
-    // above AND below the split point — and so moving it with ↑/↓ or a click
-    // doesn't snap scroll to the top and push the divider off-screen.
-    if (divider) window.requestAnimationFrame(() => divider.scrollIntoView({ block: "center" }));
+    // Center the active divider after a (re)render so you keep context both above
+    // AND below it — and so nudging it with ↑/↓ doesn't snap it off-screen.
+    if (activeDivider) window.requestAnimationFrame(() => activeDivider.scrollIntoView({ block: "center" }));
   }
 
   /** 0.168.2: a framed section with a tucked header that is itself the

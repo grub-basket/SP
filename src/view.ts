@@ -8509,6 +8509,7 @@ export class StashpadView extends ItemView {
       app: this.app,
       snippets: getSettings().snippets,
       toolbarButtons: getSettings().toolbarButtons,
+      multiInsert: true, // 0.510.0: insert text at multiple points
       // 0.397.0: composer-only Drafts button (edit modal passes no `drafts`).
       drafts: {
         active: () => getSettings().draftsSurfacedFolders?.includes(this.noteFolder) ?? false,
@@ -20350,7 +20351,7 @@ export class StashpadView extends ItemView {
     // block — there is no separate title element — so repaintRowBody already
     // refreshes the visible title. What it cannot fix is the row's POSITION, hence
     // the fall-backs below. Note `performEdit` never creates a note (the split
-    // paths are performSplit / createNoteUnder, which keep rebuild + render), and
+    // paths are performMultiSplit / createNoteUnder, which keep rebuild + render), and
     // it preserves frontmatter verbatim, so completion/task state — and therefore
     // `hideCompletedNotes` visibility — cannot change here.
     const firstLine = (s: string): string => (s.split(/\r?\n/).find((l) => l.trim().length > 0) ?? "").trim();
@@ -20416,131 +20417,87 @@ export class StashpadView extends ItemView {
     const originalId = target.id;
     // 0.170.0 / 0.319.0: Edit-surface Save → the shared writeEditedBody chokepoint.
     const performEdit = (newBody: string): Promise<boolean> => this.writeEditedBody(target, md, newBody);
-    const performSplit = async (firstBody: string, secondBody: string, payload: Record<string, unknown>, nest = false) => {
-      if (!firstBody.trim() || !secondBody.trim()) { notify("Split would leave one part empty."); return; }
-      try {
-        const split = this.splitFrontmatterForWrite(md, originalPath);
-      if (!split) return;   // truncated frontmatter — refuse rather than orphan the note
-      const fm = split.fm;
-        const newOriginal = fm + (fm ? "\n" : "") + firstBody + "\n";
-        await this.app.vault.modify(file, newOriginal);
-        // 0.168.3: nest → the new part becomes a CHILD of the original; otherwise a sibling.
-        const parentId = nest ? target.id : (target.parent ?? ROOT_ID);
-        // Don't record the createNoteUnder action — the split itself
-        // becomes one combined undo entry. Inherit the source note's
-        // `created` time PLUS 1 ms so the second half sorts immediately
-        // after the first half (instead of either jumping to the end
-        // or tying for the same instant). ISO-8601 carries millisecond
-        // precision so this round-trips cleanly.
-        const baseTime = Date.parse(target.created || "");
-        const inheritedCreated = Number.isFinite(baseTime)
-          ? new Date(baseTime + 1).toISOString()
-          : new Date().toISOString();
-        const newId = await this.createNoteUnder(secondBody, parentId, {
-          record: false,
-          createdOverride: inheritedCreated,
-        });
-        await this.log.append({
-          type: "rename", id: target.id,
-          payload: { action: "split", into: newId, ...payload },
-        });
-        this.tree.rebuild(this.noteFolder);
-        this.render();
-        // 0.76.21: keep focus in the list, not the composer. Splitting
-        // closes a modal which re-activates the leaf and (via
-        // focusComposer) used to pull focus into the composer even
-        // with autofocus-after-send OFF. Suppress that activation
-        // focus briefly and land on the list instead.
-        this.suppressComposerFocusUntil = Date.now() + 500;
-        this.viewRoot?.focus({ preventScroll: true });
-        this.plugin.notifications.show({
-          message: `Split "${this.titleForNode(target)}" into two`,
-          kind: "success",
-          category: "split",
-          affectedIds: [target.id],
-          folder: this.noteFolder,
-        });
-
-        // Find the new note's path so undo/redo can locate it.
-        const newNode = newId ? this.tree.get(newId) : undefined;
-        const newPath = newNode?.file?.path;
-        const newContentForRedo = newPath ? await this.app.vault.read(newNode.file!) : null;
-
-        const folder = this.noteFolder;
-        this.plugin.getUndoStack(folder).push({
-          label: "Split note",
-          undo: async () => {
-            // Trash the new note, restore the original's full body.
-            // 0.211.4 (H6): resolve the original FIRST and bail if it's gone. Undo is
-            // only safe as a pair — trashing the split-off half without restoring the
-            // original's full body destroys part two outright. Both lookups go through
-            // fileForNote so an auto-reslug rename since the split doesn't strand them.
-            const of = this.fileForNote(originalId, originalPath);
-            if (!of) { notify("Can't undo the split — the original note was moved or deleted. The split-off note was left in place."); return; }
-            if (newPath) {
-              const nf = this.fileForNote(newId, newPath);
-              if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
-            }
-            await this.app.vault.modify(of, originalContent);
-            this.tree.rebuild(folder);
-            this.render();
-          },
-          redo: async () => {
-            const of = this.fileForNote(originalId, originalPath);
-            if (of) await this.app.vault.modify(of, newOriginal);
-            // 0.211.6 (L4): a path check alone isn't enough. The split-off note
-            // reslugs when its first line changes, so it can be alive at a DIFFERENT
-            // path — the path lookup then misses and redo creates a second file
-            // carrying the same id. restoreSnapshots already guards this way; match
-            // it. Recreate only when the id is genuinely absent from the tree.
-            if (newPath && newContentForRedo
-              && !(newId && this.tree.get(newId))
-              && !(await this.app.vault.adapter.exists(newPath))) {
-              await this.app.vault.create(newPath, newContentForRedo);
-            }
-            this.tree.rebuild(folder);
-            this.render();
-          },
-        });
-      } catch (e) {
-        notify(`Stashpad: split failed (${(e as Error).message})`);
-        console.error(e);
-      }
-    };
-
-    // Multi-split: the original keeps part 1; parts 2..N become new siblings
-    // (in order, via incrementing createdOverride). One bulk-render window + one
-    // grouped undo, same as the composer batch.
+    // 0.509.0: the single split engine for every mode (line / cursor / preset /
+    // custom), each of which hands this an ordered list of PART strings.
+    //
+    //  • Part 1 always reuses the ORIGINAL note (its body is rewritten in place),
+    //    so splitting into N parts leaves N top-level notes — the original plus
+    //    N-1 new siblings — never an empty husk.
+    //  • Parts 2..N become new SIBLINGS of the original (under the original's own
+    //    parent), in order, via an incrementing createdOverride.
+    //  • nest ON with 3+ parts → each part is DECOMPOSED: its first line becomes
+    //    the note and its remaining lines become that note's children (fence-aware,
+    //    blank lines dropped — same `splitIntoChunks(_, "lines")` rule the preview
+    //    uses). The children of part K never bleed into part K+1. Parts 2..N are
+    //    siblings of the original.
+    //  • nest ON with just ONE split (exactly 2 parts) → the ORIGINAL "nest under
+    //    the previous part" behavior: part 1 stays whole as the original and part 2
+    //    becomes a single child of it (neither part decomposed). This is the
+    //    fallback the user asked for so a single split behaves as it did before the
+    //    multi-marker rework.
+    //  • nest OFF → each part stays one note (its full body intact), as siblings.
+    //
+    // One bulk-render window + one grouped undo for the whole operation.
     const performMultiSplit = async (parts: string[], nest = false): Promise<void> => {
       if (parts.length < 2) return;
       try {
         const split = this.splitFrontmatterForWrite(md, originalPath);
       if (!split) return;   // truncated frontmatter — refuse rather than orphan the note
       const fm = split.fm;
-        const firstBody = parts[0].replace(/\s+$/, "");
+        // Decompose a part into first-line-parent + children-lines ONLY for a
+        // multi-part nested split. A single nested split (2 parts) and every
+        // non-nested split keep each part whole (one chunk).
+        const decompose = nest && parts.length >= 3;
+        // A single nested split nests part 2 UNDER the original (old behavior);
+        // every other case places parts 2..N as siblings of the original.
+        const singleNest = nest && parts.length === 2;
+        const chunksOf = (seg: string): string[] =>
+          decompose ? splitIntoChunks(seg, "lines") : [seg.replace(/\s+$/, "")].filter((s) => s.trim());
+        const firstChunks = chunksOf(parts[0]);
+        const firstBody = (firstChunks[0] ?? "").replace(/\s+$/, "");
         if (!firstBody.trim()) { notify("Split would leave the first part empty."); return; }
         const newOriginal = fm + (fm ? "\n" : "") + firstBody + "\n";
         await this.app.vault.modify(file, newOriginal);
-        // 0.168.3: nest → parts 2..N become CHILDREN of the original; else siblings.
-        const parentId = nest ? target.id : (target.parent ?? ROOT_ID);
+        // Where parts 2..N go: under the original for a single nested split, else
+        // as siblings (under the original's own parent).
+        const siblingParent = target.parent ?? ROOT_ID;
+        const partParentId = singleNest ? target.id : siblingParent;
         const baseTime = Date.parse(target.created || "");
         const base = Number.isFinite(baseTime) ? baseTime : Date.now();
+        // One monotonic clock for every created note so siblings sort in part
+        // order and a part's children sort in line order (createdOverride drives
+        // the sort; only RELATIVE order within a sibling group matters).
+        let seq = 0;
+        const stamp = (): string => new Date(base + (++seq)).toISOString();
         const collected: Array<{ path: string; content: string }> = [];
         this.beginBulkRender();
         try {
-          for (let i = 1; i < parts.length; i++) {
-            await this.createNoteUnder(parts[i], parentId, {
-              record: false,
-              createdOverride: new Date(base + i).toISOString(),
-              deferRender: true,
-              collectInto: collected,
+          // Part 1's extra lines become children of the ORIGINAL note.
+          for (let j = 1; j < firstChunks.length; j++) {
+            await this.createNoteUnder(firstChunks[j], target.id, {
+              record: false, createdOverride: stamp(), deferRender: true, collectInto: collected,
             });
+          }
+          // Parts 2..N: a new sibling note per part, then its own children.
+          for (let i = 1; i < parts.length; i++) {
+            const chunks = chunksOf(parts[i]);
+            const head = (chunks[0] ?? "").trim();
+            if (!head) continue; // an all-whitespace part contributes nothing
+            const partParent = await this.createNoteUnder(chunks[0], partParentId, {
+              record: false, createdOverride: stamp(), deferRender: true, collectInto: collected,
+            });
+            if (!partParent) continue; // creation failed — don't orphan its children under root
+            for (let j = 1; j < chunks.length; j++) {
+              await this.createNoteUnder(chunks[j], partParent, {
+                record: false, createdOverride: stamp(), deferRender: true, collectInto: collected,
+              });
+            }
           }
         } finally {
           try { await this.fmSync.flush(); } catch { /* best effort */ }
           this.endBulkRender();
         }
-        await this.log.append({ type: "rename", id: target.id, payload: { action: "split-many", parts: parts.length } });
+        await this.log.append({ type: "rename", id: target.id, payload: { action: "split-many", parts: parts.length, nest, created: collected.length } });
         this.suppressComposerFocusUntil = Date.now() + 500;
         this.viewRoot?.focus({ preventScroll: true });
         this.plugin.notifications.show({
@@ -20593,17 +20550,21 @@ export class StashpadView extends ItemView {
     let currentColor: string | null = this.colorForNode(target) ?? null;
     // 0.169.0: the split handlers, shared by the modal AND the popped-out tab.
     const splitCore = {
+      // 0.509.0: a single-divider line split is just a 2-part split — route it
+      // through the one engine so nesting behaves the same as a multi-marker
+      // split. (The line surface normally calls onSplitMany directly with every
+      // segment; this stays for any single-cut caller / the popped-out tab.)
       onSplitAtLine: async (lineIdx: number, nest: boolean) => {
         const firstBody = lines.slice(0, lineIdx).join("\n").replace(/\s+$/, "");
         const secondBody = lines.slice(lineIdx).join("\n").replace(/^\s+|\s+$/g, "");
-        await performSplit(firstBody, secondBody, { mode: "line", splitAtLine: lineIdx, nest }, nest);
+        await performMultiSplit([firstBody, secondBody], nest);
       },
       onSplitAtChar: async (text: string, charIdx: number, nest: boolean) => {
         // 0.168.0: split the (possibly edited) text from the modal, not the
         // original body — so edits made in the cursor textarea are honored.
         const firstBody = text.slice(0, charIdx).replace(/\s+$/, "");
         const secondBody = text.slice(charIdx).replace(/^\s+|\s+$/g, "");
-        await performSplit(firstBody, secondBody, { mode: "cursor", splitAtChar: charIdx, edited: text !== body, nest }, nest);
+        await performMultiSplit([firstBody, secondBody], nest);
       },
       onSplitMany: async (parts: string[], nest: boolean) => { await performMultiSplit(parts, nest); },
       // 0.317.1: the body write first; the surface's pending reply-link change
