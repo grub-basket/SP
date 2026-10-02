@@ -437,6 +437,31 @@ export class MarkdownInput {
       const closer = e.key.length === 1 ? (isSpoilerWrap ? "|" : WRAP[e.key]) : undefined;
       if (!closer || (!isSpoilerWrap && !allowed(e.key))) return;
       e.preventDefault();
+      // 0.515.0: the THIRD backtick on a selection makes a fenced code block,
+      // not ```inline```. The first two wraps went `sel` → ``sel``; this one
+      // swaps those for an opening fence, the text, and a closing fence, each
+      // on its own line (breaking the surrounding line if needed). Caret lands
+      // after the opening ``` so a language can be typed straight away.
+      if (e.key === "`" && v.slice(start - 2, start) === "``" && v.slice(end, end + 2) === "``"
+          && v[start - 3] !== "`" && v[end + 2] !== "`") {
+        let outerStart = start - 2;
+        let outerEnd = end + 2;
+        const { start: ls } = this.lineBounds(outerStart);
+        const prefix = v.slice(ls, outerStart);
+        const atLineStart = prefix.trim() === "";
+        // Fences and the first code line keep the opener's indent (list items).
+        const lead = atLineStart ? prefix : "";
+        // Breaking mid-line: drop the spaces at the break so neither the line
+        // before nor the text after is left with stray edge whitespace.
+        if (!atLineStart) while (outerStart > ls && /[ \t]/.test(v[outerStart - 1])) outerStart--;
+        while (/[ \t]/.test(v[outerEnd] ?? "")) outerEnd++;
+        const before = atLineStart ? "" : "\n";
+        const after = v[outerEnd] === undefined || v[outerEnd] === "\n" ? "" : "\n";
+        const body = v.slice(start, end).replace(/\n$/, "");
+        const caret = outerStart + before.length + 3;
+        this.splice(outerStart, outerEnd, `${before}\`\`\`\n${lead}${body}\n${lead}\`\`\`${after}`, caret, caret);
+        return;
+      }
       this.splice(start, end, e.key + v.slice(start, end) + closer, start + 1, end + 1);
       return;
     }

@@ -1566,7 +1566,6 @@ export class MediaViewerModal extends Modal {
     const pts = new Map<number, { x: number; y: number; t: number }>();
     let panning = false;
     let startX = 0, startY = 0, startTx = 0, startTy = 0;
-    let moved = 0;
     // Pinch state, captured when the second pointer lands.
     let pinchDist0 = 0;
     let pinchScale0 = 1;
@@ -1648,7 +1647,6 @@ export class MediaViewerModal extends Modal {
       pts.set(e.pointerId, stagePoint(e));
       if (pts.size >= 2) { beginPinch(); capture(e.pointerId); return; }
       panning = true;
-      moved = 0;
       startX = e.clientX; startY = e.clientY;
       startTx = this.tx; startTy = this.ty;
       stage.addClass("is-panning");
@@ -1680,7 +1678,6 @@ export class MediaViewerModal extends Modal {
       if (!panning) return;
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
-      moved = Math.max(moved, Math.abs(dx) + Math.abs(dy));
       this.tx = startTx + dx;
       this.ty = startTy + dy;
       this.applyTransform();
@@ -1744,17 +1741,12 @@ export class MediaViewerModal extends Modal {
       if (handled) { e.preventDefault(); e.stopPropagation(); }
     });
 
-    // Clicking the backdrop (the stage itself, not the image) closes — matches
-    // every lightbox. Guarded on "no pan happened" so a drag that ends over the
-    // backdrop does not dismiss.
-    stage.addEventListener("click", (e: MouseEvent) => {
-      if (e.target !== stage) return;
-      // Cropping owns the stage — a backdrop click shouldn't dismiss the modal.
-      if (this.cropping) return;
-      // A drag that happens to end over the backdrop must not dismiss.
-      if (moved > 4) { moved = 0; return; }
-      this.close();
-    });
+    // 0.514.0: clicking INSIDE the viewer never closes it — not the image and
+    // not the empty stage around it (the user kept dismissing it by accident).
+    // Close via a click OUTSIDE the modal (Obsidian's own modal-bg handler),
+    // Esc, or the close button. The stage click-to-close handler that lived
+    // here is gone, along with the pan-distance and press-origin guards it
+    // needed (0.513.0's pointer-capture retargeting fix).
   }
 }
 

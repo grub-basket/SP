@@ -48,7 +48,7 @@ import { rowIcon, refreshIconSprite, ensureIconSprite, type RowIconName } from "
 import { openAggregateView } from "./aggregate-view";
 import { AuthorshipTracker } from "./authorship-tracker";
 import { ViewDnD } from "./view-dnd";
-import { NoteBodyRenderer } from "./note-body-renderer";
+import { NoteBodyRenderer, OV_MEMO_VERSION } from "./note-body-renderer";
 import type { RenderEntry } from "./note-body-renderer";
 import { returnToOriginOnClose } from "./leaf-return";
 import { computeSortedIds } from "./view-sort";
@@ -116,6 +116,15 @@ const OPTIMISTIC_ROWS = 4;
 /** Below this the list is too short to position anything inside — see the
  *  scroll-to-id re-assert chain, which otherwise churns forever trying. */
 const MIN_SCROLLABLE_PX = 48;
+/** 0.512.0: character-count fallback for the Show more toggle. The clamp
+ *  decision is a height measurement, which can be wrong (a row measured while
+ *  hidden, or a verdict cached under older clamp CSS). No body this long fits a
+ *  2-line clamp or the 6-line block-content cap at any realistic pane width, so
+ *  past it the note is collapsible whatever the measurement said. */
+const CLAMP_CHAR_FALLBACK = 2000;
+function isLongBody(text: string): boolean {
+  return text.length > CLAMP_CHAR_FALLBACK;
+}
 /** 0.279.3: max entries kept in each nav history stack (back / forward). The
  *  stacks are persisted, so an uncapped one grew without bound over a session and
  *  across reloads. 100 is far more than anyone back-steps through in practice. */
@@ -8653,14 +8662,22 @@ export class StashpadView extends ItemView {
       for (const r of cursorRows) r.removeClass("is-cursor-expanded");
       // Phase 2 (reads): one layout for the whole batch. 0.118.7 — measure
       // overflow against the ACTUAL clamped height, not a line-height heuristic.
-      const overflow = measured.map((b) => b.textEl.scrollHeight > b.textEl.clientHeight + 4);
+      const sizes = measured.map((b) => ({ sh: b.textEl.scrollHeight, ch: b.textEl.clientHeight }));
       // Phase 3 (writes): restore, then apply each row's decision.
       for (const r of cursorRows) r.addClass("is-cursor-expanded");
       measured.forEach((b, i) => {
-        const overflowing = overflow[i];
-        // Memoize for subsequent re-renders at this width (clamped read only).
-        b.entry.ovW = b.memoW;
-        b.entry.ovV = overflowing;
+        const { sh, ch } = sizes[i];
+        // 0.512.0: a row that isn't laid out (hidden pane, display:none parent)
+        // reads 0/0 = "fits". Don't memoize that — the persisted memo would pin
+        // the note unclamped with no toggle until it's next edited.
+        const laidOut = ch > 0;
+        const overflowing = (laidOut && sh > ch + 4) || isLongBody(b.entry.text);
+        if (laidOut) {
+          // Memoize for subsequent re-renders at this width (clamped read only).
+          b.entry.ovW = b.memoW;
+          b.entry.ovV = overflowing;
+          b.entry.ovX = OV_MEMO_VERSION;
+        }
         if (!overflowing) {
           // Short note that fits — drop the clamp so the fade gradient doesn't apply.
           b.textEl.removeClass("is-clamped");
@@ -8820,8 +8837,8 @@ export class StashpadView extends ItemView {
       // This is what spares a 200-child Home from 200 layout reflows
       // when one note is added (199 rows hit this branch).
       const memoW = this.lastListWidth;
-      if (entry.ovW === memoW && entry.ovV !== undefined && !expanded) {
-        if (!entry.ovV) {
+      if (entry.ovW === memoW && entry.ovV !== undefined && entry.ovX === OV_MEMO_VERSION && !expanded) {
+        if (!entry.ovV && !isLongBody(text)) {
           textEl.removeClass("is-clamped");
         } else {
           this.attachExpandToggle(opts, container, node, expanded);

@@ -15,7 +15,16 @@ export interface RenderEntry {
   html: string;
   ovW?: number;
   ovV?: boolean;
+  /** 0.512.0: which version of the clamp rules produced `ovV`. The memo is
+   *  persisted with the render, so a verdict measured under old clamp CSS
+   *  (pre-0.473.2 code blocks collapsed to ~0 height and read as "fits")
+   *  outlived the fix. A memo whose `ovX` isn't OV_MEMO_VERSION is re-measured. */
+  ovX?: number;
 }
+
+/** Bump when the clamp CSS / overflow rules change, to re-measure every
+ *  persisted overflow verdict without discarding the cached renders. */
+export const OV_MEMO_VERSION = 1;
 
 /** The view members the body renderer calls back into. */
 export interface NoteBodyHost {
