@@ -1011,6 +1011,9 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    // 0.528.2: cancel a pending (or stop a running) numeric-id quoting sweep.
+    this.numericIdSweepCancelled = true;
+    if (this.numericIdSweepTimer !== null) { window.clearTimeout(this.numericIdSweepTimer); this.numericIdSweepTimer = null; }
     // 0.296.0: row-icon sprites live on each window's <body>; sweep them.
     try {
       const docs = new Set<Document>([document]);
@@ -3324,7 +3327,8 @@ export default class StashpadPlugin extends Plugin {
         try { await this.migrateDeletedToTrashSubfolders(); } catch (e) { console.error("[Stashpad] trash migration failed", e); }
         void this.pruneZombieArchiveEntries();
         // 0.527.0: one-time quoting of bare all-digit id/parent values.
-        void this.runNumericIdQuoteSweepOnce();
+        // 0.528.2: deferred until the cache has resolved + 2 min (+ foreground on mobile).
+        this.scheduleNumericIdQuoteSweep();
       }, 5000);
       // 0.138.0: opt-in nudge — previously-encrypted notes still plaintext.
       window.setTimeout(() => {
@@ -8873,11 +8877,58 @@ export default class StashpadPlugin extends Plugin {
    *  no writes), paced at 50ms per actual write, and runs once.
    *
    *  Runs only after the metadata cache has resolved, so an unparsed file is
-   *  not mistaken for "nothing to quote" and then never revisited. The done
-   *  flag is set even if some files failed or were unsafe to quote — they
-   *  still work through the number-or-text fallback, Rebootstrap retries
-   *  them, and the counts are in the action log. */
+   *  not mistaken for "nothing to quote" and then never revisited. 0.528.3:
+   *  the done flag is set only when failed === 0 ("unsafe" notes are
+   *  permanent skips and count as handled). A partial run (failed > 0)
+   *  stores numericIdQuoteSweepLastRun instead and is retried by the
+   *  scheduler at most every 7 days. Counts + complete/partial are logged. */
   private numericIdQuoteSweepInFlight = false;
+  /** 0.528.2: startup trigger for the sweep. Waits for the metadata cache's
+   *  initial index ('resolved'), then 2 more minutes, so a sync service has
+   *  time to finish downloading notes before we write any (conflict copies).
+   *  On mobile it also waits until the app is in the foreground. Unload
+   *  cancels it; a cancelled or never-fired sweep runs on a later session,
+   *  because the done flag is only set by a completed run. */
+  private numericIdSweepScheduled = false;
+  private numericIdSweepCancelled = false;
+  private numericIdSweepTimer: number | null = null;
+  private scheduleNumericIdQuoteSweep(): void {
+    if (this.settings.numericIdQuoteSweepDone || this.numericIdSweepScheduled || this.numericIdSweepCancelled) return;
+    // 0.528.3: a partial run (failed > 0) retries at most every 7 days.
+    const last = Date.parse(this.settings.numericIdQuoteSweepLastRun ?? "");
+    if (Number.isFinite(last) && Date.now() - last < 7 * 24 * 60 * 60 * 1000) return;
+    this.numericIdSweepScheduled = true;
+    const fire = (): void => {
+      if (this.numericIdSweepCancelled) return;
+      if (Platform.isMobile && document.visibilityState !== "visible") {
+        let waiting = true;
+        this.registerDomEvent(document, "visibilitychange", () => {
+          if (!waiting || document.visibilityState !== "visible" || this.numericIdSweepCancelled) return;
+          waiting = false;
+          void this.runNumericIdQuoteSweepOnce();
+        });
+        return;
+      }
+      void this.runNumericIdQuoteSweepOnce();
+    };
+    const afterResolved = (): void => {
+      if (this.numericIdSweepCancelled) return;
+      this.numericIdSweepTimer = window.setTimeout(() => { this.numericIdSweepTimer = null; fire(); }, 2 * 60 * 1000);
+    };
+    const mc = this.app.metadataCache as unknown as { resolved?: boolean };
+    if (mc.resolved === false) {
+      let pending = true;
+      const ref = this.app.metadataCache.on("resolved", () => {
+        if (!pending) return;
+        pending = false;
+        this.app.metadataCache.offref(ref);
+        afterResolved();
+      });
+      this.registerEvent(ref);
+    } else {
+      afterResolved();
+    }
+  }
   async runNumericIdQuoteSweepOnce(): Promise<{ scanned: number; quoted: number; unsafe: number; failed: number } | null> {
     if (this.settings.numericIdQuoteSweepDone || this.numericIdQuoteSweepInFlight) return null;
     const mc = this.app.metadataCache as unknown as { resolved?: boolean };
@@ -8891,25 +8942,32 @@ export default class StashpadPlugin extends Plugin {
     }
     this.numericIdQuoteSweepInFlight = true;
     let scanned = 0, quoted = 0, unsafe = 0, failed = 0;
+    const unsafePaths: string[] = [];
     try {
       const { quoteNumericIdsInFile } = await import("./numeric-id-quote");
       const folders = new Set(this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, "")));
       for (const f of this.app.vault.getMarkdownFiles()) {
+        // 0.528.2: plugin unloaded mid-run → stop; done flag stays unset, so it resumes next session.
+        if (this.numericIdSweepCancelled) return null;
         const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
         if (!folders.has(dir)) continue;
         scanned++;
         const r = await quoteNumericIdsInFile(this.app, f);
         if (r === "none") continue;
         if (r === "quoted") quoted++;
-        else if (r === "unsafe") unsafe++;
+        else if (r === "unsafe") { unsafe++; if (unsafePaths.length < 50) unsafePaths.push(f.path); }
         else failed++;
         await new Promise((res) => window.setTimeout(res, 50));
       }
-      this.settings.numericIdQuoteSweepDone = true;
+      // 0.528.3: complete only when nothing failed; unsafe notes are permanent skips.
+      const complete = failed === 0;
+      if (complete) this.settings.numericIdQuoteSweepDone = true;
+      else this.settings.numericIdQuoteSweepLastRun = new Date().toISOString();
       await this.saveSettings();
       void this.newLog().append({
         type: "id_maintenance", id: "",
-        payload: { what: "quote-numeric-ids", trigger: "one-time-sweep", scanned, quoted, unsafe, failed, folders: folders.size },
+        payload: { what: "quote-numeric-ids", trigger: "one-time-sweep", scanned, quoted, unsafe, failed, folders: folders.size, complete,
+          unsafePaths, unsafeMore: Math.max(0, unsafe - unsafePaths.length) },
       });
       return { scanned, quoted, unsafe, failed };
     } catch (e) {

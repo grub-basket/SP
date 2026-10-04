@@ -600,6 +600,10 @@ export interface StashpadSettings {
    *  same quoting on demand. Per-device (data.json), so each device sweeps
    *  once; the second device finds nothing left and writes no file. */
   numericIdQuoteSweepDone: boolean;
+  /** 0.528.3: ISO time of the last PARTIAL sweep (failed > 0). The scheduler
+   *  retries only when this is unset or at least 7 days old. Absent on older
+   *  installs = unset. Not written by complete or cancelled runs. */
+  numericIdQuoteSweepLastRun?: string;
   /** 0.138.0 (smart re-encrypt sweep): subtrees that WERE encrypted and got
    *  unlocked back to plaintext (ad-hoc unlock or restore-from-trash).
    *  Unlimited — the "Previously encrypted" review view manages it. `removed`

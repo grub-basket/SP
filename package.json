@@ -1,6 +1,6 @@
 {
 	"name": "stashpad-obsidian",
-	"version": "0.529.0",
+	"version": "0.528.3",
 	"private": true,
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
