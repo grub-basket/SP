@@ -46,6 +46,8 @@ export const CONFIG_FILES: Record<string, readonly string[]> = {
     "contextSubmenus", "contextMenuOrder", "contextMenuHidden",
     "itemButtons", "quickMenuActions", "quickMenuCustom",
     "commandIcons", "toolbarButtons",
+    // 0.529.0: the ⚡ actions menu (new keys — nothing to migrate).
+    "zapMenuOrder", "zapSubmenus",
   ],
   "templates/templates.json": ["noteTemplates"],
   "appearance/appearance.json": [

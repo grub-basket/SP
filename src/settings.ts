@@ -17,7 +17,7 @@ import type StashpadPlugin from "./main";
 import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
-import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS } from "./note-actions";
+import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS, ZAP_ACTIONS, ZAP_ADDABLE, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, type NoteActionDef } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
 import { guessCommandIcon } from "./icon-guess";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal } from "./modals";
@@ -406,6 +406,16 @@ export interface StashpadSettings {
    *  them, and hiding sticks. Holds leaf ids ("delete"), `submenu:<key>`, and
    *  `cmd:<id>`. Only the context menu honors it (not the star menu / item buttons). */
   contextMenuHidden: string[];
+  /** 0.529.0: the ⚡ actions menu (toolbar button; acts on the selection). Ids are
+   *  ZAP_ACTIONS / catalog / context-extra ids, `sep`, `cmd:<obsidian id>`, or
+   *  `zapsub:<key>`. EMPTY = use ZAP_DEFAULT_ORDER (so existing installs get the
+   *  new grouped default with no migration). */
+  zapMenuOrder: string[];
+  /** 0.529.0: ⚡-menu submenus keyed by an opaque id, referenced as
+   *  `zapsub:<key>`. A built-in key (DEFAULT_ZAP_SUBMENUS) missing here falls
+   *  back to its default, so only EDITED submenus are stored. Separate from the
+   *  ⋮ menu's contextSubmenus — the two menus are edited independently. */
+  zapSubmenus: Record<string, { name: string; icon: string; items: string[] }>;
   /** 0.395.0: folders (vault paths) whose composer shows the "N drafts" reminder
    *  chip. Toggled per-folder by the composer's Drafts button. A composer draft is
    *  NEVER auto-restored into the text box any more (that resurfaced already-sent
@@ -1319,6 +1329,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextMenuOrderRefreshedV2: false,
   contextMoveInListFirstV1: false,
   contextMenuHidden: [],
+  zapMenuOrder: [],
+  zapSubmenus: {},
   draftsSurfacedFolders: [],
   draftsLaunchReminder: true,
   showNotePreviewButton: true,
@@ -2471,23 +2483,24 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.320.3: the dedicated "Note Actions & Menus" tab — every note-action
    *  customization in one place, each with a visible heading + explainer. */
   private noteActionsItems(): SettingDefinitionItem[] {
-    return [this.sectionDef("Note actions & menus", "star menu item buttons right-click menu command icons custom command submenu", (host) => {
+    return [this.sectionDef("Note actions & menus", "star menu item buttons right-click menu actions menu zap lightning toolbar command icons custom command submenu", (host) => {
       // 0.321.3 (user): one self-owned container with a master rebuild, so an
       // icon change (or any edit) re-walks the whole page and updates every place
       // that action's icon appears.
       const box = host.createDiv();
       const rebuild = (): void => { box.empty(); buildAll(box); };
       const buildAll = (h: HTMLElement): void => {
-        h.createDiv({ cls: "setting-item-description", text: "Customize the buttons and menus on every Stashpad note — the star menu, the buttons on each row, the right-click / ⋮ menu, and the icon each action uses. Nothing here changes what an action DOES, only where it appears." });
+        h.createDiv({ cls: "setting-item-description", text: "Customize the buttons and menus on every Stashpad note — the star menu, the buttons on each row, the right-click / ⋮ menu, the ⚡ actions menu in the toolbar, and the icon each action uses. Nothing here changes what an action DOES, only where it appears." });
         this.quickMenuBody(h, rebuild);
         this.itemButtonsBody(h, rebuild);
         this.contextMenuBody(h, rebuild);
+        this.zapMenuBody(h, rebuild);
         this.iconRegistryBody(h, rebuild);
         this.composerActionButtonBody(h);
         this.reactionsBody(h, rebuild);
       };
       buildAll(box);
-    }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu", "reaction", "reactions", "emoji", "favorite", "favorites", "preset", "presets"])];
+    }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu", "actions menu", "zap", "lightning", "toolbar", "reaction", "reactions", "emoji", "favorite", "favorites", "preset", "presets"])];
   }
 
   /** 0.459.0: manage the emoji reaction picker's Favorites (pinned emoji shown
@@ -3047,7 +3060,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.320.0: the command + icon REGISTRY — every catalog action with its icon,
    *  editable, resettable to the built-in default. */
   private iconRegistryBody(host: HTMLElement, rebuild: () => void): void {
-        this.sectionHeader(host, "🎨 Command icons", "The icon each action uses everywhere it appears — the menus, the star menu, and item buttons. Type any Lucide icon name (with live preview) or reset one to its default. (The four built-in row buttons — Edit, open, Reply, React — keep their fixed icons.)");
+        this.sectionHeader(host, "🎨 Command icons", "The icon each action uses everywhere it appears — the menus (including the ⚡ actions menu), the star menu, and item buttons. Type any Lucide icon name (with live preview) or reset one to its default. (The four built-in row buttons — Edit, open, Reply, React — keep their fixed icons.)");
         new Setting(host).addButton((b) => b.setButtonText("Reset all icons").setWarning().onClick(async () => {
           this.plugin.settings.commandIcons = {};
           await this.plugin.saveSettings();
@@ -3059,8 +3072,16 @@ export class StashpadSettingTab extends PluginSettingTab {
         const builtinHead = new Setting(host).setName("Built-in actions").setHeading();
         builtinHead.setDesc("Stashpad's own note actions (already in the menus). Add more commands in “Other commands” above.");
         let curGroup = "";
-        for (const def of NOTE_ACTION_CATALOG) {
-          if (def.group !== curGroup) { curGroup = def.group; new Setting(host).setName(curGroup).setHeading(); }
+        // 0.529.0: also the menu-only actions whose icon the menus honour, and the
+        // ⚡-menu actions — so every built-in item in the ⚡ menu is re-iconable.
+        const ICON_EXTRAS = new Set(["moveInList", "delete", "history", "pinListTop", "pinListBottom", "encrypt", "moreCommands"]);
+        const registryDefs: { def: NoteActionDef; group: string }[] = [
+          ...NOTE_ACTION_CATALOG.map((def) => ({ def, group: def.group as string })),
+          ...CONTEXT_EXTRA_ACTIONS.filter((d) => ICON_EXTRAS.has(d.id)).map((def) => ({ def, group: "Menu-only actions" })),
+          ...ZAP_ACTIONS.map((def) => ({ def, group: def.group as string })),
+        ];
+        for (const { def, group } of registryDefs) {
+          if (group !== curGroup) { curGroup = group; new Setting(host).setName(curGroup).setHeading(); }
           const cur = this.plugin.settings.commandIcons?.[def.id] || def.icon;
           const row = new Setting(host).setName(def.label);
           const preview = row.nameEl.createSpan({ cls: "stashpad-cmdicon-preview" });
@@ -3097,7 +3118,8 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  icon section auto-lists a command as soon as it's used. */
   private usedCustomCmdIds(): string[] {
     const s = this.plugin.settings;
-    const all = [...(s.quickMenuActions ?? []), ...(s.itemButtons ?? []), ...(s.contextMenuOrder ?? [])];
+    const all = [...(s.quickMenuActions ?? []), ...(s.itemButtons ?? []), ...(s.contextMenuOrder ?? []),
+      ...(s.zapMenuOrder ?? []), ...Object.values(s.zapSubmenus ?? {}).flatMap((m) => m.items)];
     return [...new Set(all.filter((id) => id.startsWith("cmd:")).map((id) => id.slice(4)))];
   }
 
@@ -3198,6 +3220,136 @@ export class StashpadSettingTab extends PluginSettingTab {
     this.plugin.settings.contextMenuHidden = [...set];
     await this.plugin.saveSettings();
   }
+  /** 0.529.0: the ⚡ actions-menu builder (the toolbar button that acts on the
+   *  selection — the main way to move / delete / copy on mobile). Reuses the
+   *  shared list builder; adds submenus (`zapsub:<key>`) and dividers. */
+  private zapMenuBody(host: HTMLElement, rebuild: () => void): void {
+    this.sectionHeader(host, "⚡ Actions menu (toolbar)", "The ⚡ button in the Stashpad toolbar opens this menu. It acts on the selected notes (or the one under the cursor), so on mobile it's the main way to move, delete or copy notes. Put what you reach for most near the top, group the rest into submenus, remove what you never use, or add any Obsidian command. Change an action's icon under “Command icons” below.");
+    const subs = (): Record<string, { name: string; icon: string; items: string[] }> => ({ ...DEFAULT_ZAP_SUBMENUS, ...(this.plugin.settings.zapSubmenus ?? {}) });
+    // Submenus are addable like actions (so a removed built-in one can come back).
+    const subDefs: NoteActionDef[] = Object.entries(subs()).map(([k, v]) => ({ id: `zapsub:${k}`, label: `${v.name || "Submenu"} ▸`, icon: v.icon || "folder", group: "Actions menu (⚡)" }));
+    this.actionListBuilder(host,
+      () => this.plugin.settings.zapMenuOrder ?? [],
+      (ids) => { this.plugin.settings.zapMenuOrder = ids; },
+      "",
+      {
+        defs: [...ZAP_ADDABLE, ...subDefs],
+        defaultOrder: ZAP_DEFAULT_ORDER,
+        labelFor: (id) => this.zapLabel(id),
+        rowExtra: (row, id) => {
+          if (!id.startsWith("zapsub:")) return;
+          const key = id.slice(7);
+          const sm = subs()[key];
+          row.settingEl.addClass("is-submenu");
+          if (sm) row.setDesc(`${sm.items.length} item${sm.items.length === 1 ? "" : "s"}`);
+          row.addExtraButton((b) => b.setIcon("pencil").setTooltip("Edit submenu").onClick(() => this.editZapSubmenu(key, rebuild)));
+        },
+        addExtra: (addRow, ids, commit) => {
+          addRow.addButton((b) => b.setButtonText("Add divider").onClick(async () => { await commit([...ids(), "sep"]); }));
+          addRow.addButton((b) => b.setButtonText("New submenu…").onClick(async () => {
+            const key = `zs-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+            this.plugin.settings.zapSubmenus = { ...(this.plugin.settings.zapSubmenus ?? {}), [key]: { name: "New submenu", icon: "folder", items: [] } };
+            await commit([...ids(), "sep", `zapsub:${key}`]);
+            this.editZapSubmenu(key, rebuild);
+          }));
+        },
+      });
+  }
+
+  /** 0.529.0: settings label for a ⚡-menu id where the generic catalog label
+   *  would mislead (submenus; Copy renders as a "Copy ▸" submenu there). */
+  private zapLabel(id: string): { icon: string; name: string } | null {
+    const icons = this.plugin.settings.commandIcons ?? {};
+    if (id.startsWith("zapsub:")) {
+      const key = id.slice(7);
+      const sm = this.plugin.settings.zapSubmenus?.[key] ?? DEFAULT_ZAP_SUBMENUS[key];
+      return { icon: sm?.icon || "folder", name: sm ? `${sm.name || "Submenu"} ▸` : "(deleted submenu)" };
+    }
+    if (id === "copy") return { icon: icons.copy || "copy", name: "Copy ▸ (text, tree, clone…)" };
+    if (id === "blur") return { icon: icons.blur || "eye-off", name: "Obscure / reveal (visual only)" };
+    return null;
+  }
+
+  /** 0.529.0: edit ONE ⚡-menu submenu — name, icon, items. Built-in submenus are
+   *  only STORED once edited (until then they read from DEFAULT_ZAP_SUBMENUS), so
+   *  "Reset" just drops the stored copy. */
+  private editZapSubmenu(key: string, onDone: () => void): void {
+    new ContextSubmenuModal(this.app, (host, close) => this.renderZapSubmenuEditorBody(host, key, close), onDone).open();
+  }
+
+  private renderZapSubmenuEditorBody(host: HTMLElement, key: string, close: () => void): void {
+    const builtin = key in DEFAULT_ZAP_SUBMENUS;
+    const cur = this.plugin.settings.zapSubmenus?.[key] ?? DEFAULT_ZAP_SUBMENUS[key];
+    if (!cur) { host.createDiv({ text: "This submenu was removed." }); return; }
+    const sm = { name: cur.name, icon: cur.icon, items: [...cur.items] };
+    const persist = async (): Promise<void> => {
+      this.plugin.settings.zapSubmenus = { ...(this.plugin.settings.zapSubmenus ?? {}), [key]: { name: sm.name, icon: sm.icon, items: [...sm.items] } };
+      await this.plugin.saveSettings();
+    };
+    new Setting(host).setName("Submenu name").addText((t) => {
+      t.setValue(sm.name).setPlaceholder("Submenu");
+      t.onChange(async (v) => { sm.name = v || "Submenu"; await persist(); });
+    });
+    const iconRow = new Setting(host).setName("Icon");
+    const prev = iconRow.nameEl.createSpan({ cls: "stashpad-cmdicon-preview" }); setIcon(prev, sm.icon || "folder"); iconRow.nameEl.prepend(prev);
+    iconRow.addText((t) => {
+      new IconSuggest(this.app, t.inputEl);
+      t.setValue(sm.icon).setPlaceholder("folder"); t.inputEl.addClass("stashpad-cmdicon-input");
+      const commit = async (): Promise<void> => {
+        const v = t.getValue().trim().replace(/^lucide-/, "") || "folder";
+        if (v === sm.icon) return;
+        sm.icon = v; setIcon(prev, v); await persist();
+      };
+      t.inputEl.addEventListener("blur", () => void commit());
+      t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
+    });
+    new Setting(host).setName("Items").setHeading();
+    this.actionListBuilder(host,
+      () => sm.items,
+      (ids) => { sm.items = ids; void persist(); },
+      "No items yet — an empty submenu is hidden from the ⚡ menu. Add actions or commands below.",
+      {
+        defs: ZAP_ADDABLE,
+        labelFor: (id) => this.zapLabel(id),
+        addExtra: (addRow, ids, commit) => {
+          addRow.addButton((b) => b.setButtonText("Add divider").onClick(async () => { await commit([...ids(), "sep"]); }));
+        },
+      });
+    if (builtin) {
+      if (!this.plugin.settings.zapSubmenus?.[key]) return;   // nothing stored → already the default
+      new Setting(host)
+        .setName("Reset this submenu")
+        .setDesc("Restore its built-in name, icon and items.")
+        .addButton((b) => b.setButtonText("Reset to default").onClick(async () => {
+          const next = { ...(this.plugin.settings.zapSubmenus ?? {}) };
+          delete next[key];
+          this.plugin.settings.zapSubmenus = next;
+          await this.plugin.saveSettings();
+          close();
+        }));
+      return;
+    }
+    new Setting(host).addButton((b) => b.setButtonText("Delete this submenu").setWarning().onClick(() => {
+      new ConfirmModal(this.app, "Delete submenu?",
+        `Remove the “${sm.name || "Submenu"}” submenu from the ⚡ menu? Its actions aren't deleted — they just stop being grouped here.`,
+        "Delete", async (ok: boolean) => {
+          if (!ok) return;
+          const meId = `zapsub:${key}`;
+          const next: Record<string, { name: string; icon: string; items: string[] }> = {};
+          for (const [k, v] of Object.entries(this.plugin.settings.zapSubmenus ?? {})) {
+            if (k !== key) next[k] = { ...v, items: v.items.filter((x) => x !== meId) };
+          }
+          this.plugin.settings.zapSubmenus = next;
+          const order = this.plugin.settings.zapMenuOrder ?? [];
+          // An empty order means "the default", which never references a user
+          // submenu — so only a saved order needs stripping.
+          if (order.length) this.plugin.settings.zapMenuOrder = order.filter((x) => x !== meId);
+          await this.plugin.saveSettings();
+          close();
+        }, "Cancel").open();
+    }));
+  }
+
   /** Attach the right removal control to a context-menu row: an eye toggle for a
    *  baked-in default (hide/show, sticks), or ✕ for a genuinely removable item. */
   private ctxRowRemoveControl(row: Setting, id: string, remove: () => Promise<void>, rebuild: () => void): void {
@@ -3385,7 +3537,18 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.320.0: a reorderable list of note-action ids (catalog ids or
    *  `cmd:<obsidian id>`), with add / remove / move up / move down. Shared by the
    *  star menu and the item-button builders. Re-renders `host` in place. */
-  private actionListBuilder(host: HTMLElement, getIds: () => string[], setIds: (ids: string[]) => void, emptyText: string, opts?: { allowCustom?: boolean; catalogIds?: readonly string[]; defaultOrder?: readonly string[]; ctxHide?: boolean; alwaysList?: readonly string[]; resetTo?: readonly string[] }): void {
+  private actionListBuilder(host: HTMLElement, getIds: () => string[], setIds: (ids: string[]) => void, emptyText: string, opts?: {
+    allowCustom?: boolean; catalogIds?: readonly string[]; defaultOrder?: readonly string[]; ctxHide?: boolean; alwaysList?: readonly string[]; resetTo?: readonly string[];
+    /** 0.529.0: the "Add action…" list, replacing the catalog (⚡ menu: its own actions + extras). */
+    defs?: readonly NoteActionDef[];
+    /** 0.529.0: label override, consulted first (null = the default lookup). */
+    labelFor?: (id: string) => { icon: string; name: string } | null;
+    /** 0.529.0: extra controls on a row (e.g. a submenu's edit button), before the arrows. */
+    rowExtra?: (row: Setting, id: string) => void;
+    /** 0.529.0: extra buttons on the add row (divider, new submenu). `ids` reads the
+     *  CURRENT effective list; `commit` saves + re-renders the list. */
+    addExtra?: (addRow: Setting, ids: () => string[], commit: (ids: string[]) => Promise<void>) => void;
+  }): void {
     const wrap = host.createDiv({ cls: "stashpad-action-builder" });
     const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     // 0.476.2: drag-to-reorder (the ▲▼ buttons still work). Listeners live on the
@@ -3426,12 +3589,14 @@ export class StashpadSettingTab extends PluginSettingTab {
       this.refreshCustomCmdIcons?.();   // keep the "Other commands" icon list in sync
     };
     const label = (id: string): { icon: string; name: string } => {
+      const custom = opts?.labelFor?.(id);
+      if (custom) return custom;
       if (id.startsWith("cmd:")) { const cid = id.slice(4); const nm = registry[cid]?.name || cid; return { icon: this.plugin.settings.commandIcons?.[id] || guessCommandIcon(nm, this.plugin.settings.slugStopWords), name: nm + (registry[cid] ? "" : " (missing)") }; }
       const def = noteAction(id);
       return { icon: this.plugin.settings.commandIcons?.[id] || def?.icon || "terminal", name: def?.label || id };
     };
     const allowCustom = opts?.allowCustom !== false;
-    const catalog = opts?.catalogIds ? NOTE_ACTION_CATALOG.filter((a) => opts.catalogIds!.includes(a.id)) : NOTE_ACTION_CATALOG;
+    const catalog = opts?.defs ?? (opts?.catalogIds ? NOTE_ACTION_CATALOG.filter((a) => opts.catalogIds!.includes(a.id)) : NOTE_ACTION_CATALOG);
     const effective = (): string[] => { const cur = getIds(); return cur.length ? cur : [...(opts?.defaultOrder ?? [])]; };
     const build = (idsIn: string[]): void => {
       const ids = idsIn.length ? idsIn : [...(opts?.defaultOrder ?? [])];
@@ -3448,6 +3613,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         row.settingEl.prepend(grip);
         const ic = row.nameEl.createSpan({ cls: "stashpad-cmdicon-preview" });
         setIcon(ic, icon); row.nameEl.prepend(ic);
+        opts?.rowExtra?.(row, id);
         row.addExtraButton((b) => b.setIcon("arrow-up").setTooltip("Move up").setDisabled(i === 0).onClick(async () => {
           const n = ids.slice(); [n[i - 1], n[i]] = [n[i], n[i - 1]]; await rerender(true, n);
         }));
@@ -3512,6 +3678,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         }
         menu.showAtMouseEvent(e as MouseEvent);
       }));
+      opts?.addExtra?.(addRow, effective, (n) => rerender(true, n));
       if (opts?.defaultOrder) {
         addRow.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset to default order").onClick(async () => { await rerender(true, []); }));
       }

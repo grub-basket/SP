@@ -81,7 +81,7 @@ import { collectDropEntries, readDroppedTree, countTreeFiles, countTreeDirs, typ
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS } from "./note-actions";
+import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
 import { nestBlockMessage, rootRedirectName, withReservedRule, type NestBlocked } from "./nest-guard";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
@@ -5971,85 +5971,138 @@ export class StashpadView extends ItemView {
     }
   }
 
-  /** Action menu for mobile — a single Menu with the most common
-   *  selection-aware commands plus undo/redo. Reachable from the
-   *  top-right ⋯ button. */
+  /** The ⚡ actions menu (toolbar button, desktop + mobile) — acts on the
+   *  SELECTION (or the cursor row), plus selection-independent app actions.
+   *  0.529.0: built from `settings.zapMenuOrder` (empty = ZAP_DEFAULT_ORDER)
+   *  instead of a hardcoded ~45-item list, so it's editable under Settings →
+   *  Note Actions & Menus: reorder, remove, re-icon, add any Obsidian command,
+   *  and group into submenus (`zapsub:<key>`). */
   private openMobileActionsMenu(anchor: HTMLElement): void {
     const menu = new Menu();
-    const hasTargets = this.selection.size > 0 || (this.cursorIdx >= 0 && !!this.currentChildren[this.cursorIdx]);
-    const exactlyOne = this.selection.size <= 1;
-    // Undo / Redo at the top — independent of selection state.
-    menu.addItem((it: any) => it.setTitle("Undo").setIcon("undo").onClick(() => this.cmdUndo()));
-    menu.addItem((it: any) => it.setTitle("Redo").setIcon("redo").onClick(() => this.cmdRedo()));
-    menu.addSeparator();
-    // 0.62.4: shortcut to the notification history / log so users
-    // don't have to dive into Settings or the command palette to
-    // review what happened. Triggers the same command palette entry.
-    menu.addItem((it: any) => it.setTitle("Notification history…").setIcon("bell").onClick(() => {
-      (this.app as any).commands?.executeCommandById?.("stashpad:stashpad-open-notification-history");
-    }));
-    // 0.103.x: "Reload without saving" recovery action — the fix when the view
-    // looks reverted to a stale state. Kept here in the top (selection-independent)
-    // group so it's visible without scrolling past the selection commands.
-    menu.addItem((it: any) => it.setTitle("Reload without saving").setIcon("rotate-ccw").onClick(() => this.plugin.reloadAppForUpdate()));
-    menu.addItem((it: any) => it.setTitle("Launch View…").setIcon("layout-grid").onClick(() => (this.app as unknown as { commands?: { executeCommandById?: (id: string) => void } }).commands?.executeCommandById?.("stashpad:stashpad-open-view-launcher")));
-    menu.addItem((it: any) => it.setTitle("Open Stashpad link…").setIcon("link").onClick(() => this.plugin.openDeepLinkModal()));
-    menu.addSeparator();
-    // List-wide expand/collapse — operate on every note, independent of selection.
-    menu.addItem((it: any) => it.setTitle("Expand all").setIcon("unfold-vertical").onClick(() => this.cmdExpandAll()));
-    menu.addItem((it: any) => it.setTitle("Collapse all").setIcon("fold-vertical").onClick(() => this.cmdCollapseAll()));
-    menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").setDisabled(!hasTargets).onClick(() => this.cmdOpenInNewStashpadTab()));
-    menu.addItem((it: any) => it.setTitle(this.selection.size > 1 ? "Edit in Stashpad (one at a time)" : "Edit in Stashpad").setIcon("pencil-line").setDisabled(!hasTargets).onClick(() => this.cmdEditQueue()));
-    menu.addItem((it: any) => it.setTitle("Open in Obsidian editor").setIcon("pencil").setDisabled(!hasTargets).onClick(() => this.cmdOpenInEditor()));
-    menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Move…").setIcon("arrow-right-circle").setDisabled(!hasTargets).onClick(() => this.cmdMovePicker()));
-    menu.addItem((it: any) => it.setTitle("Nest under… (in-list)").setIcon("indent").setDisabled(!hasTargets).onClick(() => this.cmdInListPicker()));
-    menu.addItem((it: any) => it.setTitle("Reply to… (in-list)").setIcon("reply").setDisabled(!hasTargets).onClick(() => this.cmdReplyInListPicker()));
-    menu.addItem((it: any) => it.setTitle("Outdent").setIcon("outdent").setDisabled(!hasTargets).onClick(() => void this.cmdOutdent()));
-    menu.addItem((it: any) => it.setTitle("Set color…").setIcon("palette").setDisabled(!hasTargets).onClick(() => this.cmdSetColor()));
-    menu.addItem((it: any) => it.setTitle("Toggle complete").setIcon("check-circle").setDisabled(!hasTargets).onClick(() => void this.cmdToggleComplete()));
-    menu.addItem((it: any) => it.setTitle("Toggle task (todo)").setIcon("square-check-big").setDisabled(!hasTargets).onClick(() => void this.cmdToggleTask()));
-    menu.addItem((it: any) => it.setTitle("Obscure / reveal (visual only)").setIcon("eye-off").setDisabled(!hasTargets).onClick(() => void this.cmdToggleObscured()));
-    menu.addItem((it: any) => it.setTitle("Set due date…").setIcon("calendar-clock").setDisabled(!hasTargets).onClick(() => this.cmdSetDue()));
-    menu.addItem((it: any) => it.setTitle("Assign to…").setIcon("user-plus").setDisabled(!hasTargets).onClick(() => this.cmdAssign()));
-    menu.addSeparator();
-    // 0.278.0: timestamps are a modifier gesture now (copyTimestampModifiers).
-    // Hint the modifier in the label, and read it off the click so holding it
-    // while picking the item includes timestamps.
-    const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
-    const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
-    menu.addItem((it: any) => it.setTitle(`Copy${tsHint}`).setIcon("copy").setDisabled(!hasTargets).onClick((evt: MouseEvent | KeyboardEvent) => void this.cmdCopy(eventHasMods(evt, tsMods))));
-    menu.addItem((it: any) => it.setTitle(`Copy tree${tsHint}`).setIcon("copy-plus").setDisabled(!hasTargets).onClick((evt: MouseEvent | KeyboardEvent) => void this.cmdCopyTree(eventHasMods(evt, tsMods))));
-    // 0.214.0: plain Copy/Cut no longer build the cross-vault payload, so these
-    // are the way notes travel between vaults — they need to be findable here,
-    // not only in the command palette.
-    menu.addItem((it: any) => it.setTitle("Copy for another vault").setIcon("copy").setDisabled(!hasTargets).onClick(() => void this.cmdCopyForOtherVault()));
-    menu.addItem((it: any) => it.setTitle("Cut for another vault").setIcon("scissors").setDisabled(!hasTargets).onClick(() => void this.cmdCutForOtherVault()));
-    menu.addItem((it: any) => it.setTitle("Clone (duplicate / copy)").setIcon("files").setDisabled(!hasTargets).onClick(() => void this.cmdClone()));
-    // 0.155.1: Share & export ▸ — same submenu as the desktop context menu (the
-    // ⚡ menu previously had no copy-link/export). Copy-link targets the primary
-    // selected note; exports act on the whole selection.
-    this.addShareExportSubmenu(menu, this.getActionTargets()[0] ?? null, { normalizeToNode: false });
-    if (this.plugin.settings.enableSheetVersions) {
-      menu.addItem((it: any) => it.setTitle("Fork as a version (draft)").setIcon("git-fork").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdForkVersion()));
-      menu.addItem((it: any) => it.setTitle("Mark version as final").setIcon("star").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdMarkVersionFinal()));
-    }
-    menu.addItem((it: any) => it.setTitle("Insert template…").setIcon("file-plus-2").onClick(() => this.cmdInsertTemplate()));
-    menu.addItem((it: any) => it.setTitle("Merge").setIcon("merge").setDisabled(this.selection.size < 2).onClick(() => void this.cmdMerge()));
-    menu.addItem((it: any) => it.setTitle("Merge with…").setIcon("merge").setDisabled(!hasTargets).onClick(() => this.cmdMergeWith()));
-    menu.addItem((it: any) => it.setTitle("Merge into parent").setIcon("merge").setDisabled(!hasTargets).onClick(() => void this.cmdMergeWithParent()));
-    // Split only operates on a single note — the cmdSplit modal would
-    // be ambiguous across a multi-selection. Disable when 2+ selected.
-    menu.addItem((it: any) => it.setTitle("Split note…").setIcon("scissors").setDisabled(!hasTargets || !exactlyOne).onClick(() => void this.cmdSplit()));
-    menu.addSeparator();
-    menu.addItem((it: any) => it.setTitle("Delete").setIcon("trash-2").setDisabled(!hasTargets).onClick(() => void this.cmdDelete()));
-    menu.addSeparator();
-    // 0.87.0: escape hatch to the full command set — anything not surfaced
-    // here (or in the context menu) is reachable via the command palette.
-    menu.addItem((it: any) => it.setTitle("More commands…").setIcon("terminal").onClick(() => this.openCommandPalette()));
+    const node = this.getActionTargets()[0] ?? null;
+    const saved = getSettings().zapMenuOrder ?? [];
+    const order = saved.length ? saved : ZAP_DEFAULT_ORDER;
+    for (const id of order) this.renderZapLeaf(menu, id, node, 0);
     const r = anchor.getBoundingClientRect();
     menu.showAtPosition({ x: r.left, y: r.bottom + 4 });
+  }
+
+  /** 0.529.0: a ⚡-menu submenu's effective config — the user's edited copy,
+   *  else the built-in default (only edited submenus are stored). */
+  private zapSubmenu(key: string): { name: string; icon: string; items: string[] } | undefined {
+    return getSettings().zapSubmenus?.[key] ?? DEFAULT_ZAP_SUBMENUS[key];
+  }
+
+  /** 0.529.0: whether a ⚡ id renders at all right now (feature-gated actions,
+   *  uninstalled commands). Lets a submenu whose items all drop out vanish
+   *  instead of opening empty. */
+  private zapLeafVisible(id: string): boolean {
+    if (id === "forkVersion" || id === "markVersionFinal") return !!this.plugin.settings.enableSheetVersions;
+    if (id.startsWith("cmd:")) return !!(this.app as any).commands?.commands?.[id.slice(4)];
+    return true;
+  }
+
+  /** 0.529.0: render ONE ⚡-menu entry. `node` is the primary action target
+   *  (null when nothing is selected and there's no cursor row); target-needing
+   *  items render DISABLED then, exactly like the old hardcoded menu. Commands
+   *  resolve their own targets via getActionTargets(), so a multi-selection is
+   *  honoured. Anything not special-cased falls through to the ⋮ menu's leaf
+   *  renderer, so every catalog action works here too. */
+  private renderZapLeaf(menu: any, id: string, node: TreeNode | null, depth: number): void {
+    if (!this.zapLeafVisible(id)) return;
+    if (id === "sep") { menu.addSeparator(); return; }
+    const A = (title: string, icon: string, onClick: (e?: MouseEvent | KeyboardEvent) => void, disabled = false): void =>
+      menu.addItem((it: any) => it.setTitle(title).setIcon(icon).setDisabled(disabled).onClick(onClick));
+    const icon = (x: string): string => this.actionIcon(x);
+    const exec = (cid: string): void => { (this.app as any).commands?.executeCommandById?.(cid); };
+    const none = !node;
+    const many = this.selection.size > 1;
+    if (id.startsWith("zapsub:")) {
+      const cfg = this.zapSubmenu(id.slice(7));
+      if (!cfg || depth > 3) return;   // depth cap: a hand-edited cycle can't recurse forever
+      const items = cfg.items.filter((x) => x !== id && this.zapLeafVisible(x));
+      if (!items.some((x) => x !== "sep")) return;
+      menu.addItem((it: any) => {
+        it.setTitle(cfg.name || "Submenu").setIcon(cfg.icon || "folder");
+        const sub = it.setSubmenu?.();
+        for (const sid of items) this.renderZapLeaf(sub ?? menu, sid, node, depth + 1);
+      });
+      return;
+    }
+    if (id.startsWith("cmd:")) {
+      const cid = id.slice(4);
+      const nm: string = (this.app as any).commands?.commands?.[cid]?.name || cid;
+      A(nm, (getSettings().commandIcons ?? {})[id] || guessCommandIcon(nm, getSettings().slugStopWords), () => exec(cid));
+      return;
+    }
+    switch (id) {
+      // Selection-independent.
+      case "undo":            A("Undo", icon(id), () => this.cmdUndo()); return;
+      case "redo":            A("Redo", icon(id), () => this.cmdRedo()); return;
+      // 0.62.4: notification history without diving into Settings.
+      case "notificationLog": A("Notification history…", icon(id), () => exec("stashpad:stashpad-open-notification-history")); return;
+      // 0.103.x: the fix when the view looks reverted to a stale state.
+      case "reloadNoSave":    A("Reload without saving", icon(id), () => this.plugin.reloadAppForUpdate()); return;
+      case "launchView":      A("Launch View…", icon(id), () => exec("stashpad:stashpad-open-view-launcher")); return;
+      // Always available here — the toolbar's 🔗 button is hidden on narrow widths.
+      case "openLink":        A("Open Stashpad link…", icon(id), () => this.plugin.openDeepLinkModal()); return;
+      case "expandAll":       A("Expand all", icon(id), () => this.cmdExpandAll()); return;
+      case "collapseAll":     A("Collapse all", icon(id), () => this.cmdCollapseAll()); return;
+      case "insertTemplate":  A("Insert template…", icon(id), () => this.cmdInsertTemplate()); return;
+      // 0.87.0: escape hatch to the full command set.
+      case "moreCommands":    A("More commands…", icon(id), () => this.openCommandPalette()); return;
+      // Selection-aware.
+      case "edit":            A(many ? "Edit in Stashpad (one at a time)" : "Edit in Stashpad", icon(id), () => this.cmdEditQueue(), none); return;
+      case "openNewTab":      A("Open in new Stashpad tab", icon(id), () => this.cmdOpenInNewStashpadTab(), none); return;
+      case "openObsidian":    A("Open in Obsidian editor", icon(id), () => this.cmdOpenInEditor(), none); return;
+      case "move":            A("Move to…", icon(id), () => this.cmdMovePicker(), none); return;
+      case "moveInList":      A("Move in list", icon(id), () => this.cmdInListPicker(), none); return;
+      case "replyInList":     A("Reply to… (in-list)", icon(id), () => this.cmdReplyInListPicker(), none); return;
+      case "outdent":         A("Outdent", icon(id), () => void this.cmdOutdent(), none); return;
+      case "setColor":        A("Set color…", icon(id), () => this.cmdSetColor(), none); return;
+      case "toggleComplete":  A("Toggle complete", icon(id), () => void this.cmdToggleComplete(), none); return;
+      case "toggleTask":      A("Toggle task (todo)", icon(id), () => void this.cmdToggleTask(), none); return;
+      case "blur":            A("Obscure / reveal (visual only)", icon(id), () => void this.cmdToggleObscured(), none); return;
+      case "setDue":          A("Set due date…", icon(id), () => this.cmdSetDue(), none); return;
+      case "assign":          A("Assign to…", icon(id), () => this.cmdAssign(), none); return;
+      // 0.214.0: how notes travel between vaults — findable here, not only the palette.
+      case "copyOtherVault":  A("Copy for another vault", icon(id), () => void this.cmdCopyForOtherVault(), none); return;
+      case "cutOtherVault":   A("Cut for another vault", icon(id), () => void this.cmdCutForOtherVault(), none); return;
+      case "clone":           A("Clone (duplicate / copy)", icon(id), () => void this.cmdClone(), none); return;
+      // Copy-family leaves that only exist INSIDE the ⋮ menu's Copy ▸ submenu —
+      // the ⋮ renderer has no standalone case for them, so they'd render nothing.
+      case "copyTree": case "copyLevelMarkers": case "copySubtree": {
+        const tsMods = parseModifierTokens(getSettings().copyTimestampModifiers);
+        const tsHint = tsMods.length ? ` (hold ${humanCombo(tsMods.join("+"))} for timestamps)` : "";
+        const run = id === "copyTree" ? (ts: boolean) => this.cmdCopyTree(ts)
+          : id === "copyLevelMarkers" ? (ts: boolean) => this.cmdCopyTreeLevelMarkers(ts)
+          : (ts: boolean) => this.cmdCopyFocusedSubtree(ts);
+        A(`${noteAction(id)?.label ?? id}${tsHint}`, icon(id), (e) => void run(!!e && eventHasMods(e, tsMods)), none);
+        return;
+      }
+      case "exportHtml":      A("Export to HTML / PDF…", icon(id), () => this.cmdExportDoc(), none); return;
+      // 0.155.1: same Share & export ▸ submenu as the ⋮ menu; acts on the selection.
+      case "shareExport":     this.addShareExportSubmenu(menu, node, { normalizeToNode: false }); return;
+      case "forkVersion":     A("Fork as a version (draft)", icon(id), () => void this.cmdForkVersion(), none || many); return;
+      case "markVersionFinal":A("Mark version as final", icon(id), () => void this.cmdMarkVersionFinal(), none || many); return;
+      case "merge":           A("Merge selected", icon(id), () => void this.cmdMerge(), this.selection.size < 2); return;
+      case "mergeWith":       A("Merge with…", icon(id), () => this.cmdMergeWith(), none); return;
+      case "mergeParent":     A("Merge into parent", icon(id), () => void this.cmdMergeWithParent(), none); return;
+      // Split is single-note only — the modal would be ambiguous across a selection.
+      case "split":           A("Split note…", icon(id), () => void this.cmdSplit(), none || many); return;
+      case "delete":          A("Delete", icon(id), () => void this.cmdDelete(), none); return;
+      default: break;
+    }
+    // Any other catalog / ⋮-menu leaf (Copy ▸, React, Pin, Task ▸, History, …):
+    // reuse the ⋮ renderer against the primary target. The selection is already
+    // the target set, so the selection-normaliser is a no-op.
+    if (!node?.file) {
+      const def = noteAction(id);
+      // "copy" renders as the Copy ▸ submenu when enabled — match its label.
+      if (def) A(id === "copy" ? "Copy" : def.label.replace(/ ▸$/, ""), icon(id), () => {}, true);
+      return;
+    }
+    this.renderCtxLeaf(menu, id, node, node.file, () => {}, { ignoreHidden: true });
   }
 
   /** Open Obsidian's command palette (the "more commands" escape hatch from the
@@ -23442,12 +23495,14 @@ export class StashpadView extends ItemView {
   /** 0.320.0: render ONE reorderable context-menu leaf item by catalog id.
    *  `focusClicked` normalises the selection to the right-clicked row for the
    *  selection-based commands. */
-  private renderCtxLeaf(menu: any, id: string, node: TreeNode, file: TFile, focusClicked: () => void): void {
+  private renderCtxLeaf(menu: any, id: string, node: TreeNode, file: TFile, focusClicked: () => void, opts?: { ignoreHidden?: boolean }): void {
     // 0.367.0: a HIDDEN id renders nothing — the way baked-in defaults (which the
     // seed keeps re-adding) are removed for good. `sep` is never hidden (it has no
     // stable identity to hide); everything else — leaves, `submenu:<key>`, `cmd:` —
     // is checked. A hidden submenu drops the whole group.
-    if (id !== "sep" && (getSettings().contextMenuHidden ?? []).includes(id)) return;
+    // 0.529.0: the ⚡ menu reuses this renderer but has its own list, so the ⋮
+    // menu's hidden set must not leak into it.
+    if (!opts?.ignoreHidden && id !== "sep" && (getSettings().contextMenuHidden ?? []).includes(id)) return;
     const A = (title: string, icon: string, onClick: (e?: MouseEvent | KeyboardEvent) => void): void =>
       menu.addItem((it: any) => it.setTitle(title).setIcon(icon).onClick(onClick));
     // 0.321.2: an arbitrary Obsidian command leaf (used inside custom submenus).
@@ -23509,7 +23564,7 @@ export class StashpadView extends ItemView {
       case "moveHome":     A("Move to Home", this.actionIcon("moveHome"), async () => { await this.changeParent(node, ROOT_ID); if (this.plugin.settings.autoNavOnMoveOut && this.focusId !== ROOT_ID) this.navigateTo(ROOT_ID); }); break;
       case "setColor":     A("Set color…", this.actionIcon("setColor"), () => { focusClicked(); this.cmdSetColor(); }); break;
       case "sep":          menu.addSeparator(); break;
-      case "moreCommands": A("More commands…", "terminal", () => this.openCommandPalette()); break;
+      case "moreCommands": A("More commands…", this.actionIcon("moreCommands"), () => this.openCommandPalette()); break;
       case "delete":       A("Delete", this.actionIcon("delete") || "trash", () => { focusClicked(); void this.cmdDelete(); }); break;
       case "history":      A("View history", this.actionIcon("history") || "history", () => { focusClicked(); void this.cmdViewHistory(node); }); break;
       case "recurrenceSkip":

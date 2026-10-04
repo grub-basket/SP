@@ -18,7 +18,7 @@ export interface NoteActionDef {
    *  that a tooltip can't explain). All actions can go in menus. */
   button?: boolean;
   /** Grouping label for settings (icon registry, add menu). */
-  group: "Open & navigate" | "Compose" | "Copy" | "Organize";
+  group: "Open & navigate" | "Compose" | "Copy" | "Organize" | "Actions menu (⚡)";
 }
 
 export const NOTE_ACTION_CATALOG: readonly NoteActionDef[] = [
@@ -129,14 +129,72 @@ export const CONTEXT_EXTRA_ACTIONS: readonly NoteActionDef[] = [
   { id: "moreCommands",   label: "More commands…",          icon: "terminal",        group: "Organize" },
 ];
 
+/** 0.529.0: actions that only make sense in the ⚡ actions menu (the toolbar
+ *  button that acts on the SELECTION, or on nothing at all — undo, expand all,
+ *  …). Ids are persisted in `settings.zapMenuOrder` / `zapSubmenus`, so never
+ *  rename one. The ⚡ menu can also hold any catalog action, the context extras
+ *  above, and `cmd:<obsidian id>` commands. */
+export const ZAP_ACTIONS: readonly NoteActionDef[] = [
+  { id: "undo",              label: "Undo",                              icon: "undo",               group: "Actions menu (⚡)" },
+  { id: "redo",              label: "Redo",                              icon: "redo",               group: "Actions menu (⚡)" },
+  { id: "notificationLog",   label: "Notification history…",             icon: "bell",               group: "Actions menu (⚡)" },
+  { id: "reloadNoSave",      label: "Reload without saving",             icon: "rotate-ccw",         group: "Actions menu (⚡)" },
+  { id: "launchView",        label: "Launch View…",                      icon: "layout-grid",        group: "Actions menu (⚡)" },
+  { id: "openLink",          label: "Open Stashpad link…",               icon: "link",               group: "Actions menu (⚡)" },
+  { id: "expandAll",         label: "Expand all",                        icon: "unfold-vertical",    group: "Actions menu (⚡)" },
+  { id: "collapseAll",       label: "Collapse all",                      icon: "fold-vertical",      group: "Actions menu (⚡)" },
+  { id: "replyInList",       label: "Reply to… (in-list)",               icon: "reply",              group: "Actions menu (⚡)" },
+  { id: "toggleComplete",    label: "Toggle complete",                   icon: "check-circle",       group: "Actions menu (⚡)" },
+  { id: "toggleTask",        label: "Toggle task (todo)",                icon: "square-check-big",   group: "Actions menu (⚡)" },
+  { id: "assign",            label: "Assign to…",                        icon: "user-plus",          group: "Actions menu (⚡)" },
+  { id: "copyOtherVault",    label: "Copy for another vault",            icon: "copy",               group: "Actions menu (⚡)" },
+  { id: "cutOtherVault",     label: "Cut for another vault",             icon: "scissors",           group: "Actions menu (⚡)" },
+  { id: "insertTemplate",    label: "Insert template…",                  icon: "file-plus-2",        group: "Actions menu (⚡)" },
+  { id: "merge",             label: "Merge selected",                    icon: "merge",              group: "Actions menu (⚡)" },
+  { id: "mergeWith",         label: "Merge with…",                       icon: "merge",              group: "Actions menu (⚡)" },
+  { id: "mergeParent",       label: "Merge into parent",                 icon: "merge",              group: "Actions menu (⚡)" },
+  { id: "forkVersion",       label: "Fork as a version (draft)",         icon: "git-fork",           group: "Actions menu (⚡)" },
+  { id: "markVersionFinal",  label: "Mark version as final",             icon: "star",               group: "Actions menu (⚡)" },
+];
+
 /** 0.350.0: id → def, built from the catalog AND the context-only extras. The
  *  extras (delete, history, obscure, encrypt, …) were previously absent, so
  *  defaultActionIcon() returned the "terminal" fallback for them and the ⋮ menu
  *  showed a generic icon while settings — which reads the extras array directly —
- *  showed the right one. Declared after both arrays (const, no hoist). */
+ *  showed the right one. Declared after both arrays (const, no hoist).
+ *  0.529.0: the ⚡-only actions too. */
 const BY_ID = new Map<string, NoteActionDef>(
-  [...NOTE_ACTION_CATALOG, ...CONTEXT_EXTRA_ACTIONS].map((a) => [a.id, a]),
+  [...NOTE_ACTION_CATALOG, ...CONTEXT_EXTRA_ACTIONS, ...ZAP_ACTIONS].map((a) => [a.id, a]),
 );
+
+/** 0.529.0: everything the ⚡ menu builder can add (besides `cmd:` commands and
+ *  submenus): the ⚡-only actions, the catalog, and the context extras. */
+export const ZAP_ADDABLE: readonly NoteActionDef[] = [
+  ...ZAP_ACTIONS,
+  ...NOTE_ACTION_CATALOG,
+  ...CONTEXT_EXTRA_ACTIONS.filter((a) => a.id !== "sep"),
+];
+
+/** 0.529.0: the ⚡ menu's DEFAULT layout. It used to be one ~45-item flat list
+ *  you had to scroll on a phone; now the everyday actions (move, delete, copy,
+ *  edit, complete) sit right under Undo / Redo and the rest group into
+ *  submenus. Used whenever `settings.zapMenuOrder` is empty, so existing users
+ *  get it with no migration. `zapsub:<key>` resolves through
+ *  `settings.zapSubmenus[key] ?? DEFAULT_ZAP_SUBMENUS[key]`. */
+export const ZAP_DEFAULT_ORDER: readonly string[] = [
+  "undo", "redo", "sep",
+  "move", "moveInList", "delete", "copy", "edit", "toggleComplete", "sep",
+  "zapsub:organize", "zapsub:open", "zapsub:share", "zapsub:merge", "zapsub:view", "sep",
+  "moreCommands",
+];
+
+export const DEFAULT_ZAP_SUBMENUS: Record<string, { name: string; icon: string; items: string[] }> = {
+  organize: { name: "Organize",        icon: "folder-tree",  items: ["outdent", "replyInList", "setColor", "setDue", "assign", "toggleTask", "blur"] },
+  open:     { name: "Open",            icon: "external-link", items: ["openNewTab", "openObsidian", "launchView", "openLink"] },
+  share:    { name: "Copy & share",    icon: "share",        items: ["copyOtherVault", "cutOtherVault", "shareExport", "insertTemplate"] },
+  merge:    { name: "Merge & split",   icon: "merge",        items: ["merge", "mergeWith", "mergeParent", "split", "forkVersion", "markVersionFinal"] },
+  view:     { name: "View & app",      icon: "settings-2",   items: ["expandAll", "collapseAll", "notificationLog", "reloadNoSave"] },
+};
 /** Actions the ⋮-menu builder can add: the catalog's context leaves + the extras
  *  above + a few catalog actions not in the default order. */
 export const CONTEXT_LEAF_IDS: readonly string[] = [

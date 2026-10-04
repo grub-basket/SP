@@ -12651,6 +12651,12 @@ export default class StashpadPlugin extends Plugin {
       contextMenuHidden: Array.isArray(data?.contextMenuHidden)
         ? data.contextMenuHidden.filter((x: unknown): x is string => typeof x === "string")
         : [],
+      zapMenuOrder: Array.isArray(data?.zapMenuOrder)
+        ? data.zapMenuOrder.filter((x: unknown): x is string => typeof x === "string")
+        : [],
+      zapSubmenus: (data?.zapSubmenus && typeof data.zapSubmenus === "object" && !Array.isArray(data.zapSubmenus))
+        ? Object.fromEntries(Object.entries(data.zapSubmenus).filter(([, v]: [string, any]) => v && typeof v.name === "string").map(([k, v]: [string, any]) => [k, { name: String(v.name), icon: typeof v.icon === "string" ? v.icon : "folder", items: Array.isArray(v.items) ? v.items.filter((x: unknown): x is string => typeof x === "string") : [] }])) as Record<string, { name: string; icon: string; items: string[] }>
+        : {},
       dueQuickAdjusts: Array.isArray(data?.dueQuickAdjusts)
         ? data.dueQuickAdjusts.filter((x: unknown): x is string => typeof x === "string")
         : ["5m", "15m", "30m", "1h", "1d", "1w"],
