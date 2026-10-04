@@ -16,6 +16,7 @@ import type StashpadPlugin from "./main";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { ROOT_ID } from "./types";
 import { buildHomeFilename } from "./view-helpers";
+import { nestBlockMessage } from "./nest-guard";
 
 interface DemoNote {
   /** Symbolic key, local to this file — mapped to a minted id at seed time. */
@@ -103,6 +104,11 @@ function isoAt(daysFromNow: number, hour: number): string {
 export interface SeedResult {
   created: number;
   skipped: number;
+  /** 0.528.0: the folder actually seeded (or opened); differs from the one
+   *  asked for after a vault-root redirect. */
+  folder: string;
+  /** 0.528.0: the redirect notice, or null when it went where asked. */
+  message: string | null;
 }
 
 /**
@@ -111,15 +117,29 @@ export interface SeedResult {
  * so re-running is safe and can't clobber a user's note that happens to collide.
  */
 export async function seedDemoContent(app: App, plugin: StashpadPlugin, folder: string): Promise<SeedResult> {
-  const dir = normalizePath(folder.trim().replace(/^\/+|\/+$/g, ""));
-  if (!dir) throw new Error("Folder name is empty");
+  const typed = normalizePath(folder.trim().replace(/^\/+|\/+$/g, ""));
+  if (!typed) throw new Error("Folder name is empty");
   // normalizePath collapses slashes but does NOT strip "..", and every path
   // below is joined against the vault root — so an unchecked name could write
   // outside the intended folder (e.g. into .obsidian/). Reject loudly rather
   // than silently rewriting, per the project's path-traversal invariant.
-  if (dir.split("/").some((p) => p === "." || p === "..")) {
+  if (typed.split("/").some((p) => p === "." || p === "..")) {
     throw new Error(`Folder name can't contain "." or ".." path segments`);
   }
+  // 0.522.0: no Stashpad inside (or around) another one — checked before the
+  // first mkdir, so a refused name creates nothing. The welcome modal shows
+  // this message and stays open. Seeding into a folder that is already a
+  // Stashpad (the empty-folder "Load example content" button) passes.
+  // 0.525.0: also refuses a folder inside one Stashpad keeps for itself.
+  // 0.528.0: a name refused for being INSIDE a Stashpad (or a reserved folder)
+  // is redirected to the vault root under its last segment. When the root
+  // already has that name nothing is seeded: the caller opens the existing
+  // folder (demo notes are never mixed into a folder the user already has).
+  const target = await plugin.resolveNewStashpadTarget(typed);
+  if (!target.ok) throw new Error(nestBlockMessage(target.verdict));
+  const dir = target.folder;
+  const message = target.redirect?.message ?? null;
+  if (target.redirect && target.redirect.existing !== "none") return { created: 0, skipped: 0, folder: dir, message };
 
   const adapter = app.vault.adapter;
   // mkdir intermediates (same approach as createNewStashpad).
@@ -189,5 +209,5 @@ export async function seedDemoContent(app: App, plugin: StashpadPlugin, folder: 
     created++;
   }
 
-  return { created, skipped };
+  return { created, skipped, folder: dir, message };
 }

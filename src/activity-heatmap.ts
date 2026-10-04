@@ -24,7 +24,7 @@ const BUCKET_OF: Record<LogEventType, Bucket> = {
   parent_change: "moved", reorder: "moved", rename: "moved",
   attachment_add: "files", attachment_remove: "files",
   lock: "vault", unlock: "vault", archive: "vault", restore: "vault",
-  archive_migration: "vault", palette_color_add: "vault", palette_color_remove: "vault",
+  archive_migration: "vault", id_maintenance: "vault", palette_color_add: "vault", palette_color_remove: "vault",
   stash_export: "vault", stash_import: "vault",
   delete: "deleted", missing: "deleted",
 };
@@ -320,6 +320,7 @@ function describeEvent(ev: LogEvent, title?: string): string {
     case "stash_export": return `Exported ${who}`;
     case "stash_import": return `Imported ${who}`;
     case "archive_migration": return "Archive maintenance";
+    case "id_maintenance": return "Note id maintenance";
     default: return `${ev.type} ${who}`;
   }
 }

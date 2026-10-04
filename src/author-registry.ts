@@ -66,16 +66,35 @@ export class AuthorRegistry {
   async load(): Promise<void> {
     if (this.loaded) return;
     this.loaded = true;
+    const adapter = this.app.vault.adapter;
+    // 0.517.2 (perf): read directly instead of exists-then-read. This runs on
+    // the awaited startup path, and once anyone has an author identity the
+    // file is there on every launch, so the existence check was a wasted
+    // network round trip. A failed read still has to tell "no registry yet"
+    // (silent, data untouched, as before) from an existing file that can't be
+    // read (warn + start empty, as before). Desktop says so in the error code;
+    // anything else asks once more, so a missing file costs no more than the
+    // old check did on desktop and one extra local call elsewhere.
+    let raw: string;
     try {
-      const adapter = this.app.vault.adapter;
-      if (await adapter.exists(this.path)) {
-        const parsed = JSON.parse(await adapter.read(this.path)) as Partial<RegistryFile>;
-        if (parsed && typeof parsed === "object" && parsed.authors) {
-          this.data = {
-            version: typeof parsed.version === "number" ? parsed.version : REGISTRY_VERSION,
-            authors: parsed.authors,
-          };
-        }
+      raw = await adapter.read(this.path);
+    } catch (e) {
+      if ((e as { code?: unknown } | null)?.code === "ENOENT") return;
+      let present = true;
+      try { present = await adapter.exists(this.path); } catch { /* can't tell — warn as before */ }
+      if (present) {
+        console.warn("[Stashpad] author registry load failed; starting empty", e);
+        this.data = { version: REGISTRY_VERSION, authors: {} };
+      }
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as Partial<RegistryFile>;
+      if (parsed && typeof parsed === "object" && parsed.authors) {
+        this.data = {
+          version: typeof parsed.version === "number" ? parsed.version : REGISTRY_VERSION,
+          authors: parsed.authors,
+        };
       }
     } catch (e) {
       console.warn("[Stashpad] author registry load failed; starting empty", e);

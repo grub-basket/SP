@@ -3,6 +3,7 @@ import { FolderKeystore, KEYFILE_NAME } from "./folder-keystore";
 import { buildStashZip, importStashZip, splitFrontmatter, resolveNoteAttachmentFiles } from "./stash-package";
 import { encryptWithKey, decryptWithKey, isEncryptedStash } from "./stash-crypto";
 import { type StashpadId } from "./types";
+import { readId } from "./id-service";
 import { unzipFiles, zipFiles } from "./zip";
 
 /** In-vault locked-bundle extension (NOT `.stash` — `.stash` is an export to
@@ -65,20 +66,24 @@ export interface LockResult {
   unpurged: string[];
 }
 
-interface SubtreeNode {
+export interface SubtreeNode {
   id: StashpadId; file: TFile; parent: StashpadId | null; created: string;
   /** 0.306.0: pin/task state carried out to the sidecar on lock (P1). */
   pinned?: boolean; pinnedAt?: number; listPinned?: string | boolean;
   task?: boolean; due?: string; completed?: boolean;
 }
 
-/** Collect a note + all its descendants within `folder` by walking frontmatter
- *  `parent` links. Returns the root note and the rest, plus the root's parent. */
-export async function collectSubtree(app: App, folder: string, rootId: StashpadId): Promise<{
-  rootNote: SubtreeNode; descendants: SubtreeNode[]; parentId: StashpadId | null;
-} | null> {
+/** 0.517.9: one disk read of every Stashpad note directly in `folder` — the scan
+ *  `collectSubtree` used to repeat on every call, moved out unchanged. A caller
+ *  collecting K roots in a loop reads this once and passes it to each
+ *  `collectSubtree`, so a K-root copy/cut/paste/export reads the folder once
+ *  instead of K times. Cleans the path itself: a raw path with a trailing slash
+ *  would otherwise match zero files and silently collect nothing. The result is
+ *  a point-in-time snapshot — only reuse it within ONE read-only pass (never
+ *  across a trash/import, an undo/redo closure, or a later call). */
+export async function readFolderSubtreeNodes(app: App, folder: string): Promise<SubtreeNode[]> {
   const cleaned = folder.replace(/\/+$/, "");
-  const inFolder: SubtreeNode[] = [];
+  const nodes: SubtreeNode[] = [];
   // Read frontmatter from DISK, not metadataCache — the cache can lag right
   // after edits/imports, and an under-read here would bundle an INCOMPLETE
   // subtree (leaving children orphaned or stranded). Disk is authoritative.
@@ -86,11 +91,15 @@ export async function collectSubtree(app: App, folder: string, rootId: StashpadI
     if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
     let fm: Record<string, unknown>;
     try { fm = splitFrontmatter(await app.vault.read(f)).fm; } catch { continue; }
-    if (typeof fm.id !== "string") continue;
-    inFolder.push({
-      id: fm.id, file: f,
-      parent: typeof fm.parent === "string" ? fm.parent : null,
-      created: typeof fm.created === "string" ? fm.created : "",
+    // 0.527.1: readId — a bare all-digit id/parent (YAML number) is still an
+    // id. With typeof it was skipped, so a lock left that note out of the
+    // bundle (plaintext left behind) and its children looked parentless.
+    const nodeId = readId(fm.id);
+    if (nodeId === null) continue;
+    nodes.push({
+      id: nodeId, file: f,
+      parent: readId(fm.parent),
+      created: typeof fm.created === "string" ? fm.created : typeof fm.created === "number" ? String(fm.created) : "",
       // 0.306.0: capture pin/task state so lockSubtree can surface it (P1).
       pinned: fm.pinned === true || undefined,
       pinnedAt: typeof fm.pinnedAt === "number" ? fm.pinnedAt : undefined,
@@ -100,12 +109,24 @@ export async function collectSubtree(app: App, folder: string, rootId: StashpadI
       completed: fm.completed === true || undefined,
     });
   }
-  const root = inFolder.find((n) => n.id === rootId);
+  return nodes;
+}
+
+/** Collect a note + all its descendants within `folder` by walking frontmatter
+ *  `parent` links. Returns the root note and the rest, plus the root's parent.
+ *  0.517.9: `inFolder` is an optional `readFolderSubtreeNodes(app, folder)` result
+ *  for the SAME folder, read once by a multi-root caller's loop; omitted,
+ *  the folder is read here exactly as before. Only read from, never mutated. */
+export async function collectSubtree(app: App, folder: string, rootId: StashpadId, inFolder?: readonly SubtreeNode[]): Promise<{
+  rootNote: SubtreeNode; descendants: SubtreeNode[]; parentId: StashpadId | null;
+} | null> {
+  const nodes = inFolder ?? await readFolderSubtreeNodes(app, folder);
+  const root = nodes.find((n) => n.id === rootId);
   if (!root) return null;
 
   // BFS down the parent graph.
   const childrenOf = new Map<StashpadId, SubtreeNode[]>();
-  for (const n of inFolder) {
+  for (const n of nodes) {
     if (!n.parent) continue;
     const arr = childrenOf.get(n.parent) ?? [];
     arr.push(n); childrenOf.set(n.parent, arr);
@@ -273,7 +294,19 @@ function safeBlobBase(title: string): string {
  *  on a shared drive, sync client) is NOT deleted — the blob holds the stale
  *  content and deleting would destroy the newer edit irreversibly. Skipped and
  *  failed deletions are returned so callers can warn loudly: a file we report
- *  as "locked" but couldn't remove is still readable plaintext on disk. */
+ *  as "locked" but couldn't remove is still readable plaintext on disk.
+ *
+ *  0.516.0 INVARIANT: purge set ⊆ bundle set. The attachment candidates are
+ *  re-resolved from the LIVE notes here (exclusivity needs the current link
+ *  graph), so an attachment embedded AFTER the bundle was built (other pane,
+ *  coworker on a share, sync) used to show up with no mtime baseline, fall
+ *  through the guard, and get `vault.delete`d — permanently, while not in the
+ *  blob. Now an attachment is deleted only if the builder WROTE it
+ *  (`bundledAttachmentPaths`) AND gather baselined it (`mtimes`, so the change
+ *  guard can vouch the bytes on disk are the bundled ones). Anything else is kept
+ *  and reported in `unpurged`; its companions follow it. A normal lock/delete is
+ *  unchanged: gather baselines every attachment it resolves and the builder
+ *  bundles the same set, so every candidate passes both tests. */
 async function purgeSubtreePlaintext(
   app: App, all: { file: TFile }[], mtimes?: Map<string, number>,
   /** 0.277.0: plaintext companion sidecars (already bundled into the blob) to
@@ -287,7 +320,16 @@ async function purgeSubtreePlaintext(
    *  we KEEP (because an external note also links it) must stay plaintext too, or
    *  we'd destroy the still-present file's history. */
   attachmentCompanions: { file: TFile; attPath: string }[] = [],
+  /** 0.516.0: vault paths of the attachments the bundle builder actually wrote
+   *  (`ExportInput.bundledAttachmentPaths`). See the invariant above. */
+  bundledAttachmentPaths?: Set<string>,
 ): Promise<{ unpurged: string[] }> {
+  // 0.516.0: membership test for attachments (and, via their owner, attachment
+  // companions). Each half is skipped only when its source wasn't supplied; every
+  // caller supplies both, and a caller that forgot the bundle set still gets the
+  // baseline half (gather baselines exactly what it saw before the bundle read).
+  const inBundle = (path: string): boolean =>
+    (!bundledAttachmentPaths || bundledAttachmentPaths.has(path)) && (!mtimes || mtimes.has(path));
   const subtreePaths = new Set(all.map((n) => n.file.path));
   const subtreeAtts = new Map<string, TFile>();
   for (const n of all) {
@@ -319,6 +361,13 @@ async function purgeSubtreePlaintext(
   }
   for (const [path, af] of subtreeAtts) {
     if (sharedExternally.has(path)) continue;
+    // 0.516.0: not in the bundle (embedded after it was built, or never
+    // baselined) — deleting it would be permanent with no copy in the blob.
+    if (!inBundle(path)) {
+      console.warn("[Stashpad] attachment isn't in the bundle (embedded after it was built) — keeping plaintext", path);
+      unpurged.push(path);
+      continue;
+    }
     // Same mid-lock-edit guard as notes: if the attachment changed since it was
     // baselined (re-pasted image, sync write) its newer bytes aren't in the blob
     // — keep the plaintext rather than destroy the newer copy. (0.140.8)
@@ -369,6 +418,14 @@ async function purgeSubtreePlaintext(
   for (const { file: cf, attPath } of attachmentCompanions) {
     if (sharedExternally.has(attPath)) continue;
     if (!(await app.vault.adapter.exists(cf.path))) continue; // already removed = purged
+    // 0.516.0: these come from gather, but the builder bundles them only when it
+    // bundles their attachment — an embed removed between gather and the bundle
+    // read leaves the companion OUT of the blob. Follow the owner's membership.
+    if (!inBundle(attPath)) {
+      console.warn("[Stashpad] attachment companion's attachment isn't in the bundle — keeping plaintext", cf.path);
+      unpurged.push(cf.path);
+      continue;
+    }
     const baseline = mtimes?.get(cf.path);
     if (baseline != null) {
       try {
@@ -408,11 +465,15 @@ export async function lockSubtree(
   const { companionsByPath, attachmentCompanionsByPath, noteCompanions: allCompanions, attachmentCompanions, mtimes } =
     await gatherSubtreeCompanions(app, allNodes, companionExts);
 
+  // 0.516.0: the builder fills this with the attachments it actually wrote; the
+  // purge may only permanently delete those (purge set ⊆ bundle set).
+  const bundledAttachmentPaths = new Set<string>();
   const zip = await buildStashZip(app, {
     rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
     allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
     attachmentCompanionsByPath,
+    bundledAttachmentPaths,
   });
   const blob = await encryptWithKey(zip, dek);
 
@@ -475,7 +536,7 @@ export async function lockSubtree(
   // now PERMANENTLY delete the plaintext originals (notes + subtree-exclusive
   // attachments). The blob is the recoverable copy. See purgeSubtreePlaintext
   // for the why-not-trash rationale.
-  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions, attachmentCompanions);
+  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions, attachmentCompanions, bundledAttachmentPaths);
 
   return { blobPath, noteCount: all.length, rootId, parentId, title: meta.title, created: rootNote.created, unpurged };
 }
@@ -485,6 +546,7 @@ export async function lockSubtree(
  *  elsewhere (e.g. archive-undo restores the blob back to its SOURCE folder). */
 export async function unlockBundle(
   app: App, blobPath: string, dek: Uint8Array, existingIds: Set<StashpadId>, destFolder?: string,
+  isStashpadFolder?: (folder: string) => boolean,
 ): Promise<{ notesWritten: number; restoredTo: string }> {
   const blob = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
   if (!isEncryptedStash(blob)) throw new Error("Not an encrypted bundle.");
@@ -494,7 +556,9 @@ export async function unlockBundle(
   const folder = safeVaultFolder(destFolder) ?? blobPath.replace(/\/[^/]*$/, "");
   // dedupeExisting: a SHARED attachment's original wasn't trashed on lock, so
   // reuse it instead of writing a duplicate copy into _attachments on unlock.
-  const summary = await importStashZip(app, zip, folder, existingIds, { dedupeExisting: true });
+  // 0.523.8: only at its recorded origin path (older bundles: never another
+  // Stashpad folder's _attachments), so a same-name twin elsewhere isn't linked.
+  const summary = await importStashZip(app, zip, folder, existingIds, { dedupeExisting: true, isStashpadFolder });
   await app.vault.adapter.remove(blobPath);
   try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* sidecar may not exist */ }
   return { notesWritten: summary.notesWritten, restoredTo: folder };
@@ -610,11 +674,14 @@ export async function deleteEncryptSubtree(
   const { companionsByPath, attachmentCompanionsByPath, noteCompanions: allCompanions, attachmentCompanions, mtimes } =
     await gatherSubtreeCompanions(app, allNodes, companionExts);
 
+  // 0.516.0: purge set ⊆ bundle set — see lockSubtree / purgeSubtreePlaintext.
+  const bundledAttachmentPaths = new Set<string>();
   const zip = await buildStashZip(app, {
     rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
     allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
     attachmentCompanionsByPath,
+    bundledAttachmentPaths,
   });
   const blob = await encryptWithKey(zip, dek);
   // Byte-for-byte verify before deleting the only plaintext copy.
@@ -659,7 +726,7 @@ export async function deleteEncryptSubtree(
     throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
   }
 
-  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions, attachmentCompanions);
+  const { unpurged } = await purgeSubtreePlaintext(app, all, mtimes, allCompanions, attachmentCompanions, bundledAttachmentPaths);
   return { blobPath, noteCount: all.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
 }
 
@@ -668,6 +735,7 @@ export async function deleteEncryptSubtree(
  *  the sidecar/originalFolder is missing. */
 export async function restoreDeleted(
   app: App, blobPath: string, dek: Uint8Array, existingIds: Set<StashpadId>,
+  isStashpadFolder?: (folder: string) => boolean,
 ): Promise<{ notesWritten: number; restoredTo: string }> {
   const blob = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
   if (!isEncryptedStash(blob)) throw new Error("Not an encrypted bundle.");
@@ -676,7 +744,7 @@ export async function restoreDeleted(
   // can't redirect decrypted plaintext outside the vault.
   const dest = await deletedRestoreDest(app, blobPath, meta, dek);
   const zip = await decryptWithKey(blob, dek);
-  const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true });
+  const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true, isStashpadFolder });
   await app.vault.adapter.remove(blobPath);
   try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* may not exist */ }
   return { notesWritten: summary.notesWritten, restoredTo: dest };
@@ -710,11 +778,14 @@ export async function deletePlaintextSubtree(
   const { companionsByPath, attachmentCompanionsByPath, noteCompanions: allCompanions, attachmentCompanions, mtimes } =
     await gatherSubtreeCompanions(app, allNodes, companionExts);
 
+  // 0.516.0: purge set ⊆ bundle set — see lockSubtree / purgeSubtreePlaintext.
+  const bundledAttachmentPaths = new Set<string>();
   const zip = await buildStashZip(app, {
     rootNotes: [{ id: rootNote.id, file: rootNote.file, companions: companionsByPath.get(rootNote.file.path) }],
     allDescendants: descendants.map((d) => ({ id: d.id, file: d.file, companions: companionsByPath.get(d.file.path) })),
     sourceFolder: folder,
     attachmentCompanionsByPath,
+    bundledAttachmentPaths,
   });
 
   // dest may be nested (X/trash) — mkdir intermediates.
@@ -747,7 +818,7 @@ export async function deletePlaintextSubtree(
     throw new Error("Couldn't write trash metadata — the note was NOT deleted (kept intact).");
   }
 
-  const { unpurged } = await purgeSubtreePlaintext(app, allNodes, mtimes, allCompanions, attachmentCompanions);
+  const { unpurged } = await purgeSubtreePlaintext(app, allNodes, mtimes, allCompanions, attachmentCompanions, bundledAttachmentPaths);
   return { blobPath, noteCount: allNodes.length, rootId, originalFolder: cleanedFolder, title: meta.title, unpurged };
 }
 
@@ -756,13 +827,14 @@ export async function deletePlaintextSubtree(
  *  minus the crypto. */
 export async function restorePlaintextDeleted(
   app: App, blobPath: string, existingIds: Set<StashpadId>,
+  isStashpadFolder?: (folder: string) => boolean,
 ): Promise<{ notesWritten: number; restoredTo: string; bundleKept: boolean; warnings: string[] }> {
   const zip = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
   const meta = await readDeletedMeta(app, blobPath);
   // No dek: plaintext bundles never hide their origin, so `originalFolder` (or the
   // blob's own trash-parent fallback) is always the source of truth.
   const dest = await deletedRestoreDest(app, blobPath, meta);
-  const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true });
+  const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true, isStashpadFolder });
   // 0.211.6 (L3): the bundle is the ONLY copy of these notes — it was previously
   // removed unconditionally, so an import that wrote nothing, or skipped entries,
   // destroyed the notes it failed to restore. Since 0.211.4 a per-note write failure

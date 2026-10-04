@@ -1,4 +1,5 @@
-import { TFile, TFolder, type App } from "obsidian";
+import { TFile, TFolder, normalizePath, type App } from "obsidian";
+import { readId } from "./id-service";
 import { ROOT_ID, isReservedSubfolderName, isInReservedSubfolder, type StashpadId, type TreeNode } from "./types";
 
 /** Walk a Stashpad folder's TFolder subtree and return every .md file under
@@ -30,6 +31,26 @@ export function collectMarkdown(app: App, folderPath: string): TFile[] {
     }
   }
   return out;
+}
+
+/** 0.521.0: true when `path` sits DIRECTLY in `folder`, not in a subfolder.
+ *  A folder's Home is the `id: __root__` note at exactly this depth. A
+ *  subfolder can be a Stashpad of its own with its own `__root__` Home
+ *  (Sub/Home-Sub.md), and the old prefix matches let that nested Home stand in
+ *  for the outer folder's: collectMarkdown lists a folder's own files before
+ *  its subfolders', and the last `__root__` seen won. The recovery-link queue
+ *  then wrote the outer folder's children list into the nested Home. The
+ *  folder pickers and rebootstrap-all already find a Home this way
+ *  (`f.parent.path === folder`). `folder` goes through normalizePath so a
+ *  trailing slash or doubled separator in a folder setting still matches the
+ *  note's real parent path (getAbstractFileByPath itself is a raw file-map
+ *  lookup and does not normalise). Callers run
+ *  this once per `__root__` note, not once per file. */
+export function isDirectlyInFolder(path: string, folder: string): boolean {
+  let dir = normalizePath(folder);
+  if (dir === "/") dir = "";   // vault root: its files have no "/" in their path
+  const slash = path.lastIndexOf("/");
+  return (slash < 0 ? "" : path.slice(0, slash)) === dir;
 }
 
 export class TreeIndex {
@@ -91,7 +112,10 @@ export class TreeIndex {
 
     for (const f of files) {
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
-      const id = fm?.id as string | undefined;
+      // 0.527.0: ids and parents are TEXT in the index. An unquoted all-digit
+      // `id: 42` arrives from YAML as the number 42; readId turns it into "42",
+      // so it matches the quoted form, row.dataset.id and the order sidecar.
+      const id = readId(fm?.id) ?? undefined;
 
       // Carry-forward path: the file exists in the vault, but metadataCache hasn't
       // parsed it yet (no id). If we previously had a node for this path (synthetic
@@ -111,13 +135,18 @@ export class TreeIndex {
       this.synthetic.delete(f.path);
 
       if (id === ROOT_ID) {
+        // 0.521.0: only the folder's OWN Home can be the root. A `__root__`
+        // note deeper down is a nested Stashpad's Home; it always came after
+        // ours in `files`, so it replaced this root. It is not an ordinary
+        // note here either, so leave it out of the index.
+        if (folder && !isDirectlyInFolder(f.path, folder)) continue;
         const root = this.nodes.get(ROOT_ID)!;
         root.file = f;
         root.created = (fm?.created as string) ?? "";
         this.byPath.set(f.path, ROOT_ID);
         continue;
       }
-      let parent = (fm?.parent as string | null | undefined) ?? null;
+      let parent = readId(fm?.parent);
       // 0.77.11 (robustness): a note declaring itself as its own parent
       // (a 1-node cycle, e.g. from a hand-edited/synced frontmatter on a
       // shared drive) would hang every parent-chain walk. Pin it to ROOT.
@@ -170,7 +199,11 @@ export class TreeIndex {
         // order tied notes differently on another device or after a re-index, and
         // manual reordering then starts from a different baseline. Ids are unique
         // and identical everywhere, so this makes sibling order deterministic.
-        return (na.created || "").localeCompare(nb.created || "") || a.localeCompare(b);
+        // 0.526.5: String() both sides. YAML parses an unquoted all-digit id
+        // (`id: 1234567`) or `created` as a NUMBER; `a.localeCompare` then threw
+        // on a tie, rebuild() aborted and the whole folder rendered blank. For
+        // string values String() is a no-op, so existing order is unchanged.
+        return String(na.created || "").localeCompare(String(nb.created || "")) || String(a).localeCompare(String(b));
       });
       // If an explicit order is provided for this parent, apply it: ids in the
       // order array come first (in the array's order); ids not in it stay where
@@ -216,8 +249,14 @@ export class TreeIndex {
     return [...this.nodes.values()];
   }
 
+  /** 0.527.0: keys are text, but a caller holding a raw frontmatter value may
+   *  pass the number form (`42`). keyOf maps it to "42" so the lookup still hits. */
+  private keyOf(id: unknown): StashpadId {
+    return (readId(id) ?? id) as StashpadId;
+  }
+
   get(id: StashpadId): TreeNode | undefined {
-    return this.nodes.get(id);
+    return this.nodes.get(this.keyOf(id));
   }
 
   getRoot(): TreeNode {
@@ -231,7 +270,7 @@ export class TreeIndex {
   }
 
   getChildren(id: StashpadId): TreeNode[] {
-    const node = this.nodes.get(id);
+    const node = this.nodes.get(this.keyOf(id));
     if (!node) return [];
     return node.children
       .map((cid) => this.nodes.get(cid))
@@ -250,7 +289,7 @@ export class TreeIndex {
   pathTo(id: StashpadId): TreeNode[] {
     const out: TreeNode[] = [];
     const seen = new Set<StashpadId>();   // cycle guard (see rebuild note)
-    let cur = this.nodes.get(id);
+    let cur = this.nodes.get(this.keyOf(id));
     while (cur && cur.id !== ROOT_ID && !seen.has(cur.id)) {
       seen.add(cur.id);
       out.unshift(cur);
@@ -397,7 +436,7 @@ export class TreeIndex {
       return this.byPath.has(file.path) ? this.applyDelete(file.path) : false;
     }
     const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-    const id = fm?.id as string | undefined;
+    const id = readId(fm?.id) ?? undefined;   // 0.527.0: text key, see rebuild()
     const oldId = this.byPath.get(file.path);
 
     // Metadata cache hasn't parsed this file yet (no id in frontmatter).
@@ -421,6 +460,13 @@ export class TreeIndex {
     // Self-declared root note. Update root metadata in place; root never
     // has siblings to re-sort.
     if (id === ROOT_ID) {
+      // 0.521.0: same rule as rebuild(). A nested Stashpad's Home is not this
+      // root. If this path was indexed as an ordinary note (its id has just
+      // become __root__), rebuild so the stale node goes too.
+      if (this.currentFolder && !isDirectlyInFolder(file.path, this.currentFolder)) {
+        if (oldId) { this.rebuild(); return true; }
+        return false;
+      }
       const root = this.nodes.get(ROOT_ID)!;
       const created = (fm?.created as string) ?? "";
       let changed = false;
@@ -433,7 +479,7 @@ export class TreeIndex {
       return changed;
     }
 
-    let parentId = ((fm?.parent as string | null | undefined) ?? ROOT_ID);
+    let parentId = readId(fm?.parent) ?? ROOT_ID;
     // 0.140.3 (review): the self-parent guard existed only in rebuild() — a note
     // declaring itself its own parent (hand-edited / synced) arriving via the
     // incremental `changed` event would attach as its OWN child, hanging every
@@ -560,6 +606,13 @@ export class TreeIndex {
       // We never had this path indexed — fall through to a normal apply.
       return this.applyChange(file);
     }
+    // 0.521.0: the Home moved down into a subfolder is no longer this
+    // folder's Home (rebuild() skips it there). Rebuild instead of remapping,
+    // so the incremental path agrees with a full rebuild.
+    if (id === ROOT_ID && folder && !isDirectlyInFolder(file.path, folder)) {
+      this.rebuild();
+      return true;
+    }
     this.byPath.delete(oldPath);
     this.byPath.set(file.path, id);
     const node = this.nodes.get(id);
@@ -570,10 +623,24 @@ export class TreeIndex {
   // --- attach / detach / sort helpers ---
 
   private detachFromParent(node: TreeNode): void {
-    const parent = this.nodes.get(node.parent ?? ROOT_ID);
+    // 0.519.3: an orphan sits in ROOT's children while its recorded parent says
+    // otherwise — rebuild()'s second pass and attachToParent park it there.
+    // Two shapes: the recorded parent is missing, or it has come back since
+    // (parsed after the child in a sync, or restored from the trash) and was
+    // added incrementally without re-adopting the child. In both, look in ROOT
+    // too. Returning early left the id in ROOT.children after applyDelete
+    // dropped the node, and the next resortChildrenOf(ROOT) threw on the
+    // missing node. Only harmless while every delete was followed by a
+    // same-event rebuild; the view now defers that rebuild to its render.
+    const root = this.nodes.get(ROOT_ID);
+    const parent = this.nodes.get(node.parent ?? ROOT_ID) ?? root;
     if (!parent) return;
     const i = parent.children.indexOf(node.id);
-    if (i >= 0) parent.children.splice(i, 1);
+    if (i >= 0) { parent.children.splice(i, 1); return; }
+    if (root && parent !== root) {
+      const j = root.children.indexOf(node.id);
+      if (j >= 0) root.children.splice(j, 1);
+    }
   }
 
   private attachToParent(node: TreeNode): void {
@@ -613,7 +680,7 @@ export class TreeIndex {
       // Same id tie-break as rebuild() — see the note there. Both comparators must
       // agree or the incremental path would order a tie group differently from a
       // full rebuild, and rows would jump on the next metadata-cache event.
-      return (na.created || "").localeCompare(nb.created || "") || a.localeCompare(b);
+      return String(na.created || "").localeCompare(String(nb.created || "")) || String(a).localeCompare(String(b));
     });
     if (this.orderProvider) {
       const explicit = this.orderProvider(parentId);

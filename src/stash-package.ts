@@ -60,6 +60,25 @@ export interface StashManifest {
    *  note stem, so unlock restores each next to the possibly-renamed attachment.
    *  `name` is the companion's original filename; ext = name minus `attName`. */
   attachmentCompanions?: { i: number; attName: string; name: string }[];
+  /** 0.523.8: bundle attachment name → the vault PATH its bytes were read from.
+   *  Written only for lock/trash bundles (the builder got `bundledAttachmentPaths`),
+   *  never for shareable `.stash` exports or cross-vault payloads. Restore/unlock
+   *  reuses an existing file only at THIS path, not any same-name file in the vault. */
+  attachmentOrigins?: Record<string, string>;
+}
+
+/** Options shared by importStashZip / importFromFileMap. */
+export interface StashImportOptions {
+  dedupeExisting?: boolean;
+  forceNewIds?: boolean;
+  reparentRootsTo?: StashpadId | null;
+  stripReserved?: boolean;
+  /** 0.523.8: is this folder a Stashpad folder? Lets the dedupe fallback for
+   *  bundles WITHOUT `attachmentOrigins` skip another Stashpad folder's own
+   *  `<folder>/_attachments/` store, while a non-Stashpad folder that happens to
+   *  be named `_attachments` (e.g. a universal attachment folder) stays reusable.
+   *  Omitted → no skip (the pre-0.523.8 vault-wide lookup). */
+  isStashpadFolder?: (folder: string) => boolean;
 }
 
 export interface ExportInput {
@@ -76,6 +95,12 @@ export interface ExportInput {
    *  Bundled next to the attachment binary and restored beside it on unlock so an
    *  attachment's edit history isn't left readable on disk. */
   attachmentCompanionsByPath?: Map<string, TFile[]>;
+  /** 0.516.0: OUT-param (encryption/trash paths only). When given, the builder
+   *  adds the vault PATH of every attachment whose bytes it actually wrote into
+   *  the bundle. The plaintext purge uses it as its membership test: it may only
+   *  permanently delete an attachment that is IN the bundle. Frontmatter-only
+   *  `attachments:` entries get a bundle NAME but no bytes, so they're not added. */
+  bundledAttachmentPaths?: Set<string>;
 }
 
 export interface ImportSummary {
@@ -111,6 +136,7 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
   const entries: ZipEntry[] = [];
   const allNotes = dedupeById([...input.rootNotes, ...input.allDescendants]);
   const collectedAtts = new Map<string, ArrayBuffer>(); // BUNDLE name -> binary
+  const attOrigins = new Map<string, string>(); // BUNDLE name -> vault path (lock/trash only)
   // 0.211.4 (F2): identity is the vault PATH, not the basename. Two distinct
   // attachments can share a name in different folders (Assets/A/diagram.png and
   // Assets/B/diagram.png); keying the bundle by basename dropped the second and
@@ -145,6 +171,7 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
     const md = await app.vault.read(n.file);
     let rewritten = md;
     const refs = extractAttachmentRefs(md);
+    const bodyPaths = new Set<string>(); // 0.520.0: gates the frontmatter self-heal
     for (const ref of refs) {
       // 0.209.0: defensive path fallback, NOT a fix for a demonstrated bug.
       // Trynalist's rendering notes report that getFirstLinkpathDest misses a
@@ -170,6 +197,14 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
       if (!collectedAtts.has(basename)) {
         collectedAtts.set(basename, await app.vault.readBinary(af));
       }
+      // 0.516.0: record AFTER the read succeeded — a bundle name maps to exactly one
+      // path, so this path's bytes are now in the bundle (and so are the companions
+      // bundled just below, which ride only with a bundled attachment).
+      input.bundledAttachmentPaths?.add(af.path);
+      // 0.523.8: lock/trash bundles also record WHERE the bytes came from, so
+      // restore can reuse the kept shared original and nothing else.
+      if (input.bundledAttachmentPaths) attOrigins.set(basename, af.path);
+      bodyPaths.add(af.path);
       // 0.451.0: bundle this attachment's plaintext companions ONCE (an attachment
       // referenced by several notes is collected once; scan its companions once
       // too). Keyed by the attachment's bundle name so unlock re-pairs it even if
@@ -187,7 +222,7 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
       rewritten = rewriteAttachmentRef(rewritten, ref, basename);
     }
     // Also normalize attachments: list in frontmatter to bare basenames.
-    rewritten = rewriteFrontmatterAttachmentList(rewritten, app, n.file.path, bundleNameFor);
+    rewritten = rewriteFrontmatterAttachmentList(rewritten, app, n.file.path, bundleNameFor, bodyPaths);
     // 0.211.8: flat, collision-free entry names — the same guard buildFilteredZip has.
     // A subtree can span nested folders, so two notes CAN share a filename; without
     // this, the second entry overwrites the first in the zip and that note is simply
@@ -223,6 +258,7 @@ export async function buildStashEntries(app: App, input: ExportInput): Promise<Z
     rootIds: input.rootNotes.map((n) => n.id),
     ...(companionManifest.length ? { companions: companionManifest } : {}),
     ...(attCompanionManifest.length ? { attachmentCompanions: attCompanionManifest } : {}),
+    ...(input.bundledAttachmentPaths ? { attachmentOrigins: Object.fromEntries(attOrigins) } : {}),
   };
   entries.push({ name: "manifest.json", data: JSON.stringify(manifest, null, 2) });
 
@@ -271,14 +307,16 @@ export async function buildFilteredZip(
     // Collect + rewrite attachments before filtering (frontmatter-only has no
     // body to reference them, so skip that case).
     if (content !== "frontmatter") {
+      const bodyPaths = new Set<string>(); // 0.520.0: gates the frontmatter self-heal
       for (const ref of extractAttachmentRefs(md)) {
         const af = app.metadataCache.getFirstLinkpathDest(ref, n.file.path);
         if (!af) { warnings.push(`Missing attachment "${ref}" in ${n.file.path}`); continue; }
         const basename = bundleNameFor(af);
         if (!collectedAtts.has(basename)) collectedAtts.set(basename, await app.vault.readBinary(af));
+        bodyPaths.add(af.path);
         md = rewriteAttachmentRef(md, ref, basename);
       }
-      md = rewriteFrontmatterAttachmentList(md, app, n.file.path, bundleNameFor);
+      md = rewriteFrontmatterAttachmentList(md, app, n.file.path, bundleNameFor, bodyPaths);
     }
     const data = filterNoteContent(md, content);
     // Flat, collision-free filenames (the subtree may span nested folders).
@@ -300,7 +338,7 @@ export async function importStashZip(
   buf: ArrayBuffer | Uint8Array,
   destFolder: string,
   existingIds: Set<StashpadId>,
-  opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null; stripReserved?: boolean } = {},
+  opts: StashImportOptions = {},
 ): Promise<ImportSummary> {
   return importFromFileMap(app, await unzipFiles(buf), destFolder, existingIds, opts);
 }
@@ -314,7 +352,7 @@ export async function importFromFileMap(
   zip: Record<string, Uint8Array>,
   destFolder: string,
   existingIds: Set<StashpadId>,
-  opts: { dedupeExisting?: boolean; forceNewIds?: boolean; reparentRootsTo?: StashpadId | null; stripReserved?: boolean } = {},
+  opts: StashImportOptions = {},
 ): Promise<ImportSummary> {
   const manifestBytes = zip["manifest.json"];
   if (!manifestBytes) throw new Error("Not a valid .stash package: missing manifest.json");
@@ -399,13 +437,53 @@ export async function importFromFileMap(
   // (a real shared attachment). A same-named-but-DIFFERENT file is a genuine
   // collision — we write the bundled copy under a unique name (foo-1.png, foo-2…)
   // so the note links to the CORRECT content. (dedupeExisting widens the "already
-  // here?" check to the whole vault, e.g. a shared original left in place on lock.)
+  // here?" check beyond _attachments, e.g. a shared original left in place on lock.)
+  //
+  // 0.523.8: byte equality proves the CONTENT matches, not that it's the file the
+  // note linked. A cross-folder paste leaves an identical same-name twin in the
+  // other folder's _attachments, and the old vault-wide name lookup relinked the
+  // restored note to it. So a bundle that recorded origins (lock/trash) may reuse
+  // a file ONLY at its original path. A bundle without origins (pre-0.523.8 trash
+  // or lock, cross-vault paste) keeps the name lookup but skips ANOTHER Stashpad
+  // folder's own `_attachments/` store. A miss writes a fresh copy below.
   const attRoute = new Map<string, string>();
+  // Origins are trusted only from our own lock/trash bundles: an untrusted payload
+  // (stripReserved, e.g. cross-vault clipboard) can't steer which file gets linked.
+  const rawOrigins = opts.dedupeExisting && !opts.stripReserved ? manifest.attachmentOrigins : undefined;
+  const origins: Record<string, unknown> | null =
+    rawOrigins && typeof rawOrigins === "object" && !Array.isArray(rawOrigins) ? rawOrigins : null;
+  // Read-only lookup; only an indexed vault FILE counts (no traversal, no config dir).
+  const originOf = (bundleName: string): string | null => {
+    if (!origins || !Object.prototype.hasOwnProperty.call(origins, bundleName)) return null;
+    const o = origins[bundleName];
+    if (typeof o !== "string" || !o) return null;
+    const f = app.vault.getAbstractFileByPath(o);
+    return f instanceof TFile ? f.path : null;
+  };
+  // True for a file inside another Stashpad folder's `<folder>/_attachments/`
+  // (the destination's own store stays eligible). Only the caller knows which
+  // folders are Stashpads; a non-Stashpad `…/_attachments/` folder is still reused.
+  const ownStore = `${attachmentsFolder}/`;
+  const ownerIsStashpad = new Map<string, boolean>();
+  const inOtherStashpadStore = (path: string): boolean => {
+    const isStashpad = opts.isStashpadFolder;
+    if (!isStashpad || !path.includes("/_attachments/") || path.startsWith(ownStore)) return false;
+    const segs = path.split("/");
+    for (let i = 1; i < segs.length - 1; i++) {
+      if (segs[i] !== "_attachments") continue;
+      const owner = segs.slice(0, i).join("/");
+      let hit = ownerIsStashpad.get(owner);
+      if (hit === undefined) { hit = isStashpad(owner); ownerIsStashpad.set(owner, hit); }
+      if (hit) return true;
+    }
+    return false;
+  };
   let existingByName: Map<string, string> | null = null;
-  if (opts.dedupeExisting) {
+  if (opts.dedupeExisting && !origins) {
     existingByName = new Map();
     for (const tf of app.vault.getFiles()) {
-      if (!existingByName.has(tf.name)) existingByName.set(tf.name, tf.path);
+      if (existingByName.has(tf.name) || inOtherStashpadStore(tf.path)) continue;
+      existingByName.set(tf.name, tf.path);
     }
   }
   const sameBytes = (a: Uint8Array, b: Uint8Array) => {
@@ -418,10 +496,11 @@ export async function importFromFileMap(
     const basename = safeZipEntryName(name.slice("attachments/".length));
     if (!basename) continue;  // empty or traversal attempt → skip
     const zipBytes = bytes;
-    // Candidate same-named files already on disk: a vault-wide match (unlock) and
-    // the default _attachments slot. Reuse the first whose CONTENT is identical.
+    // Candidates already on disk: the recorded original path (or, for a bundle
+    // without origins, the scoped name match) and the default _attachments slot.
+    // Reuse the first whose CONTENT is identical.
     const candidates: string[] = [];
-    const vaultMatch = existingByName?.get(basename);
+    const vaultMatch = origins ? originOf(basename) : existingByName?.get(basename);
     if (vaultMatch) candidates.push(vaultMatch);
     const defaultPath = `${attachmentsFolder}/${basename}`;
     if (await app.vault.adapter.exists(defaultPath)) candidates.push(defaultPath);
@@ -675,13 +754,50 @@ function rewriteImportedAttachmentLinks(body: string, attRoute: Map<string, stri
 /** `nameFor` (0.211.4, F2) must be the SAME resolver the body rewrite used, or the
  *  frontmatter list and the body disagree: the body would point at `diagram-2.png`
  *  while `attachments:` still claimed `diagram.png`. Falls back to the bare basename
- *  when no resolver is supplied. */
-function rewriteFrontmatterAttachmentList(md: string, app: App, notePath: string, nameFor?: (af: TFile) => string): string {
+ *  when no resolver is supplied.
+ *
+ *  0.520.0: entries are `[[wikilinks]]` since 0.79.18, but the raw entry went
+ *  straight to getFirstLinkpathDest, which resolves NOTHING with the brackets on
+ *  (measured on Obsidian 1.14.0). The miss fell back to `baseFileName("[[a/x.png]]")`
+ *  = `x.png]]`, and the import's toAttachmentLink wrapped that into
+ *  `[[…/x.png]]]]` — one more `]]` per delete→restore / lock→unlock trip. Now
+ *  the raw entry is tried first (exactly the old lookup, so anything that
+ *  resolved before still maps to the same file, and a non-string still throws
+ *  here, failing the export before anything is trashed), then the link-stripped
+ *  form from the same attachmentLinkPath the view and the import side use.
+ *
+ *  `bodyPaths` = vault paths of the attachments THIS note's body embeds, as the
+ *  caller's ref loop resolved and bundled them. It gates the self-heal below;
+ *  omit it and no heal is attempted. */
+function rewriteFrontmatterAttachmentList(
+  md: string, app: App, notePath: string, nameFor?: (af: TFile) => string, bodyPaths?: ReadonlySet<string>,
+): string {
   const split = splitFrontmatter(md);
   if (!split.fm.attachments || !Array.isArray(split.fm.attachments)) return md;
+  // "" means "the source note itself" to getFirstLinkpathDest; never let a
+  // stripped `[[]]` / `[[#h]]` entry claim the note as its own attachment.
+  const resolve = (p: string) => (p ? app.metadataCache.getFirstLinkpathDest(p, notePath) : null);
   const remapped = (split.fm.attachments as string[]).map((a) => {
-    const af = app.metadataCache.getFirstLinkpathDest(a, notePath);
-    return af ? (nameFor ? nameFor(af) : af.name) : baseFileName(a);
+    const raw = app.metadataCache.getFirstLinkpathDest(a, notePath);
+    if (raw) return nameFor ? nameFor(raw) : raw.name;
+    const link = attachmentLinkPath(a);
+    let af = resolve(link);
+    // 0.520.0 self-heal for entries already damaged by the bug above
+    // (`[[a/x.png]]]]]]`). Only taken when neither the entry as written nor its
+    // link path resolves, AND the `]`-trimmed path resolves to a file this note's
+    // BODY embeds. A damaged path is the import's fallback `_attachments/<name>`,
+    // built without consulting where the bytes actually went (a collision rename
+    // to x-1.png, or a vault-wide dedupe reuse), so on its own it can name an
+    // unrelated same-named file. Requiring a body embed means a healed entry can
+    // only name a file the note already embeds and bundles: it gets the body's own
+    // bundle name and routes through the same attRoute entry on import, never the
+    // fallback. Anything else is left alone: it no longer grows, and the next body
+    // edit rewrites the list from the body (syncAttachmentsFrontmatter).
+    if (!af && bodyPaths && link.endsWith("]")) {
+      const healed = resolve(link.replace(/\]+$/, ""));
+      if (healed && bodyPaths.has(healed.path)) af = healed;
+    }
+    return af ? (nameFor ? nameFor(af) : af.name) : baseFileName(link);
   });
   const newFm = { ...split.fm, attachments: remapped };
   return serializeNote(newFm, split.body);

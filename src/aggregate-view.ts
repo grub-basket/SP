@@ -105,8 +105,20 @@ export class StashpadAggregateView extends ItemView {
     // calendar all show. The heatmap re-reads the (possibly large) log on every
     // render, so it stays on the discrete create/delete/rename triggers + the
     // manual refresh button rather than firing on every keystroke-debounced edit.
+    // 0.518.8 (perf): an edit to a note OUTSIDE every Stashpad folder can't
+    // change these tabs — collectIndexRows / collectTasks only read notes whose
+    // own folder is a discovered Stashpad folder (exact match, so archive/ and
+    // other subfolders are out too) — yet typing in an ordinary note next to a
+    // visible tab re-swept the whole vault on every save. Skip it, but only on
+    // a definite "not listed" from the warm discovery memo: a cold memo
+    // (`null`) falls through to the old render rather than walking the vault
+    // per event. Known edge: a note edited in place to GAIN Stashpad's claim
+    // signature is still unlisted at this point (the memo updates on the
+    // metadata "changed" that follows), so its brand-new folder shows on the
+    // next refresh or vault change instead.
     this.registerEvent(this.app.vault.on("modify", (f) => {
-      if ((this.mode === "index" || this.mode === "timeline" || this.mode === "calendar") && f.path.endsWith(".md")) this.scheduleRender();
+      if ((this.mode === "index" || this.mode === "timeline" || this.mode === "calendar") && f.path.endsWith(".md")
+          && this.plugin.stashpadFolderMemoHas(f.parent?.path ?? "") !== false) this.scheduleRender();
     }));
     // 0.274.3 (perf): when this aggregate tab is in the BACKGROUND, a vault
     // mutation only marks it dirty — it does NOT recompute. The index/calendar/

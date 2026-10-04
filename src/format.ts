@@ -19,15 +19,63 @@ function tzOpt(prefs: DateDisplayPrefs): { timeZone?: string } {
   return { timeZone: tz };
 }
 
+/** 0.518.1 (perf scan P34): reuse DateTimeFormat objects. Building one
+ *  is the costly part, and list rows / task panels format a date per row.
+ *  Keyed by locale + the exact options, so a hit was built from the same
+ *  arguments a fresh call would use. A formatter with no explicit
+ *  timeZone fixes the device zone when built, so the whole cache is
+ *  dropped when the device's zone changes (travel, OS zone change
+ *  without a restart): checked per call by its January/July offsets and
+ *  by name via deviceZoneSig(). Stored only after the constructor
+ *  returns, so a bad IANA name throws on every call exactly as before.
+ *  Cleared at 64 entries (normal use needs about a dozen per zone). */
+const DTF_CACHE_MAX = 64;
+const dtfCache = new Map<string, Intl.DateTimeFormat>();
+let dtfCacheTzSig = "";
+
+/** 0.518.1: the device zone NAME (+ default locale), read once per
+ *  synchronous run and forgotten at the next microtask. Offsets alone
+ *  miss zones that match today but differed in the past (Los Angeles ->
+ *  Tijuana showed a 2009 note an hour off until restart). The OS zone
+ *  only changes between tasks, so a value read earlier in the same run
+ *  is still current. Costs one bare constructor per render, not per row. */
+let deviceZoneMemo: string | null = null;
+
+function deviceZoneSig(): string {
+  if (deviceZoneMemo === null) {
+    const r = new Intl.DateTimeFormat().resolvedOptions();
+    deviceZoneMemo = `${r.locale}|${r.timeZone}`;
+    queueMicrotask(() => { deviceZoneMemo = null; });
+  }
+  return deviceZoneMemo;
+}
+
+function cachedDtf(locale: string | undefined, opts: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
+  const y = new Date().getFullYear();
+  const sig = `${new Date(y, 0, 1).getTimezoneOffset()}/${new Date(y, 6, 1).getTimezoneOffset()}|${deviceZoneSig()}`;
+  if (sig !== dtfCacheTzSig) {
+    dtfCache.clear();
+    dtfCacheTzSig = sig;
+  }
+  const key = `${locale ?? ""}|${JSON.stringify(opts)}`;
+  let f = dtfCache.get(key);
+  if (!f) {
+    f = new Intl.DateTimeFormat(locale, opts);
+    if (dtfCache.size >= DTF_CACHE_MAX) dtfCache.clear();
+    dtfCache.set(key, f);
+  }
+  return f;
+}
+
 /** Safe wrapper — a bad IANA name in Intl throws; fall back to the
  *  system zone rather than crash the render. */
 function fmt(ms: number, opts: Intl.DateTimeFormatOptions): string {
   try {
-    return new Intl.DateTimeFormat(undefined, opts).format(new Date(ms));
+    return cachedDtf(undefined, opts).format(new Date(ms));
   } catch {
     const { timeZone, ...rest } = opts;
     void timeZone;
-    return new Intl.DateTimeFormat(undefined, rest).format(new Date(ms));
+    return cachedDtf(undefined, rest).format(new Date(ms));
   }
 }
 
@@ -85,7 +133,7 @@ export function formatTimeOnly(ms: number, prefs: DateDisplayPrefs): string {
  *  chosen timezone. Built from Intl parts so the zone applies. */
 function formatIso(ms: number, prefs: DateDisplayPrefs, withTime: boolean): string {
   const tz = tzOpt(prefs);
-  const parts = new Intl.DateTimeFormat("en-CA", {
+  const parts = cachedDtf("en-CA", {
     ...tz, year: "numeric", month: "2-digit", day: "2-digit",
     ...(withTime ? { hour: "2-digit", minute: "2-digit", hourCycle: "h23" } : {}),
   }).formatToParts(new Date(ms));

@@ -417,7 +417,11 @@ export type LogEventType =
   // 0.276.0: a Stashpad note was OPENED/viewed. OPT-IN (settings.logNoteOpens,
   // default off) because opens are frequent and would bloat the log for users
   // who don't want view tracking. Feeds the activity heatmap's "Viewed" bucket.
-  | "open";
+  | "open"
+  // 0.527.0: id housekeeping that rewrites no value — currently the quoting of
+  // bare all-digit `id:` / `parent:` frontmatter (one-time sweep + Rebootstrap).
+  // payload: { what, trigger, quoted, unsafe, failed?, scanned? }.
+  | "id_maintenance";
 
 export interface LogEvent {
   ts: string;

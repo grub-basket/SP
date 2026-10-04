@@ -6,6 +6,7 @@ function osFileManagerName(): string {
 }
 import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal, buildJdPreviewNotice } from "./index-builder";
 import { FolderSuggest } from "./folder-suggest";
+import { nestBlockMessage, rootRedirectName } from "./nest-guard";
 import { StringSuggest, vaultTagEntries, vaultExtensionEntries, timezoneNames, CALLOUT_TYPES } from "./input-suggest";
 import { siftRank } from "./suggest-match";
 import { isValidConfigFolder } from "./config-layout";
@@ -583,6 +584,12 @@ export interface StashpadSettings {
   /** 0.137.0: one-time move of _deleted/ encrypted-trash blobs into each
    *  origin folder's own trash/ subfolder (per-folder trash overhaul). */
   migratedTrashToSubfolders: boolean;
+  /** 0.527.0: the one-time sweep that quotes bare all-digit `id:` / `parent:`
+   *  frontmatter values (`id: 42` → `id: "42"`) has run in this vault. Set
+   *  once it finishes; it is never re-run automatically. Rebootstrap does the
+   *  same quoting on demand. Per-device (data.json), so each device sweeps
+   *  once; the second device finds nothing left and writes no file. */
+  numericIdQuoteSweepDone: boolean;
   /** 0.138.0 (smart re-encrypt sweep): subtrees that WERE encrypted and got
    *  unlocked back to plaintext (ad-hoc unlock or restore-from-trash).
    *  Unlimited — the "Previously encrypted" review view manages it. `removed`
@@ -1368,6 +1375,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   migratedPreviewHomeChord2: false,
   migratedArchiveToSubfolders: false,
   migratedTrashToSubfolders: false,
+  numericIdQuoteSweepDone: false,
   reEncryptWatch: [],
   reEncryptNudge: false,
   reEncryptAfterMin: 0,
@@ -1553,10 +1561,27 @@ export function isWithinObscureSchedule(
  *  back to device local day when the tz is empty or invalid. Kept consistent with
  *  currentHourInTz so the weekday gate and the hour window agree on "which day". */
 const WEEKDAY_ABBR = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/** 0.518.0: building an Intl.DateTimeFormat is the costly part, and with the hide
+ *  schedule on, a folder hidden by default and a home timezone set, these helpers
+ *  run for every row on every render (via isObscured), so reuse one formatter per
+ *  zone. One Map PER formatter kind: the weekday and
+ *  hour formatters take different options, so a zone-only key shared by both
+ *  would hand one helper the other's formatter. A formatter is stored only after
+ *  its constructor returned, so an invalid zone id still throws on every call and
+ *  still falls back to device-local time exactly as before. The keys are the few
+ *  zones the settings UI can set (device zone + recent-zone chips), so the maps
+ *  stay tiny; an empty zone never reaches them. */
+const weekdayFmtByTz = new Map<string, Intl.DateTimeFormat>();
+const hourMinuteFmtByTz = new Map<string, Intl.DateTimeFormat>();
 function currentWeekdayInTz(tz: string | undefined, now: Date): number {
   if (!tz) return now.getDay();
   try {
-    const name = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(now);
+    let fmt = weekdayFmtByTz.get(tz);
+    if (!fmt) {
+      fmt = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" });
+      weekdayFmtByTz.set(tz, fmt);
+    }
+    const name = fmt.format(now);
     const i = WEEKDAY_ABBR.indexOf(name);
     return i >= 0 ? i : now.getDay();
   } catch {
@@ -1570,7 +1595,12 @@ function currentHourInTz(tz: string | undefined, now: Date): number {
   const local = now.getHours() + now.getMinutes() / 60;
   if (!tz) return local;
   try {
-    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(now);
+    let fmt = hourMinuteFmtByTz.get(tz);
+    if (!fmt) {
+      fmt = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false });
+      hourMinuteFmtByTz.set(tz, fmt);
+    }
+    const parts = fmt.formatToParts(now);
     const hh = Number(parts.find((p) => p.type === "hour")?.value);
     const mm = Number(parts.find((p) => p.type === "minute")?.value);
     if (!Number.isFinite(hh) || !Number.isFinite(mm)) return local;
@@ -3895,6 +3925,21 @@ export class StashpadSettingTab extends PluginSettingTab {
             return;
           }
           if (cleaned === this.plugin.settings.folder) return;
+          // 0.522.0: the default folder becomes a Stashpad the first time it
+          // opens, so it can't sit inside (or hold) one. An existing Stashpad
+          // passes, so pointing this at any current Stashpad still works.
+          // 0.525.0: checkCreateStashpadFolder also refuses Stashpad's own
+          // folders the list above misses (_archive, .archive, case variants).
+          const nest = this.plugin.checkCreateStashpadFolder(cleaned);
+          if (!nest.ok) {
+            // 0.528.0: NOT redirected (this is a setting the user is typing, and
+            // silently saving a different path would surprise them); name the
+            // vault-root alternative so they can type it.
+            const alt = rootRedirectName(nest);
+            new Notice(`${nestBlockMessage(nest)} ${alt ? `Pick another folder, such as "${alt}" at the top of your vault.` : "Pick another folder."}`);
+            t.setValue(this.plugin.settings.folder);
+            return;
+          }
           this.plugin.settings.folder = cleaned;
           await set();
         };
@@ -6205,11 +6250,21 @@ export class StashpadSettingTab extends PluginSettingTab {
           .addButton((b) => b.setButtonText("Create").setCta().onClick(async () => {
             const raw = (nameInput?.value ?? "").trim().replace(/^\/+|\/+$/g, "");
             if (!raw) { new Notice("Enter a folder name first."); return; }
+            // 0.522.0: explain a nested name with a way to the Stashpad in the
+            // way. createNewStashpad refuses it too; this adds the "Open" choice.
+            // 0.525.0: and a folder inside one Stashpad keeps for itself.
+            // 0.528.0: a name INSIDE a Stashpad (or a reserved folder) is
+            // redirected to the vault root instead, so only the refusals with
+            // no root alternative (wrap, a blocked root name) stop here.
             try {
-              await this.plugin.createNewStashpad(raw);
-              new Notice(`Created Stashpad "${raw}".`);
+              const target = await this.plugin.resolveNewStashpadTarget(raw);
+              if (!target.ok) { this.plugin.explainNestBlock(target.verdict, { modal: true }); return; }
+              const { folder: made, message } = await this.plugin.createNewStashpad(raw);
+              new Notice(message ?? `Created Stashpad "${made}".`, message ? 10000 : undefined);
               if (nameInput) nameInput.value = "";
-              await this.plugin.waitForStashpadFolder(raw, 2000);
+              // The notice says an existing root folder "was opened", so open it.
+              if (target.redirect && target.redirect.existing !== "none") await this.plugin.openFolderInStashpad(made);
+              await this.plugin.waitForStashpadFolder(made, 2000);
               this.update?.();
             } catch (e) {
               new Notice(`Couldn't create: ${(e as Error).message}`);

@@ -2727,6 +2727,10 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   font-style: italic;
   color: var(--text-accent);
 }
+/* 0.522.0: folder switcher row for a create/convert the nesting rule refuses.
+   Muted rather than faded, so the reason line stays readable; choosing it
+   explains why. */
+.stashpad-suggest-blocked .stashpad-suggest-title { color: var(--text-muted); font-weight: normal; }
 
 /* 0.92.1: "Search excluded Stashpad folders" bottom action. */
 .stashpad-search-excluded-row {
@@ -4937,7 +4941,8 @@ body.is-mobile .stashpad-okf-cta {
 /* Shrinkable, capped: a long `detail` clause must never push the row's buttons
    past the modal edge (it did — they were unreachable). */
 .stashpad-link-log-outcome { flex: 0 1 auto; min-width: 0; max-width: 38%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
-.stashpad-link-log-outcome.is-not-found { color: var(--text-error); }
+.stashpad-link-log-outcome.is-not-found,
+.stashpad-link-log-outcome.is-refused { color: var(--text-error); }
 .stashpad-link-log-outcome.is-ignored { color: var(--text-faint); }
 .stashpad-link-log-btn { flex: 0 0 auto; padding: 2px 8px; font-size: 0.9em; }
 .stashpad-link-log-footer {

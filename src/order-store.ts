@@ -1,9 +1,29 @@
 import type { App } from "obsidian";
 import { STASHPAD_SIDECAR_FILES, type StashpadId } from "./types";
+import { readId } from "./id-service";
 
 // Canonical name lives in types.ts (STASHPAD_SIDECAR_FILES) so the list a
 // sibling plugin mirrors can never drift from what we actually write.
 const ORDER_FILE = STASHPAD_SIDECAR_FILES[0];
+
+/** 0.527.0: read one parent's order array from the sidecar, as TEXT ids.
+ *
+ *  An entry written by an older build (or by hand) may be the number 42 for a
+ *  note whose YAML id is the bare `42`. The old rule kept a parent's order only
+ *  if EVERY entry was a string, so one such entry silently dropped that
+ *  parent's whole manual order on reload. Now a number is read as its digit
+ *  string (readId), matching the text keys TreeIndex uses. Anything that is
+ *  neither (null, an object) is skipped on its own rather than discarding the
+ *  rest. Returns null only when `v` is not an array at all. */
+function orderIds(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: string[] = [];
+  for (const x of v) {
+    const id = readId(x);
+    if (id !== null && id !== "") out.push(id);
+  }
+  return out;
+}
 
 /** Per-folder ordering store. Maintains a `{ parentId: [childId, ...] }` map
  *  in `<folder>/.stashpad-order.json`. Children present in the map sort by
@@ -26,7 +46,8 @@ export class OrderStore {
         const parsed = JSON.parse(text);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           for (const [k, v] of Object.entries(parsed)) {
-            if (Array.isArray(v) && v.every((x) => typeof x === "string")) map[k] = v;
+            const ids = orderIds(v);
+            if (ids) map[k] = ids;
           }
         }
       }
@@ -123,7 +144,9 @@ export class OrderStore {
         const parsed = JSON.parse(await adapter.read(path));
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           for (const [k, v] of Object.entries(parsed)) {
-            if (!(k in map) && Array.isArray(v) && v.every((x) => typeof x === "string")) map[k] = v as string[];
+            if (k in map) continue;
+            const ids = orderIds(v);
+            if (ids) map[k] = ids;
           }
         }
       }

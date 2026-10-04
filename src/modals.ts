@@ -495,8 +495,19 @@ export class ConfirmDeleteModal extends Modal {
  *  (newlines included, rendered with `white-space: pre-wrap`). */
 type SplitDiffPart = { t: "eq" | "ins" | "del"; s: string };
 function splitWordDiff(a: string, b: string): SplitDiffPart[] {
-  const ax = a.split(/(\s+)/);
-  const bx = b.split(/(\s+)/);
+  // 0.517.1: skip the shared leading tokens before building the O(n×m) table.
+  // The Edit window calls this on every keystroke and the caret opens at the
+  // end of the note, so the whole note was being re-tabled per key (~45 ms at
+  // 8k chars, ~290 ms at 20k). Output is identical: the walk below always takes
+  // "eq" when tokens match, so the shared start already came out as one merged
+  // "eq" run, and the table past it depends only on the remaining tokens, so
+  // every later tie-break is unchanged. Do NOT also trim the shared suffix — the
+  // walk prefers "del" on ties, so suffix trimming changes the output. n/m must
+  // come from the sliced arrays or the walk reads past the table.
+  const ax0 = a.split(/(\s+)/), bx0 = b.split(/(\s+)/);
+  let p = 0;
+  while (p < ax0.length && p < bx0.length && ax0[p] === bx0[p]) p++;
+  const ax = ax0.slice(p), bx = bx0.slice(p);
   const n = ax.length, m = bx.length;
   const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
   for (let i = n - 1; i >= 0; i--) {
@@ -509,6 +520,10 @@ function splitWordDiff(a: string, b: string): SplitDiffPart[] {
     const last = out[out.length - 1];
     if (last && last.t === t) last.s += s; else out.push({ t, s });
   };
+  // 0.517.1: the skipped shared start, as the single "eq" run the walk used to
+  // build token by token. Guarded so a pair that differs from the very first
+  // token (p = 0) doesn't gain a leading empty "eq" part.
+  if (p) push("eq", ax0.slice(0, p).join(""));
   let i = 0, j = 0;
   while (i < n && j < m) {
     if (ax[i] === bx[j]) { push("eq", ax[i]); i++; j++; }
@@ -883,10 +898,17 @@ export class NoteWorkbench {
         row.textContent = line.length ? line : "\u200b";
         rows.push(row);
       }
+      // 0.519.0: measure every row BEFORE touching the gutter. Reading
+      // offsetHeight inside the loop below forced a fresh layout per line,
+      // because each createDiv + style.height write had just dirtied it. One
+      // batched read is a single layout. The heights are the same either way:
+      // the mirror is absolutely positioned with a fixed px width, so nothing
+      // the gutter does can change where its rows wrap.
+      const heights = rows.map((r) => r.offsetHeight);
       gutter.empty();
       for (let i = 0; i < lines.length; i++) {
         const n = gutter.createDiv({ cls: "stashpad-edit-lineno", text: String(i + 1) });
-        n.style.height = `${rows[i].offsetHeight}px`;
+        n.style.height = `${heights[i]}px`;
       }
     };
 

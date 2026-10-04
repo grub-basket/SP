@@ -1,9 +1,11 @@
 import { TFile, type App } from "obsidian";
 import { ROOT_ID, type StashpadId, type TreeNode } from "./types";
-import type { TreeIndex } from "./tree-index";
+import { isDirectlyInFolder, type TreeIndex } from "./tree-index";
 import { perf } from "./perf";
 import { getSettings } from "./settings";
 import { deriveCleanTitle } from "./alias-service";
+import { readId } from "./id-service";
+import { quoteNumericIdsInFile } from "./numeric-id-quote";
 
 const PARENT_LINK_FIELD = "parentLink";
 const CHILDREN_FIELD = "children";
@@ -78,6 +80,14 @@ export class FrontmatterSyncQueue {
     if (t == null) return false;
     this.recentSelfWrites.delete(path); // one-shot
     return Date.now() - t < FrontmatterSyncQueue.SELF_WRITE_GRACE_MS;
+  }
+
+  /** 0.523.9: same test as `wasRecentSelfWrite` but does NOT consume the flag.
+   *  The view's processOwnFrontMatter uses it to skip its own log-only marker
+   *  when this one will take the next modify event (see that helper). */
+  hasRecentSelfWrite(path: string): boolean {
+    const t = this.recentSelfWrites.get(path);
+    return t != null && Date.now() - t < FrontmatterSyncQueue.SELF_WRITE_GRACE_MS;
   }
 
   constructor(
@@ -267,6 +277,53 @@ export class FrontmatterSyncQueue {
     );
   }
 
+  /** 0.523.2: open-time heal check for a TOP-LEVEL note. True only when the
+   *  note sits directly in `folder` and HAS a `parentLink` that resolves to
+   *  something other than this folder's Home. Narrower than `wouldWrite` on
+   *  purpose, so a healthy folder sees zero writes on open:
+   *  - a missing `parentLink` is left to Rebootstrap (a folder used with
+   *    recovery links off, or imported, would otherwise be rewritten in full);
+   *  - `children` order drift is ignored;
+   *  - a link spelled differently that still resolves to the Home (Obsidian
+   *    rewrites it to the shortest form when the Home is renamed) is not wrong;
+   *  - an orphan (parent id missing) keeps its link, its only breadcrumb;
+   *    `computeParentLink` would return null and delete it;
+   *  - the note must be top-level ON DISK too (`parent` empty, `__root__` or
+   *    itself). TreeIndex.rebuild pins one member of a multi-note parent cycle
+   *    to the top, and which member depends on file order, so two devices
+   *    would each rewrite their own pick on every open;
+   *  - a note in a subfolder is skipped: a nested Stashpad links its own
+   *    top-level notes to ITS Home, so both views would flip it on every open;
+   *  - a link to a second `__root__` note directly in this folder (a sync
+   *    conflict copy, or the duplicate Home described for 0.521.0) counts as
+   *    this folder's Home. Devices can disagree on which of the two the tree
+   *    picks, and calling that wrong would rewrite every top-level note on
+   *    each open.
+   *  Parses the link the way the pinned-note "Go to parent" reader does
+   *  (`resolvePinnedParent` in folder-panel-view.ts), so "wrong" here means
+   *  that action opens the wrong note. Reads cached metadata only — no IO. */
+  staleTopLevelParentLink(id: StashpadId, folder: string): boolean {
+    const tree = this.getTree();
+    const node = tree.get(id);
+    const home = tree.getRoot().file;
+    if (!node?.file || !home || node.id === ROOT_ID) return false;
+    if (node.parent && node.parent !== ROOT_ID) return false;
+    if (!isDirectlyInFolder(node.file.path, folder)) return false;
+    const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
+    const diskParent: unknown = fm?.parent;
+    const topOnDisk = diskParent == null || diskParent === "" || diskParent === ROOT_ID || diskParent === node.id;
+    if (!topOnDisk) return false;
+    const raw: unknown = fm?.[PARENT_LINK_FIELD];
+    if (typeof raw !== "string" || !raw) return false;
+    if (raw === wikilinkFor(home.path)) return false;
+    const target = raw.replace(/^\[\[/, "").replace(/\]\]$/, "").split("|")[0].split("#")[0].trim();
+    const dest = this.app.metadataCache.getFirstLinkpathDest(target, node.file.path);
+    if (dest === home) return false;
+    if (dest && isDirectlyInFolder(dest.path, folder)
+      && this.app.metadataCache.getFileCache(dest)?.frontmatter?.id === ROOT_ID) return false;
+    return true;
+  }
+
   /** 0.294.0 (perf): the comparison half of `wouldWrite`, taking the
    *  already-computed links. `syncOne` used to call `wouldWrite` (which
    *  computed parentLink + children) and then compute BOTH again for the
@@ -374,8 +431,8 @@ export async function rebootstrapFolderFrontmatter(
   app: App,
   folder: string,
   opts?: { onlyIds?: ReadonlySet<string>; writeAliases?: boolean },
-): Promise<{ checked: number; written: number }> {
-  type Entry = { file: TFile; id: string; parent: string };
+): Promise<{ checked: number; written: number; quoted: number; unsafeIds: number }> {
+  type Entry = { file: TFile; id: string; parent: string; created: string };
 
   // 1. Index every Stashpad note in the folder by id, and build a
   //    parent→[children ids] adjacency list.
@@ -385,10 +442,19 @@ export async function rebootstrapFolderFrontmatter(
   for (const f of app.vault.getMarkdownFiles()) {
     if (f.path !== folder && !f.path.startsWith(folderPrefix)) continue;
     const fm = app.metadataCache.getFileCache(f)?.frontmatter;
-    const id = typeof fm?.id === "string" ? fm.id : null;
+    // 0.527.0: readId. A bare all-digit id (YAML number) used to be skipped
+    // here entirely, so its parentLink/children were never backfilled.
+    const id = readId(fm?.id);
     if (!id) continue;
-    const parent = typeof fm?.parent === "string" ? fm.parent : ROOT_ID;
-    byId.set(id, { file: f, id, parent });
+    // 0.521.0: only the folder's own Home is ROOT here. A `__root__` note in a
+    // subfolder is a nested Stashpad's Home. byId kept whichever `__root__`
+    // came last in getMarkdownFiles order, so the answer depended on file
+    // order and could disagree with the open view. That folder's own backfill
+    // looks after it.
+    if (id === ROOT_ID && !isDirectlyInFolder(f.path, folder)) continue;
+    const parent = readId(fm?.parent) ?? ROOT_ID;
+    const created = typeof fm?.created === "string" ? fm.created : "";
+    byId.set(id, { file: f, id, parent, created });
     const arr = childrenByParent.get(parent) ?? [];
     arr.push(id);
     childrenByParent.set(parent, arr);
@@ -407,14 +473,14 @@ export async function rebootstrapFolderFrontmatter(
   };
   const computeChildren = (entry: Entry): string[] => {
     const childIds = childrenByParent.get(entry.id) ?? [];
-    const links: string[] = [];
+    const kids: Entry[] = [];
     for (const cid of childIds) {
       // The home note's own `parent` is ROOT_ID, which is also its id — so a
       // naive adjacency lookup makes it its own child and writes a recovery
       // link pointing back at the note you're already reading.
       if (cid === entry.id) continue;
       const e = byId.get(cid);
-      if (e) links.push(linkForEntry(e));
+      if (e) kids.push(e);
     }
     // 0.272.5: sort deterministically. The order came from getMarkdownFiles(),
     // which is filesystem order and DIFFERS BETWEEN DEVICES — so each device
@@ -423,13 +489,29 @@ export async function rebootstrapFolderFrontmatter(
     // doing a large sync even though it says fully synced" churn: not new notes,
     // just this field flip-flopping. A stable sort makes every device produce
     // byte-identical output, so the write happens once and then stops.
-    links.sort();
-    return links;
+    // 0.523.4: sort by created, then id, NOT alphabetically. The open view's
+    // FrontmatterSyncQueue writes TreeIndex order, and alphabetical made the
+    // two writers rewrite each other's lists on every Rebootstrap → open.
+    // Keep in step with TreeIndex.rebuild's default comparator (tree-index.ts).
+    kids.sort((a, b) => a.created.localeCompare(b.created) || a.id.localeCompare(b.id));
+    return kids.map(linkForEntry);
+  };
+  // 0.523.4: compare children as a set of members, not a sequence. The view
+  // owns the order (manual drag order, sort modes, list pins), which this
+  // standalone pass cannot see. Rewriting a list whose members were already
+  // right only changed its order, and the view's next open changed it back.
+  const sameMembers = (a: string[], b: string[]): boolean => {
+    if (a.length !== b.length) return false;
+    const sa = [...a].sort();
+    const sb = [...b].sort();
+    return sa.every((v, i) => v === sb[i]);
   };
 
   // 2. Iterate, skip-if-equal, write with 50ms pacing on actual writes.
   let checked = 0;
   let written = 0;
+  let quoted = 0;
+  let unsafeIds = 0;
   for (const entry of byId.values()) {
     // Targeted mode: the whole folder is still INDEXED (children lists
     // and parent links can only be computed from the complete adjacency
@@ -439,6 +521,11 @@ export async function rebootstrapFolderFrontmatter(
     // one move look like a whole-folder re-upload to Obsidian Sync.
     if (opts?.onlyIds && !opts.onlyIds.has(entry.id)) continue;
     checked += 1;
+    // 0.527.0: quote a bare all-digit `id:` / `parent:` (value unchanged; see
+    // numeric-id-quote.ts). A cache-only check, so ordinary notes cost no IO.
+    const q = await quoteNumericIdsInFile(app, entry.file);
+    if (q === "quoted") quoted += 1;
+    else if (q === "unsafe") unsafeIds += 1;
     const desiredParent = computeParent(entry);
     const desiredChildren = computeChildren(entry);
     const fm = app.metadataCache.getFileCache(entry.file)?.frontmatter;
@@ -449,8 +536,10 @@ export async function rebootstrapFolderFrontmatter(
       ? currentChildrenRaw.filter((x: unknown): x is string => typeof x === "string")
       : [];
     const parentEqual = (currentParent ?? null) === (desiredParent ?? null);
-    const childrenEqual = currentChildren.length === desiredChildren.length
-      && currentChildren.every((v, i) => v === desiredChildren[i]);
+    const childrenEqual = sameMembers(currentChildren, desiredChildren);
+    // Same members: keep the order already on disk, even when this note is
+    // written for its parentLink or alias.
+    const childrenOut = childrenEqual ? currentChildren : desiredChildren;
     // 0.271.7: rebootstrap also backfills the readable alias when asked. Compute
     // the title (async file read) BEFORE the sync processFrontMatter callback,
     // and decide whether it is missing so a note that only needs an alias is not
@@ -472,7 +561,7 @@ export async function rebootstrapFolderFrontmatter(
       await app.fileManager.processFrontMatter(entry.file, (m) => {
         if (desiredParent) m[PARENT_LINK_FIELD] = desiredParent;
         else delete m[PARENT_LINK_FIELD];
-        if (desiredChildren.length > 0) m[CHILDREN_FIELD] = desiredChildren;
+        if (childrenOut.length > 0) m[CHILDREN_FIELD] = childrenOut;
         else delete m[CHILDREN_FIELD];
         if (aliasToAdd !== null) {
           const cur = m.aliases;
@@ -492,7 +581,7 @@ export async function rebootstrapFolderFrontmatter(
       console.warn("[Stashpad] rebootstrap fm sync failed", entry.file.path, e);
     }
   }
-  return { checked, written };
+  return { checked, written, quoted, unsafeIds };
 }
 
 function wikilinkFor(path: string): string {

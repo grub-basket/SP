@@ -224,7 +224,10 @@ export class ComposerAutocomplete {
     }
     win.addEventListener("resize", this.reposition);
     this.vaultListeners.push(() => win.removeEventListener("resize", this.reposition));
-    this.buildIndex();
+    // 0.517.0: index builds lazily on first trigger (buildItems) — no eager
+    // buildIndex() here. The detail panel re-attaches on every render (each
+    // cursor move), so an eager build walked the whole vault per move for a
+    // popup that usually never opens.
     // Refresh index on vault structure changes. Coalesce by just
     // invalidating; next openFor call rebuilds lazily.
     const invalidate = () => { this.indexBuilt = false; };

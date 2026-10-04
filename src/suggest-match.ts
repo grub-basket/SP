@@ -8,7 +8,8 @@
  *  the first token > everything else. Ties keep the caller's order (so a source
  *  pre-sorted by frequency stays frequency-sorted inside each band).
  *
- *  0.494.0 — autocomplete-everywhere. */
+ *  0.494.0 — autocomplete-everywhere. 0.526.3 — also holds keepMatchInClamp,
+ *  the search-snippet clamp helper used by `src/note-picker.ts`. */
 
 export function siftTokens(query: string): string[] {
   return query.toLowerCase().split(/\s+/).filter(Boolean);
@@ -98,4 +99,66 @@ export function replaceToken(value: string, tok: ListToken, replacement: string)
   const pad = before.length > 0 && prev.trim() !== "" ? " " : "";
   const next = before + pad + replacement + after;
   return { value: next, caret: before.length + pad.length + replacement.length };
+}
+
+/** 0.526.3: keep the search match inside the snippet's line clamp.
+ *
+ *  The search picker's cluster-row snippet is a ±2-line window around the
+ *  match line, but `.stashpad-suggest-snippet` in styles.css clamps it to 5
+ *  VISUAL lines (`-webkit-line-clamp: 5` on a pre-wrap block). Long context
+ *  lines above the match wrap into several visual lines each, and a match deep
+ *  inside a long line sits several visual lines into it, so the highlighted
+ *  word could land past line 5 and be cut off.
+ *
+ *  `lines` is the window (blank lines already dropped), `hitIdx` the match
+ *  line's index in it, `tokens` the lowercased query tokens, `cpl` an
+ *  estimated characters-per-visual-line. When every token's first hit already
+ *  fits in `maxLines`, the SAME array comes back (identical output). Otherwise
+ *  the match line's head is cut to "…" (only when the line alone overflows),
+ *  then the farthest context lines above are dropped until it fits. Only text
+ *  BEFORE the first highlight is ever removed, so a highlight that was visible
+ *  stays visible. */
+export function keepMatchInClamp(lines: string[], hitIdx: number, tokens: string[], cpl: number, maxLines = 5): string[] {
+  let hit = lines[hitIdx] ?? "";
+  const lower = hit.toLowerCase();
+  // col = start of the first highlight: every highlight starts at or after it,
+  // so it is the one safe cut point. end = where the LAST token's first hit
+  // ends, so a multi-word query keeps its far word in view too (review of
+  // 0.526.3: "paragraph zebra" kept only "paragraph" in view). firstEnd = end
+  // of the first highlight, the fallback target when the far word can't fit.
+  let col = -1;
+  let firstEnd = 0;
+  let end = 0;
+  for (const t of tokens) {
+    const i = t ? lower.indexOf(t) : -1;
+    if (i < 0) continue;
+    if (col < 0 || i < col) { col = i; firstEnd = i + t.length; }
+    end = Math.max(end, i + t.length);
+  }
+  if (col < 0) return lines;
+  let lead = lines.slice(0, hitIdx);
+  const ahead = (): number =>
+    lead.reduce((n, l) => n + Math.max(1, Math.ceil(l.length / cpl)), 0) + Math.floor(end / cpl);
+  if (ahead() < maxLines) return lines;
+  // The cut slices the RAW line at a column found in the lowercased copy, so
+  // skip it when lowercasing changed the length ("İ" → 2 code units): the
+  // offsets no longer line up and the cut could land past the match.
+  if (Math.floor(end / cpl) >= maxLines && lower.length === hit.length) {
+    // The match line alone overflows: keep about half a line before the match,
+    // starting at a word boundary when one falls before it.
+    let cut = Math.max(0, col - Math.floor(cpl / 2));
+    // Don't start on the second half of an emoji (a lone surrogate renders as
+    // a replacement box), and search from cut - 1 so a cut already at a word
+    // start stays put.
+    if (cut > 0 && cut < col && (hit.charCodeAt(cut) & 0xfc00) === 0xdc00) cut++;
+    const sp = hit.indexOf(" ", Math.max(0, cut - 1));
+    if (sp >= 0 && sp < col) cut = sp + 1;
+    if (cut > 0) { hit = "…" + hit.slice(cut); firstEnd += 1 - cut; end += 1 - cut; }
+  }
+  // The far word can't fit even with no context: aim for the first highlight.
+  if (Math.floor(end / cpl) >= maxLines) end = firstEnd;
+  // Dropping context only helps when the target fits once it is all gone;
+  // otherwise keep it, rather than losing context and still hiding the match.
+  if (Math.floor(end / cpl) < maxLines) while (lead.length && ahead() >= maxLines) lead = lead.slice(1);
+  return [...lead, hit, ...lines.slice(hitIdx + 1)];
 }

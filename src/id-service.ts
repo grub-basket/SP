@@ -42,6 +42,27 @@ export function readId(value: unknown): string | null {
   return null;
 }
 
+/** 0.527.1: true when a frontmatter date field (`created` / `modified`) holds
+ *  ANY value. YAML reads `created: 20261003` as a number (and a hand-written
+ *  date can come through as a non-string too); the old `typeof === "string"`
+ *  checks read that as missing and overwrote it with "now". A value that is
+ *  present is never ours to replace, whatever its type. */
+export function hasFmValue(v: unknown): boolean {
+  if (v === null || v === undefined) return false;
+  if (typeof v === "string") return v.trim() !== "";
+  return true;
+}
+
+/** 0.527.0: true when two id values name the same note, whether either side
+ *  came through as a YAML number (`id: 42`) or as text (`id: "42"`). Both sides
+ *  go through readId, so a number and its digit string match and a missing or
+ *  non-id value never matches anything (including another missing value).
+ *  Use this for every comparison against a RAW frontmatter `id`/`parent`. */
+export function sameId(a: unknown, b: unknown): boolean {
+  const x = readId(a);
+  return x !== null && x === readId(b);
+}
+
 /** Generate an id that `isUsed` rejects — dedup-at-creation. 6 chars over a
  *  32-char alphabet is ~1.07e9 ids, so the birthday bound gives a ~4% collision
  *  chance at 10k notes and near-certainty in the hundreds of thousands; checking

@@ -2,6 +2,7 @@ import { TFile, TFolder } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink } from "./types";
+import { readId } from "./id-service";
 import { formatDateOnly } from "./format";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { splitFrontmatter, serializeNote, importStashZip, STASH_EXT } from "./stash-package";
@@ -240,7 +241,7 @@ export class ImportService {
     if (file.extension === "md") {
       try {
         const { fm } = splitFrontmatter(await this.app.vault.read(file));
-        if (fm && typeof fm.id === "string" && fm.id) return false;
+        if (fm && readId(fm.id)) return false;   // 0.527.0: a bare all-digit id is still an id
       } catch { /* unreadable — fall through and let the import try */ }
     }
     return true;

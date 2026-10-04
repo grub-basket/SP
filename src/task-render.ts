@@ -50,6 +50,14 @@ export interface TaskTriageOpts {
   onOpen: (folder: string, id: string) => void;
 }
 
+/** 0.523.5: render generation per triage host. renderTaskTriage re-renders into
+ *  the SAME `host` (status chips, filters, complete, snooze), so an older render's
+ *  async Locked append still passes `host.isConnected` and would add a second
+ *  "Locked" section, or stale rows if its read lands last. Each render bumps the
+ *  host's generation; an append that sees a newer one drops itself. Keyed by the
+ *  element, so it is garbage-collected with the modal or aggregate div. */
+const triageGen = new WeakMap<HTMLElement, number>();
+
 /** 0.126.2: shared "grouped task triage" — filter bar (assignment / folder /
  *  status, matching the Tasks panel) + grouped sections + per-row
  *  complete/snooze/open. Owns `host` and re-renders itself after a filter
@@ -60,10 +68,10 @@ export interface TaskTriageOpts {
  *  header. Reads only the plaintext sidecar (never decrypts); click unlocks the
  *  bundle. Shared by the aggregate All-tasks view AND the Daily Review modal (both
  *  render through renderTaskTriage), so both surface locked tasks in one place. */
-async function appendLockedTasksToTriage(host: HTMLElement, app: App, plugin: StashpadPlugin): Promise<void> {
+async function appendLockedTasksToTriage(host: HTMLElement, app: App, plugin: StashpadPlugin, gen: number): Promise<void> {
   let locked: Awaited<ReturnType<StashpadPlugin["listLockedTasks"]>>;
   try { locked = await plugin.listLockedTasks(); } catch { return; }
-  if (!locked.length || !host.isConnected) return;
+  if (!locked.length || !host.isConnected || triageGen.get(host) !== gen) return;
   host.querySelector(".stashpad-tasks-empty")?.remove();
   const header = host.createDiv({ cls: "stashpad-review-section is-locked" });
   setIcon(header.createSpan({ cls: "stashpad-review-section-icon" }), "lock");
@@ -94,8 +102,11 @@ export function renderTaskTriage(
   host.addClass("stashpad-task-triage");
   // 0.306.0 (encrypted-pins P1): surface LOCKED tasks read-only at the end, so a
   // due task isn't lost behind the lock. Async + fire-and-forget (plaintext
-  // sidecars); runs regardless of the empty early-return below.
-  void appendLockedTasksToTriage(host, app, plugin);
+  // sidecars); runs regardless of the empty early-return below. 0.523.5: tagged
+  // with this render's generation so a superseded render's append is dropped.
+  const gen = (triageGen.get(host) ?? 0) + 1;
+  triageGen.set(host, gen);
+  void appendLockedTasksToTriage(host, app, plugin, gen);
 
   const allTasks = collectTasks(app, plugin);
 

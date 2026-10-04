@@ -2,7 +2,7 @@ import { App, ItemView, Menu, Modal, Platform, TFile, TFolder, WorkspaceLeaf, se
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type StashpadId } from "./types";
-import { renderCountBadge } from "./panels-view";
+import { ShowRenderGate, renderCountBadge } from "./panels-view";
 import { ConfirmModal, PinAliasModal } from "./modals";
 import { canRevealInOs, osFileManagerName, revealInOsFileManager } from "./os-reveal";
 
@@ -53,15 +53,32 @@ export class StashpadFolderPanelView extends ItemView {
    *  under the finger, cutting the gesture short (user report). */
   private gestureUntil = 0;
   private gestureDown = false;
+  /** 0.524.1 (perf P44): a vault or layout event while this panel is a hidden
+   *  tab no longer rebuilds it; the rebuild runs when the panel is shown. The
+   *  render on show supersedes any tick still pending, so that tick is
+   *  cancelled, unless a gesture is under way: then the normal tick waits it
+   *  out, as it always has. */
+  private showGate = new ShowRenderGate(this, () => {
+    if (this.gestureDown || Date.now() < this.gestureUntil) { this.scheduleRender(); return; }
+    if (this.renderTimer != null) { window.clearTimeout(this.renderTimer); this.renderTimer = null; }
+    this.render();
+  });
   private scheduleRender(): void {
     if (this.renderTimer != null) return;
     const tick = (): void => {
       this.renderTimer = null;
       if (!this.containerEl.isConnected) return;
+      if (this.showGate.deferWhileHidden()) return;
       if (this.gestureDown || Date.now() < this.gestureUntil) { this.renderTimer = window.setTimeout(tick, 150); return; }
       this.render();
     };
     this.renderTimer = window.setTimeout(tick, 100);
+  }
+  /** 0.524.1 (perf P44): Obsidian calls this when the view is laid out, which
+   *  includes being shown. Runs a render skipped while hidden. */
+  onResize(): void {
+    super.onResize();
+    this.showGate.renderIfShown();
   }
   private gestureListenersInstalled = false;
   private installGestureListeners(): void {
@@ -76,7 +93,37 @@ export class StashpadFolderPanelView extends ItemView {
     this.registerDomEvent(el, "scroll", bump, { capture: true, passive: true });
   }
 
+  /** 0.517.5 (perf P08): markdown files bucketed by parent dir, alive ONLY for
+   *  the duration of one synchronous render() (null otherwise). Each render used
+   *  to walk the whole vault 2 + folders + pins + expanded-children times via
+   *  childrenOf / rebuildHomeColors; now this view walks it once (the plugin's
+   *  listPinnedNotes still does its own walk, so 2 per render). Keyed with the exact
+   *  dir expression childrenOf compares against, so lookups by the raw `folder`
+   *  argument match the old per-file test; each bucket keeps getMarkdownFiles
+   *  order. Callers outside a render (click handlers) see null and fall back to
+   *  the live walk. Never hand a bucket out or sort it in place. */
+  private filesByDir: Map<string, TFile[]> | null = null;
+
   private render(): void {
+    // 0.517.5 (perf P08): the try/finally covers the whole body (incl. the
+    // scroll-restore tail), so the snapshot can't outlive this synchronous
+    // render, even when a step throws.
+    try {
+      const byDir = new Map<string, TFile[]>();
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+        let bucket = byDir.get(dir);
+        if (!bucket) { bucket = []; byDir.set(dir, bucket); }
+        bucket.push(f);
+      }
+      this.filesByDir = byDir;
+      this.renderBody();
+    } finally {
+      this.filesByDir = null;
+    }
+  }
+
+  private renderBody(): void {
     const root = this.contentEl;
     this.installGestureListeners();
     // 0.318.1: keep both lists' scroll positions across the rebuild (the pins
@@ -718,9 +765,15 @@ export class StashpadFolderPanelView extends ItemView {
     return null;
   }
 
-  private childrenOf(folder: string, parentId: StashpadId): TFile[] {
+  private childrenOf(folder: string, parentId: StashpadId, keep?: (fm: Record<string, unknown>) => boolean): TFile[] {
     const out: TFile[] = [];
-    for (const f of this.app.vault.getMarkdownFiles()) {
+    // 0.517.5 (perf P08): during a render, walk only this folder's bucket
+    // (looked up by the RAW `folder`, exactly what the dir test below compares
+    // against); outside a render, the live whole-vault walk as before. The dir
+    // test stays for that fallback. `keep` filters BEFORE the stable sort, which
+    // orders the survivors exactly as sort-then-filter did.
+    const src = this.filesByDir ? (this.filesByDir.get(folder) ?? []) : this.app.vault.getMarkdownFiles();
+    for (const f of src) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (dir !== folder) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
@@ -728,6 +781,7 @@ export class StashpadFolderPanelView extends ItemView {
       const p = fm.parent;
       if (p === parentId || (parentId === ROOT_ID && (p == null || p === ROOT_ID))) {
         if (fm.id === ROOT_ID) continue;
+        if (keep && !keep(fm)) continue;
         out.push(f);
       }
     }
@@ -820,7 +874,11 @@ export class StashpadFolderPanelView extends ItemView {
   }
   private rebuildHomeColors(): void {
     this.homeColorByFolder.clear();
-    for (const f of this.app.vault.getMarkdownFiles()) {
+    // 0.517.5 (perf P08): reuse render()'s dir buckets instead of a fresh vault
+    // walk. A dir's files all sit in its own bucket in getMarkdownFiles order, so
+    // when a folder has two colored Home notes the same (last) one still wins.
+    const groups = this.filesByDir ? this.filesByDir.values() : [this.app.vault.getMarkdownFiles()];
+    for (const files of groups) for (const f of files) {
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
       if (!fm || fm.id !== ROOT_ID || typeof fm.color !== "string" || !fm.color.trim()) continue;
       const dir = (f.parent?.path ?? "").replace(/\/+$/, "");
@@ -1067,8 +1125,10 @@ export class StashpadFolderPanelView extends ItemView {
     // 0.270.0: `listPinned` is "top" | "bottom" now; legacy `true` == "top".
     // Accept all three — an `=== true` test would silently drop every note
     // pinned since the bottom-pin feature landed.
-    return this.childrenOf(folder, ROOT_ID).filter((f) => {
-      const v = (this.app.metadataCache.getFileCache(f)?.frontmatter as any)?.listPinned;
+    // 0.517.5 (perf P08): filter inside childrenOf (before its sort) so a folder's
+    // 400-1000 Home notes aren't sorted just to find the 0-3 list-pinned ones.
+    return this.childrenOf(folder, ROOT_ID, (fm) => {
+      const v = fm.listPinned;
       return v === true || v === "top" || v === "bottom";
     });
   }

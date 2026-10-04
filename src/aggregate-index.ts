@@ -3,6 +3,7 @@ import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, siftMatch, parseAuthorRef, writeCompletedFm } from "./types";
 import { stripInlineMarkdown } from "./slug-service";
+import { readId } from "./id-service";
 import { ConfirmModal } from "./modals";
 import { parseSearchQuery } from "./note-picker";
 
@@ -165,7 +166,7 @@ export async function collectIndexRows(
     if (!folders.has(dir)) continue;
     const cache = app.metadataCache.getFileCache(f);
     const fm = (cache?.frontmatter ?? {}) as Record<string, unknown>;
-    const id = typeof fm.id === "string" ? fm.id : null;
+    const id = readId(fm.id);   // 0.527.1: bare all-digit ids count
     if (!id) continue;
     let set = idsByFolder.get(dir);
     if (!set) { set = new Set(); idsByFolder.set(dir, set); }
@@ -239,12 +240,12 @@ export async function collectIndexRows(
       repeat: typeof fm.repeat === "string" && fm.repeat.trim() ? fm.repeat.trim() : null,
       linkedDays: [...linkedDays],
       orphan: id !== ROOT_ID && (() => {
-        const parent = typeof fm.parent === "string" ? fm.parent : "";
+        const parent = readId(fm.parent) ?? "";
         if (!parent) return true;                     // no parent at all
         if (parent === ROOT_ID) return false;         // top-level — fine
         return !(idsByFolder.get(dir)?.has(parent));  // parent id resolves nowhere
       })(),
-      parentId: typeof fm.parent === "string" && fm.parent ? fm.parent : null,
+      parentId: readId(fm.parent) || null,
     });
   }
   return rows;

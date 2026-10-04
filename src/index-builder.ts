@@ -4,6 +4,7 @@ import type StashpadPlugin from "./main";
 import type { StashpadSettings } from "./settings";
 import { bodyToSlug, buildFilename } from "./slug-service";
 import { ROOT_ID } from "./types";
+import { readId } from "./id-service";
 
 /** Match a JD-style prefix at the START of a basename (file or folder)
  *  followed by a single space and the human title. A prefix is one of:
@@ -311,7 +312,8 @@ export async function buildJdIndexNotes(
         await app.fileManager.processFrontMatter(existing, (fm: any) => {
           fm.jdPrefix = prefix;
           if (parentId) fm.parent = parentId;
-          if (!fm.id || typeof fm.id !== "string") {
+          // 0.527.0: readId — a bare all-digit id (YAML number) is kept, not re-minted.
+          if (!readId(fm.id)) {
             fm.id = plugin.mintNoteId();
           }
           if (!fm.created) {

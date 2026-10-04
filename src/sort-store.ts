@@ -5,9 +5,10 @@ import { STASHPAD_SIDECAR_FILES, type StashpadId } from "./types";
  *  `{ parentId: SortMode }` map in `<folder>/.stashpad-sort.json`, loaded
  *  on view bootstrap and consulted by the tree's orderProvider.
  *
- *  - "manual" is the default and is NEVER persisted (it's the absence of
- *    an entry). Auto-flip-to-manual on drag/keyboard reorder is implemented
- *    by deleting the parent's entry.
+ *  - "manual" is the default and is NEVER persisted (on disk it's the
+ *    absence of an entry). In memory, choosing Manual — from the sort menu
+ *    or the drag/keyboard auto-flip — stores an explicit "manual" value so
+ *    doWrite's merge knows this session touched the parent (0.526.1).
  *  - Any non-manual mode is persisted explicitly so navigating away and
  *    back restores the user's chosen sort for each parent independently.
  *  - Granularity is per-parent — each parent in the tree carries its own
@@ -44,7 +45,8 @@ const VALID_MODES = new Set<string>(SORT_MODES_ORDER);
 const SORT_FILE = STASHPAD_SIDECAR_FILES[1]; // see types.ts
 
 export class SortStore {
-  /** folder -> { parentId -> SortMode } (excluding "manual" entries) */
+  /** folder -> { parentId -> SortMode }. "manual" may appear here as a
+   *  this-session marker (see setMode); it is never written to disk. */
   private cache = new Map<string, Record<string, SortMode>>();
 
   constructor(private app: App) {}
@@ -159,8 +161,15 @@ export class SortStore {
       // parse it. Treat unreadable as "leave it exactly as it is".
       try { existedButUnreadable = await adapter.exists(path); } catch { existedButUnreadable = true; }
     }
+    // 0.526.1: "manual" entries are in-memory markers only (see setMode). They
+    // stayed in `map` through the merge above so it wouldn't copy the old
+    // on-disk mode back over them; strip them here so disk keeps "manual = no
+    // entry". The empty check runs on what we'd write, so a folder whose only
+    // entries are manual removes the sidecar — unless it was unreadable.
+    const persisted: Record<string, SortMode> = {};
+    for (const [k, v] of Object.entries(map)) if (v !== "manual") persisted[k] = v;
     try {
-      if (Object.keys(map).length === 0) {
+      if (Object.keys(persisted).length === 0) {
         if (existedButUnreadable) {
           console.warn("Stashpad: sort sidecar unreadable — keeping it rather than deleting", path);
           return;
@@ -169,7 +178,7 @@ export class SortStore {
         // we swallow. One round-trip instead of two on a network drive.
         try { await adapter.remove(path); } catch { /* file already gone */ }
       } else {
-        await adapter.write(path, JSON.stringify(map, null, 2));
+        await adapter.write(path, JSON.stringify(persisted, null, 2));
       }
     } catch (e) {
       console.warn("Stashpad: sort save failed", e);
@@ -181,20 +190,28 @@ export class SortStore {
     return this.cache.get(folder)?.[parentId] ?? "manual";
   }
 
-  /** Set a parent's sort mode. Passing "manual" deletes the entry (manual is the
-   *  absence of an entry — keeps the json file compact). */
+  /** Set a parent's sort mode. "manual" is kept as an explicit value in memory
+   *  and never written (doWrite strips it, so the json file stays compact).
+   *
+   *  0.526.1: this used to `delete` the entry for "manual". doWrite's 0.140.3
+   *  merge copies every on-disk key that is missing from the cache, so the
+   *  deleted parent got its old mode back from the sidecar on the next save
+   *  (~150ms later) — picking Manual, or the drag/keyboard auto-flip to it,
+   *  never stuck once another mode had been saved. An explicit value reads as
+   *  "touched this session", which the merge already leaves alone. */
   setMode(folder: string, parentId: StashpadId, mode: SortMode): void {
     const map = this.cache.get(folder) ?? {};
-    if (mode === "manual") delete map[parentId];
-    else map[parentId] = mode;
+    map[parentId] = mode;
     this.cache.set(folder, map);
   }
 
-  /** Drop a parent's entry — used when a parent note is deleted. */
+  /** Drop a parent's entry — used when a parent note is deleted. 0.526.1: marks
+   *  it "manual" rather than deleting it, for the same reason as setMode — a
+   *  deleted key would be copied back from disk by doWrite's merge. */
   removeParent(folder: string, parentId: StashpadId): void {
     const map = this.cache.get(folder);
     if (!map) return;
-    delete map[parentId];
+    map[parentId] = "manual";
   }
 
   invalidate(folder: string): void { this.cache.delete(folder); }

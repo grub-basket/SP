@@ -1,4 +1,4 @@
-import { App, ItemView, Menu, TFile, WorkspaceLeaf, setIcon, type EventRef } from "obsidian";
+import { App, ItemView, Menu, Platform, TFile, WorkspaceLeaf, setIcon, type EventRef } from "obsidian";
 import { notify } from "./notify";
 import { returnToOriginOnClose } from "./leaf-return";
 import type StashpadPlugin from "./main";
@@ -13,6 +13,7 @@ import {
   type StashpadId,
 } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
+import { readId, sameId } from "./id-service";
 import { PinAliasModal } from "./modals";
 import { collectTasks as collectTasksShared, titleFromTaskFile, type TaskItem } from "./task-collect";
 import { isFailedTask } from "./task-render";
@@ -28,6 +29,75 @@ export function renderCountBadge(host: HTMLElement, count: number, expanded: boo
   const badge = host.createSpan({ cls: "stashpad-count-badge" });
   if (expanded) badge.addClass("is-expanded");
   badge.setText(count > 99 ? "99+" : String(count));
+}
+
+/** 0.524.1 (perf P44): lets a sidebar view skip a scheduled rebuild while it is
+ *  hidden (a background tab: an ancestor is display:none, so offsetParent is
+ *  null) and run it the moment it is shown. Desktop only: on mobile the gate is
+ *  off and every tick renders as before. A closed mobile drawer IS display:none
+ *  (Obsidian hides it once the close animation ends), so without that check the
+ *  owed render would run on the first frame of opening the drawer, mid-swipe.
+ *  That path was never part of this design or its tests, so it is left alone.
+ *  Shared by StashpadPanelsView + StashpadFolderPanelView.
+ *
+ *  The first try (0.519.4) was reverted after live testing: when a tab was
+ *  hidden and shown again within one frame (shown from a requestAnimationFrame
+ *  callback queued after the skipped tick), no observer ever saw its size
+ *  change, so neither Obsidian's onResize nor a rAF re-check fired once it was
+ *  visible, and the panel kept old content. Here EVERY skip re-arms a
+ *  ResizeObserver on the view's container: unobserve + observe resets its last
+ *  reported size to 0x0. The browser checks observed sizes after all of a
+ *  frame's rAF callbacks and before paint, so the observer fires at that check
+ *  if the view is visible by then, or later when the view gets a size. Either
+ *  way the render lands before the shown panel is painted. Obsidian's onResize
+ *  is a second trigger. Each trigger re-checks visibility, so an early or extra
+ *  fire just waits for the next one. */
+export class ShowRenderGate {
+  /** A render was skipped while hidden and is owed on the next show. */
+  private renderWhenShown = false;
+  private ro: ResizeObserver | null = null;
+  private roWin: Window | null = null;
+  constructor(private view: ItemView, private renderNow: () => void) {}
+
+  /** Call from the render tick, AFTER the isConnected check. Returns true when
+   *  the view is hidden and the render is owed until it is shown. Always false
+   *  on mobile (see the class comment). */
+  deferWhileHidden(): boolean {
+    if (Platform.isMobile) return false;
+    const el = this.view.containerEl;
+    if (el.offsetParent) return false;
+    // The observer must come from the view's OWN window: one from the main
+    // window may not see layout in a popout.
+    const win = el.ownerDocument?.defaultView ?? window;
+    const RO = win.ResizeObserver;
+    if (typeof RO !== "function") return false; // no way to hear the show, so render now
+    if (!this.ro || this.roWin !== win) {
+      this.ro?.disconnect();
+      const ro = new RO(() => this.renderIfShown());
+      this.view.register(() => ro.disconnect());
+      this.ro = ro;
+      this.roWin = win;
+    }
+    // observe() on an element that is already observed does nothing in
+    // Chromium, so unobserve first, or its last reported size never resets.
+    this.ro.unobserve(el);
+    this.ro.observe(el);
+    this.renderWhenShown = true;
+    return true;
+  }
+
+  /** Call from the view's onResize; also the observer's callback. Does nothing
+   *  unless a render is owed AND the view is visible right now. */
+  renderIfShown(): void {
+    if (!this.renderWhenShown) return;
+    const el = this.view.containerEl;
+    if (!el.isConnected || !el.offsetParent) return;
+    this.renderWhenShown = false;
+    this.ro?.unobserve(el);
+    // This can run inside Obsidian's resize pass; a render error must not stop
+    // the other leaves from being resized.
+    try { this.renderNow(); } catch (e) { console.warn("[Stashpad] panel render on show failed", e); }
+  }
 }
 
 /** 0.76.2: one task row in the Tasks panel. */
@@ -128,12 +198,27 @@ export class StashpadPanelsView extends ItemView {
   }
 
   private renderTimer: number | null = null;
+  /** 0.524.1 (perf P44): a vault event while this view is a hidden tab no
+   *  longer rebuilds it; the rebuild runs when the view is shown. The render
+   *  on show supersedes any tick still pending, so that tick is cancelled. */
+  private showGate = new ShowRenderGate(this, () => {
+    if (this.renderTimer != null) { window.clearTimeout(this.renderTimer); this.renderTimer = null; }
+    this.render();
+  });
   private scheduleRender(): void {
     if (this.renderTimer != null) return;
     this.renderTimer = window.setTimeout(() => {
       this.renderTimer = null;
-      if (this.containerEl.isConnected) this.render();
+      if (!this.containerEl.isConnected) return;
+      if (this.showGate.deferWhileHidden()) return;
+      this.render();
     }, 80);
+  }
+  /** 0.524.1 (perf P44): Obsidian calls this when the view is laid out, which
+   *  includes being shown. Runs a render skipped while hidden. */
+  onResize(): void {
+    super.onResize();
+    this.showGate.renderIfShown();
   }
 
   private render(): void {
@@ -240,7 +325,42 @@ export class StashpadPanelsView extends ItemView {
     this.render();
   }
 
+  /** 0.518.6 (perf P37): markdown files bucketed by parent dir, alive ONLY for
+   *  the duration of one synchronous renderPinnedPanel() (null otherwise). A
+   *  Pinned render used to walk the whole vault once per pin (findFileFor),
+   *  once per pin again for its child count, and once per expanded child and
+   *  per visible subtree row (childrenOf); now this panel walks it once (the
+   *  plugin's listPinnedNotes still does its own walk). Keyed with the exact
+   *  dir expression findFileFor / childrenOf compare against, so lookups by the
+   *  raw folder argument match the old per-file test; each bucket keeps
+   *  getMarkdownFiles order, so findFileFor still returns the same first match.
+   *  Built here rather than in render() so the Shared and Tasks panels don't
+   *  pay for it. Callers outside a Pinned render see null and fall back to the
+   *  live walk. Never hand a bucket out or sort it in place. Same pattern as the
+   *  folder panel's P08 index. */
+  private filesByDir: Map<string, TFile[]> | null = null;
+
   private renderPinnedPanel(parent: HTMLElement): void {
+    // 0.518.6 (perf P37): the try/finally covers the whole panel body,
+    // including its early returns, so the snapshot can't outlive this
+    // synchronous render even when a step throws. The fire-and-forget
+    // locked-pins append never reads it.
+    try {
+      const byDir = new Map<string, TFile[]>();
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+        let bucket = byDir.get(dir);
+        if (!bucket) { bucket = []; byDir.set(dir, bucket); }
+        bucket.push(f);
+      }
+      this.filesByDir = byDir;
+      this.renderPinnedPanelBody(parent);
+    } finally {
+      this.filesByDir = null;
+    }
+  }
+
+  private renderPinnedPanelBody(parent: HTMLElement): void {
     const list = parent.createDiv({ cls: "stashpad-panel-pinned" });
     // 0.306.0 (encrypted-pins P1): append any LOCKED pinned bundles below the
     // live pins. Async (reads the plaintext .stashmeta sidecars) + fire-and-
@@ -363,7 +483,7 @@ export class StashpadPanelsView extends ItemView {
     const title = this.titleFromFile(file);
     const color = typeof fm.color === "string" ? fm.color : null;
     const completed = fm.completed === true;
-    const childCount = this.childrenOf(pin.folder, pin.id).length;
+    const childCount = this.childrenOf(pin.folder, pin.id, false).length;
     const hasChildren = childCount > 0;
     const isExpanded = this.expanded.has(`${pin.folder}|${pin.id}`);
 
@@ -484,11 +604,11 @@ export class StashpadPanelsView extends ItemView {
     const children = this.childrenOf(folder, parentId);
     for (const child of children) {
       const fm = (this.app.metadataCache.getFileCache(child)?.frontmatter ?? {}) as any;
-      const childId = typeof fm.id === "string" ? fm.id : null;
+      const childId = readId(fm.id);   // 0.527.0: a bare all-digit id is an id
       if (!childId) continue;
       const color = typeof fm.color === "string" ? fm.color : null;
       const completed = fm.completed === true;
-      const grandkidCount = this.childrenOf(folder, childId).length;
+      const grandkidCount = this.childrenOf(folder, childId, false).length;
       const hasGrandkids = grandkidCount > 0;
       const isExpanded = this.expanded.has(`${folder}|${childId}`);
       const row = parent.createDiv({ cls: "stashpad-pinned-subrow" });
@@ -518,41 +638,56 @@ export class StashpadPanelsView extends ItemView {
 
   // ---------- Helpers ----------
 
-  /** Find the file backing a {folder, id} reference. Walks the
-   *  metadataCache once per call — cheap on typical vault sizes; can
-   *  cache if it ever shows up in profiles. */
+  /** Find the file backing a {folder, id} reference. During a Pinned render
+   *  it scans only the pin's folder bucket from filesByDir (0.518.6);
+   *  outside one it walks every markdown file in the vault once per call. */
   private findFileFor(pin: PinnedNoteRef): TFile | null {
-    for (const f of this.app.vault.getMarkdownFiles()) {
+    // 0.518.6 (perf P37): during a Pinned render, scan only the pin's folder
+    // bucket (looked up by the raw pin.folder the dir test compares against,
+    // in getMarkdownFiles order, so the same first match wins); otherwise the
+    // live whole-vault walk as before.
+    const src = this.filesByDir ? (this.filesByDir.get(pin.folder) ?? []) : this.app.vault.getMarkdownFiles();
+    for (const f of src) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (dir !== pin.folder) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
-      if (fm?.id === pin.id) return f;
+      if (sameId(fm?.id, pin.id)) return f;   // 0.527.0: lockstep with plugin.fileForPin
     }
     return null;
   }
 
   /** Children of a given id within a folder — files whose
-   *  frontmatter.parent matches. */
-  private childrenOf(folder: string, parentId: StashpadId): TFile[] {
+   *  frontmatter.parent matches. 0.518.6 (perf P37): callers that only read
+   *  `.length` (the child-count badges) pass `sort = false` to skip the
+   *  created-date sort; the set of files is identical either way. */
+  private childrenOf(folder: string, parentId: StashpadId, sort = true): TFile[] {
     const out: TFile[] = [];
-    for (const f of this.app.vault.getMarkdownFiles()) {
+    // 0.518.6 (perf P37): during a Pinned render, walk only this folder's
+    // bucket (looked up by the RAW `folder`, exactly what the dir test below
+    // compares against); otherwise the live whole-vault walk as before. The
+    // dir test stays for that fallback. Matches always go into a fresh `out`,
+    // so the sort below never reorders a bucket.
+    const src = this.filesByDir ? (this.filesByDir.get(folder) ?? []) : this.app.vault.getMarkdownFiles();
+    for (const f of src) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (dir !== folder) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
-      if (!fm || typeof fm.id !== "string") continue;
+      if (!fm || !readId(fm.id)) continue;
       const p = fm.parent;
-      if (p === parentId || (parentId === ROOT_ID && (p == null || p === ROOT_ID))) {
+      // 0.527.0: sameId — `parent: 42` (number) and "42" are the same parent.
+      if (sameId(p, parentId) || (parentId === ROOT_ID && (p == null || p === ROOT_ID))) {
         // Skip the home note itself when listing children of root.
         if (fm.id === ROOT_ID) continue;
         out.push(f);
       }
     }
+    if (!sort) return out;
     // Sort by created (created frontmatter ascending), fallback to filename.
     out.sort((a, b) => {
       const fmA = this.app.metadataCache.getFileCache(a)?.frontmatter as any;
       const fmB = this.app.metadataCache.getFileCache(b)?.frontmatter as any;
-      const ca = (fmA?.created as string) ?? "";
-      const cb = (fmB?.created as string) ?? "";
+      const ca = String(fmA?.created ?? "");
+      const cb = String(fmB?.created ?? "");
       return ca.localeCompare(cb);
     });
     return out;
@@ -835,8 +970,8 @@ export class StashpadPanelsView extends ItemView {
     out.sort((a, b) => {
       const fmA = (this.app.metadataCache.getFileCache(a.file)?.frontmatter ?? {}) as any;
       const fmB = (this.app.metadataCache.getFileCache(b.file)?.frontmatter ?? {}) as any;
-      const tA = (fmA.modified ?? fmA.created ?? "") as string;
-      const tB = (fmB.modified ?? fmB.created ?? "") as string;
+      const tA = String(fmA.modified ?? fmA.created ?? "");
+      const tB = String(fmB.modified ?? fmB.created ?? "");
       return tB.localeCompare(tA);
     });
     return out;

@@ -145,18 +145,25 @@ export class WelcomeModal extends Modal {
   private async run(choice: OnboardingChoice): Promise<void> {
     if (this.busy) return; // double-click guard: seeding is not instant
     this.busy = true;
-    const folder = this.resolvedFolder();
+    let folder = this.resolvedFolder();
     try {
+      // 0.528.0: a name inside an existing Stashpad is redirected to the vault
+      // root; `folder` becomes where it actually went, and the notice says why.
       if (choice === "demo") {
-        const { created, skipped } = await seedDemoContent(this.app, this.plugin, folder);
-        notify(
-          `Stashpad: created "${folder}" with ${created} example note${created === 1 ? "" : "s"}` +
-            (skipped > 0 ? ` (${skipped} skipped — those files already existed)` : ""),
-          8000,
-        );
+        const { created, skipped, folder: made, message } = await seedDemoContent(this.app, this.plugin, folder);
+        folder = made;
+        if (message) notify(`Stashpad: ${message}`, 10000);
+        if (created > 0 || !message) {
+          notify(
+            `Stashpad: created "${folder}" with ${created} example note${created === 1 ? "" : "s"}` +
+              (skipped > 0 ? ` (${skipped} skipped — those files already existed)` : ""),
+            8000,
+          );
+        }
       } else {
-        await this.plugin.createNewStashpad(folder);
-        notify(`Stashpad: created "${folder}".`, 6000);
+        const { folder: made, message } = await this.plugin.createNewStashpad(folder);
+        folder = made;
+        notify(message ? `Stashpad: ${message}` : `Stashpad: created "${folder}".`, message ? 10000 : 6000);
       }
       this.choice = choice;
       this.close();

@@ -66,6 +66,10 @@ export class RenderCacheStore implements RenderCacheLike {
   private saveTimer: number | null = null;
   private dirOk = false;
   private writeChain: Promise<void> = Promise.resolve();
+  /** 0.518.2 (perf): the save QUEUED behind the in-flight one that has not yet
+   *  snapshotted the map. While it exists, further save() calls join it instead
+   *  of chaining their own whole-cache write — see the note in save(). */
+  private trailingSave: Promise<void> | null = null;
   private idbBroken = false;
   private static SAVE_DEBOUNCE_MS = 8000;
   private static IDB_NAME = "stashpad-render-cache";
@@ -324,13 +328,37 @@ export class RenderCacheStore implements RenderCacheLike {
     for (const k of ranked.slice(0, over)) { this.map.delete(k); this.used.delete(k); }
   }
 
-  /** Flush if dirty. Chained so overlapping saves serialize. Call on plugin
-   *  unload to persist the latest. */
+  /** Flush if dirty. Chained so overlapping saves serialize, and coalesced
+   *  (0.518.2) so saves that arrive while a write is still queued join it.
+   *  That only cuts writes when one write takes longer than the gap between
+   *  saves (a large cache, a slow disk, or many evicts in one tick); a small
+   *  cache on a fast disk finishes each write before the next evict, so it
+   *  still writes once per evict. Call on plugin unload to persist the
+   *  latest. */
   save(): Promise<void> {
     if (this.saveTimer != null) { window.clearTimeout(this.saveTimer); this.saveTimer = null; }
     if (!this.dirty) return this.writeChain;
     this.dirty = false;
-    this.writeChain = this.writeChain.then(async () => {
+    // 0.518.2 (perf): TRAILING-COALESCE, same shape as the settings queueWrite
+    // (src/main.ts). Every flushing evict() — one per file of a bulk delete or
+    // a subtree lock — used to chain its OWN write, and each one serialized the
+    // WHOLE cache (up to MAX_ENTRIES bodies + rendered HTML) into IndexedDB: N
+    // notes = N multi-MB writes. A write snapshots the LIVE map, so one write
+    // satisfies every caller whose change landed before its snapshot. While a
+    // write is queued but has not snapshotted yet, join it; a burst becomes the
+    // in-flight write plus one trailing write.
+    //
+    // SECURITY (the cache holds note plaintext): evict() deletes from the map
+    // synchronously BEFORE calling here, and we only join a write that has not
+    // snapshotted yet, so the joined write still omits the evicted path. The
+    // slot is cleared after the load wait and BEFORE the snapshot (no await in
+    // between), so a change arriving after the snapshot schedules a fresh write
+    // rather than riding one that already captured the map. The load wait
+    // swallows errors so the slot can never get stuck — a stuck slot would make
+    // every later save join a write that already ran, and no evict would ever
+    // reach disk again.
+    if (this.trailingSave) return this.trailingSave;
+    const run: Promise<void> = this.writeChain.then(async () => {
       try {
         // 0.294.0 (perf): load() is no longer awaited in onload, so a save can be
         // reached (a first render's debounce, or the unload flush) while the map
@@ -339,7 +367,8 @@ export class RenderCacheStore implements RenderCacheLike {
         // merge in first. Resolves immediately if no load was ever started, and
         // load()'s merge already refuses to re-admit anything tombstoned, so a
         // security flush still can't be undone by the entries it waits for.
-        await this.ready;
+        await this.ready.catch(() => {});
+        if (this.trailingSave === run) this.trailingSave = null; // about to snapshot — stop coalescing
         this.pruneLru();
         const obj = {
           schema: CACHE_SCHEMA,
@@ -363,7 +392,9 @@ export class RenderCacheStore implements RenderCacheLike {
         console.warn("[Stashpad] render cache save failed", e);
       }
     });
-    return this.writeChain;
+    this.writeChain = run.catch(() => {});
+    this.trailingSave = run;
+    return run;
   }
 
   private async ensureDir(): Promise<void> {

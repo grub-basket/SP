@@ -1,6 +1,6 @@
 import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
-import { freshId, newId } from "./id-service";
+import { freshId, hasFmValue, newId, readId, sameId } from "./id-service";
 import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
@@ -22,7 +22,7 @@ import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-vie
 // 0.301.0: searchable modal to jump to any Stashpad view.
 import { ViewLauncherModal } from "./view-launcher";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
+import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, readFolderSubtreeNodes, type SubtreeNode, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
 import { RecentLinksModal, ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult, SettingsBackupModal} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
@@ -44,7 +44,7 @@ import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { buildStashpadLink, parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
-import { LinkLog, type LinkLogEntry } from "./link-log";
+import { LinkLog, type LinkLogEntry, type LinkLogOutcome } from "./link-log";
 import { ROOT_ID, parseAssignees, writeCompletedFm, siftMatch } from "./types";
 import { removeIconSprites } from "./icon-sprite";
 import { parseRecurrence, nextDueOnComplete, parseDuration, parseRepeatMode } from "./recurrence";
@@ -73,6 +73,7 @@ import { SettingsStore } from "./settings-store";
 import { TEXT_IMPORT_VIEW_TYPE, TextImportView, type ImporterViewContext } from "./text-import-modal";
 import { APP_IMPORT_VIEW_TYPE, AppImportView, type AppImporterViewContext } from "./stashpad-app-import-modal";
 import { settleNewTab, buildHomeFilename, splitIntoChunks } from "./view-helpers";
+import { makeNestChecker, nestBlockMessage, nestBlockReason, normalizeNestPath, headClaimsFolder, trivialNestVerdict, withReservedRule, rootRedirectName, redirectMessage, redirectWhy, type NestVerdict, type NewStashpadVerdict, type NewStashpadTarget, type NewStashpadResult } from "./nest-guard";
 import { returnToOriginOnClose } from "./leaf-return";
 import { resolveObscureAll } from "./obscure-scope";
 
@@ -104,7 +105,8 @@ class AttachmentParentPicker extends FuzzySuggestModal<TFile> {
 /** 0.292.0 (perf): per-folder keys excluded from the render signature (their
  *  local setters repaint + `refreshFolderPeers`). When one is ADOPTED from
  *  another device no setter runs, so `onExternalDataJsonChange` forces a repaint
- *  — but only for these. */
+ *  — but only for these. Keep in sync with peerFilterSig() in view.ts, which
+ *  hand-copies this key set. */
 const PEER_RENDER_KEYS = new Set([
   "viewModes", "includeAttachmentsInEverything", "encryptionFilter",
   "hideChildlessNotes", "hideCompletedNotes", "attachmentsOnlyNotes",
@@ -473,7 +475,12 @@ export default class StashpadPlugin extends Plugin {
     const beat = this.takeHeartbeat();
     try {
       let body = "";
-      if (await adapter.exists(cur)) body = await adapter.read(cur);
+      // 0.517.2 (perf): check for the file once and reuse the answer for the
+      // remove below — each check is a full round trip on a network-drive
+      // vault, and this runs on the awaited startup path. Nothing can create
+      // the file in between: flushTraceToDisk waits for traceRotateDone.
+      const had = await adapter.exists(cur);
+      if (had) body = await adapter.read(cur);
       if (sync.trim()) {
         body += `${body ? "\n" : ""}--- last synchronous snapshot (survives a force-quit; may overlap the lines above) ---\n${sync}`;
       }
@@ -485,7 +492,7 @@ export default class StashpadPlugin extends Plugin {
         body += `${body ? "\n" : ""}--- last heartbeat before this session ended (250ms resolution) ---\n${beat}`;
       }
       if (body.trim()) await adapter.write(prev, body);
-      if (await adapter.exists(cur)) await adapter.remove(cur);
+      if (had) await adapter.remove(cur);
     } catch { /* best effort */ }
   }
 
@@ -1146,9 +1153,29 @@ export default class StashpadPlugin extends Plugin {
    *  ROOT_ID frontmatter. Throws on collision so the caller can surface
    *  a clear error. After this resolves, discoverStashpadFolders will
    *  include the new folder. */
-  async createNewStashpad(folder: string): Promise<void> {
-    const cleaned = folder.trim().replace(/^\/+|\/+$/g, "");
-    if (!cleaned) throw new Error("Folder name is empty");
+  async createNewStashpad(folder: string): Promise<NewStashpadResult> {
+    const typed = folder.trim().replace(/^\/+|\/+$/g, "");
+    if (!typed) throw new Error("Folder name is empty");
+    // Reject "." / ".." before anything reads the disk (see below).
+    if (typed.split("/").some((p) => p === "." || p === "..")) {
+      throw new Error(`Folder name can't contain "." or ".." path segments`);
+    }
+    // 0.528.0: a name refused for being INSIDE a Stashpad (or inside one of
+    // Stashpad's own folders) goes to the vault root under its last segment.
+    // If the root already has that name, nothing is created: an existing
+    // Stashpad is returned as-is, a plain folder becomes the Stashpad (Home
+    // seeded below, nothing overwritten). Everything else still throws.
+    const target = await this.resolveNewStashpadTarget(typed);
+    if (!target.ok) throw new Error(nestBlockMessage(target.verdict));
+    const result: NewStashpadResult = { folder: target.folder, message: target.redirect?.message ?? null };
+    if (target.redirect?.existing === "stashpad") return result;
+    await this.createStashpadAt(target.folder);
+    return result;
+  }
+
+  /** The create half of createNewStashpad, for a path already judged. */
+  private async createStashpadAt(folder: string): Promise<void> {
+    const cleaned = folder;
     // Reject "." / ".." segments before any mkdir. Paths here are joined against
     // the vault root, and 0.208.0 wired this to a free-text field in the
     // first-run welcome, so the traversal invariant now has a user-facing entry
@@ -1156,6 +1183,12 @@ export default class StashpadPlugin extends Plugin {
     if (cleaned.split("/").some((p) => p === "." || p === "..")) {
       throw new Error(`Folder name can't contain "." or ".." path segments`);
     }
+    // 0.522.0: no Stashpad inside (or around) another one. Checked before the
+    // mkdir so a refused name leaves no empty folder behind. Backs the settings
+    // "Create" button and the welcome modal, which show this message.
+    // 0.525.0: also refuses a folder inside one Stashpad keeps for itself.
+    const nest = this.checkCreateStashpadFolder(cleaned);
+    if (!nest.ok) throw new Error(nestBlockMessage(nest));
     const adapter = this.app.vault.adapter;
     // mkdir intermediates.
     const parts = cleaned.split("/").filter(Boolean);
@@ -1181,7 +1214,7 @@ export default class StashpadPlugin extends Plugin {
         await this.app.fileManager.processFrontMatter(homeFile, (fm) => {
           if (typeof fm.id !== "string" || !fm.id) fm.id = ROOT_ID;
           if (!("parent" in fm)) fm.parent = null;
-          if (typeof fm.created !== "string" || !fm.created) {
+          if (!hasFmValue(fm.created)) {   // 0.527.1: never overwrite a present created
             fm.created = new Date().toISOString();
           }
         });
@@ -1204,6 +1237,65 @@ export default class StashpadPlugin extends Plugin {
     // 0.99.17 (#2): also seed every KNOWN author (coworkers from other folders)
     // so a new folder auto-populates and you can assign anyone immediately.
     try { await this.seedKnownAuthorsInFolder(cleaned); } catch { /* ignore */ }
+  }
+
+  /** 0.528.0: where a NEW Stashpad typed as `path` should go. As typed when it
+   *  passes the nest + reserved rules. When it's refused for being INSIDE a
+   *  Stashpad or inside a reserved folder, the vault root under its last path
+   *  segment, matched against the root's existing folders case-insensitively
+   *  on a case-insensitive disk:
+   *   - nothing there → create it (`existing: "none"`);
+   *   - a Stashpad there → open it, create nothing (`"stashpad"`);
+   *   - a plain folder that may become a Stashpad → open it as one (`"folder"`);
+   *   - anything else (a file, an unindexed entry, a folder that itself holds
+   *     a Stashpad) → refused with the ORIGINAL verdict.
+   *  The redirect target is a root folder, so it can never be inside another
+   *  Stashpad; it is still run through the full check (contains / reserved).
+   *  Read-only: writes nothing. */
+  async resolveNewStashpadTarget(path: string): Promise<NewStashpadTarget> {
+    const p = normalizeNestPath(path);
+    // Same refusals as createNewStashpad. Before any disk read: the adapter
+    // joins against the vault root, so a ".." could look outside the vault.
+    if (!p) throw new Error("Folder name is empty");
+    if (p.split("/").some((s) => s === "." || s === "..")) {
+      throw new Error(`Folder name can't contain "." or ".." path segments`);
+    }
+    const v = withReservedRule(await this.checkNewStashpadFolderOnDisk(p), p);
+    if (v.ok) return { ok: true, folder: p, redirect: null };
+    const name = rootRedirectName(v);
+    if (!name) return { ok: false, verdict: v };
+    const adapter = this.app.vault.adapter as typeof this.app.vault.adapter & { insensitive?: boolean };
+    // Unknown → assume case-insensitive: matching more names means switching
+    // to an existing folder rather than making a near-duplicate, the safe way.
+    const insensitive = adapter.insensitive !== false;
+    const lower = name.toLowerCase();
+    const hit = this.app.vault.getRoot().children.find((c) => (insensitive ? c.name.toLowerCase() === lower : c.name === name));
+    if (hit && !(hit instanceof TFolder)) return { ok: false, verdict: v };
+    // Not in the index but on disk (a dot-name, a file the index skips): never
+    // write over or into something we can't see.
+    if (!hit && (await adapter.exists(name))) return { ok: false, verdict: v };
+    const folder = hit?.path ?? name;
+    const rv = withReservedRule(await this.checkNewStashpadFolderOnDisk(folder), folder);
+    if (!rv.ok) return { ok: false, verdict: v };
+    const existing = !hit ? "none" : rv.why === "already" ? "stashpad" : "folder";
+    return { ok: true, folder, redirect: { from: v, existing, message: redirectMessage(v, folder, existing) } };
+  }
+
+  /** 0.528.0: the folder switcher's "create" action. Resolves the target
+   *  (see resolveNewStashpadTarget), makes the folder if it's new, opens it,
+   *  and says where it went when that isn't where it was typed. Returns the
+   *  folder opened, or null when refused / not opened. */
+  async createOrRedirectAndOpen(path: string): Promise<string | null> {
+    const t = await this.resolveNewStashpadTarget(path);
+    if (!t.ok) { this.explainNestBlock(t.verdict, { modal: true }); return null; }
+    if (t.redirect?.existing === "stashpad") {
+      await this.openFolderInStashpad(t.folder);
+    } else {
+      if (!(await this.app.vault.adapter.exists(t.folder))) await this.app.vault.createFolder(t.folder);
+      if (!(await this.activateViewForFolder(t.folder))) return null;
+    }
+    if (t.redirect) this.notifications.show({ message: t.redirect.message, kind: "info", category: "system", folder: t.folder });
+    return t.folder;
   }
 
   /** Tally per-note colors found in EVERY markdown file under `folder`.
@@ -1394,7 +1486,8 @@ export default class StashpadPlugin extends Plugin {
       if (dir !== cleaned) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
       // Healthy note → leave it entirely alone.
-      if (typeof fm?.id === "string" && fm.id.trim()) continue;
+      // 0.527.0: readId — a bare all-digit id is present, not missing.
+      if (readId(fm?.id)?.trim()) continue;
       if (byPath.has(f.path)) candidates.push(f);
     }
     const scanned = byPath.size;
@@ -1413,7 +1506,7 @@ export default class StashpadPlugin extends Plugin {
         await this.app.fileManager.processFrontMatter(file, (fm) => {
           fm.id = hit.id;
           fm.parent = parentForFrontmatter(hit.entry.parent);
-          if (hit.entry.created && typeof fm.created !== "string") fm.created = hit.entry.created;
+          if (hit.entry.created && !hasFmValue(fm.created)) fm.created = hit.entry.created;
           if (!Array.isArray(fm.attachments)) fm.attachments = [];
         });
         repaired++;
@@ -1489,10 +1582,32 @@ export default class StashpadPlugin extends Plugin {
   private memoIgnoresDir(dir: string | undefined): boolean {
     return !!this.stashpadFoldersMemo && !!dir && isInReservedSubfolder(dir.replace(/\/+$/, ""));
   }
+  /** 0.518.8 (perf): side-effect-free "is `dir` a discovered folder?" for hot
+   *  event handlers elsewhere (the aggregate tabs' modify gate). Returns `null`
+   *  while the memo is cold, so the caller falls back to its old behaviour
+   *  instead of forcing a vault walk — and never re-warms the memo itself,
+   *  which would let refreshSettingsIfStashpadsChanged's fast path skip a real
+   *  folder-set change. Exact match after stripping trailing slashes, the same
+   *  normalisation the collectors use: a nested folder is listed on its own,
+   *  and the vault root ("/" → "") never is. */
+  stashpadFolderMemoHas(dir: string): boolean | null {
+    if (!this.stashpadFoldersMemo) return null;
+    return this.stashpadFoldersMemo.includes(dir.replace(/\/+$/, ""));
+  }
 
   /** 0.291.0 (perf): drop the discovery memo; the next call recomputes. */
   invalidateStashpadFoldersMemo(): void {
     this.stashpadFoldersMemo = null;
+  }
+
+  /** 0.291.0 (perf): drop the memo only when `importExcludePrefixes` — the one
+   *  setting discovery reads — changed since we last looked. 0.519.5: shared by
+   *  saveSettings and onExternalDataJsonChange (a synced change). */
+  private dropFolderMemoIfPrefixesChanged(): void {
+    const prefixSig = JSON.stringify(this.settings.importExcludePrefixes ?? null);
+    if (prefixSig === this.memoPrefixSig) return;
+    this.memoPrefixSig = prefixSig;
+    this.invalidateStashpadFoldersMemo();
   }
 
   /** 0.291.0 (perf): true when the memo is warm — lets the "resolved" handler
@@ -1514,7 +1629,57 @@ export default class StashpadPlugin extends Plugin {
     return sorted.slice();
   }
 
+  /** 0.523.8: a "is this folder a Stashpad?" test for importStashZip's
+   *  `isStashpadFolder` (restore/unlock/cross-vault paste attachment dedupe).
+   *  The folder set is read lazily, once, since only bundles without recorded
+   *  attachment origins ever ask. */
+  stashpadFolderTest(): (folder: string) => boolean {
+    let set: Set<string> | null = null;
+    return (folder) => {
+      if (!set) set = new Set(this.discoverStashpadFolders());
+      return set.has(folder);
+    };
+  }
+
+  /** 0.519.5 (perf): THE claim test — does this note's frontmatter claim its
+   *  folder as a Stashpad? Shared by computeStashpadFolders and the
+   *  metadataCache "changed" memo guard in onload, so the two can't drift.
+   *  0.517.4: onMaybeOrphan's pre-layout guard (in onload) keeps a LOOSER
+   *  inline copy of this test; loosen that one too if you loosen this one. */
+  private static isStashpadClaimant(
+    fm: { id?: unknown; parent?: unknown; attachments?: unknown } | undefined,
+  ): boolean {
+    if (!readId(fm?.id)?.trim()) return false;   // 0.527.0: number ids count
+    // Require parent to be present in the frontmatter (any value —
+    // including null and ROOT_ID — counts). A note without a parent
+    // field isn't a Stashpad note.
+    if (!fm || !("parent" in fm)) return false;
+    // 0.205.0: `id` + `parent` alone is NOT a Stashpad signature — it's a
+    // generic outliner one. Another plugin in the same vault (an outliner
+    // writing id/parent/created/due per note) had every one of its folders
+    // claimed here, which put them in every folder picker AND exposed their
+    // notes to Stashpad's task/reminder/integrity machinery — including
+    // writers like the recovery-link sync. Qualify a folder only on a
+    // signature Stashpad actually owns:
+    //   - the home note (`id: __root__`), written for every folder we create; or
+    //   - `attachments`, which createNoteUnder writes on EVERY note.
+    // Verified against the dev vault: keeps all 12 real Stashpad folders,
+    // drops the foreign plugin's entirely.
+    return fm.id === ROOT_ID || "attachments" in fm;
+  }
+
   private computeStashpadFolders(): string[] {
+    const sorted = this.scanClaimFolders(true);
+    this.knownStashpadFolders = new Set(sorted);
+    return sorted;
+  }
+
+  /** The claim scan behind discovery. 0.522.0: split out so the nesting guard
+   *  can run it WITHOUT the `importExcludePrefixes` filter: that setting only
+   *  hides folders from the pickers (their notes are still walked), so a hidden
+   *  `_Private` Stashpad still nests. Side-effect free — it does not touch
+   *  `knownStashpadFolders` or the memo. */
+  private scanClaimFolders(honourExcludes: boolean): string[] {
     const folders = new Set<string>();
     const foreign = this.foreignClaimedFolders();
     // 0.206.1: the claim covers the folder AND everything under it. Trynalist's
@@ -1535,31 +1700,13 @@ export default class StashpadPlugin extends Plugin {
       }
     };
     for (const f of this.app.vault.getMarkdownFiles()) {
-      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
-        | { id?: unknown; parent?: unknown; attachments?: unknown } | undefined;
-      if (typeof fm?.id !== "string" || !fm.id.trim()) continue;
-      // Require parent to be present in the frontmatter (any value —
-      // including null and ROOT_ID — counts). A note without a parent
-      // field isn't a Stashpad note.
-      if (!fm || !("parent" in fm)) continue;
-      // 0.205.0: `id` + `parent` alone is NOT a Stashpad signature — it's a
-      // generic outliner one. Another plugin in the same vault (an outliner
-      // writing id/parent/created/due per note) had every one of its folders
-      // claimed here, which put them in every folder picker AND exposed their
-      // notes to Stashpad's task/reminder/integrity machinery — including
-      // writers like the recovery-link sync. Qualify a folder only on a
-      // signature Stashpad actually owns:
-      //   - the home note (`id: __root__`), written for every folder we create; or
-      //   - `attachments`, which createNoteUnder writes on EVERY note.
-      // Verified against the dev vault: keeps all 12 real Stashpad folders,
-      // drops the foreign plugin's entirely.
-      if (fm.id !== ROOT_ID && !("attachments" in fm)) continue;
+      if (!StashpadPlugin.isStashpadClaimant(this.app.metadataCache.getFileCache(f)?.frontmatter)) continue;
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       // 0.136.0: reserved subfolders (archive/, trash/, _archive/, …) are never
       // Stashpad folders of their own — their notes surface via the aggregated
       // views instead of the folder pickers.
       if (isForeign(dir)) continue; // another plugin's document folder (0.205.1)
-      if (dir && !this.pathHasExcludedSegment(dir) && !isInReservedSubfolder(dir)) folders.add(dir);
+      if (dir && !(honourExcludes && this.pathHasExcludedSegment(dir)) && !isInReservedSubfolder(dir)) folders.add(dir);
     }
     // 0.165.0: sort alphabetically, case-INSENSITIVELY, so the Folders lists in
     // settings (and every other folder picker) read A→Z regardless of casing
@@ -1570,8 +1717,164 @@ export default class StashpadPlugin extends Plugin {
       (a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })
         || (a < b ? -1 : a > b ? 1 : 0),
     );
-    this.knownStashpadFolders = new Set(sorted);
     return sorted;
+  }
+
+  /** 0.522.0: a checker for "may this folder become a Stashpad?" over ONE scan
+   *  of the vault, for pickers that test many rows. Only notes on disk count as
+   *  a claim; a folder named in settings (default folder, pins, recents) does
+   *  not, so a stale setting can never block anything. See nest-guard.ts. */
+  nestGuard(): (path: string) => NestVerdict {
+    // With no exclude prefixes the discovery memo IS the unfiltered scan.
+    const claims = this.importExcludePrefixList().length ? this.scanClaimFolders(false) : this.discoverStashpadFolders();
+    const check = makeNestChecker(claims);
+    return (path: string): NestVerdict => {
+      const v = check(path);
+      const p = normalizeNestPath(path);
+      // The metadata cache may not have parsed a folder's Home yet (just
+      // written, just restored, or startup). Its canonical file name is known
+      // without the cache, so an unparsed Home counts as a Stashpad: its own
+      // means "already" (a pass), an ancestor's means "inside". Without the
+      // second half a tab left on a refused folder, restored at startup before
+      // the outer Stashpad was parsed, would pass and write a Home (a new pair).
+      if (v.ok) {
+        if (v.why !== "free") return v;
+        for (let cut = p.lastIndexOf("/"); cut > 0; cut = p.lastIndexOf("/", cut - 1)) {
+          const anc = p.slice(0, cut);
+          if (!this.hasUnparsedHome(anc)) continue;
+          return this.hasUnparsedHome(p) ? { ok: true, why: "already" } : { ok: false, why: "inside", path: p, stashpad: anc };
+        }
+        return v;
+      }
+      return this.hasUnparsedHome(p) ? { ok: true, why: "already" } : v;
+    };
+  }
+
+  /** 0.522.0: `dir`'s canonical Home exists but the metadata cache hasn't
+   *  parsed it yet. Index lookups only, no disk read. */
+  private hasUnparsedHome(dir: string): boolean {
+    const home = this.app.vault.getAbstractFileByPath(`${dir}/${buildHomeFilename(dir)}`);
+    return home instanceof TFile && !this.app.metadataCache.getFileCache(home);
+  }
+
+  /** 0.522.0: the first folder under `dir` whose Home the cache hasn't parsed.
+   *  Walks the vault's folder index (folders, not files; no disk read) and skips
+   *  Stashpad's own subfolders. Bounded so a huge tree can't stall an open. */
+  private unparsedHomeBelow(dir: string): string | null {
+    const root = dir ? this.app.vault.getAbstractFileByPath(dir) : null;
+    if (!(root instanceof TFolder)) return null;
+    const stack = root.children.filter((c): c is TFolder => c instanceof TFolder);
+    for (let seen = 0; seen < 2000; seen++) {
+      const f = stack.pop();
+      if (!f) break;
+      if (isInReservedSubfolder(f.path)) continue;
+      if (this.hasUnparsedHome(f.path)) return f.path;
+      for (const c of f.children) if (c instanceof TFolder) stack.push(c);
+    }
+    return null;
+  }
+
+  /** 0.522.0: one-off check. Use `nestGuard()` when checking many paths. */
+  checkNewStashpadFolder(path: string): NestVerdict {
+    // Fast paths, no unfiltered scan: the root and Stashpad's own subfolders,
+    // then the common call (opening a folder that's already a Stashpad), which
+    // the discovery memo answers. A cold memo is warmed here (the same scan
+    // every picker runs), so the next call is a lookup.
+    const trivial = trivialNestVerdict(path);
+    if (trivial) return trivial;
+    const p = normalizeNestPath(path);
+    // 0.525.0 (perf): before layout-ready the memo is never kept, so each
+    // restored tab cost a discovery scan plus an unfiltered one (18 claim scans
+    // for 3 tabs, measured). The folder's own parsed Home answers it first.
+    if (this.ownHomeClaimsFolder(p)) return { ok: true, why: "already" };
+    if (this.stashpadFolderMemoHas(p) ?? this.discoverStashpadFolders().includes(p)) return { ok: true, why: "already" };
+    return this.nestGuard()(path);
+  }
+
+  /** 0.525.0 (perf): would the claim scan list `dir` because of its own Home?
+   *  Exactly the scan's conditions, from index lookups only: the canonical Home
+   *  is parsed and passes isStashpadClaimant, and no folder from `dir` up (vault
+   *  root excluded, as in scanClaimFolders' isForeign) holds another plugin's
+   *  manifest. When true, both the memo and the unfiltered scan answer
+   *  "already", so skipping them changes no verdict. An unparsed Home returns
+   *  false and takes the full check, which can answer "free" for it. */
+  private ownHomeClaimsFolder(dir: string): boolean {
+    const home = this.app.vault.getAbstractFileByPath(`${dir}/${buildHomeFilename(dir)}`);
+    if (!(home instanceof TFile)) return false;
+    if (!StashpadPlugin.isStashpadClaimant(this.app.metadataCache.getFileCache(home)?.frontmatter)) return false;
+    for (let cur = dir; cur; ) {
+      const f = this.app.vault.getAbstractFileByPath(cur);
+      if (f instanceof TFolder && f.children.some((c) => c instanceof TFile && StashpadPlugin.FOREIGN_MANIFEST_EXTS.has(c.extension))) return false;
+      const cut = cur.lastIndexOf("/");
+      cur = cut < 0 ? "" : cur.slice(0, cut);
+    }
+    return true;
+  }
+
+  /** 0.525.0: the check for every path that makes a NEW Stashpad from a name
+   *  (createNewStashpad, seedDemoContent, settings "Create a new Stashpad" and
+   *  "Stashpad notes folder"): the nest rule plus the reserved-folder rule.
+   *  Paths that only OPEN a view keep using checkNewStashpadFolder, which lets
+   *  reserved folders through so the Archived view's "Open" still works. */
+  checkCreateStashpadFolder(path: string): NewStashpadVerdict {
+    return withReservedRule(this.checkNewStashpadFolder(path), path);
+  }
+
+  /** 0.522.0: the same check, plus a look at the disk before saying no. Used
+   *  where a view is about to open (and would write a Home): a tab restored at
+   *  startup can reach here before the cache has parsed its folder's notes, and
+   *  a Stashpad that already exists must never be shown as blocked. The disk
+   *  read only runs on a would-be block, so the normal path costs nothing. */
+  async checkNewStashpadFolderOnDisk(path: string): Promise<NestVerdict> {
+    let v = this.checkNewStashpadFolder(path);
+    const p = normalizeNestPath(path);
+    if (v.ok && v.why === "free") {
+      // The "contains" half of nestGuard's unparsed-Home check. Only here (one
+      // path per view open), not per picker row, because it walks subfolders.
+      const inner = this.unparsedHomeBelow(p);
+      if (inner) v = { ok: false, why: "contains", path: p, stashpad: inner, count: 1 };
+    }
+    if (v.ok) return v;
+    // Typed paths reach here (the switcher's create row) and the adapter joins
+    // against the vault root, so never list or read a "."/".." path: it could
+    // look outside the vault. Keep the refusal instead.
+    if (p.split("/").some((s) => s === "." || s === "..")) return v;
+    const adapter = this.app.vault.adapter;
+    let files: string[] = [];
+    try { files = (await adapter.list(p)).files; } catch { return v; }
+    let reads = 0;
+    for (const fp of files) {
+      if (!fp.toLowerCase().endsWith(".md")) continue;
+      // A parsed file was already judged by the scan; only read unparsed ones.
+      const f = this.app.vault.getAbstractFileByPath(fp);
+      if (f instanceof TFile && this.app.metadataCache.getFileCache(f)) continue;
+      if (++reads > 200) break; // bounded: a cold folder, not a vault scan
+      try {
+        if (headClaimsFolder((await adapter.read(fp)).slice(0, 1024))) return { ok: true, why: "already" };
+      } catch { /* unreadable: keep the cache's answer */ }
+    }
+    return v;
+  }
+
+  /** 0.522.0: tell the user why a folder can't be a Stashpad, with a way to the
+   *  Stashpad that's in the way. `modal` for flows the user is actively driving
+   *  (switcher, settings), a notification everywhere else. */
+  explainNestBlock(v: NewStashpadVerdict, opts: { modal?: boolean } = {}): void {
+    if (v.ok) return;
+    const msg = nestBlockMessage(v);
+    // 0.525.0: a reserved-folder refusal has no Stashpad to offer instead.
+    if (v.why === "reserved") {
+      this.notifications.show({ message: `${msg} Pick another folder.`, kind: "warning", category: "system" });
+      return;
+    }
+    const name = v.stashpad.split("/").pop() || v.stashpad;
+    const open = (): void => { void this.openFolderInStashpad(v.stashpad); };
+    if (opts.modal) {
+      new ConfirmModal(this.app, "Can't make this a Stashpad", `${msg}\nOpen the existing Stashpad instead?`, `Open "${name}"`,
+        (ok: boolean) => { if (ok) open(); }).open();
+      return;
+    }
+    this.notifications.show({ message: msg, kind: "warning", category: "system", folder: v.stashpad, actions: [{ label: `Open "${name}"`, onClick: open }] });
   }
 
   /** Folder paths whose delete WE initiated (panel delete with undo). The vault
@@ -1914,7 +2217,7 @@ export default class StashpadPlugin extends Plugin {
     for (const f of this.app.vault.getMarkdownFiles()) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (!(dir === folder || (folder !== "" && dir.startsWith(prefix)))) continue;
-      if (this.app.metadataCache.getFileCache(f)?.frontmatter?.id === id) return f;
+      if (sameId(this.app.metadataCache.getFileCache(f)?.frontmatter?.id, id)) return f;
     }
     return null;
   }
@@ -2371,9 +2674,12 @@ export default class StashpadPlugin extends Plugin {
       for (const f of files) {
         const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
           | { id?: string; parent?: string | null } | undefined;
-        const id = typeof fm?.id === "string" ? fm.id.trim() : "";
+        // 0.527.1: readId on both. The quoting sweep turns `parent: 42` into
+        // "42"; comparing raw values against the stored snapshot logged a
+        // spurious parent_change for every quoted note.
+        const id = readId(fm?.id)?.trim() ?? "";
         if (!id) continue;
-        const parent = (fm && "parent" in fm ? (fm.parent ?? null) : null);
+        const parent = (fm && "parent" in fm ? readId(fm.parent) : null);
         cur[id] = { parent, path: f.path };
       }
 
@@ -2386,7 +2692,7 @@ export default class StashpadPlugin extends Plugin {
           const before = prev[id];
           if (!before) {
             await log.append({ type: "create", id, payload: { path: info.path, parent: info.parent } });
-          } else if (before.parent !== info.parent) {
+          } else if ((readId(before.parent) ?? null) !== info.parent) {
             await log.append({ type: "parent_change", id, payload: { from: before.parent, to: info.parent } });
           } else if (before.path !== info.path) {
             await log.append({ type: "rename", id, payload: { from: before.path, to: info.path } });
@@ -2601,9 +2907,10 @@ export default class StashpadPlugin extends Plugin {
     let folder = base;
     for (let i = 2; await this.app.vault.adapter.exists(folder); i++) folder = `${base} ${i}`;
     try {
-      const { created } = await seedDemoContent(this.app, this, folder);
-      notify(`Stashpad: created "${folder}" with ${created} example notes.`, 8000);
-      await this.openFolderInStashpad(folder);
+      // `made` is always `folder` here (a free top-level name never redirects).
+      const { created, folder: made } = await seedDemoContent(this.app, this, folder);
+      notify(`Stashpad: created "${made}" with ${created} example notes.`, 8000);
+      await this.openFolderInStashpad(made);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       notify(`Stashpad: couldn't create the demo — ${msg}`, 0);
@@ -2687,7 +2994,11 @@ export default class StashpadPlugin extends Plugin {
     // whose diagnostic just aged out above) keeps no files around.
     // Clean up when either switch is off, so turning persistence off leaves no
     // file behind for a later session to rotate and hand back.
-    if (!this.settings.debugTrace || !this.settings.debugTracePersist) await this.removeTraceFiles();
+    // 0.517.2 (perf): in the background rather than awaited — up to four disk
+    // round trips that nothing later in onload depends on (same pattern as
+    // clearDebugTrace and the trace toggle). Its localStorage clears still run
+    // synchronously here, and every await inside it is caught.
+    if (!this.settings.debugTrace || !this.settings.debugTracePersist) void this.removeTraceFiles();
     perf.enabled = !!this.settings.enablePerfProfiling;
     this.encryption = new EncryptionService(
       this.app,
@@ -2744,7 +3055,8 @@ export default class StashpadPlugin extends Plugin {
     // The result is a pure function of (a) the set of vault files — markdown
     // files supply the id/parent/attachments signature, any `.trynalist` file
     // supplies a foreign claim — (b) each markdown file's frontmatter, and
-    // (c) `settings.importExcludePrefixes` (handled in saveSettings).
+    // (c) `settings.importExcludePrefixes` (handled in saveSettings, and since
+    // 0.519.5 in onExternalDataJsonChange for a synced change).
     // Files can only appear/disappear/move via create/delete/rename (a folder
     // rename fires for the folder itself, so a subtree move is covered), and
     // frontmatter can only change via metadataCache "changed". Registered with
@@ -2798,11 +3110,16 @@ export default class StashpadPlugin extends Plugin {
     // claimant, so losing the signature must recompute).
     this.registerEvent(this.app.metadataCache.on("changed", (f, _data, cache) => {
       if (f.extension === "md" && this.memoIgnoresDir(f.parent?.path)) return;
-      if (f.extension === "md" && this.memoListsDir(f.parent?.path)) {
-        const fm = cache?.frontmatter as { id?: unknown; parent?: unknown; attachments?: unknown } | undefined;
-        const claims = typeof fm?.id === "string" && !!fm.id.trim() && "parent" in fm
-          && (fm.id === ROOT_ID || "attachments" in fm);
-        if (claims) return;
+      if (f.extension === "md") {
+        const claims = StashpadPlugin.isStashpadClaimant(cache?.frontmatter);
+        const listed = this.memoListsDir(f.parent?.path);
+        if (claims && listed) return;
+        // 0.519.5 (perf): the mirror case — a NON-claiming file in an UNLISTED
+        // folder can't add that folder, and can't remove it either (it isn't
+        // there). This is every save of an ordinary note, which used to cool
+        // the memo and hand the next "resolved" a full vault walk. While the
+        // memo is cold `listed` is false, but dropping a cold memo is a no-op.
+        if (!claims && !listed) return;
       }
       dropFolderMemo();
     }));
@@ -3006,6 +3323,8 @@ export default class StashpadPlugin extends Plugin {
         try { await this.migrateArchiveFoldersToSubfolders(); } catch (e) { console.error("[Stashpad] archive migration failed", e); }
         try { await this.migrateDeletedToTrashSubfolders(); } catch (e) { console.error("[Stashpad] trash migration failed", e); }
         void this.pruneZombieArchiveEntries();
+        // 0.527.0: one-time quoting of bare all-digit id/parent values.
+        void this.runNumericIdQuoteSweepOnce();
       }, 5000);
       // 0.138.0: opt-in nudge — previously-encrypted notes still plaintext.
       window.setTimeout(() => {
@@ -3567,6 +3886,10 @@ export default class StashpadPlugin extends Plugin {
 
     const call = (method: string, ...args: unknown[]) => {
       const v = getActiveView();
+      // 0.522.0: a tab on a folder that can't be a Stashpad runs no view
+      // commands (paste, import, …) — they would write notes into it.
+      const blocked = v?.nestBlockHere?.() as NestVerdict | null | undefined;
+      if (blocked) { this.explainNestBlock(blocked); return; }
       if (v && typeof v[method] === "function") v[method](...args);
     };
 
@@ -4836,6 +5159,24 @@ export default class StashpadPlugin extends Plugin {
     const onMaybeOrphan = (file: TFile): void => {
       if (file.extension !== "md") return;
       const dir = file.parent?.path?.replace(/\/+$/, "") ?? "";
+      // 0.517.4 (perf): discovery never lists the vault root, so this is exact.
+      if (!dir) return;
+      // 0.517.4 (perf): Obsidian fires "create" for EVERY existing file while
+      // the vault loads, before layout-ready, and discovery isn't memoised
+      // until then — so each event walked every file loaded so far (~N²/2 on
+      // a cold start). A folder can only be discovered when a claiming md file
+      // sits directly in it, and `parent.children` is exactly what's loaded
+      // so far, so "no claimant sibling" here always means "not discovered".
+      // This claim test MUST stay a superset (looser or equal) of
+      // isStashpadClaimant (0.519.5) — it deliberately drops the ROOT_ID/attachments
+      // clause so a drift there can't make this stricter and skip an orphan.
+      // After layout-ready the path below is unchanged; the skipped
+      // knownStashpadFolders refresh is redone by the layout-ready handler.
+      if (!this.app.workspace.layoutReady && !file.parent?.children.some((c) => {
+        if (!(c instanceof TFile) || c.extension !== "md") return false;
+        const fm = this.app.metadataCache.getFileCache(c)?.frontmatter as { id?: unknown; parent?: unknown } | undefined;
+        return !!readId(fm?.id)?.trim() && !!fm && "parent" in fm;
+      })) return;
       if (!this.discoverStashpadFolders().includes(dir)) return;
       // Defer to give metadataCache time to parse the frontmatter.
       setTimeout(() => { void this.fixOrphanParentForFile(file); }, 800);
@@ -5317,17 +5658,27 @@ export default class StashpadPlugin extends Plugin {
   }
 
   /** Single-file version of fixOrphanParents. Stamps id/parent/created
-   *  iff each is missing. Never overwrites an existing value. */
+   *  iff each is missing. Never overwrites an existing value. Never stamps
+   *  `parent` on a Home (id __root__): its `parent: null` is canonical. */
   private async fixOrphanParentForFile(file: TFile): Promise<void> {
     try {
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as
         | { id?: unknown; parent?: unknown; created?: unknown } | undefined;
-      const idStr = typeof fm?.id === "string" ? fm.id.trim() : "";
+      // 0.527.0: readId — a bare all-digit id (YAML number) IS an id. With
+      // typeof it read as missing and a fresh id was minted over it, orphaning
+      // every child whose `parent` still named the old one.
+      const idStr = readId(fm?.id)?.trim() ?? "";
       const p = fm?.parent;
       const hasParent = typeof p === "string" ? p.trim() !== "" : (p !== undefined && p !== null);
-      const hasCreated = typeof fm?.created === "string" && fm.created.trim() !== "";
+      const hasCreated = hasFmValue(fm?.created);   // 0.527.1: a number counts
       const addId = !idStr;
-      const addParent = !hasParent;
+      // 0.523.3: a Home (id __root__) has `parent: null` by design, so it is
+      // never an orphan. Without this, every post-layout create/rename event
+      // on a Home (a Home synced or copied into an already-discovered folder,
+      // a legacy-Home rename, a folder rename, a manual move) wrote
+      // `parent: __root__` into it — sync churn plus a false
+      // "Adopted … → Home" notice and parent_change log entry.
+      const addParent = !hasParent && idStr !== ROOT_ID;
       const addCreated = !hasCreated;
       if (!addId && !addParent && !addCreated) return;
 
@@ -5340,17 +5691,19 @@ export default class StashpadPlugin extends Plugin {
         // task — common on mobile right after a sync brings the file
         // in). Only modify slots that are actually empty on disk.
         if (addId) {
-          const cur = typeof m.id === "string" ? m.id.trim() : "";
+          const cur = readId(m.id)?.trim() ?? "";   // 0.527.0: number ids count
           if (!cur) { stampedId = this.mintNoteId(); m.id = stampedId; }
         }
         if (addParent) {
           const cur = m.parent;
           const set = typeof cur === "string" ? cur.trim() !== "" : (cur !== undefined && cur !== null);
-          if (!set) { m.parent = ROOT_ID; stampedParent = true; }
+          // 0.523.3: same Home exemption, checked against the true frontmatter
+          // in case the cache was stale when addParent was decided.
+          const isHome = typeof m.id === "string" && m.id.trim() === ROOT_ID;
+          if (!set && !isHome) { m.parent = ROOT_ID; stampedParent = true; }
         }
         if (addCreated) {
-          const cur = typeof m.created === "string" ? m.created.trim() : "";
-          if (!cur) { m.created = new Date(file.stat.ctime).toISOString(); stampedCreated = true; }
+          if (!hasFmValue(m.created)) { m.created = new Date(file.stat.ctime).toISOString(); stampedCreated = true; }
         }
       });
       // No-op if the file was already valid (the cache was stale but the
@@ -5408,16 +5761,19 @@ export default class StashpadPlugin extends Plugin {
     try {
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter as
         | { id?: unknown; parent?: unknown } | undefined;
-      const id = typeof fm?.id === "string" ? fm.id.trim() : "";
-      const parent = typeof fm?.parent === "string" ? fm.parent.trim() : "";
+      // 0.527.0: readId/sameId. A quoted `parent: "42"` must resolve to a note
+      // whose id is still the bare number 42 (and vice versa); with `===` that
+      // parent looked absent and the note was re-homed to Home.
+      const id = readId(fm?.id)?.trim() ?? "";
+      const parent = readId(fm?.parent)?.trim() ?? "";
       if (!id || !parent || parent === ROOT_ID) return;            // no id / no or home parent
       const parentInFolder = this.app.vault.getMarkdownFiles().some((f) =>
         (f.parent?.path?.replace(/\/+$/, "") ?? "") === dir
-        && this.app.metadataCache.getFileCache(f)?.frontmatter?.id === parent);
+        && sameId(this.app.metadataCache.getFileCache(f)?.frontmatter?.id, parent));
       if (parentInFolder) return;                                  // parent resolves here — fine
       await this.app.fileManager.processFrontMatter(file, (m: any) => {
         // re-check against disk truth (cache may have lagged)
-        const cur = typeof m.parent === "string" ? m.parent.trim() : "";
+        const cur = readId(m.parent)?.trim() ?? "";
         if (cur && cur !== ROOT_ID) m.parent = ROOT_ID;
       });
       await this.newLog().append({
@@ -5521,7 +5877,7 @@ export default class StashpadPlugin extends Plugin {
     };
     for (const f of this.app.vault.getMarkdownFiles()) {
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
-      if (fm?.id !== id) continue;
+      if (!sameId(fm?.id, id)) continue;
       const author = extract(fm?.author);
       if (author) out.add(author);
       const contribs = fm?.contributors;
@@ -5662,6 +6018,8 @@ export default class StashpadPlugin extends Plugin {
     };
     let fmChecked = 0;
     let fmWritten = 0;
+    let idsQuoted = 0;
+    let idsUnsafe = 0;
     let slugsRenamed = 0;
     let imported = 0;
     let attachmentsRenamed = 0;
@@ -5701,6 +6059,8 @@ export default class StashpadPlugin extends Plugin {
         const stats = await rebootstrapFolderFrontmatter(this.app, folder, { writeAliases: true });
         fmChecked += stats.checked;
         fmWritten += stats.written;
+        idsQuoted += stats.quoted;
+        idsUnsafe += stats.unsafeIds;
         // 0.58.1: rename files whose slug no longer matches their body's
         // first line — catches notes from before the auto-retitle logic
         // landed (and any whose body was edited without the per-view
@@ -5781,6 +6141,10 @@ export default class StashpadPlugin extends Plugin {
         category: "attachment",
         duration: strays.shared ? 0 : 6000,
       });
+    }
+    // 0.527.0: record any bare all-digit ids Rebootstrap quoted (or had to skip).
+    if (idsQuoted > 0 || idsUnsafe > 0) {
+      void this.newLog().append({ type: "id_maintenance", id: "", payload: { what: "quote-numeric-ids", trigger: "rebootstrap", quoted: idsQuoted, unsafe: idsUnsafe, folders: touched.length } });
     }
     return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped };
   }
@@ -6082,9 +6446,38 @@ export default class StashpadPlugin extends Plugin {
     const dir = folder.replace(/\/+$/, "");
     for (const f of this.app.vault.getMarkdownFiles()) {
       if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dir) continue;
-      if (this.app.metadataCache.getFileCache(f)?.frontmatter?.id === id) return f;
+      // 0.527.0: sameId, not ===. A pin ref's id is text ("42") while an
+      // unquoted all-digit frontmatter id is the number 42; both name the note.
+      if (sameId(this.app.metadataCache.getFileCache(f)?.frontmatter?.id, id)) return f;
     }
     return null;
+  }
+
+  /** 0.524.0: every id in `folder` whose note is sidebar-pinned, from ONE walk.
+   *  Each `isPinned` call is O(vault). `fileForPin` stops scanning at its first
+   *  match, but the `getMarkdownFiles()` call before that scan walks the whole
+   *  vault tree to build its list every time (checked in Obsidian 1.14.0). A
+   *  filtered list render asked it once per child (O(children x vault)). This
+   *  answers `isPinned({ folder, id })` for many ids at once and MUST stay in
+   *  lockstep with `fileForPin`: same walk and order, same folder test, and the
+   *  FIRST file per id wins (so `seen` holds every id walked, pinned or not, and
+   *  an unpinned first copy masks a pinned duplicate). 0.527.0: ids are read
+   *  through readId, so a legacy unquoted all-digit id (YAML number 42) lands
+   *  in the set as "42" — the same text key TreeIndex now uses — and
+   *  `fileForPin` matches it with sameId. Build it fresh per pass; never cached. */
+  sidebarPinnedIdSet(folder: string): Set<unknown> {
+    const dir = folder.replace(/\/+$/, "");
+    const seen = new Set<unknown>();
+    const pinned = new Set<unknown>();
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dir) continue;
+      const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+      const id: unknown = readId(fm?.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (fm?.pinned === true) pinned.add(id);
+    }
+    return pinned;
   }
 
   /** Pin a note. Idempotent — writes `pinned: true` + `pinnedAt` to its FM. */
@@ -6142,9 +6535,12 @@ export default class StashpadPlugin extends Plugin {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (!folders.has(dir)) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
-      if (!fm || fm.pinned !== true || typeof fm.id !== "string" || !fm.id) continue;
+      // 0.527.0: readId, so a pinned note with an unquoted all-digit id is
+      // listed (it used to be skipped as "no id") under its text form.
+      const pinId = readId(fm?.id);
+      if (!fm || fm.pinned !== true || !pinId) continue;
       const at = typeof fm.pinnedAt === "number" ? fm.pinnedAt : 0;
-      out.push({ folder: dir, id: fm.id, pinnedAt: at, file: f });
+      out.push({ folder: dir, id: pinId, pinnedAt: at, file: f });
     }
     out.sort((a, b) => a.pinnedAt - b.pinnedAt || a.file.path.localeCompare(b.file.path));
     return out;
@@ -6715,8 +7111,12 @@ export default class StashpadPlugin extends Plugin {
       | { kind: "open"; folder: string; label: string; icon: string }
       | { kind: "open-anyway"; folder: string; label: string; icon: string }
       | { kind: "switch-current"; folder: string; label: string; icon: string }
-      | { kind: "create"; folder: string; label: string; icon: string }
+      // 0.528.0: `preview` replaces the folder line (the vault-root redirect).
+      | { kind: "create"; folder: string; label: string; icon: string; preview?: string }
       | { kind: "convert"; folder: string; label: string; icon: string }
+      // 0.522.0: a create/convert that would nest one Stashpad in another.
+      // 0.525.0: or that sits in a folder Stashpad keeps for its own files.
+      | { kind: "blocked"; folder: string; label: string; icon: string; verdict: NewStashpadVerdict }
       | { kind: "pinned"; folder: string; label: string; icon: string; file: TFile }
       | { kind: "trash"; label: string; icon: string };
 
@@ -6841,6 +7241,12 @@ export default class StashpadPlugin extends Plugin {
       : [];
 
     const plugin = this;
+    // 0.522.0: at most one scan per picker open, not one per keystroke — and
+    // none at all unless a create/convert row is actually built, since with
+    // exclude prefixes set the scan skips the discovery memo and most opens
+    // just switch folders.
+    let nestGuard: ((path: string) => NestVerdict) | null = null;
+    const nestCheck = (path: string): NestVerdict => (nestGuard ??= plugin.nestGuard())(path);
     const modal = new (class extends SuggestModal<Item> {
       getSuggestions(query: string): Item[] {
         const q = query.trim().toLowerCase();
@@ -6891,20 +7297,49 @@ export default class StashpadPlugin extends Plugin {
           const existsLower = Array.from(allVaultFolderPaths).find((f) => f.toLowerCase() === cleaned.toLowerCase());
           const isStashpad = stashpadFolders.some((f) => f.toLowerCase() === cleaned.toLowerCase());
           if (existsLower && !isStashpad) {
-            filtered.push({
+            // 0.522.0: offer it, but as a row that explains why it can't be done
+            // — a missing row would read as "not found".
+            // 0.525.0: withReservedRule — convert opens the folder as a view,
+            // which lets Stashpad's own subfolders through, so refuse them here.
+            const nest = withReservedRule(nestCheck(existsLower), existsLower);
+            filtered.push(nest.ok ? {
               kind: "convert",
               folder: existsLower,
               label: `Convert “${properCaseFolderPath(existsLower)}” into a Stashpad…`,
               icon: "folder-cog",
-            });
+            } : { kind: "blocked", folder: existsLower, label: `Can't convert “${properCaseFolderPath(existsLower)}”`, icon: "ban", verdict: nest });
           } else if (!existsLower) {
             const cased = properCaseFolderPath(cleaned);
-            filtered.push({
+            // 0.525.0: the reserved check is case-insensitive, so the typed
+            // "archive" (proper-cased to "Archive" here) is still caught.
+            const nest = withReservedRule(nestCheck(cased), cased);
+            // 0.528.0: refused for being INSIDE something → offer the vault
+            // root instead, and say so in the row before it's chosen. The
+            // choose handler re-resolves on disk (resolveNewStashpadTarget).
+            const alt = nest.ok ? null : rootRedirectName(nest);
+            if (alt) {
+              const altLower = alt.toLowerCase();
+              const rootHit = Array.from(allVaultFolderPaths).find((f) => !f.includes("/") && f.toLowerCase() === altLower);
+              const rootName = rootHit ?? alt;
+              const rootVerdict = withReservedRule(nestCheck(rootName), rootName);
+              const rootIsFile = !rootHit && !!plugin.app.vault.getRoot().children.find((c) => c.name.toLowerCase() === altLower);
+              if (rootVerdict.ok && !rootIsFile) {
+                filtered.push({
+                  kind: "create",
+                  folder: cased,
+                  label: rootHit ? `Open “${rootName}” at the vault root` : `+ Create “${rootName}” at the vault root`,
+                  icon: rootHit ? "folder-open" : "folder-plus",
+                  preview: `${redirectWhy(nest)}, so it goes at the top of your vault`,
+                });
+              } else {
+                filtered.push({ kind: "blocked", folder: cased, label: `Can't create “${cased}”`, icon: "ban", verdict: nest });
+              }
+            } else filtered.push(nest.ok ? {
               kind: "create",
               folder: cleaned,
               label: `+ Create new Stashpad “${cased}”`,
               icon: "folder-plus",
-            });
+            } : { kind: "blocked", folder: cased, label: `Can't create “${cased}”`, icon: "ban", verdict: nest });
           }
         }
         // 0.65.1: open-anyway entries pinned to the very bottom — one
@@ -6924,16 +7359,23 @@ export default class StashpadPlugin extends Plugin {
         el.addClass("stashpad-suggest-item");
         el.addClass("stashpad-ribbon-suggest-item");
         if (item.kind === "create") el.addClass("stashpad-suggest-create");
+        // 0.522.0: muted so it reads as unavailable; still choosable, to explain.
+        if (item.kind === "blocked") el.addClass("stashpad-suggest-blocked");
         const iconEl = el.createSpan({ cls: "stashpad-ribbon-suggest-icon" });
         setIcon(iconEl, item.icon);
         const body = el.createDiv({ cls: "stashpad-ribbon-suggest-body" });
         body.createDiv({ cls: "stashpad-suggest-title", text: item.label });
-        if ("folder" in item && item.folder && item.label !== item.folder) {
+        if (item.kind === "blocked") {
+          body.createDiv({ cls: "stashpad-suggest-preview", text: nestBlockReason(item.verdict) });
+        } else if (item.kind === "create" && item.preview) {
+          body.createDiv({ cls: "stashpad-suggest-preview", text: item.preview });
+        } else if ("folder" in item && item.folder && item.label !== item.folder) {
           body.createDiv({ cls: "stashpad-suggest-preview", text: item.folder });
         }
       }
       async onChooseSuggestion(item: Item): Promise<void> {
         if (item.kind === "trash") { plugin.openEncryptedTrash(); return; }
+        if (item.kind === "blocked") { plugin.explainNestBlock(item.verdict, { modal: true }); return; }
         if (item.kind === "pinned") { await plugin.revealNoteInStashpad(item.file); return; }
         if (item.kind === "reveal") {
           plugin.app.workspace.revealLeaf(item.leaf);
@@ -6958,10 +7400,13 @@ export default class StashpadPlugin extends Plugin {
           // whatever the user was looking at.
           try {
             const properCased = properCaseFolderPath(item.folder);
-            if (!(await plugin.app.vault.adapter.exists(properCased))) {
-              await plugin.app.vault.createFolder(properCased);
-            }
-            await plugin.activateViewForFolder(properCased);
+            // 0.522.0: re-check now (the row was judged when the picker opened)
+            // and BEFORE createFolder, so a refusal leaves no empty folder.
+            // 0.525.0: plus the reserved-folder rule (activateViewForFolder
+            // lets Stashpad's own subfolders through).
+            // 0.528.0: createOrRedirectAndOpen does both checks, and sends a
+            // name INSIDE a Stashpad / reserved folder to the vault root.
+            await plugin.createOrRedirectAndOpen(properCased);
           } catch (e) {
             notify(`Stashpad: couldn't create folder (${(e as Error).message})`);
           }
@@ -6989,7 +7434,10 @@ export default class StashpadPlugin extends Plugin {
             async (ok: boolean) => {
               if (!ok) return;
               try {
-                await plugin.activateViewForFolder(folder);
+                // 0.522.0: only sweep when the folder actually opened. The open
+                // refuses a folder that holds (or sits in) a Stashpad, and the
+                // sweep would turn an inner Stashpad into notes and archive it.
+                if (!(await plugin.activateViewForFolder(folder))) return;
                 // Reconcile with the loose-file importer: sweep existing
                 // top-level files / subfolders / .stash into notes now.
                 await plugin.runImportLooseFiles(folder);
@@ -7682,15 +8130,9 @@ export default class StashpadPlugin extends Plugin {
     const folder = (destFolder ?? blobPath.replace(/\/[^/]*$/, "")).replace(/\/+$/, "");
     // Disk frontmatter, not metadataCache (lags after lock churn) — a stale
     // miss here re-pins an unlocked nested note to ROOT in importStashZip.
-    const existing = new Set<StashpadId>();
-    for (const f of this.app.vault.getMarkdownFiles()) {
-      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== folder) continue;
-      try {
-        const id = splitFrontmatter(await this.app.vault.read(f)).fm.id;
-        if (typeof id === "string") existing.add(id);
-      } catch { /* unreadable — skip */ }
-    }
-    return unlockBundle(this.app, blobPath, dek, existing, destFolder);
+    // 0.517.7: via idsInFolder (same disk scan, up to 8 reads requested at once; still serial on desktop).
+    const existing = await this.idsInFolder(folder);
+    return unlockBundle(this.app, blobPath, dek, existing, destFolder, this.stashpadFolderTest());
   }
 
   async unlockBundleAt(blobPath: string, opts: { silent?: boolean; destFolder?: string } = {}): Promise<boolean> {
@@ -7738,9 +8180,9 @@ export default class StashpadPlugin extends Plugin {
       // child as a root, giving it its own bundle orphaned from its parent's.
       let fm: Record<string, unknown>;
       try { fm = splitFrontmatter(await this.app.vault.read(f)).fm; } catch { continue; }
-      const id = fm.id;
-      if (typeof id !== "string" || id === ROOT_ID) continue;
-      const parent = typeof fm.parent === "string" ? fm.parent : ROOT_ID;
+      const id = readId(fm.id);   // 0.527.1: bare all-digit ids are locked too
+      if (id === null || id === ROOT_ID) continue;
+      const parent = readId(fm.parent) ?? ROOT_ID;
       if (parent !== ROOT_ID) continue; // children ride along inside their root's bundle
       roots.push(id);
     }
@@ -8106,13 +8548,9 @@ export default class StashpadPlugin extends Plugin {
         // Existing ids from DISK frontmatter (cache lags after restore churn), same
         // as the encrypted path — prevents importStashZip re-pinning a child to ROOT.
         const destGuess = await deletedRestoreDest(this.app, blobPath, meta);
-        const existing = new Set<StashpadId>();
-        for (const f of this.app.vault.getMarkdownFiles()) {
-          if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== destGuess.replace(/\/+$/, "")) continue;
-          try { const id = splitFrontmatter(await this.app.vault.read(f)).fm.id; if (typeof id === "string") existing.add(id); }
-          catch { /* unreadable — skip */ }
-        }
-        const r = await restorePlaintextDeleted(this.app, blobPath, existing);
+        // 0.517.7: via idsInFolder (same disk scan, up to 8 reads requested at once; still serial on desktop).
+        const existing = await this.idsInFolder(destGuess);
+        const r = await restorePlaintextDeleted(this.app, blobPath, existing, this.stashpadFolderTest());
         this.pendingEncBlobs.delete(blobPath);
         try { await this.newLog().append({ type: "restore", id: meta?.rootId || ROOT_ID, payload: { to: r.restoredTo, from: "trash", encrypted: false } }); } catch { /* log best-effort */ }
         // 0.211.6 (L3): an incomplete restore KEEPS the bundle, so say so — the user
@@ -8165,16 +8603,9 @@ export default class StashpadPlugin extends Plugin {
       const dest = await deletedRestoreDest(this.app, blobPath, meta, dek);
       // Existing ids from DISK frontmatter, not metadataCache — the cache lags
       // after lock/restore churn, and a stale miss makes importStashZip re-pin
-      // a restored child to ROOT.
-      const existing = new Set<StashpadId>();
-      for (const f of this.app.vault.getMarkdownFiles()) {
-        if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dest.replace(/\/+$/, "")) continue;
-        try {
-          const id = splitFrontmatter(await this.app.vault.read(f)).fm.id;
-          if (typeof id === "string") existing.add(id);
-        } catch { /* unreadable — skip */ }
-      }
-      const r = await restoreDeleted(this.app, blobPath, dek, existing);
+      // a restored child to ROOT. 0.517.7: via idsInFolder (up to 8 reads requested at once; still serial on desktop).
+      const existing = await this.idsInFolder(dest);
+      const r = await restoreDeleted(this.app, blobPath, dek, existing, this.stashpadFolderTest());
       this.pendingEncBlobs.delete(blobPath);
       try { await this.newLog().append({ type: "restore", id: meta?.rootId || ROOT_ID, payload: { to: r.restoredTo, from: "trash", encrypted: true } }); } catch { /* log best-effort */ }
       // 0.138.0: restore-from-trash counts as an unlock (user decision) — the
@@ -8426,6 +8857,68 @@ export default class StashpadPlugin extends Plugin {
   /** True while the one-time archive migration is moving files — gates the
    *  auto-encrypt sweep (its rename events must not look like new arrivals). */
   private archiveMigrationInFlight = false;
+
+  /** 0.527.0: one-time quoting sweep for bare all-digit note ids.
+   *
+   *  `id: 1234567` / `parent: 42` are YAML numbers. Every reader now accepts
+   *  either form (readId / sameId), so this is tidying, not a fix: it stores
+   *  those values as text so older bundles, other devices and other tools see
+   *  a string. Only `id` and `parent`, only in Stashpad folders (direct
+   *  children, same scope as the tree), only values the cache already holds
+   *  as numbers, and the value itself never changes (numeric-id-quote.ts).
+   *
+   *  Not gated by the maintenance window: that window's scope rule is
+   *  "derived data only, never a note write", and this writes notes. It is
+   *  instead cheap when there is nothing to do (cache reads only, no file IO,
+   *  no writes), paced at 50ms per actual write, and runs once.
+   *
+   *  Runs only after the metadata cache has resolved, so an unparsed file is
+   *  not mistaken for "nothing to quote" and then never revisited. The done
+   *  flag is set even if some files failed or were unsafe to quote — they
+   *  still work through the number-or-text fallback, Rebootstrap retries
+   *  them, and the counts are in the action log. */
+  private numericIdQuoteSweepInFlight = false;
+  async runNumericIdQuoteSweepOnce(): Promise<{ scanned: number; quoted: number; unsafe: number; failed: number } | null> {
+    if (this.settings.numericIdQuoteSweepDone || this.numericIdQuoteSweepInFlight) return null;
+    const mc = this.app.metadataCache as unknown as { resolved?: boolean };
+    if (mc.resolved === false) {
+      const ref = this.app.metadataCache.on("resolved", () => {
+        this.app.metadataCache.offref(ref);
+        void this.runNumericIdQuoteSweepOnce();
+      });
+      this.registerEvent(ref);
+      return null;
+    }
+    this.numericIdQuoteSweepInFlight = true;
+    let scanned = 0, quoted = 0, unsafe = 0, failed = 0;
+    try {
+      const { quoteNumericIdsInFile } = await import("./numeric-id-quote");
+      const folders = new Set(this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, "")));
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
+        if (!folders.has(dir)) continue;
+        scanned++;
+        const r = await quoteNumericIdsInFile(this.app, f);
+        if (r === "none") continue;
+        if (r === "quoted") quoted++;
+        else if (r === "unsafe") unsafe++;
+        else failed++;
+        await new Promise((res) => window.setTimeout(res, 50));
+      }
+      this.settings.numericIdQuoteSweepDone = true;
+      await this.saveSettings();
+      void this.newLog().append({
+        type: "id_maintenance", id: "",
+        payload: { what: "quote-numeric-ids", trigger: "one-time-sweep", scanned, quoted, unsafe, failed, folders: folders.size },
+      });
+      return { scanned, quoted, unsafe, failed };
+    } catch (e) {
+      console.warn("[Stashpad] numeric-id quoting sweep failed (ids still work unquoted)", e);
+      return null;
+    } finally {
+      this.numericIdQuoteSweepInFlight = false;
+    }
+  }
 
   async migrateArchiveFoldersToSubfolders(): Promise<void> {
     if (this.settings.migratedArchiveToSubfolders) return;
@@ -8706,8 +9199,13 @@ export default class StashpadPlugin extends Plugin {
     const allDescendants: { id: StashpadId; file: TFile }[] = [];
     const files: TFile[] = [];
     const scopeIds = new Set<string>();
+    // 0.517.9: read the folder once for every root (was once per root). Read
+    // lazily so an empty selection costs no reads; this loop only reads, so one
+    // snapshot equals K fresh scans. Local to this call only.
+    let snap: SubtreeNode[] | undefined;
     for (const rid of rootIds) {
-      const sub = await collectSubtree(this.app, cleaned, rid);
+      if (!snap) snap = await readFolderSubtreeNodes(this.app, cleaned);
+      const sub = await collectSubtree(this.app, cleaned, rid, snap);
       if (!sub) continue;
       rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
       files.push(sub.rootNote.file); scopeIds.add(sub.rootNote.id);
@@ -8743,10 +9241,25 @@ export default class StashpadPlugin extends Plugin {
   async idsInFolder(folder: string): Promise<Set<StashpadId>> {
     const cleaned = folder.replace(/\/+$/, "");
     const out = new Set<StashpadId>();
-    for (const f of this.app.vault.getMarkdownFiles()) {
-      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== cleaned) continue;
-      try { const id = splitFrontmatter(await this.app.vault.read(f)).fm.id; if (typeof id === "string") out.add(id); } catch { /* skip unreadable */ }
-    }
+    // 0.517.7: request up to 8 note reads at a time (shared cursor) instead of one
+    // by one. Undo of a delete, Trash restore and unlock all await this once per blob.
+    // Measured: Obsidian's DESKTOP FileSystemAdapter runs every operation through one
+    // serial queue, so on desktop the real file reads still happen one at a time and
+    // the gain is ~0; any gain is on mobile (different adapter, untested). Kept
+    // because it is behavior-identical and harmless. Callers only test membership (it is
+    // copied into takenIds / `.has()`), so out-of-order adds are harmless. The read
+    // AND the parse both stay inside the try: a throw escaping a worker would reject
+    // Promise.all and abort the restore. The file list is still one snapshot.
+    const files = this.app.vault.getMarkdownFiles().filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned);
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = cursor++;
+        if (i >= files.length) return;
+        try { const id = splitFrontmatter(await this.app.vault.read(files[i])).fm.id; if (typeof id === "string") out.add(id); } catch { /* skip unreadable */ }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, files.length) }, worker));
     return out;
   }
 
@@ -8765,8 +9278,12 @@ export default class StashpadPlugin extends Plugin {
       const cleaned = folder.replace(/\/+$/, "");
       const rootNotes: { id: StashpadId; file: TFile }[] = [];
       const allDescendants: { id: StashpadId; file: TFile }[] = [];
+      // 0.517.9: one folder read for all roots (was one per root). Every desktop
+      // multi-note Mod+C / Mod+X lands here (alwaysStampCrossVault defaults on).
+      let snap: SubtreeNode[] | undefined;
       for (const rid of rootIds) {
-        const sub = await collectSubtree(this.app, cleaned, rid);
+        if (!snap) snap = await readFolderSubtreeNodes(this.app, cleaned);
+        const sub = await collectSubtree(this.app, cleaned, rid, snap);
         if (!sub) continue;
         rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
         for (const d of sub.descendants) allDescendants.push({ id: d.id, file: d.file });
@@ -8818,8 +9335,11 @@ export default class StashpadPlugin extends Plugin {
       const cleaned = folder.replace(/\/+$/, "");
       const rootNotes: { id: StashpadId; file: TFile }[] = [];
       const allDescendants: { id: StashpadId; file: TFile }[] = [];
+      // 0.517.9: one folder read for all roots (was one per root).
+      let snap: SubtreeNode[] | undefined;
       for (const rid of rootIds) {
-        const sub = await collectSubtree(this.app, cleaned, rid);
+        if (!snap) snap = await readFolderSubtreeNodes(this.app, cleaned);
+        const sub = await collectSubtree(this.app, cleaned, rid, snap);
         if (!sub) continue;
         rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
         for (const d of sub.descendants) allDescendants.push({ id: d.id, file: d.file });
@@ -8935,8 +9455,13 @@ export default class StashpadPlugin extends Plugin {
     const allDescendants: { id: StashpadId; file: TFile }[] = [];
     const srcRootOldIds: StashpadId[] = [];
     const srcNoteFiles: TFile[] = [];
+    // 0.517.9: one folder read for all roots (was one per root). The snapshot
+    // stays inside this gather loop — the trash below and the undo/redo closures
+    // never see it (they act on the files/snapshots captured here).
+    let snap: SubtreeNode[] | undefined;
     for (const rid of rootIds) {
-      const sub = await collectSubtree(this.app, srcFolder, rid);
+      if (!snap) snap = await readFolderSubtreeNodes(this.app, srcFolder);
+      const sub = await collectSubtree(this.app, srcFolder, rid, snap);
       if (!sub) continue;
       srcRootOldIds.push(sub.rootNote.id);
       rootNotes.push({ id: sub.rootNote.id, file: sub.rootNote.file });
@@ -9003,8 +9528,12 @@ export default class StashpadPlugin extends Plugin {
    *  Returns the files it trashed (for the caller's undo snapshot). */
   async trashSubtrees(folder: string, rootIds: StashpadId[]): Promise<TFile[]> {
     const files: TFile[] = [];
+    // 0.517.9: one folder read for all roots, fresh on EVERY call (redo calls this
+    // again after undo restored the files) — never a snapshot from an earlier call.
+    let snap: SubtreeNode[] | undefined;
     for (const rid of rootIds) {
-      const sub = await collectSubtree(this.app, folder, rid);
+      if (!snap) snap = await readFolderSubtreeNodes(this.app, folder);
+      const sub = await collectSubtree(this.app, folder, rid, snap);
       if (!sub) continue;
       files.push(sub.rootNote.file, ...sub.descendants.map((d) => d.file));
     }
@@ -9037,8 +9566,12 @@ export default class StashpadPlugin extends Plugin {
    *  subtrees — for an undo snapshot taken before trashing. */
   async subtreeFilePaths(folder: string, rootIds: StashpadId[]): Promise<string[]> {
     const files: TFile[] = [];
+    // 0.517.9: one folder read for all roots (was one per root). Not shared with
+    // the trashSubtrees call that usually follows — that one reads its own.
+    let snap: SubtreeNode[] | undefined;
     for (const rid of rootIds) {
-      const sub = await collectSubtree(this.app, folder, rid);
+      if (!snap) snap = await readFolderSubtreeNodes(this.app, folder);
+      const sub = await collectSubtree(this.app, folder, rid, snap);
       if (!sub) continue;
       files.push(sub.rootNote.file, ...sub.descendants.map((d) => d.file));
     }
@@ -9057,8 +9590,11 @@ export default class StashpadPlugin extends Plugin {
     const seen = new Set<StashpadId>();
     const posOf = (f: TFile): number => { const v = (this.app.metadataCache.getFileCache(f)?.frontmatter)?.position; return typeof v === "number" ? v : Number.MAX_SAFE_INTEGER; };
     type N = { id: StashpadId; file: TFile; created: string };
+    // 0.517.9: one folder read for all roots (was one per root).
+    let snap: SubtreeNode[] | undefined;
     for (const rid of rootIds) {
-      const sub = await collectSubtree(this.app, folder, rid);
+      if (!snap) snap = await readFolderSubtreeNodes(this.app, folder);
+      const sub = await collectSubtree(this.app, folder, rid, snap);
       if (!sub) continue;
       const childrenOf = new Map<StashpadId, N[]>();
       for (const d of sub.descendants) {
@@ -9104,9 +9640,13 @@ export default class StashpadPlugin extends Plugin {
   /** Recreate files from a snapshot (parents are created as needed). Overwrites an
    *  existing file at the same path. */
   async restoreSnapshot(snaps: FileSnapshot[]): Promise<void> {
+    // 0.519.1: one Set for this pass only, so files sharing a folder don't each
+    // re-run exists() on every ancestor. The adapter serialises its calls, so on
+    // a network share every skipped check is a full round trip saved.
+    const ensuredDirs = new Set<string>();
     for (const s of snaps) {
       const dir = s.path.split("/").slice(0, -1).join("/");
-      await this.ensureVaultFolder(dir);
+      await this.ensureVaultFolder(dir, ensuredDirs);
       const existing = this.app.vault.getAbstractFileByPath(s.path) as TFile | null;
       try {
         if (s.binary) {
@@ -9120,13 +9660,19 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  /** Ensure a (possibly nested) vault folder exists. */
-  async ensureVaultFolder(dir: string): Promise<void> {
+  /** Ensure a (possibly nested) vault folder exists. `ensured` (optional, one
+   *  pass only) skips folders already confirmed earlier in the same pass. */
+  async ensureVaultFolder(dir: string, ensured?: Set<string>): Promise<void> {
     if (!dir) return;
     let acc = "";
     for (const seg of dir.split("/")) {
       acc = acc ? `${acc}/${seg}` : seg;
-      if (!(await this.app.vault.adapter.exists(acc))) { try { await this.app.vault.createFolder(acc); } catch { /* race / exists */ } }
+      if (ensured?.has(acc)) continue;
+      // 0.519.1: record a folder only once exists() said yes or createFolder
+      // succeeded — never from the catch, so a failed create (network hiccup)
+      // is retried for the next file instead of being remembered as present.
+      if (await this.app.vault.adapter.exists(acc)) { ensured?.add(acc); continue; }
+      try { await this.app.vault.createFolder(acc); ensured?.add(acc); } catch { /* race / exists */ }
     }
   }
 
@@ -9222,9 +9768,9 @@ export default class StashpadPlugin extends Plugin {
       // believes auto-encrypts. Disk is authoritative.
       let fm: Record<string, unknown>;
       try { fm = splitFrontmatter(await this.app.vault.read(f)).fm; } catch { continue; }
-      const id = typeof fm.id === "string" ? fm.id : null;
+      const id = readId(fm.id);   // 0.527.1: bare all-digit ids must not stay plaintext
       if (!id || id === ROOT_ID) continue;
-      arrived.push({ id, parent: typeof fm.parent === "string" ? fm.parent : null });
+      arrived.push({ id, parent: readId(fm.parent) });
     }
     if (arrived.length === 0) return;
     const arrivedIds = new Set(arrived.map((a) => a.id));
@@ -9259,6 +9805,11 @@ export default class StashpadPlugin extends Plugin {
   async activateViewForFolder(folder: string): Promise<WorkspaceLeaf | null> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
     if (!cleaned) return null;
+    // 0.522.0: opening a view writes a Home note, which would make the folder a
+    // Stashpad. Refuse before a tab exists, so nothing flashes open. Callers
+    // already treat null as "didn't open".
+    const nest = await this.checkNewStashpadFolderOnDisk(cleaned);
+    if (!nest.ok) { this.explainNestBlock(nest); return null; }
     const prev = this.app.workspace.activeLeaf;
     const leaf = this.app.workspace.getLeaf("tab");
     await leaf.setViewState({
@@ -9508,6 +10059,12 @@ export default class StashpadPlugin extends Plugin {
   // Shared by the file-event path and the network-drive poll so neither
   // re-notifies the other's finds, and pre-existing notes never notify.
   private teamNotifiedIds = new Set<string>();
+  // 0.526.4: folders whose existing notes are already in teamNotifiedIds. A
+  // folder that only becomes discoverable later (lower import-exclude prefix,
+  // newly claimed, synced in) was never baselined, so the poll used to fire
+  // one persistent notice per old teammate note in it. Never pruned: a folder
+  // that was ever baselined keeps notifying normally for new notes.
+  private teamNotifyBaselineDirs = new Set<string>();
   private teamPollTimer: number | null = null;
 
   private queueTeamNotify(file: TFile): void {
@@ -9526,23 +10083,30 @@ export default class StashpadPlugin extends Plugin {
     });
   }
 
+  /** Public: re-baseline and restart the poll after a settings change. */
+  restartTeamNotifyPoll(): void { if (this.teamNotifyArmed) this.startTeamNotifyPoll(); }
+
+  /** Mark every note already in `dirs` as seen, without notifying, and record
+   *  the folders as baselined. */
+  private seedTeamNotifyBaseline(dirs: string[]): void {
+    for (const f of this.teamNotifyCandidateFiles(dirs)) {
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id === "string" && id) this.teamNotifiedIds.add(id);
+    }
+    for (const d of dirs) this.teamNotifyBaselineDirs.add(d.replace(/\/+$/, ""));
+  }
+
   /** Start (or restart) the network-drive fallback poll. File-change events
    *  don't cross machines on a shared network drive, so a coworker's note
    *  written on another Mac never fires vault.on("create"); this scans for
    *  notes new since the last pass and notifies for them. Baselines the
    *  current note set as "already seen" so it never floods on first run. */
-  /** Public: re-baseline and restart the poll after a settings change. */
-  restartTeamNotifyPoll(): void { if (this.teamNotifyArmed) this.startTeamNotifyPoll(); }
-
   private startTeamNotifyPoll(): void {
     if (this.teamPollTimer != null) { window.clearInterval(this.teamPollTimer); this.teamPollTimer = null; }
     // Baseline: every note that already exists is "seen" (don't notify for
     // the backlog — same philosophy as teamNotifyArmed suppressing the
     // startup create-storm).
-    for (const f of this.teamNotifyCandidateFiles(this.discoverStashpadFolders())) {
-      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
-      if (typeof id === "string" && id) this.teamNotifiedIds.add(id);
-    }
+    this.seedTeamNotifyBaseline(this.discoverStashpadFolders());
     const secs = this.settings.teamNotifyPollSeconds;
     if (!this.settings.teamNotifications || !secs || secs <= 0) return;
     this.teamPollTimer = window.setInterval(() => this.pollTeamNotify(), Math.max(15, secs) * 1000);
@@ -9554,8 +10118,17 @@ export default class StashpadPlugin extends Plugin {
    *  long after it was created). Dedupe is by note id via teamNotifiedIds. */
   private pollTeamNotify(): void {
     if (!this.settings.teamNotifications) return;
+    // 0.526.4: a folder that became discoverable since the last baseline
+    // brings its whole backlog with it — seed those notes silently instead of
+    // treating each one as news. Seeds from every discovered folder, not just
+    // the watched ones, so watching such a folder later can't flood either.
+    // Discovery is memoized, and the default (no watched folders) config
+    // already called it on every pass, so this adds no vault walk there.
+    const discovered = this.discoverStashpadFolders();
+    const fresh = discovered.filter((d) => !this.teamNotifyBaselineDirs.has(d.replace(/\/+$/, "")));
+    if (fresh.length) this.seedTeamNotifyBaseline(fresh);
     const watched = (this.settings.watchedFolders ?? []).map((f) => f.replace(/\/+$/, "")).filter(Boolean);
-    const dirs = watched.length ? watched : this.discoverStashpadFolders();
+    const dirs = watched.length ? watched : discovered;
     for (const f of this.teamNotifyCandidateFiles(dirs)) {
       const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
       if (typeof id !== "string" || !id || this.teamNotifiedIds.has(id)) continue;
@@ -9803,7 +10376,8 @@ export default class StashpadPlugin extends Plugin {
     const dir = folder.replace(/\/+$/, "");
     for (const f of this.app.vault.getMarkdownFiles()) {
       if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== dir) continue;
-      if (this.app.metadataCache.getFileCache(f)?.frontmatter?.id === id) return f;
+      // 0.527.0: number-or-text — a deep link carries "42", an unswept note's id is 42.
+      if (sameId(this.app.metadataCache.getFileCache(f)?.frontmatter?.id, id)) return f;
     }
     return null;
   }
@@ -9865,6 +10439,10 @@ export default class StashpadPlugin extends Plugin {
       log?: boolean;
       /** Where the link landed, for a caller that needs to undo it. */
       onLanding?: (landing: DeepLinkLanding, title: string | null) => void;
+      /** 0.525.0: why it failed, for a `silent` caller that reports on its own
+       *  (the paste box and the clipboard probe), so a refused link isn't
+       *  reported as "not found". `reason` has no "Stashpad link: " prefix. */
+      onFail?: (outcome: LinkLogOutcome, reason: string) => void;
     } = {},
   ): Promise<boolean> {
     const folder = (params.folder || "").replace(/^\/+|\/+$/g, "");
@@ -9872,10 +10450,14 @@ export default class StashpadPlugin extends Plugin {
     const viewName = ((params as { view?: string }).view || "").trim();
     const actions = parseRunActions(params);
     const url = this.canonicalLinkFor(params);
-    const fail = (msg: string): boolean => {
+    // 0.525.0: `outcome` — the nest guard's refusal logs as "refused", not
+    // "not found"; the folder is there, the link just can't open it.
+    const fail = (msg: string, outcome: LinkLogOutcome = "not-found"): boolean => {
       if (!opts.silent) notify(msg);
+      const reason = msg.replace(/^Stashpad link: /, "");
+      opts.onFail?.(outcome, reason);
       if (opts.log === false) return false;
-      void this.recordLink({ kind: "received", url, folder, noteId: noteId || null, view: viewName || null, title: null, outcome: "not-found", detail: msg.replace(/^Stashpad link: /, "") });
+      void this.recordLink({ kind: "received", url, folder, noteId: noteId || null, view: viewName || null, title: null, outcome, detail: reason });
       return false;
     };
 
@@ -9911,6 +10493,11 @@ export default class StashpadPlugin extends Plugin {
     // no leaf to mount into. onLayoutReady fires immediately if already ready
     // (the common same-vault path), so this is a no-op there.
     await new Promise<void>((resolve) => this.app.workspace.onLayoutReady(() => resolve()));
+    // 0.522.0: a link names any folder, so it could make a Stashpad inside (or
+    // around) another one. Checked after layout-ready so the cache has had its
+    // chance; the disk look keeps an existing Stashpad from being refused.
+    const nest = await this.checkNewStashpadFolderOnDisk(dir.path);
+    if (!nest.ok) return fail(`Stashpad link: ${nestBlockMessage(nest)}`, "refused");
 
     let file: TFile | null = null;
     if (noteId) {
@@ -10068,11 +10655,12 @@ export default class StashpadPlugin extends Plugin {
     // A holder rather than two `let`s: the callback fires inside the await, and
     // TypeScript's flow analysis narrows a `let` assigned only from a callback
     // to its initializer type.
-    const out: { landing: DeepLinkLanding | null; title: string | null } = { landing: null, title: null };
+    const out: { landing: DeepLinkLanding | null; title: string | null; refused: string | null } = { landing: null, title: null, refused: null };
     const ok = await this.handleDeepLink(parsed, {
       silent: true,          // this path shows its OWN receipt, with the undo
       log: false,            // …and owns the log entry, as `clipboard`
       onLanding: (l, t) => { out.landing = l; out.title = t; },
+      onFail: (o, reason) => { if (o === "refused") out.refused = reason; },
     });
     const { landing, title } = out;
     const folder = (parsed.folder || "").replace(/^\/+|\/+$/g, "");
@@ -10083,6 +10671,14 @@ export default class StashpadPlugin extends Plugin {
       noteId: parsed.note ?? null, view: parsed.view ?? null, title,
     };
     const sticky = this.settings.deepLinkReceiptSticky;
+
+    // 0.525.0: the folder IS here, but opening it would put one Stashpad inside
+    // another. Say so; "isn't in this vault yet" and "Try again" would mislead.
+    if (!ok && out.refused) {
+      await this.recordLink({ ...base, outcome: "refused", detail: out.refused });
+      this.notifications.show({ message: `A Stashpad link is on your clipboard, but it can't be opened. ${out.refused}`, kind: "warning", category: "link", folder });
+      return;
+    }
 
     if (!ok) {
       // Couldn't serve it — the folder or note isn't here (yet; a fresh device
@@ -10103,10 +10699,12 @@ export default class StashpadPlugin extends Plugin {
         actions: [{
           label: "Try again",
           onClick: async () => {
-            const retried = await this.handleDeepLink(parsed, { log: false });
+            // 0.525.0: a holder, for the same flow-analysis reason as `out`.
+            const why: { outcome: LinkLogOutcome } = { outcome: "not-found" };
+            const retried = await this.handleDeepLink(parsed, { log: false, onFail: (o) => { why.outcome = o; } });
             this.updateLinkRecord(id, retried
               ? { outcome: "opened", detail: "opened from the clipboard offer" }
-              : { outcome: "not-found", detail: "retried from the clipboard offer" });
+              : { outcome: why.outcome, detail: "retried from the clipboard offer" });
           },
         }],
       });
@@ -10338,7 +10936,8 @@ export default class StashpadPlugin extends Plugin {
   private async openDeepLinks(items: Array<{ raw: string; parsed: NonNullable<ReturnType<typeof parseStashpadLink>> }>): Promise<void> {
     const myVault = this.app.vault.getName();
     const multi = items.length > 1;
-    let opened = 0, handedOff = 0, notFound = 0;
+    let opened = 0, handedOff = 0, notFound = 0, refused = 0;
+    let refusedWhy: string | null = null;
     for (const { raw, parsed } of items) {
       // Cross-vault link → let Obsidian open it (it switches vaults). Don't try
       // locally (the folder isn't in THIS vault).
@@ -10349,8 +10948,16 @@ export default class StashpadPlugin extends Plugin {
         await new Promise((r) => window.setTimeout(r, 350)); // stagger so Obsidian routes each
         continue;
       }
-      const ok = await this.handleDeepLink(parsed, { forceNewTab: multi, silent: true });
+      // 0.525.0: a holder, so the callback's write survives flow analysis.
+      const why: { refused: string | null } = { refused: null };
+      const ok = await this.handleDeepLink(parsed, {
+        forceNewTab: multi, silent: true,
+        onFail: (o, reason) => { if (o === "refused") why.refused = reason; },
+      });
       if (ok) { opened++; continue; }
+      // 0.525.0: the folder is here but the nest guard refused it. Counted
+      // apart, with the first reason shown: "not found" was wrong for these.
+      if (why.refused) { refused++; refusedWhy ??= why.refused; continue; }
       // Resolved to THIS vault but not found. If the link names a vault (this one)
       // there's nothing more to try; if it names ANOTHER, we already handed off.
       // A vault-less miss is a genuine not-found — report it.
@@ -10360,7 +10967,9 @@ export default class StashpadPlugin extends Plugin {
     if (opened) parts.push(`opened ${opened}`);
     if (handedOff) parts.push(`sent ${handedOff} to Obsidian (other vault)`);
     if (notFound) parts.push(`${notFound} not found`);
-    notify(`Stashpad link${items.length === 1 ? "" : "s"}: ${parts.join(" · ") || "nothing to open"}.`);
+    if (refused) parts.push(`${refused} can't be opened`);
+    const tally = `Stashpad link${items.length === 1 ? "" : "s"}: ${parts.join(" · ") || "nothing to open"}.`;
+    notify(refusedWhy ? `${tally} ${refusedWhy}` : tally);
   }
 
   /** Hand a raw `obsidian://…` URL to Obsidian's own protocol handling (via the
@@ -11641,7 +12250,14 @@ export default class StashpadPlugin extends Plugin {
   async runFolderFrontmatterBackfill(folder: string): Promise<void> {
     const label = folder.split("/").pop() || folder;
     let written = 0, checked = 0;
-    try { const s = await rebootstrapFolderFrontmatter(this.app, folder); written = s.written; checked = s.checked; }
+    try {
+      const s = await rebootstrapFolderFrontmatter(this.app, folder);
+      written = s.written; checked = s.checked;
+      // 0.527.0: same record as the full Rebootstrap when ids were quoted.
+      if (s.quoted > 0 || s.unsafeIds > 0) {
+        void this.newLog().append({ type: "id_maintenance", id: "", payload: { what: "quote-numeric-ids", trigger: "folder-backfill", quoted: s.quoted, unsafe: s.unsafeIds, folders: 1 } });
+      }
+    }
     catch (e) {
       this.notifications.show({ message: `Stashpad: frontmatter backfill failed in \`${label}\`\n${(e as Error).message}`, kind: "error", category: "system", folder });
       console.error("[Stashpad] runFolderFrontmatterBackfill failed", folder, e);
@@ -12500,6 +13116,14 @@ export default class StashpadPlugin extends Plugin {
       }
       this.lastSeenSettingsRev = diskRev;
     }
+    // 0.519.5 (perf): a synced `importExcludePrefixes` change must drop the
+    // folder memo — no setter ran on this device, so saveSettings' check never
+    // saw it. It used to be fixed only by accident, when an ordinary note's
+    // frontmatter "changed" dropped the memo; 0.519.5 stopped that. Checked
+    // unconditionally (not only when this pass adopted the key) so a value the
+    // save-time collision guard already adopted during a quiet write is caught
+    // too, and BEFORE setSettings so its listeners see the new folder set.
+    this.dropFolderMemoIfPrefixesChanged();
 
     if (anyChanged) {
       // 0.292.0 (perf): FORCE the repaint here. The per-folder filter keys
@@ -12727,11 +13351,7 @@ export default class StashpadPlugin extends Plugin {
     // when THAT changed; a loud save happens on every toggle and tab switch,
     // and cooling the memo each time would hand the next `resolved` a full
     // vault walk again.
-    const prefixSig = JSON.stringify(this.settings.importExcludePrefixes ?? null);
-    if (prefixSig !== this.memoPrefixSig) {
-      this.memoPrefixSig = prefixSig;
-      this.invalidateStashpadFoldersMemo();
-    }
+    this.dropFolderMemoIfPrefixesChanged();
     perf.enabled = !!this.settings.enablePerfProfiling;
     // 0.77.1: keep the registry's record of the local user current. The
     // registry is a recovery cache — recording here means a name/role/
@@ -12779,7 +13399,8 @@ export default class StashpadPlugin extends Plugin {
   /** Scan every markdown file inside any discovered Stashpad folder
    *  and bring its frontmatter into a valid Stashpad shape:
    *    - id        → generated if missing, never overwritten if present
-   *    - parent    → ROOT_ID if missing/empty, never overwritten otherwise
+   *    - parent    → ROOT_ID if missing/empty, never overwritten otherwise;
+   *                  never stamped on a Home (id __root__)
    *    - created   → file ctime if missing
    *
    *  This is the batch version of the adopt command, except it also
@@ -12801,7 +13422,7 @@ export default class StashpadPlugin extends Plugin {
     for (const f of allMd) {
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
         | { id?: unknown } | undefined;
-      const id = typeof fm?.id === "string" ? fm.id.trim() : "";
+      const id = readId(fm?.id)?.trim() ?? "";   // 0.527.1
       if (id) usedIds.add(id);
     }
 
@@ -12825,12 +13446,17 @@ export default class StashpadPlugin extends Plugin {
       if (!stashpadFolders.has(dir)) continue;
       const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
         | { id?: unknown; parent?: unknown; created?: unknown } | undefined;
-      const idStr = typeof fm?.id === "string" ? fm.id.trim() : "";
+      // 0.527.0: readId — a bare all-digit id (YAML number) IS an id. With
+      // typeof it read as missing and a fresh id was minted over it, orphaning
+      // every child whose `parent` still named the old one.
+      const idStr = readId(fm?.id)?.trim() ?? "";
       const p = fm?.parent;
       const hasParent = typeof p === "string" ? p.trim() !== "" : (p !== undefined && p !== null);
-      const hasCreated = typeof fm?.created === "string" && fm.created.trim() !== "";
+      const hasCreated = hasFmValue(fm?.created);   // 0.527.1: a number counts
       const addId = !idStr;
-      const addParent = !hasParent;
+      // 0.523.3: a Home's `parent: null` is canonical, not an orphan (see
+      // fixOrphanParentForFile).
+      const addParent = !hasParent && idStr !== ROOT_ID;
       const addCreated = !hasCreated;
       if (!addId && !addParent && !addCreated) continue;
       plan.push({ file: f, addId, addParent, addCreated });
@@ -12851,17 +13477,17 @@ export default class StashpadPlugin extends Plugin {
         let stampedId: string | undefined;
         await this.app.fileManager.processFrontMatter(item.file, (m) => {
           if (item.addId) {
-            const cur = typeof m.id === "string" ? m.id.trim() : "";
+            const cur = readId(m.id)?.trim() ?? "";   // 0.527.0: number ids count
             if (!cur) { stampedId = pickFreshId(); m.id = stampedId; }
           }
           if (item.addParent) {
             const cur = m.parent;
             const set = typeof cur === "string" ? cur.trim() !== "" : (cur !== undefined && cur !== null);
-            if (!set) m.parent = ROOT_ID;
+            const isHome = typeof m.id === "string" && m.id.trim() === ROOT_ID;
+            if (!set && !isHome) m.parent = ROOT_ID;
           }
           if (item.addCreated) {
-            const cur = typeof m.created === "string" ? m.created.trim() : "";
-            if (!cur) m.created = new Date(item.file.stat.ctime).toISOString();
+            if (!hasFmValue(m.created)) m.created = new Date(item.file.stat.ctime).toISOString();
           }
         });
         const fmAfter = this.app.metadataCache.getFileCache(item.file)?.frontmatter as
@@ -12970,7 +13596,7 @@ export default class StashpadPlugin extends Plugin {
           kept.push("parent");
         }
         // created: missing/blank → file's ctime as ISO string.
-        const hasCreated = typeof fm.created === "string" && fm.created.trim() !== "";
+        const hasCreated = hasFmValue(fm.created);   // 0.527.1: a number counts
         if (!hasCreated) {
           fm.created = new Date(file.stat.ctime).toISOString();
           added.push("created");

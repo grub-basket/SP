@@ -6,6 +6,7 @@ import type { TreeIndex } from "./tree-index";
 import type { TreeNode } from "./types";
 import { ROOT_ID } from "./types";
 import { buildTimePickerInto, formatWhenTime } from "./time-picker";
+import { keepMatchInClamp } from "./suggest-match";
 // Obsidian types `moment` as the namespace (not callable); a callable view for
 // the call sites. Type usage like `moment.unitOfTime` keeps using `moment`.
 const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
@@ -194,6 +195,16 @@ interface NoteBody {
   /** 0.124.0: when set, this entry is an encrypted/locked note (no node, no
    *  searchable body — only its visible label/placeholder matches). */
   locked?: LockedNote;
+}
+
+/** 0.518.5 (perf P86): id → NoteBody lookup built by StashpadSuggest.noteLookup. */
+interface NoteIndex {
+  /** `notes.length` when built — a different length means rebuild. */
+  len: number;
+  /** Local entries by node id. */
+  local: Map<string, NoteBody>;
+  /** Cross-folder entries by folder, then note id. */
+  cross: Map<string, Map<string, NoteBody>>;
 }
 
 export class StashpadSuggest extends SuggestModal<PickerItem> {
@@ -401,6 +412,8 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
   }
 
   getSuggestions(query: string): PickerItem[] {
+    // 0.518.5 (perf P86): each pass re-parses its highlight tokens — see highlightTokens.
+    this.highlightMemo = null;
     const q = query.trim().toLowerCase();
     // 0.322.0: recent + saved searches head the SEARCH modal when the box is
     // empty; a "Save this search" row leads when there's a query to save.
@@ -513,10 +526,6 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       }
       return true;
     };
-    // For search mode's per-line matchLine: a line is a match when it
-    // contains EVERY token (token-order-agnostic on a single line).
-    const lineMatchesAll = (line: string): boolean => matchesAll(line.toLowerCase());
-
     // Tier the candidates: local first (notes from the active tree),
     // then cross-folder (notes from other Stashpads). The user wanted
     // cross-folder results to appear AFTER the local ones rather than
@@ -533,7 +542,11 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       label: n.title,
       node: n.node,
       kind: "note",
-      bodyPreview: this.previewFromBody(n.body, matchLine),
+      // 0.518.4 (perf P71): only cluster rows (matchLine >= 0) get a preview.
+      // renderSuggestion draws the snippet only when matchLine >= 0, so the
+      // first-lines preview built for matchLine -1 was split + filtered for
+      // every note on every keystroke and never shown.
+      bodyPreview: matchLine >= 0 ? this.previewFromBody(n.body, matchLine, tokens) : undefined,
       matchLine,
       crossFolder: n.cross?.folder,
       crossFile: n.cross?.file,
@@ -563,12 +576,13 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         band = 0; // empty query → recency only
       } else {
         const t = n.title.toLowerCase();
-        const b = n.body.toLowerCase();
+        // 0.518.3 (perf P40): the body is lowercased only once the title
+        // bands miss — a title hit never needed it.
         if (t === q) band = 6;
         else if (t.startsWith(q)) band = 5;
         else if (t.includes(q)) band = 4;                 // exact phrase in title
         else if (tokens.every((x) => t.includes(x))) band = 3; // all tokens in title
-        else if (b.includes(q)) band = 2;                 // exact phrase in body
+        else if (n.body.toLowerCase().includes(q)) band = 2; // exact phrase in body
         else band = 1;                                    // token(s) in body only
       }
       if (pinHomes && isHome(n)) band += 0.5; // destination picker: float homes up
@@ -588,13 +602,23 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         if (this.opts.mode === "search") {
           if (!q) { matched.push({ n, matchLines: [] }); continue; }
           const titleHit = matchesAll(n.title.toLowerCase());
-          const lines = n.body.split(/\r?\n/);
+          // 0.518.3 (perf P40): lowercase the body once for matching and split
+          // that, instead of lowercasing every line and then the whole body
+          // again for the fallback. (relevanceBand may lowercase it once more,
+          // only when no title band hits.) Same lines at the same indices:
+          // lowercasing never adds or removes \r/\n, and the one
+          // context-sensitive mapping (final sigma) stops at a line break, so
+          // previewFromBody's split of the raw body still lines up with
+          // matchLine.
+          const lb = n.body.toLowerCase();
+          const lines = lb.split(/\r?\n/);
           // 0.69.12: collect ALL per-line matches; clustered into rows below.
+          // A line matches when it contains EVERY token (any order).
           const matchLines: number[] = [];
           for (let i = 0; i < lines.length; i++) {
-            if (lineMatchesAll(lines[i])) matchLines.push(i);
+            if (matchesAll(lines[i])) matchLines.push(i);
           }
-          const bodyHit = matchLines.length > 0 || matchesAll(n.body.toLowerCase());
+          const bodyHit = matchLines.length > 0 || matchesAll(lb);
           if (!titleHit && !bodyHit) continue;
           matched.push({ n, matchLines });
         } else {
@@ -753,6 +777,9 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // from the pre-merge note set, so newly-merged excluded notes would render
     // with empty breadcrumbs otherwise. 0.140.14
     this.crossFolderIndex = null;
+    // Same for the row lookup (0.518.5, perf P86) — its length check would
+    // catch the merge anyway; dropping it here keeps the two in step.
+    this.noteIndex = null;
     for (const n of this.notes) {
       if (!n.cross || n.body || !n.cross.file) continue;
       this.app.vault.cachedRead(n.cross.file).then((md) => { n.body = this.stripFm(md); });
@@ -765,7 +792,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     }
   }
 
-  private previewFromBody(body: string, matchLine: number): string {
+  private previewFromBody(body: string, matchLine: number, tokens: string[] = []): string {
     // 0.69.19: index against the UNFILTERED line array — matchLine in
     // PickerItems comes from matchTier's unfiltered split, so filtering
     // empty lines here desynced the index (preview was anchored to the
@@ -779,10 +806,60 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     }
     const start = Math.max(0, matchLine - 2);
     const end = Math.min(rawLines.length, matchLine + 3);
-    return rawLines
-      .slice(start, end)
-      .filter((l) => l.trim().length > 0)
-      .join("\n");
+    // 0.526.3: split the window at the match line so keepMatchInClamp knows
+    // where it is; lead + rest is the same filtered window as before. With
+    // tokens, rest[0] is the match line (it holds every token, so it is never
+    // blank). The CSS clamp counts wrapped lines, so long lines above the match
+    // could push the highlight out of view; the characters-per-line figure is
+    // an estimate on the low side (desktop measured ~95, phone estimated ~40,
+    // and word wrap fits fewer than that per line). Too low only trims context
+    // a little early; too high would let the highlight slip past the clamp.
+    const keep = (l: string): boolean => l.trim().length > 0;
+    const lead = rawLines.slice(start, matchLine).filter(keep);
+    const rest = rawLines.slice(matchLine, end).filter(keep);
+    if (!tokens.length || !rest.length) return [...lead, ...rest].join("\n");
+    return keepMatchInClamp([...lead, ...rest], lead.length, tokens, Platform.isPhone ? 32 : 80).join("\n");
+  }
+
+  /** 0.518.5 (perf P86): renderSuggestion (every row) and parentBlurbFor (every
+   *  local row) found their NoteBody with `this.notes.find` — a scan of every
+   *  note, per row, per keystroke. Index once: local entries by node id,
+   *  cross-folder entries by folder THEN id (every folder's home shares
+   *  ROOT_ID). The first entry per key wins, as `find` returned the first
+   *  match. Entries are the same objects as in `this.notes`, so bodies and
+   *  titles read in later show through. `notes` only grows (loadExcludedNotes)
+   *  and node / cross ids never change in place — a rename while the picker is
+   *  open keeps the id, a delete leaves the stale entry exactly as `find` did —
+   *  so a length change is the one rebuild cue. */
+  private noteIndex: NoteIndex | null = null;
+  private noteLookup(): NoteIndex {
+    if (this.noteIndex && this.noteIndex.len === this.notes.length) return this.noteIndex;
+    const local = new Map<string, NoteBody>();
+    const cross = new Map<string, Map<string, NoteBody>>();
+    for (const n of this.notes) {
+      if (n.node && !local.has(n.node.id)) local.set(n.node.id, n);
+      if (n.cross) {
+        let byId = cross.get(n.cross.folder);
+        if (!byId) { byId = new Map(); cross.set(n.cross.folder, byId); }
+        if (!byId.has(n.cross.id)) byId.set(n.cross.id, n);
+      }
+    }
+    this.noteIndex = { len: this.notes.length, local, cross };
+    return this.noteIndex;
+  }
+
+  /** 0.518.5 (perf P86): the free-text tokens to highlight, parsed once per
+   *  suggestion pass instead of once per rendered row. Keyed on the input value
+   *  AND dropped at the top of every getSuggestions, because whether a date
+   *  filter parses (and so whether its words count as text) can depend on
+   *  today's date. Highlighting only — getSuggestions parses its own query. */
+  private highlightMemo: { value: string; tokens: string[] } | null = null;
+  private highlightTokens(): string[] {
+    const value: string = (this as any).inputEl?.value ?? "";
+    if (!this.highlightMemo || this.highlightMemo.value !== value) {
+      this.highlightMemo = { value, tokens: parseSearchQuery(value).text };
+    }
+    return this.highlightMemo.tokens;
   }
 
   renderSuggestion(item: PickerItem, el: HTMLElement): void {
@@ -835,7 +912,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       const body = el.createDiv({ cls: "stashpad-suggest-body" });
       const top = body.createDiv({ cls: "stashpad-suggest-title stashpad-suggest-locked" });
       setIcon(top.createSpan({ cls: "stashpad-suggest-locked-icon" }), "lock");
-      const tokens = parseSearchQuery((this as any).inputEl?.value ?? "").text;
+      const tokens = this.highlightTokens();
       this.highlightInto(top.createSpan(), item.label, tokens);
       body.createDiv({
         cls: "stashpad-suggest-preview",
@@ -851,16 +928,17 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     const body = el.createDiv({ cls: "stashpad-suggest-body" });
 
     // Locate the underlying NoteBody so we can render body + parent body.
-    const note = this.notes.find((n) => {
-      // Match folder AND id — home notes across folders all share ROOT_ID, so id
-      // alone would resolve every cross-folder home to the first one (the
-      // "Beta home shows Alpha's title/body" bug).
-      if (item.crossFolder) return n.cross?.folder === item.crossFolder && n.cross?.id === item.crossId;
-      return n.node?.id === item.id;
-    });
-    // 0.69.3: re-parse the current input each render so we know which
-    // free-text tokens to highlight (filter prefixes excluded).
-    const tokens = parseSearchQuery((this as any).inputEl?.value ?? "").text;
+    // Match folder AND id — home notes across folders all share ROOT_ID, so id
+    // alone would resolve every cross-folder home to the first one (the
+    // "Beta home shows Alpha's title/body" bug). 0.518.5 (perf P86): a Map
+    // lookup instead of a scan of every note per row.
+    const idx = this.noteLookup();
+    const note = item.crossFolder
+      ? (item.crossId !== undefined ? idx.cross.get(item.crossFolder)?.get(item.crossId) : undefined)
+      : idx.local.get(item.id);
+    // 0.69.3: re-parse the current input so we know which free-text tokens to
+    // highlight (filter prefixes excluded) — once per pass as of 0.518.5.
+    const tokens = this.highlightTokens();
     // Top line: body's first non-empty line (or fallback to the label).
     const bodyTop = this.firstLineOfBody(note?.body ?? "") || item.label.trim();
     const top = body.createDiv({ cls: "stashpad-suggest-title" });
@@ -1041,7 +1119,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     if (!node || !node.parent || node.parent === ROOT_ID) return "";
     const parent = this.tree.get(node.parent);
     if (!parent || !parent.file) return "";
-    const parentEntry = this.notes.find((n) => n.node?.id === parent.id);
+    const parentEntry = this.noteLookup().local.get(parent.id); // 0.518.5 (perf P86): was a notes.find scan
     return parentEntry ? this.firstLineOfBody(parentEntry.body) : "";
   }
 

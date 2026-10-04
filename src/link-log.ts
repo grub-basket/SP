@@ -21,12 +21,15 @@ export type LinkLogKind = "shared" | "received" | "clipboard";
  *    re-navigated. Distinct from `opened` (no new tab) and from `revealed`
  *    (something did move).
  *  - `not-found` — resolved against this vault and missed.
+ *  - `refused` — (0.525.0) the folder is here, but opening it would put one
+ *    Stashpad inside another (the nest guard), so it was not opened. An older
+ *    build shows this entry with an empty label.
  *  - `handed-off` — names another vault; passed to Obsidian to route.
  *  - `offered` — surfaced to the user, awaiting their say-so.
  *  - `undone` — opened, then the user took the offer to close it again.
  *  - `ignored` — surfaced and never acted on. */
 export type LinkLogOutcome =
-  | "copied" | "opened" | "revealed" | "reused" | "not-found"
+  | "copied" | "opened" | "revealed" | "reused" | "not-found" | "refused"
   | "handed-off" | "offered" | "undone" | "ignored";
 
 export interface LinkLogEntry {
@@ -237,6 +240,7 @@ export const LINK_OUTCOME_LABELS: Record<LinkLogOutcome, string> = {
   revealed: "revealed",
   reused: "reused its tab",
   "not-found": "not found",
+  refused: "refused",
   "handed-off": "sent to Obsidian",
   offered: "offered",
   undone: "closed again",
