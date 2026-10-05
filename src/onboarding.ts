@@ -12,7 +12,7 @@
  *  ONLY thing that writes to the vault on first run — nothing is created until
  *  the user picks "fresh" or "demo".
  */
-import { App, Modal, Setting } from "obsidian";
+import { App, Modal, Setting, type EventRef } from "obsidian";
 import { notify } from "./notify";
 import { seedDemoContent, DEMO_NOTE_COUNT } from "./demo-content";
 import { FolderSuggest } from "./folder-suggest";
@@ -50,13 +50,45 @@ export class WelcomeModal extends Modal {
    *  something" from "user dismissed with Escape / the X". */
   private choice: OnboardingChoice | null = null;
   private busy = false;
+  /** 0.531.0: opened by the first-run check (not from Help / the command). An
+   *  automatic welcome steps aside if a Stashpad turns up while it's open — a
+   *  slow network drive or a sync can deliver the existing folders late. */
+  private auto: boolean;
 
-  constructor(app: App, plugin: StashpadPlugin) {
+  constructor(app: App, plugin: StashpadPlugin, opts: { auto?: boolean } = {}) {
     super(app);
     this.plugin = plugin;
+    this.auto = opts.auto === true;
+  }
+
+  private cacheRefs: EventRef[] = [];
+  private recheckTimer: number | null = null;
+
+  /** Automatic welcome only: if the vault turns out to have a Stashpad after
+   *  all (late index / sync), close without writing anything and say so. */
+  private watchForExistingStashpad(): void {
+    // Trailing debounce: during a long cold index every parsed note in a new
+    // folder drops the folder memo, so check once the burst goes quiet rather
+    // than re-walking the vault every 400 ms.
+    const recheck = (): void => {
+      if (this.recheckTimer !== null) window.clearTimeout(this.recheckTimer);
+      this.recheckTimer = window.setTimeout(() => {
+        this.recheckTimer = null;
+        if (this.busy || this.choice) return;
+        const found = this.plugin.discoverStashpadFolders();
+        if (!found.length) return;
+        this.choice = "later";
+        this.close();
+        const name = found.length === 1 ? `"${found[0]}"` : `${found.length} Stashpads`;
+        notify(`Stashpad: found ${name} in this vault, so setup isn't needed. Open it from the Stashpad icon.`, 10000);
+      }, 400);
+    };
+    const mc = this.app.metadataCache;
+    this.cacheRefs.push(mc.on("changed", recheck), mc.on("resolved", recheck));
   }
 
   onOpen(): void {
+    if (this.auto) this.watchForExistingStashpad();
     const { contentEl } = this;
     contentEl.addClass("stashpad-welcome");
 
@@ -185,6 +217,9 @@ export class WelcomeModal extends Modal {
   }
 
   onClose(): void {
+    for (const ref of this.cacheRefs) this.app.metadataCache.offref(ref);
+    this.cacheRefs = [];
+    if (this.recheckTimer !== null) { window.clearTimeout(this.recheckTimer); this.recheckTimer = null; }
     // Any exit is an answer, including Escape and the close button: the user
     // has seen the offer, and re-asking every launch would be nagging. They can
     // always reopen it from Settings → Help & Getting started.

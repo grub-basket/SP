@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type TAbstractFile } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type Events, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId, hasFmValue, newId, readId, sameId } from "./id-service";
 import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
@@ -2907,11 +2907,61 @@ export default class StashpadPlugin extends Plugin {
    *  with no guard, so opening Stashpad within ~2.5s of launch on a fresh vault
    *  put TWO stacked copies of the setup dialog on screen (confirmed live: two
    *  full sets of "Set up later / Set up fresh / Set up with demo content"). */
-  showWelcome(): void {
+  showWelcome(opts: { auto?: boolean } = {}): void {
     if (this.welcomeModal) return; // already on screen — don't stack a second
-    const modal = new WelcomeModal(this.app, this);
+    const modal = new WelcomeModal(this.app, this, { auto: opts.auto === true });
     this.welcomeModal = modal;
     modal.open();
+  }
+
+  /** 0.531.0: run `fn` once Obsidian's metadata cache has finished its initial
+   *  index — immediately if it already has. Anything that decides "this vault
+   *  has no Stashpads" must wait for this, because folder discovery reads note
+   *  frontmatter from that cache.
+   *
+   *  Obsidian exposes no public "indexed" flag. The internals used here exist
+   *  in 1.13/1.14 and are feature-detected: `initialized` (initial load + parse
+   *  queued; `finished` fires when it flips) and `onCleanCache(cb)` (runs cb once
+   *  no parse task is in flight and the link resolver is idle — it can fire
+   *  before `initialized`, so it's only asked AFTER). There is NO
+   *  `metadataCache.resolved` field — an earlier draft keyed on it and never
+   *  waited. If the internals are missing, `fn` runs now (old behaviour), and
+   *  a cap means a stuck index can't defer `fn` forever — pass `null` for
+   *  work that must NEVER run on a partial index (anything that writes). */
+  whenVaultIndexed(fn: () => void, capMs: number | null = 60_000): void {
+    const mc = this.app.metadataCache as unknown as Events & {
+      initialized?: boolean; onCleanCache?: (cb: () => void) => void;
+    };
+    let done = false;
+    // onCleanCache keeps its callback in Obsidian's own list, which unload
+    // can't reach — so a plugin disabled/reloaded mid-index (BRAT update, dev
+    // reload) must neuter its callback itself, or the dead instance would still
+    // run fn (e.g. open a second Welcome next to the new instance's).
+    let dead = false;
+    let cap: number | null = null;
+    const run = (): void => {
+      if (done || dead) return;
+      done = true;
+      if (cap !== null) { window.clearTimeout(cap); cap = null; }
+      fn();
+    };
+    // Need the functions AND a real boolean `initialized`; otherwise the old
+    // behaviour (run now) rather than mis-detecting "indexing forever".
+    if (typeof mc.onCleanCache !== "function" || typeof mc.initialized !== "boolean") { run(); return; }
+    this.register(() => { dead = true; if (cap !== null) window.clearTimeout(cap); });
+    if (capMs !== null) cap = window.setTimeout(run, capMs);
+    const afterInit = (): void => mc.onCleanCache!(run);
+    if (mc.initialized) { afterInit(); return; }
+    const ref = mc.on("finished", () => { mc.offref(ref); afterInit(); });
+    this.registerEvent(ref);
+  }
+
+  /** True while Obsidian is still building its initial index of the vault
+   *  (false if that can't be determined — see whenVaultIndexed). */
+  vaultIndexing(): boolean {
+    const mc = this.app.metadataCache as unknown as { initialized?: boolean; isCacheClean?: () => boolean };
+    if (typeof mc.isCacheClean !== "function" || typeof mc.initialized !== "boolean") return false;
+    return !mc.initialized || !mc.isCacheClean();
   }
 
   /** Seed the example content into a fresh folder and open it. Used by the
@@ -3297,16 +3347,26 @@ export default class StashpadPlugin extends Plugin {
       // reads frontmatter from the metadata cache, which isn't populated yet
       // during onload. Asking too early would report zero folders for an
       // existing user and greet them as if they were new.
-      window.setTimeout(() => {
-        if (!shouldShowWelcome(this)) return;
-        // 0.484.1: via showWelcome() so the single-instance guard applies — this
-        // timer racing a user-initiated open is exactly how two stacked.
-        this.showWelcome();
-      }, 2500);
-      // 0.395.0: a short launch reminder that unsent composer drafts exist (drafts
-      // are no longer surfaced in the composer text). Setting-gated; skipped when
-      // the welcome modal is showing so a first-run user isn't double-notified.
-      window.setTimeout(() => { if (!shouldShowWelcome(this)) this.maybeShowDraftsReminder(); }, 3200);
+      // 0.531.0: and wait for the cache's INITIAL INDEX ('resolved'), not just a
+      // fixed delay. On a large vault on a network drive — or a coworker's
+      // first open of a shared vault, where their own config folder means a
+      // cold cache — 2.5 s is nowhere near enough, the existing Stashpads
+      // aren't parsed yet, and they were greeted as a new user (with "Set up
+      // fresh" a click away from writing into the shared vault).
+      this.whenVaultIndexed(() => {
+        window.setTimeout(() => {
+          if (!shouldShowWelcome(this)) return;
+          // 0.484.1: via showWelcome() so the single-instance guard applies — this
+          // timer racing a user-initiated open is exactly how two stacked.
+          this.showWelcome({ auto: true });
+        }, 2500);
+        // 0.395.0: a short launch reminder that unsent composer drafts exist (drafts
+        // are no longer surfaced in the composer text). Setting-gated; skipped when
+        // the welcome modal is showing so a first-run user isn't double-notified.
+        // 0.531.0: deferred with the welcome check, which it mirrors — mid-index
+        // shouldShowWelcome() can read "no Stashpads" and silently skip it.
+        window.setTimeout(() => { if (!shouldShowWelcome(this)) this.maybeShowDraftsReminder(); }, 3200);
+      });
       // Vault is fully indexed now — safe to reconcile locked placeholders
       // (drop entries whose blob is truly gone, add cross-device blobs).
       void this.reconcileLockedRegistry();
@@ -3745,9 +3805,24 @@ export default class StashpadPlugin extends Plugin {
     // 2+ → picker. The picker is deliberately kept for 2+ rather than auto-opening
     // the last-used folder, so nothing is opened or converted without being asked;
     // last-used is merely ranked first inside it.
-    const openStashpadEntryPoint = (): void => {
+    let entryWaiting = false;
+    const openStashpadEntryPoint = (retry = false): void => {
       const folders = this.discoverStashpadFolders();
-      if (folders.length === 0) { this.showWelcome(); return; }
+      // 0.531.0: "no Stashpads yet" is only true once the vault is indexed —
+      // mid-index, wait (once) and retry instead of offering to set one up.
+      // The retry never waits again: if the 60 s cap fired on a very slow
+      // index, it falls through to the auto Welcome (which still steps aside
+      // when the Stashpad's notes arrive) instead of re-notifying every minute.
+      if (folders.length === 0 && !retry && this.vaultIndexing()) {
+        if (entryWaiting) return;
+        entryWaiting = true;
+        notify("Stashpad: Obsidian is still indexing this vault — opening as soon as it's done.");
+        this.whenVaultIndexed(() => { entryWaiting = false; openStashpadEntryPoint(true); });
+        return;
+      }
+      // First contact, not a deliberate "open Help": auto, so the dialog still
+      // steps aside if a Stashpad turns up after the index wait / cap.
+      if (folders.length === 0) { this.showWelcome({ auto: true }); return; }
       if (folders.length === 1) { void this.openFolderInStashpad(folders[0]); return; }
       this.openFolderPicker();
     };
@@ -8945,29 +9020,18 @@ export default class StashpadPlugin extends Plugin {
       if (this.numericIdSweepCancelled) return;
       this.numericIdSweepTimer = window.setTimeout(() => { this.numericIdSweepTimer = null; fire(); }, 2 * 60 * 1000);
     };
-    const mc = this.app.metadataCache as unknown as { resolved?: boolean };
-    if (mc.resolved === false) {
-      let pending = true;
-      const ref = this.app.metadataCache.on("resolved", () => {
-        if (!pending) return;
-        pending = false;
-        this.app.metadataCache.offref(ref);
-        afterResolved();
-      });
-      this.registerEvent(ref);
-    } else {
-      afterResolved();
-    }
+    // 0.531.2: this used to test `metadataCache.resolved`, a field Obsidian
+    // doesn't have, so it never waited — the sweep simply ran 2 min after
+    // layout-ready. Now it really waits for the initial index (no cap: the
+    // sweep writes frontmatter and must not run on a partial index).
+    this.whenVaultIndexed(afterResolved, null);
   }
   async runNumericIdQuoteSweepOnce(): Promise<{ scanned: number; quoted: number; unsafe: number; failed: number } | null> {
     if (this.settings.numericIdQuoteSweepDone || this.numericIdQuoteSweepInFlight) return null;
-    const mc = this.app.metadataCache as unknown as { resolved?: boolean };
-    if (mc.resolved === false) {
-      const ref = this.app.metadataCache.on("resolved", () => {
-        this.app.metadataCache.offref(ref);
-        void this.runNumericIdQuoteSweepOnce();
-      });
-      this.registerEvent(ref);
+    // 0.531.2: same fix as scheduleNumericIdQuoteSweep — a manual run mid-index
+    // defers until the index is complete instead of scanning unparsed notes.
+    if (this.vaultIndexing()) {
+      this.whenVaultIndexed(() => { void this.runNumericIdQuoteSweepOnce(); }, null);
       return null;
     }
     this.numericIdQuoteSweepInFlight = true;
