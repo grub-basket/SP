@@ -83,3 +83,22 @@ export function anyStashpadLeafOnFolder(
   const want = normalize ? folder.replace(/\/+$/, "") : folder;
   return stashpadLeaves(app).find((l) => folderOf(l, normalize) === want) ?? null;
 }
+
+/** 0.530.0: like `anyStashpadLeafOnFolder`, but also matches a DEFERRED leaf
+ *  (Obsidian 1.7+ restores background tabs unloaded, so `leaf.view.noteFolder`
+ *  is missing until first shown) by its persisted `folderOverride` — an empty
+ *  override means the plugin's default folder. A live match wins. The caller
+ *  must `loadIfDeferred()` the result before touching its view. Used by
+ *  companion tabs (Showcase) that borrow a list view's tree after a restart. */
+export function stashpadLeafOnFolderIncludingDeferred(
+  app: App, folder: string, defaultFolder: string,
+): WorkspaceLeaf | null {
+  const want = folder.trim().replace(/^\/+|\/+$/g, "");
+  const live = anyStashpadLeafOnFolder(app, want, { normalize: true });
+  if (live) return live;
+  const persisted = (l: WorkspaceLeaf): string => {
+    const st = (l.getViewState?.()?.state ?? {}) as { folderOverride?: string | null };
+    return ((st.folderOverride ?? "").trim() || defaultFolder.trim() || "Stashpad").replace(/^\/+|\/+$/g, "");
+  };
+  return stashpadLeaves(app).find((l) => !folderOf(l, true) && persisted(l) === want) ?? null;
+}

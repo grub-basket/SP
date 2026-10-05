@@ -80,6 +80,7 @@ import { folderTransferAvailable, readXvFolderPointer } from "./cross-vault-fold
 import { collectDropEntries, readDroppedTree, countTreeFiles, countTreeDirs, type DroppedDir } from "./dropped-folders";
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
+import { openShowcaseView, renderFeedbackTargetChip } from "./showcase-view";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
 import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
@@ -6734,6 +6735,22 @@ export class StashpadView extends ItemView {
     addRow("flat", "All descendants of the current focus, flat by sort.", "list");
     container.createDiv({ cls: "stashpad-view-popover-divider" });
     addRow("everything", "All descendants PLUS non-Stashpad files in the folder.", "layout-grid");
+    container.createDiv({ cls: "stashpad-view-popover-divider" });
+    // 0.530.0: Showcase isn't a list mode — it opens this level as a page in its
+    // own tab — but it belongs with the ways of looking at a level.
+    {
+      const row = container.createDiv({ cls: "stashpad-view-popover-row" });
+      const main = row.createDiv({ cls: "stashpad-view-popover-main" });
+      setIcon(main.createSpan({ cls: "stashpad-view-popover-icon" }), "presentation");
+      main.createSpan({ cls: "stashpad-view-popover-label", text: "Showcase" });
+      row.createDiv({ cls: "stashpad-view-popover-desc", text: "This level as one page: big images and PDFs, reactions and feedback. Opens in a new tab." });
+      row.onclick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onPicked();
+        void openShowcaseView(this.plugin, this.noteFolder, this.focusId);
+      };
+    }
 
     container.createDiv({ cls: "stashpad-view-popover-divider" });
 
@@ -10043,6 +10060,8 @@ export class StashpadView extends ItemView {
    *  nothing when the note isn't a reply. */
   private renderReplyQuote(host: HTMLElement, node: TreeNode): void {
     if (!node.file) return;
+    // 0.530.0: a Showcase comment about one file says so — tap opens that file.
+    renderFeedbackTargetChip(this.app, host, node.file);
     const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
     const raw = fm?.replyTo;
     if (typeof raw !== "string" || !raw) return;
@@ -21146,7 +21165,15 @@ export class StashpadView extends ItemView {
     if (attempt < 4) window.setTimeout(() => this.applyPendingBotToNoteId(id, attempt + 1), 300);
   }
 
-  private async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string; deferRender?: boolean; deferUndo?: boolean; replyTo?: { link: string; blurb: string }; collectInto?: Array<{ path: string; content: string }> } = { record: true }): Promise<StashpadId | null> {
+  // 0.530.0: public so the Showcase view creates feedback notes through this
+  // same bottleneck (templates, authorship, synthetic insert, undo).
+  async createNoteUnder(body: string, parentOverride: StashpadId | null, opts: { record?: boolean; createdOverride?: string; targetFolder?: string; deferRender?: boolean; deferUndo?: boolean; replyTo?: { link: string; blurb: string }; collectInto?: Array<{ path: string; content: string }>; extraFm?: Record<string, string | boolean>; skipTemplate?: boolean; keepComposer?: boolean } = { record: true }): Promise<StashpadId | null> {
+    // 0.530.2 (Showcase): `extraFm` = extra scalar keys written in the SAME
+    // create (one write, so no follow-up processFrontMatter that the modify
+    // handler would misread as a coworker's edit). `skipTemplate` = don't fold
+    // the folder's note template into this note (comments aren't pages).
+    // `keepComposer` = this note didn't come from the list composer, so undo /
+    // redo must not put its text into, or clear, the composer draft.
     // 0.76.15: targetFolder lets the destination picker SHIP a note to
     // another Stashpad folder without switching this view there. When
     // it differs from the current folder we skip the synthetic insert
@@ -21174,7 +21201,7 @@ export class StashpadView extends ItemView {
     // attachments) always win over the template.
     let templateFm: Record<string, any> | null = null;
     {
-      const tplPath = (this.plugin.settings.noteTemplates ?? {})[folder];
+      const tplPath = opts.skipTemplate ? undefined : (this.plugin.settings.noteTemplates ?? {})[folder];
       if (tplPath) {
         const tplFile = this.app.vault.getAbstractFileByPath(tplPath) as TFile | null;
         if (tplFile && (tplFile as any).extension === "md") {
@@ -21235,25 +21262,37 @@ export class StashpadView extends ItemView {
     const author = this.authorship.currentAuthorLink();
     if (author) { void this.authorship.ensureAuthorFile(author); }
 
+    // 0.530.4: ONE escape for every double-quoted value built here — newlines
+    // collapsed, then backslashes, then quotes (docs/security-findings.md: text-
+    // built YAML must escape backslashes too; a name or blurb ending in "\\"
+    // used to turn the closing quote into \\" and break the frontmatter).
+    const yq = (v: string): string => `"${v.replace(/[\r\n]+/g, " ").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
     const fmLines = [
       "---", `id: ${id}`, `parent: ${parentId}`, `created: ${created}`,
       `modified: ${created}`,
     ];
-    if (author) fmLines.push(`author: "${author.link.replace(/"/g, '\\"')}"`);
+    if (author) fmLines.push(`author: ${yq(author.link)}`);
     if (opts.replyTo) {
       // 0.288.0: `replyTo` is a wikilink; `replyToBlurb` caches the target's
       // preview so the quote renders vault-wide. Both are double-quoted YAML.
-      fmLines.push(`replyTo: "${opts.replyTo.link.replace(/"/g, '\\"')}"`);
-      if (opts.replyTo.blurb) fmLines.push(`replyToBlurb: "${opts.replyTo.blurb.replace(/"/g, '\\"')}"`);
+      fmLines.push(`replyTo: ${yq(opts.replyTo.link)}`);
+      if (opts.replyTo.blurb) fmLines.push(`replyToBlurb: ${yq(opts.replyTo.blurb)}`);
     }
     if (attachments.length > 0) {
       fmLines.push("attachments:");
-      for (const a of attachments) fmLines.push(`  - "${a.replace(/"/g, '\\"')}"`);
+      for (const a of attachments) fmLines.push(`  - ${yq(a)}`);
     } else {
       fmLines.push("attachments: []");
     }
     // 0.176.0: a "[]"/"[x]" body prefix made this note a task on creation.
     if (taskPrefix) fmLines.push("task: true", `completed: ${taskPrefix.completed}`);
+    if (opts.extraFm) {
+      const taken = new Set(fmLines.map((l) => l.split(":")[0]));
+      for (const [k, v] of Object.entries(opts.extraFm)) {
+        if (!/^[A-Za-z][\w-]*$/.test(k) || taken.has(k)) continue; // never shadow a key Stashpad just wrote
+        fmLines.push(typeof v === "boolean" ? `${k}: ${v}` : `${k}: ${yq(String(v))}`);
+      }
+    }
     // No trailing newline — keeps the file ending tight on the body's last
     // character. (Editors that auto-add a final newline on save will still
     // append one, but freshly-created notes start clean.)
@@ -21414,7 +21453,7 @@ export class StashpadView extends ItemView {
             // 0.140.9: only if the composer is empty — don't destroy a draft the
             // user started typing after submitting.
             const curDraft = this.composerInputEl?.value ?? this.composerDraft;
-            if (!curDraft.trim()) {
+            if (!opts.keepComposer && !curDraft.trim()) {
               this.composerDraft = originalBody;
               void this.saveDraft(originalBody);
               void this.recordLastSubmitted("");
@@ -21432,10 +21471,12 @@ export class StashpadView extends ItemView {
             if (!(await this.app.vault.adapter.exists(path))) {
               await this.app.vault.create(path, fullContent);
             }
-            this.composerDraft = "";
-            void this.saveDraft("");
-            void this.recordLastSubmitted(originalBody);
-            if (this.composerInputEl) this.composerInputEl.value = "";
+            if (!opts.keepComposer) {
+              this.composerDraft = "";
+              void this.saveDraft("");
+              void this.recordLastSubmitted(originalBody);
+              if (this.composerInputEl) this.composerInputEl.value = "";
+            }
             if (!remote) this.tree.rebuild(this.noteFolder);
             this.render();
           },

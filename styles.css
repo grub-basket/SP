@@ -11768,3 +11768,189 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   color: var(--text-on-accent);
   background: var(--interactive-accent);
 }
+
+/* ============================================================================
+   0.530.0: Showcase — one level as a flat review page (src/showcase-view.ts).
+   Each section = main column (caption + big files) + a feedback column made of
+   the section's child notes. Several files = lettered options, stacked or side
+   by side. Below ~900px the feedback column drops under the section.
+   ============================================================================ */
+.stashpad-showcase { display: flex; flex-direction: column; height: 100%; padding: 0; box-sizing: border-box; }
+.stashpad-showcase-bar {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; flex: 0 0 auto;
+  padding: 8px 14px; border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-showcase-crumbs { display: flex; align-items: center; gap: 4px; font-weight: 600; min-width: 0; }
+.stashpad-showcase-crumb { cursor: pointer; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 18em; }
+.stashpad-showcase-crumb:hover { color: var(--text-normal); }
+.stashpad-showcase-crumb.is-current { cursor: default; color: var(--text-normal); }
+.stashpad-showcase-crumb-sep { color: var(--text-faint); }
+.stashpad-showcase-count { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.stashpad-showcase-open { font-size: var(--font-ui-smaller); color: var(--text-muted); padding: 2px 8px; border-radius: 999px; }
+.stashpad-showcase-open.has-open { cursor: pointer; color: var(--text-on-accent); background: var(--color-orange); }
+.stashpad-showcase-spacer { flex: 1 1 auto; }
+.stashpad-showcase-seg { display: inline-flex; border: 1px solid var(--background-modifier-border); border-radius: 6px; overflow: hidden; }
+.stashpad-showcase .stashpad-showcase-segbtn {
+  display: inline-flex; align-items: center; gap: 4px; border: 0; border-radius: 0; box-shadow: none;
+  background: transparent; font-size: var(--font-ui-smaller); padding: 3px 8px; height: auto;
+}
+.stashpad-showcase-segbtn .svg-icon { width: 14px; height: 14px; }
+.stashpad-showcase .stashpad-showcase-segbtn.is-active { background: var(--interactive-accent); color: var(--text-on-accent); }
+.stashpad-showcase-btn { font-size: var(--font-ui-smaller); padding: 3px 8px; height: auto; }
+.stashpad-showcase-btn.is-active { color: var(--text-accent); }
+
+.stashpad-showcase-scroll { flex: 1 1 auto; overflow-y: auto; padding: 18px 14px 60px; }
+.stashpad-showcase-empty { max-width: 560px; margin: 40px auto; text-align: center; color: var(--text-muted); display: flex; flex-direction: column; gap: 12px; align-items: center; }
+.stashpad-showcase-page { max-width: 1500px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+
+.stashpad-showcase-section {
+  display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 18px;
+  padding-bottom: 28px; border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-showcase-section:last-child { border-bottom: 0; }
+@container (max-width: 900px) { .stashpad-showcase-section { grid-template-columns: minmax(0, 1fr); } }
+.stashpad-showcase-scroll { container-type: inline-size; }
+
+.stashpad-showcase-main { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.stashpad-showcase-sec-head { display: flex; align-items: center; gap: 8px; }
+.stashpad-showcase-sec-num {
+  font-size: var(--font-ui-smaller); font-weight: 600; color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border); border-radius: 999px; min-width: 22px; text-align: center; padding: 0 6px;
+}
+.stashpad-showcase-sec-tools { margin-left: auto; display: flex; gap: 2px; }
+.stashpad-showcase-caption { font-size: var(--font-text-size); }
+.stashpad-showcase-caption > :first-child { margin-top: 0; }
+.stashpad-showcase-caption > :last-child { margin-bottom: 0; }
+
+.stashpad-showcase-atts { display: flex; flex-direction: column; gap: 16px; }
+.stashpad-showcase-atts.is-compare:not(.is-single) {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); align-items: start;
+}
+.stashpad-showcase-att {
+  border: 1px solid var(--background-modifier-border); border-radius: 8px; overflow: hidden;
+  background: var(--background-secondary); transition: box-shadow 0.2s ease;
+}
+.stashpad-showcase-att.is-flash { box-shadow: 0 0 0 3px var(--interactive-accent); }
+.stashpad-showcase-att-head {
+  display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 10px;
+  font-size: var(--font-ui-smaller); color: var(--text-muted);
+}
+.stashpad-showcase-att-label { font-weight: 700; color: var(--text-normal); }
+.stashpad-showcase-att-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-showcase-media { background: var(--background-primary); }
+/* The box shrink-wraps the DRAWN image (no object-fit letterboxing), so pin
+   fractions measured against it are fractions of the picture itself and stay
+   put across Stack / Side by side and window sizes. */
+.stashpad-showcase-imgbox { position: relative; line-height: 0; width: fit-content; max-width: 100%; margin: 0 auto; }
+.stashpad-showcase-img { display: block; max-width: 100%; max-height: 85vh; width: auto; height: auto; cursor: zoom-in; }
+.stashpad-showcase-veil { display: flex; align-items: center; gap: 8px; padding: 24px 14px; color: var(--text-muted); background: var(--background-secondary); border-radius: 8px; }
+.stashpad-showcase-veil button { margin-left: auto; }
+.stashpad-showcase-section.is-pin-picking .stashpad-showcase-img { cursor: crosshair; outline: 2px dashed var(--interactive-accent); outline-offset: -2px; }
+.stashpad-showcase-pdf { height: 85vh; min-height: 420px; }
+.stashpad-showcase-atts.is-compare:not(.is-single) .stashpad-showcase-pdf { height: 70vh; }
+.stashpad-showcase-pdf.is-embed { height: auto; min-height: 0; }
+.stashpad-showcase-pdf.is-embed .internal-embed, .stashpad-showcase-pdf.is-embed .pdf-embed { height: 85vh; }
+.stashpad-showcase-pdfframe { width: 100%; height: 100%; border: 0; display: block; }
+.stashpad-showcase-video { display: block; width: 100%; max-height: 85vh; }
+.stashpad-showcase-audio { display: block; width: 100%; padding: 10px; box-sizing: border-box; }
+.stashpad-showcase-filecard { display: flex; align-items: center; gap: 10px; padding: 18px 14px; color: var(--text-muted); }
+.stashpad-showcase-filecard button { margin-left: auto; }
+
+/* Pins: numbered dots over an image (fractions of its rendered box). The pins,
+   reaction chips and layout toggle are <button>s, so these rules are prefixed
+   with .stashpad-showcase to outrank Obsidian's button:not(.clickable-icon). */
+.stashpad-showcase-pins { position: absolute; inset: 0; pointer-events: none; }
+.stashpad-showcase .stashpad-showcase-pin {
+  position: absolute; transform: translate(-50%, -50%); pointer-events: auto;
+  width: 24px; height: 24px; min-width: 0; padding: 0; border-radius: 50% 50% 50% 0;
+  display: flex; align-items: center; justify-content: center; line-height: 1;
+  font-size: 12px; font-weight: 700; color: #fff; background: var(--color-orange);
+  border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.45); cursor: pointer;
+}
+.stashpad-showcase .stashpad-showcase-pin.is-resolved { background: var(--color-green); opacity: 0.75; }
+.stashpad-showcase .stashpad-showcase-pin.is-pending { background: var(--interactive-accent); cursor: default; }
+
+/* Reactions: approve / reject quick bar under a section or an option. */
+.stashpad-showcase-reactions { display: flex; flex-wrap: wrap; gap: 4px; }
+.stashpad-showcase-reactions.is-option { padding: 6px 8px; border-top: 1px solid var(--background-modifier-border); }
+.stashpad-showcase .stashpad-showcase-react {
+  display: inline-flex; align-items: center; gap: 4px; height: auto; padding: 2px 8px;
+  border-radius: 999px; font-size: var(--font-ui-small); box-shadow: none;
+  background: var(--background-primary); border: 1px solid var(--background-modifier-border);
+  opacity: 0.7;
+}
+.stashpad-showcase .stashpad-showcase-react:hover, .stashpad-showcase .stashpad-showcase-react.has-count { opacity: 1; }
+.stashpad-showcase .stashpad-showcase-react.is-mine { border-color: var(--interactive-accent); background: hsla(var(--interactive-accent-hsl), 0.15); }
+.stashpad-showcase-react-count { font-size: var(--font-ui-smaller); font-weight: 600; }
+.stashpad-showcase-react.is-more .svg-icon { width: 14px; height: 14px; }
+
+/* Feedback column. */
+.stashpad-showcase-aside {
+  min-width: 0; display: flex; flex-direction: column; gap: 8px; align-self: start;
+  position: sticky; top: 0; max-height: calc(100vh - 140px); overflow-y: auto;
+  background: var(--background-secondary); border-radius: 8px; padding: 10px;
+}
+@container (max-width: 900px) { .stashpad-showcase-aside { position: static; max-height: none; } }
+.stashpad-showcase-aside-head { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: var(--font-ui-small); }
+.stashpad-showcase-aside-icon .svg-icon { width: 14px; height: 14px; }
+.stashpad-showcase-aside-count { margin-left: auto; font-weight: normal; color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.stashpad-showcase-section.has-open .stashpad-showcase-aside-count { color: var(--color-orange); }
+.stashpad-showcase-comments { display: flex; flex-direction: column; gap: 8px; }
+.stashpad-showcase-nocomments, .stashpad-showcase-hidden-note { color: var(--text-faint); font-size: var(--font-ui-smaller); }
+.stashpad-showcase-comment {
+  background: var(--background-primary); border-radius: 6px; padding: 6px 8px;
+  border: 1px solid var(--background-modifier-border); transition: box-shadow 0.2s ease;
+}
+.stashpad-showcase-comment.is-flash { box-shadow: 0 0 0 2px var(--interactive-accent); }
+.stashpad-showcase-comment.is-reply { border: 0; border-left: 2px solid var(--background-modifier-border); border-radius: 0; padding: 4px 0 4px 8px; margin-top: 6px; }
+.stashpad-showcase-comment.is-resolved > .stashpad-showcase-comment-body { opacity: 0.55; }
+.stashpad-showcase-comment-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; font-size: var(--font-ui-smaller); }
+.stashpad-showcase-comment-num {
+  font-weight: 700; color: #fff; background: var(--color-orange); border-radius: 999px;
+  min-width: 18px; text-align: center; padding: 0 5px; align-self: center;
+}
+.stashpad-showcase-comment.is-resolved .stashpad-showcase-comment-num { background: var(--color-green); }
+.stashpad-showcase-comment-author { font-weight: 600; }
+.stashpad-showcase-comment-role { color: var(--text-muted); }
+.stashpad-showcase-comment-time { color: var(--text-faint); margin-left: auto; }
+.stashpad-showcase-comment-target {
+  display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; cursor: pointer;
+  font-size: var(--font-ui-smaller); color: var(--text-accent);
+}
+.stashpad-showcase-comment-target .svg-icon { width: 12px; height: 12px; }
+.stashpad-showcase-comment-body { font-size: var(--font-ui-small); margin-top: 2px; overflow-wrap: anywhere; }
+.stashpad-showcase-comment-body > :first-child { margin-top: 0; }
+.stashpad-showcase-comment-body > :last-child { margin-bottom: 0; }
+.stashpad-showcase-comment-body img { max-width: 100%; }
+.stashpad-showcase-comment-actions { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
+.stashpad-showcase-comment-actions button { height: auto; padding: 2px 6px; font-size: var(--font-ui-smaller); box-shadow: none; }
+.stashpad-showcase-comment-actions .clickable-icon { margin-left: auto; }
+.stashpad-showcase-resolve { display: inline-flex; align-items: center; gap: 4px; }
+.stashpad-showcase-resolve .svg-icon { width: 12px; height: 12px; }
+.stashpad-showcase-resolve.is-on { color: var(--color-green); }
+.stashpad-showcase-composer { display: flex; flex-direction: column; gap: 6px; margin-top: 2px; }
+.stashpad-showcase-composer-target { display: flex; gap: 6px; align-items: center; }
+.stashpad-showcase-composer-target select { flex: 1 1 auto; min-width: 0; font-size: var(--font-ui-smaller); }
+.stashpad-showcase-pinbtn { display: inline-flex; align-items: center; gap: 4px; height: auto; padding: 3px 8px; font-size: var(--font-ui-smaller); white-space: nowrap; }
+.stashpad-showcase-pinbtn .svg-icon { width: 12px; height: 12px; }
+.stashpad-showcase-pinbtn.is-picking, .stashpad-showcase-pinbtn.is-set { color: var(--text-on-accent); background: var(--interactive-accent); }
+.stashpad-showcase-composer-chip { display: flex; align-items: center; gap: 4px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-showcase-composer-chip button { margin-left: auto; }
+.stashpad-showcase-input { width: 100%; resize: vertical; font-size: var(--font-ui-small); min-height: 3em; }
+.stashpad-showcase-post { align-self: flex-end; height: auto; padding: 4px 14px; }
+
+/* The list's chip on a feedback note: "Feedback on cover.png" → opens it. */
+.stashpad-feedback-chip {
+  display: inline-flex; align-items: center; gap: 4px; margin: 0 0 4px; padding: 1px 8px;
+  border-radius: 999px; font-size: var(--font-ui-smaller); cursor: pointer;
+  color: var(--text-accent); background: hsla(var(--interactive-accent-hsl), 0.1);
+}
+.stashpad-feedback-chip-icon .svg-icon { width: 12px; height: 12px; }
+/* 0.530.2: paging + hidden (obscured) comments. */
+.stashpad-showcase-more { display: flex; justify-content: center; padding: 8px 0 24px; }
+.stashpad-showcase-comment-veil { display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: var(--font-ui-smaller); margin-top: 2px; }
+.stashpad-showcase-comment-veil button { margin-left: auto; height: auto; padding: 2px 8px; font-size: var(--font-ui-smaller); }
+/* 0.530.2: ten quick reactions (👎 ❌ added) — let the popover's rows use its
+   full width and trim the side padding so the presets stay on ONE line. */
+.stashpad-reaction-picker.stashpad-reaction-body .stashpad-reaction-pickgrid { max-width: none; }
+.stashpad-reaction-picker.stashpad-reaction-body .stashpad-reaction-pick { padding: 4px 3px; }

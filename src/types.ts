@@ -23,6 +23,9 @@ export const STASHPAD_AGGREGATE_VIEW_TYPE = "stashpad-aggregate";
 /** 0.364.0: kanban board — property-pivot by color. Each color (+ "No color")
  *  becomes a column, notes are cards, dragging a card sets its color. */
 export const STASHPAD_KANBAN_VIEW_TYPE = "stashpad-kanban";
+/** 0.530.0: showcase — one level as a flat review page (big images/PDFs + a
+ *  feedback column made of the sections' child notes). */
+export const STASHPAD_SHOWCASE_VIEW_TYPE = "stashpad-showcase";
 /** 0.315.0: the per-folder action log and the notification history, promoted
  *  from modals to dedicated tabs so they're reachable from the launcher and can
  *  sit alongside the other views. */
@@ -154,6 +157,14 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   // 0.105.0: list pin — floats a note to the TOP of its sibling list (distinct
   // from the sidebar pin above). Stashpad-managed; not inherited by clones.
   "listPinned", "listPinnedAt",
+  // 0.530.0: Showcase review state. `attachmentReactions` = per-attachment
+  // reactions on a section note (flat list, "👍:<authorId>:<vault path>");
+  // `feedbackOn` / `feedbackPin` point a comment at one of the section's files
+  // and at a spot on that image. Multiplayer state like `reactions`/`replyTo`:
+  // a clone or template must not carry it. (The plain `feedback: true` marker
+  // is deliberately NOT reserved: nothing reads it, and reserving a word that
+  // generic would strip users' own `feedback` property on import/merge.)
+  "attachmentReactions", "feedbackOn", "feedbackPin",
   // 0.88.0: marks a note that came in via import (used by the "imported only"
   // view filter). Stashpad-managed; a clone of an imported note isn't imported.
   "imported",

@@ -13,8 +13,9 @@ import { StashpadTrashView, openTrashView } from "./trash-view";
 import { ReEncryptScheduler } from "./reencrypt-scheduler";
 import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
-import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_KANBAN_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
+import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_KANBAN_VIEW_TYPE, STASHPAD_SHOWCASE_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
 import { StashpadKanbanView, openKanbanView } from "./kanban-view";
+import { StashpadShowcaseView, openShowcaseView } from "./showcase-view";
 import { StashpadLogView, StashpadNotificationsView, openStashpadLogView, openStashpadNotificationsView } from "./activity-views";
 import { StashpadPanelsView, openStashpadPanelsView, openStashpadSinglePanel, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { TaskReviewModal } from "./task-review-modal";
@@ -2745,6 +2746,18 @@ export default class StashpadPlugin extends Plugin {
     return (this.settings.folder || "Stashpad").replace(/\/+$/, "");
   }
 
+  /** 0.530.0: open the Showcase for the level the user is looking at — the most
+   *  recent live Stashpad view's folder + current focus (its zoomed-in level). */
+  async openShowcaseForActiveLevel(): Promise<void> {
+    const leaf = this.activeStashpadLeafIfOpen();
+    const v = leaf?.view as unknown as { getViewType?: () => string; noteFolder?: string; focusId?: StashpadId } | undefined;
+    if (v && v.getViewType?.() === STASHPAD_VIEW_TYPE && v.noteFolder) {
+      await openShowcaseView(this, v.noteFolder, v.focusId ?? ROOT_ID);
+      return;
+    }
+    await openShowcaseView(this, this.activeStashpadFolder(), ROOT_ID);
+  }
+
   /** Mint a note id that doesn't collide with any id currently in the vault.
    *  Use this for EVERY note-creation site instead of bare newId(). Amortized
    *  O(1) — the used-id set is built once (lazily) and maintained by the
@@ -3460,6 +3473,11 @@ export default class StashpadPlugin extends Plugin {
       STASHPAD_KANBAN_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadKanbanView(leaf, this),
     );
+    // 0.530.0: showcase — a level as one flat review page.
+    this.registerView(
+      STASHPAD_SHOWCASE_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadShowcaseView(leaf, this),
+    );
     // 0.315.0: action log + notification history, promoted from modals to tabs.
     this.registerView(
       STASHPAD_LOG_VIEW_TYPE,
@@ -4019,6 +4037,13 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-open-kanban",
       name: "Open kanban board (columns by color)",
       callback: () => void openKanbanView(this, this.activeStashpadFolder()),
+    });
+    // 0.530.0: showcase — the active Stashpad view's CURRENT LEVEL as one flat
+    // page (big images/PDFs, per-option reactions, a feedback column).
+    this.addCommand({
+      id: "stashpad-open-showcase",
+      name: "Open showcase (page view with feedback) for this level",
+      callback: () => void this.openShowcaseForActiveLevel(),
     });
     // 0.273.1: each task as a created→completed span on a time axis.
     this.addCommand({
@@ -6818,6 +6843,11 @@ export default class StashpadPlugin extends Plugin {
       const v = leaf.view as any;
       v?.clearObscureReveals?.();
       if (typeof v?.render === "function") v.render();
+    }
+    // 0.530.2: Showcase tabs draw note content too — re-hide them in the same pass
+    // so "Cover everything" (and the schedule) applies there immediately.
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_SHOWCASE_VIEW_TYPE)) {
+      (leaf.view as unknown as { reHide?: () => void })?.reHide?.();
     }
   }
 

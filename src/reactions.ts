@@ -12,9 +12,11 @@ import { EMOJI_DATA, EMOJI_GROUPS } from "./emoji-data";
 /** 0.316.0: the quick-pick presets shown at the top of the reaction picker.
  *  0.316.3: eight — happy / sad / tada / angry / surprised / looking / thumbs-up /
  *  green-check — to fill the popover width. Everything else is reachable through
- *  the live search below them. */
+ *  the live search below them.
+ *  0.530.0: + thumbs-down / cross, so a proposal can be rejected as quickly as
+ *  approved (Showcase reviews). Users with customised presets keep their own. */
 export const QUICK_REACTIONS: readonly string[] = [
-  "😄", "😢", "🎉", "😠", "😮", "👀", "👍", "✅",
+  "😄", "😢", "🎉", "😠", "😮", "👀", "👍", "✅", "👎", "❌",
 ];
 
 export type ReactionMap = Record<string, string[]>;

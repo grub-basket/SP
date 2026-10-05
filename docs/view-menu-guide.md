@@ -19,6 +19,14 @@ narrow widths) — this page is the canonical, expanded reference. Each setting 
 - **Everything** — like Flat, **plus** the non-Stashpad files that live in the
   same folder (interleaved by created / file ctime). Lets the Stashpad view double
   as a file browser for that folder.
+- **Showcase** — not a list mode: opens the current level as **one page** in a new
+  tab, for reviewing visual work together. Each note is a numbered section with its
+  images and PDFs shown large (several files become *Option A, B, C…*, stacked or
+  side by side), quick 👍 👎 ✅ ❌ reactions per section and per option, and a
+  feedback column made of the section's child notes. You can target a comment at
+  one file, pin it to a spot on an image, reply, and mark it resolved. **Export**
+  saves the page as a single web page file that opens in any browser, with
+  feedback optional.
 
 ## Encryption filter *(only when vault encryption is set up)*
 
@@ -64,6 +72,7 @@ strings still live in `src/view.ts` ~3880–4029, just `display:none`):
 | Nested | Tree of immediate children (default). |
 | Flat | All descendants of the current focus, flat by sort. |
 | Everything | All descendants PLUS non-Stashpad files in the folder. |
+| Showcase | This level as one page: big images and PDFs, reactions and feedback. Opens in a new tab. |
 | Encryption: show all | Both locked 🔒 and decrypted notes. |
 | Encryption: locked only | Show only locked 🔒 stubs. |
 | Encryption: decrypted only | Hide locked 🔒 stubs. |

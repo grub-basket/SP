@@ -61,6 +61,14 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     command: "stashpad:stashpad-open-kanban",
   },
   {
+    id: "showcase",
+    label: "Showcase (page view)",
+    keywords: "showcase page gallery presentation review proof feedback comment brochure images pdf flat",
+    hint: "This level as one page — big images and PDFs, reactions and a feedback column",
+    icon: "presentation",
+    command: "stashpad:stashpad-open-showcase",
+  },
+  {
     id: "tasks",
     label: "Tasks",
     keywords: "aggregate tasks todo all open due checkbox",
