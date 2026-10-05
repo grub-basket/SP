@@ -313,11 +313,14 @@ export function matchesObsidianIgnore(path: string, filters: string[] | undefine
   return false;
 }
 
-/** Sift: the canonical Stashpad search match — all whitespace-split tokens
- *  must each appear (case-insensitive substring) somewhere in the haystack,
- *  in any order. Empty query matches everything. See docs/sift.md. Exported
- *  so simple inputs (e.g. the assignee picker) reuse it instead of
- *  re-implementing `includes`. */
+/** 0.532.0: ONE double-quoted YAML scalar for hand-built frontmatter —
+ *  newlines collapsed, then backslashes, then quotes (docs/security-findings.md:
+ *  text-built YAML must escape backslashes too; a value ending in "\" otherwise
+ *  turns the closing quote into \" and breaks the whole block). */
+export function yamlQuote(v: string): string {
+  return `"${v.replace(/[\r\n]+/g, " ").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
 /** 0.273.1: the ONE way to flip a task's completion in frontmatter. Also
  *  stamps/clears `completedAt`, which the task timeline needs — before this,
  *  only the recurrence spawner recorded WHEN something was completed, so a
@@ -329,6 +332,11 @@ export function writeCompletedFm(fm: Record<string, unknown>, on: boolean): void
   else { delete fm.completed; delete fm.completedAt; }
 }
 
+/** Sift: the canonical Stashpad search match — all whitespace-split tokens
+ *  must each appear (case-insensitive substring) somewhere in the haystack,
+ *  in any order. Empty query matches everything. See docs/sift.md. Exported
+ *  so simple inputs (e.g. the assignee picker) reuse it instead of
+ *  re-implementing `includes`. */
 export function siftMatch(query: string, haystack: string): boolean {
   const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return true;

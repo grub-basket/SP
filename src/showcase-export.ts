@@ -24,7 +24,7 @@ export interface ExportComment {
   target: string;
   resolved: boolean;
   depth: number;
-  pin: { x: number; y: number; path: string } | null;
+  pin: { x: number; y: number; page?: number; path: string } | null;
 }
 export interface ExportSection {
   text: string;
@@ -89,8 +89,9 @@ section.sec:last-child { border-bottom: 0; }
 .att-head b { color: var(--fg); }
 .imgbox { position: relative; line-height: 0; width: fit-content; max-width: 100%; margin: 0 auto; background: var(--bg); }
 .imgbox img { display: block; max-width: 100%; max-height: 90vh; width: auto; height: auto; }
-img.pdfpage { display: block; width: 100%; height: auto; background: #fff; border-top: 1px solid var(--line); }
-img.pdfpage:first-of-type { border-top: 0; }
+img.pdfpage { display: block; width: 100%; height: auto; background: #fff; }
+.imgbox.pagebox { width: 100%; max-width: none; border-top: 1px solid var(--line); }
+.att-head + .imgbox.pagebox { border-top: 0; }
 iframe.pdf { display: block; width: 100%; height: 90vh; border: 0; background: var(--bg); }
 video, audio { display: block; width: 100%; }
 .file { padding: 18px 12px; color: var(--muted); font-size: 14px; }
@@ -143,7 +144,7 @@ async function rasterisePdf(bytes: ArrayBuffer, onPage?: (n: number, total: numb
       const base = page.getViewport({ scale: 1 });
       const scale = Math.min(4, RASTER_WIDTH / Math.max(1, base.width), MAX_CANVAS_PX / Math.max(1, base.height));
       const viewport = page.getViewport({ scale });
-      const canvas = activeDocument.createElement("canvas");
+      const canvas = createEl("canvas");
       canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
       const ctx = canvas.getContext("2d");
       if (!ctx) return null;
@@ -270,8 +271,18 @@ export async function buildShowcaseHtml(
             const b64 = pages ? "" : arrayBufferToBase64(bytes);
             if (pages) {
               pages.forEach((src, pi) => {
-                const pg = card.appendChild(doc.createElement("img")); pg.className = "pdfpage";
+                // 0.532.2: each page in its own box so pins on that page sit on it.
+                const box = card.appendChild(doc.createElement("div")); box.className = "imgbox pagebox";
+                const pg = box.appendChild(doc.createElement("img")); pg.className = "pdfpage";
                 pg.src = src; pg.alt = `${a.file.basename} — page ${pi + 1} of ${pages.length}`;
+                if (opts.includeFeedback) {
+                  for (const c of s.comments) {
+                    if (!c.pin || c.pin.path !== a.file.path || c.pin.page !== pi + 1) continue;
+                    const pin = box.appendChild(doc.createElement("span")); pin.className = "pin" + (c.resolved ? " ok" : "");
+                    pin.textContent = String(c.num);
+                    pin.style.left = `${c.pin.x * 100}%`; pin.style.top = `${c.pin.y * 100}%`;
+                  }
+                }
               });
             } else if (mime.startsWith("image/")) {
               const box = card.appendChild(doc.createElement("div")); box.className = "imgbox";
@@ -279,7 +290,7 @@ export async function buildShowcaseHtml(
               img.src = `data:${mime};base64,${b64}`; img.alt = a.file.basename;
               if (opts.includeFeedback) {
                 for (const c of s.comments) {
-                  if (!c.pin || c.pin.path !== a.file.path) continue;
+                  if (!c.pin || c.pin.path !== a.file.path || c.pin.page) continue;
                   const pin = box.appendChild(doc.createElement("span")); pin.className = "pin" + (c.resolved ? " ok" : "");
                   pin.textContent = String(c.num);
                   pin.style.left = `${c.pin.x * 100}%`; pin.style.top = `${c.pin.y * 100}%`;

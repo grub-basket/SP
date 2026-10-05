@@ -1,8 +1,8 @@
-import { Component, ItemView, Keymap, MarkdownRenderer, Platform, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
+import { Component, ItemView, Keymap, MarkdownRenderer, Platform, Scope, TFile, WorkspaceLeaf, loadPdfJs, moment, setIcon, type ViewStateResult } from "obsidian";
 import type StashpadPlugin from "./main";
 import type { StashpadView } from "./view";
 import { ROOT_ID, STASHPAD_SHOWCASE_VIEW_TYPE, attachmentLinkPath, parseAuthorRef, type StashpadId, type TreeNode } from "./types";
-import { stashpadLeafOnFolderIncludingDeferred } from "./leaf-lookup";
+import { anyStashpadLeafOnFolder, stashpadLeafOnFolderIncludingDeferred } from "./leaf-lookup";
 import { MediaViewerModal, mediaItemsFor } from "./media-viewer";
 import { isImageExt } from "./file-kinds";
 import { myReactionId, openReactionPicker, readReactions, toggleReaction, type ReactionMap } from "./reactions";
@@ -61,6 +61,19 @@ const SECTION_PAGE = 30;
 /** PDFs above this open in Obsidian's own viewer instead of being read whole
  *  into memory for the iframe. */
 const PDF_INLINE_LIMIT = 60 * 1024 * 1024;
+/** 0.532.2: PDFs up to this many pages are drawn page by page with Obsidian's
+ *  pdf.js, so each page can carry pins; longer ones keep the browser viewer. */
+const PDF_PAGE_RENDER_MAX = 60;
+/** Widest canvas a page is drawn at (CSS width × devicePixelRatio, capped). */
+const PDF_PAGE_MAX_PX = 2400;
+
+interface PdfJsRenderTask { promise: Promise<void>; cancel?: () => void }
+interface PdfJsTextContent { items: Array<{ str?: string; hasEOL?: boolean }> }
+interface PdfJsPage { getViewport(o: { scale: number }): { width: number; height: number }; render(o: { canvasContext: CanvasRenderingContext2D; viewport: unknown }): PdfJsRenderTask; getTextContent(): Promise<PdfJsTextContent>; cleanup?: () => void }
+/** pdf.js 4/5 text layer: transparent, selectable text positioned over a page. */
+type PdfJsTextLayerCtor = new (o: { textContentSource: PdfJsTextContent; container: HTMLElement; viewport: unknown }) => { render(): Promise<void> };
+interface PdfJsLib { getDocument(o: { data: Uint8Array }): { promise: Promise<PdfJsDoc> }; TextLayer?: PdfJsTextLayerCtor }
+interface PdfJsDoc { numPages: number; getPage(n: number): Promise<PdfJsPage>; destroy?: () => Promise<void> }
 
 interface Attachment { file: TFile; label: string; key: string }
 interface SectionData { node: TreeNode; file: TFile; text: string; atts: Attachment[] }
@@ -76,7 +89,8 @@ interface SectionCache {
   /** Hosts for the reaction bars, repainted on every pass (cheap, and frontmatter-
    *  only changes must not rebuild the media above them). key "" = section. */
   bars: Map<string, HTMLElement>;
-  /** Hosts for image pin overlays, keyed by attachment vault path. */
+  /** Hosts for pin overlays: an image's vault path, or "path#page" for a PDF
+   *  page drawn by pdf.js (0.532.2). */
   pinHosts: Map<string, HTMLElement>;
 }
 
@@ -92,14 +106,41 @@ function optionLabel(i: number): string {
   return s;
 }
 
-/** Parse `feedbackPin: "0.42,0.31"` → fractions in [0,1], or null. */
-export function parseFeedbackPin(raw: unknown): { x: number; y: number } | null {
+/** Parse `feedbackPin: "0.42,0.31"` (an image) or `"0.42,0.31,3"` (page 3 of
+ *  a PDF, 0.532.2) → fractions in [0,1] (+ 1-based page), or null. */
+export function parseFeedbackPin(raw: unknown): { x: number; y: number; page?: number } | null {
   if (typeof raw !== "string") return null;
-  const m = raw.match(/^\s*([0-9.]+)\s*,\s*([0-9.]+)\s*$/);
+  const m = raw.match(/^\s*([0-9.]+)\s*,\s*([0-9.]+)\s*(?:,\s*([0-9]+)\s*)?$/);
   if (!m) return null;
   const x = Number(m[1]); const y = Number(m[2]);
   if (!isFinite(x) || !isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) return null;
-  return { x, y };
+  if (m[3] === undefined) return { x, y };
+  const page = Number(m[3]);
+  return Number.isInteger(page) && page >= 1 ? { x, y, page } : null;
+}
+
+/** Lower-case for Find WITHOUT changing the string's length, so every index
+ *  still maps back to the same character in the page text. A code point whose
+ *  lower-case form is longer ("İ" → "i̇") folds to its base letter ("i") when
+ *  that keeps the length, else stays as is. */
+export function foldForFind(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const l = ch.toLowerCase();
+    // Final sigma: lowering per code point loses toLowerCase's context rule,
+    // so treat ς and σ as the same letter (same length — indices hold).
+    if (l.length === ch.length) { out += l === "\u03C2" ? "\u03C3" : l; continue; }
+    // Longer lower-case = base letter + combining mark(s) (İ → i + U+0307):
+    // keep just the base letter when it fits, so "istanbul" finds "İstanbul".
+    const base = l.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    out += base.length === ch.length ? base : ch;
+  }
+  return out;
+}
+
+/** The pin-layer key for an image (its path) or one PDF page ("path#page"). */
+function pinKey(path: string, page?: number): string {
+  return page ? `${path}#${page}` : path;
 }
 
 /** Resolve a feedback note's `feedbackOn` target to a file. The value is
@@ -160,11 +201,43 @@ export class StashpadShowcaseView extends ItemView {
   private dirty = false;
 
   private barEl: HTMLElement | null = null;
+  /** 0.532.5: Find bar (persistent — the toolbar is rebuilt every pass). */
+  private findEl: HTMLElement | null = null;
+  private findInput: HTMLInputElement | null = null;
+  private findCount: HTMLElement | null = null;
+  private findIdx = -1;
+  private findMatches: Array<{ range: Range } | { page: HTMLElement }> = [];
+  /** A queued Find run keeps the current match only if EVERY request asked to
+   *  (a user's typing must not be swallowed by a render-triggered re-run). */
+  private findKeepPending = true;
+  /** pdf.js page text, fetched lazily (first Find open, or when the page's text
+   *  layer is built) and shared by both. */
+  private pdfTextSources = new Map<HTMLElement, () => Promise<PdfJsTextContent>>();
+  /** PDFs not opened yet (still lazy): Find opens them all so their text exists. */
+  private pdfBuilders = new Set<() => void>();
+  /** Highlight names are global PER WINDOW: one owning Showcase tab per
+   *  window, and each tab remembers which window it painted in. */
+  private static findOwners = new WeakMap<Window, StashpadShowcaseView>();
+  private findWin: Window | null = null;
+  /** Whether the last run hit the match cap (shows "1000+"). */
+  private findCapped = false;
+  /** The previous current match was a whole-page stop (so when it turns into
+   *  the exact words, scroll to them). */
+  private findWasPageStop = false;
+  private findTimer: number | null = null;
+  /** Plain text of every pdf.js page box, for Find on pages not yet drawn. */
+  private pdfText = new Map<HTMLElement, string>();
   private scrollEl: HTMLElement | null = null;
   private pageEl: HTMLElement | null = null;
   private emptyEl: HTMLElement | null = null;
 
-  constructor(leaf: WorkspaceLeaf, private plugin: StashpadPlugin) { super(leaf); }
+  constructor(leaf: WorkspaceLeaf, private plugin: StashpadPlugin) {
+    super(leaf);
+    // Cmd/Ctrl+F finds within the page (Obsidian's own search doesn't look
+    // inside a custom view — captions, comments and PDF text).
+    this.scope = new Scope(this.app.scope);
+    this.scope.register(["Mod"], "f", () => { this.openFind(); return false; });
+  }
 
   getViewType(): string { return STASHPAD_SHOWCASE_VIEW_TYPE; }
   getDisplayText(): string {
@@ -195,6 +268,7 @@ export class StashpadShowcaseView extends ItemView {
     root.empty();
     root.addClass("stashpad-showcase");
     this.barEl = root.createDiv({ cls: "stashpad-showcase-bar" });
+    this.buildFindBar(root.createDiv({ cls: "stashpad-showcase-find" }));
     this.scrollEl = root.createDiv({ cls: "stashpad-showcase-scroll" });
     this.emptyEl = this.scrollEl.createDiv({ cls: "stashpad-showcase-empty" });
     this.pageEl = this.scrollEl.createDiv({ cls: "stashpad-showcase-page" });
@@ -217,6 +291,8 @@ export class StashpadShowcaseView extends ItemView {
     // Background tabs only mark themselves dirty; catch up when shown.
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => {
       if (leaf === this.leaf && this.dirty) this.scheduleRender(0);
+      // Highlights are per window: repaint ours when this tab comes back.
+      if (leaf === this.leaf && this.findEl?.hasClass("is-open")) this.paintFind(false);
     }));
     this.registerDomEvent(window, "keydown", (e: KeyboardEvent) => {
       if (e.key === "Escape" && this.pinPicking) { this.setPinPicking(null); }
@@ -225,6 +301,8 @@ export class StashpadShowcaseView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    if (this.findTimer !== null) { window.clearTimeout(this.findTimer); this.findTimer = null; }
+    this.clearFindHighlights();
     if (this.renderTimer !== null) { window.clearTimeout(this.renderTimer); this.renderTimer = null; }
     this.unsubTree?.(); this.unsubTree = null;
     this.resetSections();
@@ -370,6 +448,7 @@ export class StashpadShowcaseView extends ItemView {
       if (asideSig !== c.asideSig) { this.renderAside(c, s, comments); c.asideSig = asideSig; }
       this.renderPins(c, s, comments);
     });
+    this.scheduleFind(true);
     this.pageEl.querySelector(".stashpad-showcase-more")?.remove();
     if (nodes.length > sections.length) {
       const more = this.pageEl.createDiv({ cls: "stashpad-showcase-more" });
@@ -493,6 +572,10 @@ export class StashpadShowcaseView extends ItemView {
     const resolvedBtn = bar.createEl("button", { cls: "stashpad-showcase-btn" + (this.hideResolved ? " is-active" : ""), text: this.hideResolved ? "Show resolved" : "Hide resolved" });
     resolvedBtn.onclick = () => { this.hideResolved = !this.hideResolved; this.persist(); this.scheduleRender(0); };
 
+    const findBtn = bar.createEl("button", { cls: "stashpad-showcase-btn clickable-icon", attr: { "aria-label": "Find in this page" } });
+    setIcon(findBtn, "search");
+    findBtn.onclick = () => this.openFind();
+
     const exportBtn = bar.createEl("button", { cls: "stashpad-showcase-btn", attr: { "aria-label": "Export this page as one web page file (no Obsidian needed)" } });
     setIcon(exportBtn.createSpan(), "download");
     exportBtn.createSpan({ text: "Export" });
@@ -606,7 +689,7 @@ export class StashpadShowcaseView extends ItemView {
       };
       c.pinHosts.set(a.file.path, box.createDiv({ cls: "stashpad-showcase-pins" }));
     } else if (ext === "pdf") {
-      this.renderPdf(media, a.file, c.mainComp);
+      this.renderPdfPages(media, c, s, a, i);
     } else if (VIDEO_EXT.has(ext)) {
       const v = media.createEl("video", { cls: "stashpad-showcase-video", attr: { controls: "", preload: "metadata" } });
       v.src = this.app.vault.getResourcePath(a.file);
@@ -656,6 +739,225 @@ export class StashpadShowcaseView extends ItemView {
     }, { root: this.scrollEl, rootMargin: "800px 0px" });
     io.observe(box);
     comp.register(() => io.disconnect());
+  }
+
+  /** 0.532.2: a PDF as its pages, each drawn by Obsidian's bundled pdf.js into a
+   *  canvas when it nears the viewport, each with its own pin layer — so a
+   *  comment can be pinned to a spot on page 3 exactly like on an image. Reads
+   *  the file through the vault (never the app:// URL, which blanks on some
+   *  network vaults). Over PDF_PAGE_RENDER_MAX pages, over PDF_INLINE_LIMIT
+   *  bytes, or if pdf.js fails, it falls back to the browser/Obsidian viewer
+   *  (renderPdf), without pins. */
+  private renderPdfPages(media: HTMLElement, c: SectionCache, s: SectionData, a: Attachment, index: number): void {
+    const comp = c.mainComp;
+    const file = a.file;
+    const wrap = media.createDiv({ cls: "stashpad-showcase-pdfpages" });
+    // Back to the viewer (no pins). Drop any page pin layers already made so
+    // "Pin a spot" isn't offered over a viewer that can't take the click.
+    const fallback = (): void => {
+      void doc?.destroy?.(); doc = null;
+      wrap.remove();
+      for (const k of [...c.pinHosts.keys()]) if (k.startsWith(file.path + "#")) c.pinHosts.delete(k);
+      c.asideSig = "";
+      this.renderPdf(media, file, comp);
+      this.scheduleRender(0);
+    };
+    if (file.stat.size > PDF_INLINE_LIMIT) { fallback(); return; }
+    let doc: PdfJsDoc | null = null;
+    comp.register(() => { void doc?.destroy?.(); doc = null; });
+    const build = async (): Promise<void> => {
+      try {
+        const bytes = await this.app.vault.readBinary(file);
+        const pdfjs = await loadPdfJs() as PdfJsLib;
+        const d = await pdfjs.getDocument({ data: new Uint8Array(bytes) }).promise;
+        if (!wrap.isConnected) { void d.destroy?.(); return; }
+        doc = d;
+        if (!d.numPages || d.numPages > PDF_PAGE_RENDER_MAX) { fallback(); return; }
+        const pages: Array<{ n: number; box: HTMLElement; page: PdfJsPage; drawn: boolean; gen: number; task: PdfJsRenderTask | null; textLayer: boolean; text: Promise<PdfJsTextContent> | null }> = [];
+        for (let n = 1; n <= d.numPages; n++) {
+          const page = await d.getPage(n);
+          if (!wrap.isConnected) return;
+          const vp = page.getViewport({ scale: 1 });
+          const box = wrap.createDiv({ cls: "stashpad-showcase-pdfpage" });
+          box.style.aspectRatio = `${vp.width} / ${vp.height}`;
+          box.dataset.page = String(n);
+          box.setAttr("role", "img");
+          box.setAttr("aria-label", `${file.basename}, page ${n} of ${d.numPages}`);
+          box.createDiv({ cls: "stashpad-showcase-pdfpage-num", text: `${n} / ${d.numPages}` });
+          c.pinHosts.set(pinKey(file.path, n), box.createDiv({ cls: "stashpad-showcase-pins" }));
+          // pdf.js's text-layer CSS rounds its size with these (normally set by
+          // its own viewer); 1px = no rounding, so the layer matches the box.
+          box.setCssProps({ "--scale-round-x": "1px", "--scale-round-y": "1px" });
+          box.addEventListener("click", (e) => {
+            if ((e.target as HTMLElement).closest(".stashpad-showcase-pin")) return;
+            if (this.pinPicking === s.node.id) { this.placePin(s, a, box, e, n); return; }
+            const win = box.win;
+            const selectingText = (): boolean => {
+              const sel = win.getSelection();
+              return !!sel && !sel.isCollapsed && box.contains(sel.anchorNode);
+            };
+            // A drag that selected text isn't a click to open the preview.
+            if (selectingText() || e.detail > 1) return;
+            // On the text itself, wait out a possible double/triple click
+            // (word/line selection) before treating it as "open".
+            if ((e.target as HTMLElement).closest(".textLayer")) {
+              win.setTimeout(() => { if (box.isConnected && !selectingText()) this.openViewer(s, index); }, 280);
+              return;
+            }
+            this.openViewer(s, index);
+          });
+          pages.push({ n, box, page, drawn: false, gen: 0, task: null, textLayer: false, text: null });
+        }
+        // Page text, fetched once per page and only when needed: by the text
+        // layer when the page draws, or for every page when Find opens (so a
+        // match on a page that isn't drawn yet can be jumped to). Joined the
+        // same way the text layer lays it out (item text, a space per line
+        // end), so a match found here still matches once the page draws.
+        const textOf = (p: typeof pages[number]): Promise<PdfJsTextContent> => {
+          if (!p.text) {
+            p.text = p.page.getTextContent();
+            void p.text.then((tc) => {
+              if (!p.box.isConnected) return;
+              // Exactly the DOM side's rule (blockText): item text, plus one space
+              // at a line end unless the text already ends in one.
+              let t = "";
+              for (const it of tc.items) { t += it.str ?? ""; if (it.hasEOL && t && !t.endsWith(" ")) t += " "; }
+              this.pdfText.set(p.box, t);
+              this.scheduleFind(true);
+            }).catch(() => { p.text = null; /* retry next time it's asked for */ });
+          }
+          return p.text;
+        };
+        for (const p of pages) this.pdfTextSources.set(p.box, () => textOf(p));
+        if (this.findEl?.hasClass("is-open")) for (const p of pages) void textOf(p).catch(() => undefined);
+        comp.register(() => { for (const p of pages) { this.pdfText.delete(p.box); this.pdfTextSources.delete(p.box); } });
+        // The text layer scales with the page box via --total-scale-factor
+        // (pdf.js 5 sizes it as calc(var(--total-scale-factor) * <page pt>)).
+        const setScale = (): void => {
+          for (const p of pages) {
+            const w = p.box.clientWidth; const base = p.page.getViewport({ scale: 1 }).width;
+            if (w && base) p.box.setCssProps({ "--total-scale-factor": String(w / base) });
+          }
+        };
+        setScale();
+        if (typeof ResizeObserver !== "undefined") {
+          const ro = new ResizeObserver(() => setScale());
+          ro.observe(wrap);
+          comp.register(() => ro.disconnect());
+        }
+        /** Selectable text over the page (built once, kept when the canvas is
+         *  released so Find highlights survive scrolling). */
+        const buildText = async (p: typeof pages[number]): Promise<void> => {
+          if (p.textLayer || !pdfjs.TextLayer) return;
+          p.textLayer = true;
+          let layer: HTMLElement | null = null;
+          try {
+            const tc = await textOf(p);
+            if (!p.box.isConnected) return;
+            layer = p.box.createDiv({ cls: "textLayer stashpad-showcase-textlayer" });
+            await new pdfjs.TextLayer({ textContentSource: tc, container: layer, viewport: p.page.getViewport({ scale: 1 }) }).render();
+            this.scheduleFind(true);
+          } catch {
+            layer?.remove(); // never leave an empty layer for Find to read
+            p.textLayer = false;
+          }
+        };
+        // Canvases are big (a page at 2× is ~10 MB), so only pages near the
+        // viewport keep one: leaving the margin releases it, coming back redraws.
+        // Mobile gets a smaller cap — WebKit has a total canvas-memory limit and
+        // returns no context past it.
+        const maxPx = Platform.isMobile ? 1400 : PDF_PAGE_MAX_PX;
+        const release = (p: typeof pages[number]): void => {
+          p.gen++;
+          p.drawn = false;
+          p.task?.cancel?.(); // stop rasterising a page that scrolled away
+          p.task = null;
+          const cv = p.box.querySelector("canvas");
+          if (cv) { cv.width = 0; cv.height = 0; cv.remove(); }
+        };
+        const draw = async (p: typeof pages[number]): Promise<void> => {
+          if (p.drawn || !p.box.isConnected) return;
+          p.drawn = true;
+          const gen = ++p.gen;
+          const cssW = Math.max(1, p.box.clientWidth);
+          const base = p.page.getViewport({ scale: 1 });
+          const dpr = activeWindow.devicePixelRatio || 1;
+          const scale = Math.min(maxPx, cssW * dpr) / base.width;
+          const viewport = p.page.getViewport({ scale });
+          const canvas = p.box.createEl("canvas", { cls: "stashpad-showcase-pdfcanvas" });
+          canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
+          p.box.prepend(canvas);
+          const ctx = canvas.getContext("2d");
+          if (!ctx) { release(p); return; } // out of canvas memory: retry on next entry
+          ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+          void buildText(p);
+          try {
+            p.task = p.page.render({ canvasContext: ctx, viewport });
+            await p.task.promise;
+          } catch { /* cancelled, destroyed mid-render, or a bad page: leave it white */ }
+          finally {
+            if (gen === p.gen) p.task = null;
+            try { p.page.cleanup?.(); } catch { /* still rendering elsewhere — pdf.js refuses, fine */ }
+          }
+        };
+        if (typeof IntersectionObserver === "undefined") { for (const p of pages) void draw(p); }
+        else {
+          // Hysteresis: draw within 600 px of the viewport, release only past
+          // 1800 px — a page sitting on one shared edge re-rendered on every
+          // small back-and-forth scroll.
+          const drawIo = new IntersectionObserver((entries) => {
+            for (const en of entries) {
+              const p = pages.find((x) => x.box === en.target);
+              if (p && en.isIntersecting) void draw(p);
+            }
+          }, { root: this.scrollEl, rootMargin: "600px 0px" });
+          const releaseIo = new IntersectionObserver((entries) => {
+            for (const en of entries) {
+              const p = pages.find((x) => x.box === en.target);
+              if (p && !en.isIntersecting && p.drawn) release(p);
+            }
+          }, { root: this.scrollEl, rootMargin: "1800px 0px" });
+          for (const p of pages) { drawIo.observe(p.box); releaseIo.observe(p.box); }
+          comp.register(() => { drawIo.disconnect(); releaseIo.disconnect(); });
+        }
+        wrap.removeClass("is-loading");
+        // Pages (and their pin layers) exist now: paint existing pins and let
+        // the composer offer "Pin a spot" for this PDF.
+        c.asideSig = "";
+        this.scheduleRender(0);
+      } catch (e) {
+        if (!wrap.isConnected) return; // section rebuilt / view closed — not a failure
+        console.warn("Stashpad showcase: pdf.js couldn't draw this PDF; using the viewer", file.path, e);
+        fallback();
+      }
+    };
+    if (typeof IntersectionObserver === "undefined") { void build(); return; }
+    let started = false;
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((en) => en.isIntersecting)) start();
+    }, { root: this.scrollEl, rootMargin: "1200px 0px" });
+    // Open the PDF (pages + text, not drawing) — when it nears the viewport,
+    // or as soon as Find opens, so a PDF further down the page is searchable.
+    const start = (): void => {
+      if (started) return;
+      started = true;
+      io.disconnect();
+      this.pdfBuilders.delete(start);
+      void build();
+    };
+    this.pdfBuilders.add(start);
+    if (this.findEl?.hasClass("is-open")) start();
+    // A sized placeholder so the observer has something to see before pages exist.
+    wrap.addClass("is-loading");
+    io.observe(wrap);
+    comp.register(() => { io.disconnect(); this.pdfBuilders.delete(start); });
+  }
+
+  /** True when this file can take pins: an image, or a PDF drawn as pages. */
+  private pinnable(c: SectionCache, a: Attachment): boolean {
+    if (isImageExt(a.file.extension.toLowerCase())) return true;
+    for (const k of c.pinHosts.keys()) if (k.startsWith(a.file.path + "#")) return true;
+    return false;
   }
 
   private openViewer(s: SectionData, index: number): void {
@@ -726,17 +1028,24 @@ export class StashpadShowcaseView extends ItemView {
    *  through the folder's normal undo stack; the toggle is its own inverse. */
   private async toggleAttachmentReaction(view: StashpadView, s: SectionData, key: string, emoji: string): Promise<void> {
     const me = myReactionId(view);
-    const path = s.file.path;
+    // 0.532.5: hold the FILES, not their paths. A TFile keeps its identity
+    // (and updates its .path) through renames, so undo/redo after the image
+    // was renamed — or after the section note's slug changed — still hits the
+    // right note and the right entry; with captured paths it silently did
+    // nothing.
+    const noteFile = s.file;
+    const attAbs = this.app.vault.getAbstractFileByPath(key);
+    const attFile = attAbs instanceof TFile ? attAbs : null;
     const write = async (add: boolean): Promise<void> => {
-      const f = this.app.vault.getAbstractFileByPath(path);
-      if (!(f instanceof TFile)) return;
-      view.markFmSelfWrite(path, true);
-      await this.app.fileManager.processFrontMatter(f, (fm: Record<string, unknown>) => {
+      if (this.app.vault.getAbstractFileByPath(noteFile.path) !== noteFile) return; // note deleted
+      const attPath = attFile && this.app.vault.getAbstractFileByPath(attFile.path) === attFile ? attFile.path : key;
+      view.markFmSelfWrite(noteFile.path, true);
+      await this.app.fileManager.processFrontMatter(noteFile, (fm: Record<string, unknown>) => {
         // Read-modify-write of ONE entry: other people's entries (and other
         // files' entries) pass through untouched, so a coworker's concurrent
         // reaction survives unless both writes land on the same instant.
         const list = Array.isArray(fm.attachmentReactions) ? (fm.attachmentReactions as unknown[]).filter((e): e is string => typeof e === "string") : [];
-        const entry = `${emoji}:${me}:${key}`;
+        const entry = `${emoji}:${me}:${attPath}`;
         const next = list.filter((e) => e !== entry);
         if (add) next.push(entry);
         if (next.length) fm.attachmentReactions = next; else delete fm.attachmentReactions;
@@ -750,7 +1059,7 @@ export class StashpadShowcaseView extends ItemView {
     // Hold the key until the cache has caught up (next render reads it fresh).
     window.setTimeout(() => this.pendingReacts.delete(pendingKey), 600);
     this.scheduleRender(50);
-    const name = key.split("/").pop() ?? key;
+    const name = attFile?.name ?? key.split("/").pop() ?? key;
     view.plugin.getUndoStack(view.noteFolder).push({
       label: had ? `Remove ${emoji} on ${name}` : `React ${emoji} on ${name}`,
       undo: async () => { await write(had); this.scheduleRender(50); },
@@ -840,8 +1149,8 @@ export class StashpadShowcaseView extends ItemView {
       const pin = parseFeedbackPin(fm?.feedbackPin);
       const chip = item.createDiv({ cls: "stashpad-showcase-comment-target", attr: { role: "button", tabindex: "0" } });
       setIcon(chip.createSpan(), pin ? "map-pin" : "image");
-      chip.createSpan({ text: `on ${att?.label ? att.label + " · " : ""}${target.name}` });
-      const go = (): void => this.flashAttachment(s.node.id, target.path);
+      chip.createSpan({ text: `on ${att?.label ? att.label + " · " : ""}${target.name}${pin?.page ? ` · p. ${pin.page}` : ""}` });
+      const go = (): void => this.flashAttachment(s.node.id, target.path, pin?.page);
       chip.onclick = go;
       chip.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
     }
@@ -913,11 +1222,12 @@ export class StashpadShowcaseView extends ItemView {
       }
       select.onchange = () => { d.target = select.value; d.pin = null; this.setPinPicking(null); c.asideSig = ""; this.scheduleRender(0); };
       const targetAtt = s.atts.find((a) => a.file.path === d.target);
-      if (targetAtt && isImageExt(targetAtt.file.extension.toLowerCase())) {
+      if (targetAtt && this.pinnable(c, targetAtt)) {
         const pinBtn = row.createEl("button", { cls: "stashpad-showcase-pinbtn" + (d.pin ? " is-set" : "") + (this.pinPicking === s.node.id ? " is-picking" : "") });
         setIcon(pinBtn.createSpan(), "map-pin");
-        pinBtn.createSpan({ text: d.pin ? "Pinned" : (this.pinPicking === s.node.id ? "Click the image…" : "Pin a spot") });
-        pinBtn.title = d.pin ? "Click to remove the pin" : "Then click the exact spot on the image";
+        const pinned = d.pin ? parseFeedbackPin(d.pin) : null;
+        pinBtn.createSpan({ text: pinned ? (pinned.page ? `Pinned on p. ${pinned.page}` : "Pinned") : (this.pinPicking === s.node.id ? "Click the spot…" : "Pin a spot") });
+        pinBtn.title = d.pin ? "Click to remove the pin" : "Then click the exact spot on the image or page";
         pinBtn.onclick = () => {
           if (d.pin) { d.pin = null; this.setPinPicking(null); c.asideSig = ""; this.scheduleRender(0); return; }
           this.setPinPicking(this.pinPicking === s.node.id ? null : s.node.id);
@@ -981,6 +1291,201 @@ export class StashpadShowcaseView extends ItemView {
     }
   }
 
+  // ---------------------------------------------------------------- find
+
+  private buildFindBar(el: HTMLElement): void {
+    this.findEl = el;
+    const input = el.createEl("input", { cls: "stashpad-showcase-find-input", attr: { type: "search", placeholder: "Find in captions, comments and PDF text", "aria-label": "Find in this page" } });
+    this.findInput = input;
+    this.findCount = el.createSpan({ cls: "stashpad-showcase-find-count", attr: { "aria-live": "polite" } });
+    const prev = el.createEl("button", { cls: "clickable-icon", attr: { "aria-label": "Previous match" } });
+    setIcon(prev, "chevron-up");
+    const next = el.createEl("button", { cls: "clickable-icon", attr: { "aria-label": "Next match" } });
+    setIcon(next, "chevron-down");
+    const close = el.createEl("button", { cls: "clickable-icon", attr: { "aria-label": "Close find" } });
+    setIcon(close, "x");
+    input.addEventListener("input", () => { this.findIdx = -1; this.scheduleFind(false); });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); this.stepFind(e.shiftKey ? -1 : 1); }
+      else if (e.key === "Escape") { e.preventDefault(); this.closeFind(); }
+    });
+    prev.onclick = () => this.stepFind(-1);
+    next.onclick = () => this.stepFind(1);
+    close.onclick = () => this.closeFind();
+  }
+
+  private openFind(): void {
+    if (!this.findEl || !this.findInput) return;
+    const wasOpen = this.findEl.hasClass("is-open");
+    this.findEl.addClass("is-open");
+    const sel = this.containerEl.win.getSelection()?.toString().trim();
+    if (sel && sel.length < 80 && !sel.includes("\n")) this.findInput.value = sel;
+    this.findInput.focus();
+    this.findInput.select();
+    // First open: open every PDF not opened yet, and fetch every page's text,
+    // so pages that aren't drawn (or PDFs far down the page) are searchable.
+    if (!wasOpen) {
+      for (const start of [...this.pdfBuilders]) start();
+      for (const get of this.pdfTextSources.values()) void get().catch(() => undefined);
+    }
+    this.findIdx = -1;
+    this.scheduleFind(false);
+  }
+
+  private closeFind(): void {
+    this.findEl?.removeClass("is-open");
+    this.findInput?.blur(); // don't leave focus in a hidden input
+    this.findMatches = []; this.findIdx = -1;
+    if (this.findTimer !== null) { window.clearTimeout(this.findTimer); this.findTimer = null; }
+    this.pageEl?.querySelectorAll(".stashpad-showcase-pdfpage.is-find-current").forEach((el) => el.removeClass("is-find-current"));
+    this.findWasPageStop = false;
+    this.clearFindHighlights();
+  }
+
+  /** `keepPlace`: a re-run after the page changed (render, text arriving) —
+   *  keep the current match rather than restarting. Queued requests combine:
+   *  if any asked for a fresh search, the run is a fresh search. */
+  private scheduleFind(keepPlace: boolean): void {
+    if (!this.findEl?.hasClass("is-open")) return;
+    this.findKeepPending = this.findKeepPending && keepPlace;
+    // A run is already queued: fold this request into it rather than pushing
+    // it back — a stream of page-text arrivals must not starve Find. (A fresh
+    // typing request still shortens nothing, but it can't be postponed either.)
+    if (this.findTimer !== null) return;
+    this.findTimer = window.setTimeout(() => {
+      this.findTimer = null;
+      const keep = this.findKeepPending;
+      this.findKeepPending = true;
+      this.runFind(keep);
+    }, keepPlace ? 300 : 150);
+  }
+
+  /** The searchable text of a block plus a map back to its text nodes.
+   *  Line breaks (<br>, which the PDF text layer emits at each line end) and
+   *  block boundaries count as one space, so phrases match across pdf.js items
+   *  and lines the same way as in the extracted page text. */
+  private blockText(scope: HTMLElement): { text: string; segs: Array<{ node: Text; start: number }> } {
+    const doc = scope.doc;
+    const BLOCK = /^(P|LI|H[1-6]|DIV|BLOCKQUOTE|PRE|TR|TD|TH|DT|DD)$/;
+    let text = "";
+    const segs: Array<{ node: Text; start: number }> = [];
+    const walker = doc.createTreeWalker(scope, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      if (n.nodeType === Node.TEXT_NODE) {
+        const v = n.nodeValue ?? "";
+        if (!v) continue;
+        segs.push({ node: n as Text, start: text.length });
+        text += v;
+      } else {
+        const tag = (n as Element).tagName;
+        if ((tag === "BR" || BLOCK.test(tag)) && text && !text.endsWith(" ")) text += " ";
+      }
+    }
+    return { text, segs };
+  }
+
+  /** Matches in page order: ranges (possibly spanning several text nodes) in
+   *  captions, comment bodies and drawn PDF text layers; a PDF page not drawn
+   *  yet is a whole-page stop per occurrence in its extracted text. Capped so a
+   *  one-letter query on a long PDF can't build tens of thousands of ranges. */
+  private runFind(keepPlace: boolean): void {
+    const q = foldForFind((this.findInput?.value ?? "").trim()).replace(/\s+/g, " ");
+    const CAP = 1000;
+    const matches: Array<{ range: Range } | { page: HTMLElement }> = [];
+    if (q && this.pageEl) {
+      const blocks = this.pageEl.querySelectorAll<HTMLElement>(".stashpad-showcase-caption, .stashpad-showcase-comment-body, .stashpad-showcase-pdfpage");
+      outer: for (const block of Array.from(blocks)) {
+        if (block.closest(".stashpad-showcase-veil, .is-veiled")) continue;
+        const scope = block.hasClass("stashpad-showcase-pdfpage") ? block.querySelector<HTMLElement>(".textLayer") : block;
+        if (scope) {
+          const { text, segs } = this.blockText(scope);
+          if (!segs.length) continue;
+          const hay = foldForFind(text).replace(/\s/g, " ");
+          // index → (text node, offset); an index on a virtual space snaps to
+          // the next real character (start) / previous one (end).
+          const at = (i: number, isEnd: boolean): [Text, number] | null => {
+            for (let k = 0; k < segs.length; k++) {
+              const sg = segs[k]; const len = sg.node.nodeValue?.length ?? 0;
+              if (isEnd ? (i > sg.start && i <= sg.start + len) : (i >= sg.start && i < sg.start + len)) return [sg.node, i - sg.start];
+              if (!isEnd && i < sg.start) return [sg.node, 0];
+              if (isEnd && i <= sg.start) return k > 0 ? [segs[k - 1].node, segs[k - 1].node.nodeValue?.length ?? 0] : null;
+            }
+            const last = segs[segs.length - 1];
+            return isEnd ? [last.node, last.node.nodeValue?.length ?? 0] : null;
+          };
+          for (let i = hay.indexOf(q); i >= 0; i = hay.indexOf(q, i + q.length)) {
+            const a = at(i, false); const b = at(i + q.length, true);
+            if (!a || !b) continue;
+            const r = scope.doc.createRange();
+            try { r.setStart(a[0], a[1]); r.setEnd(b[0], b[1]); } catch { continue; }
+            matches.push({ range: r });
+            if (matches.length >= CAP) break outer;
+          }
+        } else {
+          const hay = foldForFind(this.pdfText.get(block) ?? "").replace(/\s/g, " ");
+          for (let i = hay.indexOf(q); i >= 0; i = hay.indexOf(q, i + q.length)) {
+            matches.push({ page: block });
+            if (matches.length >= CAP) break outer;
+          }
+        }
+      }
+    }
+    this.findMatches = matches;
+    this.findCapped = matches.length >= CAP;
+    if (!matches.length) this.findIdx = -1;
+    else if (!keepPlace || this.findIdx < 0) this.findIdx = 0;
+    else if (this.findIdx >= matches.length) this.findIdx = matches.length - 1;
+    const cur = this.findIdx >= 0 ? matches[this.findIdx] : null;
+    const pageStopResolved = keepPlace && this.findWasPageStop && !!cur && "range" in cur;
+    this.paintFind(!keepPlace || pageStopResolved);
+  }
+
+  private stepFind(dir: 1 | -1): void {
+    if (!this.findMatches.length) { this.runFind(false); return; }
+    this.findIdx = (this.findIdx + dir + this.findMatches.length) % this.findMatches.length;
+    this.paintFind(true);
+  }
+
+  private paintFind(scroll: boolean): void {
+    const n = this.findMatches.length;
+    const q = (this.findInput?.value ?? "").trim();
+    if (this.findCount) this.findCount.setText(!q ? "" : n ? `${this.findIdx + 1} of ${n}${this.findCapped ? "+" : ""}` : "No matches");
+    // Highlights live in the window this view is in (popouts have their own).
+    const win = this.containerEl.win as unknown as { CSS?: { highlights?: Map<string, unknown> }; Highlight?: new (...r: Range[]) => unknown };
+    const reg = win.CSS?.highlights; const HL = win.Highlight;
+    const cur = this.findIdx >= 0 ? this.findMatches[this.findIdx] : null;
+    if (reg && HL) {
+      const w = this.containerEl.win;
+      if (this.findWin && this.findWin !== w) this.clearFindHighlights(); // moved windows: clean the old one
+      StashpadShowcaseView.findOwners.set(w, this);
+      this.findWin = w;
+      const others = this.findMatches.filter((m): m is { range: Range } => "range" in m && m !== cur).map((m) => m.range);
+      reg.set("stashpad-find", new HL(...others));
+      if (cur && "range" in cur) reg.set("stashpad-find-current", new HL(cur.range)); else reg.delete("stashpad-find-current");
+    }
+    this.pageEl?.querySelectorAll(".stashpad-showcase-pdfpage.is-find-current").forEach((el) => el.removeClass("is-find-current"));
+    this.findWasPageStop = !!cur && "page" in cur;
+    if (!cur) return;
+    if ("range" in cur) {
+      if (scroll) cur.range.startContainer.parentElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+    } else {
+      // A page that isn't drawn yet: go there; once its text layer exists the
+      // keep-place re-run swaps this stop for the exact words.
+      cur.page.addClass("is-find-current");
+      if (scroll) cur.page.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }
+
+  private clearFindHighlights(): void {
+    const w = this.findWin;
+    if (!w) return;
+    this.findWin = null;
+    if (StashpadShowcaseView.findOwners.get(w) !== this) return; // another tab owns that window's now
+    StashpadShowcaseView.findOwners.delete(w);
+    const reg = (w as unknown as { CSS?: { highlights?: Map<string, unknown> } }).CSS?.highlights;
+    reg?.delete("stashpad-find"); reg?.delete("stashpad-find-current");
+  }
+
   // ---------------------------------------------------------------- export
 
   /** "👍 2 (Alex, Sam) · ❌ 1 (Kim)" with real names — the export's reader isn't "You". */
@@ -1022,7 +1527,7 @@ export class StashpadShowcaseView extends ItemView {
               comments.push({
                 num: depth ? 0 : i + 1, author: who.name, role: who.role,
                 when: created?.isValid() ? created.format("LLL") : "",
-                text, target: target ? `${att?.label ? att.label + " · " : ""}${target.name}` : "",
+                text, target: target ? `${att?.label ? att.label + " · " : ""}${target.name}${pin?.page ? ` · p. ${pin.page}` : ""}` : "",
                 resolved: this.isResolved(n), depth,
                 pin: pin && target ? { ...pin, path: target.path } : null,
               });
@@ -1079,14 +1584,15 @@ export class StashpadShowcaseView extends ItemView {
     this.scheduleRender(0);
   }
 
-  private placePin(s: SectionData, a: Attachment, img: HTMLImageElement, e: MouseEvent): void {
-    const r = img.getBoundingClientRect();
+  /** `el` = the image, or a PDF page box (then `page` is its 1-based number). */
+  private placePin(s: SectionData, a: Attachment, el: HTMLElement, e: MouseEvent, page?: number): void {
+    const r = el.getBoundingClientRect();
     if (!r.width || !r.height) return;
     const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
     const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
     const d = this.draftFor(s.node.id);
     d.target = a.file.path;
-    d.pin = `${x.toFixed(4)},${y.toFixed(4)}`;
+    d.pin = `${x.toFixed(4)},${y.toFixed(4)}${page ? `,${page}` : ""}`;
     this.setPinPicking(null);
     window.setTimeout(() => this.cache.get(s.node.id)?.asideEl.querySelector<HTMLTextAreaElement>("textarea")?.focus(), 260);
   }
@@ -1094,11 +1600,11 @@ export class StashpadShowcaseView extends ItemView {
   /** Numbered dots on images for comments that carry a `feedbackPin`, plus the
    *  pending pin of a draft. Repainted every pass (cheap). */
   private renderPins(c: SectionCache, s: SectionData, comments: TreeNode[]): void {
-    for (const [path, host] of c.pinHosts) {
+    for (const [key, host] of c.pinHosts) {
       // Same focus-keeping rule as the reaction bars: skip if nothing changed.
       const d0 = this.drafts.get(s.node.id);
       const sig = comments.map((n) => { const fm = this.fmOf(n.file); return `${n.id}:${String(fm?.feedbackPin ?? "")}:${String(fm?.feedbackOn ?? "")}:${fm?.completed === true}:${this.veiled(n)}`; }).join(",")
-        + `|${this.hideResolved}|${this.veiled(s.node)}|${d0?.target === path ? d0.pin ?? "" : ""}`;
+        + `|${this.hideResolved}|${this.veiled(s.node)}|${d0?.target ?? ""}|${d0?.pin ?? ""}`;
       if (host.dataset.sig === sig) continue;
       host.dataset.sig = sig;
       host.empty();
@@ -1107,7 +1613,7 @@ export class StashpadShowcaseView extends ItemView {
         const pin = parseFeedbackPin(fm?.feedbackPin);
         if (!pin) return;
         const t = resolveFeedbackTarget(this.app, fm, n.file!.path);
-        if (!t || t.path !== path) return;
+        if (!t || pinKey(t.path, pin.page) !== key) return;
         if (this.hideResolved && this.isResolved(n)) return;
         if (this.veiled(n) || this.veiled(s.node)) return;
         const dot = host.createEl("button", { cls: "stashpad-showcase-pin" + (this.isResolved(n) ? " is-resolved" : ""), text: String(i + 1) });
@@ -1117,7 +1623,8 @@ export class StashpadShowcaseView extends ItemView {
         dot.onclick = (e) => { e.stopPropagation(); this.flashComment(c, n.id); };
       });
       const d = this.drafts.get(s.node.id);
-      const pending = d?.pin && d.target === path ? parseFeedbackPin(d.pin) : null;
+      const draftPin = d?.pin && d.target ? parseFeedbackPin(d.pin) : null;
+      const pending = draftPin && pinKey(d!.target, draftPin.page) === key ? draftPin : null;
       if (pending) {
         const dot = host.createDiv({ cls: "stashpad-showcase-pin is-pending", text: "+" });
         dot.style.left = `${pending.x * 100}%`;
@@ -1126,9 +1633,11 @@ export class StashpadShowcaseView extends ItemView {
     }
   }
 
-  private flashAttachment(sectionId: string, path: string): void {
+  private flashAttachment(sectionId: string, path: string, page?: number): void {
     const c = this.cache.get(sectionId);
-    const card = c ? Array.from(c.mainEl.querySelectorAll<HTMLElement>(".stashpad-showcase-att")).find((el) => el.dataset.path === path) : null;
+    const att = c ? Array.from(c.mainEl.querySelectorAll<HTMLElement>(".stashpad-showcase-att")).find((el) => el.dataset.path === path) : null;
+    // A pin on a PDF page scrolls to (and flashes) that page, not the whole PDF.
+    const card = (page && att?.querySelector<HTMLElement>(`.stashpad-showcase-pdfpage[data-page="${page}"]`)) || att;
     if (!card) return;
     card.scrollIntoView({ behavior: "smooth", block: "center" });
     card.removeClass("is-flash"); void card.offsetWidth; card.addClass("is-flash");
@@ -1143,6 +1652,86 @@ export class StashpadShowcaseView extends ItemView {
     window.setTimeout(() => el.removeClass("is-flash"), 1600);
   }
 
+}
+
+/** 0.532.1: keep Showcase review state attached to a file through renames and
+ *  moves. Per-option reactions are keyed by the file's vault path
+ *  (`"<emoji>:<authorId>:<path>"`), so without this a renamed proposal lost
+ *  its votes. Also re-points a comment's `feedbackOn` if Obsidian's own link
+ *  updater left it on the old path (it normally updates frontmatter links —
+ *  then this is a no-op). Renames are batched (a folder move renames every
+ *  file in it) and chained (a→b→c within one batch resolves to c). Only the
+ *  device that performs the rename runs this; the edit syncs like any other. */
+export function installAttachmentRenameSync(plugin: StashpadPlugin): void {
+  const { app } = plugin;
+  const pending = new Map<string, string>();
+  let timer: number | null = null;
+  let chain: Promise<void> = Promise.resolve();
+  const entryPath = (e: string): string => {
+    const a = e.indexOf(":"); const b = a < 0 ? -1 : e.indexOf(":", a + 1);
+    return b < 0 ? "" : e.slice(b + 1);
+  };
+  const flush = async (): Promise<void> => {
+    const moves = new Map(pending); pending.clear();
+    for (const [k, v] of moves) if (k === v) moves.delete(k); // moved back = no change
+    if (!moves.size) return;
+    const finalPath = (p: string): string => moves.get(p) ?? p;
+    for (const f of app.vault.getMarkdownFiles()) {
+      const fm = app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
+      if (!fm) continue;
+      const list = Array.isArray(fm.attachmentReactions) ? (fm.attachmentReactions as unknown[]) : null;
+      const hitReactions = !!list?.some((e) => typeof e === "string" && moves.has(entryPath(e)));
+      const fbRaw = typeof fm.feedbackOn === "string" ? fm.feedbackOn : "";
+      const fbInner = fbRaw.trim().replace(/^\[\[/, "").replace(/\]\]$/, "");
+      const hitFeedback = !!fbInner && moves.has(fbInner);
+      if (!hitReactions && !hitFeedback) continue;
+      const leaf = anyStashpadLeafOnFolder(app, f.parent?.path ?? "", { normalize: true });
+      const markSelf = (): void => (leaf?.view as unknown as { markFmSelfWrite?: (p: string) => void } | undefined)?.markFmSelfWrite?.(f.path);
+      try {
+        await app.fileManager.processFrontMatter(f, (m: Record<string, unknown>) => {
+          const before = JSON.stringify([m.attachmentReactions, m.feedbackOn]);
+          if (Array.isArray(m.attachmentReactions)) {
+            const out: string[] = [];
+            for (const e of m.attachmentReactions as unknown[]) {
+              if (typeof e !== "string") continue;
+              const path = entryPath(e);
+              const next = path && moves.has(path) ? e.slice(0, e.length - path.length) + finalPath(path) : e;
+              if (!out.includes(next)) out.push(next);
+            }
+            if (out.length) m.attachmentReactions = out; else delete m.attachmentReactions;
+          }
+          if (typeof m.feedbackOn === "string") {
+            const inner = m.feedbackOn.trim().replace(/^\[\[/, "").replace(/\]\]$/, "");
+            // Only if nothing lives at the old path any more: when a path was
+            // reused in the batch, Obsidian's own link updater has already
+            // rewritten this link, and mapping it again would mis-point it.
+            if (moves.has(inner) && !app.vault.getAbstractFileByPath(inner)) m.feedbackOn = `[[${finalPath(inner)}]]`;
+          }
+          // Mark it as our own write only when something actually changed — an
+          // unused marker would hide a real outside edit's log line for a while.
+          if (JSON.stringify([m.attachmentReactions, m.feedbackOn]) !== before) markSelf();
+        });
+      } catch (e) {
+        console.warn("Stashpad showcase: couldn't move review state after a rename", f.path, e);
+      }
+    }
+  };
+  plugin.registerEvent(app.vault.on("rename", (file, oldPath) => {
+    if (!(file instanceof TFile) || file.extension === "md") return;
+    // Map ORIGINAL path → CURRENT path, composed as renames arrive, so each
+    // lookup is one step: A→B then C→A keeps C's votes on A (a chain walk
+    // sent them to B), and a swap through a temp name resolves correctly.
+    let composed = false;
+    for (const [orig, cur] of pending) if (cur === oldPath) { pending.set(orig, file.path); composed = true; break; }
+    // A NEW file at an original key's path renamed again mustn't take over
+    // that key (its votes, if any, aren't the moved file's).
+    if (!composed && !pending.has(oldPath)) pending.set(oldPath, file.path);
+    if (timer !== null) window.clearTimeout(timer);
+    // Flushes run one after another: a batch that starts while the previous
+    // one is still writing would read a cache that hasn't caught up.
+    timer = window.setTimeout(() => { timer = null; chain = chain.then(flush, flush); }, 600);
+  }));
+  plugin.register(() => { if (timer !== null) window.clearTimeout(timer); });
 }
 
 /** Open (or reveal) the Showcase for a level — mirrors openKanbanView. */

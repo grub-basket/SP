@@ -1,7 +1,7 @@
 import { TFile, TFolder } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
-import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink } from "./types";
+import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink, yamlQuote } from "./types";
 import { readId } from "./id-service";
 import { formatDateOnly } from "./format";
 import { bodyToSlug, buildFilename } from "./slug-service";
@@ -1042,7 +1042,9 @@ export class ImportService {
       // the tree, appear in the list, or be counted by folder discovery.
       const reason = err instanceof Error ? err.message : String(err);
       const noteName = dest.replace(/\.[^.]+$/, "") + ".error.md";
-      const yaml = (v: string): string => `"${v.replace(/"/g, '\\"')}"`;
+      // 0.532.0: the shared escape — an error message can carry a Windows path
+      // (backslashes) or a newline, which the old quote-only escape broke on.
+      const yaml = yamlQuote;
       await this.app.vault.create(noteName,
         [
           `---`,

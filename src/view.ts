@@ -8,7 +8,7 @@ import {
   ROOT_ID, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
   archiveSubfolderOf, isArchiveSubfolderPath,
   isReservedSubfolderName,
-  isInReservedSubfolder, writeCompletedFm,
+  isInReservedSubfolder, writeCompletedFm, yamlQuote,
   type StashpadId, type TimeFilter, type TimeUnit, type TreeNode, type ViewConfigState, type ViewMode, type ScrollPolicy, type ComposerDraft,
   type ListPinEdge, siftMatch,
 } from "./types";
@@ -16320,7 +16320,7 @@ export class StashpadView extends ItemView {
     const fmInit = ["---", `id: ${cloneId}`, `parent: ${newParent}`, `created: ${created}`];
     if (attachments.length > 0) {
       fmInit.push("attachments:");
-      for (const a of attachments) fmInit.push(`  - "${a.replace(/"/g, '\\"')}"`);
+      for (const a of attachments) fmInit.push(`  - ${yamlQuote(a)}`); // 0.532.0: shared escape (was quote-only)
     } else {
       fmInit.push("attachments: []");
     }
@@ -21266,7 +21266,7 @@ export class StashpadView extends ItemView {
     // collapsed, then backslashes, then quotes (docs/security-findings.md: text-
     // built YAML must escape backslashes too; a name or blurb ending in "\\"
     // used to turn the closing quote into \\" and break the frontmatter).
-    const yq = (v: string): string => `"${v.replace(/[\r\n]+/g, " ").replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    const yq = yamlQuote;
     const fmLines = [
       "---", `id: ${id}`, `parent: ${parentId}`, `created: ${created}`,
       `modified: ${created}`,

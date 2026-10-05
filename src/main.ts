@@ -15,7 +15,7 @@ import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
 import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_KANBAN_VIEW_TYPE, STASHPAD_SHOWCASE_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
 import { StashpadKanbanView, openKanbanView } from "./kanban-view";
-import { StashpadShowcaseView, openShowcaseView } from "./showcase-view";
+import { StashpadShowcaseView, installAttachmentRenameSync, openShowcaseView } from "./showcase-view";
 import { StashpadLogView, StashpadNotificationsView, openStashpadLogView, openStashpadNotificationsView } from "./activity-views";
 import { StashpadPanelsView, openStashpadPanelsView, openStashpadSinglePanel, PANEL_REGISTRY, type PanelId } from "./panels-view";
 import { TaskReviewModal } from "./task-review-modal";
@@ -3538,6 +3538,10 @@ export default class StashpadPlugin extends Plugin {
       STASHPAD_SHOWCASE_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadShowcaseView(leaf, this),
     );
+    // 0.532.1: per-option reactions / feedback targets follow file renames.
+    // After layout-ready: renames fired while the vault is still loading have
+    // no cached frontmatter to rewrite against.
+    this.app.workspace.onLayoutReady(() => installAttachmentRenameSync(this));
     // 0.315.0: action log + notification history, promoted from modals to tabs.
     this.registerView(
       STASHPAD_LOG_VIEW_TYPE,

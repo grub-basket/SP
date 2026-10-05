@@ -11954,3 +11954,28 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
    full width and trim the side padding so the presets stay on ONE line. */
 .stashpad-reaction-picker.stashpad-reaction-body .stashpad-reaction-pickgrid { max-width: none; }
 .stashpad-reaction-picker.stashpad-reaction-body .stashpad-reaction-pick { padding: 4px 3px; }
+/* 0.532.2: PDFs drawn page by page (pdf.js canvases), each page pinnable. */
+.stashpad-showcase-pdfpages { display: flex; flex-direction: column; gap: 6px; background: var(--background-modifier-border); }
+.stashpad-showcase-pdfpages.is-loading { min-height: 320px; background: var(--background-primary); }
+.stashpad-showcase-pdfpage { position: relative; width: 100%; background: #fff; line-height: 0; cursor: zoom-in; }
+.stashpad-showcase-pdfcanvas { display: block; width: 100%; height: 100%; }
+.stashpad-showcase-pdfpage-num {
+  position: absolute; right: 6px; bottom: 6px; z-index: 1; pointer-events: none;
+  padding: 1px 6px; border-radius: 999px; line-height: 1.4;
+  font-size: var(--font-ui-smaller); color: #fff; background: rgba(0, 0, 0, 0.55);
+}
+.stashpad-showcase-section.is-pin-picking .stashpad-showcase-pdfpage { cursor: crosshair; outline: 2px dashed var(--interactive-accent); outline-offset: -2px; }
+/* 0.532.5: Find bar + highlights; selectable PDF text layer over pdf.js pages. */
+.stashpad-showcase-find { display: none; align-items: center; gap: 6px; flex: 0 0 auto; padding: 6px 14px; border-bottom: 1px solid var(--background-modifier-border); }
+.stashpad-showcase-find.is-open { display: flex; }
+.stashpad-showcase-find-input { flex: 1 1 auto; max-width: 420px; }
+.stashpad-showcase-find-count { color: var(--text-muted); font-size: var(--font-ui-smaller); min-width: 6em; }
+::highlight(stashpad-find) { background-color: rgba(255, 208, 0, 0.45); }
+::highlight(stashpad-find-current) { background-color: rgba(255, 128, 0, 0.8); }
+.stashpad-showcase-pdfpage.is-find-current { outline: 3px solid rgba(255, 128, 0, 0.8); outline-offset: -3px; }
+.stashpad-showcase-pdfpage .stashpad-showcase-textlayer { z-index: 1; line-height: 1; }
+.stashpad-showcase-pdfpage .stashpad-showcase-pins { z-index: 3; }
+.stashpad-showcase-pdfpage .stashpad-showcase-pdfpage-num { z-index: 4; }
+/* Obsidian makes app chrome unselectable; the page's TEXT should be copyable. */
+.stashpad-showcase-textlayer, .stashpad-showcase-textlayer *,
+.stashpad-showcase-caption, .stashpad-showcase-comment-body { user-select: text; -webkit-user-select: text; }
