@@ -996,6 +996,12 @@ export interface StashpadSettings {
    *  folder opens, note/attachment "open in new tab", reminder clicks,
    *  aggregate/tasks/trash views, deep links. Off by default. */
   newTabsInBackground: boolean;
+  /** 0.535.0: the exception to newTabsInBackground — a folder SWITCH (folder
+   *  switcher, a tab's header folder menu, the folders panel, the search modal's
+   *  folder result, the file-explorer "Open folder in Stashpad") always brings
+   *  the folder's new tab to the front, even with background tabs on. Only
+   *  matters while newTabsInBackground is on. On by default. */
+  folderSwitchTakesFocus: boolean;
   /** 0.199.2: composer/edit textareas auto-close `[[` with `]]` and type-over
    *  an existing closing bracket. On by default. */
   autoPairBrackets: boolean;
@@ -1490,6 +1496,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   autoNavOnMoveIn: false,
   openParentTabOnMoveIn: true,
   newTabsInBackground: false,
+  folderSwitchTakesFocus: true,
   autoPairBrackets: true,
   tabIndentsProse: false,
   lastCaptureFolder: "",
@@ -4956,6 +4963,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.foldersAlwaysNewTab, (v) => { this.plugin.settings.foldersAlwaysNewTab = v; }, ["folder", "new tab", "reveal", "open", "panel"]));
     cats.windowsTabs.push(toggle("New tabs open in the background", "When Stashpad opens something in a new tab — a folder, a note, an attachment, a reminder's task, an aggregate/tasks/trash view — the tab opens WITHOUT stealing focus; you stay where you are and switch when ready. Off by default (new tabs come to the front).",
       () => this.plugin.settings.newTabsInBackground, (v) => { this.plugin.settings.newTabsInBackground = v; }, ["background", "tab", "focus", "steal", "new"]));
+    cats.windowsTabs.push(toggle("Switching folders always brings the tab to the front", "The exception to “New tabs open in the background”: when you switch folders — the folder switcher, the folder menu in a Stashpad tab's header, the folders panel, a folder picked in Search, or the file explorer's “Open folder in Stashpad” — the folder's new tab takes focus, so you land where you chose. Notes, attachments, reminders and other new tabs still open in the background. Only matters while “New tabs open in the background” is on. On by default.",
+      () => this.plugin.settings.folderSwitchTakesFocus, (v) => { this.plugin.settings.folderSwitchTakesFocus = v; }, ["folder", "switch", "switcher", "background", "tab", "focus", "steal", "front", "exception"]));
     cats.composerCopy.push(toggle("Line numbers in the editor", "Show a line-number gutter beside the edit/split editor, and a line count alongside the word and character counts. Desktop only — on a phone the gutter costs width the editor needs more. On by default.",
       () => this.plugin.settings.showEditorLineNumbers, (v) => { this.plugin.settings.showEditorLineNumbers = v; }, ["line", "number", "gutter", "editor", "count"]));
     cats.composerCopy.push(toggle("Auto-pair Markdown syntax", "Brackets, parentheses, quotes (double + single, at word starts only — apostrophes are safe), inline code, **bold**, ~~strikethrough~~ and ==highlight== markers auto-close with the caret between them. Select text first and the character WRAPS it instead of replacing it (press again to nest: [note] → [[note]], *word* → **word**). Typing the closing character steps over an existing one, and Backspace on an empty pair removes both. Applies to the composer and the edit/split textareas. On by default.",

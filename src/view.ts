@@ -18093,7 +18093,10 @@ export class StashpadView extends ItemView {
     });
     ws.setActiveLeaf(leaf, { focus: true });
     ws.revealLeaf(leaf);
-    settleNewTab(ws, originLeaf); // 0.199.0 background-tabs behavior
+    // 0.199.0 background-tabs behavior. 0.535.0: both callers (the header
+    // folder menu + Search's folder result) are folder switches, so the
+    // folderSwitchTakesFocus exception applies.
+    settleNewTab(ws, originLeaf, { folderSwitch: true });
     // When the spawned leaf closes, restore focus to the originating tab.
     returnToOriginOnClose(ws, leaf, originLeaf, (ref) => this.plugin.registerEvent(ref));
   }

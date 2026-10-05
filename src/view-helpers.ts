@@ -4,10 +4,16 @@ import { getSettings } from "./settings";
 /** 0.199.0: "New tabs open in the background" behavior. Call AFTER opening a
  *  new tab, passing the leaf that was active BEFORE `getLeaf("tab")`: when the
  *  setting is on, focus is handed straight back so the new tab loads behind
- *  the user's current place. Returns true when it backgrounded. (settings.ts's
+ *  the user's current place. Returns true when it backgrounded. Pass
+ *  `folderSwitch` from a folder-switch opener so the folderSwitchTakesFocus
+ *  exception can keep that tab in front. (settings.ts's
  *  import of this module is type-only, so there's no runtime import cycle.) */
-export function settleNewTab(ws: Workspace, prev: WorkspaceLeaf | null | undefined): boolean {
-  if (!getSettings().newTabsInBackground) return false;
+export function settleNewTab(ws: Workspace, prev: WorkspaceLeaf | null | undefined, opts: { folderSwitch?: boolean } = {}): boolean {
+  const s = getSettings();
+  if (!s.newTabsInBackground) return false;
+  // 0.535.0: a folder switch is the exception — the folder you just chose
+  // comes to the front ("Switching folders always brings the tab to the front").
+  if (opts.folderSwitch && s.folderSwitchTakesFocus) return false;
   if (prev) ws.setActiveLeaf(prev, { focus: true });
   return true;
 }

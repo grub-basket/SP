@@ -1289,14 +1289,14 @@ export default class StashpadPlugin extends Plugin {
    *  (see resolveNewStashpadTarget), makes the folder if it's new, opens it,
    *  and says where it went when that isn't where it was typed. Returns the
    *  folder opened, or null when refused / not opened. */
-  async createOrRedirectAndOpen(path: string): Promise<string | null> {
+  async createOrRedirectAndOpen(path: string, opts: { folderSwitch?: boolean } = {}): Promise<string | null> {
     const t = await this.resolveNewStashpadTarget(path);
     if (!t.ok) { this.explainNestBlock(t.verdict, { modal: true }); return null; }
     if (t.redirect?.existing === "stashpad") {
-      await this.openFolderInStashpad(t.folder);
+      await this.openFolderInStashpad(t.folder, opts);
     } else {
       if (!(await this.app.vault.adapter.exists(t.folder))) await this.app.vault.createFolder(t.folder);
-      if (!(await this.activateViewForFolder(t.folder))) return null;
+      if (!(await this.activateViewForFolder(t.folder, opts))) return null;
     }
     if (t.redirect) this.notifications.show({ message: t.redirect.message, kind: "info", category: "system", folder: t.folder });
     return t.folder;
@@ -3726,7 +3726,7 @@ export default class StashpadPlugin extends Plugin {
         item
           .setTitle("Open folder in Stashpad")
           .setIcon("layout-list")
-          .onClick(() => void this.openFolderInStashpad(path));
+          .onClick(() => void this.openFolderInStashpad(path, { folderSwitch: true }));
       });
     }));
     // 0.174.0: "Open in Stashpad" on a non-md ATTACHMENT file — jumps to the
@@ -7507,7 +7507,8 @@ export default class StashpadPlugin extends Plugin {
           return;
         }
         if (item.kind === "open" || item.kind === "open-anyway") {
-          await plugin.activateViewForFolder(item.folder);
+          // 0.535.0: a folder-switcher pick always lands you there.
+          await plugin.activateViewForFolder(item.folder, { folderSwitch: true });
           return;
         }
         if (item.kind === "switch-current") {
@@ -7531,7 +7532,7 @@ export default class StashpadPlugin extends Plugin {
             // lets Stashpad's own subfolders through).
             // 0.528.0: createOrRedirectAndOpen does both checks, and sends a
             // name INSIDE a Stashpad / reserved folder to the vault root.
-            await plugin.createOrRedirectAndOpen(properCased);
+            await plugin.createOrRedirectAndOpen(properCased, { folderSwitch: true });
           } catch (e) {
             notify(`Stashpad: couldn't create folder (${(e as Error).message})`);
           }
@@ -7562,7 +7563,7 @@ export default class StashpadPlugin extends Plugin {
                 // 0.522.0: only sweep when the folder actually opened. The open
                 // refuses a folder that holds (or sits in) a Stashpad, and the
                 // sweep would turn an inner Stashpad into notes and archive it.
-                if (!(await plugin.activateViewForFolder(folder))) return;
+                if (!(await plugin.activateViewForFolder(folder, { folderSwitch: true }))) return;
                 // Reconcile with the loose-file importer: sweep existing
                 // top-level files / subfolders / .stash into notes now.
                 await plugin.runImportLooseFiles(folder);
@@ -9970,7 +9971,7 @@ export default class StashpadPlugin extends Plugin {
    *  navigate IT — navigating via `lastActiveStashpadLeaf` right after this
    *  raced the MRU update and could navigate the PREVIOUS tab instead (the
    *  "current tab hijacked into the pinned note + duplicate tab" bug). */
-  async activateViewForFolder(folder: string): Promise<WorkspaceLeaf | null> {
+  async activateViewForFolder(folder: string, opts: { folderSwitch?: boolean } = {}): Promise<WorkspaceLeaf | null> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
     if (!cleaned) return null;
     // 0.522.0: opening a view writes a Home note, which would make the folder a
@@ -9986,7 +9987,9 @@ export default class StashpadPlugin extends Plugin {
       state: { folderOverride: cleaned },
     });
     this.app.workspace.revealLeaf(leaf);
-    settleNewTab(this.app.workspace, prev); // 0.199.0 background-tabs behavior
+    // 0.199.0 background-tabs behavior; 0.535.0: folder switches are exempt
+    // (folderSwitchTakesFocus) so the folder you chose comes to the front.
+    settleNewTab(this.app.workspace, prev, { folderSwitch: opts.folderSwitch });
     // 0.275.3: closing this spawned folder tab returns focus to where it was
     // opened FROM (the aggregate index / calendar / timeline row, a deep link,
     // etc.) instead of falling to the tab on the right. activateViewForFolder is
@@ -10007,13 +10010,13 @@ export default class StashpadPlugin extends Plugin {
    *  already on that folder (reveal it) instead of opening a duplicate, else
    *  opening a fresh tab. Backs the file-explorer "Open folder in Stashpad"
    *  context-menu item. */
-  async openFolderInStashpad(folder: string): Promise<void> {
+  async openFolderInStashpad(folder: string, opts: { folderSwitch?: boolean } = {}): Promise<void> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
     if (!cleaned) return;
     // 0.174.0: "Folders always open in a new tab" — skip the reuse-existing-tab
     // path entirely and open a fresh tab at the home note. Propagates to every
     // caller of this method (folders-panel row click, file-explorer menu, …).
-    if (this.settings.foldersAlwaysNewTab) { this.trace("r1:open", { folder: cleaned, path: "always-new-tab" }); await this.activateViewForFolder(cleaned); return; }
+    if (this.settings.foldersAlwaysNewTab) { this.trace("r1:open", { folder: cleaned, path: "always-new-tab" }); await this.activateViewForFolder(cleaned, opts); return; }
     const existing = await this.findStashpadLeafForFolder(cleaned);
     if (existing) {
       this.trace("r1:open", { folder: cleaned, path: "reveal-existing", deferred: !(existing.view as { noteFolder?: string })?.noteFolder });
@@ -10029,7 +10032,7 @@ export default class StashpadPlugin extends Plugin {
       return;
     }
     this.trace("r1:open", { folder: cleaned, path: "fresh-tab" });
-    await this.activateViewForFolder(cleaned);
+    await this.activateViewForFolder(cleaned, opts);
   }
 
   /** Find an existing Stashpad leaf showing `folder` — INCLUDING deferred

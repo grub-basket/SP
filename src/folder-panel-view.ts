@@ -415,7 +415,7 @@ export class StashpadFolderPanelView extends ItemView {
   private pinnedTabMenu(e: MouseEvent, folder: string, items: PinnedItem[]): void {
     const menu = new Menu();
     menu.addItem((i) => i.setTitle("Open this Stashpad").setIcon("list-tree").onClick(() => { this.setPinnedTab(folder); this.onNavigateAway(); this.jumpToFolder(folder); }));
-    menu.addItem((i) => i.setTitle("Open in a new tab").setIcon("layout-grid").onClick(() => { this.onNavigateAway(); void this.plugin.activateViewForFolder(folder); }));
+    menu.addItem((i) => i.setTitle("Open in a new tab").setIcon("layout-grid").onClick(() => { this.onNavigateAway(); void this.plugin.activateViewForFolder(folder, { folderSwitch: true }); }));
     if (items.some((it) => it.folder === folder && it.kind === "note")) {
       menu.addSeparator();
       menu.addItem((i) => i.setTitle("Unpin all in this folder").setIcon("pin-off").onClick(() => this.confirmUnpinAll(folder, items)));
@@ -1064,7 +1064,7 @@ export class StashpadFolderPanelView extends ItemView {
     newTabBtn.onpointerdown = (e) => {   // 0.302.0: touch-safe (see row handler)
       if (e.button !== 0) return;
       e.preventDefault(); e.stopPropagation();
-      this.onNavigateAway(); void this.plugin.activateViewForFolder(folder);
+      this.onNavigateAway(); void this.plugin.activateViewForFolder(folder, { folderSwitch: true });
     };
     }
 
@@ -1164,7 +1164,7 @@ export class StashpadFolderPanelView extends ItemView {
    *  the local live-view-only check spawned duplicates for backgrounded tabs.) */
   private jumpToFolder(folder: string): void {
     this.plugin.trace("r1:tap", { via: "folder-panel", folder });
-    void this.plugin.openFolderInStashpad(folder);
+    void this.plugin.openFolderInStashpad(folder, { folderSwitch: true });
   }
 
   private revealFolder(folder: string): void {
@@ -1180,7 +1180,7 @@ export class StashpadFolderPanelView extends ItemView {
     const menu = new Menu();
     // Order: non-destructive navigation first, then rename, then delete (isolated).
     menu.addItem((i) => i.setTitle("Open in new tab").setIcon("plus-square")
-      .onClick(() => void this.plugin.activateViewForFolder(folder)));
+      .onClick(() => void this.plugin.activateViewForFolder(folder, { folderSwitch: true })));
     menu.addItem((i) => i.setTitle("Reveal in file explorer").setIcon("folder-search")
       .onClick(() => this.revealFolder(folder)));
     // 0.215.0: hand off to the OS file manager. Desktop only — mobile has no
