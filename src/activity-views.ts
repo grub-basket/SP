@@ -1,4 +1,5 @@
-import { ItemView, WorkspaceLeaf } from "obsidian";
+import { ItemView, WorkspaceLeaf, type Menu } from "obsidian";
+import { addCopyTabLinkItem } from "./tab-link-menu";
 import type StashpadPlugin from "./main";
 import { LogPanel, NotificationHistoryPanel } from "./modals";
 import { STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE } from "./types";
@@ -14,6 +15,11 @@ export class StashpadLogView extends ItemView {
   getViewType(): string { return STASHPAD_LOG_VIEW_TYPE; }
   getDisplayText(): string { return "Stashpad log"; }
   getIcon(): string { return "scroll-text"; }
+
+  onPaneMenu(menu: Menu, source: string): void {
+    super.onPaneMenu(menu, source);
+    addCopyTabLinkItem(menu, this.plugin, this.leaf);
+  }
 
   async onOpen(): Promise<void> {
     this.contentEl.addClass("stashpad-activity-view"); // fill the tab, not the modal box
@@ -46,6 +52,11 @@ export class StashpadNotificationsView extends ItemView {
   getViewType(): string { return STASHPAD_NOTIFICATIONS_VIEW_TYPE; }
   getDisplayText(): string { return "Stashpad notifications"; }
   getIcon(): string { return "bell"; }
+
+  onPaneMenu(menu: Menu, source: string): void {
+    super.onPaneMenu(menu, source);
+    addCopyTabLinkItem(menu, this.plugin, this.leaf);
+  }
 
   async onOpen(): Promise<void> {
     this.contentEl.addClass("stashpad-activity-view"); // fill the tab, not the modal box

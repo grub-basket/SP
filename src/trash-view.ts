@@ -1,4 +1,5 @@
-import { ItemView, WorkspaceLeaf, moment, setIcon } from "obsidian";
+import { ItemView, WorkspaceLeaf, moment, setIcon, type Menu } from "obsidian";
+import { addCopyTabLinkItem } from "./tab-link-menu";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { STASHPAD_TRASH_VIEW_TYPE } from "./types";
@@ -23,6 +24,11 @@ export class StashpadTrashView extends ItemView {
   getViewType(): string { return STASHPAD_TRASH_VIEW_TYPE; }
   getDisplayText(): string { return "Trash"; }
   getIcon(): string { return "trash-2"; }
+
+  onPaneMenu(menu: Menu, source: string): void {
+    super.onPaneMenu(menu, source);
+    addCopyTabLinkItem(menu, this.plugin, this.leaf);
+  }
 
   async onOpen(): Promise<void> {
     this.containerEl.addClass("stashpad-trash-view");

@@ -44,7 +44,7 @@ import { buildOkfBundleFiles, zipBundle, tarGzBundle } from "./okf-export";
 import { formatDateTime } from "./format";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
-import { buildStashpadLink, parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION } from "./deep-link";
+import { buildStashpadLink, parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION, DEEP_LINK_TAB_LABELS, isDeepLinkTab, type DeepLinkTab } from "./deep-link";
 import { LinkLog, type LinkLogEntry, type LinkLogOutcome } from "./link-log";
 import { ROOT_ID, parseAssignees, writeCompletedFm, siftMatch } from "./types";
 import { removeIconSprites } from "./icon-sprite";
@@ -3013,7 +3013,7 @@ export default class StashpadPlugin extends Plugin {
     // the fix is to stop racing: claim the action synchronously, and let the
     // handler itself wait for the plugin to be ready (`drainDeepLinks`).
     this.registerObsidianProtocolHandler(STASHPAD_PROTOCOL_ACTION, (params) => {
-      this.trace("link:recv", { ready: this.deepLinksReady, folder: params.folder, note: params.note, view: (params as { view?: string }).view });
+      this.trace("link:recv", { ready: this.deepLinksReady, folder: params.folder, note: params.note, view: (params as { view?: string }).view, tab: (params as { tab?: string }).tab });
       if (!this.deepLinksReady) { this.pendingDeepLinks.push({ ...params }); this.armDeepLinkWatchdog(); return; }
       void this.handleDeepLink(params);
     });
@@ -4527,6 +4527,18 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-copy-link",
       name: "Copy Stashpad link (deep link / URL) to note",
       callback: () => call("cmdCopyStashpadLink"),
+    });
+    // 0.533.0: the link for the TAB in front — a Showcase level, a board, the
+    // tasks/calendar/… aggregates, trash, log, notifications, or the note list.
+    this.addCommand({
+      id: "stashpad-copy-tab-link",
+      name: "Copy Stashpad link to this tab (Showcase, board, tasks, …)",
+      checkCallback: (checking) => {
+        const leaf = this.app.workspace.getMostRecentLeaf();
+        if (!this.linkForLeaf(leaf)) return false;
+        if (!checking) void this.copyLinkForLeaf(leaf);
+        return true;
+      },
     });
     this.addCommand({
       id: "stashpad-open-link",
@@ -10587,7 +10599,7 @@ export default class StashpadPlugin extends Plugin {
    *  run macro. Any unresolved target is a LOUD failure (Notice), never a silent
    *  no-op. See `docs/deep-links-plan.md`. */
   async handleDeepLink(
-    params: { folder?: string; note?: string; run?: string; action?: string; vault?: string },
+    params: { folder?: string; note?: string; run?: string; action?: string; vault?: string; tab?: string },
     opts: {
       forceNewTab?: boolean; silent?: boolean; queued?: boolean;
       /** false when the CALLER owns the log entry for this link (the clipboard
@@ -10635,6 +10647,15 @@ export default class StashpadPlugin extends Plugin {
         return true;
       }
       catch (e) { return fail(`Stashpad link: couldn't open view “${viewName}”: ${(e as Error).message}`); }
+    }
+
+    // 0.533.0: a tab link (`?tab=showcase&folder=…`) opens one of the non-list
+    // Stashpad tabs. Checked before the folder guard below: most tabs are
+    // vault-wide and carry no folder at all.
+    const tabRaw = (params.tab || "").trim().toLowerCase();
+    if (tabRaw) {
+      if (!isDeepLinkTab(tabRaw)) return fail(`Stashpad link: unknown tab “${tabRaw}”.`);
+      return await this.handleTabLink(tabRaw, folder, noteId, url, opts, fail);
     }
 
     // 1. Guard + resolve. Returns false (not thrown) on a bad link so a batch
@@ -10716,6 +10737,139 @@ export default class StashpadPlugin extends Plugin {
       }
       console.warn(`[stashpad] deep link: unknown action “${token}” — skipped.`);
     }
+    return true;
+  }
+
+  /** 0.533.0: open the tab a `tab=` link names. Same contract as the rest of
+   *  handleDeepLink — a bad target fails LOUDLY (Notice + link log), a good one
+   *  gets a receipt — and the same folder guards where the tab is scoped to a
+   *  folder (it must exist, and the nest guard still applies: a Showcase or
+   *  board on a folder inside another Stashpad would treat it as one). */
+  private async handleTabLink(
+    tab: DeepLinkTab, folder: string, noteId: string, url: string,
+    opts: { silent?: boolean; queued?: boolean; log?: boolean },
+    fail: (msg: string, outcome?: LinkLogOutcome) => boolean,
+  ): Promise<boolean> {
+    const label = DEEP_LINK_TAB_LABELS[tab];
+    const scoped = tab === "showcase" || tab === "board";
+    if (tab === "showcase" && !folder) return fail(`Stashpad link: a ${label} link needs a “folder”.`);
+    await new Promise<void>((resolve) => this.app.workspace.onLayoutReady(() => resolve()));
+    let title: string | null = null;
+    if (scoped && folder) {
+      const dir = this.app.vault.getAbstractFileByPath(folder);
+      if (!(dir instanceof TFolder)) return fail(`Stashpad link: folder “${folder}” not found.`);
+      const nest = await this.checkNewStashpadFolderOnDisk(dir.path);
+      if (!nest.ok) return fail(`Stashpad link: ${nestBlockMessage(nest)}`, "refused");
+    }
+    if (tab === "showcase" && noteId && noteId !== ROOT_ID) {
+      // Same cold-start retry as a note link: the cache may not have parsed
+      // frontmatter yet on a cross-vault jump.
+      let file: TFile | null = null;
+      for (let i = 0; i < 12 && !file; i++) {
+        file = this.resolveNoteFileInFolder(folder, noteId);
+        if (!file) await new Promise((r) => window.setTimeout(r, 150));
+      }
+      if (!file) return fail(`Stashpad link: note “${noteId}” not found in ${folder}.`);
+      title = await deriveCleanTitle(this.app, file).catch(() => null) ?? file.basename;
+    }
+    // Every opener reveals an existing matching tab instead of opening a
+    // second one. A new leaf of the type appearing is how we tell the two
+    // apart, so the log and the receipt say "opened" vs "already open"
+    // truthfully (same distinction as a note link's landing).
+    const viewType = tab === "showcase" ? STASHPAD_SHOWCASE_VIEW_TYPE : tab === "board" ? STASHPAD_KANBAN_VIEW_TYPE
+      : tab === "trash" ? STASHPAD_TRASH_VIEW_TYPE : tab === "log" ? STASHPAD_LOG_VIEW_TYPE
+      : tab === "notifications" ? STASHPAD_NOTIFICATIONS_VIEW_TYPE : STASHPAD_AGGREGATE_VIEW_TYPE;
+    const before = new Set(this.app.workspace.getLeavesOfType(viewType));
+    try {
+      switch (tab) {
+        case "showcase": await openShowcaseView(this, folder, (noteId || ROOT_ID) as StashpadId); break;
+        case "board": await openKanbanView(this, folder || null); break;
+        case "trash": await openTrashView(this); break;
+        case "log": await openStashpadLogView(this); break;
+        case "notifications": await openStashpadNotificationsView(this); break;
+        default: await openAggregateView(this, tab); break;
+      }
+    } catch (e) {
+      return fail(`Stashpad link: couldn't open ${label}: ${(e as Error).message}`);
+    }
+    this.deepLinksServed++;
+    const fresh = this.app.workspace.getLeavesOfType(viewType).some((l) => !before.has(l));
+    const where = scoped && folder ? (title || folder.split("/").pop() || folder) : null;
+    const what = where ? `${label} — ${where}` : label;
+    if (opts.log !== false) void this.recordLink({
+      kind: "received", url, folder, noteId: noteId || null, view: null, title: what, outcome: fresh ? "opened" : "revealed",
+      detail: opts.queued ? "arrived during startup" : undefined,
+    });
+    if (!opts.silent) {
+      this.notifications.show({ message: fresh ? `Opened **${what}** from a link.` : `**${what}** was already open — a link pointed here.`, kind: "success", category: "link", folder: folder || undefined, duration: this.settings.deepLinkReceiptSticky ? 0 : 8000 });
+    }
+    return true;
+  }
+
+  /** 0.533.0: the deep link for whatever a Stashpad tab is showing — the note
+   *  list (focused note / folder), a Showcase level, a board, or one of the
+   *  vault-wide tabs. Read from the leaf's persisted view state, so a deferred
+   *  (not-yet-loaded) tab answers too. Null for anything that isn't ours. */
+  linkForLeaf(leaf: WorkspaceLeaf | null | undefined): { url: string; label: string } | null {
+    if (!leaf) return null;
+    const vs = leaf.getViewState?.();
+    const type = vs?.type;
+    const st = (vs?.state ?? {}) as Record<string, unknown>;
+    const vault = this.app.vault.getName();
+    const str = (v: unknown): string => (typeof v === "string" ? v.replace(/\/+$/, "") : "");
+    const tabLink = (tab: DeepLinkTab, folder?: string, note?: string, where?: string): { url: string; label: string } => ({
+      url: buildStashpadLink({ vault, tab, folder: folder || undefined, note: note || undefined }),
+      label: where ? `${DEEP_LINK_TAB_LABELS[tab]} — ${where}` : DEEP_LINK_TAB_LABELS[tab],
+    });
+    switch (type) {
+      case STASHPAD_VIEW_TYPE: {
+        const v = leaf.view as unknown as { currentPathLink?: () => { url: string; label: string } | null };
+        return typeof v?.currentPathLink === "function" ? v.currentPathLink() : null;
+      }
+      case STASHPAD_SHOWCASE_VIEW_TYPE: {
+        const folder = str(st.folder);
+        if (!folder) return null;
+        const focus = str(st.focusId);
+        const note = focus && focus !== ROOT_ID ? focus : "";
+        const shown = (leaf.view as unknown as { getViewType?: () => string; getDisplayText?: () => string });
+        const text = shown?.getViewType?.() === STASHPAD_SHOWCASE_VIEW_TYPE ? (shown.getDisplayText?.() ?? "").replace(/^Showcase — /, "") : "";
+        return tabLink("showcase", folder, note, text || folder.split("/").pop() || folder);
+      }
+      case STASHPAD_KANBAN_VIEW_TYPE: {
+        const folder = str(st.folder);
+        return tabLink("board", folder, undefined, folder ? (folder.split("/").pop() || folder) : "all notes");
+      }
+      case STASHPAD_AGGREGATE_VIEW_TYPE: {
+        const mode = str(st.mode);
+        return isDeepLinkTab(mode) ? tabLink(mode) : null;
+      }
+      case STASHPAD_TRASH_VIEW_TYPE: return tabLink("trash");
+      case STASHPAD_LOG_VIEW_TYPE: return tabLink("log");
+      case STASHPAD_NOTIFICATIONS_VIEW_TYPE: return tabLink("notifications");
+      default: return null;
+    }
+  }
+
+  /** 0.533.0: copy the deep link for a Stashpad tab (see linkForLeaf) and log
+   *  it as `shared`, like every other copied link. The note list routes through
+   *  its own copier so a note link keeps its title in the log. */
+  async copyLinkForLeaf(leaf: WorkspaceLeaf | null | undefined): Promise<boolean> {
+    if (!leaf) return false;
+    if (leaf.getViewState?.()?.type === STASHPAD_VIEW_TYPE) {
+      const v = leaf.view as unknown as { cmdCopyCrumbLink?: (id: string) => Promise<boolean>; focusId?: string };
+      if (typeof v?.cmdCopyCrumbLink === "function") return await v.cmdCopyCrumbLink(v.focusId ?? ROOT_ID);
+    }
+    const link = this.linkForLeaf(leaf);
+    if (!link) { notify("This tab has nothing to link to yet."); return false; }
+    try {
+      await navigator.clipboard.writeText(link.url);
+    } catch {
+      notify("Couldn't copy the link to the clipboard.");
+      return false;
+    }
+    notify(`Stashpad link copied — ${link.label}.`);
+    const parsed = parseStashpadLink(link.url);
+    void this.recordLink({ kind: "shared", url: link.url, folder: parsed?.folder ?? "", noteId: parsed?.note ?? null, view: null, title: link.label, outcome: "copied" });
     return true;
   }
 
@@ -10821,10 +10975,16 @@ export default class StashpadPlugin extends Plugin {
     const { landing, title } = out;
     const folder = (parsed.folder || "").replace(/^\/+|\/+$/g, "");
     const where = folder.split("/").pop() || folder;
-    const what = parsed.view ? `the saved view **${parsed.view}**` : title ? `**${title}** in **${where}**` : `**${where}**`;
+    // 0.533.0: a tab link names its tab ("All tasks", "Showcase — Brochure"),
+    // and most carry no folder — so `where` alone would print an empty name.
+    const tab = (parsed.tab || "").trim().toLowerCase();
+    const tabTitle = !tab ? null
+      : isDeepLinkTab(tab) ? DEEP_LINK_TAB_LABELS[tab] + ((tab === "showcase" || tab === "board") && where ? ` — ${where}` : "")
+      : `the “${tab}” tab`;
+    const what = parsed.view ? `the saved view **${parsed.view}**` : tabTitle ? `**${tabTitle}**` : title ? `**${title}** in **${where}**` : `**${where}**`;
     const base = {
       kind: "clipboard" as const, url, folder,
-      noteId: parsed.note ?? null, view: parsed.view ?? null, title,
+      noteId: parsed.note ?? null, view: parsed.view ?? null, title: title ?? tabTitle,
     };
     const sticky = this.settings.deepLinkReceiptSticky;
 
@@ -10848,6 +11008,7 @@ export default class StashpadPlugin extends Plugin {
       // the truth.
       const missing = parsed.view ? `the saved view **${parsed.view}**`
         : parsed.note ? `the note it points to (\`${parsed.note}\` in **${where}**)`
+        : tabTitle ? `**${tabTitle}**`
         : `**${where}**`;
       this.notifications.show({
         message: `A Stashpad link is on your clipboard, but ${missing} isn’t in this vault yet.`,
@@ -10910,12 +11071,16 @@ export default class StashpadPlugin extends Plugin {
    *  normalize to the same string, which is what makes "have I already acted on
    *  this link?" answerable by comparison. Keeps the link's OWN vault when it
    *  names one — a cross-vault link isn't the same link as a local one. */
-  private canonicalLinkFor(params: { folder?: string; note?: string; view?: string; run?: string; action?: string; vault?: string }): string {
+  private canonicalLinkFor(params: { folder?: string; note?: string; view?: string; run?: string; action?: string; vault?: string; tab?: string }): string {
+    const tab = (params.tab || "").trim().toLowerCase();
     return buildStashpadLink({
       vault: params.vault || this.app.vault.getName(),
       folder: params.folder,
       note: params.note,
       view: params.view,
+      // An unknown tab still canonicalizes to a stable string (so the log
+      // dedupes it); it's rejected by the handler, never built by us.
+      tab: tab ? (tab as DeepLinkTab) : undefined,
       run: parseRunActions(params),
     });
   }
@@ -11066,9 +11231,16 @@ export default class StashpadPlugin extends Plugin {
       focusId?: string;
     } | null;
     const where = active?.currentPathLink?.() ?? null;
+    // 0.533.0: when the tab in front is a Showcase / board / tasks / … tab,
+    // offer THAT tab's link — it's where the user is, more than the list
+    // they last had focused.
+    const recent = this.app.workspace.getMostRecentLeaf();
+    const tabWhere = recent && recent.getViewState?.()?.type !== STASHPAD_VIEW_TYPE ? this.linkForLeaf(recent) : null;
     // The copy runs through the view's own copier, so it lands in the link log
     // like every other copied link instead of being a silent third route.
-    const current = where && active
+    const current = tabWhere
+      ? { ...tabWhere, noCrumbHint: true, copy: async (): Promise<boolean> => await this.copyLinkForLeaf(recent) }
+      : where && active
       ? { ...where, copy: async (): Promise<boolean> => await active.cmdCopyCrumbLink?.(active.focusId ?? "") ?? false }
       : null;
     new OpenDeepLinkModal(this.app, (raw) => {

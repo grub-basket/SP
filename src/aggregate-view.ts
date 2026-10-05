@@ -1,4 +1,5 @@
 import { ItemView, Menu, Platform, TFile, WorkspaceLeaf, moment, setIcon, type ViewStateResult } from "obsidian";
+import { addCopyTabLinkItem } from "./tab-link-menu";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { perf } from "./perf";
@@ -56,6 +57,11 @@ export class StashpadAggregateView extends ItemView {
   getViewType(): string { return STASHPAD_AGGREGATE_VIEW_TYPE; }
   getDisplayText(): string { return this.mode === "archived" ? "All archived" : this.mode === "tasks" ? "All tasks" : this.mode === "watch" ? "Previously encrypted" : this.mode === "index" ? "All notes" : this.mode === "timeline" ? "Task timeline" : this.mode === "calendar" ? "Due calendar" : this.mode === "heatmap" ? "Activity heatmap" : "All encrypted"; }
   getIcon(): string { return this.mode === "archived" ? "archive" : this.mode === "tasks" ? "square-check-big" : this.mode === "watch" ? "history" : this.mode === "index" ? "table" : this.mode === "timeline" ? "calendar-range" : this.mode === "calendar" ? "calendar" : this.mode === "heatmap" ? "activity" : "lock"; }
+
+  onPaneMenu(menu: Menu, source: string): void {
+    super.onPaneMenu(menu, source);
+    addCopyTabLinkItem(menu, this.plugin, this.leaf);
+  }
 
   getState(): Record<string, unknown> { return { ...super.getState(), mode: this.mode }; }
   async setState(state: AggregateState, result: unknown): Promise<void> {

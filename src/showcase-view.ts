@@ -1,4 +1,5 @@
-import { Component, ItemView, Keymap, MarkdownRenderer, Platform, Scope, TFile, WorkspaceLeaf, loadPdfJs, moment, setIcon, type ViewStateResult } from "obsidian";
+import { Component, ItemView, Keymap, MarkdownRenderer, Platform, Scope, TFile, WorkspaceLeaf, loadPdfJs, moment, setIcon, type Menu, type ViewStateResult } from "obsidian";
+import { addCopyTabLinkItem } from "./tab-link-menu";
 import type StashpadPlugin from "./main";
 import type { StashpadView } from "./view";
 import { ROOT_ID, STASHPAD_SHOWCASE_VIEW_TYPE, attachmentLinkPath, parseAuthorRef, type StashpadId, type TreeNode } from "./types";
@@ -245,6 +246,11 @@ export class StashpadShowcaseView extends ItemView {
     return t ? `Showcase — ${t}` : "Showcase";
   }
   getIcon(): string { return "presentation"; }
+
+  onPaneMenu(menu: Menu, source: string): void {
+    super.onPaneMenu(menu, source);
+    addCopyTabLinkItem(menu, this.plugin, this.leaf);
+  }
 
   getState(): Record<string, unknown> {
     return { ...super.getState(), folder: this.folder, focusId: this.focusId, layout: this.layout, hideResolved: this.hideResolved };
@@ -580,6 +586,12 @@ export class StashpadShowcaseView extends ItemView {
     setIcon(exportBtn.createSpan(), "download");
     exportBtn.createSpan({ text: "Export" });
     exportBtn.onclick = () => new ShowcaseExportModal(this.app, (o) => void this.runExport(o.includeFeedback)).open();
+
+    // 0.533.0: a deep link straight to this page — paste it in chat/email and
+    // the reviewer lands on the same Showcase level.
+    const linkBtn = bar.createEl("button", { cls: "stashpad-showcase-btn clickable-icon", attr: { "aria-label": "Copy a Stashpad link to this page" } });
+    setIcon(linkBtn, "link");
+    linkBtn.onclick = () => { void this.plugin.copyLinkForLeaf(this.leaf); };
 
     const listBtn = bar.createEl("button", { cls: "stashpad-showcase-btn clickable-icon", attr: { "aria-label": "Show this level in the list" } });
     setIcon(listBtn, "list-tree");

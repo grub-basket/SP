@@ -1,4 +1,5 @@
 import { notify } from "./notify";
+import { addCopyTabLinkItem } from "./tab-link-menu";
 import {
   App, ItemView, Keymap, MarkdownRenderer, Menu, Modal, Notice, Platform,
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce, type Debouncer,
@@ -1005,6 +1006,14 @@ export class StashpadView extends ItemView {
     // via setIcon, which only understands Lucide ids — an invalid id renders
     // nothing, so the picker shows a live preview to guard against that.
     return this.plugin.getFolderIcon(this.noteFolder) ?? "list-tree";
+  }
+
+  /** 0.533.0: "Copy Stashpad link" on the tab's ⋯ menu — the link to where
+   *  this list is (the focused note, or the folder at the top), same as every
+   *  other Stashpad tab offers. */
+  onPaneMenu(menu: Menu, source: string): void {
+    super.onPaneMenu(menu, source);
+    addCopyTabLinkItem(menu, this.plugin, this.leaf);
   }
 
   async onOpen(): Promise<void> {

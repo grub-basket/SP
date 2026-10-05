@@ -1,4 +1,5 @@
-import { ItemView, WorkspaceLeaf, setIcon, type ViewStateResult } from "obsidian";
+import { ItemView, WorkspaceLeaf, setIcon, type Menu, type ViewStateResult } from "obsidian";
+import { addCopyTabLinkItem } from "./tab-link-menu";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { STASHPAD_KANBAN_VIEW_TYPE, type StashpadId, fmAddTag, fmRemoveTag, writeCompletedFm } from "./types";
@@ -54,6 +55,11 @@ export class StashpadKanbanView extends ItemView {
     return this.folder ? `Board — ${this.folder.split("/").pop() || this.folder}` : "Board — all notes";
   }
   getIcon(): string { return "columns-3"; }
+
+  onPaneMenu(menu: Menu, source: string): void {
+    super.onPaneMenu(menu, source);
+    addCopyTabLinkItem(menu, this.plugin, this.leaf);
+  }
 
   getState(): Record<string, unknown> {
     return { ...super.getState(), folder: this.folder, groupBy: this.groupBy, showNone: this.showNone };

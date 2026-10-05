@@ -2766,7 +2766,7 @@ export class OpenDeepLinkModal extends Modal {
     /** 0.483.0: where the user currently IS, when a Stashpad view is open —
      *  so the modal answers both halves of the question it raises. Null when
      *  no view is open, in which case the copy row simply isn't rendered. */
-    private currentTarget?: { url: string; label: string; copy: () => Promise<boolean> } | null,
+    private currentTarget?: { url: string; label: string; copy: () => Promise<boolean>; noCrumbHint?: boolean } | null,
   ) { super(app); }
   onOpen(): void {
     this.contentEl.empty();
@@ -2847,7 +2847,9 @@ export class OpenDeepLinkModal extends Modal {
           }, 2000);
         });
       };
-      copyRow.createDiv({
+      // 0.533.0: only the note list has breadcrumbs — a Showcase / board /
+      // tasks tab link gets no pointer to something that isn't on screen.
+      if (!target.noCrumbHint) copyRow.createDiv({
         cls: "stashpad-open-link-copyhint",
         text: "Right-click any breadcrumb for a link to that level of the path instead.",
       });
