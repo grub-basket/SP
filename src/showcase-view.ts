@@ -187,6 +187,8 @@ export class StashpadShowcaseView extends ItemView {
   private drafts = new Map<string, Draft>();
   /** Section whose composer is waiting for a click on an image to place a pin. */
   private pinPicking: string | null = null;
+  /** The "click the spot" hint from a 📍 click, so a repeat click replaces it. */
+  private pinHint: { hide(): void } | null = null;
   /** Obscured (blurred) sections the user revealed in this tab, by id. */
   private revealed = new Set<string>();
   private renderTimer: number | null = null;
@@ -688,6 +690,14 @@ export class StashpadShowcaseView extends ItemView {
     const open = head.createEl("button", { cls: "clickable-icon", attr: { "aria-label": `Open ${a.file.name} in the preview` } });
     setIcon(open, "maximize-2");
     open.onclick = () => this.openViewer(s, i);
+    // 0.534.0: pin straight from the file — no dropdown step. (A PDF that ends
+    // up in the plain viewer drops this button again; see renderPdfPages.)
+    const extLower = a.file.extension.toLowerCase();
+    if (isImageExt(extLower) || extLower === "pdf") {
+      const pin = head.createEl("button", { cls: "clickable-icon stashpad-showcase-att-pin", attr: { "aria-label": `Pin a comment to a spot on ${a.file.name}` } });
+      setIcon(pin, "map-pin");
+      pin.onclick = () => this.startPinOn(s, a);
+    }
 
     const media = card.createDiv({ cls: "stashpad-showcase-media" });
     const ext = a.file.extension.toLowerCase();
@@ -767,6 +777,11 @@ export class StashpadShowcaseView extends ItemView {
     // Back to the viewer (no pins). Drop any page pin layers already made so
     // "Pin a spot" isn't offered over a viewer that can't take the click.
     const fallback = (): void => {
+      media.closest(".stashpad-showcase-att")?.querySelector(".stashpad-showcase-att-pin")?.remove();
+      // If the user was mid-pin on this PDF, the viewer can't take the click:
+      // end the picking so the section isn't stuck in it.
+      const dr = this.drafts.get(s.node.id);
+      if (this.pinPicking === s.node.id && dr?.target === file.path) { dr.target = ""; dr.pin = null; this.setPinPicking(null); }
       void doc?.destroy?.(); doc = null;
       wrap.remove();
       for (const k of [...c.pinHosts.keys()]) if (k.startsWith(file.path + "#")) c.pinHosts.delete(k);
@@ -1234,11 +1249,13 @@ export class StashpadShowcaseView extends ItemView {
       }
       select.onchange = () => { d.target = select.value; d.pin = null; this.setPinPicking(null); c.asideSig = ""; this.scheduleRender(0); };
       const targetAtt = s.atts.find((a) => a.file.path === d.target);
-      if (targetAtt && this.pinnable(c, targetAtt)) {
+      // 0.534.0: offered whenever the page has something pinnable — with
+      // "Whole section" selected, the click on an image/page picks the file.
+      if (targetAtt ? this.pinnable(c, targetAtt) : s.atts.some((x) => this.pinnable(c, x))) {
         const pinBtn = row.createEl("button", { cls: "stashpad-showcase-pinbtn" + (d.pin ? " is-set" : "") + (this.pinPicking === s.node.id ? " is-picking" : "") });
         setIcon(pinBtn.createSpan(), "map-pin");
         const pinned = d.pin ? parseFeedbackPin(d.pin) : null;
-        pinBtn.createSpan({ text: pinned ? (pinned.page ? `Pinned on p. ${pinned.page}` : "Pinned") : (this.pinPicking === s.node.id ? "Click the spot…" : "Pin a spot") });
+        pinBtn.createSpan({ text: pinned ? (pinned.page ? `Pinned on p. ${pinned.page}` : "Pinned") : (this.pinPicking === s.node.id ? (targetAtt ? "Click the spot…" : "Click an image or page…") : "Pin a spot") });
         pinBtn.title = d.pin ? "Click to remove the pin" : "Then click the exact spot on the image or page";
         pinBtn.onclick = () => {
           if (d.pin) { d.pin = null; this.setPinPicking(null); c.asideSig = ""; this.scheduleRender(0); return; }
@@ -1585,6 +1602,19 @@ export class StashpadShowcaseView extends ItemView {
   }
 
   // ---------------------------------------------------------------- pins
+
+  /** 📍 on a file card: aim the comment at that file and wait for the click.
+   *  Clicking the same button again while picking cancels. */
+  private startPinOn(s: SectionData, a: Attachment): void {
+    const d = this.draftFor(s.node.id);
+    this.pinHint?.hide(); this.pinHint = null; // one hint at a time
+    if (this.pinPicking === s.node.id && d.target === a.file.path && !d.pin) { this.setPinPicking(null); return; }
+    d.target = a.file.path;
+    d.pin = null;
+    d.replyTo = null;
+    this.setPinPicking(s.node.id);
+    this.pinHint = notify(`Click the spot on ${a.file.name} to pin your comment. Esc cancels.`, 4000);
+  }
 
   private setPinPicking(sectionId: string | null): void {
     this.pinPicking = sectionId;

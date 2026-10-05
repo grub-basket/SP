@@ -11979,3 +11979,5 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 /* Obsidian makes app chrome unselectable; the page's TEXT should be copyable. */
 .stashpad-showcase-textlayer, .stashpad-showcase-textlayer *,
 .stashpad-showcase-caption, .stashpad-showcase-comment-body { user-select: text; -webkit-user-select: text; }
+/* 0.534.0: 📍 on each image/PDF card; lit while that section is picking a spot. */
+.stashpad-showcase-section.is-pin-picking .stashpad-showcase-att-pin { color: var(--interactive-accent); }
