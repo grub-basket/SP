@@ -12,6 +12,7 @@ const ENTRIES = [
   "scripts/tests/md-tables.test.ts",
   "scripts/tests/suggest-match.test.ts",
   "scripts/tests/excel-paste.test.ts",
+  "scripts/tests/deep-link-markdown.test.ts",
 ];
 
 let passed = 0;

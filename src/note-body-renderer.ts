@@ -1,6 +1,7 @@
 import { App, Component, MarkdownRenderer, TFile } from "obsidian";
 import { perf } from "./perf";
 import { takeLeadingColor } from "./highlight-colors";
+import { protectDeepLinks, restoreDeepLinks } from "./deep-link-markdown";
 import type { RenderCacheLike } from "./render-cache-store";
 
 /** A cached per-file body render. `html` is the rendered MarkdownRenderer
@@ -20,6 +21,19 @@ export interface RenderEntry {
    *  (pre-0.473.2 code blocks collapsed to ~0 height and read as "fits")
    *  outlived the fix. A memo whose `ovX` isn't OV_MEMO_VERSION is re-measured. */
   ovX?: number;
+  /** 0.542.0: DEEP_LINK_RENDER_VERSION this was rendered under. A cached body
+   *  that contains `obsidian://` without it predates the deep-link fix (links cut
+   *  at `_`/`*`, `&note` shown as `¬e`) and is re-rendered on next view. */
+  dlX?: number;
+}
+
+/** Bump when the deep-link render rules change (see `dlX`). Only renders whose
+ *  text contains `obsidian://` are invalidated, not the whole cache. */
+export const DEEP_LINK_RENDER_VERSION = 1;
+
+function isFreshEntry(e: RenderEntry | undefined, mtime: number): e is RenderEntry {
+  if (!e || e.mtime !== mtime) return false;
+  return e.dlX === DEEP_LINK_RENDER_VERSION || !e.text?.includes("obsidian://");
 }
 
 /** Bump when the clamp CSS / overflow rules change, to re-measure every
@@ -82,7 +96,7 @@ export class NoteBodyRenderer {
     // (peekCache, the view's pre-paint peeks) just see a miss until then.
     if (this.renderCache.ready) await this.renderCache.ready;
     const cached = this.renderCache.get(file.path);
-    if (cached && cached.mtime === file.stat.mtime) { perf.record("render.row.cacheHit", 0); return cached; }
+    if (isFreshEntry(cached, file.stat.mtime)) { perf.record("render.row.cacheHit", 0); return cached; }
     // Cache miss / stale entry. Read + parse + render into a detached div
     // and stash the result before returning. 0.81.1: split the body READ
     // (network I/O on a share) from the markdown RENDER (CPU) so the
@@ -91,11 +105,9 @@ export class NoteBodyRenderer {
     const raw = this.host.stripFrontmatter(md);
     const { text, attachments } = this.splitAttachments(raw);
     const detached = createDiv({ cls: "stashpad-note-text" });
-    await perf.timeAsync("render.row.markdown", () => MarkdownRenderer.render(this.host.app, text, detached, file.path, this.component));
-    this.colorizeHighlights(detached);
-    this.autolinkDeepLinks(detached);
+    await perf.timeAsync("render.row.markdown", () => this.renderMarkdown(text, detached, file.path));
     const html = detached.innerHTML;
-    const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html };
+    const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html, dlX: DEEP_LINK_RENDER_VERSION };
     this.renderCache.set(file.path, entry);
     return entry;
   }
@@ -113,14 +125,24 @@ export class NoteBodyRenderer {
     try {
       const { text, attachments } = this.splitAttachments(this.host.stripFrontmatter(rawBody));
       const detached = createDiv({ cls: "stashpad-note-text" });
-      await MarkdownRenderer.render(this.host.app, text, detached, file.path, this.component);
-      this.colorizeHighlights(detached);
-      this.autolinkDeepLinks(detached);
-      const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html: detached.innerHTML };
+      await this.renderMarkdown(text, detached, file.path);
+      const entry: RenderEntry = { mtime: file.stat.mtime, text, attachments, html: detached.innerHTML, dlX: DEEP_LINK_RENDER_VERSION };
       this.renderCache.set(file.path, entry);
     } catch (e) {
       console.warn("[Stashpad] primeRender failed", e);
     }
+  }
+
+  /** MarkdownRenderer + the body post-passes, shared by the read and prime
+   *  paths so both produce the same html. 0.542.0: bare deep links are swapped
+   *  for inert tokens around the markdown pass so emphasis and `&not` can't
+   *  split or mangle them (see deep-link-markdown.ts). */
+  private async renderMarkdown(text: string, el: HTMLElement, sourcePath: string): Promise<void> {
+    const { md, links } = protectDeepLinks(text);
+    await MarkdownRenderer.render(this.host.app, md, el, sourcePath, this.component);
+    restoreDeepLinks(el, links);
+    this.colorizeHighlights(el);
+    this.autolinkDeepLinks(el);
   }
 
   /** 0.331.0: autolink BARE `obsidian://…` URLs in the rendered body. Obsidian's
@@ -294,8 +316,7 @@ export class NoteBodyRenderer {
   }
 
   hasFreshRenderCache(file: TFile): boolean {
-    const c = this.renderCache.get(file.path);
-    return !!c && c.mtime === file.stat.mtime;
+    return isFreshEntry(this.renderCache.get(file.path), file.stat.mtime);
   }
 
   /** 0.180.0: the cached render entry REGARDLESS of mtime (may be stale). Used to
