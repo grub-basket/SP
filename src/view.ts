@@ -2058,6 +2058,7 @@ export class StashpadView extends ItemView {
     // never usefully run — the rows are about to be detached.
     if (this.clampRaf !== null) { cancelAnimationFrame(this.clampRaf); this.clampRaf = null; }
     this.clampBatch = [];
+    if (this.clampWidthTimer !== null) { window.clearTimeout(this.clampWidthTimer); this.clampWidthTimer = null; }
     this.barOverflowRO?.disconnect();
     this.barOverflowRO = null;
     this.composerNarrowObserver?.disconnect();
@@ -5335,6 +5336,15 @@ export class StashpadView extends ItemView {
       const targetList = this.listEl;
       let settleTop = targetList.scrollTop;
       const ro = new ResizeObserver(() => {
+        // 0.540.3: a WIDTH change re-decides each row's clamp + Show more once
+        // the resize settles (height-only changes — the common case — skip it).
+        if (targetList.clientWidth !== this.lastListWidth) {
+          if (this.clampWidthTimer !== null) window.clearTimeout(this.clampWidthTimer);
+          this.clampWidthTimer = window.setTimeout(() => {
+            this.clampWidthTimer = null;
+            this.remeasureClampsForWidth();
+          }, 150);
+        }
         // 0.76.27: during a mobile keyboard show/hide the list resizes;
         // don't touch scrollTop then, or the list visibly jumps on
         // every composer tap. Let the browser's reflow settle.
@@ -8957,6 +8967,46 @@ export class StashpadView extends ItemView {
     expanded: boolean;
   }[] = [];
   private clampRaf: number | null = null;
+  /** 0.540.3: debounce for remeasureClampsForWidth (see the list ResizeObserver). */
+  private clampWidthTimer: number | null = null;
+
+  /** 0.540.3: re-decide every on-screen row's clamp + Show more after the list
+   *  changes WIDTH. The overflow decision is made once, when a row's body is
+   *  drawn, so resizing used to leave it stale: widen and a note that fit stayed
+   *  fully open with no collapse button; narrow and a note that now fits kept a
+   *  Show more that did nothing. The 0.540.0 narrow switch made it much worse —
+   *  crossing 700px moves the buttons out of the text's way, changing the text
+   *  width by ~300px at once. Expanded rows are skipped: they always carry a
+   *  collapse toggle and don't depend on width. Re-clamping then going through
+   *  the normal batched measure keeps this to one layout pass for all rows. */
+  private remeasureClampsForWidth(): void {
+    const list = this.listEl;
+    if (!list?.isConnected) return;
+    const w = list.clientWidth;
+    if (!w || w === this.lastListWidth) return;
+    this.lastListWidth = w;
+    for (const row of Array.from(list.querySelectorAll<HTMLElement>(".stashpad-note[data-id]"))) {
+      const node = this.tree.get(row.dataset.id as StashpadId);
+      if (!node?.file || this.isNoteExpanded(node.id)) continue;
+      const container = row.querySelector<HTMLElement>(".stashpad-note-body-content");
+      const textEl = container?.querySelector<HTMLElement>(":scope > .stashpad-note-text");
+      const actions = row.querySelector<HTMLElement>(".stashpad-note-actions");
+      const entry = this.bodyRenderer.peekCache(node.file);
+      // A row still showing its lazy placeholder has nothing measured yet; its
+      // real render measures at the new width on its own.
+      if (!container || !textEl || !actions || !entry) continue;
+      textEl.addClass("is-clamped");
+      const opts = { clamp: true, toggleHost: actions, toggleAnchor: this.rowToggleAnchor(actions) };
+      this.queueClampMeasure({ opts, container, node, textEl, entry, memoW: w, expanded: false });
+    }
+  }
+
+  /** Where a list row's Show more toggle goes inside its action cluster. */
+  private rowToggleAnchor(actions: HTMLElement): HTMLElement | undefined {
+    return (Platform.isMobile
+      ? actions.querySelector<HTMLElement>(".stashpad-note-more")
+      : actions.querySelector<HTMLElement>(".stashpad-pencil")) ?? undefined;
+  }
 
   /** 0.295.2 (perf): queue one row's clamp measurement into the shared batch. */
   private queueClampMeasure(item: StashpadView["clampBatch"][number]): void {
@@ -9007,6 +9057,11 @@ export class StashpadView extends ItemView {
         if (!overflowing) {
           // Short note that fits — drop the clamp so the fade gradient doesn't apply.
           b.textEl.removeClass("is-clamped");
+          // 0.540.3: a width re-measure (remeasureClampsForWidth) can find a note
+          // that USED to overflow now fits — drop its leftover Show more, which
+          // would otherwise sit there doing nothing. No-op on a first render.
+          b.opts.toggleHost?.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());
+          b.container.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());
           return;
         }
         this.attachExpandToggle(b.opts, b.container, b.node, b.expanded);
@@ -23051,9 +23106,7 @@ export class StashpadView extends ItemView {
     const bodyContent = row.querySelector<HTMLElement>(".stashpad-note-body-content");
     const actions = row.querySelector<HTMLElement>(".stashpad-note-actions");
     if (!bodyContent || !actions) return false;
-    const toggleAnchor = (Platform.isMobile
-      ? actions.querySelector<HTMLElement>(".stashpad-note-more")
-      : actions.querySelector<HTMLElement>(".stashpad-pencil")) ?? undefined;
+    const toggleAnchor = this.rowToggleAnchor(actions);
     // immediate: true → renderNoteBodyNow, which reads fresh content (the cache
     // was evicted just above in onFileModify) and only swaps the DOM once ready.
     this.renderNoteBody(bodyContent, node, { clamp: true, toggleHost: actions, toggleAnchor, immediate: true });
