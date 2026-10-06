@@ -855,6 +855,30 @@ export default class StashpadPlugin extends Plugin {
    *  wikilink rewrites Obsidian does when slug-renames move files — never
    *  bump `modified` (or add the local user as a contributor). */
   rebootstrapInProgress = false;
+  /** 0.537.1: ONE "lots of files are changing" notice for every Stashpad tab.
+   *  Each view detects its own file-event burst, so with several tabs open
+   *  (background tabs and pop-outs included) a single sync burst used to
+   *  stack one identical notice per tab. Views now hold/release this shared
+   *  notice; it stays up while any view is paused and lingers briefly after
+   *  the last release so back-to-back bursts don't flicker it off and on. */
+  private syncBurstHolders = new Set<object>();
+  private syncBurstNotice: Notice | null = null;
+  private syncBurstHideTimer: number | null = null;
+  holdSyncBurstNotice(holder: object): void {
+    this.syncBurstHolders.add(holder);
+    if (this.syncBurstHideTimer !== null) { window.clearTimeout(this.syncBurstHideTimer); this.syncBurstHideTimer = null; }
+    if (!this.syncBurstNotice) this.syncBurstNotice = new Notice("Stashpad: lots of files are changing — list updates paused until it settles…", 0);
+  }
+  releaseSyncBurstNotice(holder: object): void {
+    if (!this.syncBurstHolders.delete(holder) || this.syncBurstHolders.size > 0) return;
+    if (this.syncBurstHideTimer !== null) window.clearTimeout(this.syncBurstHideTimer);
+    this.syncBurstHideTimer = window.setTimeout(() => {
+      this.syncBurstHideTimer = null;
+      if (this.syncBurstHolders.size > 0) return;
+      this.syncBurstNotice?.hide();
+      this.syncBurstNotice = null;
+    }, 1500);
+  }
   /** 0.112.0: paths of `.stashenc` blobs written via the adapter THIS session
    *  that the vault's in-memory index may not have picked up yet. Backs the fast
    *  encryption-state check so the removal guard never has to do a full recursive
@@ -1012,6 +1036,10 @@ export default class StashpadPlugin extends Plugin {
   }
 
   async onunload(): Promise<void> {
+    // 0.537.1: the shared sync-burst notice is persistent (duration 0).
+    if (this.syncBurstHideTimer !== null) { window.clearTimeout(this.syncBurstHideTimer); this.syncBurstHideTimer = null; }
+    this.syncBurstNotice?.hide();
+    this.syncBurstNotice = null;
     // 0.528.2: cancel a pending (or stop a running) numeric-id quoting sweep.
     this.numericIdSweepCancelled = true;
     if (this.numericIdSweepTimer !== null) { window.clearTimeout(this.numericIdSweepTimer); this.numericIdSweepTimer = null; }

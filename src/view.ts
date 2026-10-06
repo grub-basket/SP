@@ -636,6 +636,10 @@ export class StashpadView extends ItemView {
    *  full list rebuild + re-render. Cleared implicitly by the count changing
    *  (a note added or removed), so a genuinely stale tree still reconciles. */
   private reconcileUnresolvableAt: number | null = null;
+  /** 0.537.0: set while healTreeAfterIndex waits for Obsidian's first index of
+   *  this folder — the only window where an empty list may say "still reading".
+   *  vaultIndexing() alone also flickers true after every ordinary save. */
+  private awaitingIndex = false;
   /** Set once the duplicate-id warning has been surfaced, so it never nags. */
   private reportedDuplicateIds = false;
   /** 0.76.27: timestamp until which the listResizeObserver ignores
@@ -1406,6 +1410,7 @@ export class StashpadView extends ItemView {
       })();
     }, 0);
     this.tree.rebuild(this.noteFolder);
+    this.healTreeAfterIndex(); // 0.537.0: slow-drive safety net
     // Subscribe the persistent "updating recovery metadata…" notice
     // to the fmSync queue's activity events. Done BEFORE the backfill
     // schedules anything so its events are caught from the first
@@ -1696,7 +1701,6 @@ export class StashpadView extends ItemView {
   private syncBurstTimes: number[] = [];
   private autoSyncDeferActive = false;
   private autoSyncSettleTimer: number | null = null;
-  private autoSyncNotice: Notice | null = null;
 
   /** Record an external file event; returns true when the render should be
    *  deferred (a burst is in progress). Resets the settle timer on every
@@ -1718,7 +1722,8 @@ export class StashpadView extends ItemView {
       // open. Claiming Sync sent people looking at their Sync settings for a
       // problem that wasn't there. Describe the observation, not a guess at the
       // cause.
-      this.autoSyncNotice = new Notice("Stashpad: lots of files are changing — list updates paused until it settles…", 0);
+      // 0.537.1: one shared notice across all tabs (see holdSyncBurstNotice).
+      this.plugin.holdSyncBurstNotice(this);
     }
     if (!this.autoSyncDeferActive) return false;
     if (this.autoSyncSettleTimer != null) window.clearTimeout(this.autoSyncSettleTimer);
@@ -1730,9 +1735,56 @@ export class StashpadView extends ItemView {
     this.autoSyncSettleTimer = null;
     this.autoSyncDeferActive = false;
     this.syncBurstTimes = [];
-    this.autoSyncNotice?.hide();
-    this.autoSyncNotice = null;
+    this.plugin.releaseSyncBurstNotice(this);
     this.forceReconcileRender();
+  }
+
+  /** Stashpad notes on disk under `folder` (markdown with a frontmatter id),
+   *  over the same file set TreeIndex.rebuild walks — see the reconcile below
+   *  for why reserved subfolders and id-less files are excluded. */
+  private countNotesOnDisk(folder: string): number {
+    const files = folder ? collectMarkdown(this.app, folder) : this.app.vault.getMarkdownFiles();
+    let onDisk = 0;
+    for (const f of files) {
+      const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      if (typeof id === "string" && id) onDisk++;
+    }
+    return onDisk;
+  }
+
+  /** 0.537.0: one guaranteed tree check once Obsidian has finished indexing.
+   *  On a slow network drive the view can mount before the metadata cache has
+   *  read the folder, so the first rebuild comes up empty. The `changed` /
+   *  `resolved` heals usually fill it in, but scheduleTreeReconcile DROPS a
+   *  check that lands in a bulk / sync-burst window, and the reported symptom
+   *  ("folder loads empty until I reload") is what a lost heal looks like.
+   *  This waits for the index, then rebuilds if the tree is missing notes —
+   *  retrying while a bulk window is open instead of dropping. Only the
+   *  tree-BEHIND direction rebuilds: tree-ahead is the just-created-note grace
+   *  case the normal reconcile already handles. */
+  private healTreeAfterIndex(): void {
+    const folder = this.noteFolder;
+    let tries = 0;
+    this.awaitingIndex = true;
+    const check = (): void => {
+      if (!this.viewRoot?.isConnected || this.noteFolder !== folder) return;
+      this.awaitingIndex = false;
+      // Hidden: owe a full rebuild + render for when it's shown (the flush
+      // rebuilds before painting, which also clears a stale loading line).
+      if (this.isHiddenLeaf()) { this.pendingVisibleRender = true; return; }
+      if (this.bulkRenderDepth > 0 || this.bulkSettleTimer != null || this.autoSyncDeferActive
+          || this.plugin.rebootstrapInProgress || this.plugin.okfRebuildingFolders.has(folder)) {
+        if (++tries <= 20) window.setTimeout(check, 1500);
+        return;
+      }
+      const onDisk = this.countNotesOnDisk(folder);
+      const before = this.tree.fileBackedCount();
+      const showingLoading = !!this.listEl?.querySelector(".stashpad-empty-loading");
+      this.plugin.trace("reconcile:index-ready", { folder, onDisk, tree: before, showingLoading });
+      if (onDisk > before) this.tree.rebuild(folder);
+      if (this.tree.fileBackedCount() !== before || showingLoading) this.debouncedRender();
+    };
+    this.plugin.whenVaultIndexed(check);
   }
 
   /** Public: a one-shot rebuild + render. Used by the plugin after rebootstrap
@@ -1790,12 +1842,7 @@ export class StashpadView extends ItemView {
       // to-do toggle and completed toggle. Measured on the user's device:
       // onDisk 417 vs tree 368 — 49 archived notes — firing before every
       // single reported jump.
-      const files = folder ? collectMarkdown(this.app, folder) : this.app.vault.getMarkdownFiles();
-      let onDisk = 0;
-      for (const f of files) {
-        const id = this.app.metadataCache.getFileCache(f)?.frontmatter?.id;
-        if (typeof id === "string" && id) onDisk++;
-      }
+      const onDisk = this.countNotesOnDisk(folder);
       const treeCount = this.tree.fileBackedCount();
       if (onDisk === treeCount) return; // in sync — no-op
       // 0.290.0 (perf): reconcile GRACE WINDOW. Right after a create, the tree
@@ -2019,8 +2066,7 @@ export class StashpadView extends ItemView {
     this.headingStuckCleanup = null;
     if (this.treeReconcileTimer != null) { window.clearTimeout(this.treeReconcileTimer); this.treeReconcileTimer = null; }
     if (this.autoSyncSettleTimer != null) { window.clearTimeout(this.autoSyncSettleTimer); this.autoSyncSettleTimer = null; }
-    this.autoSyncNotice?.hide();
-    this.autoSyncNotice = null;
+    this.plugin.releaseSyncBurstNotice(this);
     this.composerAutocomplete?.detach();
     this.composerAutocomplete = null;
     for (const d of this.slugDebouncers.values()) d.cancel();
@@ -2074,6 +2120,15 @@ export class StashpadView extends ItemView {
       // view (tag filter, calendar/rolling mode).
       tagFilter: this.tagFilter,
       colorFilter: this.colorFilter,
+      // 0.537.2: day / author / imported-only used to live ONLY in the
+      // per-folder chip cache, which a reload skips (workspace state carries
+      // tagFilter) — so they silently vanished on restart but came back on the
+      // next fresh open of the folder. Persisting them here makes them stick
+      // everywhere until cleared; the filtered-empty state says when they hide
+      // every note.
+      dateFilter: this.dateFilter,
+      authorFilter: this.authorFilter,
+      importedOnly: this.importedOnly,
       timeFilterCalendar: this.timeFilterCalendar,
       tinyMode: this.tinyMode,
       tinyAlwaysOnTop: this.tinyAlwaysOnTop,
@@ -2093,6 +2148,9 @@ export class StashpadView extends ItemView {
       folderOverride?: string | null;
       tagFilter?: string | null;
       colorFilter?: string | null;
+      dateFilter?: number | null;
+      authorFilter?: string | null;
+      importedOnly?: boolean;
       timeFilterCalendar?: boolean;
       tinyMode?: boolean;
       tinyAlwaysOnTop?: boolean;
@@ -2116,6 +2174,11 @@ export class StashpadView extends ItemView {
       }
       if ("tagFilter" in s) this.tagFilter = s.tagFilter ?? null;
       if ("colorFilter" in s) this.colorFilter = s.colorFilter ?? null;
+      // 0.537.2: validated like applyChipSnapshot. Absent keys (state saved
+      // by an older build, a saved view, a deep link) leave the value alone.
+      if ("dateFilter" in s) this.dateFilter = typeof s.dateFilter === "number" && Number.isFinite(s.dateFilter) ? s.dateFilter : null;
+      if ("authorFilter" in s) this.authorFilter = typeof s.authorFilter === "string" ? s.authorFilter : null;
+      if ("importedOnly" in s) this.importedOnly = s.importedOnly === true;
       // 0.335.0: a FRESH folder open carries a folderOverride but NO serialized
       // filters (activateViewForFolder sets only { folderOverride }). A reload,
       // saved view, or deep link always includes tagFilter (getState /
@@ -2157,6 +2220,7 @@ export class StashpadView extends ItemView {
       this.loadConfig();
       await this.bootstrapFolder();
       this.tree.rebuild(this.noteFolder);
+      this.healTreeAfterIndex(); // 0.537.0
       this.backfillFrontmatterSync();
       this.defaultCursorToLast();
       // CRITICAL: reset stale composerDraft/cache and reload drafts for the new folder.
@@ -2343,6 +2407,7 @@ export class StashpadView extends ItemView {
       if (!/already exists/i.test(msg)) console.warn("[Stashpad] bootstrapFolder failed:", e);
     }
     this.tree.rebuild(this.noteFolder);
+    this.healTreeAfterIndex(); // 0.537.0
     this.backfillFrontmatterSync();
     // Integrity sweep is owned by the plugin (runs once at startup), not
     // per-view. Mounting / switching Stashpad tabs no longer triggers it —
@@ -3699,7 +3764,15 @@ export class StashpadView extends ItemView {
       // Stashpad with nothing in it means the user has just arrived and has no
       // idea what to do — that one earns a real zero-state. Same branch used to
       // serve both, which is why first-run guidance was a single sentence.
-      if (focused.id === ROOT_ID) this.renderRootZeroState(list);
+      // 0.537.0: two more "empty"s that are NOT empty. Filters can hide every
+      // note (a day filter brought back from the folder's saved chips), and on
+      // a slow network drive the view can paint before Obsidian has read the
+      // folder. Both used to land on the zero-state — "This Stashpad is empty"
+      // plus a button that seeds demo notes into the real folder.
+      const hidden = this.countFilteredOut(focused.id);
+      if (hidden > 0) this.renderFilteredEmptyState(list, hidden);
+      else if (this.awaitingIndex && this.plugin.vaultIndexing()) list.createDiv({ cls: "stashpad-empty stashpad-empty-loading", text: "Still reading notes from disk…" });
+      else if (focused.id === ROOT_ID) this.renderRootZeroState(list);
       else list.createDiv({ cls: "stashpad-empty", text: "No notes here yet. Type below to add one." });
     } else if (manual && lockItems.length > 0) {
       // Build the full sibling sequence (unlocked notes + locked placeholders),
@@ -17669,6 +17742,68 @@ export class StashpadView extends ItemView {
    *  Says what this pane is, what the composer does, and offers the two ways
    *  out (example content, or the welcome walkthrough). Only rendered at the
    *  root — see the call site for why. */
+  /** 0.537.0: how many notes the active filters hide at `focusId` — 0 when
+   *  the level is genuinely empty. Hide-childless prunes inside
+   *  collectViewItems, so it's counted against the raw children. */
+  private countFilteredOut(focusId: StashpadId): number {
+    const unfiltered = this.collapseVersions(this.collectViewItems(focusId)).length;
+    if (unfiltered > 0) return unfiltered;
+    return this.currentHideChildless() ? this.tree.getChildren(focusId).length : 0;
+  }
+
+  /** 0.537.0: names of the filters currently narrowing this list, for the
+   *  filtered-empty state. The filter bar can be hidden (compact mode on
+   *  desktop), so this is often the only place the user sees them. */
+  private activeFilterLabels(): string[] {
+    const out: string[] = [];
+    if (this.dateFilter !== null) out.push(`Day: ${(moment as any)(this.dateFilter).format("D MMM YYYY")}`);
+    if (this.timeFilterCount > 0) out.push(this.timeFilterLongLabel());
+    if (this.tagFilter === TAG_FILTER_TAGGED) out.push("Tagged only");
+    else if (this.tagFilter === TAG_FILTER_UNTAGGED) out.push("Untagged only");
+    else if (this.tagFilter) out.push(`Tag: #${this.tagFilter.replace(/^#/, "")}`);
+    if (this.colorFilter) out.push(`Colour: ${this.colorFilter}`);
+    if (this.authorFilter) out.push("By author");
+    if (this.importedOnly) out.push("Imported only");
+    if (this.currentHideCompleted()) out.push("Hide completed");
+    if (this.currentHideChildless()) out.push("Hide notes without children");
+    if (this.currentAttachmentsOnly()) out.push("Attachments only");
+    if (this.findText && this.findText.trim()) out.push(`Find: “${this.findText.trim()}”`);
+    return out;
+  }
+
+  /** 0.537.0: the list is empty only because filters hide every note. Say so,
+   *  name the filters, and offer one button that clears them (find excepted —
+   *  its own bar is on screen and the user is mid-query). */
+  private renderFilteredEmptyState(list: HTMLElement, hidden: number): void {
+    // 0.537.2: a card, deliberately unlike both the quiet "No notes here yet"
+    // line and the first-run zero-state, so "filtered out" never reads as
+    // "empty". Filters are listed as chips.
+    const box = list.createDiv({ cls: "stashpad-empty-filtered" });
+    const icon = box.createDiv({ cls: "stashpad-empty-filtered-icon" });
+    setIcon(icon, "filter");
+    box.createDiv({ cls: "stashpad-empty-filtered-title", text: `${hidden} note${hidden === 1 ? " is" : "s are"} hidden by filters` });
+    box.createDiv({ cls: "stashpad-empty-filtered-body", text: "This folder isn't empty — the filters below are hiding everything here." });
+    const labels = this.activeFilterLabels();
+    if (labels.length) {
+      const chips = box.createDiv({ cls: "stashpad-empty-filtered-reasons" });
+      for (const l of labels) chips.createSpan({ cls: "stashpad-empty-filtered-chip", text: l });
+    }
+    const clearable = this.dateFilter !== null || this.timeFilterCount > 0 || !!this.tagFilter
+      || !!this.colorFilter || !!this.authorFilter || this.importedOnly
+      || this.currentHideCompleted() || this.currentHideChildless() || this.currentAttachmentsOnly();
+    if (!clearable) return;
+    const btn = box.createEl("button", { text: "Clear all filters", cls: "mod-cta" });
+    btn.addEventListener("click", () => {
+      void (async () => {
+        btn.disabled = true;
+        if (this.currentHideCompleted()) await this.setHideCompleted(false);
+        if (this.currentHideChildless()) await this.setHideChildless(false);
+        if (this.currentAttachmentsOnly()) await this.setAttachmentsOnly(false);
+        this.resetFilters(); // chips + render + "Filters cleared." notice
+      })();
+    });
+  }
+
   private renderRootZeroState(list: HTMLElement): void {
     const zero = list.createDiv({ cls: "stashpad-zerostate" });
     zero.createDiv({ cls: "stashpad-zerostate-title", text: "This Stashpad is empty" });

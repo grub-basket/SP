@@ -11981,3 +11981,38 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-showcase-caption, .stashpad-showcase-comment-body { user-select: text; -webkit-user-select: text; }
 /* 0.534.0: 📍 on each image/PDF card; lit while that section is picking a spot. */
 .stashpad-showcase-section.is-pin-picking .stashpad-showcase-att-pin { color: var(--interactive-accent); }
+
+/* 0.537.0 / 0.537.2: the list is empty only because filters hide every note.
+   A bordered card in the accent colour so it can't be mistaken for the quiet
+   "No notes here yet" line or the first-run zero-state. */
+.stashpad-empty-filtered {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 460px;
+  margin: 32px auto;
+  padding: 24px 20px;
+  text-align: center;
+  border: 2px solid var(--interactive-accent);
+  border-radius: 12px;
+  background: hsla(var(--interactive-accent-hsl), 0.08);
+}
+.stashpad-empty-filtered-icon { color: var(--interactive-accent); }
+.stashpad-empty-filtered-icon svg { width: 32px; height: 32px; }
+.stashpad-empty-filtered-title {
+  font-size: calc(var(--font-ui-large) * 1.15);
+  font-weight: var(--font-bold);
+  color: var(--text-normal);
+}
+.stashpad-empty-filtered-body { font-size: var(--font-ui-small); color: var(--text-muted); line-height: 1.5; }
+.stashpad-empty-filtered-reasons { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+.stashpad-empty-filtered-chip {
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-semibold);
+  padding: 2px 10px;
+  border-radius: 999px;
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+}
+.stashpad-empty-filtered button { margin-top: 4px; }
