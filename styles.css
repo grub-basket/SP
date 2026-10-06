@@ -2362,6 +2362,107 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   gap: 4px;
   align-items: flex-start;
 }
+
+/* 0.540.0: desktop rows — long notes flow UNDER the action buttons.
+   The row drops its right-hand actions column; body + buttons share one
+   wrapper (.stashpad-note-main, see the row build in view.ts) and the buttons
+   float top-right inside it. Once a note's lines get past the button cluster
+   they use the full width instead of staying squeezed beside an empty column.
+   Same button size, same row padding — only the wasted strip goes away.
+
+   Collapsed notes look the same as before: the 2-line clamp is its own
+   formatting context, so it sits beside the float as a whole, and the button
+   cluster is taller than one line anyway. The gain is on expanded notes. */
+.stashpad-note.is-wrap-actions { grid-template-columns: auto 1fr; }
+.stashpad-note.is-wrap-actions.is-task { grid-template-columns: auto auto 1fr; }
+.stashpad-note-main { min-width: 0; }
+.stashpad-note.is-wrap-actions .stashpad-note-main > .stashpad-note-actions {
+  float: right;
+  margin: 0 0 4px 10px;
+  /* Above the body's own overlays (the obscure-solid cover is an absolutely
+     positioned ::after on the body, whose box runs under the float). */
+  position: relative;
+  z-index: 2;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* An expanded note's scroll window has to contain the float, or the text box
+   becomes its own formatting context and is squeezed beside the buttons for
+   its full height again. So the cap moves from the text up to the wrapper
+   (buttons scroll with the note, the same as its first line does). */
+.stashpad-note.is-wrap-actions .stashpad-note-body-content.is-body-expanded .stashpad-note-text {
+  max-height: none;
+  overflow-y: visible;
+}
+.stashpad-note.is-wrap-actions .stashpad-note-main:has(> .stashpad-note-body > .stashpad-note-body-content.is-body-expanded) {
+  max-height: calc(var(--font-text-size, 16px) * 1.5 * 16);
+  overflow-y: auto;
+}
+/* 0.540.1: every hidden (obscured, not yet revealed) list note gets the SAME
+   fixed height — two text lines — whatever its length. Showing a hidden note at
+   full size was pointless (nothing in it is readable) and leaked how long it is;
+   an expanded hidden note was a huge blank bar. Plain CSS, so the virtualized
+   list just measures a steadier row; revealing restores the natural height the
+   same way Show more changes it. overflow-clip-margin keeps the blur's
+   text-shadow from being sliced at the edges. The Show more toggle would do
+   nothing here, so it's hidden until the note is revealed. */
+/* Not in compact mode: those rows are already a uniform 32px with the body
+   centered, and a 48px body would shove the single line up and clip it. */
+.stashpad-view:not(.is-compact) .stashpad-note.is-obscured:not(.is-text-revealed) .stashpad-note-body {
+  height: calc(var(--font-text-size, 16px) * 1.5 * 2);
+  overflow: clip;
+  overflow-clip-margin: 8px;
+}
+.stashpad-note.is-obscured:not(.is-text-revealed) .stashpad-expand-toggle {
+  display: none;
+}
+/* A solid-covered note has no text to wrap, and its cover bar (inset: 0 on the
+   body) would otherwise run behind the floated buttons. Put the buttons back
+   in their own column for that case — floats are ignored in a grid. */
+.stashpad-view.obscure-solid .stashpad-note.is-wrap-actions.is-obscured:not(.is-text-revealed) .stashpad-note-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 10px;
+  align-items: start;
+}
+.stashpad-view.obscure-solid .stashpad-note.is-wrap-actions.is-obscured:not(.is-text-revealed) .stashpad-note-main > .stashpad-note-actions {
+  grid-column: 2;
+  grid-row: 1;
+  margin: 0;
+}
+.stashpad-view.obscure-solid .stashpad-note.is-wrap-actions.is-obscured:not(.is-text-revealed) .stashpad-note-main > .stashpad-note-body {
+  grid-column: 1;
+  grid-row: 1;
+}
+/* Narrow list: the buttons leave the text alone entirely and appear on hover,
+   as a small toolbar over the row's top-right corner. The container is the
+   view's .stashpad-scroll-host (container-type: inline-size). Only with a
+   real hover pointer — a touchscreen laptop keeps the wrap layout above, since
+   hover-only buttons would be unreachable there. */
+@media (hover: hover) {
+@container (max-width: 700px) {
+  .stashpad-note.is-wrap-actions .stashpad-note-main > .stashpad-note-actions {
+    float: none;
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    z-index: 3;
+    margin: 0;
+    padding: 2px;
+    background: var(--background-primary);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 8px;
+    box-shadow: var(--shadow-s);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.08s ease;
+  }
+  .stashpad-note.is-wrap-actions:is(:hover, :focus-within) .stashpad-note-main > .stashpad-note-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+}
 .stashpad-pencil {
   background: transparent;
   border: 1px solid var(--background-modifier-border);

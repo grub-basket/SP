@@ -8683,7 +8683,21 @@ export class StashpadView extends ItemView {
       }
     }
 
-    const body = row.createDiv({ cls: "stashpad-note-body" });
+    // 0.540.0: on desktop the body and the action buttons share one wrapper
+    // (`.stashpad-note-main`) instead of being two grid columns. The buttons
+    // float top-right inside it, so a long note's lines flow under them once
+    // they get past the button cluster rather than staying squeezed into the
+    // column beside it for the note's whole height. The buttons are a SIBLING
+    // of the body, not inside it, so the body-wide effects (obscure blur and
+    // cover, completed fade, pick/drag states) never reach them. A narrow list
+    // switches to hover-only buttons over the corner instead (CSS container
+    // query, see styles.css). Mobile keeps its own grid layout untouched.
+    const main = Platform.isMobile ? row : row.createDiv({ cls: "stashpad-note-main" });
+    if (!Platform.isMobile) row.addClass("is-wrap-actions");
+    // Created before the body so the float precedes the text it wraps; filled
+    // further down once the body exists (the Show More toggle needs both).
+    const actionsEl = Platform.isMobile ? null : main.createDiv({ cls: "stashpad-note-actions" });
+    const body = main.createDiv({ cls: "stashpad-note-body" });
     // In Flat / Everything mode show a small clickable breadcrumb above
     // the body — the chain of ancestors between the current focus and
     // this note's parent. Gives "where does this row live in the tree"
@@ -8702,7 +8716,7 @@ export class StashpadView extends ItemView {
     // Build the actions cluster first so we can pass it (and the pencil)
     // to renderNoteBody as the host/anchor for the Show More toggle —
     // the toggle then lands beside the pencil instead of below the body.
-    const actions = row.createDiv({ cls: "stashpad-note-actions" });
+    const actions = actionsEl ?? row.createDiv({ cls: "stashpad-note-actions" });
     let toggleAnchor: HTMLElement;
     if (Platform.isMobile) {
       // 0.87.1: ONE button on mobile — it opens the context menu, which already
