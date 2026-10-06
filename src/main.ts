@@ -140,6 +140,10 @@ export default class StashpadPlugin extends Plugin {
    *  handler in onload — so minting never scans the vault per call, and stays
    *  correct as notes sync in from other devices. */
   private usedNoteIds: Set<string> | null = null;
+  /** 0.539.0: the empty tab whose "Open Stashpad" button was clicked, so the
+   *  view opens IN that tab (as "Create new note" does) instead of beside it.
+   *  Read once via claimEmptyTabTarget(). */
+  private emptyTabTarget: WorkspaceLeaf | null = null;
   /** 0.108.2: in-memory debug trace ring buffer. Populated by trace() only
    *  when settings.debugTrace is on; copied out from the Diagnostics tab.
    *  Purely local — no network, no file writes. Capped so a long session
@@ -3870,6 +3874,35 @@ export default class StashpadPlugin extends Plugin {
     ribbon.addEventListener("contextmenu", (evt) => {
       evt.preventDefault();
       this.openFolderPicker();
+    });
+
+    // 0.539.0: Obsidian's New tab screen lists "Create new note", "Go to
+    // file", … and nothing for Stashpad. Add an "Open Stashpad" row there,
+    // running the same entry point as the ribbon. Obsidian has no API for
+    // this list and rebuilds it whenever an empty tab opens, so re-check on
+    // layout / active-leaf changes and add the row only where it's missing.
+    const addEmptyTabAction = (): void => {
+      for (const leaf of this.app.workspace.getLeavesOfType("empty")) {
+        const list = leaf.view.containerEl.querySelector(".empty-state-action-list");
+        if (!list || list.querySelector(".stashpad-empty-tab-action")) continue;
+        // Created through the list so it belongs to that window's document
+        // (an empty tab can live in a pop-out window).
+        const row = list.createDiv({ cls: "empty-state-action tappable stashpad-empty-tab-action", text: "Open Stashpad" });
+        row.addEventListener("click", () => {
+          this.emptyTabTarget = leaf;
+          openStashpadEntryPoint();
+        });
+        // Above "Close", like the other open/create actions.
+        list.insertBefore(row, list.querySelector(".mod-close"));
+      }
+    };
+    this.app.workspace.onLayoutReady(addEmptyTabAction);
+    this.registerEvent(this.app.workspace.on("layout-change", addEmptyTabAction));
+    this.registerEvent(this.app.workspace.on("active-leaf-change", addEmptyTabAction));
+    this.register(() => {
+      for (const leaf of this.app.workspace.getLeavesOfType("empty")) {
+        leaf.view.containerEl.querySelector(".stashpad-empty-tab-action")?.remove();
+      }
     });
 
     // 0.68.1: ribbon icon for the sidebar panels view — installed by
@@ -7685,7 +7718,10 @@ export default class StashpadPlugin extends Plugin {
         if (item.kind === "blocked") { plugin.explainNestBlock(item.verdict, { modal: true }); return; }
         if (item.kind === "pinned") { await plugin.revealNoteInStashpad(item.file); return; }
         if (item.kind === "reveal") {
+          // 0.539.0: picked from the New tab screen — don't leave it behind.
+          const emptyTab = plugin.claimEmptyTabTarget();
           plugin.app.workspace.revealLeaf(item.leaf);
+          emptyTab?.detach();
           return;
         }
         if (item.kind === "open" || item.kind === "open-anyway") {
@@ -10146,10 +10182,23 @@ export default class StashpadPlugin extends Plugin {
     if (count > 0) this.notifications.show({ message: `Archived (encrypted) ${count} note${count === 1 ? "" : "s"} moved into “${cleaned.split("/").pop()}”.`, kind: "success", category: "system", folder: cleaned, actions: [{ label: "All archived", onClick: () => void openAggregateView(this, "archived") }] });
   }
 
+  /** 0.539.0: take the New-tab-screen target, if it's still usable. One-shot,
+   *  and only while that tab is still empty AND still the active tab — so a
+   *  folder picker the user cancelled can't make some later, unrelated open
+   *  land in a tab they've since walked away from. */
+  private claimEmptyTabTarget(): WorkspaceLeaf | null {
+    const leaf = this.emptyTabTarget;
+    this.emptyTabTarget = null;
+    if (!leaf || leaf.view?.getViewType() !== "empty") return null;
+    if (this.app.workspace.activeLeaf !== leaf) return null;
+    return leaf;
+  }
+
   /** Open a fresh Stashpad tab focused on a specific folder via the
    *  per-leaf folderOverride mechanism. Used by the Authorship settings
    *  section's "folders you've contributed to" list. */
-  /** Open `folder` in a NEW Stashpad tab. Returns the leaf so callers can
+  /** Open `folder` in a NEW Stashpad tab — or, from the New tab screen, in
+   *  that empty tab. Returns the leaf so callers can
    *  navigate IT — navigating via `lastActiveStashpadLeaf` right after this
    *  raced the MRU update and could navigate the PREVIOUS tab instead (the
    *  "current tab hijacked into the pinned note + duplicate tab" bug). */
@@ -10162,13 +10211,17 @@ export default class StashpadPlugin extends Plugin {
     const nest = await this.checkNewStashpadFolderOnDisk(cleaned);
     if (!nest.ok) { this.explainNestBlock(nest); return null; }
     const prev = this.app.workspace.activeLeaf;
-    const leaf = this.app.workspace.getLeaf("tab");
+    // 0.539.0: opened from the New tab screen → fill that tab, not a new one.
+    const emptyTab = this.claimEmptyTabTarget();
+    const leaf = emptyTab ?? this.app.workspace.getLeaf("tab");
     await leaf.setViewState({
       type: STASHPAD_VIEW_TYPE,
       active: true,
       state: { folderOverride: cleaned },
     });
     this.app.workspace.revealLeaf(leaf);
+    // The user's own tab, already in front: nothing to background or return to.
+    if (emptyTab) return leaf;
     // 0.199.0 background-tabs behavior; 0.535.0: folder switches are exempt
     // (folderSwitchTakesFocus) so the folder you chose comes to the front.
     settleNewTab(this.app.workspace, prev, { folderSwitch: opts.folderSwitch });
@@ -10202,8 +10255,12 @@ export default class StashpadPlugin extends Plugin {
     const existing = await this.findStashpadLeafForFolder(cleaned);
     if (existing) {
       this.trace("r1:open", { folder: cleaned, path: "reveal-existing", deferred: !(existing.view as { noteFolder?: string })?.noteFolder });
+      // 0.539.0: asked for from the New tab screen, but the folder is already
+      // open — go there and close the empty tab rather than leave it behind.
+      const emptyTab = this.claimEmptyTabTarget();
       this.app.workspace.revealLeaf(existing);
       this.app.workspace.setActiveLeaf(existing, { focus: true });
+      emptyTab?.detach();
       // 0.302.0: unify with the folder switcher — landing on a folder always
       // shows the newest notes, whether it opens a new tab or reveals an
       // existing one. Without this, revealing an existing tab kept its stale
