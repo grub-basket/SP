@@ -3985,6 +3985,17 @@ export default class StashpadPlugin extends Plugin {
         });
       },
     });
+    // 0.538.0: same report as the empty page's "Copy diagnostic report" button,
+    // for when the list is wrong but not completely empty.
+    this.addCommand({
+      id: "stashpad-copy-empty-folder-report",
+      name: "Diagnostics: copy missing / empty folder report",
+      callback: () => {
+        const view = getActiveView();
+        if (!view) { notify("Open the Stashpad folder that looks wrong first, then run this."); return; }
+        void view.copyEmptyFolderReport();
+      },
+    });
     this.addCommand({
       id: "stashpad-welcome",
       name: "Getting started (welcome / setup)",

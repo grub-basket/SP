@@ -3,7 +3,7 @@ import { addCopyTabLinkItem } from "./tab-link-menu";
 import {
   App, ItemView, Keymap, MarkdownRenderer, Menu, Modal, Notice, Platform,
   Scope, SuggestModal, TFile, TFolder, WorkspaceLeaf, debounce, type Debouncer,
-  moment, sanitizeHTMLToDom, setIcon,
+  moment, sanitizeHTMLToDom, setIcon, apiVersion,
 } from "obsidian";
 import {
   ROOT_ID, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, RESERVED_FRONTMATTER, fmHasTag, fmAddTag, fmRemoveTag, parseAssignees, parseAuthorRef, attachmentLinkPath, toAttachmentLink,
@@ -17806,6 +17806,22 @@ export class StashpadView extends ItemView {
 
   private renderRootZeroState(list: HTMLElement): void {
     const zero = list.createDiv({ cls: "stashpad-zerostate" });
+    // 0.538.1: the folder may NOT be empty on disk — notes still loading from a
+    // slow drive, or markdown files without a Stashpad id. Say so instead of
+    // greeting a first-time user, and drop "Load example content", which seeds
+    // demo notes on the premise that the folder really is empty.
+    const onDisk = this.noteFolder ? collectMarkdown(this.app, this.noteFolder).length : 0;
+    const unloaded = Math.max(0, onDisk - this.tree.fileBackedCount());
+    if (unloaded > 0) {
+      zero.addClass("is-unloaded");
+      zero.createDiv({ cls: "stashpad-zerostate-title", text: "No notes are showing" });
+      zero.createDiv({
+        cls: "stashpad-zerostate-body",
+        text: `This folder has ${unloaded} markdown file${unloaded === 1 ? "" : "s"} that ${unloaded === 1 ? "isn't" : "aren't"} showing as notes. ${unloaded === 1 ? "It" : "They"} may still be loading from a slow drive, or may not be Stashpad notes. Copy a diagnostic report before reloading so the cause can be found.`,
+      });
+      this.renderZeroStateTrouble(zero, false);
+      return;
+    }
     zero.createDiv({ cls: "stashpad-zerostate-title", text: "This Stashpad is empty" });
     zero.createDiv({
       cls: "stashpad-zerostate-body",
@@ -17821,8 +17837,9 @@ export class StashpadView extends ItemView {
     const demoBtn = actions.createEl("button", { text: "Load example content", cls: "mod-cta" });
     // Seed into THIS folder, not a new one. The command-palette version creates a
     // separate "Stashpad demo" so it can't mix examples into someone's real
-    // notes — but that reasoning doesn't apply here: this folder is provably
-    // empty (it's why the zero-state is on screen), and jumping the user to a
+    // notes — but that reasoning doesn't apply here: this folder is empty on
+    // disk too (0.538.1: the unloaded-files branch above returns before this
+    // button exists), and jumping the user to a
     // different folder after they clicked a button labelled "load example
     // content" would be a surprise.
     demoBtn.addEventListener("click", () => {
@@ -17841,6 +17858,79 @@ export class StashpadView extends ItemView {
     });
     const helpBtn = actions.createEl("button", { text: "Getting started" });
     helpBtn.addEventListener("click", () => this.plugin.showWelcome());
+
+    this.renderZeroStateTrouble(zero, true);
+  }
+
+  /** 0.538.0: this screen is also what a folder looks like when its notes
+   *  failed to load (the network-drive "loads empty, reload fixes it" report).
+   *  Give that person a way to capture the state BEFORE they reload it away.
+   *  `withHeading` false = the unloaded-files variant, whose own title already
+   *  asks the question. */
+  private renderZeroStateTrouble(zero: HTMLElement, withHeading: boolean): void {
+    const trouble = zero.createDiv({ cls: "stashpad-zerostate-trouble" });
+    if (withHeading) {
+      trouble.createDiv({ cls: "stashpad-zerostate-trouble-title", text: "Expected notes here?" });
+      trouble.createDiv({
+        cls: "stashpad-zerostate-trouble-body",
+        text: "If this folder shouldn't be empty and no filters are on, copy a diagnostic report before reloading, then paste it to the developer.",
+      });
+    }
+    trouble.createDiv({
+      cls: "stashpad-zerostate-trouble-body",
+      text: "The report holds counts, settings and recent errors — no note contents, though error lines can include file names.",
+    });
+    const reportBtn = trouble.createEl("button", { text: "Copy diagnostic report" });
+    if (!withHeading) reportBtn.addClass("mod-cta"); // the only action on that page
+    reportBtn.addEventListener("click", () => { void this.copyEmptyFolderReport(); });
+  }
+
+  /** 0.538.0: plain-text snapshot for "this folder loaded empty". Answers the
+   *  one question that matters — where did the notes drop out? —
+   *  files on disk → parsed by Obsidian → in the tree → shown — plus the index
+   *  and filter state that explain each gap, and the recent errors / trace.
+   *  No note titles or bodies of its own; captured-error lines can carry file
+   *  paths (which are slugs of note text), and the button's copy says so. */
+  async buildEmptyFolderReport(): Promise<string> {
+    const folder = this.noteFolder;
+    const files = folder ? collectMarkdown(this.app, folder) : this.app.vault.getMarkdownFiles();
+    let parsed = 0, withId = 0;
+    for (const f of files) {
+      const fc = this.app.metadataCache.getFileCache(f);
+      if (fc) parsed++;
+      const id = fc?.frontmatter?.id;
+      if ((typeof id === "string" && id) || typeof id === "number") withId++;
+    }
+    const mc = this.app.metadataCache as unknown as { initialized?: boolean; isCacheClean?: () => boolean };
+    const os = Platform.isMobileApp ? (Platform.isIosApp ? "iOS" : "Android") : "desktop";
+    const filters = this.activeFilterLabels();
+    const lines = [
+      "Stashpad empty-folder report",
+      `Time: ${new Date().toISOString()}`,
+      `Stashpad ${this.plugin.manifest.version} · Obsidian ${apiVersion} · ${os}`,
+      `Folder: ${folder || "(vault root)"} · focus: ${this.focusId === ROOT_ID ? "Home" : this.focusId} · view: ${this.currentViewMode()}`,
+      `Folder exists: ${!!this.app.vault.getAbstractFileByPath(folder)}`,
+      `Markdown files on disk: ${files.length}`,
+      `Read by Obsidian: ${parsed} · with a Stashpad id: ${withId}`,
+      `Notes in Stashpad's tree: ${this.tree.fileBackedCount()} · children here: ${this.tree.getChildren(this.focusId).length} · shown: ${this.currentChildren.length}`,
+      `Obsidian index: initialized=${mc.initialized ?? "?"} · clean=${typeof mc.isCacheClean === "function" ? mc.isCacheClean() : "?"} · waiting for first index: ${this.awaitingIndex}`,
+      `Filters: ${filters.length ? filters.join(" · ") : "none"}`,
+      `Paused for file burst: ${this.autoSyncDeferActive} · bulk render: ${this.bulkRenderDepth > 0} · rebootstrap: ${this.plugin.rebootstrapInProgress}`,
+    ];
+    const errors = await this.plugin.getCapturedErrors();
+    lines.push("", errors ? errors.split("\n").slice(-40).join("\n") : "Captured errors: none");
+    const trace = this.plugin.getDebugTrace();
+    lines.push("", trace
+      ? `Debug trace (last 60 lines):\n${trace.split("\n").slice(-60).join("\n")}`
+      : "Debug trace: off (turn on Settings → Stashpad → Diagnostics → Debug trace to capture more next time)");
+    return lines.join("\n");
+  }
+
+  async copyEmptyFolderReport(): Promise<void> {
+    const report = await this.buildEmptyFolderReport();
+    this.plugin.trace("empty-folder-report", { folder: this.noteFolder });
+    if (await writeClipboardText(report)) notify("Diagnostic report copied — paste it into a message to the developer.", 6000);
+    else notify("Couldn't write to the clipboard.", 6000);
   }
 
   // --- Bootstrap ---
@@ -18499,6 +18589,9 @@ export class StashpadView extends ItemView {
         attachmentsOnly: this.currentAttachmentsOnly(),
         importedOnly: this.importedOnly,
         author: this.authorFilter ?? null,
+        // 0.538.1: both narrow the list too, and were missing here.
+        day: this.dateFilter !== null ? (moment as any)(this.dateFilter).format("YYYY-MM-DD") : null,
+        find: this.findText?.trim() || null,
       },
       mdFilesUnderFolder: onDisk,
       treeChildrenOfFocus: focused ? this.tree.getChildren(this.focusId).length : null,
