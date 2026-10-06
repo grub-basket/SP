@@ -1015,6 +1015,10 @@ export default class StashpadPlugin extends Plugin {
     // 0.528.2: cancel a pending (or stop a running) numeric-id quoting sweep.
     this.numericIdSweepCancelled = true;
     if (this.numericIdSweepTimer !== null) { window.clearTimeout(this.numericIdSweepTimer); this.numericIdSweepTimer = null; }
+    // 0.536.0: drop a pending update-notice recheck (held while Sync was busy).
+    if (this.buildRecheckTimer !== null) { window.clearTimeout(this.buildRecheckTimer); this.buildRecheckTimer = null; }
+    // 0.536.1: stop waiting to reload (the Reload click that was waiting on Sync).
+    this.syncReloadWait?.cancel();
     // 0.296.0: row-icon sprites live on each window's <body>; sweep them.
     try {
       const docs = new Set<Document>([document]);
@@ -5534,8 +5538,20 @@ export default class StashpadPlugin extends Plugin {
       // announce a build that actually settled.
       if (this.pendingBuildVersion !== onDisk) {
         this.pendingBuildVersion = onDisk;
+        this.resetBuildNoticeDefer();
         return;
       }
+      // 0.536.0: hold the notice while Obsidian Sync is still mid-sync. A build
+      // usually arrives as three files (main.js, manifest.json, styles.css) and
+      // Sync can land the manifest before the others, so "Reload app" offered
+      // mid-sync could load a half-arrived build. Wait until Sync has been idle
+      // for two consecutive checks, but never longer than BUILD_NOTICE_MAX_DEFER_MS,
+      // so a stuck or endlessly busy Sync can't swallow the notice for good.
+      if (this.shouldDeferBuildNoticeForSync()) {
+        this.scheduleBuildRecheck();
+        return;
+      }
+      this.resetBuildNoticeDefer();
       this.notifiedBuildVersion = onDisk;
       this.notifications.show({
         // 0.214.1: say what is actually known. checkForSyncedBuild only compares
@@ -5550,12 +5566,139 @@ export default class StashpadPlugin extends Plugin {
         duration: 0,
         actions: [{
           label: "Reload app",
-          onClick: () => this.reloadAppForUpdate(),
+          onClick: () => this.reloadAppForUpdateWhenSynced(),
         }],
       });
     } catch (e) {
       console.debug("[Stashpad] synced-build check failed", e);
     }
+  }
+
+  /** 0.536.0: state for holding the update notice while Obsidian Sync works. */
+  private buildNoticeDeferredSince: number | null = null;
+  private buildRecheckTimer: number | null = null;
+  /** When Sync was first seen idle in the current run of idle checks. Sync goes
+   *  briefly idle between batches, so idle must hold for BUILD_RECHECK_MS. */
+  private syncIdleSince: number | null = null;
+  private static readonly BUILD_RECHECK_MS = 5_000;
+  private static readonly BUILD_NOTICE_MAX_DEFER_MS = 10 * 60_000;
+
+  /** Obsidian Sync's status, or null when the core plugin is off or absent.
+   *  getStatus() is internal API: "uninitialized" | "disconnected" | "error" |
+   *  "paused" | "syncing" | "synced". Anything unexpected reads as null so a
+   *  future Obsidian change can only make the notice show sooner, never hide it. */
+  private obsidianSyncStatus(): string | null {
+    try {
+      const sync = (this.app as unknown as {
+        internalPlugins?: { plugins?: Record<string, { enabled?: boolean; instance?: { getStatus?: () => unknown } }> };
+      }).internalPlugins?.plugins?.sync;
+      if (!sync?.enabled) return null;
+      const status = sync.instance?.getStatus?.();
+      return typeof status === "string" ? status : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Should the update notice wait for Sync? Only "syncing" (actively moving
+   *  files) and "uninitialized" (enabled but not started yet, e.g. right after
+   *  launch) hold it. Paused, errored, or disconnected Sync isn't going to finish
+   *  on its own, so waiting would just hide the notice. */
+  private shouldDeferBuildNoticeForSync(): boolean {
+    const status = this.obsidianSyncStatus();
+    // Sync off entirely: nothing to wait for, show right away.
+    if (status === null) return false;
+    const now = Date.now();
+    const busy = this.isSyncBusyStatus(status);
+    if (busy) this.syncIdleSince = null;
+    else if (this.syncIdleSince === null) this.syncIdleSince = now;
+    if (this.syncIdleSince !== null && now - this.syncIdleSince >= StashpadPlugin.BUILD_RECHECK_MS) return false;
+    if (this.buildNoticeDeferredSince === null) this.buildNoticeDeferredSince = now;
+    if (now - this.buildNoticeDeferredSince >= StashpadPlugin.BUILD_NOTICE_MAX_DEFER_MS) {
+      this.trace("update:sync-defer-timeout", { status });
+      return false;
+    }
+    this.trace("update:sync-defer", { status });
+    return true;
+  }
+
+  /** Re-check sooner than the 45s poll while the notice is being held. */
+  private scheduleBuildRecheck(): void {
+    if (this.buildRecheckTimer !== null) return;
+    this.buildRecheckTimer = window.setTimeout(() => {
+      this.buildRecheckTimer = null;
+      void this.checkForSyncedBuild();
+    }, StashpadPlugin.BUILD_RECHECK_MS);
+  }
+
+  /** "syncing" = moving files; "uninitialized" = enabled but not started yet. */
+  private isSyncBusyStatus(status: string | null): boolean {
+    return status === "syncing" || status === "uninitialized";
+  }
+
+  /** 0.536.1: the update notice's "Reload app" button. The notice itself waits
+   *  for Sync (see shouldDeferBuildNoticeForSync), but it stays on screen, and
+   *  Sync can start again before the user clicks. So the click checks too: if
+   *  Sync is busy, show a "waiting" notice and reload once Sync has been idle
+   *  for BUILD_RECHECK_MS. "Reload now" skips the wait; "Cancel" or dismissing
+   *  the waiting notice abandons the reload. After BUILD_NOTICE_MAX_DEFER_MS it
+   *  stops waiting and asks again rather than reloading out of the blue.
+   *  The general "Reload without saving" menu item (view.ts) still reloads
+   *  immediately — that one is a plain reload, not an update. */
+  private syncReloadWait: { cancel: () => void } | null = null;
+  reloadAppForUpdateWhenSynced(): void {
+    if (!this.isSyncBusyStatus(this.obsidianSyncStatus())) { this.reloadAppForUpdate(); return; }
+    if (this.syncReloadWait) return; // already waiting from an earlier click
+    let timer: number | null = null;
+    const stop = (): void => {
+      if (timer !== null) window.clearInterval(timer);
+      timer = null;
+      this.syncReloadWait = null;
+    };
+    this.syncReloadWait = { cancel: stop };
+    const notice = this.notifications.show({
+      message: "Obsidian Sync is still syncing. Stashpad will reload as soon as it finishes.",
+      kind: "info",
+      category: "system",
+      duration: 0,
+      actions: [
+        { label: "Reload now", onClick: () => { stop(); this.reloadAppForUpdate(); } },
+        { label: "Cancel", onClick: () => stop() },
+      ],
+    });
+    this.trace("update:reload-wait", { status: this.obsidianSyncStatus() });
+    const started = Date.now();
+    let idleSince: number | null = null;
+    timer = window.setInterval(() => {
+      // Dismissed (closed or clicked away) = the user changed their mind.
+      if (notice && !notice.containerEl?.isConnected) { stop(); return; }
+      const now = Date.now();
+      if (this.isSyncBusyStatus(this.obsidianSyncStatus())) idleSince = null;
+      else if (idleSince === null) idleSince = now;
+      if (idleSince !== null && now - idleSince >= StashpadPlugin.BUILD_RECHECK_MS) {
+        stop();
+        notice?.hide();
+        this.reloadAppForUpdate();
+        return;
+      }
+      if (now - started >= StashpadPlugin.BUILD_NOTICE_MAX_DEFER_MS) {
+        stop();
+        notice?.hide();
+        this.notifications.show({
+          message: "Obsidian Sync still hadn't finished after 10 minutes, so Stashpad didn't reload.",
+          kind: "warning",
+          category: "system",
+          duration: 0,
+          actions: [{ label: "Reload anyway", onClick: () => this.reloadAppForUpdate() }],
+        });
+      }
+    }, 1000);
+  }
+
+  /** Reset the Sync hold so the next new build starts its wait from scratch. */
+  private resetBuildNoticeDefer(): void {
+    this.buildNoticeDeferredSince = null;
+    this.syncIdleSince = null;
   }
 
   /** 0.89.1: full app reload ("Reload app without saving") — the reliable way to
