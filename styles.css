@@ -12131,3 +12131,9 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 }
 .stashpad-zerostate-trouble-title { font-size: var(--font-ui-small); font-weight: var(--font-semibold); color: var(--text-normal); }
 .stashpad-zerostate-trouble-body { font-size: var(--font-ui-smaller); color: var(--text-muted); line-height: 1.5; }
+
+/* 0.541.0: "This folder was moved, renamed or deleted" — candidate rows. */
+.stashpad-missing-actions { display: flex; flex-direction: column; align-items: center; gap: 8px; margin-top: 12px; }
+.stashpad-missing-option { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.stashpad-missing-why { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-zerostate.is-missing .stashpad-zerostate-actions { margin-top: 16px; }

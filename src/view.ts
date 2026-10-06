@@ -14,6 +14,7 @@ import {
   type ListPinEdge, siftMatch,
 } from "./types";
 import { TreeIndex, collectMarkdown } from "./tree-index";
+import { RelinkFolderModal, type MovedFolderGuess } from "./folder-identity";
 import { perf } from "./perf";
 import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
 import { parseRecurrence, nextDueOnComplete, parseRepeatMode } from "./recurrence";
@@ -379,6 +380,11 @@ export class StashpadView extends ItemView {
    *  While it applies, the view draws an explanation instead of the list and
    *  writes nothing — see bootstrapFolder / renderNestBlocked / createNoteUnder. */
   private nestBlock: { folder: string; verdict: NestBlocked } | null = null;
+  /** 0.541.0: this tab's folder is gone (moved, renamed elsewhere, or deleted).
+   *  Only honoured while `folder === noteFolder`, so any switch clears it.
+   *  `guess` is null until the search has run. */
+  private missingFolder: { folder: string; guess: MovedFolderGuess | null } | null = null;
+  private missingSearchTimer: number | null = null;
   /** 0.522.0: the block for the folder on screen, if any. Public so the
    *  plugin's command dispatcher can refuse view commands here too. */
   nestBlockHere(): NestBlocked | null {
@@ -1264,6 +1270,12 @@ export class StashpadView extends ItemView {
         this.sortStore.handleFolderRename(oldPath, file.path);
       }
     }));
+    // 0.541.0: while this tab's folder is missing, a Home note appearing or
+    // changing anywhere may be it arriving under a new name (the "create" half
+    // of a rename made on another machine). Cheap: one frontmatter check.
+    this.registerEvent(this.app.metadataCache.on("changed", (_f, _d, cache) => {
+      if (this.missingFolder && cache?.frontmatter?.id === ROOT_ID) this.scheduleMissingFolderSearch();
+    }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
       this.completedState.delete(file.path);
       this.taskTaggedState.delete(file.path);
@@ -2068,6 +2080,7 @@ export class StashpadView extends ItemView {
     if (this.treeReconcileTimer != null) { window.clearTimeout(this.treeReconcileTimer); this.treeReconcileTimer = null; }
     if (this.autoSyncSettleTimer != null) { window.clearTimeout(this.autoSyncSettleTimer); this.autoSyncSettleTimer = null; }
     this.plugin.releaseSyncBurstNotice(this);
+    if (this.missingSearchTimer != null) { window.clearTimeout(this.missingSearchTimer); this.missingSearchTimer = null; }
     this.composerAutocomplete?.detach();
     this.composerAutocomplete = null;
     for (const d of this.slugDebouncers.values()) d.cancel();
@@ -3771,7 +3784,8 @@ export class StashpadView extends ItemView {
       // folder. Both used to land on the zero-state — "This Stashpad is empty"
       // plus a button that seeds demo notes into the real folder.
       const hidden = this.countFilteredOut(focused.id);
-      if (hidden > 0) this.renderFilteredEmptyState(list, hidden);
+      if (this.missingFolder?.folder === this.noteFolder) this.renderMissingFolderPage(list);
+      else if (hidden > 0) this.renderFilteredEmptyState(list, hidden);
       else if (this.awaitingIndex && this.plugin.vaultIndexing()) list.createDiv({ cls: "stashpad-empty stashpad-empty-loading", text: "Still reading notes from disk…" });
       else if (focused.id === ROOT_ID) this.renderRootZeroState(list);
       else list.createDiv({ cls: "stashpad-empty", text: "No notes here yet. Type below to add one." });
@@ -17873,6 +17887,115 @@ export class StashpadView extends ItemView {
     });
   }
 
+  /** 0.541.0: plugin calls this when the vault reports this tab's folder (or a
+   *  folder above it) deleted. Often it's a rename on another machine arriving
+   *  as delete + create, so look for it rather than treat it as gone. */
+  onFolderVanished(): void {
+    const folder = this.noteFolder;
+    this.bootstrappedFolders.delete(folder);
+    this.plugin.folderInfraReady.delete(folder);
+    this.enterMissingFolder(folder);
+    this.tree.rebuild(folder);
+    this.render();
+  }
+
+  private enterMissingFolder(folder: string): void {
+    if (this.missingFolder?.folder !== folder) this.missingFolder = { folder, guess: null };
+    this.plugin.trace("folder:missing", { folder });
+    this.plugin.whenVaultIndexed(() => this.searchForMissingFolder(), 60_000);
+  }
+
+  /** Run (or re-run) the search. A unique folder-id match is followed at once;
+   *  anything less is offered on the page. Re-run on Home-note changes while
+   *  missing, so a remote rename's "create" half is picked up when it lands. */
+  private searchForMissingFolder(): void {
+    const m = this.missingFolder;
+    if (!m || m.folder !== this.noteFolder || !this.viewRoot?.isConnected) return;
+    if (this.app.vault.getAbstractFileByPath(m.folder) instanceof TFolder) {
+      // It came back (sync restored it, or someone renamed it back).
+      this.missingFolder = null;
+      void this.bootstrapFolder().then(() => { this.tree.rebuild(this.noteFolder); this.render(); });
+      return;
+    }
+    const guess = this.plugin.guessMovedFolder(m.folder);
+    this.plugin.trace("folder:guess", { folder: m.folder, auto: guess.auto, options: guess.options.length });
+    if (guess.auto) {
+      // Follow on a fresh task: this can run INSIDE the tab's own setState /
+      // bootstrap (the index is often already clean), and re-pointing the leaf
+      // mid-setState lost the switch. `missingFolder` stays set until the tab is
+      // actually on the new folder (it's ignored once noteFolder changes), so
+      // nothing in between can recreate the old path.
+      const from = m.folder, to = guess.auto;
+      window.setTimeout(() => {
+        if (this.noteFolder !== from) return;
+        void this.plugin.followMovedFolder(from, to, { notice: true });
+      }, 0);
+      return;
+    }
+    m.guess = guess;
+    this.render();
+  }
+
+  private scheduleMissingFolderSearch(): void {
+    if (!this.missingFolder || this.missingFolder.folder !== this.noteFolder) return;
+    if (this.missingSearchTimer != null) window.clearTimeout(this.missingSearchTimer);
+    this.missingSearchTimer = window.setTimeout(() => {
+      this.missingSearchTimer = null;
+      this.searchForMissingFolder();
+    }, 1000);
+  }
+
+  private renderMissingFolderPage(list: HTMLElement): void {
+    const m = this.missingFolder;
+    if (!m) return;
+    const name = m.folder.split("/").pop() || m.folder;
+    const zero = list.createDiv({ cls: "stashpad-zerostate is-missing" });
+    zero.createDiv({ cls: "stashpad-zerostate-title", text: "This folder was moved, renamed or deleted" });
+    zero.createDiv({
+      cls: "stashpad-zerostate-body",
+      text: `Stashpad can't find “${m.folder}” any more, so this tab has nothing to show. Nothing was created in its place.`,
+    });
+    const actions = zero.createDiv({ cls: "stashpad-missing-actions" });
+    if (!m.guess) {
+      actions.createDiv({ cls: "stashpad-zerostate-body", text: "Looking for where it went…" });
+    } else if (m.guess.options.length) {
+      actions.createDiv({ cls: "stashpad-zerostate-body", text: m.guess.options.length === 1 ? "It looks like it's now:" : "It could be one of these:" });
+      m.guess.options.forEach((o, i) => {
+        const row = actions.createDiv({ cls: "stashpad-missing-option" });
+        const btn = row.createEl("button", { text: `Open “${o.path}”` });
+        if (i === 0) btn.addClass("mod-cta");
+        row.createSpan({
+          cls: "stashpad-missing-why",
+          text: o.why === "id" ? "same folder ID (one may be a copy)" : `has ${o.hits} of the notes you last used in “${name}”`,
+        });
+        btn.addEventListener("click", () => { void this.relinkMissingFolder(m.folder, o.path); });
+      });
+    } else {
+      actions.createDiv({ cls: "stashpad-zerostate-body", text: "Couldn't find it automatically. If you know where it is now, pick it below." });
+    }
+    const more = zero.createDiv({ cls: "stashpad-zerostate-actions" });
+    const pick = more.createEl("button", { text: "Pick a folder…" });
+    pick.addEventListener("click", () => {
+      new RelinkFolderModal(this.app, (f) => { void this.relinkMissingFolder(m.folder, f.path); }).open();
+    });
+    const recreate = more.createEl("button", { text: "Create it here again" });
+    recreate.addEventListener("click", () => {
+      void (async () => {
+        this.plugin.recreateAllowed.add(m.folder);
+        this.missingFolder = null;
+        await this.bootstrapFolder();
+        this.tree.rebuild(this.noteFolder);
+        this.render();
+      })();
+    });
+    this.renderZeroStateTrouble(zero, false);
+  }
+
+  private async relinkMissingFolder(oldPath: string, newPath: string): Promise<void> {
+    // missingFolder stays set; it lapses on its own once the tab is on newPath.
+    await this.plugin.followMovedFolder(oldPath, newPath);
+  }
+
   private renderRootZeroState(list: HTMLElement): void {
     const zero = list.createDiv({ cls: "stashpad-zerostate" });
     // 0.538.1: the folder may NOT be empty on disk — notes still loading from a
@@ -17888,7 +18011,7 @@ export class StashpadView extends ItemView {
         cls: "stashpad-zerostate-body",
         text: `This folder has ${unloaded} markdown file${unloaded === 1 ? "" : "s"} that ${unloaded === 1 ? "isn't" : "aren't"} showing as notes. ${unloaded === 1 ? "It" : "They"} may still be loading from a slow drive, or may not be Stashpad notes. Copy a diagnostic report before reloading so the cause can be found.`,
       });
-      this.renderZeroStateTrouble(zero, false);
+      this.renderZeroStateTrouble(zero, false, true);
       return;
     }
     zero.createDiv({ cls: "stashpad-zerostate-title", text: "This Stashpad is empty" });
@@ -17936,7 +18059,7 @@ export class StashpadView extends ItemView {
    *  Give that person a way to capture the state BEFORE they reload it away.
    *  `withHeading` false = the unloaded-files variant, whose own title already
    *  asks the question. */
-  private renderZeroStateTrouble(zero: HTMLElement, withHeading: boolean): void {
+  private renderZeroStateTrouble(zero: HTMLElement, withHeading: boolean, reportIsPrimary = false): void {
     const trouble = zero.createDiv({ cls: "stashpad-zerostate-trouble" });
     if (withHeading) {
       trouble.createDiv({ cls: "stashpad-zerostate-trouble-title", text: "Expected notes here?" });
@@ -17950,7 +18073,7 @@ export class StashpadView extends ItemView {
       text: "The report holds counts, settings and recent errors — no note contents, though error lines can include file names.",
     });
     const reportBtn = trouble.createEl("button", { text: "Copy diagnostic report" });
-    if (!withHeading) reportBtn.addClass("mod-cta"); // the only action on that page
+    if (reportIsPrimary) reportBtn.addClass("mod-cta"); // the unloaded-files page: its only action
     reportBtn.addEventListener("click", () => { void this.copyEmptyFolderReport(); });
   }
 
@@ -18033,10 +18156,23 @@ export class StashpadView extends ItemView {
       // plugin writing four things into someone's vault while they were still
       // working out what it does. Check first so we can say so afterwards.
       const preexisting = await this.app.vault.adapter.exists(this.noteFolder);
+      // 0.541.0: a folder this device has used before and that is now GONE was
+      // moved, renamed (often on another machine) or deleted — not a request to
+      // set up a new Stashpad. Recreating it here is how a renamed folder came
+      // back as an empty duplicate under its old name. Show the missing-folder
+      // page instead; nothing is created or memoised, so the next open re-checks.
+      if (!preexisting && !this.plugin.recreateAllowed.has(folder)
+          && (this.plugin.isKnownStashpadFolder(folder) || this.plugin.movedAway.has(folder) || this.missingFolder?.folder === folder)) {
+        this.enterMissingFolder(folder);
+        return;
+      }
       // Reuse that answer: `ensureFolder` would otherwise `exists` the same path
       // again, immediately, which was a measured duplicate round trip.
       await this.ensureFolder(this.noteFolder, preexisting);
       await this.ensureHomeNote();
+      // 0.541.0: stamp / remember the folder's identity. It writes, so only on a
+      // complete index (a partial one can't see a copy elsewhere carrying it).
+      this.plugin.whenVaultIndexed(() => { void this.plugin.ensureFolderId(folder); }, null);
       await this.migrateNullParents();
       // Pre-create the import + export subfolders so users have an obvious target.
       const importSub = (this.plugin.settings.importDropFolder || "").trim().replace(/^\/+|\/+$/g, "");
@@ -21490,6 +21626,12 @@ export class StashpadView extends ItemView {
     // tree, and instead surface a "sent to <folder>" notice with a
     // Jump action.
     const folder = (opts.targetFolder ?? this.noteFolder).replace(/\/+$/, "");
+    // 0.541.0: writing into a vanished folder would recreate it under its old
+    // name — the empty duplicate this guard exists to prevent.
+    if (this.missingFolder && this.missingFolder.folder === folder) {
+      notify("This Stashpad's folder was moved, renamed or deleted. Re-link it first (see the list).", 6000);
+      return null;
+    }
     const remote = folder !== this.noteFolder;
     // 0.522.0: the single note-creation bottleneck refuses a folder this view
     // was blocked on — one note there would make it a Stashpad. Covers paste,

@@ -131,6 +131,9 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   "id", "parent", "created", "modified", "attachments", "position",
   "author", "contributors",
   "parentLink", "children",
+  // 0.541.0: the folder's identity, on its Home note (folder-identity.ts). A
+  // template or clone copying it would make two folders claim one identity.
+  "stashpadFolderId",
   // 0.280.0 (teams): emoji reactions — `{ "👍": ["<authorId>", ...] }`.
   // Stashpad-managed multiplayer state; a clone/template must not carry someone
   // else's reactions.

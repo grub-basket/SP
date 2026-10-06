@@ -29,6 +29,7 @@ import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type Onboardi
 import { seedDemoContent } from "./demo-content";
 import { preferredStashpadLeaf, preferredStashpadLeafOnFolder, anyStashpadLeafOnFolder } from "./leaf-lookup";
 import { readClipboardText, writeClipboardText } from "./cross-vault-clipboard";
+import { FOLDER_ID_KEY, findMovedFolder, mintFolderId, readFolderIdMap, scanHomes, writeFolderIdMap, type MovedFolderGuess } from "./folder-identity";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
@@ -1991,7 +1992,7 @@ export default class StashpadPlugin extends Plugin {
     // moved — this method now runs twice per rename (folder-panel call + the vault
     // rename listener), and an idempotent second pass must not spawn a redundant
     // saveData (which bumps settingsRev + can fire a spurious collision notice).
-    const snap = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter]);
+    const snap = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter, s.hideCompletedNotes, s.hideChildlessNotes, s.attachmentsOnlyNotes, s.includeAttachmentsInEverything, s.folderIcons, s.noteTemplates, s.colorAliases, s.obscureFolders]);
     s.folderPanelPinned = remapArr(s.folderPanelPinned) ?? s.folderPanelPinned;
     s.folderPanelDownranked = remapArr(s.folderPanelDownranked) ?? s.folderPanelDownranked;
     s.folderPanelHidden = remapArr(s.folderPanelHidden) ?? s.folderPanelHidden;
@@ -2003,8 +2004,144 @@ export default class StashpadPlugin extends Plugin {
     s.folderEncPrefs = remapRec(s.folderEncPrefs) ?? s.folderEncPrefs;
     s.viewModes = remapRec(s.viewModes) ?? s.viewModes;
     if (s.encryptionFilter) s.encryptionFilter = remapRec(s.encryptionFilter);
-    const after = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter]);
+    // 0.541.0: the per-folder view toggles, icons, templates, colour names and
+    // obscure flags are keyed by folder path too — a renamed folder lost them.
+    s.hideCompletedNotes = remapRec(s.hideCompletedNotes) ?? s.hideCompletedNotes;
+    s.hideChildlessNotes = remapRec(s.hideChildlessNotes) ?? s.hideChildlessNotes;
+    s.attachmentsOnlyNotes = remapRec(s.attachmentsOnlyNotes) ?? s.attachmentsOnlyNotes;
+    s.includeAttachmentsInEverything = remapRec(s.includeAttachmentsInEverything) ?? s.includeAttachmentsInEverything;
+    s.folderIcons = remapRec(s.folderIcons) ?? s.folderIcons;
+    s.noteTemplates = remapRec(s.noteTemplates) ?? s.noteTemplates;
+    s.colorAliases = remapRec(s.colorAliases) ?? s.colorAliases;
+    s.obscureFolders = remapRec(s.obscureFolders) ?? s.obscureFolders;
+    const after = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter, s.hideCompletedNotes, s.hideChildlessNotes, s.attachmentsOnlyNotes, s.includeAttachmentsInEverything, s.folderIcons, s.noteTemplates, s.colorAliases, s.obscureFolders]);
     if (after !== snap) await this.saveSettings();
+  }
+
+  // --- 0.541.0: rename-proof folders (see folder-identity.ts) -----------------
+
+  /** Folders the user chose "Create it here again" for this session — the
+   *  missing-folder guard in bootstrapFolder lets these through. */
+  recreateAllowed = new Set<string>();
+  /** Paths this session followed away from (old → new). Following re-keys the
+   *  per-device memory, so the old path stops looking "known"; this keeps a
+   *  late bootstrap for the old path from recreating it anyway. */
+  movedAway = new Map<string, string>();
+
+  /** Re-key this device's per-folder LOCAL state (folder-id memory, filter
+   *  chips, last cursor, last selection) from `oldPath` to `newPath`, for the
+   *  folder and everything under it. Settings-file state is
+   *  remapFolderPathInSettings's job. */
+  remapLocalFolderState(oldPath: string, newPath: string): void {
+    const from = oldPath.replace(/\/+$/, ""), to = newPath.replace(/\/+$/, "");
+    if (!from || !to || from === to) return;
+    const remapOne = (p: string): string | null =>
+      p === from ? to : (p.startsWith(from + "/") ? to + p.slice(from.length) : null);
+    const ids = readFolderIdMap(this.app);
+    let idsChanged = false;
+    for (const k of Object.keys(ids)) {
+      const n = remapOne(k);
+      if (n) { ids[n] = ids[k]; delete ids[k]; idsChanged = true; }
+    }
+    if (idsChanged) writeFolderIdMap(this.app, ids);
+    for (const key of [this.LAST_CURSOR_LS_KEY, this.LAST_SELECTION_LS_KEY]) {
+      try {
+        const raw = window.localStorage.getItem(key);
+        if (!raw) continue;
+        const all = JSON.parse(raw) as Record<string, unknown>;
+        let changed = false;
+        for (const k of Object.keys(all)) {
+          const n = remapOne(k);
+          if (n) { all[n] = all[k]; delete all[k]; changed = true; }
+        }
+        if (changed) window.localStorage.setItem(key, JSON.stringify(all));
+      } catch { /* per-device convenience only */ }
+    }
+    // Filter chips: one key per folder; only the folder itself is knowable here.
+    try {
+      const chips = this.app.loadLocalStorage(`stashpad-chips:${from}`) as unknown;
+      if (chips) {
+        this.app.saveLocalStorage(`stashpad-chips:${to}`, chips);
+        this.app.saveLocalStorage(`stashpad-chips:${from}`, null);
+      }
+    } catch { /* ignore */ }
+    for (const f of [...this.folderInfraReady]) {
+      if (f === from || f.startsWith(from + "/")) this.folderInfraReady.delete(f);
+    }
+  }
+
+  /** True when this device has opened `folder` as a Stashpad before — so a
+   *  missing folder at that path means it MOVED, not "set me up". */
+  isKnownStashpadFolder(folder: string): boolean {
+    const f = folder.replace(/^\/+|\/+$/g, "");
+    if (readFolderIdMap(this.app)[f]) return true; // vault-scoped
+    // Last cursor / selection live in window.localStorage, which every vault on
+    // this device SHARES — a "Stashpad" folder used in another vault would make
+    // a brand-new one here look moved. So they count only if those notes exist
+    // in THIS vault under some other Stashpad (folders opened before folder ids).
+    const ids = this.rememberedNoteIds(f);
+    return ids.size > 0 && findMovedFolder(this.app, f, ids).options.length > 0;
+  }
+
+  /** Note ids this device remembers from `folder` (cursor + selection, every
+   *  focus) — the fallback fingerprint for findMovedFolder. */
+  rememberedNoteIds(folder: string): Set<string> {
+    const out = new Set<string>();
+    for (const [focus, id] of this.loadLastCursor(folder)) { out.add(id); if (focus !== ROOT_ID) out.add(focus); }
+    for (const [focus, ids] of this.loadLastSelection(folder)) { for (const id of ids) out.add(id); if (focus !== ROOT_ID) out.add(focus); }
+    out.delete(ROOT_ID);
+    return out;
+  }
+
+  guessMovedFolder(folder: string): MovedFolderGuess {
+    return findMovedFolder(this.app, folder, this.rememberedNoteIds(folder));
+  }
+
+  /** Point every tab (and the path-keyed settings + local state) at the folder's
+   *  new location — the same moves an in-app rename makes. */
+  async followMovedFolder(oldPath: string, newPath: string, opts: { notice?: boolean } = {}): Promise<void> {
+    this.trace("folder:follow", { from: oldPath, to: newPath });
+    this.movedAway.set(oldPath.replace(/^\/+|\/+$/g, ""), newPath.replace(/^\/+|\/+$/g, ""));
+    this.remapLocalFolderState(oldPath, newPath);
+    this.retargetStashpadViewsForFolderRename(oldPath, newPath);
+    await this.remapFolderPathInSettings(oldPath, newPath);
+    if (opts.notice) {
+      const name = (p: string): string => p.split("/").pop() || p;
+      notify(`Stashpad: “${name(oldPath)}” was moved or renamed to “${newPath}”. This tab followed it.`, 8000);
+    }
+  }
+
+  /** Give the Stashpad at `folder` an identity on its Home note if it has none,
+   *  and remember it on this device. A COPIED folder carries a copy of the id:
+   *  if another Stashpad already has this id and this device doesn't know
+   *  `folder` as its owner, this one is treated as the copy and re-minted.
+   *  Writes — so callers run it only on a fully built index. */
+  async ensureFolderId(folder: string, attempt = 0): Promise<void> {
+    const f = folder.replace(/^\/+|\/+$/g, "");
+    if (!f) return;
+    const homes = scanHomes(this.app);
+    const home = homes.find((h) => h.folder === f);
+    if (!home) {
+      // A Home note written moments ago (a brand-new Stashpad) isn't in the
+      // metadata cache yet. Retry briefly; a folder with no Home gets nothing.
+      if (attempt < 10 && this.app.vault.getAbstractFileByPath(f) instanceof TFolder) {
+        const t = window.setTimeout(() => { void this.ensureFolderId(f, attempt + 1); }, 1000);
+        this.register(() => window.clearTimeout(t));
+      }
+      return;
+    }
+    const map = readFolderIdMap(this.app);
+    let id = home.id;
+    const sharedWith = id ? homes.filter((h) => h.folder !== f && h.id === id) : [];
+    if (!id || (sharedWith.length && map[f] !== id)) {
+      const fresh = mintFolderId();
+      try {
+        await this.app.fileManager.processFrontMatter(home.file, (fm: Record<string, unknown>) => { fm[FOLDER_ID_KEY] = fresh; });
+      } catch (e) { console.warn("[Stashpad] couldn't write folder id", e); return; }
+      this.trace("folder:id", { folder: f, id: fresh, reason: id ? "copy" : "new" });
+      id = fresh;
+    }
+    if (map[f] !== id) { map[f] = id; writeFolderIdMap(this.app, map); }
   }
 
   private async prunePlacementFor(cleaned: string): Promise<void> {
@@ -5437,8 +5574,22 @@ export default class StashpadPlugin extends Plugin {
     // rename source, so it also covers file-explorer renames the panel path missed.
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (file instanceof TFolder) {
+        this.remapLocalFolderState(oldPath, file.path); // 0.541.0
         this.retargetStashpadViewsForFolderRename(oldPath, file.path);
         void this.remapFolderPathInSettings(oldPath, file.path);
+      }
+    }));
+    // 0.541.0: a folder DELETED under an open tab. A rename made on another
+    // machine (shared network drive, sync) arrives as delete + create, so this
+    // is often a move in disguise: the tab shows "moved, renamed or deleted"
+    // and looks for the folder instead of recreating an empty one.
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (!(file instanceof TFolder)) return;
+      const p = file.path.replace(/\/+$/, "");
+      for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+        const v = leaf.view as unknown as { noteFolder?: string; onFolderVanished?: () => void };
+        if (typeof v?.onFolderVanished !== "function" || !v.noteFolder) continue;
+        if (v.noteFolder === p || v.noteFolder.startsWith(p + "/")) v.onFolderVanished();
       }
     }));
 
