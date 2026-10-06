@@ -228,6 +228,13 @@ export class StructureSnapshotStore {
           // write instead of 4), and they could see different bytes if a sync landed
           // between them.
           const live = await this.readLive(key);
+          // 0.541.1: no sidecar on disk — make sure the FOLDER is still there
+          // before writing one. adapter.write recreates missing parents, and this
+          // timer outlives tab closes and folder switches: writing here is how a
+          // deleted/renamed folder kept coming back, holding only this hidden file
+          // (so it looked empty). Costs one `exists` only when the sidecar is
+          // missing, never on the normal path.
+          if (live.raw === null && !(await adapter.exists(key))) return;
           const merged = await this.mergeWithPrevious(key, snap, live.parsed);
           // Rotate before overwriting: one intact generation behind us.
           try {

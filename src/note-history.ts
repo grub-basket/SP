@@ -127,9 +127,19 @@ export class NoteHistoryStore {
     if (this.ensuredDirs.has(dir)) return;
     const adapter = this.app.vault.adapter;
     const parts = dir.split("/");
+    // 0.541.1: only `.stashpad/…` and below may be created. Everything above it
+    // is the Stashpad folder itself (and its parents); if that is gone the
+    // folder was deleted or renamed, and recreating it here is how an empty
+    // copy kept reappearing under the old name.
+    const own = parts.indexOf(".stashpad");
     let cur = "";
-    for (const p of parts) {
+    for (const [i, p] of parts.entries()) {
       cur = cur ? `${cur}/${p}` : p;
+      if (own > 0 && i < own) {
+        if (!this.ensuredDirs.has(cur) && !(await adapter.exists(cur))) throw new Error(`Stashpad folder is gone: ${cur}`);
+        this.ensuredDirs.add(cur);
+        continue;
+      }
       try { if (!(await adapter.exists(cur))) await adapter.mkdir(cur); } catch { /* concurrent create */ }
       // Remember each ANCESTOR too, so ensuring `<f>/.stashpad/history/_trashed`
       // after `<f>/.stashpad/history` costs one step rather than the whole ladder.

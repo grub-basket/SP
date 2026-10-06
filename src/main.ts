@@ -29,7 +29,7 @@ import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type Onboardi
 import { seedDemoContent } from "./demo-content";
 import { preferredStashpadLeaf, preferredStashpadLeafOnFolder, anyStashpadLeafOnFolder } from "./leaf-lookup";
 import { readClipboardText, writeClipboardText } from "./cross-vault-clipboard";
-import { FOLDER_ID_KEY, findMovedFolder, mintFolderId, readFolderIdMap, scanHomes, writeFolderIdMap, type MovedFolderGuess } from "./folder-identity";
+import { FOLDER_ID_KEY, findMovedFolder, forgetFolderMove, mintFolderId, readFolderIdMap, readFolderMoves, recordFolderMove, scanHomes, writeFolderIdMap, type MovedFolderGuess } from "./folder-identity";
 import {
   DEFAULT_SETTINGS, StashpadSettings, StashpadSettingTab, setSettings, SETTINGS_TABS,
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
@@ -1333,6 +1333,8 @@ export default class StashpadPlugin extends Plugin {
       await this.openFolderInStashpad(t.folder, opts);
     } else {
       if (!(await this.app.vault.adapter.exists(t.folder))) await this.app.vault.createFolder(t.folder);
+      // 0.541.1: an explicit "create" — never treat it as a moved folder's shell.
+      this.allowRecreate(t.folder);
       if (!(await this.activateViewForFolder(t.folder, opts))) return null;
     }
     if (t.redirect) this.notifications.show({ message: t.redirect.message, kind: "info", category: "system", folder: t.folder });
@@ -2023,6 +2025,14 @@ export default class StashpadPlugin extends Plugin {
   /** Folders the user chose "Create it here again" for this session — the
    *  missing-folder guard in bootstrapFolder lets these through. */
   recreateAllowed = new Set<string>();
+  /** The user chose to (re)create a Stashpad at `folder`: stop treating it as a
+   *  moved folder's old path, now and after a restart. */
+  allowRecreate(folder: string): void {
+    const f = folder.replace(/^\/+|\/+$/g, "");
+    this.recreateAllowed.add(f);
+    this.movedAway.delete(f);
+    forgetFolderMove(this.app, f);
+  }
   /** Paths this session followed away from (old → new). Following re-keys the
    *  per-device memory, so the old path stops looking "known"; this keeps a
    *  late bootstrap for the old path from recreating it anyway. */
@@ -2075,6 +2085,7 @@ export default class StashpadPlugin extends Plugin {
   isKnownStashpadFolder(folder: string): boolean {
     const f = folder.replace(/^\/+|\/+$/g, "");
     if (readFolderIdMap(this.app)[f]) return true; // vault-scoped
+    if (readFolderMoves(this.app)[f]) return true; // 0.541.1: a move this device saw
     // Last cursor / selection live in window.localStorage, which every vault on
     // this device SHARES — a "Stashpad" folder used in another vault would make
     // a brand-new one here look moved. So they count only if those notes exist
@@ -2102,6 +2113,7 @@ export default class StashpadPlugin extends Plugin {
   async followMovedFolder(oldPath: string, newPath: string, opts: { notice?: boolean } = {}): Promise<void> {
     this.trace("folder:follow", { from: oldPath, to: newPath });
     this.movedAway.set(oldPath.replace(/^\/+|\/+$/g, ""), newPath.replace(/^\/+|\/+$/g, ""));
+    recordFolderMove(this.app, oldPath, newPath); // 0.541.1: survives restarts
     this.remapLocalFolderState(oldPath, newPath);
     this.retargetStashpadViewsForFolderRename(oldPath, newPath);
     await this.remapFolderPathInSettings(oldPath, newPath);
@@ -2221,14 +2233,20 @@ export default class StashpadPlugin extends Plugin {
   async handleStashpadFolderDeleted(path: string): Promise<void> {
     const cleaned = path.replace(/\/+$/, "");
     if (!cleaned || this.suppressedFolderDeletes.has(cleaned)) return;
-    const closed = this.closeStashpadTabsFor(cleaned);
+    // 0.541.1: tabs are NOT closed any more. A folder that vanishes outside
+    // Stashpad was often renamed or moved (a rename on another machine arrives
+    // as delete + create), and closing the tab both threw away the chance to
+    // follow it and flushed the tab's sidecars into the old path — recreating
+    // the folder. Open tabs now show "moved, renamed or deleted" and look for
+    // it (view.onFolderVanished, via the delete listener registered later).
+    const name = cleaned.split("/").pop() || cleaned;
+    // Give a remote rename's "create" half a moment to land and be followed.
+    await new Promise((r) => window.setTimeout(r, 3000));
+    if (this.movedAway.has(cleaned) || this.app.vault.getAbstractFileByPath(cleaned) instanceof TFolder) return;
     await this.prunePlacementFor(cleaned);
     this.knownStashpadFolders.delete(cleaned);
-    const name = cleaned.split("/").pop() || cleaned;
     this.notifications.show({
-      message: closed > 0
-        ? `Stashpad “${name}” was deleted — closed ${closed} open tab${closed === 1 ? "" : "s"}.`
-        : `Stashpad “${name}” was deleted.`,
+      message: `Stashpad “${name}” was deleted, or moved or renamed outside Stashpad. Any open tabs for it are showing where it might have gone.`,
       kind: "warning",
       category: "delete",
       folder: cleaned,
@@ -5575,6 +5593,8 @@ export default class StashpadPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
       if (file instanceof TFolder) {
         this.remapLocalFolderState(oldPath, file.path); // 0.541.0
+        // 0.541.1: only for Stashpads — a plain folder rename isn't a move to follow.
+        if (this.knownStashpadFolders.has(oldPath.replace(/\/+$/, "")) || readFolderIdMap(this.app)[file.path]) recordFolderMove(this.app, oldPath, file.path);
         this.retargetStashpadViewsForFolderRename(oldPath, file.path);
         void this.remapFolderPathInSettings(oldPath, file.path);
       }

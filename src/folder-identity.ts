@@ -57,7 +57,39 @@ export function mintFolderId(): string { return `sf-${newId(10)}`; }
  *  folder-id match — the one case safe to follow without asking. */
 export interface MovedFolderGuess {
   auto: string | null;
-  options: Array<{ path: string; why: "id" | "notes"; hits?: number }>;
+  options: Array<{ path: string; why: "moved" | "id" | "notes"; hits?: number }>;
+}
+
+/** 0.541.1: per-device record of moves this device has SEEN (old → new). Following
+ *  a move re-keys every other per-path memory to the new path, so without this the
+ *  old path looks brand new afterwards — and an empty folder recreated there (by an
+ *  older Stashpad, often a coworker's) would be set up as a fresh Stashpad. */
+const MOVES_KEY = "stashpad-folder-moves";
+const MOVES_MAX = 200;
+export function readFolderMoves(app: App): Record<string, string> {
+  try {
+    const raw = app.loadLocalStorage(MOVES_KEY) as unknown;
+    return raw && typeof raw === "object" ? { ...(raw as Record<string, string>) } : {};
+  } catch { return {}; }
+}
+export function recordFolderMove(app: App, from: string, to: string): void {
+  const a = norm(from), b = norm(to);
+  if (!a || !b || a === b) return;
+  const moves = readFolderMoves(app);
+  // Chains collapse: anything that pointed at `a` now points at `b`.
+  for (const k of Object.keys(moves)) if (moves[k] === a) moves[k] = b;
+  delete moves[b];
+  delete moves[a];
+  moves[a] = b; // re-inserted last = newest
+  const keys = Object.keys(moves);
+  for (const k of keys.slice(0, Math.max(0, keys.length - MOVES_MAX))) delete moves[k];
+  try { app.saveLocalStorage(MOVES_KEY, moves); } catch { /* per-device only */ }
+}
+export function forgetFolderMove(app: App, from: string): void {
+  const moves = readFolderMoves(app);
+  if (!(norm(from) in moves)) return;
+  delete moves[norm(from)];
+  try { app.saveLocalStorage(MOVES_KEY, moves); } catch { /* ignore */ }
 }
 
 /** Look for the folder this device knew as `oldFolder`:
@@ -70,6 +102,11 @@ export function findMovedFolder(app: App, oldFolder: string, noteIds: Set<string
   const homes = scanHomes(app).filter((h) => norm(h.folder) !== old);
   const id = readFolderIdMap(app)[old];
   const options: MovedFolderGuess["options"] = [];
+  // A move this device saw happen is exact.
+  const seen = readFolderMoves(app)[old];
+  if (seen && app.vault.getAbstractFileByPath(seen) instanceof TFolder) {
+    return { auto: seen, options: [{ path: seen, why: "moved" }] };
+  }
   if (id) {
     for (const h of homes) if (h.id === id) options.push({ path: h.folder, why: "id" });
   }

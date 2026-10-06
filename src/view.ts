@@ -383,7 +383,7 @@ export class StashpadView extends ItemView {
   /** 0.541.0: this tab's folder is gone (moved, renamed elsewhere, or deleted).
    *  Only honoured while `folder === noteFolder`, so any switch clears it.
    *  `guess` is null until the search has run. */
-  private missingFolder: { folder: string; guess: MovedFolderGuess | null } | null = null;
+  private missingFolder: { folder: string; guess: MovedFolderGuess | null; shell: boolean } | null = null;
   private missingSearchTimer: number | null = null;
   /** 0.522.0: the block for the folder on screen, if any. Public so the
    *  plugin's command dispatcher can refuse view commands here too. */
@@ -2012,6 +2012,11 @@ export class StashpadView extends ItemView {
         // deferred rebuild. Pay it here so the sidecar records the rebuilt
         // shape (a deleted parent's children keep their recorded parent, a
         // duplicate-id survivor stays listed), as it did before the deferral.
+        // 0.541.1: the timer fires up to 4s later. If this tab has switched
+        // folders (or its folder went missing) since, `this.tree` is another
+        // folder's — return nothing (the store skips empty snapshots) rather than
+        // writing that folder's notes into this one's sidecar.
+        if (this.noteFolder !== folder || this.missingFolder?.folder === folder) return {};
         this.settleOwedDeleteRebuild();
         const notes: Record<string, { parent: string | null; path: string; created?: string; title?: string }> = {};
         for (const node of this.tree.allNodes()) {
@@ -17899,8 +17904,8 @@ export class StashpadView extends ItemView {
     this.render();
   }
 
-  private enterMissingFolder(folder: string): void {
-    if (this.missingFolder?.folder !== folder) this.missingFolder = { folder, guess: null };
+  private enterMissingFolder(folder: string, opts: { shell?: boolean } = {}): void {
+    if (this.missingFolder?.folder !== folder) this.missingFolder = { folder, guess: null, shell: !!opts.shell };
     this.plugin.trace("folder:missing", { folder });
     this.plugin.whenVaultIndexed(() => this.searchForMissingFolder(), 60_000);
   }
@@ -17911,7 +17916,7 @@ export class StashpadView extends ItemView {
   private searchForMissingFolder(): void {
     const m = this.missingFolder;
     if (!m || m.folder !== this.noteFolder || !this.viewRoot?.isConnected) return;
-    if (this.app.vault.getAbstractFileByPath(m.folder) instanceof TFolder) {
+    if (!m.shell && this.app.vault.getAbstractFileByPath(m.folder) instanceof TFolder) {
       // It came back (sync restored it, or someone renamed it back).
       this.missingFolder = null;
       void this.bootstrapFolder().then(() => { this.tree.rebuild(this.noteFolder); this.render(); });
@@ -17919,7 +17924,7 @@ export class StashpadView extends ItemView {
     }
     const guess = this.plugin.guessMovedFolder(m.folder);
     this.plugin.trace("folder:guess", { folder: m.folder, auto: guess.auto, options: guess.options.length });
-    if (guess.auto) {
+    if (guess.auto && !m.shell) {
       // Follow on a fresh task: this can run INSIDE the tab's own setState /
       // bootstrap (the index is often already clean), and re-pointing the leaf
       // mid-setState lost the switch. `missingFolder` stays set until the tab is
@@ -17950,10 +17955,12 @@ export class StashpadView extends ItemView {
     if (!m) return;
     const name = m.folder.split("/").pop() || m.folder;
     const zero = list.createDiv({ cls: "stashpad-zerostate is-missing" });
-    zero.createDiv({ cls: "stashpad-zerostate-title", text: "This folder was moved, renamed or deleted" });
+    zero.createDiv({ cls: "stashpad-zerostate-title", text: m.shell ? "This folder's notes moved somewhere else" : "This folder was moved, renamed or deleted" });
     zero.createDiv({
       cls: "stashpad-zerostate-body",
-      text: `Stashpad can't find “${m.folder}” any more, so this tab has nothing to show. Nothing was created in its place.`,
+      text: m.shell
+        ? `“${m.folder}” is an empty folder now. Its notes were moved or renamed to another folder, and an empty folder was left (or recreated) at the old name — that can happen when it's renamed on another computer.`
+        : `Stashpad can't find “${m.folder}” any more, so this tab has nothing to show. Nothing was created in its place.`,
     });
     const actions = zero.createDiv({ cls: "stashpad-missing-actions" });
     if (!m.guess) {
@@ -17966,7 +17973,7 @@ export class StashpadView extends ItemView {
         if (i === 0) btn.addClass("mod-cta");
         row.createSpan({
           cls: "stashpad-missing-why",
-          text: o.why === "id" ? "same folder ID (one may be a copy)" : `has ${o.hits} of the notes you last used in “${name}”`,
+          text: o.why === "moved" ? "where this folder moved to" : o.why === "id" ? "same folder ID (one may be a copy)" : `has ${o.hits} of the notes you last used in “${name}”`,
         });
         btn.addEventListener("click", () => { void this.relinkMissingFolder(m.folder, o.path); });
       });
@@ -17978,10 +17985,10 @@ export class StashpadView extends ItemView {
     pick.addEventListener("click", () => {
       new RelinkFolderModal(this.app, (f) => { void this.relinkMissingFolder(m.folder, f.path); }).open();
     });
-    const recreate = more.createEl("button", { text: "Create it here again" });
+    const recreate = more.createEl("button", { text: m.shell ? "Make this a new Stashpad" : "Create it here again" });
     recreate.addEventListener("click", () => {
       void (async () => {
-        this.plugin.recreateAllowed.add(m.folder);
+        this.plugin.allowRecreate(m.folder);
         this.missingFolder = null;
         await this.bootstrapFolder();
         this.tree.rebuild(this.noteFolder);
@@ -18164,6 +18171,17 @@ export class StashpadView extends ItemView {
       if (!preexisting && !this.plugin.recreateAllowed.has(folder)
           && (this.plugin.isKnownStashpadFolder(folder) || this.plugin.movedAway.has(folder) || this.missingFolder?.folder === folder)) {
         this.enterMissingFolder(folder);
+        return;
+      }
+      // 0.541.1: the folder IS there but holds no notes at all, while this
+      // device knows it moved (a Stashpad with its id lives elsewhere). That is
+      // an empty shell recreated under the old name — by an older Stashpad,
+      // often on a coworker's machine. Follow the move instead of turning the
+      // shell back into a Stashpad with a fresh Home note.
+      // Never followed automatically: the user may have recreated it on purpose.
+      if (preexisting && !this.plugin.recreateAllowed.has(folder) && collectMarkdown(this.app, folder).length === 0
+          && this.plugin.isKnownStashpadFolder(folder) && this.plugin.guessMovedFolder(folder).options.length > 0) {
+        this.enterMissingFolder(folder, { shell: true });
         return;
       }
       // Reuse that answer: `ensureFolder` would otherwise `exists` the same path

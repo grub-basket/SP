@@ -554,6 +554,9 @@ export class EncryptionService {
     for (const [path, entry] of Object.entries(fks)) {
       const f = this.cleanFolder(path);
       if (this.folderKeyFiles.has(f) || await this.folderKeystore.hasFile(f)) continue; // already migrated
+      // 0.541.1: the keyfile remembers folders by PATH and never forgets them, so
+      // a renamed or deleted folder was recreated here on every launch.
+      if (!(await this.app.vault.adapter.exists(f))) continue;
       const active = (entry.passwordSlots ?? []).filter((s) => !s.label.startsWith("[deprecated]"));
       if (!active.length) continue; // no active wrap to carry over
       const sk: StashKey = {

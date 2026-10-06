@@ -144,6 +144,10 @@ export class SortStore {
     // mutation before load() resolves can't clobber other parents' sort modes.
     let existedButUnreadable = false;
     try {
+      // 0.541.1: write a missing sidecar only into a folder that still exists —
+      // adapter.write would otherwise recreate a deleted/renamed folder. One
+      // extra `exists` only when the sidecar is absent.
+      if (!(await adapter.exists(path)) && !(await adapter.exists(folder))) return;
       if (await adapter.exists(path)) {
         const parsed = JSON.parse(await adapter.read(path));
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {

@@ -102,6 +102,9 @@ export async function rebuildOkfForFolder(app: App, folder: string): Promise<{ c
     } catch (err) { console.warn("[Stashpad] OKF rebuild failed", e.file.path, err); }
   }
   // Regenerate the folder's index.md (OKF requires a per-dir index).
+  // 0.541.1: this runs on a timer after file events — never recreate a folder
+  // that was deleted or renamed in the meantime.
+  if (!(await app.vault.adapter.exists(cleaned))) return { checked, written };
   try { await app.vault.adapter.write(`${cleaned}/index.md`, await buildOkfIndex(app, cleaned)); }
   catch (err) { console.warn("[Stashpad] OKF index.md write failed", cleaned, err); }
   return { checked, written };
