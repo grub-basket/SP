@@ -13,6 +13,7 @@ import {
   type StashpadId,
 } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
+import { dueDeadlineMs, isBareDateDue } from "./due-warmth";
 import { readId, sameId } from "./id-service";
 import { PinAliasModal } from "./modals";
 import { collectTasks as collectTasksShared, titleFromTaskFile, type TaskItem } from "./task-collect";
@@ -1249,10 +1250,11 @@ export class StashpadPanelsView extends ItemView {
     // Folder chip — tasks span folders in the status-grouped view.
     row.createSpan({ cls: "stashpad-task-folder", text: t.folder.split("/").pop() || t.folder });
     if (t.due != null) {
-      const due = row.createSpan({ cls: "stashpad-task-due", text: this.formatDueShort(t.due, isToday) });
+      const due = row.createSpan({ cls: "stashpad-task-due", text: this.formatDueShort(t.due, isToday, t.dueRaw) });
       // Past-due (and not done) gets the warning tint even inside the
-      // "Due today" section (time has passed today).
-      if (t.due < Date.now() && !t.completed) due.addClass("is-overdue");
+      // "Due today" section (time has passed today). 0.546.2: a date-only due
+      // lapses at the END of its day (dueDeadlineMs), as in task-render.ts.
+      if (dueDeadlineMs(t.due, t.dueRaw) < Date.now() && !t.completed) due.addClass("is-overdue");
     } else if (t.dueRaw) {
       // Unparseable due string — show it raw rather than dropping it.
       row.createSpan({ cls: "stashpad-task-due", text: t.dueRaw });
@@ -1304,9 +1306,10 @@ export class StashpadPanelsView extends ItemView {
 
   /** 0.76.6: compact due label honouring the user's display format +
    *  timezone. Time-only for today's tasks; date-only otherwise. */
-  private formatDueShort(dueMs: number, isToday: boolean): string {
+  private formatDueShort(dueMs: number, isToday: boolean, raw?: string | null): string {
+    // 0.546.2: a date-only due has no time — "Today", not "12:00 AM".
     return isToday
-      ? formatTimeOnly(dueMs, this.plugin.settings)
+      ? (isBareDateDue(raw) ? "Today" : formatTimeOnly(dueMs, this.plugin.settings))
       : formatDateOnly(dueMs, this.plugin.settings);
   }
 

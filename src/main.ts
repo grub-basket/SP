@@ -42,7 +42,8 @@ import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, s
 import { writeXvClipboard, readXvAck, writeXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
 import { ensureOkfTemplate, okfFolders, rebuildOkfForFolder, OKF_DEFAULT_TEMPLATE_PATH } from "./okf";
 import { buildOkfBundleFiles, zipBundle, tarGzBundle } from "./okf-export";
-import { formatDateTime } from "./format";
+import { formatDateTime, formatDateOnly } from "./format";
+import { parseDueString, isBareDateDue, dueDeadlineMs, reminderAtMs, nextDueValue } from "./due-warmth";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { StashpadLog } from "./log";
 import { buildStashpadLink, parseRunActions, parseStashpadLink, STASHPAD_PROTOCOL_ACTION, DEEP_LINK_TAB_LABELS, isDeepLinkTab, type DeepLinkTab } from "./deep-link";
@@ -3009,7 +3010,7 @@ export default class StashpadPlugin extends Plugin {
    *  write. `run()` on unload lands a pending write so quitting inside the
    *  window can't lose `lastUsedFolder` (which decides where we open next
    *  launch) — same shape as the render-cache/trace flushes in onunload. */
-  private mruPersistDebounced = debounce(() => this.persistSettingsQuiet(), 1500, true);
+  private mruPersistDebounced = debounce(() => this.persistSettingsQuiet("mru"), 1500, true);
 
   /** 0.224.0: re-rank a folder list so pinned folders lead, in the SAME order
    *  the folders panel shows them (`folderPanelPinnedAt`, ascending), and
@@ -7241,7 +7242,7 @@ export default class StashpadPlugin extends Plugin {
       let openTasks = 0;
       for (const it of tasks) {
         if (!it.completed) openTasks++;
-        if (it.due && !it.completed) { const t = Date.parse(it.due); if (Number.isFinite(t) && (due == null || t < due)) due = t; }
+        if (it.due && !it.completed) { const t = parseDueString(String(it.due)); if (Number.isFinite(t) && (due == null || t < due)) due = t; }
       }
       out.push({ folder: dir, blobPath: f.path, title: meta.title || "Locked note", due, openTasks });
     }
@@ -12080,10 +12081,11 @@ export default class StashpadPlugin extends Plugin {
         // the caller passed can be stale (a concurrent sweep / another device
         // may have just rolled it), which would re-roll from the wrong anchor
         // and skip/duplicate a cycle.
-        const curDue = fm.due != null ? Date.parse(String(fm.due)) : NaN;
+        const curDue = fm.due != null ? parseDueString(String(fm.due)) : NaN;
         if (Number.isFinite(curDue) && curDue > now) return; // already rolled forward — done
         const rec = parseRecurrence(fm.repeat as string | undefined);
-        if (rec) { fm.due = new Date(nextDueOnComplete(rec, Number.isFinite(curDue) ? curDue : null, now)).toISOString(); delete fm.completed; }
+        // 0.546.2: a date-only due rolls to a date-only due (nextDueValue).
+        if (rec) { fm.due = nextDueValue(fm.due, nextDueOnComplete(rec, Number.isFinite(curDue) ? curDue : null, now)); delete fm.completed; }
         else writeCompletedFm(fm as Record<string, unknown>, true);
       });
     } catch (e) { console.warn("[Stashpad] auto-resolve failed", f.path, e); }
@@ -12097,7 +12099,7 @@ export default class StashpadPlugin extends Plugin {
   private async autoFailDueTask(f: TFile, now: number): Promise<void> {
     try {
       await this.app.fileManager.processFrontMatter(f, (fm) => {
-        const curDue = fm.due != null ? Date.parse(String(fm.due)) : NaN;
+        const curDue = fm.due != null ? parseDueString(String(fm.due)) : NaN;
         if (Number.isFinite(curDue) && curDue > now) return; // rescheduled since — skip
         if (fm.completed === true) return;                   // already done
         writeCompletedFm(fm as Record<string, unknown>, true);
@@ -12130,7 +12132,7 @@ export default class StashpadPlugin extends Plugin {
     if (path.includes("/_authors/")) return null;
     if (!fm || fm.due == null) return null;
     if (typeof fm.id !== "string" || !fm.id) return null;
-    const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(String(fm.due));
+    const dueMs = typeof fm.due === "number" ? fm.due : parseDueString(String(fm.due));
     return Number.isFinite(dueMs) ? dueMs : null;
   }
 
@@ -12207,8 +12209,9 @@ export default class StashpadPlugin extends Plugin {
       const id = typeof fm.id === "string" ? fm.id : "";
       if (!id) continue;
       const dueRaw = String(fm.due);
-      const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(dueRaw);
-      if (!Number.isFinite(dueMs) || dueMs > now) continue; // not due yet
+      const dueMs = typeof fm.due === "number" ? fm.due : parseDueString(dueRaw);
+      // A date-only due reminds at the configured time on its day, not midnight.
+      if (!Number.isFinite(dueMs) || reminderAtMs(dueMs, fm.due, this.settings.dateOnlyDueReminderTime) > now) continue; // not due yet
 
       // 0.305.0: auto-FAIL — a one-off task with `failIfOverdue` that's still
       // open past its due date is closed out as a miss (complete + "failed" tag)
@@ -12216,7 +12219,8 @@ export default class StashpadPlugin extends Plugin {
       // fail policy wins over a silent resolve if both are set. Repeating tasks
       // are left to the repeat / interval machinery, which already models misses.
       if (fm.completed !== true && (fm as { failIfOverdue?: unknown }).failIfOverdue === true
-          && !parseRecurrence(fm.repeat as string | undefined)) {
+          && !parseRecurrence(fm.repeat as string | undefined)
+          && now > dueDeadlineMs(dueMs, fm.due)) {
         await this.autoFailDueTask(f, now);
         autoFailed++;
         continue;
@@ -12227,7 +12231,10 @@ export default class StashpadPlugin extends Plugin {
       // scoping so it applies regardless of who'd be reminded.
       if (fm.completed !== true) {
         const grace = parseDuration(fm.autoDoneAfter as string | undefined);
-        if (grace != null && now >= dueMs + grace) {
+        // 0.546.2: grace counts from the DEADLINE — the end of the day for a
+        // date-only due (it was midnight, so a <7h grace auto-resolved a
+        // date-only task at 07:00 before it ever reminded).
+        if (grace != null && now >= dueDeadlineMs(dueMs, fm.due) + grace) {
           await this.autoResolveDueTask(f, dueMs, now);
           continue;
         }
@@ -12251,7 +12258,7 @@ export default class StashpadPlugin extends Plugin {
             let nextMs = windowEnd;
             let guard = 0;
             while (nextMs <= now && guard++ < 500) nextMs = recI.next(nextMs);
-            await spawnNextOccurrence(this.app, f, new Date(nextMs).toISOString(), () => this.mintNoteId());
+            await spawnNextOccurrence(this.app, f, nextDueValue(fm.due, nextMs), () => this.mintNoteId());
             missedRolled++;
             continue;
           }
@@ -12326,7 +12333,7 @@ export default class StashpadPlugin extends Plugin {
       for (const d of due) {
         const title = await titleOf(d.file);
         this.notifications.show({
-          message: `⏰ Task due: “${title}” (${formatDateTime(d.dueMs, this.settings)})`,
+          message: `⏰ Task due: “${title}” (${isBareDateDue(this.app.metadataCache.getFileCache(d.file)?.frontmatter?.due) ? formatDateOnly(d.dueMs, this.settings) : formatDateTime(d.dueMs, this.settings)})`,
           kind: "warning", category: "reminder", duration: 0, folder: d.folder, affectedIds: [d.id],
           // 0.171.0: whole card opens the task; the corner Snooze control opens
           // the scheduler/assigner modal instead (layered above, stopPropagation).
@@ -12376,8 +12383,8 @@ export default class StashpadPlugin extends Plugin {
       if (!fm || fm.due == null) continue;
       const id = typeof fm.id === "string" ? fm.id : "";
       if (!id || fm.completed === true) continue;
-      const dueMs = typeof fm.due === "number" ? fm.due : Date.parse(String(fm.due));
-      if (!Number.isFinite(dueMs) || dueMs > now) continue; // not due yet
+      const dueMs = typeof fm.due === "number" ? fm.due : parseDueString(String(fm.due));
+      if (!Number.isFinite(dueMs) || reminderAtMs(dueMs, fm.due, this.settings.dateOnlyDueReminderTime) > now) continue; // not due yet
       const assignees = parseAssignees(fm);
       if (assignees.length > 0 && !(myId && assignees.some((a) => a.id === myId))) continue;
       due.push({ id, folder: (f.parent?.path ?? "").replace(/\/+$/, ""), file: f, dueMs });
@@ -14146,10 +14153,13 @@ export default class StashpadPlugin extends Plugin {
   /** Persist settings to disk WITHOUT firing the onSettingsChange listeners,
    *  so high-frequency writes (e.g. composer drafts) don't trigger re-renders
    *  that would steal focus from the textarea. */
-  async persistSettingsQuiet(): Promise<void> {
+  async persistSettingsQuiet(by = "?"): Promise<void> {
     // 0.363.12: trace quiet writes too (draft churn is a prime burst suspect).
+    // 0.545.3 (diag, revived from dump-scroll-drafts-2026-09-15's 0.386.0): tag
+    // each quiet write with its CALLER, so an on-device capture names which site
+    // is storming data.json (the still-open mobile lag / force-quit write storm).
     this.savesSinceWrite++;
-    this.trace("settings:write-quiet");
+    this.trace("settings:write-quiet", { by });
     await this.queueWrite();
   }
 

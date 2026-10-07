@@ -624,6 +624,9 @@ export interface StashpadSettings {
   /** 0.125.1: quick relative time-adjust presets shown in the due-date / snooze
    *  picker (e.g. ["5m","15m","1h","1d"]). A +/- flip toggles add vs subtract. */
   dueQuickAdjusts: string[];
+  /** Time of day ("HH:mm", 24h) a reminder fires for a task whose due is a bare
+   *  date with no time (e.g. `due: 2026-09-23`). Default 07:00. */
+  dateOnlyDueReminderTime: string;
   /** 0.276.0: tags offered in the due/assign picker. `taskTagChips` are shown as
    *  one-tap quick chips; `taskTagSuggestions` (plus the chips) feed the
    *  type-to-add autocomplete. Both are plain tag names (no leading #). */
@@ -1419,6 +1422,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   reEncryptNudge: false,
   reEncryptAfterMin: 0,
   dueQuickAdjusts: ["5m", "15m", "30m", "1h", "1d", "1w"],
+  dateOnlyDueReminderTime: "07:00",
   taskTagChips: [],
   taskTagSuggestions: [],
   logNoteOpens: false,
@@ -4523,6 +4527,18 @@ export class StashpadSettingTab extends PluginSettingTab {
           });
         });
       }, ["quick", "adjust", "snooze", "due", "preset", "increment", "decrement"]));
+      cats.datesTime.push(this.renderDef("Reminder time for date-only tasks", "When a task's due date has no time (just a day), its reminder fires at this time on that day.", (s) => {
+        s.addText((t) => {
+          t.inputEl.type = "time";
+          t.setValue(this.plugin.settings.dateOnlyDueReminderTime || "07:00");
+          t.onChange(async (v) => {
+            // Native time inputs give "HH:mm"; ignore a half-typed/blank value.
+            if (!/^\d{2}:\d{2}$/.test(v)) return;
+            this.plugin.settings.dateOnlyDueReminderTime = v;
+            await set();
+          });
+        });
+      }, ["reminder", "notify", "due", "date", "time", "morning", "all-day", "date-only"]));
       const parseTags = (v: string): string[] => [...new Set(v.split(",").map((x) => x.trim().replace(/^#+/, "").replace(/\s+/g, "-")).filter(Boolean))];
       cats.datesTime.push(this.renderDef("Task tag chips", "Comma-separated tags shown as one-tap chips in the due-date / assign picker, so you can label a task (e.g. events, saga, outage) without typing. Plain names, no # needed.", (s) => {
         s.addText((t) => {

@@ -162,7 +162,7 @@ export class QuickCaptureModal extends Modal {
       const ok = await this.plugin.runQuickCapture(this.folder, text, this.staged, this.split);
       if (ok) {
         this.plugin.settings.lastCaptureFolder = this.folder;
-        await this.plugin.persistSettingsQuiet();
+        await this.plugin.persistSettingsQuiet("quick-capture");
         this.close();
       } else {
         this.submitting = false;

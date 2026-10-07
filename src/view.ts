@@ -17,6 +17,7 @@ import { TreeIndex, collectMarkdown } from "./tree-index";
 import { RelinkFolderModal, type MovedFolderGuess } from "./folder-identity";
 import { perf } from "./perf";
 import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
+import { parseDue, parseDueString, dueTier, dueLabel, dueRelative, nextDueValue, isBareDateDue, type DueInfo } from "./due-warmth";
 import { parseRecurrence, nextDueOnComplete, parseRepeatMode } from "./recurrence";
 import { spawnNextOccurrence, archiveOccurrenceSnapshot } from "./recurrence-spawn";
 import { OrderStore } from "./order-store";
@@ -1130,6 +1131,10 @@ export class StashpadView extends ItemView {
     // long-lived session doesn't accumulate dead per-file entries.
     // registerInterval auto-clears on view unload.
     this.registerInterval(window.setInterval(() => this.authorship.pruneContribMaps(), 60_000));
+    // Due-date warmth drifts with the clock (week → soon → today → overdue);
+    // re-tint the visible due chips once a minute so an open view doesn't sit
+    // on a stale colour. Only touches slots that already show a due.
+    this.registerInterval(window.setInterval(() => this.repaintDueSlots(true), 60_000));
 
     // Push a keymap Scope while focus is anywhere inside the view so
     // Escape can never warp to the previous tab. This sits BENEATH any
@@ -2996,7 +3001,7 @@ export class StashpadView extends ItemView {
     this.activeDraftId = id;
     this.setDraftPointer(id);
     // 0.340.0: clean up exact-duplicate drafts accumulated across sessions/devices.
-    if (this.pruneDuplicateDrafts(this.noteFolder)) void this.plugin.persistSettingsQuiet();
+    if (this.pruneDuplicateDrafts(this.noteFolder)) void this.plugin.persistSettingsQuiet("draft-prune");
     const d = id ? all[id] : null;
     this.composerDraft = d?.text ?? "";
     // The reply target rides along with the draft (it used to be lost on reload).
@@ -3100,7 +3105,7 @@ export class StashpadView extends ItemView {
       // composerDraft and don't write it back on the next blur. Mid-typing
       // saves stay quiet to avoid focus-stealing re-render storms.
       if (empty) await this.plugin.saveSettings();
-      else await this.plugin.persistSettingsQuiet();
+      else await this.plugin.persistSettingsQuiet("draft-save");
       this.refreshDraftsChip();
     } catch (e) { console.warn("Stashpad: drafts save failed", e); }
   }
@@ -3113,7 +3118,7 @@ export class StashpadView extends ItemView {
     const replyTo = this.replyTarget ? { id: this.replyTarget.id, title: this.replyTarget.title, path: this.replyTarget.path } : null;
     if (JSON.stringify(cur.replyTo ?? null) === JSON.stringify(replyTo)) return;
     this.plugin.settings.composerDrafts = { ...(this.plugin.settings.composerDrafts ?? {}), [cur.id]: { ...cur, replyTo, modified: Date.now() } };
-    try { await this.plugin.persistSettingsQuiet(); } catch { /* ignore */ }
+    try { await this.plugin.persistSettingsQuiet("draft-meta"); } catch { /* ignore */ }
   }
 
   /** 0.319.0: bind the composer to draft `id` (from the drafts modal). Whatever
@@ -3235,7 +3240,7 @@ export class StashpadView extends ItemView {
       replyTo: null,
     };
     this.plugin.settings.composerDrafts = { ...(this.plugin.settings.composerDrafts ?? {}), [id]: draft };
-    try { await this.plugin.persistSettingsQuiet(); } catch { /* ignore */ }
+    try { await this.plugin.persistSettingsQuiet("composer-edit"); } catch { /* ignore */ }
     this.activeDraftId = id;
     this.setDraftPointer(id);
     this.composerDraft = body;
@@ -3397,7 +3402,7 @@ export class StashpadView extends ItemView {
         all[folder] = [t, ...prev].slice(0, StashpadView.RECENT_SUBMIT_CAP);
       }
       this.plugin.settings.lastSubmitted = all;
-      await this.plugin.persistSettingsQuiet();
+      await this.plugin.persistSettingsQuiet("last-submitted");
     } catch { /* ignore */ }
   }
 
@@ -13420,6 +13425,7 @@ export class StashpadView extends ItemView {
     }
     this.repaintRowColors();
     this.repaintSelectionClasses();
+    this.repaintDueSlots();
     for (const row of rows) {
       const node = this.tree.get((row.dataset.id ?? "") as StashpadId);
       if (!node) continue;
@@ -15145,7 +15151,7 @@ export class StashpadView extends ItemView {
           if (!list.some((c) => c.toLowerCase() === lower)) {
             list.push(color);
             this.plugin.settings.customPalette = list;
-            await this.plugin.persistSettingsQuiet();
+            await this.plugin.persistSettingsQuiet("custom-color");
             await this.log.append({ type: "palette_color_add", id: ROOT_ID, payload: { color } });
           }
         }
@@ -15192,7 +15198,7 @@ export class StashpadView extends ItemView {
           (c) => c.toLowerCase() !== color.toLowerCase(),
         );
         this.plugin.settings.customPalette = list;
-        await this.plugin.persistSettingsQuiet();
+        await this.plugin.persistSettingsQuiet("custom-color");
         await this.log.append({ type: "palette_color_remove", id: ROOT_ID, payload: { color } });
         return list;
       },
@@ -15955,12 +15961,12 @@ export class StashpadView extends ItemView {
       const fm = this.app.metadataCache.getFileCache(t.file)?.frontmatter;
       const rec = parseRecurrence(fm?.repeat as string | undefined);
       if (!rec) continue;
-      const oldDue = fm?.due != null ? Date.parse(String(fm.due)) : NaN;
+      const oldDue = fm?.due != null ? parseDueString(String(fm.due)) : NaN;
       const next = nextDueOnComplete(rec, Number.isFinite(oldDue) ? oldDue : null, Date.now());
       prior.push({ path: t.file.path, due: fm?.due, completed: fm?.completed, missed: fm?.missed, missedAt: fm?.missedAt });
       this.markFmSelfWrite(t.file.path);
       await this.app.fileManager.processFrontMatter(t.file, (m) => {
-        m.due = new Date(next).toISOString();
+        m.due = nextDueValue(fm?.due, next); // 0.546.2: date-only stays date-only
         // Skipping is not completing, and not a miss — it's a deliberate pass.
         delete m.completed;
         delete m.missed;
@@ -19211,9 +19217,9 @@ export class StashpadView extends ItemView {
         const rec = newState ? parseRecurrence(fm.repeat as string | undefined) : null;
         const mode = parseRepeatMode(fm.repeatMode);
         if (rec) {
-          const oldDue = fm.due != null ? Date.parse(String(fm.due)) : NaN;
+          const oldDue = fm.due != null ? parseDueString(String(fm.due)) : NaN;
           const next = nextDueOnComplete(rec, Number.isFinite(oldDue) ? oldDue : null, Date.now());
-          const nextIso = new Date(next).toISOString();
+          const nextIso = nextDueValue(fm.due, next); // 0.546.2: date-only stays date-only
           if (mode === "complete" || mode === "interval") {
             // This occurrence is genuinely finished — it stays completed, and a
             // fresh incomplete one is created for the next interval.
@@ -19558,7 +19564,7 @@ export class StashpadView extends ItemView {
       const nodes = changedIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
       this.plugin.notifications.show({
         message: this.bulkActionMessage({
-          verb: iso === null ? "Cleared due date" : `Due ${formatDateTime(Date.parse(iso), this.plugin.settings)}`,
+          verb: iso === null ? "Cleared due date" : (isBareDateDue(iso) ? `Due ${formatDateOnly(parseDueString(iso), this.plugin.settings)}` : `Due ${formatDateTime(parseDueString(iso), this.plugin.settings)}`),
           nodes,
         }),
         kind: "success",
@@ -22810,7 +22816,7 @@ export class StashpadView extends ItemView {
   private renderAuthorshipFooter(container: HTMLElement, node: TreeNode): void {
     if (!node.file) return;
     const s = this.plugin.settings;
-    if (!s.showAuthor && !s.showContributors && !s.showLastEdit) return;
+    if (!s.showAuthor && !s.showContributors && !s.showLastEdit && !this.openDue(node)) return;
     const fm = (this.app.metadataCache.getFileCache(node.file)?.frontmatter ?? {}) as Record<string, any>;
     const authorRaw = typeof fm.author === "string" ? fm.author : "";
     const contributorsRaw: string[] = Array.isArray(fm.contributors)
@@ -22818,10 +22824,14 @@ export class StashpadView extends ItemView {
       : [];
     const modifiedRaw = typeof fm.modified === "string" ? fm.modified : (typeof fm.created === "string" ? fm.created : "");
 
+    // The due date shares this line with the edit time. Desktop: due first (the
+    // actionable date), then the edit. Mobile: the line has no room for both, so
+    // the due REPLACES the edit time; author/contributors stay.
+    const hasDue = !!this.openDue(node);
     const showAuthorPart = s.showAuthor && !!authorRaw;
     const showContribPart = s.showContributors && contributorsRaw.length > 0;
-    const showEditPart = s.showLastEdit && !!modifiedRaw;
-    if (!showAuthorPart && !showContribPart && !showEditPart) return;
+    const showEditPart = s.showLastEdit && !!modifiedRaw && !(hasDue && Platform.isMobile);
+    if (!showAuthorPart && !showContribPart && !showEditPart && !hasDue) return;
 
     const footer = container.createDiv({ cls: "stashpad-note-authorship" });
 
@@ -22852,6 +22862,13 @@ export class StashpadView extends ItemView {
     // only between actually-rendered pieces (no leading/trailing dots,
     // no double-gap when the middle piece is missing).
     const pieces: Array<(host: HTMLElement) => void> = [];
+    if (hasDue) {
+      pieces.push((host) => {
+        const slot = host.createSpan({ cls: "stashpad-note-due" });
+        slot.dataset.id = node.id;
+        this.fillDueSlot(slot, node);
+      });
+    }
     if (showAuthorPart) {
       pieces.push((host) => {
         host.createSpan({ cls: "stashpad-authorship-label", text: "by " });
@@ -23613,6 +23630,55 @@ export class StashpadView extends ItemView {
     const m = text.match(/^\s*---\s*\r?\n[\s\S]*?\r?\n---\s*(?:\r?\n|$)/);
     if (!m) return text;
     return text.slice(m[0].length);
+  }
+  /** The note's open due date — null when it has none or is already done
+   *  (a finished task's deadline is no longer news). */
+  private openDue(node: TreeNode): DueInfo | null {
+    if (!node.file || this.isCompleted(node)) return null;
+    return parseDue(this.app.metadataCache.getFileCache(node.file)?.frontmatter?.due);
+  }
+  /** Fill a footer due slot: icon + short label, tinted by warmth tier
+   *  (due-warmth.ts). Refilled in place by repaintDueSlots. */
+  private fillDueSlot(slot: HTMLElement, node: TreeNode): void {
+    slot.empty();
+    const due = this.openDue(node);
+    if (!due) return;
+    const settings = getSettings();
+    const tier = dueTier(due);
+    slot.className = `stashpad-note-due is-${tier}`;
+    rowIcon(slot.createSpan({ cls: "stashpad-note-due-icon" }), tier === "overdue" || tier === "stale" ? "alarm-clock-off" : "calendar-clock");
+    slot.createSpan({ cls: "stashpad-note-due-text", text: `due ${dueLabel(due, settings, !Platform.isMobile)}` });
+    const full = due.dateOnly ? formatDateOnly(due.ms, settings) : formatDateTime(due.ms, settings);
+    slot.setAttr("aria-label", `Due ${full} (${dueRelative(due)})`);
+  }
+  /** Keep the footer's due in step with the note. A due that appeared or went
+   *  away (set / cleared / ticked done) re-renders that row's footer in place —
+   *  it also decides whether the mobile "edited" piece shows. Otherwise just
+   *  refill the chip (date moved, or the clock crossed a tier). `tickOnly` = the
+   *  once-a-minute warmth refresh: existing chips only. */
+  private repaintDueSlots(tickOnly = false): void {
+    const root = this.viewRoot;
+    if (!root) return;
+    if (tickOnly) {
+      for (const slot of Array.from(root.querySelectorAll<HTMLElement>(".stashpad-note-due[data-id]"))) {
+        const node = this.tree.get((slot.dataset.id ?? "") as StashpadId);
+        if (node) this.fillDueSlot(slot, node);
+      }
+      return;
+    }
+    // List rows + the drilled-in (focused) note's header body.
+    for (const content of Array.from(root.querySelectorAll<HTMLElement>(".stashpad-note-body-content, .stashpad-focused-body"))) {
+      // Placeholder / not-yet-rendered bodies build their footer fresh later.
+      if (!content.querySelector(":scope > .stashpad-note-text:not(.is-lazy-placeholder)")) continue;
+      const row = content.closest<HTMLElement>(".stashpad-note");
+      const id = row ? row.dataset.id : content.closest(".stashpad-focused") ? this.focusId : undefined;
+      const node = id ? this.tree.get(id as StashpadId) : undefined;
+      if (!node) continue;
+      const slot = content.querySelector<HTMLElement>(".stashpad-note-due[data-id]");
+      if (!!this.openDue(node) === !!slot) { if (slot) this.fillDueSlot(slot, node); continue; }
+      content.querySelector(":scope > .stashpad-note-authorship")?.remove();
+      this.renderAuthorshipFooter(content, node);
+    }
   }
   private formatTime(iso: string): string {
     if (!iso) return "";

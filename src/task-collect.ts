@@ -1,6 +1,7 @@
 import { App, TFile } from "obsidian";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, fmHasTag, parseAssignees, parseAuthorRef } from "./types";
+import { parseDueString } from "./due-warmth";
 
 /** 0.126.0: a task surfaced from any Stashpad folder. Shared by the Tasks
  *  panel and the Daily-review modal so both read tasks identically. */
@@ -70,7 +71,7 @@ export function collectTasks(app: App, plugin: StashpadPlugin): TaskItem[] {
       // epoch. (0.140.5 review.)
       if (Number.isFinite(fm.due) && fm.due >= 1e11) due = fm.due;
     } else if (dueRaw) {
-      const t = Date.parse(dueRaw);
+      const t = parseDueString(dueRaw);
       if (!Number.isNaN(t)) due = t;
     }
     if (!task && !completed && due == null && !dueRaw) continue;

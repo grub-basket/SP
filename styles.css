@@ -6545,7 +6545,7 @@ body.is-hidden-frameless .stashpad-tiny-header .stashpad-folder-btn {
 .stashpad-triage-chip.is-active { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
 .stashpad-triage-chip-count { opacity: 0.75; font-variant-numeric: tabular-nums; }
 /* 0.128.0: trash view-mode toolbar (reuses the triage chip look) + kind badge. */
-.stashpad-trash-modes { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 12px; }
+.stashpad-trash-modes { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0 12px; }
 .stashpad-trash-kind { display: inline-flex; align-items: center; margin-right: 6px; color: var(--text-muted); flex: 0 0 auto; }
 .stashpad-trash-kind.is-enc { color: var(--text-accent); }
 .stashpad-trash-kind .svg-icon { width: 13px; height: 13px; }
@@ -12199,3 +12199,29 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-missing-option { display: flex; flex-direction: column; align-items: center; gap: 2px; }
 .stashpad-missing-why { font-size: var(--font-ui-smaller); color: var(--text-muted); }
 .stashpad-zerostate.is-missing .stashpad-zerostate-actions { margin-top: 16px; }
+/* Due date on the footer line beside the edit time (due-warmth.ts). Desktop:
+   due first, then the edit; mobile: due replaces the edit time. Warmth:
+   neutral → yellow (≤7d) → orange (≤48h) → red-orange (today) → red (overdue)
+   → filled deep red (>7d overdue). Compact hides the whole footer. */
+.stashpad-note-due {
+  --sp-due-c: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--sp-due-c);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  border-radius: 4px;
+}
+.stashpad-note-due-icon { display: inline-flex; align-items: center; flex: 0 0 auto; }
+.stashpad-note-due-icon svg { width: 1.1em; height: 1.1em; }
+.stashpad-note-due.is-week { --sp-due-c: var(--color-yellow, #e0ac00); }
+.stashpad-note-due.is-soon { --sp-due-c: var(--color-orange, #e08a47); }
+.stashpad-note-due.is-today { --sp-due-c: color-mix(in srgb, var(--color-orange, #e08a47) 45%, var(--color-red, #e93147)); font-weight: 600; }
+.stashpad-note-due.is-overdue { --sp-due-c: var(--color-red, #e93147); font-weight: 600; }
+.stashpad-note-due.is-stale {
+  --sp-due-c: var(--color-red, #e93147);
+  font-weight: 600;
+  padding: 0 4px;
+  background: color-mix(in srgb, var(--color-red, #e93147) 18%, transparent);
+}

@@ -4,6 +4,7 @@ import type StashpadPlugin from "./main";
 import { collectTasks, titleFromTaskFile, type TaskItem } from "./task-collect";
 import { writeCompletedFm } from "./types";
 import { formatDateOnly, formatTimeOnly } from "./format";
+import { dueDeadlineMs, isBareDateDue } from "./due-warmth";
 
 type Section = "overdue" | "today" | "upcoming" | "nodate" | "completed" | "failed";
 
@@ -337,7 +338,7 @@ function renderRow(
   // 0.131.1: show the author (creator) — most tasks have one but no assignee.
   if (t.author) meta.createSpan({ cls: "stashpad-review-author", text: `by ${t.author.name}` });
   if (t.due != null) {
-    const overdue = t.due < now && !t.completed;
+    const overdue = dueDeadlineMs(t.due, t.dueRaw) < now && !t.completed;
     // Calendar "today" (midnight→midnight), matching the bucket boundaries —
     // a ±24h window mislabels yesterday-11pm / tomorrow-9am as today and then
     // renders them time-only with no date. (0.140.5 review.)
@@ -346,7 +347,8 @@ function renderRow(
     const isToday = t.due >= startTodayMs && t.due < startTodayMs + 86_400_000;
     const dueEl = meta.createSpan({
       cls: "stashpad-review-due",
-      text: isToday ? formatTimeOnly(t.due, plugin.settings) : formatDateOnly(t.due, plugin.settings),
+      // A bare-date due has no time to show — "12:00 AM" would read as a deadline.
+      text: isToday ? (isBareDateDue(t.dueRaw) ? "Today" : formatTimeOnly(t.due, plugin.settings)) : formatDateOnly(t.due, plugin.settings),
     });
     if (overdue) dueEl.addClass("is-overdue");
   } else if (t.dueRaw) {

@@ -1,4 +1,5 @@
 import type StashpadPlugin from "./main";
+import { parseDueString, isBareDateDue } from "./due-warmth";
 import { App, Modal, ItemView, WorkspaceLeaf, Platform, TFile, Menu, moment, setIcon, Setting, type SecretStorage } from "obsidian";
 import { notify } from "./notify";
 import { normalisePastedPath } from "./paste-path";
@@ -4248,7 +4249,7 @@ export class DueDatePickerModal extends Modal {
     // Pre-fill from the current value when parseable.
     let initial: Date | null = null;
     if (this.current) {
-      const t = Date.parse(this.current);
+      const t = parseDueString(this.current);
       if (!Number.isNaN(t)) initial = new Date(t);
     }
 
@@ -4364,7 +4365,9 @@ export class DueDatePickerModal extends Modal {
     timeIcon.onclick = () => this.openTimeNumpad(timeIcon, timeInput);
     if (initial) {
       dateInput.value = this.toDateValue(initial);
-      timeInput.value = this.toTimeValue(initial);
+      // 0.546.0: a date-only due (bare YYYY-MM-DD) has no time — leave the box
+      // empty rather than showing 00:00 (Set then applies the usual default).
+      if (!isBareDateDue(this.current)) timeInput.value = this.toTimeValue(initial);
     }
 
     // 0.125.1: quick relative adjust row — a +/- flip toggle plus one button per
@@ -4679,6 +4682,16 @@ export class DueDatePickerModal extends Modal {
         this.didChoose = true;
         this.close();
         this.onPick({ iso: null, assignees: this.assignees, tags: this.tagsResult(), color: this.colorResult(), ...recur() });
+        return;
+      }
+      // 0.546.2: a date-only due opened in the picker and saved with the time box
+      // still empty stays DATE-ONLY (bare YYYY-MM-DD). Opening it just to change
+      // assignees / tags / repeat used to rewrite "2026-10-10" as 09:00 local,
+      // moving its reminder, deadline and label without the user touching it.
+      if (!timeInput.value && isBareDateDue(this.current)) {
+        this.didChoose = true;
+        this.close();
+        this.onPick({ iso: dateInput.value, assignees: this.assignees, tags: this.tagsResult(), color: this.colorResult(), ...recur() });
         return;
       }
       // Default time to 09:00 when only a date was chosen.

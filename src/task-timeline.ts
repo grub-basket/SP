@@ -1,4 +1,5 @@
 import { App, moment, setIcon, TFile } from "obsidian";
+import { dueDeadlineMs } from "./due-warmth";
 import type StashpadPlugin from "./main";
 import { collectTasks, type TaskItem } from "./task-collect";
 import { writeCompletedFm } from "./types";
@@ -196,7 +197,8 @@ export function renderTaskTimeline(
     else if (s.t.author) sub.createSpan({ cls: "stashpad-review-author", text: `by ${s.t.author.name}` });
     if (s.t.due != null) {
       const dueEl = sub.createSpan({ cls: "stashpad-review-due", text: formatDateOnly(s.t.due, plugin.settings) });
-      if (s.t.due < Date.now() && !s.t.completed) dueEl.addClass("is-overdue");
+      // 0.546.2: a date-only due lapses at the END of its day.
+      if (dueDeadlineMs(s.t.due, s.t.dueRaw) < Date.now() && !s.t.completed) dueEl.addClass("is-overdue");
     } else if (s.t.dueRaw) {
       sub.createSpan({ cls: "stashpad-review-due", text: s.t.dueRaw });
     }

@@ -38,6 +38,8 @@ export const ROW_ICON_NAMES = [
   "ellipsis-vertical",  // more actions
   "star",               // quick actions
   "smile-plus",         // add reaction
+  "calendar-clock",     // due-date chip (upcoming)
+  "alarm-clock-off",    // due-date chip (overdue)
 ] as const;
 
 export type RowIconName = (typeof ROW_ICON_NAMES)[number];

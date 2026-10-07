@@ -293,7 +293,7 @@ function buildReactionPickerBody(
   const toggleFavorite = async (emoji: string): Promise<void> => {
     const cur = favorites();
     view.plugin.settings.favoriteReactions = cur.includes(emoji) ? cur.filter((e) => e !== emoji) : [...cur, emoji];
-    await view.plugin.persistSettingsQuiet();
+    await view.plugin.persistSettingsQuiet("reaction");
     renderSections();
   };
   const button = (parent: HTMLElement, emoji: string, cls: string, title?: string): HTMLButtonElement => {

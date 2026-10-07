@@ -3,7 +3,8 @@ import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { renderCountBadge } from "./panels-view";
 import { ComposerAutocomplete } from "./composer-autocomplete";
-import { formatDateTime } from "./format";
+import { formatDateTime, formatDateOnly } from "./format";
+import { parseDueString, isBareDateDue } from "./due-warmth";
 import {
   ROOT_ID,
   STASHPAD_DETAIL_VIEW_TYPE,
@@ -281,8 +282,9 @@ export class StashpadDetailView extends ItemView {
     }
     if (fm.completed === true) metaRow.createSpan({ cls: "stashpad-detail-meta-chip is-completed", text: "✓ completed" });
     if (typeof fm.due === "string" || typeof fm.due === "number") {
-      const dueMs = Date.parse(String(fm.due));
-      const dueLabel = Number.isNaN(dueMs) ? String(fm.due) : formatDateTime(dueMs, this.plugin.settings);
+      const dueMs = typeof fm.due === "number" ? fm.due : parseDueString(String(fm.due));
+      const dueLabel = Number.isNaN(dueMs) ? String(fm.due)
+        : isBareDateDue(fm.due) ? formatDateOnly(dueMs, this.plugin.settings) : formatDateTime(dueMs, this.plugin.settings);
       metaRow.createSpan({ cls: "stashpad-detail-meta-chip is-due", text: `due ${dueLabel}` });
     }
     if (Array.isArray(fm.tags)) {
