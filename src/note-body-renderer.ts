@@ -21,6 +21,14 @@ export interface RenderEntry {
    *  (pre-0.473.2 code blocks collapsed to ~0 height and read as "fits")
    *  outlived the fix. A memo whose `ovX` isn't OV_MEMO_VERSION is re-measured. */
   ovX?: number;
+  /** 0.545.0: collapsed-preview cut height in px (bottom of the Nth whole line,
+   *  measured at `ovW`); undefined when the note isn't cut. */
+  ovH?: number;
+  /** 0.545.0: height of that last visible line, for the end-of-preview fade. */
+  ovL?: number;
+  /** 0.545.0: the preview settings the verdict was made under (mode + lines +
+   *  counts) — a settings change re-measures instead of trusting the memo. */
+  ovS?: string;
   /** 0.542.0: DEEP_LINK_RENDER_VERSION this was rendered under. A cached body
    *  that contains `obsidian://` without it predates the deep-link fix (links cut
    *  at `_`/`*`, `&note` shown as `¬e`) and is re-rendered on next view. */
@@ -42,8 +50,10 @@ function isFreshEntry(e: RenderEntry | undefined, mtime: number): e is RenderEnt
  *  the same list width now gives the text more room — verdicts measured before
  *  it said "overflows" for notes that now fit (Show more on short notes).
  *  3 (0.544.4): the 0.544.1 measure of EXPANDED rows read block-content bodies
- *  (code / table / callout) as "fits" on desktop; drop those verdicts. */
-export const OV_MEMO_VERSION = 3;
+ *  (code / table / callout) as "fits" on desktop; drop those verdicts.
+ *  4 (0.545.0): collapse is decided by whole LINES (N from settings) and the
+ *  cut height is memoized alongside (ovH/ovL/ovS). */
+export const OV_MEMO_VERSION = 4;
 
 /** The view members the body renderer calls back into. */
 export interface NoteBodyHost {

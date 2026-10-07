@@ -1049,6 +1049,23 @@ export interface StashpadSettings {
    *  interpreted as "differs from this default"). Off = current behavior
    *  (bodies clamp by default, expand is opt-in). */
   expandBodiesByDefault: boolean;
+  /** 0.545.0: collapsed note preview. `lines` = whole lines shown while a note
+   *  is collapsed. `mode`:
+   *  - "classic" (DEFAULT — the pre-0.545 behavior, so nobody's list changes
+   *    overnight): -webkit-line-clamp N with a "…", code/table/callout bodies
+   *    capped at ~6 lines, overflow measured by scrollHeight. Can show part of
+   *    an extra line on block content.
+   *  - "measure": collapses notes whose rendered body runs past N lines at the
+   *    current width, cut at the bottom of the Nth whole line (no partial
+   *    lines; every note shape gets N lines; a fade replaces the "…").
+   *  - "count": collapses notes with at least `countLines` non-blank lines OR
+   *    `countChars` characters (width-independent), same whole-line cut.
+   *  Per platform, like editRouting. */
+  previewClamp: {
+    mode: "classic" | "measure" | "count";
+    desktop: { lines: number; countLines: number; countChars: number };
+    mobile: { lines: number; countLines: number; countChars: number };
+  };
   /** 0.436.0: headings (drilled-in parent notes shown as a sticky row) start
    *  EXPANDED instead of collapsed. Per-heading toggle then collapses them. */
   headingsExpandedByDefault: boolean;
@@ -1512,6 +1529,11 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   virtualizeLargeLists: true,
   favoriteReactions: [],
   expandBodiesByDefault: false,
+  previewClamp: {
+    mode: "classic",
+    desktop: { lines: 2, countLines: 3, countChars: 300 },
+    mobile: { lines: 2, countLines: 3, countChars: 150 },
+  },
   headingsExpandedByDefault: false,
   autoOpenDetailPanel: false,
   doubleClickToFocus: true,
@@ -4841,6 +4863,52 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.virtualizeLargeLists !== false, (v) => { this.plugin.settings.virtualizeLargeLists = v; }, ["virtual", "window", "large", "performance", "scroll", "rows"]));
     cats.listDisplay.push(toggle("Expand note bodies by default", "Show every note's full body by default instead of clamping long notes. The per-note 'Show more / show less' toggle and the Expand-all / Collapse-all commands then work in reverse — they let you collapse individual notes back down. Off = bodies clamp by default (expand is opt-in).",
       () => this.plugin.settings.expandBodiesByDefault, (v) => { this.plugin.settings.expandBodiesByDefault = v; }, ["expand", "collapse", "default", "body", "clamp"]));
+    // 0.545.0: how much of a collapsed note shows, and which notes collapse.
+    cats.listDisplay.push(this.renderDef("How long notes collapse", "Classic (default): the original preview — the first lines with a “…”; notes with a code block, table or callout show about 6 lines, and can show part of an extra line. Whole lines: every note shows exactly the preview lines set below, cut cleanly at the end of a line (no half lines), with a fade at the end; a note collapses when it runs past them at the current pane width. Count: like Whole lines, but a note collapses when it has at least the line or character count below — width-independent, so on a wide pane a note over the count can still fit and its Show more reveals nothing. Notes under the counts show in full.", (s) => {
+      s.addDropdown((d) => d
+        .addOption("classic", "Classic")
+        .addOption("measure", "Whole lines (measured)")
+        .addOption("count", "Count lines and characters")
+        .setValue(this.plugin.settings.previewClamp.mode)
+        .onChange(async (v) => { this.plugin.settings.previewClamp.mode = v === "count" ? "count" : v === "measure" ? "measure" : "classic"; await set(); }));
+    }, ["collapse", "clamp", "preview", "lines", "characters", "count", "measure", "show more"]));
+    for (const plat of ["desktop", "mobile"] as const) {
+      cats.listDisplay.push(this.renderDef(`Collapsed preview — ${plat}`, "", (s) => {
+        s.descEl.empty();
+        const d = DEFAULT_SETTINGS.previewClamp[plat];
+        for (const l of [
+          `On ${plat}:`,
+          "lines → how many lines a collapsed note shows (Classic: code/table/callout notes still show about 6)",
+          "count lines / count chars → Count mode only: collapse a note with at least this many non-blank lines, or at least this many characters",
+          `Defaults ${d.lines} / ${d.countLines} / ${d.countChars}.`,
+        ]) s.descEl.createDiv({ text: l });
+        // Read the live object at commit time — a settings reload/sync can
+        // replace previewClamp while this tab is open.
+        const r = (): { lines: number; countLines: number; countChars: number } => this.plugin.settings.previewClamp[plat];
+        s.controlEl.addClass("stashpad-edit-limits");
+        const fields: Array<{ key: "lines" | "countLines" | "countChars"; label: string; min: number; max: number }> = [
+          { key: "lines", label: "lines", min: 1, max: 50 },
+          { key: "countLines", label: "count lines", min: 1, max: 1000 },
+          { key: "countChars", label: "count chars", min: 1, max: 1_000_000 },
+        ];
+        for (const f of fields) {
+          const col = s.controlEl.createDiv({ cls: "stashpad-edit-limit" });
+          col.createDiv({ cls: "stashpad-edit-limit-label", text: f.label });
+          const input = col.createEl("input", { type: "text", attr: { placeholder: f.label, inputmode: "numeric", "aria-label": `${plat}: ${f.label}` } });
+          input.value = String(r()[f.key]);
+          const commit = async (): Promise<void> => {
+            const raw = input.value.trim();
+            const n = Number(raw);
+            if (!/^\d+$/.test(raw) || n < f.min || n > f.max) { input.value = String(r()[f.key]); return; }
+            if (n === r()[f.key]) return;
+            r()[f.key] = n;
+            await set();
+          };
+          input.addEventListener("blur", () => void commit());
+          input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); void commit(); } });
+        }
+      }, ["collapse", "clamp", "preview", "lines", "characters", "count", "show more", plat]));
+    }
     cats.listDisplay.push(toggle("Expand headings by default", "When you drill into a note, show its full body in the sticky heading row by default instead of the one-line preview. The heading's expand/collapse chevron then works in reverse. Off = headings start collapsed (the default).",
       () => this.plugin.settings.headingsExpandedByDefault, (v) => { this.plugin.settings.headingsExpandedByDefault = v; }, ["expand", "collapse", "heading", "default", "parent"]));
     cats.movingNotes.push(toggle("Confirm cross-parent drag-and-drop", "When dragging notes onto a note that has a different parent, ask before re-parenting (turn off to allow direct moves).",

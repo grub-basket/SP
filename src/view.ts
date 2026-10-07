@@ -129,6 +129,66 @@ const CLAMP_CHAR_FALLBACK = 2000;
 function isLongBody(text: string): boolean {
   return text.length > CLAMP_CHAR_FALLBACK;
 }
+
+/** 0.545.0: one visual line of a rendered body, in px from the top of the
+ *  element's content (scroll-independent). */
+interface LineBox { top: number; bottom: number }
+
+/** Elements that occupy a line like text does (an image or checkbox on its own
+ *  line is still "a line" of the preview). */
+const LINE_LIKE = "img, svg, video, canvas, iframe, input, .math";
+
+/** 0.545.0: the first `max` visual lines of `el`, read from the browser's own
+ *  line boxes (Range.getClientRects on text, plus line-like elements) and merged
+ *  where they overlap vertically (inline code, mixed font sizes, table cells on
+ *  one row). This is what lets the collapsed preview cut at the bottom of a real
+ *  line — a fixed `N × line-height` guess cut code blocks / callouts / tables /
+ *  quotes mid-line (their padding and font sizes differ from body text).
+ *  Stops early once `max` lines are known, so long notes cost the same as short. */
+function collectLineBoxes(el: HTMLElement, max: number): LineBox[] {
+  const doc = el.ownerDocument;
+  const box = el.getBoundingClientRect();
+  const origin = box.top - el.scrollTop;
+  const lines: LineBox[] = [];
+  const add = (r: DOMRect): void => {
+    if (r.height <= 0 || r.width <= 0) return;
+    const top = r.top - origin, bottom = r.bottom - origin;
+    // Merge into a line it overlaps (search the last few — content arrives in
+    // document order, which is top-to-bottom outside of rare float cases).
+    for (let i = lines.length - 1; i >= Math.max(0, lines.length - 4); i--) {
+      const l = lines[i];
+      if (top < l.bottom - 2 && bottom > l.top + 2) { l.top = Math.min(l.top, top); l.bottom = Math.max(l.bottom, bottom); return; }
+    }
+    let at = lines.length;
+    while (at > 0 && lines[at - 1].top > top) at--;
+    lines.splice(at, 0, { top, bottom });
+  };
+  const range = doc.createRange();
+  const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (n.nodeType === Node.TEXT_NODE) {
+      if (!n.nodeValue?.trim() || n.parentElement?.closest("svg")) continue;
+      range.selectNodeContents(n);
+      for (const r of Array.from(range.getClientRects())) add(r);
+    } else if ((n as Element).matches(LINE_LIKE) && !(n as Element).parentElement?.closest("svg")) {
+      add((n as Element).getBoundingClientRect());
+    }
+    // One line past `max` tells us both "there is more" and where it starts.
+    if (lines.length > max + 1) break;
+  }
+  range.detach();
+  return lines;
+}
+
+/** 0.545.0: Count mode — collapse at `countLines` non-blank lines OR
+ *  `countChars` characters of the note's text (raw Markdown, frontmatter and
+ *  attachment links already stripped). */
+function exceedsCounts(text: string, c: { countLines: number; countChars: number }): boolean {
+  if (text.length >= c.countChars) return true;
+  let n = 0;
+  for (const line of text.split("\n")) if (line.trim() && ++n >= c.countLines) return true;
+  return false;
+}
 /** 0.279.3: max entries kept in each nav history stack (back / forward). The
  *  stacks are persisted, so an uncapped one grew without bound over a session and
  *  across reloads. 100 is far more than anyone back-steps through in practice. */
@@ -9021,10 +9081,97 @@ export class StashpadView extends ItemView {
       // A row still showing its lazy placeholder has nothing measured yet; its
       // real render measures at the new width on its own.
       if (!container || !textEl || !actions || !entry) continue;
-      if (!expanded) textEl.addClass("is-clamped");
+      if (!expanded) this.markClamped(textEl);
       const opts = { clamp: true, toggleHost: actions, toggleAnchor: this.rowToggleAnchor(actions) };
       this.queueClampMeasure({ opts, container, node, textEl, entry, memoW: w, expanded });
     }
+  }
+
+  /** 0.545.0: the pre-0.545 ("Classic", the default) overflow measure, kept
+   *  verbatim so nothing changes for anyone who doesn't opt in: the body is
+   *  -webkit-line-clamped (block content: max-height), and it overflows when
+   *  scrollHeight beats the clamped clientHeight. Expanded rows are measured
+   *  under a temporary clamp with .is-body-expanded lifted (0.544.1/0.544.4);
+   *  the cursor row's transient un-clamp is lifted too. */
+  private measureClassic(live: StashpadView["clampBatch"], sig: string): void {
+    const cursorRows = new Set<HTMLElement>();
+    for (const b of live) {
+      const r = b.container.closest?.(".stashpad-note.is-cursor-expanded") as HTMLElement | null;
+      if (r) cursorRows.add(r);
+    }
+    for (const r of cursorRows) r.removeClass("is-cursor-expanded");
+    const tempClamped = live.filter((b) => b.expanded && !b.textEl.hasClass("is-clamped"));
+    const tempUnexpanded = tempClamped.filter((b) => b.container.hasClass("is-body-expanded"));
+    // The line count lives on the element (markClamped); an expanded row never
+    // got it, so set it for the measure — else CSS falls back to 2 lines.
+    const lines = String(this.previewCfg().lines);
+    for (const b of tempClamped) { b.textEl.addClass("is-clamped", "is-classic"); b.textEl.setCssProps({ "--sp-preview-lines": lines }); }
+    for (const b of tempUnexpanded) b.container.removeClass("is-body-expanded");
+    // Reads: one layout for the whole batch.
+    const sizes = live.map((b) => ({ sh: b.textEl.scrollHeight, ch: b.textEl.clientHeight }));
+    // Writes: restore, then apply each row's decision.
+    for (const b of tempClamped) b.textEl.removeClass("is-clamped");
+    for (const b of tempUnexpanded) b.container.addClass("is-body-expanded");
+    for (const r of cursorRows) r.addClass("is-cursor-expanded");
+    live.forEach((b, i) => {
+      const { sh, ch } = sizes[i];
+      const laidOut = ch > 0;
+      const overflowing = (laidOut && sh > ch + 4) || isLongBody(b.entry.text);
+      if (laidOut) {
+        b.entry.ovW = b.memoW;
+        b.entry.ovV = overflowing;
+        b.entry.ovX = OV_MEMO_VERSION;
+        b.entry.ovS = sig;
+        b.entry.ovH = undefined;
+        b.entry.ovL = undefined;
+      }
+      if (!overflowing) {
+        if (!b.expanded) b.textEl.removeClass("is-clamped");
+        b.opts.toggleHost?.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());
+        b.container.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());
+        return;
+      }
+      this.attachExpandToggle(b.opts, b.container, b.node, b.expanded);
+    });
+  }
+
+  /** 0.545.0: collapsed-preview settings for this platform. */
+  private previewCfg(): { mode: "classic" | "measure" | "count"; lines: number; countLines: number; countChars: number } {
+    const pc = getSettings().previewClamp;
+    const p = Platform.isMobile ? pc.mobile : pc.desktop;
+    return { mode: pc.mode, lines: Math.max(1, p.lines), countLines: p.countLines, countChars: p.countChars };
+  }
+  /** Memo key part for the preview settings (a change re-measures). */
+  private previewSig(c: ReturnType<StashpadView["previewCfg"]>): string {
+    return c.mode === "count" ? `count|${c.lines}|${c.countLines}|${c.countChars}` : `${c.mode}|${c.lines}`;
+  }
+  /** Is this entry's overflow memo valid for the current width + settings? */
+  private previewMemoValid(e: RenderEntry): boolean {
+    return e.ovW === this.lastListWidth && e.ovV !== undefined && e.ovX === OV_MEMO_VERSION
+      && e.ovS === this.previewSig(this.previewCfg());
+  }
+  /** 0.545.0: collapse a body. Sets the preview line count (the pre-measure
+   *  fallback height) and, when a valid memo exists, the exact cut. */
+  private markClamped(textEl: HTMLElement, entry?: RenderEntry): void {
+    const cfg = this.previewCfg();
+    textEl.addClass("is-clamped");
+    textEl.toggleClass("is-classic", cfg.mode === "classic");
+    textEl.setCssProps({ "--sp-preview-lines": String(cfg.lines) });
+    if (cfg.mode !== "classic" && entry && this.previewMemoValid(entry)) this.applyPreviewCut(textEl, !!entry.ovV, entry.ovH, entry.ovL, true);
+  }
+  /** 0.545.0: apply a measured cut. `cutH` = px to the bottom of the last whole
+   *  line shown; `lastH` = that line's height (the end-of-preview fade covers
+   *  it). A collapsing note with no cut (Count mode: over the counts but within
+   *  the preview lines) shows in full rather than at a guessed height. */
+  private applyPreviewCut(textEl: HTMLElement, overflowing: boolean, cutH: number | undefined, lastH: number | undefined, laidOut: boolean): void {
+    if (cutH !== undefined) {
+      textEl.setCssProps({ "--sp-clamp-h": `${cutH}px`, "--sp-clamp-last": `${lastH ?? cutH}px` });
+      textEl.addClass("is-cut");
+      return;
+    }
+    textEl.removeClass("is-cut");
+    // An empty value removes the property (setCssProps → style.setProperty).
+    textEl.setCssProps({ "--sp-clamp-last": "", "--sp-clamp-h": overflowing && laidOut ? "none" : "" });
   }
 
   /** Where a list row's Show more toggle goes inside its action cluster. */
@@ -9045,52 +9192,67 @@ export class StashpadView extends ItemView {
       // A row can be torn down (virtualization, re-render, folder switch)
       // between schedule and frame — never measure a detached node.
       const live = batch.filter((b) => b.container.isConnected && b.textEl.isConnected);
-      // An EXPANDED note isn't clamped (0.118.11), so reading it as-is says
-      // "fits" and would cache a stale ovV=false. 0.544.0: it used to skip the
-      // measure and ALWAYS get a Show less — so with "expand bodies by default"
-      // every one-line row carried a collapse button. Now it is measured under a
-      // temporary `.is-clamped` (added and removed inside this frame, before
-      // paint) and only gets the button if collapsing would actually hide text.
-      const measured = live;
-      if (measured.length === 0) return;
-      // Phase 1 (writes): the cursor row is transiently unclamped by
-      // `.is-cursor-expanded`; drop it so `.is-clamped` defines clientHeight.
+      if (live.length === 0) return;
+      const cfg = this.previewCfg();
+      const sig = this.previewSig(cfg);
+      if (cfg.mode === "classic") { this.measureClassic(live, sig); return; }
+      // 0.545.0: measure every row in its COLLAPSED layout. A collapsed body
+      // (overflow: hidden) is its own formatting context, so beside the 0.540.0
+      // floated row buttons it can wrap narrower than the same body expanded or
+      // cursor-expanded (which flow under the float) — a cut measured in the
+      // expanded layout could land mid-line once collapsed. So, as Classic does:
+      // writes (temporary collapse) → reads (one layout for the batch) → restore.
+      // Clipping doesn't remove line boxes, so every line is still readable.
       const cursorRows = new Set<HTMLElement>();
-      for (const b of measured) {
+      for (const b of live) {
         const r = b.container.closest?.(".stashpad-note.is-cursor-expanded") as HTMLElement | null;
         if (r) cursorRows.add(r);
       }
       for (const r of cursorRows) r.removeClass("is-cursor-expanded");
-      const tempClamped = measured.filter((b) => b.expanded && !b.textEl.hasClass("is-clamped"));
-      // The container's .is-body-expanded must go too: on desktop
-      // `.is-wrap-actions … .is-body-expanded .stashpad-note-text` (max-height:
-      // none) outranks the block-content clamp, so a body with a code block /
-      // table / callout would measure as "fits" while still marked expanded.
-      const tempUnexpanded = tempClamped.filter((b) => b.container.hasClass("is-body-expanded"));
+      const tempClamped = live.filter((b) => !b.textEl.hasClass("is-clamped"));
+      const tempUnexpanded = live.filter((b) => b.container.hasClass("is-body-expanded"));
       for (const b of tempClamped) b.textEl.addClass("is-clamped");
       for (const b of tempUnexpanded) b.container.removeClass("is-body-expanded");
-      // Phase 2 (reads): one layout for the whole batch. 0.118.7 — measure
-      // overflow against the ACTUAL clamped height, not a line-height heuristic.
-      const sizes = measured.map((b) => ({ sh: b.textEl.scrollHeight, ch: b.textEl.clientHeight }));
-      // Phase 3 (writes): restore, then apply each row's decision.
+      const reads = live.map((b) => {
+        // 0.512.0: a row that isn't laid out (hidden pane, display:none parent)
+        // has no lines to read. Don't memoize that.
+        const laidOut = b.textEl.clientHeight > 0;
+        const lines = laidOut ? collectLineBoxes(b.textEl, cfg.lines) : [];
+        let cutH: number | undefined, lastH: number | undefined;
+        if (lines.length > cfg.lines) {
+          // Cut at the bottom of line N — never below the top of line N+1, so
+          // no sliver of it shows (the "2.5 lines" bug) and no paragraph gap.
+          const last = lines[cfg.lines - 1], next = lines[cfg.lines];
+          let cut = Math.min(last.bottom + 2, next.top);
+          // Positions are from the border-box top; a content-box max-height
+          // excludes the top padding + border.
+          const cs = getComputedStyle(b.textEl);
+          if (cs.boxSizing !== "border-box") cut -= (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.borderTopWidth) || 0);
+          cutH = Math.max(1, Math.round(cut));
+          lastH = Math.max(1, Math.round(cut - last.top));
+        }
+        return { laidOut, lines: lines.length, cutH, lastH };
+      });
       for (const b of tempClamped) b.textEl.removeClass("is-clamped");
       for (const b of tempUnexpanded) b.container.addClass("is-body-expanded");
       for (const r of cursorRows) r.addClass("is-cursor-expanded");
-      measured.forEach((b, i) => {
-        const { sh, ch } = sizes[i];
-        // 0.512.0: a row that isn't laid out (hidden pane, display:none parent)
-        // reads 0/0 = "fits". Don't memoize that — the persisted memo would pin
-        // the note unclamped with no toggle until it's next edited.
-        const laidOut = ch > 0;
-        const overflowing = (laidOut && sh > ch + 4) || isLongBody(b.entry.text);
+      // Writes: memoize, then apply each row's decision.
+      live.forEach((b, i) => {
+        const { laidOut, lines, cutH, lastH } = reads[i];
+        const overflowing = cfg.mode === "count"
+          ? exceedsCounts(b.entry.text, cfg)
+          : (laidOut ? lines > cfg.lines : isLongBody(b.entry.text));
         if (laidOut) {
-          // Memoize for subsequent re-renders at this width (clamped read only).
           b.entry.ovW = b.memoW;
           b.entry.ovV = overflowing;
           b.entry.ovX = OV_MEMO_VERSION;
+          b.entry.ovS = sig;
+          b.entry.ovH = cutH;
+          b.entry.ovL = lastH;
         }
+        this.applyPreviewCut(b.textEl, overflowing, cutH, lastH, laidOut);
         if (!overflowing) {
-          // Short note that fits — drop the clamp so the fade gradient doesn't apply.
+          // Short note that fits — drop the clamp.
           if (!b.expanded) b.textEl.removeClass("is-clamped");
           // 0.540.3: a width re-measure (remeasureClampsForWidth) can find a note
           // that USED to overflow now fits — drop its leftover Show more, which
@@ -9147,13 +9309,13 @@ export class StashpadView extends ItemView {
   private prepaintCachedBody(
     container: HTMLElement,
     node: TreeNode,
-    entry: { text: string; html: string },
+    entry: RenderEntry,
     opts: { clamp?: boolean },
   ): void {
     container.empty();
     const textEl = container.createDiv({ cls: "stashpad-note-text" });
     const expanded = this.isNoteExpanded(node.id);
-    if (opts.clamp && !expanded) textEl.addClass("is-clamped");
+    if (opts.clamp && !expanded) this.markClamped(textEl, entry);
     container.toggleClass("is-body-expanded", opts.clamp === true && expanded);
     if (this.compactMode || this.tinyMode) { textEl.addClass("is-plain"); textEl.textContent = entry.text; }
     else {
@@ -9187,7 +9349,7 @@ export class StashpadView extends ItemView {
       container.empty();
       const textEl = container.createDiv({ cls: "stashpad-note-text" });
       const expanded = this.isNoteExpanded(node.id);
-      if (opts.clamp && !expanded) textEl.addClass("is-clamped");
+      if (opts.clamp && !expanded) this.markClamped(textEl, entry);
       // 0.171.1: the focused-header body has its own height cap
       // (.stashpad-focused-body max-height) that the text clamp doesn't
       // control. Mirror the expanded state onto the container so that cap
@@ -9253,9 +9415,10 @@ export class StashpadView extends ItemView {
       // This is what spares a 200-child Home from 200 layout reflows
       // when one note is added (199 rows hit this branch).
       const memoW = this.lastListWidth;
-      // 0.544.0: expanded rows use it too — the memo is always a CLAMPED read.
-      if (entry.ovW === memoW && entry.ovV !== undefined && entry.ovX === OV_MEMO_VERSION) {
-        if (!entry.ovV && !isLongBody(text)) {
+      // 0.544.0: expanded rows use it too. 0.545.0: also keyed by the preview
+      // settings (ovS), and carries the cut height (applied by markClamped).
+      if (this.previewMemoValid(entry)) {
+        if (!entry.ovV) {
           textEl.removeClass("is-clamped");
           // A toggle left in the action cluster by an in-place body re-render.
           opts.toggleHost?.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());

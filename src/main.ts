@@ -13350,6 +13350,19 @@ export default class StashpadPlugin extends Plugin {
       // and the legacy map is cleared so it can't re-migrate a since-edited draft.
       drafts: {},
       composerDrafts: normalizeComposerDrafts(data?.composerDrafts, normalizeDrafts(data?.drafts)),
+      // 0.545.0: collapsed-preview lines + measure/count mode, per platform.
+      previewClamp: (() => {
+        const d = DEFAULT_SETTINGS.previewClamp; const r = data?.previewClamp ?? {};
+        const int = (x: unknown, def: number, min: number, max: number): number =>
+          typeof x === "number" && Number.isFinite(x) ? Math.max(min, Math.min(max, Math.round(x))) : def;
+        const plat = (x: any, def: { lines: number; countLines: number; countChars: number }) => ({
+          lines: int(x?.lines, def.lines, 1, 50),
+          countLines: int(x?.countLines, def.countLines, 1, 1000),
+          countChars: int(x?.countChars, def.countChars, 1, 1_000_000),
+        });
+        const mode = r.mode === "count" || r.mode === "measure" ? r.mode as "count" | "measure" : "classic" as const;
+        return { mode, desktop: plat(r.desktop, d.desktop), mobile: plat(r.mobile, d.mobile) };
+      })(),
       editRouting: (() => {
         const d = DEFAULT_SETTINGS.editRouting; const r = data?.editRouting ?? {};
         const tri = (x: any, def: { composer: number; modal: number; tab: number }) => ({

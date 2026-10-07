@@ -2129,30 +2129,54 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 
 .stashpad-note-text.is-clamped {
-  /* Two-line clamp with ellipsis. Show More toggle (rendered after the
-     text) flips the .is-clamped class so the rest comes into view. */
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  /* 0.545.0: a collapsed body is a plain BLOCK cut at a measured height — the
+     bottom of its Nth whole line (Settings → "Collapsed preview", per platform),
+     set per row as --sp-clamp-h by the view after reading the browser's own line
+     boxes. Replaces -webkit-line-clamp: 2, and the 0.473.2 fixed
+     `max-height: 1.5em × 6` that code blocks / tables / callouts used instead
+     (line-clamp collapses a <pre>). Both cut mid-line — a callout showed 83 % of
+     an extra line, quotes and tables a sliver, multi-paragraph notes a blank
+     paragraph gap. Until the row is measured (one frame), N × the element's own
+     line-height is the fallback. Collapsing changes no layout inside the body,
+     which is what lets the measurement read expanded rows as they are. */
+  display: block;
   overflow: hidden;
-  text-overflow: ellipsis;
+  max-height: var(--sp-clamp-h, calc(var(--sp-preview-lines, 2) * 1lh));
   position: relative;
 }
-/* 0.473.2: a body with a code block can't be line-clamped — `-webkit-line-clamp`
-   collapses the <pre> to ~0 height, which clips Obsidian's copy button and lets
-   the row footer overlap its hit area, so clicking it does nothing. Clamp by
-   max-height instead: block layout is preserved, the <pre> lays out normally and
-   its copy button (top-right of the block) stays visible and clickable. The
-   expand toggle still appears via the generic scrollHeight overflow measure.
-   Scoped to LIST ROWS (.stashpad-note) — the focused-header body already uses a
-   block max-height scroll window (never had the -webkit-line-clamp bug), so it
-   must not be overridden by this (equal-specificity, later) rule. */
-.stashpad-note .stashpad-note-text.is-clamped.has-block-content {
+/* End-of-preview cue (the "…" that -webkit-line-clamp drew is gone with it):
+   the last visible line fades out over its right quarter. A mask, not a
+   gradient overlay, so it works on any row background (selected, coloured,
+   hover). Only on rows that are actually cut. */
+.stashpad-note-text.is-clamped.is-cut {
+  -webkit-mask-image: linear-gradient(#000, #000), linear-gradient(to right, #000 75%, transparent);
+  -webkit-mask-size: 100% calc(100% - var(--sp-clamp-last, 1lh)), 100% var(--sp-clamp-last, 1lh);
+  -webkit-mask-position: left top, left bottom;
+  -webkit-mask-repeat: no-repeat;
+  mask-image: linear-gradient(#000, #000), linear-gradient(to right, #000 75%, transparent);
+  mask-size: 100% calc(100% - var(--sp-clamp-last, 1lh)), 100% var(--sp-clamp-last, 1lh);
+  mask-position: left top, left bottom;
+  mask-repeat: no-repeat;
+}
+/* 0.545.0: "Classic" (the DEFAULT, Settings → How long notes collapse) keeps
+   the pre-0.545 preview exactly: -webkit-line-clamp N with a "…", and bodies
+   with a code block / table / callout capped by max-height instead (0.473.2 —
+   line-clamp collapses a <pre> and clips its copy button). `:where()` keeps
+   each rule at its OLD specificity, so the cursor-row un-clamp below still
+   wins over them as it always did. Whole lines / Count modes (no .is-classic)
+   give every note shape the same measured N-line cut instead. */
+.stashpad-note-text.is-clamped:where(.is-classic) {
+  display: -webkit-box;
+  -webkit-line-clamp: var(--sp-preview-lines, 2);
+  -webkit-box-orient: vertical;
+  text-overflow: ellipsis;
+  max-height: none;
+}
+.stashpad-note .stashpad-note-text.is-clamped.has-block-content:where(.is-classic) {
   display: block;
   -webkit-line-clamp: unset;
   -webkit-box-orient: unset;
-  max-height: calc(1.5em * 6);
-  overflow: hidden;
+  max-height: calc(1.5em * max(6, var(--sp-preview-lines, 2)));
   text-overflow: clip;
 }
 /* 0.73.14: transient un-clamp for the row under the keyboard cursor.
@@ -2164,7 +2188,9 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   -webkit-line-clamp: unset;
   overflow: visible;
   text-overflow: clip;
-  max-height: none; /* 0.473.2: also drop the has-block-content max-height cap */
+  max-height: none; /* also drops the measured --sp-clamp-h cut */
+  -webkit-mask-image: none;
+  mask-image: none;
 }
 /* 0.177.0 (#26): an EXPANDED list note is capped to a scroll window so a very long
    note doesn't take over the list — scroll within it to read the rest. Only the
