@@ -2025,6 +2025,9 @@ export default class StashpadPlugin extends Plugin {
   /** Folders the user chose "Create it here again" for this session — the
    *  missing-folder guard in bootstrapFolder lets these through. */
   recreateAllowed = new Set<string>();
+  /** 0.543.0: how long a tab whose folder vanished waits for it to reappear
+   *  under a new name before it is treated as deleted and closed. */
+  static readonly VANISHED_FOLDER_GRACE_MS = 10_000;
   /** The user chose to (re)create a Stashpad at `folder`: stop treating it as a
    *  moved folder's old path, now and after a restart. */
   allowRecreate(folder: string): void {
@@ -2233,20 +2236,25 @@ export default class StashpadPlugin extends Plugin {
   async handleStashpadFolderDeleted(path: string): Promise<void> {
     const cleaned = path.replace(/\/+$/, "");
     if (!cleaned || this.suppressedFolderDeletes.has(cleaned)) return;
-    // 0.541.1: tabs are NOT closed any more. A folder that vanishes outside
-    // Stashpad was often renamed or moved (a rename on another machine arrives
-    // as delete + create), and closing the tab both threw away the chance to
-    // follow it and flushed the tab's sidecars into the old path — recreating
-    // the folder. Open tabs now show "moved, renamed or deleted" and look for
-    // it (view.onFolderVanished, via the delete listener registered later).
+    // A folder that vanishes outside Stashpad may have been RENAMED — a rename
+    // on another machine arrives as delete + create — so its tabs are not closed
+    // straight away. They show "moved, renamed or deleted" and look for it
+    // (view.onFolderVanished, via the delete listener registered later); a
+    // rename is followed and the tab stays open on the new name.
+    // 0.543.0 (user call): a real DELETE closes the tabs, as before 0.541.1 —
+    // just after a grace period long enough for the rename's "create" half to
+    // land on a slow network drive. Tabs that followed a rename are on another
+    // folder by then, so closeStashpadTabsFor leaves them alone.
     const name = cleaned.split("/").pop() || cleaned;
-    // Give a remote rename's "create" half a moment to land and be followed.
-    await new Promise((r) => window.setTimeout(r, 3000));
+    await new Promise((r) => window.setTimeout(r, StashpadPlugin.VANISHED_FOLDER_GRACE_MS));
     if (this.movedAway.has(cleaned) || this.app.vault.getAbstractFileByPath(cleaned) instanceof TFolder) return;
+    const closed = this.closeStashpadTabsFor(cleaned);
     await this.prunePlacementFor(cleaned);
     this.knownStashpadFolders.delete(cleaned);
     this.notifications.show({
-      message: `Stashpad “${name}” was deleted, or moved or renamed outside Stashpad. Any open tabs for it are showing where it might have gone.`,
+      message: closed > 0
+        ? `Stashpad “${name}” was deleted — closed ${closed} open tab${closed === 1 ? "" : "s"}.`
+        : `Stashpad “${name}” was deleted.`,
       kind: "warning",
       category: "delete",
       folder: cleaned,
