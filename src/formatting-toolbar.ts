@@ -346,7 +346,8 @@ export function renderFormattingToolbar(
         const ta = getTa();
         if (!ta) return;
         ta.focus();
-        MultiInsert.toggle(ta, (active) => b.toggleClass("is-active", active));
+        // 0.544.0: dock the mark panel on top of THIS bar (not floating).
+        MultiInsert.toggle(ta, (active) => b.toggleClass("is-active", active), bar);
       };
       continue;
     }

@@ -38,7 +38,12 @@ function isFreshEntry(e: RenderEntry | undefined, mtime: number): e is RenderEnt
 
 /** Bump when the clamp CSS / overflow rules change, to re-measure every
  *  persisted overflow verdict without discarding the cached renders. */
-export const OV_MEMO_VERSION = 1;
+/** 2 (0.544.0): 0.540.0 let row text flow under the floated row buttons, so
+ *  the same list width now gives the text more room — verdicts measured before
+ *  it said "overflows" for notes that now fit (Show more on short notes).
+ *  3 (0.544.4): the 0.544.1 measure of EXPANDED rows read block-content bodies
+ *  (code / table / callout) as "fits" on desktop; drop those verdicts. */
+export const OV_MEMO_VERSION = 3;
 
 /** The view members the body renderer calls back into. */
 export interface NoteBodyHost {

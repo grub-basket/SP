@@ -11,6 +11,7 @@ import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
 import { newId } from "./id-service";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL, parseRecurrence, parseDuration } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
+import { parseNaturalDate, naturalDatePhrases, type NaturalDate } from "./natural-date";
 import { renderFormattingToolbar, wrapSelection } from "./formatting-toolbar";
 import { visibleDrafts } from "./drafts";
 import { IconSuggest } from "./icon-suggest";
@@ -4252,6 +4253,84 @@ export class DueDatePickerModal extends Modal {
     }
 
     const wrap = this.contentEl.createDiv({ cls: "stashpad-due-picker" });
+    // 0.544.0: type the date in words ("next fri 3pm", "in 2 weeks") — the same
+    // parser as the composer's `@` trigger (natural-date.ts, future-leaning). Each
+    // keystroke fills the date/time fields below, so they always show what will be
+    // saved; Enter saves like Set. A partial word ("next fr") offers the composer's
+    // phrase list as a Tab completion. Clearing the box puts the fields back.
+    const nlRow = wrap.createDiv({ cls: "stashpad-due-nl" });
+    const nlField = nlRow.createDiv({ cls: "stashpad-due-field stashpad-due-nl-field" });
+    setIcon(nlField.createSpan({ cls: "stashpad-due-field-icon" }), "wand-sparkles");
+    const nlInput = nlField.createEl("input", {
+      type: "text",
+      cls: "stashpad-due-nl-input",
+      attr: { placeholder: "Type a date: next fri 3pm, in 2 weeks…", "aria-label": "Type a due date in words", spellcheck: "false", autocomplete: "off" },
+    });
+    const nlPreview = nlRow.createDiv({ cls: "stashpad-due-nl-preview" });
+    // Field values from before the box was used — restored when it's emptied, and
+    // the time a date-only phrase falls back to (so "tomorrow" keeps the time).
+    let nlBase: { date: string; time: string } | null = null;
+    let nlParsed: NaturalDate | null = null;
+    let nlCompletion: string | null = null;
+    // What the box last wrote into the fields. Emptying the box restores nlBase
+    // only while the fields still hold that — a preset, ± nudge or hand edit made
+    // after typing wins and is left alone.
+    let nlApplied: { date: string; time: string } | null = null;
+    const nlRun = (): void => {
+      const raw = nlInput.value.trim();
+      if (!nlBase) nlBase = { date: dateInput.value, time: timeInput.value };
+      // A time set by hand (or by a nudge) after typing becomes the new
+      // fallback, so a later date-only phrase doesn't put the old time back.
+      else if (nlApplied && timeInput.value !== nlApplied.time) nlBase.time = timeInput.value;
+      nlCompletion = null;
+      nlPreview.removeClass("is-error");
+      if (!raw) {
+        nlParsed = null;
+        if (!nlApplied || (dateInput.value === nlApplied.date && timeInput.value === nlApplied.time)) {
+          dateInput.value = nlBase.date;
+          timeInput.value = nlBase.time;
+        }
+        nlBase = null;
+        nlApplied = null;
+        nlPreview.setText("");
+        return;
+      }
+      nlParsed = parseNaturalDate(raw, { prefer: "future" });
+      if (!nlParsed) {
+        const low = raw.toLowerCase();
+        nlCompletion = naturalDatePhrases().find((p) => p.startsWith(low) && p !== low) ?? null;
+        const hint = nlCompletion ? parseNaturalDate(nlCompletion, { prefer: "future" }) : null;
+        if (nlCompletion && hint) {
+          nlPreview.setText(`Tab → ${nlCompletion} · ${this.describeNatural(hint)}`);
+        } else {
+          nlPreview.setText("Didn't catch that. Try “friday 3pm” or “in 3 days”.");
+          nlPreview.addClass("is-error");
+        }
+        return;
+      }
+      const d = new Date(nlParsed.ms);
+      dateInput.value = this.toDateValue(d);
+      timeInput.value = nlParsed.hasTime ? this.toTimeValue(d) : nlBase.time;
+      nlApplied = { date: dateInput.value, time: timeInput.value };
+      nlPreview.setText(`→ ${this.describeNatural(nlParsed)}`);
+    };
+    nlInput.addEventListener("input", nlRun);
+    nlInput.addEventListener("keydown", (e) => {
+      if (e.key === "Tab" && !e.shiftKey && nlCompletion) {
+        e.preventDefault();
+        nlInput.value = nlCompletion;
+        nlRun();
+      } else if (e.key === "Enter" && !e.isComposing) {
+        e.preventDefault();
+        if (!nlParsed && nlCompletion) { nlInput.value = nlCompletion; nlRun(); }
+        // Only save on a phrase that was understood. An EMPTY box does nothing —
+        // the box has focus on open, and a reflexive Enter would otherwise commit
+        // the pre-filled values (for a multi-select: target #1's due/tags onto
+        // every selected note).
+        if (nlParsed) ok.click();
+      }
+    });
+
     // 0.76.5: each field is [leading icon] + input, constrained width
     // (the native inputs default to absurdly wide). Date row gets a
     // calendar icon; time row gets a clock icon at its START.
@@ -4587,6 +4666,7 @@ export class DueDatePickerModal extends Modal {
     clear.onclick = () => {
       dateInput.value = "";
       timeInput.value = "";
+      nlInput.value = ""; nlPreview.setText(""); nlParsed = null; nlBase = null; nlApplied = null;
       dateInput.focus();
     };
     const cancel = actionGrid.createEl("button", { cls: "stashpad-due-btn", text: "Cancel" });
@@ -4610,7 +4690,14 @@ export class DueDatePickerModal extends Modal {
       this.close();
       this.onPick({ iso: due.toISOString(), assignees: this.assignees, tags: this.tagsResult(), color: this.colorResult(), ...recur() });
     };
-    requestAnimationFrame(() => dateInput.focus());
+    // 0.544.0: desktop starts in the typed-date box (type + Enter is the fastest
+    // path). Mobile keeps the date field, so the keyboard doesn't cover the modal.
+    requestAnimationFrame(() => (Platform.isMobile ? dateInput : nlInput).focus());
+  }
+
+  /** 0.544.0: "Fri, Oct 9, 2026 · 3:00 PM" for the typed-date preview. */
+  private describeNatural(r: NaturalDate): string {
+    return momentFn(r.ms).format(r.hasTime ? "ddd, MMM D, YYYY · h:mm A" : "ddd, MMM D, YYYY");
   }
 
   onClose(): void {

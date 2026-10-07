@@ -8279,7 +8279,12 @@ export class StashpadView extends ItemView {
       // overflows — respecting the user's expand-bodies-by-default setting.
       // Previously the desktop focused header rendered un-clamped with no
       // toggle at all, so a long focused note had no collapse affordance.
-      clamp: true,
+      // 0.544.0: NOT for the drilled-in heading row (asRow) — it has its own
+      // Expand/Collapse-the-header button, and the body's Show more stacked a
+      // second, differently-labelled toggle on it (one line → 8-line window →
+      // full note). The user chose one button: expanded = the whole note
+      // (styles.css drops the scroll-window cap for an expanded heading row).
+      clamp: !opts.asRow,
       // The focused header is a single, always-visible element (and on desktop
       // lives outside the list's lazy-render observer), so render its body now
       // rather than deferring — otherwise a cold (uncached) note stays on the
@@ -8995,8 +9000,9 @@ export class StashpadView extends ItemView {
    *  fully open with no collapse button; narrow and a note that now fits kept a
    *  Show more that did nothing. The 0.540.0 narrow switch made it much worse —
    *  crossing 700px moves the buttons out of the text's way, changing the text
-   *  width by ~300px at once. Expanded rows are skipped: they always carry a
-   *  collapse toggle and don't depend on width. Re-clamping then going through
+   *  width by ~300px at once. 0.544.0: expanded rows are included too — their
+   *  Show less now also depends on whether the note overflows the clamp at this
+   *  width (measured under a temporary clamp in the batch). Going through
    *  the normal batched measure keeps this to one layout pass for all rows. */
   private remeasureClampsForWidth(): void {
     const list = this.listEl;
@@ -9006,7 +9012,8 @@ export class StashpadView extends ItemView {
     this.lastListWidth = w;
     for (const row of Array.from(list.querySelectorAll<HTMLElement>(".stashpad-note[data-id]"))) {
       const node = this.tree.get(row.dataset.id as StashpadId);
-      if (!node?.file || this.isNoteExpanded(node.id)) continue;
+      if (!node?.file) continue;
+      const expanded = this.isNoteExpanded(node.id);
       const container = row.querySelector<HTMLElement>(".stashpad-note-body-content");
       const textEl = container?.querySelector<HTMLElement>(":scope > .stashpad-note-text");
       const actions = row.querySelector<HTMLElement>(".stashpad-note-actions");
@@ -9014,9 +9021,9 @@ export class StashpadView extends ItemView {
       // A row still showing its lazy placeholder has nothing measured yet; its
       // real render measures at the new width on its own.
       if (!container || !textEl || !actions || !entry) continue;
-      textEl.addClass("is-clamped");
+      if (!expanded) textEl.addClass("is-clamped");
       const opts = { clamp: true, toggleHost: actions, toggleAnchor: this.rowToggleAnchor(actions) };
-      this.queueClampMeasure({ opts, container, node, textEl, entry, memoW: w, expanded: false });
+      this.queueClampMeasure({ opts, container, node, textEl, entry, memoW: w, expanded });
     }
   }
 
@@ -9038,14 +9045,13 @@ export class StashpadView extends ItemView {
       // A row can be torn down (virtualization, re-render, folder switch)
       // between schedule and frame — never measure a detached node.
       const live = batch.filter((b) => b.container.isConnected && b.textEl.isConnected);
-      // An EXPANDED note isn't clamped (0.118.11): measuring it would read
-      // "fits" and cache a stale ovV=false, killing the toggle on collapse. It
-      // always gets a (collapse) toggle and never enters the measure phase.
-      const measured = live.filter((b) => {
-        if (!b.expanded) return true;
-        this.attachExpandToggle(b.opts, b.container, b.node, b.expanded);
-        return false;
-      });
+      // An EXPANDED note isn't clamped (0.118.11), so reading it as-is says
+      // "fits" and would cache a stale ovV=false. 0.544.0: it used to skip the
+      // measure and ALWAYS get a Show less — so with "expand bodies by default"
+      // every one-line row carried a collapse button. Now it is measured under a
+      // temporary `.is-clamped` (added and removed inside this frame, before
+      // paint) and only gets the button if collapsing would actually hide text.
+      const measured = live;
       if (measured.length === 0) return;
       // Phase 1 (writes): the cursor row is transiently unclamped by
       // `.is-cursor-expanded`; drop it so `.is-clamped` defines clientHeight.
@@ -9055,10 +9061,20 @@ export class StashpadView extends ItemView {
         if (r) cursorRows.add(r);
       }
       for (const r of cursorRows) r.removeClass("is-cursor-expanded");
+      const tempClamped = measured.filter((b) => b.expanded && !b.textEl.hasClass("is-clamped"));
+      // The container's .is-body-expanded must go too: on desktop
+      // `.is-wrap-actions … .is-body-expanded .stashpad-note-text` (max-height:
+      // none) outranks the block-content clamp, so a body with a code block /
+      // table / callout would measure as "fits" while still marked expanded.
+      const tempUnexpanded = tempClamped.filter((b) => b.container.hasClass("is-body-expanded"));
+      for (const b of tempClamped) b.textEl.addClass("is-clamped");
+      for (const b of tempUnexpanded) b.container.removeClass("is-body-expanded");
       // Phase 2 (reads): one layout for the whole batch. 0.118.7 — measure
       // overflow against the ACTUAL clamped height, not a line-height heuristic.
       const sizes = measured.map((b) => ({ sh: b.textEl.scrollHeight, ch: b.textEl.clientHeight }));
       // Phase 3 (writes): restore, then apply each row's decision.
+      for (const b of tempClamped) b.textEl.removeClass("is-clamped");
+      for (const b of tempUnexpanded) b.container.addClass("is-body-expanded");
       for (const r of cursorRows) r.addClass("is-cursor-expanded");
       measured.forEach((b, i) => {
         const { sh, ch } = sizes[i];
@@ -9075,7 +9091,7 @@ export class StashpadView extends ItemView {
         }
         if (!overflowing) {
           // Short note that fits — drop the clamp so the fade gradient doesn't apply.
-          b.textEl.removeClass("is-clamped");
+          if (!b.expanded) b.textEl.removeClass("is-clamped");
           // 0.540.3: a width re-measure (remeasureClampsForWidth) can find a note
           // that USED to overflow now fits — drop its leftover Show more, which
           // would otherwise sit there doing nothing. No-op on a first render.
@@ -9237,9 +9253,12 @@ export class StashpadView extends ItemView {
       // This is what spares a 200-child Home from 200 layout reflows
       // when one note is added (199 rows hit this branch).
       const memoW = this.lastListWidth;
-      if (entry.ovW === memoW && entry.ovV !== undefined && entry.ovX === OV_MEMO_VERSION && !expanded) {
+      // 0.544.0: expanded rows use it too — the memo is always a CLAMPED read.
+      if (entry.ovW === memoW && entry.ovV !== undefined && entry.ovX === OV_MEMO_VERSION) {
         if (!entry.ovV && !isLongBody(text)) {
           textEl.removeClass("is-clamped");
+          // A toggle left in the action cluster by an in-place body re-render.
+          opts.toggleHost?.querySelectorAll(".stashpad-expand-toggle").forEach((el) => el.remove());
         } else {
           this.attachExpandToggle(opts, container, node, expanded);
         }

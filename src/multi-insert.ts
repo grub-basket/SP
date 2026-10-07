@@ -9,7 +9,8 @@ import { Notice, Platform } from "obsidian";
  *
  *  Flow: the toolbar button starts "mark mode" → each click in the textarea
  *  toggles a mark (a pin is drawn over that caret position) → a small panel under
- *  the editor takes the text and an Apply button → the text is inserted at every
+ *  the editor takes the text and an Apply button (0.544.0: docked as a strip on
+ *  top of the formatting toolbar when the toolbar passes itself as `dock`) → the text is inserted at every
  *  mark (processed right-to-left so earlier offsets stay valid) → marks clear and
  *  mode ends. Esc cancels; editing the textarea's own text clears the marks
  *  (their offsets would otherwise drift).
@@ -76,7 +77,9 @@ export class MultiInsert {
   private marks: number[] = [];
   private active = false;
   private layer: HTMLElement | null = null; // pin overlay (fixed-positioned)
-  private panel: HTMLElement | null = null; // text-entry panel (fixed)
+  private panel: HTMLElement | null = null; // text-entry panel (docked strip, or fixed fallback)
+  /** 0.544.0: element the panel is docked directly above (the toolbar bar). */
+  private dock: HTMLElement | null = null;
   private input: HTMLInputElement | null = null;
   private countEl: HTMLElement | null = null;
   private doc: Document;
@@ -90,11 +93,12 @@ export class MultiInsert {
    *  one toolbar button toggles the mode. `onChange` fires with the new active
    *  state on start AND on end (so the button's highlight tracks the session even
    *  when it ends via Apply/Esc rather than the button). */
-  static toggle(ta: HTMLTextAreaElement, onChange?: (active: boolean) => void): void {
+  static toggle(ta: HTMLTextAreaElement, onChange?: (active: boolean) => void, dock?: HTMLElement): void {
     const existing = CONTROLLERS.get(ta);
     if (existing && existing.active) { existing.cancel(); return; }
     const c = existing ?? new MultiInsert(ta);
     c.onChange = onChange ?? null;
+    c.dock = dock ?? null;
     CONTROLLERS.set(ta, c);
     c.start();
   }
@@ -123,7 +127,18 @@ export class MultiInsert {
   private buildOverlay(): void {
     const body = this.doc.body;
     this.layer = body.createDiv({ cls: "stashpad-multiinsert-layer" });
-    this.panel = body.createDiv({ cls: "stashpad-multiinsert-panel" });
+    // 0.544.0: the floating panel (fixed, under the textarea) landed badly on
+    // both desktop and mobile — off the bottom of a tall edit modal, under the
+    // keyboard. Dock it as a strip directly ABOVE the toolbar instead, in normal
+    // flow like the drafts chip / "Similar notes" strip in the composer. The
+    // fixed panel stays only as a fallback when there is no live toolbar.
+    const dockParent = this.dock?.isConnected ? this.dock.parentElement : null;
+    if (dockParent && this.dock) {
+      this.panel = dockParent.createDiv({ cls: "stashpad-multiinsert-panel is-docked" });
+      dockParent.insertBefore(this.panel, this.dock);
+    } else {
+      this.panel = body.createDiv({ cls: "stashpad-multiinsert-panel" });
+    }
     this.countEl = this.panel.createSpan({ cls: "stashpad-multiinsert-count" });
     this.input = this.panel.createEl("input", {
       type: "text",
@@ -157,8 +172,17 @@ export class MultiInsert {
     if (this.marks.length) { this.marks = []; this.repaint(); }
   };
 
+  /** 0.544.3: a composer rebuild / edit-modal re-render can take the textarea or
+   *  the docked panel away mid-session. End the session then, so its pins and
+   *  capture-phase Escape handler don't outlive the UI they belong to. */
+  private orphaned(): boolean {
+    if (this.ta.isConnected && this.panel?.isConnected) return false;
+    this.teardown();
+    return true;
+  }
+
   private onKeyDown = (e: KeyboardEvent): void => {
-    if (!this.active) return;
+    if (!this.active || this.orphaned()) return;
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); this.cancel(); }
   };
 
@@ -171,7 +195,7 @@ export class MultiInsert {
   }
 
   private repaint = (): void => {
-    if (!this.active || !this.layer || !this.countEl) return;
+    if (!this.active || !this.layer || !this.countEl || this.orphaned()) return;
     const rect = this.ta.getBoundingClientRect();
     this.layer.empty();
     for (const off of this.marks) {
@@ -187,8 +211,8 @@ export class MultiInsert {
     }
     const n = this.marks.length;
     this.countEl.setText(n === 0 ? "No marks yet" : `${n} mark${n === 1 ? "" : "s"}`);
-    // Anchor the panel just under the textarea.
-    if (this.panel) {
+    // Anchor the (fallback, floating) panel just under the textarea.
+    if (this.panel && !this.panel.hasClass("is-docked")) {
       this.panel.style.left = `${rect.left}px`;
       this.panel.style.top = `${Math.min(rect.bottom + 6, (this.doc.defaultView?.innerHeight ?? rect.bottom) - 48)}px`;
       this.panel.style.minWidth = `${Math.min(rect.width, 420)}px`;

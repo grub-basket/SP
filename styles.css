@@ -1548,6 +1548,17 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-focused.is-heading-row:not(.is-stuck):has(> .stashpad-focused-body.is-body-expanded) {
   max-height: none;
 }
+/* 0.544.0: the drilled-in heading row has ONE toggle (Expand/Collapse the
+   header) and no body Show more — so expanded means the whole note: no
+   scroll-window cap on the body, no 45vh cap on the row, normal text size. */
+.stashpad-focused.is-heading-row:not(.is-heading-collapsed):not(.is-stuck) {
+  max-height: none;
+}
+.stashpad-focused.is-heading-row:not(.is-heading-collapsed):not(.is-stuck) > .stashpad-focused-body {
+  max-height: none;
+  overflow-y: visible;
+  font-size: inherit;
+}
 .stashpad-focused-body > :first-child { margin-top: 0; }
 .stashpad-focused-body > :last-child { margin-bottom: 0; }
 /* 0.420.0: attachment-rail host for the focused heading — a full-width grid row
@@ -5106,6 +5117,20 @@ body.is-mobile .stashpad-okf-cta {
 .stashpad-tagsec-suggest-item { padding: 6px 10px; cursor: pointer; font-size: 0.9em; }
 .stashpad-tagsec-suggest-item:hover { background: var(--background-modifier-hover); }
 .stashpad-due-fields { display: flex; flex-direction: column; gap: 8px; }
+/* 0.544.0: typed-date box ("next fri 3pm") above the date/time fields. Full
+   width (the date/time fields cap at 260px); the preview line under it shows
+   what the phrase resolved to. */
+.stashpad-due-nl { display: flex; flex-direction: column; gap: 4px; }
+.stashpad-due-field.stashpad-due-nl-field { max-width: none; }
+.stashpad-due-nl-field .stashpad-due-field-icon { cursor: default; }
+.stashpad-due-nl-input { flex: 1; min-width: 0; }
+.stashpad-due-nl-preview {
+  min-height: 1.3em;
+  padding-left: 38px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.stashpad-due-nl-preview.is-error { color: var(--text-error); }
 .stashpad-due-field {
   display: flex;
   align-items: center;
@@ -11850,6 +11875,17 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   box-shadow: var(--shadow-s);
   max-width: min(92vw, 560px);
   flex-wrap: wrap;
+}
+/* 0.544.0: docked strip on top of the formatting toolbar (composer + edit
+   modal) — in normal flow, styled like the composer's "Similar notes" strip. */
+.stashpad-multiinsert-panel.is-docked {
+  position: static;
+  z-index: auto;
+  max-width: none;
+  margin: 0 2px 6px;
+  padding: 6px 8px;
+  background: var(--background-secondary);
+  box-shadow: none;
 }
 .stashpad-multiinsert-count {
   font-size: var(--font-ui-smaller);
