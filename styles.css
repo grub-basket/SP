@@ -2870,6 +2870,18 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    explains why. */
 .stashpad-suggest-blocked .stashpad-suggest-title { color: var(--text-muted); font-weight: normal; }
 
+/* Folder switcher: note results under the create offer when no folder
+   matches. The first note row carries a small "Notes" label and a divider. */
+.stashpad-suggest-notes-first { border-top: 1px solid var(--background-modifier-border); flex-wrap: wrap; }
+.stashpad-suggest-section {
+  flex-basis: 100%;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--size-4-1);
+}
+
 /* 0.92.1: "Search excluded Stashpad folders" bottom action. */
 .stashpad-search-excluded-row {
   display: inline-flex;
@@ -5240,28 +5252,51 @@ input[type="date"].stashpad-due-date, input[type="time"].stashpad-due-time {
 .stashpad-due-date::-webkit-datetime-edit-month-field:first-child,
 .stashpad-due-date::-webkit-datetime-edit-year-field:first-child,
 .stashpad-due-date::-webkit-datetime-edit-day-field:first-child { padding-left: 0; margin-left: 0; }
-/* 0.125.1: quick relative-adjust row in the due/snooze picker — a +/- flip
-   followed by amount buttons. Wraps on narrow widths. */
-.stashpad-due-quickadjust {
+/* 0.125.1: quick relative-adjust row in the due/snooze picker. Wraps on narrow
+   widths. 0.547.0: the +/- flip is gone — each chip is a split pill
+   [− | 15m | +] with its own subtract and add halves. */
+.stashpad-due-quickadjust,
+.stashpad-due-timechips {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   margin: 8px 0 2px;
 }
-.stashpad-due-adjust-flip {
+.stashpad-due-adjust-chip {
   flex: 0 0 auto;
-  width: 30px;
-  height: 28px;
+  display: inline-flex;
+  align-items: stretch;
   border-radius: 6px;
   border: 1px solid var(--background-modifier-border);
   background: var(--interactive-normal);
-  color: var(--text-normal);
+  overflow: hidden;
+}
+.stashpad-due-adjust-half {
+  /* Reset Obsidian's default button chrome — the chip draws the border. */
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  height: auto;
+  min-width: 20px;
+  padding: 3px 4px;
+  color: var(--text-muted);
   font-weight: 700;
-  font-size: 1.05em;
   cursor: pointer;
 }
-.stashpad-due-adjust-flip.is-minus { color: var(--text-error); border-color: var(--text-error); }
+.stashpad-due-adjust-half:hover { background: var(--interactive-hover); color: var(--text-normal); }
+.stashpad-due-adjust-half.is-minus:hover { color: var(--text-error); }
+.stashpad-due-adjust-label {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px;
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  user-select: none;
+}
 .stashpad-due-adjust-btn {
   flex: 0 0 auto;
   padding: 5px 9px;
@@ -5291,6 +5326,25 @@ input[type="date"].stashpad-due-date, input[type="time"].stashpad-due-time {
 .stashpad-due-btn:hover { background: var(--interactive-hover); }
 .stashpad-due-btn.mod-cta { background: var(--interactive-accent); color: var(--text-on-accent); border-color: var(--interactive-accent); }
 .stashpad-due-btn.mod-cta:hover { background: var(--interactive-accent-hover); }
+/* 0.547.1: one type scale for the whole due picker. Things you click or type
+   in = --font-ui-small; section headings (Assign to / Tags / Color / Repeat)
+   = --font-ui-smaller semibold muted; hints and empty states = --font-ui-smaller
+   faint. Before this the modal mixed 12, 12.75, 13 and 15px. Scoped to the
+   picker so the shared assign/tags sections elsewhere are untouched. */
+.stashpad-due-picker .stashpad-due-btn,
+.stashpad-due-picker .stashpad-due-adjust-btn,
+.stashpad-due-picker .stashpad-due-adjust-label,
+.stashpad-due-picker .stashpad-due-adjust-half,
+.stashpad-due-picker input,
+.stashpad-due-picker select { font-size: var(--font-ui-small); }
+.stashpad-due-picker .stashpad-assign-label,
+.stashpad-due-picker .stashpad-tagsec-label {
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.stashpad-due-picker .stashpad-assign-empty,
+.stashpad-due-picker .stashpad-tagsec-empty { font-size: var(--font-ui-smaller); color: var(--text-faint); }
 
 /* Stashpad notification toast — wraps Obsidian's built-in .notice with
    a structured layout so we can stack a message + action button row.
@@ -7693,9 +7747,44 @@ button.stashpad-btn-loading::after {
    sections (bold section headings, readable body text) instead of the old tiny
    muted fine print that read as an afterthought. */
 .stashpad-due-recur { margin-top: 14px; border-top: 1px solid var(--background-modifier-border); padding-top: 12px; }
-.stashpad-due-recur > summary { cursor: pointer; font-size: var(--font-ui-small); font-weight: 600; color: var(--text-normal); margin-bottom: 6px; }
+/* 0.547.1: the Repeat & reminders header is a full-width clickable row —
+   rotating chevron, icon, title, Experimental badge — instead of the browser's
+   bare disclosure triangle. */
+.stashpad-due-recur > summary.stashpad-due-recur-summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 -6px 6px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  font-size: var(--font-ui-smaller);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.stashpad-due-recur > summary.stashpad-due-recur-summary::-webkit-details-marker { display: none; }
+.stashpad-due-recur > summary.stashpad-due-recur-summary::marker { content: ""; }
+.stashpad-due-recur > summary.stashpad-due-recur-summary:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-due-recur-chevron,
+.stashpad-due-recur-icon { display: inline-flex; align-items: center; }
+.stashpad-due-recur-chevron svg,
+.stashpad-due-recur-icon svg { width: 14px; height: 14px; }
+.stashpad-due-recur-chevron { color: var(--text-faint); transition: transform 120ms ease; }
+.stashpad-due-recur[open] .stashpad-due-recur-chevron { transform: rotate(90deg); }
+.stashpad-due-recur-badge {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--text-warning);
+  color: var(--text-warning);
+  font-size: var(--font-ui-smaller);
+  font-weight: 500;
+  line-height: 1.4;
+}
 .stashpad-due-recur-row { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
-.stashpad-due-recur-row label { flex: 0 0 130px; font-size: var(--font-ui-small); color: var(--text-normal); }
+.stashpad-due-recur-row label { flex: 0 0 130px; font-size: var(--font-ui-small); color: var(--text-muted); }
 .stashpad-due-recur-row input { flex: 1; }
 /* 0.305.2: standalone "Auto-fail if overdue" option — a top-level checkbox row,
    NOT inside the recurrence section, and its label stays on ONE line (the recur
@@ -9018,6 +9107,9 @@ body.is-mobile .stashpad-due-recur .stashpad-weekday-chips button { width: 26px;
    the thin bottom toolbar stays so the toggle remains reachable. */
 .stashpad-media-modal.is-immersive .stashpad-media-header,
 .stashpad-media-modal.is-immersive .stashpad-media-rail { display: none; }
+/* 0.554.5: the 📍 row hides with the header in full-screen. */
+.stashpad-media-modal.is-immersive .stashpad-media-spots { display: none; }
+.stashpad-media-spots.is-hidden { display: none; }
 /* 0.410.0: nicer rail badges — a coloured icon over the ext/label, centred. */
 .stashpad-media-railbadge {
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px;
@@ -10730,7 +10822,7 @@ button.stashpad-reaction-chip,
 .stashpad-reply-quote.is-clickable { cursor: pointer; }
 .stashpad-reply-quote.is-clickable:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
 /* 0.288.0: brief highlight when a same-list reply source is scrolled to. */
-.stashpad-note.stashpad-row-flash { animation: stashpad-row-flash 1.2s ease-out; }
+.stashpad-note.stashpad-row-flash, .stashpad-focused.stashpad-row-flash { animation: stashpad-row-flash 1.2s ease-out; }
 @keyframes stashpad-row-flash {
   0%, 25% { background: var(--text-highlight-bg, rgba(255, 208, 0, 0.35)); }
   100% { background: transparent; }
@@ -11922,6 +12014,25 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   flex: 1 1 160px;
   min-width: 120px;
 }
+/* Field look. Obsidian (on mobile especially) strips text inputs down to
+   borderless + transparent, so on the docked strip's grey background the box
+   read as part of the toolbar, not somewhere to type. Higher specificity than
+   the theme's input rules; longhands only. */
+.stashpad-multiinsert-panel input.stashpad-multiinsert-input {
+  background-color: var(--background-primary);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--background-modifier-border);
+  border-radius: var(--input-radius, 6px);
+  padding-left: 8px;
+  padding-right: 8px;
+  height: var(--input-height, 32px);
+  color: var(--text-normal);
+}
+.stashpad-multiinsert-panel input.stashpad-multiinsert-input:focus {
+  border-color: var(--interactive-accent);
+  box-shadow: 0 0 0 2px hsla(var(--interactive-accent-hsl), 0.25);
+}
 .stashpad-multiinsert-hint {
   flex: 1 1 100%;
   font-size: var(--font-ui-smaller);
@@ -11938,7 +12049,7 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
    the section's child notes. Several files = lettered options, stacked or side
    by side. Below ~900px the feedback column drops under the section.
    ============================================================================ */
-.stashpad-showcase { display: flex; flex-direction: column; height: 100%; padding: 0; box-sizing: border-box; }
+.stashpad-showcase { display: flex; flex-direction: column; height: 100%; padding: 0; box-sizing: border-box; container: sp-showcase / inline-size; }
 .stashpad-showcase-bar {
   display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; flex: 0 0 auto;
   padding: 8px 14px; border-bottom: 1px solid var(--background-modifier-border);
@@ -11948,9 +12059,22 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-showcase-crumb:hover { color: var(--text-normal); }
 .stashpad-showcase-crumb.is-current { cursor: default; color: var(--text-normal); }
 .stashpad-showcase-crumb-sep { color: var(--text-faint); }
+/* 0.554.1: the way in — where you can go from here, after the current crumb. */
+.stashpad-showcase .stashpad-showcase-crumb.is-into {
+  font-weight: normal; color: var(--text-accent); background: transparent; border: 0; box-shadow: none;
+  height: auto; padding: 0 2px; font-size: inherit;
+}
+.stashpad-showcase .stashpad-showcase-crumb.is-into:hover { text-decoration: underline; color: var(--text-accent-hover, var(--text-accent)); }
+.stashpad-showcase .stashpad-showcase-crumb.is-into:focus-visible { box-shadow: 0 0 0 2px var(--background-modifier-border-focus); border-radius: 4px; }
 .stashpad-showcase-count { color: var(--text-muted); font-size: var(--font-ui-smaller); }
 .stashpad-showcase-open { font-size: var(--font-ui-smaller); color: var(--text-muted); padding: 2px 8px; border-radius: 999px; }
-.stashpad-showcase-open.has-open { cursor: pointer; color: var(--text-on-accent); background: var(--color-orange); }
+/* 0.548.0: "N to resolve · Next ↓" is a real button; "Nothing left to resolve" is green. */
+.stashpad-showcase .stashpad-showcase-open.has-open {
+  display: inline-flex; align-items: center; gap: 6px; height: auto; border: 0; box-shadow: none; cursor: pointer;
+  padding: 2px 10px; color: var(--text-on-accent); background: var(--color-orange);
+}
+.stashpad-showcase-open-next { font-weight: 700; }
+.stashpad-showcase-open.is-done { color: var(--color-green); }
 .stashpad-showcase-spacer { flex: 1 1 auto; }
 .stashpad-showcase-seg { display: inline-flex; border: 1px solid var(--background-modifier-border); border-radius: 6px; overflow: hidden; }
 .stashpad-showcase .stashpad-showcase-segbtn {
@@ -11959,8 +12083,10 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 }
 .stashpad-showcase-segbtn .svg-icon { width: 14px; height: 14px; }
 .stashpad-showcase .stashpad-showcase-segbtn.is-active { background: var(--interactive-accent); color: var(--text-on-accent); }
-.stashpad-showcase-btn { font-size: var(--font-ui-smaller); padding: 3px 8px; height: auto; }
+.stashpad-showcase-btn { display: inline-flex; align-items: center; gap: 4px; font-size: var(--font-ui-smaller); padding: 3px 8px; height: auto; }
+.stashpad-showcase-btn .svg-icon { width: 14px; height: 14px; }
 .stashpad-showcase-btn.is-active { color: var(--text-accent); }
+@container sp-showcase (max-width: 760px) { .stashpad-showcase-bar .stashpad-showcase-btn-text { display: none; } }
 
 .stashpad-showcase-scroll { flex: 1 1 auto; overflow-y: auto; padding: 18px 14px 60px; }
 .stashpad-showcase-empty { max-width: 560px; margin: 40px auto; text-align: center; color: var(--text-muted); display: flex; flex-direction: column; gap: 12px; align-items: center; }
@@ -11974,13 +12100,37 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 @container (max-width: 900px) { .stashpad-showcase-section { grid-template-columns: minmax(0, 1fr); } }
 .stashpad-showcase-scroll { container-type: inline-size; }
 
-.stashpad-showcase-main { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
-.stashpad-showcase-sec-head { display: flex; align-items: center; gap: 8px; }
-.stashpad-showcase-sec-num {
-  font-size: var(--font-ui-smaller); font-weight: 600; color: var(--text-muted);
-  border: 1px solid var(--background-modifier-border); border-radius: 999px; min-width: 22px; text-align: center; padding: 0 6px;
+/* 0.548.0: a section is a grid — number gutter | title | tools on row 1, then
+   this section's reactions, then the files, all right of the gutter. Row 1 is
+   pinned explicitly so the tools never push the title down a row. */
+.stashpad-showcase-main {
+  min-width: 0; display: grid; grid-template-columns: 30px minmax(0, 1fr) auto;
+  column-gap: 10px; row-gap: 10px; align-items: start;
 }
-.stashpad-showcase-sec-tools { margin-left: auto; display: flex; gap: 2px; }
+.stashpad-showcase-main > * { grid-column: 2 / -1; min-width: 0; }
+.stashpad-showcase-main > .stashpad-showcase-sec-num { grid-column: 1; grid-row: 1; }
+.stashpad-showcase-main > .stashpad-showcase-caption { grid-column: 2; grid-row: 1; }
+.stashpad-showcase-main > .stashpad-showcase-sec-tools { grid-column: 3; grid-row: 1; }
+.stashpad-showcase-sec-num {
+  width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+  border-radius: 50%; font-size: var(--font-ui-small); font-weight: 700; color: var(--text-muted);
+  background: var(--background-secondary); border: 1px solid var(--background-modifier-border);
+}
+.stashpad-showcase-sec-tools { display: flex; align-items: center; gap: 4px; }
+.stashpad-showcase .stashpad-showcase-toolbtn {
+  display: inline-flex; align-items: center; gap: 4px; height: auto; padding: 3px 8px; box-shadow: none;
+  font-size: var(--font-ui-smaller); color: var(--text-muted); background: transparent;
+  border: 1px solid var(--background-modifier-border);
+}
+.stashpad-showcase .stashpad-showcase-toolbtn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.stashpad-showcase-toolbtn .svg-icon { width: 14px; height: 14px; }
+.stashpad-showcase-sec-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; }
+.stashpad-showcase-sec-bar-label { font-size: var(--font-ui-smaller); font-weight: 600; color: var(--text-muted); }
+@container (max-width: 640px) {
+  .stashpad-showcase-sec-tools .stashpad-showcase-btn-text { display: none; }
+  .stashpad-showcase-main { grid-template-columns: 26px minmax(0, 1fr) auto; column-gap: 8px; }
+  .stashpad-showcase-sec-num { width: 26px; height: 26px; }
+}
 .stashpad-showcase-caption { font-size: var(--font-text-size); }
 .stashpad-showcase-caption > :first-child { margin-top: 0; }
 .stashpad-showcase-caption > :last-child { margin-bottom: 0; }
@@ -12045,6 +12195,8 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-showcase .stashpad-showcase-react:hover, .stashpad-showcase .stashpad-showcase-react.has-count { opacity: 1; }
 .stashpad-showcase .stashpad-showcase-react.is-mine { border-color: var(--interactive-accent); background: hsla(var(--interactive-accent-hsl), 0.15); }
 .stashpad-showcase-react-count { font-size: var(--font-ui-smaller); font-weight: 600; }
+/* 0.548.0: ✅ / ❌ say what they mean ("Approve", "Select", …). */
+.stashpad-showcase-react-word { font-size: var(--font-ui-smaller); }
 .stashpad-showcase-react.is-more .svg-icon { width: 14px; height: 14px; }
 
 /* Feedback column. */
@@ -12075,6 +12227,7 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-showcase-comment.is-resolved .stashpad-showcase-comment-num { background: var(--color-green); }
 .stashpad-showcase-comment-author { font-weight: 600; }
 .stashpad-showcase-comment-role { color: var(--text-muted); }
+.stashpad-showcase-comment-role::before { content: "· "; }
 .stashpad-showcase-comment-time { color: var(--text-faint); margin-left: auto; }
 .stashpad-showcase-comment-target {
   display: inline-flex; align-items: center; gap: 4px; margin-top: 4px; cursor: pointer;
@@ -12088,6 +12241,11 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-showcase-comment-actions { display: flex; align-items: center; gap: 4px; margin-top: 4px; }
 .stashpad-showcase-comment-actions button { height: auto; padding: 2px 6px; font-size: var(--font-ui-smaller); box-shadow: none; }
 .stashpad-showcase-comment-actions .clickable-icon { margin-left: auto; }
+/* 0.554.4: the comment's ⋯ menu (replaced the hover-only "show in list"
+   icon) — always visible, quiet until hovered. */
+.stashpad-showcase-comment-more { color: var(--text-faint); }
+.stashpad-showcase-comment:hover > .stashpad-showcase-comment-actions > .stashpad-showcase-comment-more,
+.stashpad-showcase-comment-more:focus-visible { color: var(--text-normal); }
 .stashpad-showcase-resolve { display: inline-flex; align-items: center; gap: 4px; }
 .stashpad-showcase-resolve .svg-icon { width: 12px; height: 12px; }
 .stashpad-showcase-resolve.is-on { color: var(--color-green); }
@@ -12095,12 +12253,90 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-showcase-composer-target { display: flex; gap: 6px; align-items: center; }
 .stashpad-showcase-composer-target select { flex: 1 1 auto; min-width: 0; font-size: var(--font-ui-smaller); }
 .stashpad-showcase-pinbtn { display: inline-flex; align-items: center; gap: 4px; height: auto; padding: 3px 8px; font-size: var(--font-ui-smaller); white-space: nowrap; }
-.stashpad-showcase-pinbtn .svg-icon { width: 12px; height: 12px; }
 .stashpad-showcase-pinbtn.is-picking, .stashpad-showcase-pinbtn.is-set { color: var(--text-on-accent); background: var(--interactive-accent); }
 .stashpad-showcase-composer-chip { display: flex; align-items: center; gap: 4px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
 .stashpad-showcase-composer-chip button { margin-left: auto; }
 .stashpad-showcase-input { width: 100%; resize: vertical; font-size: var(--font-ui-small); min-height: 3em; }
 .stashpad-showcase-post { align-self: flex-end; height: auto; padding: 4px 14px; }
+/* 0.548.0: one quiet "Add feedback" button per section until it's wanted. */
+.stashpad-showcase .stashpad-showcase-addfb {
+  display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: auto;
+  padding: 6px 10px; border-radius: 6px; box-shadow: none; font-size: var(--font-ui-small);
+  color: var(--text-muted); background: transparent; border: 1px dashed var(--background-modifier-border-hover);
+}
+.stashpad-showcase .stashpad-showcase-addfb:hover { color: var(--text-normal); border-color: var(--interactive-accent); background: var(--background-modifier-hover); }
+.stashpad-showcase-addfb .svg-icon { width: 14px; height: 14px; }
+/* 0.554.2: "📍 Comment on a spot" next to "Add feedback"; the 📍 emoji
+   everywhere a spot comment is offered or shown. */
+.stashpad-showcase-addrow { display: flex; flex-wrap: wrap; gap: 6px; }
+.stashpad-showcase-addrow > .stashpad-showcase-addfb { flex: 1 1 auto; width: auto; white-space: nowrap; }
+.stashpad-showcase-pin-emoji { font-size: 0.95em; line-height: 1; }
+.stashpad-showcase .stashpad-showcase-att-pin {
+  display: inline-flex; align-items: center; gap: 4px; height: auto; padding: 2px 8px; box-shadow: none;
+  font-size: var(--font-ui-smaller); color: var(--text-muted); background: transparent;
+  border: 1px solid var(--background-modifier-border); border-radius: 999px;
+}
+.stashpad-showcase .stashpad-showcase-att-pin:hover { color: var(--text-normal); border-color: var(--interactive-accent); }
+@container (max-width: 640px) { .stashpad-showcase-att-pin .stashpad-showcase-btn-text { display: none; } }
+body.is-mobile .stashpad-showcase .stashpad-showcase-att-pin { min-height: 32px; min-width: 32px; justify-content: center; }
+.stashpad-showcase-section.is-pin-picking .stashpad-showcase-att-pin { border-color: var(--interactive-accent); background: hsla(var(--interactive-accent-hsl), 0.15); color: var(--text-normal); }
+.stashpad-showcase-aside.is-empty { background: transparent; }
+.stashpad-showcase-composer-about { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-showcase-composer-about select { flex: 1 1 auto; min-width: 0; }
+.stashpad-showcase-composer-btns { display: flex; justify-content: flex-end; gap: 6px; }
+.stashpad-showcase-composer-btns button { height: auto; padding: 4px 12px; }
+/* 0.549.0: "you're inside a note that is itself a page" + the way out, and the
+   brief highlight on the section you land on from the list. */
+.stashpad-showcase-notice {
+  max-width: 1500px; margin: 0 auto 18px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px;
+  padding: 10px 12px; border-radius: 8px; background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border); font-size: var(--font-ui-small); color: var(--text-muted);
+}
+.stashpad-showcase-notice-icon .svg-icon { width: 16px; height: 16px; color: var(--interactive-accent); }
+.stashpad-showcase-notice button { margin-left: auto; height: auto; padding: 4px 12px; }
+.stashpad-showcase-more.is-earlier { padding: 0 0 18px; }
+.stashpad-showcase-section { transition: box-shadow 0.4s ease; }
+.stashpad-showcase-section.is-landed { border-radius: 8px; box-shadow: 0 0 0 3px hsla(var(--interactive-accent-hsl), 0.45); }
+/* 0.550.0: the comment box that opens AT a just-placed pin. Positioned in px
+   against the section's main column (JS), so the file card's overflow clip
+   can't cut it off. grid-column/row auto = the grid's own box is its
+   containing block, not the files' column. */
+.stashpad-showcase-main { position: relative; }
+.stashpad-showcase-main > .stashpad-showcase-pinbox {
+  position: absolute; grid-column: auto; grid-row: auto; z-index: 5; box-sizing: border-box;
+  display: flex; flex-direction: column; gap: 6px; padding: 8px; line-height: var(--line-height-normal);
+  background: var(--background-primary); border: 1px solid var(--interactive-accent); border-radius: 8px;
+  box-shadow: var(--shadow-l);
+}
+.stashpad-showcase-main > .stashpad-showcase-pinbox.is-unplaced { visibility: hidden; }
+.stashpad-showcase-pinbox-head { display: flex; align-items: center; gap: 6px; font-size: var(--font-ui-smaller); color: var(--text-muted); font-weight: 600; }
+.stashpad-showcase-composer.is-pinned .stashpad-showcase-composer-chip { flex-wrap: wrap; align-items: flex-start; }
+.stashpad-showcase-composer-chip-text { flex: 1 1 0; min-width: 8em; }
+.stashpad-showcase-composer.is-pinned .stashpad-showcase-composer-chip button { height: auto; padding: 2px 8px; }
+/* 0.550.0: hover a comment → its pin + file light up; hover a pin → its comment. */
+.stashpad-showcase .stashpad-showcase-pin.is-hot { transform: translate(-50%, -50%) scale(1.3); z-index: 2; box-shadow: 0 0 0 3px var(--interactive-accent), 0 1px 4px rgba(0,0,0,0.45); }
+.stashpad-showcase-comment.is-hot { box-shadow: 0 0 0 2px hsla(var(--interactive-accent-hsl), 0.55); }
+.stashpad-showcase-att.is-hot { box-shadow: 0 0 0 2px hsla(var(--interactive-accent-hsl), 0.55); }
+/* A click's flash outranks the hover ring it lands on. */
+.stashpad-showcase-comment.is-hot.is-flash { box-shadow: 0 0 0 2px var(--interactive-accent); }
+.stashpad-showcase-att.is-hot.is-flash { box-shadow: 0 0 0 3px var(--interactive-accent); }
+/* 0.550.0: narrow pane → feedback sits below the files; a chip by the title jumps to it. */
+.stashpad-showcase .stashpad-showcase-fbjump { display: none; }
+.stashpad-showcase .stashpad-showcase-fbjump.has-open { color: var(--color-orange); border-color: var(--color-orange); }
+@container (max-width: 900px) { .stashpad-showcase .stashpad-showcase-fbjump { display: inline-flex; } }
+/* 0.551.0: review progress — toolbar count + a decision chip per section. */
+.stashpad-showcase-progress.is-complete { color: var(--color-green); }
+.stashpad-showcase-progress-changes { color: var(--color-orange); }
+.stashpad-showcase-status { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+.stashpad-showcase-status-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 8px; border-radius: 999px;
+  font-size: var(--font-ui-smaller); font-weight: 600; border: 1px solid var(--background-modifier-border); color: var(--text-muted);
+}
+.stashpad-showcase-status-chip .svg-icon { width: 12px; height: 12px; }
+.stashpad-showcase-status-chip.is-approved { color: var(--color-green); border-color: rgba(var(--color-green-rgb), 0.5); background: rgba(var(--color-green-rgb), 0.1); }
+.stashpad-showcase-status-chip.is-changes { color: var(--color-orange); border-color: rgba(var(--color-orange-rgb), 0.5); background: rgba(var(--color-orange-rgb), 0.1); }
+.stashpad-showcase-status-chip.is-none { font-weight: normal; color: var(--text-faint); }
+.stashpad-showcase-status-chip.is-picked { color: var(--text-accent); border-color: hsla(var(--interactive-accent-hsl), 0.5); }
 
 /* The list's chip on a feedback note: "Feedback on cover.png" → opens it. */
 .stashpad-feedback-chip {
@@ -12225,3 +12461,8 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
   padding: 0 4px;
   background: color-mix(in srgb, var(--color-red, #e93147) 18%, transparent);
 }
+
+/* 0.554.5: the preview window's 📍 row — comments on this file + add one. */
+.stashpad-media-spots { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 4px 12px 6px; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-media-spots-btn { display: inline-flex; align-items: center; gap: 4px; height: auto; padding: 2px 10px; border-radius: 999px; font-size: var(--font-ui-smaller); }
+.stashpad-media-spots-none { color: var(--text-faint); }

@@ -20,7 +20,7 @@ import { QUICK_ACTION_CATALOG } from "./quick-actions";
 import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS, ZAP_ACTIONS, ZAP_ADDABLE, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, type NoteActionDef } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
 import { guessCommandIcon } from "./icon-guess";
-import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal } from "./modals";
+import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal, parseTimeOfDay, formatTimeChip } from "./modals";
 import { makeSnippet } from "./snippets";
 import { resolveToolbarButtons, type ToolbarButtonConfig } from "./formatting-toolbar";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
@@ -622,8 +622,10 @@ export interface StashpadSettings {
    *  HIGHER rev on disk knows another instance/machine wrote since. */
   settingsRev?: number;
   /** 0.125.1: quick relative time-adjust presets shown in the due-date / snooze
-   *  picker (e.g. ["5m","15m","1h","1d"]). A +/- flip toggles add vs subtract. */
+   *  picker (e.g. ["5m","15m","1h","1d"]). 0.547.0: each chip has − and + halves. */
   dueQuickAdjusts: string[];
+  /** 0.547.0: time-of-day chips in the due picker ("HH:mm", 24h). [] hides the row. */
+  dueTimePresets: string[];
   /** Time of day ("HH:mm", 24h) a reminder fires for a task whose due is a bare
    *  date with no time (e.g. `due: 2026-09-23`). Default 07:00. */
   dateOnlyDueReminderTime: string;
@@ -1422,6 +1424,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   reEncryptNudge: false,
   reEncryptAfterMin: 0,
   dueQuickAdjusts: ["5m", "15m", "30m", "1h", "1d", "1w"],
+  dueTimePresets: ["09:00", "12:00", "15:00", "17:00"],
   dateOnlyDueReminderTime: "07:00",
   taskTagChips: [],
   taskTagSuggestions: [],
@@ -4512,7 +4515,7 @@ export class StashpadSettingTab extends PluginSettingTab {
           t.onChange(async (v) => { this.plugin.settings.dateDisplayTimezone = (v || "").trim(); await set(); refreshSample(); });
         });
       }, ["timezone", "tz", "date", "iana"]));
-      cats.datesTime.push(this.renderDef("Quick due-date adjustments", "Comma-separated relative amounts shown as quick +/- buttons in the due-date and snooze pickers (e.g. 5m, 15m, 1h, 1d, 1w). Units: m=minutes, h=hours, d=days, w=weeks. A +/- flip in the picker toggles add vs subtract. Leave blank to hide the row.", (s) => {
+      cats.datesTime.push(this.renderDef("Quick due-date adjustments", "Comma-separated relative amounts shown as quick − / + buttons in the due-date and snooze pickers (e.g. 5m, 15m, 1h, 1d, 1w). Units: m=minutes, h=hours, d=days, w=weeks. Each button has its own − and + half; minute and hour steps snap to clean times (9:03 + 15m → 9:15). Leave blank to hide the row.", (s) => {
         s.addText((t) => {
           t.setPlaceholder("5m, 15m, 1h, 1d, 1w");
           t.setValue((this.plugin.settings.dueQuickAdjusts ?? []).join(", "));
@@ -4527,6 +4530,20 @@ export class StashpadSettingTab extends PluginSettingTab {
           });
         });
       }, ["quick", "adjust", "snooze", "due", "preset", "increment", "decrement"]));
+      cats.datesTime.push(this.renderDef("Due-date time presets", "Comma-separated times of day shown as one-click buttons in the due-date picker (e.g. 9am, 12pm, 3pm, 5:30pm or 17:00). Leave blank to hide the row.", (s) => {
+        s.addText((t) => {
+          t.setPlaceholder("9am, 12pm, 3pm, 5pm");
+          t.setValue((this.plugin.settings.dueTimePresets ?? []).map(formatTimeChip).join(", "));
+          t.onChange(async (v) => {
+            // Keep only real times, stored as "HH:mm"; half-typed tokens are
+            // dropped silently (same as the quick-adjust field above).
+            this.plugin.settings.dueTimePresets = v.split(",")
+              .map((x) => parseTimeOfDay(x))
+              .filter((x): x is string => !!x);
+            await set();
+          });
+        });
+      }, ["time", "preset", "due", "quick", "chip", "morning", "afternoon"]));
       cats.datesTime.push(this.renderDef("Reminder time for date-only tasks", "When a task's due date has no time (just a day), its reminder fires at this time on that day.", (s) => {
         s.addText((t) => {
           t.inputEl.type = "time";

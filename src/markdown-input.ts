@@ -21,6 +21,8 @@ import { detectTable, formatTable, emptyRow, splitRow, type TableCtx } from "./m
  *      selection so Tab keeps its focus-moving behavior everywhere else
  *      (accessibility: a textarea must stay escapable by keyboard).
  *    - DOUBLE-CLICK selection trimmed of trailing whitespace.
+ *    - MOVE LINE(S) UP/DOWN on Alt+↑/↓ or Ctrl+↑/↓  (VS Code `moveLinesUp/Down`,
+ *      Obsidian "Move line up/down") — 0.555.0, undoable.
  *
  *  Obsidian's own editor toggles are honored so a user configures this ONCE:
  *  `autoPairBrackets` gates brackets/parens/quotes, `autoPairMarkdown` gates
@@ -132,6 +134,40 @@ export function fixDuplicatedEmphasisOpeners(text: string): string {
   return out;
 }
 
+/** 0.555.0: move the line(s) the selection touches one line up (`dir` -1) or
+ *  down (+1) — VS Code's / Obsidian's "Move line up/down". The block is every
+ *  line the selection touches, EXCEPT a last line the selection merely reaches
+ *  at column 0 (dragging to the start of the next line doesn't take it along).
+ *  The selection travels with the block. Returns the swapped span
+ *  [`from`,`to`) of the ORIGINAL value plus its replacement `text`, so the
+ *  caller can apply it as one undoable edit; null at the top/bottom edge.
+ *  Exported for unit checks. */
+export function moveLines(value: string, start: number, end: number, dir: -1 | 1):
+  { from: number; to: number; text: string; selStart: number; selEnd: number } | null {
+  // start === 0 guard: lastIndexOf("\n", -1) still inspects index 0.
+  const blockStart = start === 0 ? 0 : value.lastIndexOf("\n", start - 1) + 1;
+  const endPos = end > start && end > blockStart && value[end - 1] === "\n" ? end - 1 : end;
+  const nl = value.indexOf("\n", endPos);
+  const blockEnd = nl === -1 ? value.length : nl;
+  const block = value.slice(blockStart, blockEnd);
+  if (dir < 0) {
+    if (blockStart === 0) return null;
+    const prevStart = blockStart < 2 ? 0 : value.lastIndexOf("\n", blockStart - 2) + 1;
+    const prev = value.slice(prevStart, blockStart - 1);
+    const d = prev.length + 1;
+    return { from: prevStart, to: blockEnd, text: `${block}\n${prev}`, selStart: start - d, selEnd: end - d };
+  }
+  if (blockEnd === value.length) return null;
+  const nextNl = value.indexOf("\n", blockEnd + 1);
+  const nextEnd = nextNl === -1 ? value.length : nextNl;
+  const next = value.slice(blockEnd + 1, nextEnd);
+  const d = next.length + 1;
+  // Clamp: a selection that took the block's trailing newline along overshoots
+  // when the block lands on the (newline-less) last line.
+  const max = value.length;
+  return { from: blockStart, to: nextEnd, text: `${next}\n${block}`, selStart: Math.min(start + d, max), selEnd: Math.min(end + d, max) };
+}
+
 export interface MarkdownInputOptions {
   /** True when THIS keydown will insert a newline rather than submit/commit.
    *  The composer submits on Enter (or Shift+Enter, per its mode); the
@@ -220,6 +256,10 @@ export class MarkdownInput {
 
     if (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.altKey) { this.handleEnter(e, start, end); return; }
     if (e.key === "Tab" && !e.metaKey && !e.ctrlKey && !e.altKey) { this.handleTab(e, start, end); return; }
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && (e.altKey || e.ctrlKey) && !e.metaKey && !e.shiftKey) {
+      this.handleMoveLines(e, start, end, e.key === "ArrowUp" ? -1 : 1);
+      return;
+    }
     // 0.363.7: on mobile the pair family runs off beforeinput (see attach()); a
     // keydown pass there would double it. Enter/Tab above still run on keydown on
     // both platforms — they're not affected by the preventDefault-suppression bug.
@@ -246,6 +286,32 @@ export class MarkdownInput {
       this.handlePairs({ key: "Backspace", preventDefault: pd }, start, end);
     }
   };
+
+  /** 0.555.0: Alt+↑/↓ or Ctrl+↑/↓ moves the current line (or every line the
+   *  selection touches) up/down. Always consumed — even at the top/bottom edge,
+   *  where it's a no-op — so it never falls through to a host's plain-arrow
+   *  handler (the composer's "↑ at the start leaves the field") or the open
+   *  autocomplete list. Applied via execCommand("insertText") so Cmd/Ctrl+Z
+   *  undoes the move; falls back to a plain splice if that's unavailable.
+   *  macOS note: Ctrl+↑/↓ is Mission Control by default, so on a Mac it only
+   *  reaches us if that system shortcut is off — Option+↑/↓ always works. */
+  private handleMoveLines(e: KeyboardEvent, start: number, end: number, dir: -1 | 1): void {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    const mv = moveLines(this.ta.value, start, end, dir);
+    if (!mv) return;
+    const before = this.ta.value;
+    this.ta.setSelectionRange(mv.from, mv.to);
+    let ok = false;
+    try { ok = this.ta.ownerDocument.execCommand("insertText", false, mv.text); } catch { ok = false; }
+    if (!ok || this.ta.value === before) {
+      this.ta.value = before;
+      this.splice(mv.from, mv.to, mv.text, mv.selStart, mv.selEnd);
+      return;
+    }
+    this.ta.setSelectionRange(mv.selStart, mv.selEnd);
+  }
 
   /** List continuation (Obsidian's `smartIndentList`). Runs ONLY when this
    *  Enter inserts a newline — a submit/commit Enter is left alone. */

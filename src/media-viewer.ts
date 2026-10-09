@@ -1,7 +1,7 @@
 import { App, Component, MarkdownRenderer, Menu, Modal, Platform, TFile, setIcon } from "obsidian";
 import { notify } from "./notify";
 import { buildFileActions } from "./notifications";
-import { fileKindFor } from "./file-kinds";
+import { fileKindFor, isImageExt } from "./file-kinds";
 
 /** How the viewer presents the note's files.
  *  - `view`     one file large, thin filmstrip of the rest (the default)
@@ -115,6 +115,17 @@ export interface MediaItem {
  *  point before solving for the new translation, which is where this kind of
  *  code usually goes subtly wrong.
  */
+/** 0.554.5: Showcase spot comments (📍) on the file being viewed — so the
+ *  preview says a picture isn't "clean", lists the comments, and offers to add
+ *  one. Pins themselves live only in the Showcase (one pin surface). */
+export interface SpotComments {
+  list(file: TFile): Array<{ id: string; author: string; text: string; resolved: boolean; page?: number; pinned: boolean }>;
+  /** Show this comment in the Showcase (the viewer closes first). */
+  open(id: string): void;
+  /** Start a new 📍 comment on this file in the Showcase. */
+  comment(file: TFile): void;
+}
+
 export class MediaViewerModal extends Modal {
   private items: MediaItem[];
   private idx: number;
@@ -197,6 +208,7 @@ export class MediaViewerModal extends Modal {
     items: MediaItem[],
     startIndex: number,
     private onOpenInTab: (file: TFile) => void,
+    private spot?: SpotComments,
   ) {
     super(app);
     this.items = items;
@@ -227,6 +239,9 @@ export class MediaViewerModal extends Modal {
     // --- header: caption + actions ---
     const header = contentEl.createDiv({ cls: "stashpad-media-header" });
     this.captionEl = header.createDiv({ cls: "stashpad-media-caption" });
+    // 0.554.5: the 📍 comments row (filled per slide by renderSpots).
+    this.spotsEl = contentEl.createDiv({ cls: "stashpad-media-spots" });
+    this.spotsEl.hide();
 
     // --- body: holds EITHER the stage+rail (view mode) or a browse surface ---
     this.bodyEl = contentEl.createDiv({ cls: "stashpad-media-body" });
@@ -866,6 +881,45 @@ export class MediaViewerModal extends Modal {
 
   private current(): MediaItem | null { return this.items[this.idx] ?? null; }
 
+  private spotsEl: HTMLElement | null = null;
+  /** 0.554.5: "📍 3 comments on this file ▾" (a list; pick one to see it in the
+   *  Showcase) + "📍 Comment on this". Only for an image or PDF slide, and only
+   *  when the opener passed a SpotComments hook. */
+  private renderSpots(item: MediaItem | null): void {
+    const el = this.spotsEl;
+    if (!el) return;
+    el.empty();
+    const file = item && !item.note ? item.file : null;
+    const ext = file?.extension.toLowerCase() ?? "";
+    if (!this.spot || !file || !(isImageExt(ext) || ext === "pdf")) { el.hide(); return; }
+    const spot = this.spot;
+    const list = spot.list(file);
+    el.show();
+    if (list.length) {
+      const open = list.filter((c) => !c.resolved).length;
+      const b = el.createEl("button", { cls: "stashpad-media-spots-btn", attr: { "aria-haspopup": "menu" } });
+      b.createSpan({ text: "📍", attr: { "aria-hidden": "true" } });
+      b.createSpan({ text: `${list.length} comment${list.length === 1 ? "" : "s"} on this file${open ? ` · ${open} to resolve` : ""}` });
+      b.createSpan({ text: "▾", attr: { "aria-hidden": "true" } });
+      b.onclick = () => {
+        const m = new Menu();
+        list.forEach((c) => m.addItem((it) => it
+          .setTitle(`${c.author}: ${Array.from(c.text).slice(0, 60).join("")}${c.page ? ` · p. ${c.page}` : ""}${c.resolved ? " ✓" : ""}`)
+          .setIcon(c.resolved ? "check-circle-2" : c.pinned ? "map-pin" : "message-square")
+          .onClick(() => { this.close(); spot.open(c.id); })));
+        const r = b.getBoundingClientRect();
+        m.showAtPosition({ x: r.left, y: r.bottom + 4 }, b.doc);
+      };
+    } else {
+      el.createSpan({ cls: "stashpad-media-spots-none", text: "No comments on this file yet." });
+    }
+    const add = el.createEl("button", { cls: "stashpad-media-spots-btn" });
+    add.createSpan({ text: "📍", attr: { "aria-hidden": "true" } });
+    add.createSpan({ text: "Comment on this" });
+    add.setAttr("aria-label", "Comment on this: opens the Showcase, then click the spot");
+    add.onclick = () => { this.close(); spot.comment(file); };
+  }
+
   private go(dir: -1 | 1): void {
     // Cropping is a modal sub-mode: paging away would silently drop the frame.
     if (this.cropping) return;
@@ -896,6 +950,7 @@ export class MediaViewerModal extends Modal {
     const name = item ? (item.note ? item.note.title : (item.path.split("/").pop() ?? item.path)) : "";
     this.captionEl.empty();
     this.captionEl.createSpan({ cls: "stashpad-media-name", text: name });
+    this.renderSpots(item);
     if (this.items.length > 1) {
       this.captionEl.createSpan({
         cls: "stashpad-media-count",
@@ -1110,6 +1165,8 @@ export class MediaViewerModal extends Modal {
     this.stageEl.toggleClass("is-hidden", browsing);
     this.railEl.toggleClass("is-hidden", browsing || this.items.length <= 1);
     this.browseEl.toggleClass("is-hidden", !browsing);
+    // 0.554.5: the 📍 row describes the slide on stage — not shown while browsing.
+    this.spotsEl?.toggleClass("is-hidden", browsing);
     for (const key of Object.keys(this.modeBtns) as ViewerMode[]) {
       this.modeBtns[key]?.toggleClass("is-active", key === m);
     }

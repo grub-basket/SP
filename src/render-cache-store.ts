@@ -289,6 +289,22 @@ export class RenderCacheStore implements RenderCacheLike {
     else this.scheduleSave();
   }
 
+  /** A vault rename doesn't change a note's content, so the entry moves to the
+   *  new path instead of being dropped. Dropping it lost the note's title:
+   *  editing a note's first line repaints its row (which caches the NEW text
+   *  under the OLD path), then the slug rename fires and the entry was evicted.
+   *  The new path stayed cold until the row happened to render again, which on a
+   *  virtualized list may be never, so titleForNode fell back to the filename
+   *  slug: stopwords dropped and capped at 50 chars. On a phone, where search
+   *  matches titles before the bodies finish loading, the note looked
+   *  unsearchable by its own first line. The entry's mtime still guards every
+   *  render read, so a moved entry can't serve stale HTML. */
+  rename(oldPath: string, newPath: string): void {
+    const e = this.map.get(oldPath);
+    this.evict(oldPath);
+    if (e && !this.map.has(newPath)) this.set(newPath, e); // set() refuses a tombstoned path
+  }
+
   get(path: string): RenderEntry | undefined {
     const e = this.map.get(path);
     if (!e) return undefined;

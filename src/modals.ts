@@ -83,8 +83,39 @@ export interface DuePickerOptions {
   hideAssignees?: boolean;
   /** 0.125.1: quick relative time-adjust presets (e.g. ["5m","1h","1d"]). When
    *  non-empty, a row of +/- buttons nudges the entered date/time by each
-   *  amount; a flip toggle switches between adding and subtracting. */
+   *  amount. 0.547.0: each chip has its own − and + half (the flip is gone). */
   quickAdjusts?: string[];
+  /** 0.547.0: time-of-day chips ("HH:mm", 24h) that set the time in one click.
+   *  Undefined → DEFAULT_TIME_PRESETS; [] hides the row. */
+  timePresets?: string[];
+}
+
+/** 0.547.0: fallback time-of-day chips. Mirrors DEFAULT_SETTINGS.dueTimePresets. */
+export const DEFAULT_TIME_PRESETS = ["09:00", "12:00", "15:00", "17:00"];
+
+/** 0.547.0: parse a time of day typed in settings ("9am", "3:30 pm", "17:00",
+ *  "9") into "HH:mm" (24h). Null when it isn't a real time. */
+export function parseTimeOfDay(raw: string): string | null {
+  const m = /^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)?\s*$/i.exec(raw);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const mi = m[2] ? parseInt(m[2], 10) : 0;
+  const ap = m[3]?.toLowerCase()[0];
+  if (mi > 59) return null;
+  if (ap) {
+    if (h < 1 || h > 12) return null;
+    if (ap === "a" && h === 12) h = 0;
+    else if (ap === "p" && h !== 12) h += 12;
+  } else if (h > 23) return null;
+  return `${String(h).padStart(2, "0")}:${String(mi).padStart(2, "0")}`;
+}
+
+/** 0.547.0: "15:30" → "3:30pm", "09:00" → "9am" — the compact chip label. */
+export function formatTimeChip(hhmm: string): string {
+  const [h, mi] = hhmm.split(":").map((n) => parseInt(n, 10));
+  const ap = h >= 12 ? "pm" : "am";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return mi ? `${h12}:${String(mi).padStart(2, "0")}${ap}` : `${h12}${ap}`;
 }
 
 /** 0.155.0: fallback quick-adjust presets. Mirrors DEFAULT_SETTINGS.dueQuickAdjusts.
@@ -4370,10 +4401,115 @@ export class DueDatePickerModal extends Modal {
       if (!isBareDateDue(this.current)) timeInput.value = this.toTimeValue(initial);
     }
 
-    // 0.125.1: quick relative adjust row — a +/- flip toggle plus one button per
-    // configured preset. Clicking nudges the entered date+time by ±amount; if no
-    // date/time is entered yet, it bases off "now" so a single tap schedules
-    // e.g. "+1h from now". Reschedule-friendly for Snooze.
+    // 0.547.0: one nudge engine for the chips, the scroll wheel and the arrow
+    // keys. Base = the entered date+time, with today / now filled in for a
+    // missing part. Minute and hour steps SNAP: from 9:03, +15m lands on 9:15
+    // and −15m on 9:00; once on the grid each step moves a full amount. Hour
+    // steps snap to the whole hour (9:03 +1h → 10:00). Day/week steps move the
+    // date and keep the time as is — an empty time stays empty (a date-only due
+    // stays date-only) unless the date was empty too, where "+1d" from nothing
+    // still means "this time tomorrow".
+    const nudge = (stepMin: number, dir: 1 | -1, dayUnit: boolean): void => {
+      const now = new Date();
+      const hadDate = !!dateInput.value;
+      const hadTime = !!timeInput.value;
+      let y: number, mo: number, d: number;
+      if (hadDate) { const [yy, mm, dd] = dateInput.value.split("-").map((n) => parseInt(n, 10)); y = yy; mo = mm - 1; d = dd; }
+      else { y = now.getFullYear(); mo = now.getMonth(); d = now.getDate(); }
+      let hh: number, mi: number;
+      if (hadTime) { const [h, m] = timeInput.value.split(":").map((n) => parseInt(n, 10)); hh = h; mi = m; }
+      else { hh = now.getHours(); mi = now.getMinutes(); }
+      const base = new Date(y, mo, d, hh, mi, 0, 0);
+      if (dayUnit) {
+        base.setDate(base.getDate() + dir * Math.round(stepMin / 1440));
+      } else {
+        const grid = stepMin <= 60 ? stepMin : 60;
+        const t = hh * 60 + mi;
+        const snapped = dir > 0 ? Math.floor(t / grid) * grid + grid : Math.ceil(t / grid) * grid - grid;
+        base.setHours(0, snapped + dir * (stepMin - grid), 0, 0);
+      }
+      dateInput.value = this.toDateValue(base);
+      if (hadTime || !dayUnit || !hadDate) timeInput.value = this.toTimeValue(base);
+    };
+    // Scroll wheel over a field: up = later, down = earlier. Shift = the big
+    // step (macOS turns Shift+wheel into a horizontal scroll, so read deltaX
+    // too). Trackpads send many tiny deltas — accumulate to ~one notch per step.
+    // The leftover resets on a direction change or a pause, so the tail of one
+    // gesture can't swallow (or pre-fire) the first step of the next.
+    // The modal itself scrolls (it's tall once Assign/Tags/Repeat are shown), so
+    // a scroll that STARTED elsewhere must glide over the fields instead of
+    // being captured mid-gesture and changing the date. Any wheel on the modal
+    // outside the fields marks "modal is scrolling"; while that's fresh, a wheel
+    // over a field scrolls the modal too (and keeps the mark fresh).
+    let modalScrollAt = -Infinity;
+    const isFieldWheel = (t: EventTarget | null): boolean => t instanceof Node && (dateField.contains(t) || timeField.contains(t));
+    this.modalEl.addEventListener("wheel", (e: WheelEvent) => {
+      if (!isFieldWheel(e.target)) modalScrollAt = e.timeStamp;
+    }, { capture: true, passive: true });
+    const wheelNudge = (el: HTMLElement, small: number, big: number, dayUnit: boolean): void => {
+      let acc = 0;
+      let lastAt = 0;
+      el.addEventListener("wheel", (e: WheelEvent) => {
+        const delta = e.deltaY || e.deltaX;
+        if (!delta) return;
+        if (e.timeStamp - modalScrollAt < 400) { modalScrollAt = e.timeStamp; return; }
+        e.preventDefault();
+        const px = e.deltaMode === 1 ? delta * 40 : e.deltaMode === 2 ? delta * 400 : delta;
+        if (e.timeStamp - lastAt > 250 || Math.sign(px) !== Math.sign(acc)) acc = 0;
+        lastAt = e.timeStamp;
+        acc += px;
+        while (Math.abs(acc) >= 40) {
+          const dir: 1 | -1 = acc < 0 ? 1 : -1;
+          acc += dir * 40;
+          nudge(e.shiftKey ? big : small, dir, dayUnit);
+        }
+      }, { passive: false });
+    };
+    // ↑/↓ in a focused field: same steps as the wheel, carrying across the
+    // hour / midnight / month (the native segment arrows wrap 59 → 00 without
+    // touching the hour). ←/→ and typing stay native.
+    const arrowNudge = (el: HTMLElement, small: number, big: number, dayUnit: boolean): void => {
+      el.addEventListener("keydown", (e: KeyboardEvent) => {
+        if ((e.key !== "ArrowUp" && e.key !== "ArrowDown") || e.altKey || e.metaKey || e.ctrlKey) return;
+        e.preventDefault();
+        nudge(e.shiftKey ? big : small, e.key === "ArrowUp" ? 1 : -1, dayUnit);
+      });
+    };
+    wheelNudge(timeField, 5, 60, false);
+    arrowNudge(timeInput, 5, 60, false);
+    wheelNudge(dateField, 1440, 10080, true);
+    arrowNudge(dateInput, 1440, 10080, true);
+    timeField.title = "Scroll or ↑/↓: ±5 min · Shift: ±1 hour";
+    dateField.title = "Scroll or ↑/↓: ±1 day · Shift: ±1 week";
+
+    // 0.547.0: time-of-day chips — one click sets the time. With no date yet it
+    // picks today, or tomorrow when that time has already passed today.
+    const timePresets = (this.opts.timePresets ?? DEFAULT_TIME_PRESETS)
+      .map((s) => parseTimeOfDay(s))
+      .filter((s): s is string => !!s);
+    if (timePresets.length > 0) {
+      const row = wrap.createDiv({ cls: "stashpad-due-timechips" });
+      for (const hhmm of timePresets) {
+        const b = row.createEl("button", { cls: "stashpad-due-adjust-btn stashpad-due-timechip", text: formatTimeChip(hhmm), attr: { type: "button" } });
+        b.onclick = () => {
+          if (!dateInput.value) {
+            const [h, m] = hhmm.split(":").map((n) => parseInt(n, 10));
+            const d = this.startOfTodayLocal();
+            d.setHours(h, m, 0, 0);
+            if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+            dateInput.value = this.toDateValue(d);
+          }
+          timeInput.value = hhmm;
+        };
+      }
+    }
+
+    // 0.125.1: quick relative adjust row — one button per configured preset.
+    // Clicking nudges the entered date+time by ±amount; if no date/time is
+    // entered yet, it bases off "now" so a single tap schedules e.g. "+1h from
+    // now". Reschedule-friendly for Snooze. 0.547.0: the +/- flip toggle is
+    // gone — each chip is split into its own − and + half, so going back is one
+    // click instead of two, and the add/subtract state can't be missed.
     const parsedAdjusts = (this.opts.quickAdjusts ?? DEFAULT_QUICK_ADJUSTS)
       .map((s) => ({ raw: s, min: parseAdjustMinutes(s) }))
       .filter((a): a is { raw: string; min: number } => a.min != null);
@@ -4390,33 +4526,17 @@ export class DueDatePickerModal extends Modal {
       ...parsedAdjusts.filter((a) => isDayUnit(a.raw)),
     ];
     if (adjusts.length > 0) {
-      let sign = 1; // +1 add, -1 subtract
       const row = wrap.createDiv({ cls: "stashpad-due-quickadjust" });
-      const flip = row.createEl("button", { cls: "stashpad-due-adjust-flip", attr: { type: "button" } });
-      const syncFlip = (): void => {
-        flip.setText(sign > 0 ? "+" : "−");
-        flip.toggleClass("is-minus", sign < 0);
-        flip.title = sign > 0 ? "Adding time (click to subtract)" : "Subtracting time (click to add)";
-      };
-      syncFlip();
-      flip.onclick = () => { sign = -sign; syncFlip(); };
-      const adjustBy = (deltaMin: number): void => {
-        // Base: entered date+time, else today/now filled in for the missing part.
-        const now = new Date();
-        let y: number, mo: number, d: number;
-        if (dateInput.value) { const [yy, mm, dd] = dateInput.value.split("-").map((n) => parseInt(n, 10)); y = yy; mo = mm - 1; d = dd; }
-        else { y = now.getFullYear(); mo = now.getMonth(); d = now.getDate(); }
-        let hh: number, mi: number;
-        if (timeInput.value) { const [h, m] = timeInput.value.split(":").map((n) => parseInt(n, 10)); hh = h; mi = m; }
-        else { hh = now.getHours(); mi = now.getMinutes(); }
-        const base = new Date(y, mo, d, hh, mi, 0, 0);
-        base.setMinutes(base.getMinutes() + sign * deltaMin);
-        dateInput.value = this.toDateValue(base);
-        timeInput.value = this.toTimeValue(base);
-      };
       for (const a of adjusts) {
-        const b = row.createEl("button", { cls: "stashpad-due-adjust-btn", text: a.raw, attr: { type: "button" } });
-        b.onclick = () => adjustBy(a.min);
+        const day = isDayUnit(a.raw);
+        const chip = row.createDiv({ cls: "stashpad-due-adjust-chip" });
+        const minus = chip.createEl("button", { cls: "stashpad-due-adjust-half is-minus", text: "−", attr: { type: "button", "aria-label": `Subtract ${a.raw}` } });
+        const label = chip.createSpan({ cls: "stashpad-due-adjust-label", text: a.raw });
+        const plus = chip.createEl("button", { cls: "stashpad-due-adjust-half is-plus", text: "+", attr: { type: "button", "aria-label": `Add ${a.raw}` } });
+        minus.onclick = () => nudge(a.min, -1, day);
+        plus.onclick = () => nudge(a.min, 1, day);
+        // The label is part of the + half for clicking (the common direction).
+        label.onclick = () => nudge(a.min, 1, day);
       }
     }
 
@@ -4462,7 +4582,14 @@ export class DueDatePickerModal extends Modal {
     if (this.opts.showRecurrence) {
       const det = wrap.createEl("details", { cls: "stashpad-due-recur" });
       if (this.opts.currentRepeat || this.opts.currentAutoDoneAfter || this.opts.currentRemindEvery) det.open = true;
-      det.createEl("summary", { text: "🔁 Repeat & reminders (experimental)" });
+      // 0.547.1: a real section header instead of the bare browser disclosure —
+      // rotating chevron + icon + label + an "Experimental" badge (the warning
+      // inside still spells it out).
+      const sum = det.createEl("summary", { cls: "stashpad-due-recur-summary" });
+      setIcon(sum.createSpan({ cls: "stashpad-due-recur-chevron" }), "chevron-right");
+      setIcon(sum.createSpan({ cls: "stashpad-due-recur-icon" }), "repeat");
+      sum.createSpan({ cls: "stashpad-due-recur-title", text: "Repeat & reminders" });
+      sum.createSpan({ cls: "stashpad-due-recur-badge", text: "Experimental" });
       // 0.210.4: label recurrence EXPERIMENTAL in the place someone is actually
       // about to depend on it. Repeat rules work, but they are not thoroughly
       // tested across time zones, missed occurrences and multi-device sync, and a

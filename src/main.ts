@@ -24,7 +24,7 @@ import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-vie
 import { ViewLauncherModal } from "./view-launcher";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
 import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, readFolderSubtreeNodes, type SubtreeNode, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
-import { RecentLinksModal, ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult, SettingsBackupModal} from "./modals";
+import { DEFAULT_TIME_PRESETS, RecentLinksModal, ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult, SettingsBackupModal} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
 import { preferredStashpadLeaf, preferredStashpadLeafOnFolder, anyStashpadLeafOnFolder } from "./leaf-lookup";
@@ -35,7 +35,8 @@ import {
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
   isWithinMaintenanceWindow, maintenanceSweepObeysWindow, MAINTENANCE_SWEEPS, type MaintenanceSweepId,
 } from "./settings";
-import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId } from "./slug-service";
+import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId, stripInlineMarkdown } from "./slug-service";
+import { siftRank } from "./suggest-match";
 import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, DEFAULT_ROW_BUTTONS } from "./note-actions";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
@@ -2950,9 +2951,11 @@ export default class StashpadPlugin extends Plugin {
    *  recent live Stashpad view's folder + current focus (its zoomed-in level). */
   async openShowcaseForActiveLevel(): Promise<void> {
     const leaf = this.activeStashpadLeafIfOpen();
-    const v = leaf?.view as unknown as { getViewType?: () => string; noteFolder?: string; focusId?: StashpadId } | undefined;
+    const v = leaf?.view as unknown as { getViewType?: () => string; noteFolder?: string; focusId?: StashpadId; showcaseLanding?: () => { focusId: StashpadId; scrollTo: StashpadId | null } } | undefined;
     if (v && v.getViewType?.() === STASHPAD_VIEW_TYPE && v.noteFolder) {
-      await openShowcaseView(this, v.noteFolder, v.focusId ?? ROOT_ID);
+      // 0.549.0: land on the note the list is on (see showcaseLanding).
+      const to = v.showcaseLanding?.() ?? { focusId: v.focusId ?? ROOT_ID, scrollTo: null };
+      await openShowcaseView(this, v.noteFolder, to.focusId, to.scrollTo);
       return;
     }
     await openShowcaseView(this, this.activeStashpadFolder(), ROOT_ID);
@@ -3429,9 +3432,10 @@ export default class StashpadPlugin extends Plugin {
     // cache row must not survive it even for the debounce window (or a crash /
     // force-quit inside that window). The rename caller below is ordinary
     // invalidation (the file still exists, readable, at its new path), so it
-    // rides the debounce.
+    // rides the debounce. It MOVES the entry rather than dropping it (see
+    // RenderCacheStore.rename): the file's content is unchanged by a rename.
     this.registerEvent(this.app.vault.on("delete", (f) => this.renderCacheStore.evict(f.path, { flush: true })));
-    this.registerEvent(this.app.vault.on("rename", (_f, oldPath) => this.renderCacheStore.evict(oldPath)));
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => this.renderCacheStore.rename(oldPath, f.path)));
     // Fork siblings: when a family member is deleted (single / subtree / multi /
     // fork-undo), drop it from every other member's `fork-siblings`. Debounced
     // so a burst of deletes triggers one vault scan. (Renames are handled by
@@ -4647,9 +4651,17 @@ export default class StashpadPlugin extends Plugin {
         // Switching it off removes the on-disk copies as well, so turning the
         // diagnostic off actually turns it off rather than leaving a file behind.
         if (!this.settings.debugTrace) void this.removeTraceFiles();
-        notify(this.settings.debugTrace
-          ? "Debug trace ON — reproduce the issue, then copy the trace. It's also saved to disk, so it survives a force-quit."
-          : "Debug trace OFF.");
+        // 0.546.3: only claim "saved to disk" when it is. Disk copies need the
+        // separate debugTracePersist setting (default OFF — it writes about once
+        // a second); the notice used to promise survival of a force-quit either
+        // way, so a trace was lost exactly when it mattered.
+        notify(!this.settings.debugTrace
+          ? "Debug trace OFF."
+          : this.settings.debugTracePersist
+            ? "Debug trace ON — reproduce the issue, then copy the trace. It's also saved to disk, so it survives a force-quit."
+            : "Debug trace ON — reproduce the issue, then copy the trace. Kept in memory only: a force-quit loses it. To keep it through a crash or force-quit, also turn on Settings → Stashpad → Diagnostics → \"Save the debug trace to disk\".",
+          // The memory-only notice carries an instruction — give it time to read.
+          this.settings.debugTrace && !this.settings.debugTracePersist ? 10_000 : {});
       },
     });
     this.addCommand({
@@ -7638,6 +7650,9 @@ export default class StashpadPlugin extends Plugin {
       // 0.525.0: or that sits in a folder Stashpad keeps for its own files.
       | { kind: "blocked"; folder: string; label: string; icon: string; verdict: NewStashpadVerdict }
       | { kind: "pinned"; folder: string; label: string; icon: string; file: TFile }
+      // Note search results, shown under the create offer when no folder
+      // matches (see noteResults below).
+      | { kind: "note"; folder: string; label: string; icon: string; file: TFile; snippet: string; first: boolean }
       | { kind: "trash"; label: string; icon: string };
 
     const folderForLeaf = (leaf: WorkspaceLeaf): string => {
@@ -7767,6 +7782,77 @@ export default class StashpadPlugin extends Plugin {
     // just switch folders.
     let nestGuard: ((path: string) => NestVerdict) | null = null;
     const nestCheck = (path: string): NestVerdict => (nestGuard ??= plugin.nestGuard())(path);
+    // Note results for a query that matches no folder. Before this the switcher
+    // was a dead end there: only "+ Create new Stashpad …", which is the wrong
+    // answer when you opened it by mistake while looking for a note or heading
+    // you took for a folder. Below the create offer it now lists the matching
+    // notes, from the same folders the global search covers (searchableFolders).
+    // Built on the first no-match query rather than on open, since most opens
+    // just switch folders. Titles: first heading, then the cached first line,
+    // then the filename. Bodies are read in the background and the query re-runs
+    // once they're in, same as StashpadSuggest.
+    type NoteRow = { file: TFile; folder: string; title: string; body: string };
+    let noteRows: NoteRow[] | null = null;
+    let modalClosed = false;
+    let modalRef: SuggestModal<Item> | null = null;
+    const stripFm = (md: string): string => {
+      if (!md.startsWith("---")) return md;
+      const end = md.indexOf("\n---", 3);
+      return end === -1 ? md : md.slice(end + 4).replace(/^\r?\n/, "");
+    };
+    const firstLine = (text: string): string =>
+      text.slice(0, 300).split(/\r?\n/).map((x) => x.trim()).find(Boolean) ?? "";
+    const loadNoteRows = (): NoteRow[] => {
+      if (noteRows) return noteRows;
+      const folders = new Set(this.searchableFolders(activeFolder).map((f) => f.replace(/\/+$/, "")));
+      const rows: NoteRow[] = [];
+      for (const f of this.app.vault.getMarkdownFiles()) {
+        const dir = (f.parent?.path ?? "").replace(/\/+$/, "");
+        if (!folders.has(dir)) continue;
+        const cache = this.app.metadataCache.getFileCache(f);
+        const id = readId(cache?.frontmatter?.id);
+        if (!id || id === ROOT_ID) continue; // a Home note is reached through its folder row
+        const heading = cache?.headings?.[0]?.heading;
+        const cached = this.renderCacheStore.get(f.path)?.text ?? "";
+        const title = stripInlineMarkdown((heading ?? firstLine(cached)).replace(/^#+\s*/, ""));
+        rows.push({ file: f, folder: dir, title: title || titleFromFile(f), body: cached });
+      }
+      noteRows = rows;
+      const reads = rows.map((r) => this.app.vault.cachedRead(r.file).then((md) => {
+        r.body = stripFm(md);
+        // A filename-derived title (nothing cached yet) upgrades to the real first line.
+        if (r.title === titleFromFile(r.file)) {
+          const line = stripInlineMarkdown(firstLine(r.body).replace(/^#+\s*/, ""));
+          if (line) r.title = line;
+        }
+      }, () => { /* unreadable: title-only */ }));
+      void Promise.allSettled(reads).then(() => {
+        if (modalClosed || !modalRef) return;
+        const ie = (modalRef as any).inputEl as HTMLInputElement | undefined;
+        if (ie && ie.value.trim()) ie.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      return rows;
+    };
+    const NOTE_RESULT_CAP = 30;
+    const noteResults = (query: string): Item[] => {
+      const rows = loadNoteRows();
+      // Title hits first (Sift-ranked), then body-only hits, newest first.
+      const byTitle = siftRank(query, rows, (r) => r.title);
+      const inTitle = new Set(byTitle);
+      const byBody = rows
+        .filter((r) => !inTitle.has(r) && siftMatch(query, `${r.title}\n${r.body}`))
+        .sort((a, b) => b.file.stat.mtime - a.file.stat.mtime);
+      const first = query.trim().toLowerCase().split(/\s+/)[0] ?? "";
+      return [...byTitle, ...byBody].slice(0, NOTE_RESULT_CAP).map((r, i) => {
+        const where = r.folder.split("/").pop() || r.folder;
+        const hitLine = inTitle.has(r) ? "" : (r.body.split(/\r?\n/).map((x) => x.trim()).find((x) => x.toLowerCase().includes(first)) ?? "");
+        return {
+          kind: "note" as const, folder: r.folder, file: r.file, label: r.title, icon: "file-text",
+          snippet: hitLine ? `${where} · ${hitLine.slice(0, 120)}` : where,
+          first: i === 0,
+        };
+      });
+    };
     const modal = new (class extends SuggestModal<Item> {
       getSuggestions(query: string): Item[] {
         const q = query.trim().toLowerCase();
@@ -7862,6 +7948,10 @@ export default class StashpadPlugin extends Plugin {
             } : { kind: "blocked", folder: cased, label: `Can't create “${cased}”`, icon: "ban", verdict: nest });
           }
         }
+        // No folder matched → the notes that do, under the create offer.
+        if (q && !filtered.some((it) => it.kind !== "create" && it.kind !== "convert" && it.kind !== "blocked")) {
+          filtered.push(...noteResults(query));
+        }
         // 0.65.1: open-anyway entries pinned to the very bottom — one
         // per currently-open folder, in case the user wants a second
         // tab on the same folder (e.g., main + tiny side by side).
@@ -7879,6 +7969,10 @@ export default class StashpadPlugin extends Plugin {
         el.addClass("stashpad-suggest-item");
         el.addClass("stashpad-ribbon-suggest-item");
         if (item.kind === "create") el.addClass("stashpad-suggest-create");
+        if (item.kind === "note" && item.first) {
+          el.addClass("stashpad-suggest-notes-first");
+          el.createDiv({ cls: "stashpad-suggest-section", text: "Notes" });
+        }
         // 0.522.0: muted so it reads as unavailable; still choosable, to explain.
         if (item.kind === "blocked") el.addClass("stashpad-suggest-blocked");
         const iconEl = el.createSpan({ cls: "stashpad-ribbon-suggest-icon" });
@@ -7887,6 +7981,8 @@ export default class StashpadPlugin extends Plugin {
         body.createDiv({ cls: "stashpad-suggest-title", text: item.label });
         if (item.kind === "blocked") {
           body.createDiv({ cls: "stashpad-suggest-preview", text: nestBlockReason(item.verdict) });
+        } else if (item.kind === "note") {
+          body.createDiv({ cls: "stashpad-suggest-preview", text: item.snippet });
         } else if (item.kind === "create" && item.preview) {
           body.createDiv({ cls: "stashpad-suggest-preview", text: item.preview });
         } else if ("folder" in item && item.folder && item.label !== item.folder) {
@@ -7896,7 +7992,7 @@ export default class StashpadPlugin extends Plugin {
       async onChooseSuggestion(item: Item): Promise<void> {
         if (item.kind === "trash") { plugin.openEncryptedTrash(); return; }
         if (item.kind === "blocked") { plugin.explainNestBlock(item.verdict, { modal: true }); return; }
-        if (item.kind === "pinned") { await plugin.revealNoteInStashpad(item.file); return; }
+        if (item.kind === "pinned" || item.kind === "note") { await plugin.revealNoteInStashpad(item.file); return; }
         if (item.kind === "reveal") {
           // 0.539.0: picked from the New tab screen — don't leave it behind.
           const emptyTab = plugin.claimEmptyTabTarget();
@@ -7973,7 +8069,12 @@ export default class StashpadPlugin extends Plugin {
           return;
         }
       }
+      onClose(): void {
+        modalClosed = true;
+        super.onClose();
+      }
     })(this.app);
+    modalRef = modal;
     modal.setPlaceholder(
       activeView
         ? "Open, switch this tab, or create a Stashpad folder — type to filter…"
@@ -10823,8 +10924,10 @@ export default class StashpadPlugin extends Plugin {
    *  note's id. */
   async revealNoteInStashpad(file: TFile): Promise<void> {
     const folder = file.parent?.path?.replace(/\/+$/, "") ?? "";
-    const id = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
-    if (!folder || typeof id !== "string" || !id) {
+    // readId: a bare all-digit id is a YAML number, and `typeof !== "string"`
+    // refused those notes as "not a Stashpad note".
+    const id = readId(this.app.metadataCache.getFileCache(file)?.frontmatter?.id);
+    if (!folder || !id) {
       notify("That note isn't a Stashpad note.");
       return;
     }
@@ -10910,6 +11013,57 @@ export default class StashpadPlugin extends Plugin {
     if (notes.length === 0) { notify("No Stashpad note references this attachment."); return; }
     if (notes.length === 1) { await this.revealNoteInStashpad(notes[0]); return; }
     new AttachmentParentPicker(this.app, notes, (note) => void this.revealNoteInStashpad(note)).open();
+  }
+
+  /** 0.549.0: the way BACK from the Showcase — show `id` as a highlighted,
+   *  selected row in its own level, in the folder's Stashpad tab (the one in
+   *  front if there are several), rather than zooming into it the way
+   *  revealNoteByRef does.
+   *  - Already the level the list is inside → cursor onto that heading.
+   *  - In another level → move the list to its parent level first (by path,
+   *    so an orphan goes to Home), then select + flash the row once drawn.
+   *  - The list is in its context view → leave it first (that view doesn't
+   *    show the level's rows).
+   *  - On the right level but not listed (a filter, find) → open it on its
+   *    own, with a notice, as revealNoteByRef always did. */
+  async revealRowByRef(folder: string, id: StashpadId): Promise<void> {
+    const clean = folder.replace(/\/+$/, "");
+    const leaf = preferredStashpadLeafOnFolder(this.app, this, clean, { normalize: true })
+      ?? (await this.findStashpadLeafForFolder(clean))
+      ?? (await this.activateViewForFolder(clean));
+    if (!leaf) return;
+    await this.app.workspace.revealLeaf(leaf);
+    this.app.workspace.setActiveLeaf(leaf, { focus: true });
+    type ListLike = {
+      revealAndSelectNote?: (id: StashpadId) => void; revealHeadingRow?: () => void; navigateTo?: (id: StashpadId) => void;
+      tree?: { get(id: StashpadId): unknown; pathTo(id: StashpadId): Array<{ id: StashpadId }> };
+      currentChildren?: Array<{ id: StashpadId }>; focusId?: StashpadId;
+      contextView?: unknown; exitContextView?: () => void;
+    };
+    let moves = 0;
+    let unlisted = 0;
+    const attempt = (left: number): void => {
+      // The tab was closed while we waited: stop (never steer another tab).
+      if (!this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE).includes(leaf)) return;
+      const v = leaf.view as unknown as ListLike;
+      if (typeof v?.revealAndSelectNote === "function" && v.tree?.get(id)) {
+        if (v.contextView && v.exitContextView) v.exitContextView();
+        if (v.focusId === id && v.revealHeadingRow) { v.revealHeadingRow(); return; }
+        if (v.currentChildren?.some((n) => n.id === id)) { v.revealAndSelectNote(id); return; }
+        const path = v.tree.pathTo(id);
+        const parent = path.length > 1 ? path[path.length - 2].id : ROOT_ID;
+        if (v.focusId !== parent) {
+          if (moves < 2) { moves++; v.navigateTo?.(parent); } // twice at most: a tab restoring its own focus can undo the first
+        } else if (++unlisted > 6) { // ~0.5 s for the level to draw
+          v.navigateTo?.(id);
+          notify("Stashpad: that note is hidden in this list right now (a filter or search), so it opened on its own.");
+          return;
+        }
+      }
+      if (left > 0) window.setTimeout(() => attempt(left - 1), 90);
+      else this.navigateLeafTo(leaf, clean, id); // never got ready: the old behaviour
+    };
+    attempt(30);
   }
 
   /** Open a note by folder+id: REUSE an existing Stashpad tab on that folder
@@ -12014,7 +12168,7 @@ export default class StashpadPlugin extends Plugin {
         .catch((e: any) => new Notice(`Couldn't update: ${(e as Error).message}`));
     }, {
       title: opts.title,
-      knownAuthors, currentAssignees, quickAdjusts: this.settings.dueQuickAdjusts,
+      knownAuthors, currentAssignees, quickAdjusts: this.settings.dueQuickAdjusts, timePresets: this.settings.dueTimePresets,
       showTags: true, currentTags, tagChips: this.settings.taskTagChips, tagSuggestions: this.settings.taskTagSuggestions,
       showRecurrence: true,
       currentRepeat: typeof fm?.repeat === "string" ? fm.repeat : "",
@@ -13429,6 +13583,9 @@ export default class StashpadPlugin extends Plugin {
       dueQuickAdjusts: Array.isArray(data?.dueQuickAdjusts)
         ? data.dueQuickAdjusts.filter((x: unknown): x is string => typeof x === "string")
         : ["5m", "15m", "30m", "1h", "1d", "1w"],
+      dueTimePresets: Array.isArray(data?.dueTimePresets)
+        ? data.dueTimePresets.filter((x: unknown): x is string => typeof x === "string")
+        : [...DEFAULT_TIME_PRESETS],
     };
     setSettings(this.settings);
     // 0.137.3: collision guard — baseline what the protected keys looked like

@@ -83,7 +83,7 @@ import { folderTransferAvailable, readXvFolderPointer } from "./cross-vault-fold
 import { collectDropEntries, readDroppedTree, countTreeFiles, countTreeDirs, type DroppedDir } from "./dropped-folders";
 import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
-import { openShowcaseView, renderFeedbackTargetChip } from "./showcase-view";
+import { openShowcaseAtComment, openShowcaseView, renderFeedbackTargetChip, showcaseLanding, spotCommentsHook } from "./showcase-view";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
 import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
@@ -6919,12 +6919,15 @@ export class StashpadView extends ItemView {
       const main = row.createDiv({ cls: "stashpad-view-popover-main" });
       setIcon(main.createSpan({ cls: "stashpad-view-popover-icon" }), "presentation");
       main.createSpan({ cls: "stashpad-view-popover-label", text: "Showcase" });
-      row.createDiv({ cls: "stashpad-view-popover-desc", text: "This level as one page: big images and PDFs, reactions and feedback. Opens in a new tab." });
+      row.createDiv({ cls: "stashpad-view-popover-desc", text: "Each note here as a page: big images and PDFs, reactions and feedback. Opens in its own tab, on the note you're on." });
       row.onclick = (e) => {
         e.preventDefault();
         e.stopPropagation();
         onPicked();
-        void openShowcaseView(this.plugin, this.noteFolder, this.focusId);
+        // 0.549.0: land on the note you're on (or, inside a note that is
+        // itself a page, on its parent level scrolled to it).
+        const to = this.showcaseLanding();
+        void openShowcaseView(this.plugin, this.noteFolder, to.focusId, to.scrollTo);
       };
     }
 
@@ -10417,8 +10420,9 @@ export class StashpadView extends ItemView {
    *  nothing when the note isn't a reply. */
   private renderReplyQuote(host: HTMLElement, node: TreeNode): void {
     if (!node.file) return;
-    // 0.530.0: a Showcase comment about one file says so — tap opens that file.
-    renderFeedbackTargetChip(this.app, host, node.file);
+    // 0.530.0: a Showcase comment about one file says so. 0.554.3: tap opens
+    // the Showcase at this comment (Cmd/Ctrl-click: just preview the file).
+    renderFeedbackTargetChip(this.app, host, node.file, () => void openShowcaseAtComment(this.plugin, this.noteFolder, this.tree, node.id));
     const fm = this.app.metadataCache.getFileCache(node.file)?.frontmatter;
     const raw = fm?.replyTo;
     if (typeof raw !== "string" || !raw) return;
@@ -10528,6 +10532,31 @@ export class StashpadView extends ItemView {
     await this.openNoteInNewTab(resolved.folder, resolved.id);
   }
 
+  /** 0.549.0: where "Showcase" should open from here: this level, scrolled to
+   *  the note the cursor is on — or, inside a note that is itself a page, a
+   *  level up, scrolled to it. See showcaseLanding. The cursor only counts once
+   *  the user has actually moved it: on load it's parked on the last row,
+   *  which would land every Showcase at the bottom. */
+  showcaseLanding(): { focusId: StashpadId; scrollTo: StashpadId | null } {
+    const cur = this.cursorOnHeading ? this.focusId
+      : this.cursorHasMoved ? (this.currentChildren[this.cursorIdx]?.id ?? null) : null;
+    const to = showcaseLanding(this.app, this.tree, this.focusId, cur);
+    return { focusId: to.focusId, scrollTo: to.scrollTo };
+  }
+
+  /** 0.549.0: put the cursor on the pinned heading (the note this level is)
+   *  and flash it — "Open in list" for the note the list is already inside. */
+  revealHeadingRow(): void {
+    if (!this.headingNode()) return;
+    this.cursorOnHeading = true;
+    this.selectHeadingCursor();
+    const row = this.listEl?.querySelector<HTMLElement>(".is-heading-row");
+    if (row) {
+      row.classList.add("stashpad-row-flash");
+      window.setTimeout(() => row.classList.remove("stashpad-row-flash"), 1200);
+    }
+  }
+
   /** 0.406.0: reveal a note in THIS list and cursor/select it. If it's a row in
    *  the current list (even off-screen/virtualized), scroll to it, flash it, and
    *  single-select it. If it isn't in the current list, focus its parent so it
@@ -10545,7 +10574,9 @@ export class StashpadView extends ItemView {
     }
     // Not in the current list — focus its parent (so it's a row) and cursor to it.
     const n = this.tree.get(id);
-    const parent = n?.parent && n.parent !== ROOT_ID ? n.parent : ROOT_ID;
+    // 0.549.0: an orphan (its parent note deleted outside Stashpad) shows
+    // under Home but still names the missing parent — that level is empty.
+    const parent = n?.parent && n.parent !== ROOT_ID && this.tree.get(n.parent) ? n.parent : ROOT_ID;
     this.pendingCursorId = id;
     this.navigateTo(parent);
   }
@@ -19460,7 +19491,7 @@ export class StashpadView extends ItemView {
       void this.applyDue(targets, result.iso, result.assignees, false, {
         repeat: result.repeat, autoDoneAfter: result.autoDoneAfter, remindEvery: result.remindEvery, repeatMode: result.repeatMode, failIfOverdue: result.failIfOverdue,
       }, result.tags, result.color);
-    }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts,
+    }, { knownAuthors, currentAssignees, quickAdjusts: this.plugin.settings.dueQuickAdjusts, timePresets: this.plugin.settings.dueTimePresets,
       showTags: true, currentTags, tagChips: this.plugin.settings.taskTagChips, tagSuggestions: this.plugin.settings.taskTagSuggestions,
       showColor: true, currentColor: seedColor, customPalette: this.plugin.settings.customPalette ?? [],
       // 0.140.1: recurrence is a per-note concept — only show/write it for a
@@ -19643,6 +19674,7 @@ export class StashpadView extends ItemView {
       // recurrence (single-target only; see cmdSetDue). Unifies the two entry
       // points so the modal is identical regardless of how it's opened.
       quickAdjusts: this.plugin.settings.dueQuickAdjusts,
+      timePresets: this.plugin.settings.dueTimePresets,
       showRecurrence: targets.length === 1,
       currentRepeat: typeof curFm?.repeat === "string" ? curFm.repeat : "",
       currentRepeatMode: typeof curFm?.repeatMode === "string" ? curFm.repeatMode : "",
@@ -20856,9 +20888,11 @@ export class StashpadView extends ItemView {
   async cmdDeleteUnencrypted(): Promise<void> { await this.cmdDelete({ forcePlaintext: true }); }
 
   /** Mod+Backspace handler: delete the selected notes (or cursor row, or focused note). */
-  async cmdDelete(opts: { forcePlaintext?: boolean } = {}): Promise<void> {
-    let targets = this.getActionTargets();
-    if (targets.length === 0) {
+  async cmdDelete(opts: { forcePlaintext?: boolean; targets?: TreeNode[] } = {}): Promise<void> {
+    // 0.554.4: `targets` — delete these exact notes (the Showcase's comment
+    // menu) instead of the list's selection / cursor; same path otherwise.
+    let targets = opts.targets?.filter((t) => !!t.file) ?? this.getActionTargets();
+    if (targets.length === 0 && !opts.targets) {
       const focused = this.tree.get(this.focusId);
       if (focused?.file) targets = [focused];
     }
@@ -22546,7 +22580,12 @@ export class StashpadView extends ItemView {
       const ai = attachItems.findIndex((it) => it.path === startAttachmentPath);
       if (ai >= 0) startIndex = ai + 1;
     }
-    modalRef = new MediaViewerModal(this.app, [noteItem, ...attachItems], startIndex, (f) => this.openAttachmentInTab(f));
+    // 0.554.5: the 📍 row — this note's files' Showcase comments, and a way to
+    // add one (in the Showcase, on this note's section).
+    // Only for a note of THIS folder (a reply source from another folder is
+    // a stand-in node, not in this tree).
+    const spot = this.tree.get(node.id) === node && node.id !== ROOT_ID ? spotCommentsHook(this.plugin, this.noteFolder, this.tree, node.id, (n) => this.isObscured(n) ? "Hidden comment" : this.titleForNode(n)) : undefined;
+    modalRef = new MediaViewerModal(this.app, [noteItem, ...attachItems], startIndex, (f) => this.openAttachmentInTab(f), spot);
     this.openPreviewModal = modalRef;
     modalRef.open();
   }

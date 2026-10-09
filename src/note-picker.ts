@@ -224,7 +224,11 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
    *  is still remembered, not only one that ended in a pick. */
   private recentRecordTimer: number | null = null;
   private lastRecordedRecent = "";
+  /** Set in onClose so the after-bodies-load re-query doesn't fire into a
+   *  closed modal. */
+  private closed = false;
   onClose(): void {
+    this.closed = true;
     if (this.recentRecordTimer != null) { clearTimeout(this.recentRecordTimer); this.recentRecordTimer = null; }
     while (this.pendingCleanups.length > 0) {
       const cb = this.pendingCleanups.pop();
@@ -356,9 +360,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     }
 
     // lazy-read bodies in background
+    const bodyReads: Promise<unknown>[] = [];
     for (const n of this.notes) {
       if (!n.node?.file) continue;
-      this.app.vault.cachedRead(n.node.file).then((md) => { n.body = this.stripFm(md); });
+      bodyReads.push(this.app.vault.cachedRead(n.node.file).then((md) => { n.body = this.stripFm(md); }));
     }
 
     // Cross-folder notes (loaded once on first request, then cached on
@@ -373,7 +378,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         if (!n.cross || n.body) continue;
         // Skip the synthetic-root entries (no TFile to read).
         if (!n.cross.file) continue;
-        this.app.vault.cachedRead(n.cross.file).then((md) => {
+        bodyReads.push(this.app.vault.cachedRead(n.cross.file).then((md) => {
           n.body = this.stripFm(md);
           // 0.317.3: a slug-derived title (body not in the render cache yet)
           // is upgraded to the real first line once the body is read, so
@@ -384,8 +389,22 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
             const clean = first ? stripInlineMarkdown(first.replace(/^#+\s*/, "")) : "";
             if (clean) n.title = clean;
           }
-        });
+        }));
       }
+    }
+
+    // Re-run the query once the bodies are in. getSuggestions only runs on a
+    // keystroke, so a query typed before the reads finished matched titles only
+    // and never refreshed. On a phone the reads are slow, so a note whose title
+    // didn't contain the words (a renamed note showing its filename slug, or a
+    // match deeper in the body) stayed missing until you typed again.
+    // loadExcludedNotes does the same after its merge.
+    if (bodyReads.length) {
+      void Promise.allSettled(bodyReads).then(() => {
+        if (this.closed) return;
+        const ie = (this as any).inputEl as HTMLInputElement | undefined;
+        if (ie && ie.value.trim()) ie.dispatchEvent(new Event("input", { bubbles: true }));
+      });
     }
   }
 

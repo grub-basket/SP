@@ -140,17 +140,21 @@ export class MultiInsert {
       this.panel = body.createDiv({ cls: "stashpad-multiinsert-panel" });
     }
     this.countEl = this.panel.createSpan({ cls: "stashpad-multiinsert-count" });
-    this.input = this.panel.createEl("input", {
-      type: "text",
-      cls: "stashpad-multiinsert-input",
-      attr: { placeholder: "Text to insert at each mark…" },
-    });
+    // 0.552.0: Insert + Cancel sit to the LEFT of the text field (right after the
+    // mark count) instead of trailing it. The input's flex-grow used to shove both
+    // buttons to the panel's far-right edge — a long desktop reach from the toolbar
+    // button that opens the panel. DOM order = flex order: count · Insert · Cancel · input.
     const apply = this.panel.createEl("button", { cls: "stashpad-multiinsert-apply mod-cta", text: "Insert" });
     apply.onmousedown = (e) => e.preventDefault();
     apply.onclick = () => this.apply();
     const cancel = this.panel.createEl("button", { cls: "stashpad-multiinsert-cancel", text: "Cancel" });
     cancel.onmousedown = (e) => e.preventDefault();
     cancel.onclick = () => this.cancel();
+    this.input = this.panel.createEl("input", {
+      type: "text",
+      cls: "stashpad-multiinsert-input",
+      attr: { placeholder: "Text to insert at each mark…" },
+    });
     const hint = this.panel.createSpan({ cls: "stashpad-multiinsert-hint" });
     hint.setText(Platform.isPhone ? "Tap spots to mark · Esc cancels" : "Click spots in the note to mark them · Enter inserts · Esc cancels");
     this.input.addEventListener("keydown", (e) => {
