@@ -294,7 +294,10 @@ export class StashpadAggregateView extends ItemView {
     // mirrors "All encrypted": notes listed under each archive folder, not just a count.
     const byFolder = new Map<string, typeof locked>();
     for (const e of locked) {
-      const f = this.cleanFolder(e.folder);
+      // 0.559.0: a folded folder's archive lives one level down
+      // (`<f>/archive/from-<name>`, src/folder-fold.ts) — list it under `<f>/archive`.
+      const raw = this.cleanFolder(e.folder);
+      const f = /^(.*\/archive)\/from-[^/]+$/.exec(raw)?.[1] ?? raw;
       if (!archiveSet.has(f)) continue;
       (byFolder.get(f) ?? byFolder.set(f, []).get(f)!).push(e);
     }

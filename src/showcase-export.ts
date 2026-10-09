@@ -1,4 +1,5 @@
 import { App, Component, MarkdownRenderer, Modal, Platform, Setting, TFile, arrayBufferToBase64, loadPdfJs } from "obsidian";
+import { appendShapeEl, type FeedbackShape } from "./showcase-shapes";
 
 /** 0.530.1: Showcase → ONE self-contained HTML file, for someone who reviews
  *  without Obsidian (the boss). Images are inlined as data: URIs; PDFs are
@@ -24,7 +25,8 @@ export interface ExportComment {
   target: string;
   resolved: boolean;
   depth: number;
-  pin: { x: number; y: number; page?: number; path: string } | null;
+  /** `shape` (0.556.0): the box / arrow the comment marks; the pin is its anchor. */
+  pin: { x: number; y: number; page?: number; path: string; shape?: FeedbackShape | null } | null;
 }
 export interface ExportSection {
   text: string;
@@ -99,6 +101,13 @@ video, audio { display: block; width: 100%; }
 .sec-reacts { margin-top: 10px; font-size: 14px; }
 .pin { position: absolute; transform: translate(-50%, -50%); width: 22px; height: 22px; border-radius: 50% 50% 50% 0; background: var(--open); color: #fff; border: 2px solid #fff; font: 700 11px/18px sans-serif; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,.45); }
 .pin.ok { background: var(--ok); }
+.regions { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.region { position: absolute; border: 2px solid var(--open); border-radius: 3px; background: rgba(234,117,0,.08); box-shadow: 0 0 0 1px rgba(255,255,255,.8), inset 0 0 0 1px rgba(255,255,255,.8); }
+.region.ok { border-color: var(--ok); background: rgba(46,154,79,.08); }
+svg.arrow { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; color: var(--open); }
+svg.arrow.ok { color: var(--ok); }
+svg.arrow .sp-arrow-line { stroke: currentColor; stroke-width: 3; stroke-linecap: round; }
+svg.arrow .sp-arrow-halo { stroke: rgba(255,255,255,.85); stroke-width: 6; stroke-linecap: round; }
 .feedback { margin-top: 14px; background: var(--soft); border-radius: 10px; padding: 10px 14px; }
 .feedback h3 { margin: 0 0 6px; font-size: 14px; }
 .c { padding: 6px 0; border-top: 1px solid var(--line); font-size: 14px; }
@@ -117,6 +126,27 @@ video, audio { display: block; width: 100%; }
   iframe.pdf { height: 1000px; }
   img.pdfpage { break-inside: avoid; }
 }`;
+
+/** The numbered pins — and (0.556.0) the boxes and arrows — of the comments
+ *  aimed at `path` (page `page` of a PDF; none for an image), drawn over its
+ *  picture box. Shapes go in a clipped layer under the pins. */
+function appendMarks(box: HTMLElement, comments: ExportComment[], path: string, page?: number): void {
+  const doc = box.ownerDocument;
+  let regions: HTMLElement | null = null;
+  for (const c of comments) {
+    if (!c.pin || c.pin.path !== path || c.pin.page !== page) continue;
+    if (c.pin.shape) {
+      if (!regions) { regions = doc.createElement("div"); regions.className = "regions"; box.appendChild(regions); }
+      appendShapeEl(regions, c.pin.shape, (c.pin.shape.kind === "rect" ? "region" : "arrow") + (c.resolved ? " ok" : ""));
+    }
+  }
+  for (const c of comments) {
+    if (!c.pin || c.pin.path !== path || c.pin.page !== page) continue;
+    const pin = box.appendChild(doc.createElement("span")); pin.className = "pin" + (c.resolved ? " ok" : "");
+    pin.textContent = String(c.num);
+    pin.style.left = `${c.pin.x * 100}%`; pin.style.top = `${c.pin.y * 100}%`;
+  }
+}
 
 /** Pages beyond this are left to the browser's PDF viewer (file-size guard). */
 const MAX_RASTER_PAGES = 60;
@@ -275,27 +305,13 @@ export async function buildShowcaseHtml(
                 const box = card.appendChild(doc.createElement("div")); box.className = "imgbox pagebox";
                 const pg = box.appendChild(doc.createElement("img")); pg.className = "pdfpage";
                 pg.src = src; pg.alt = `${a.file.basename} — page ${pi + 1} of ${pages.length}`;
-                if (opts.includeFeedback) {
-                  for (const c of s.comments) {
-                    if (!c.pin || c.pin.path !== a.file.path || c.pin.page !== pi + 1) continue;
-                    const pin = box.appendChild(doc.createElement("span")); pin.className = "pin" + (c.resolved ? " ok" : "");
-                    pin.textContent = String(c.num);
-                    pin.style.left = `${c.pin.x * 100}%`; pin.style.top = `${c.pin.y * 100}%`;
-                  }
-                }
+                if (opts.includeFeedback) appendMarks(box, s.comments, a.file.path, pi + 1);
               });
             } else if (mime.startsWith("image/")) {
               const box = card.appendChild(doc.createElement("div")); box.className = "imgbox";
               const img = box.appendChild(doc.createElement("img"));
               img.src = `data:${mime};base64,${b64}`; img.alt = a.file.basename;
-              if (opts.includeFeedback) {
-                for (const c of s.comments) {
-                  if (!c.pin || c.pin.path !== a.file.path || c.pin.page) continue;
-                  const pin = box.appendChild(doc.createElement("span")); pin.className = "pin" + (c.resolved ? " ok" : "");
-                  pin.textContent = String(c.num);
-                  pin.style.left = `${c.pin.x * 100}%`; pin.style.top = `${c.pin.y * 100}%`;
-                }
-              }
+              if (opts.includeFeedback) appendMarks(box, s.comments, a.file.path);
             } else if (ext === "pdf") {
               const fr = card.appendChild(doc.createElement("iframe")); fr.className = "pdf";
               fr.setAttribute("title", a.file.name);

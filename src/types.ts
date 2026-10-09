@@ -33,6 +33,9 @@ export const STASHPAD_LOG_VIEW_TYPE = "stashpad-log";
 export const STASHPAD_NOTIFICATIONS_VIEW_TYPE = "stashpad-notifications";
 export const ROOT_ID = "__root__";
 
+/** 0.561.0: where a folder sits in the folder switcher. */
+export type FolderPlacement = "pinned" | "downranked" | "hidden" | "normal";
+
 /** A user's pinned-note record. Cross-folder by design — the panel
  *  shows pins from every Stashpad folder in one flat list with a
  *  folder badge for context. 0.68.0. */
@@ -163,11 +166,12 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   // 0.530.0: Showcase review state. `attachmentReactions` = per-attachment
   // reactions on a section note (flat list, "👍:<authorId>:<vault path>");
   // `feedbackOn` / `feedbackPin` point a comment at one of the section's files
-  // and at a spot on that image. Multiplayer state like `reactions`/`replyTo`:
+  // and at a spot on that image; `feedbackShape` (0.556.0) marks an area or
+  // an arrow there instead of one spot. Multiplayer state like `reactions`/`replyTo`:
   // a clone or template must not carry it. (The plain `feedback: true` marker
   // is deliberately NOT reserved: nothing reads it, and reserving a word that
   // generic would strip users' own `feedback` property on import/merge.)
-  "attachmentReactions", "feedbackOn", "feedbackPin",
+  "attachmentReactions", "feedbackOn", "feedbackPin", "feedbackShape",
   // 0.88.0: marks a note that came in via import (used by the "imported only"
   // view filter). Stashpad-managed; a clone of an imported note isn't imported.
   "imported",

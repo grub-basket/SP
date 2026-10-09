@@ -1094,9 +1094,17 @@ export class ComposerAutocomplete {
       run();
       return;
     }
+    // 0.564.0: a picked tag always ends with a space (Enter, Tab, click, or Space),
+    // so typing flows straight on. If whitespace already follows the caret, step
+    // over it instead of doubling it up.
+    let skip = 0;
+    if (this.state.kind === "tag") {
+      if (/^[ \t]/.test(after)) { trailing = ""; skip = 1; }
+      else trailing = " ";
+    }
     const insert = item.insert + trailing;
     this.ta.value = before + insert + after;
-    const caret = before.length + insert.length - (trailing ? 0 : item.caretBack ?? 0);
+    const caret = before.length + insert.length + skip - (trailing || skip ? 0 : item.caretBack ?? 0);
     this.ta.setSelectionRange(caret, caret);
     // Fire input so the composer's draft-save and any other listeners catch up.
     this.ta.dispatchEvent(new Event("input", { bubbles: true }));

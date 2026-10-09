@@ -251,6 +251,17 @@ export interface FolderEncPrefs {
   reEncryptAfterMin?: number;
 }
 
+/** 0.558.0: one folded folder (see src/folder-fold.ts), keyed in
+ *  `foldedFolders` by its OLD path. Old deep links redirect through it. */
+export interface FoldRedirect {
+  into: string;
+  containerId: string;
+  /** Only the ids that changed (an id clash in the destination). */
+  idRemap?: Record<string, string>;
+  shell: string;
+  at: string;
+}
+
 export interface StashpadSettings {
   folder: string;
   /** True once the first-run welcome has been answered (including "Set up
@@ -884,6 +895,12 @@ export interface StashpadSettings {
    *  per-note `obscured` value still wins — see isObscured for the precedence
    *  and why it is written down. */
   obscureFolders: Record<string, boolean>;
+  /** 0.558.0: folders folded into another Stashpad, keyed by the OLD path —
+   *  old deep links redirect through this. See src/folder-fold.ts. */
+  foldedFolders: Record<string, FoldRedirect>;
+  /** 0.561.0: open the folder setup modal (icon / placement / blur) right
+   *  after creating a folder from the folder switcher. Default on. */
+  folderSetupOnCreate: boolean;
   /** 0.267.8: does the global cover travel between devices, or stay on the one
    *  you flipped it on?
    *
@@ -1494,6 +1511,8 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   obscureReHides: true,
   obscureAll: false,
   obscureFolders: {},
+  foldedFolders: {},
+  folderSetupOnCreate: true,
   obscureAllScope: "device",
   obscureStyle: "blur",
   obscureScheduleEnabled: false,
@@ -4273,6 +4292,10 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     cats.foldersStorage.push(toggle("Include pinned notes in the folder switcher", "When on, the folder switcher / creator (the folder button and the “Open or switch Stashpad folder” command) also lists your pinned notes, so you can jump straight to one. Off keeps the picker focused on folders.",
       () => this.plugin.settings.folderSwitcherIncludePinned, (v) => { this.plugin.settings.folderSwitcherIncludePinned = v; }, ["pinned", "switcher", "folder", "picker", "jump"]));
+
+    // 0.561.0: the setup modal after "Create new Stashpad" in the folder switcher.
+    cats.foldersStorage.push(toggle("Set up new folders", "After you create a folder from the folder switcher, open a short setup window for its icon, where it sits in the switcher (pinned, downranked, hidden) and blur. Skip leaves everything at the defaults. The same window is always available from \"Edit folder…\" on a folder's right-click menu.",
+      () => this.plugin.settings.folderSetupOnCreate !== false, (v) => { this.plugin.settings.folderSetupOnCreate = v; }, ["new folder", "create", "setup", "icon", "pin", "blur", "edit folder"]));
 
     // 0.118.6: per-folder tab icon — moved here from the Encryption tab's
     // per-folder panel so it's searchable. Pick a folder, then enter a Lucide

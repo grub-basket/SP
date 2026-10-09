@@ -13,6 +13,7 @@ const ENTRIES = [
   "scripts/tests/suggest-match.test.ts",
   "scripts/tests/excel-paste.test.ts",
   "scripts/tests/deep-link-markdown.test.ts",
+  "scripts/tests/showcase-shapes.test.ts",
 ];
 
 let passed = 0;

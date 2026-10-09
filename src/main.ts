@@ -23,7 +23,7 @@ import { StashpadFolderPanelView, openFolderPanelView } from "./folder-panel-vie
 // 0.301.0: searchable modal to jump to any Stashpad view.
 import { ViewLauncherModal } from "./view-launcher";
 import { EncryptionService, defaultEncryptionConfig } from "./encryption-service";
-import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, readFolderSubtreeNodes, type SubtreeNode, trashSubfolderOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
+import { lockSubtree, unlockBundle, readLockedMeta, STASHENC_EXT, type LockResult, deleteEncryptSubtree, restoreDeleted, listDeletedBlobs, readDeletedMeta, deletedRestoreDest, restoreRawTrash, purgeDeletedBlob, OBSIDIAN_TRASH_DIR, type DeletedMeta, collectSubtree, readFolderSubtreeNodes, type SubtreeNode, trashSubfolderOf, perFolderTrashDirOf, lockRawFolder, unlockRawFolder, rawFolderBlobIn, listRawFolderBlobs, deletePlaintextSubtree, restorePlaintextDeleted, listPlaintextTrashBundles, STASHPACK_EXT, lockLooseFile } from "./encryption-ops";
 import { DEFAULT_TIME_PRESETS, RecentLinksModal, ComposerDraftsModal, EncryptionPasswordModal, ConfirmModal, ReEncryptReviewModal, EncryptAllModal, OpenDeepLinkModal, NoteWorkbenchView, WORKBENCH_VIEW_TYPE, type WorkbenchCommandCallbacks, type WorkbenchState , DuplicateIdsModal, type DuplicateIdGroup, DueDatePickerModal, type DuePickResult, SettingsBackupModal} from "./modals";
 import { WelcomeModal, shouldShowWelcome, DEFAULT_STASHPAD_FOLDER, type OnboardingChoice } from "./onboarding";
 import { seedDemoContent } from "./demo-content";
@@ -37,6 +37,10 @@ import {
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId, stripInlineMarkdown } from "./slug-service";
 import { siftRank } from "./suggest-match";
+import { runFoldFlow } from "./folder-fold";
+import type { FolderPlacement } from "./types";
+import { openFolderSetup } from "./folder-setup-modal";
+import { runUnfoldFlow } from "./folder-split";
 import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, DEFAULT_ROW_BUTTONS } from "./note-actions";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
@@ -1338,6 +1342,9 @@ export default class StashpadPlugin extends Plugin {
       // 0.541.1: an explicit "create" — never treat it as a moved folder's shell.
       this.allowRecreate(t.folder);
       if (!(await this.activateViewForFolder(t.folder, opts))) return null;
+      // 0.561.0: offer icon / placement / blur for the brand-new folder
+      // (Settings → Folders & storage → "Set up new folders" turns it off).
+      if (this.settings.folderSetupOnCreate !== false) openFolderSetup(this, t.folder, { mode: "new" });
     }
     if (t.redirect) this.notifications.show({ message: t.redirect.message, kind: "info", category: "system", folder: t.folder });
     return t.folder;
@@ -1929,7 +1936,7 @@ export default class StashpadPlugin extends Plugin {
 
   /** Detach any open Stashpad tab on `cleaned` (or nested under it). Returns the
    *  count closed. Reads deferred leaves' persisted folder too. */
-  private closeStashpadTabsFor(cleaned: string): number {
+  closeStashpadTabsFor(cleaned: string): number {
     let closed = 0;
     for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
       let f = ((leaf.view as any)?.noteFolder ?? "") as string;
@@ -2161,7 +2168,25 @@ export default class StashpadPlugin extends Plugin {
     if (map[f] !== id) { map[f] = id; writeFolderIdMap(this.app, map); }
   }
 
-  private async prunePlacementFor(cleaned: string): Promise<void> {
+  /** 0.558.0 (fold): the folder-switcher placement lists, for a later restore. */
+  snapshotPlacement(): { pinned: string[]; downranked: string[]; hidden: string[] } {
+    const s = this.settings;
+    return { pinned: [...(s.folderPanelPinned ?? [])], downranked: [...(s.folderPanelDownranked ?? [])], hidden: [...(s.folderPanelHidden ?? [])] };
+  }
+  async restorePlacement(snap: { pinned: string[]; downranked: string[]; hidden: string[] }): Promise<void> {
+    this.settings.folderPanelPinned = [...snap.pinned];
+    this.settings.folderPanelDownranked = [...snap.downranked];
+    this.settings.folderPanelHidden = [...snap.hidden];
+    await this.saveSettings();
+  }
+  /** 0.558.0 (fold): mark a folder move as ours so the vault delete listener
+   *  doesn't announce it as a deletion. Clears itself after 5s. */
+  suppressFolderDelete(cleaned: string): void {
+    this.suppressedFolderDeletes.add(cleaned);
+    window.setTimeout(() => this.suppressedFolderDeletes.delete(cleaned), 5000);
+  }
+
+  async prunePlacementFor(cleaned: string): Promise<void> {
     const s = this.settings;
     const prune = (arr: string[] | undefined): string[] =>
       (arr ?? []).filter((p) => p !== cleaned && !p.startsWith(cleaned + "/"));
@@ -5081,6 +5106,18 @@ export default class StashpadPlugin extends Plugin {
       callback: () => call("cmdRedo"),
     });
     this.addCommand({
+      // 0.558.0: merge the open Stashpad into another one (src/folder-fold.ts).
+      id: "fold-folder",
+      name: "Fold (merge) this folder into another folder…",
+      callback: () => void runFoldFlow(this, this.activeStashpadFolder()),
+    });
+    this.addCommand({
+      // 0.560.0: the durable reverse of a fold (src/folder-split.ts).
+      id: "unfold-folder",
+      name: "Unfold a folded folder (split it back out)…",
+      callback: () => void runUnfoldFlow(this),
+    });
+    this.addCommand({
       // 0.167.0: one unified export command (the modal picks .stash / OKF / plain
       // .zip + content). Keeps the id so existing keybinds survive; OKF's separate
       // command was retired.
@@ -7594,6 +7631,42 @@ export default class StashpadPlugin extends Plugin {
     this.reHideAndRefreshAllViews();
   }
 
+  /** 0.561.0: where a folder sits in the folder switcher. "normal" = in none of
+   *  the override lists. (Lifted from the folder panel so the setup modal can
+   *  share it.) */
+  folderPlacement(folder: string): FolderPlacement {
+    const c = (folder || "").replace(/\/+$/, "");
+    const s = this.settings;
+    if ((s.folderPanelPinned ?? []).includes(c)) return "pinned";
+    if ((s.folderPanelDownranked ?? []).includes(c)) return "downranked";
+    if ((s.folderPanelHidden ?? []).includes(c)) return "hidden";
+    return "normal";
+  }
+
+  /** Move a folder to a placement, clearing it from the other two lists first
+   *  ("normal" removes it everywhere). Persists and repaints the folder panels. */
+  async setFolderPlacement(folder: string, state: FolderPlacement): Promise<void> {
+    const c = (folder || "").replace(/\/+$/, "");
+    const s = this.settings;
+    s.folderPanelPinned = (s.folderPanelPinned ?? []).filter((f) => f !== c);
+    s.folderPanelDownranked = (s.folderPanelDownranked ?? []).filter((f) => f !== c);
+    s.folderPanelHidden = (s.folderPanelHidden ?? []).filter((f) => f !== c);
+    s.folderPanelPinnedAt = s.folderPanelPinnedAt ?? {};
+    if (state === "pinned") {
+      s.folderPanelPinned.push(c);
+      // 0.164.0: newly-pinned folder gets `now` so it lands at the BOTTOM of the
+      // shared pin order (mixed with the most-recent note pins).
+      s.folderPanelPinnedAt[c] = Date.now();
+    } else {
+      // No longer pinned — drop its order key so it doesn't linger.
+      delete s.folderPanelPinnedAt[c];
+      if (state === "downranked") s.folderPanelDownranked.push(c);
+      else if (state === "hidden") s.folderPanelHidden.push(c);
+    }
+    await this.saveSettings();
+    this.refreshFolderIconFor(c); // also repaints every folder panel
+  }
+
   /** 0.118.0: persist a folder's icon (empty/undefined clears it), then refresh
    *  every open Stashpad tab showing that folder + the folder panels so the new
    *  icon appears immediately. */
@@ -8184,8 +8257,11 @@ export default class StashpadPlugin extends Plugin {
     // whose blob is genuinely gone is the rare external-deletion case.)
     let reg: typeof orig = [];
     for (const e of orig) {
-      const ef = (e.folder ?? "").replace(/\/+$/, "");
-      if (ef === "_deleted" || ef.startsWith("_deleted/")) continue; // encrypted-trash blobs aren't locked placeholders
+      // Encrypted-TRASH blobs aren't locked placeholders. 0.560.1: every trash
+      // store (isTrashBlobPath: _deleted/, <f>/trash/, <f>/trash/from-*), not
+      // just _deleted/ — per-folder trash blobs were being registered as live
+      // locked notes on every startup since per-folder trash (0.137.0).
+      if (this.isTrashBlobPath(e.blob)) continue;
       try { if (await this.app.vault.adapter.exists(e.blob)) reg.push(e); }
       catch { reg.push(e); } // unknown → keep (never wipe on an I/O hiccup)
     }
@@ -8196,7 +8272,7 @@ export default class StashpadPlugin extends Plugin {
     for (const f of this.app.vault.getFiles()) {
       if (f.extension !== "stashenc" || have.has(f.path)) continue;
       const folder = f.parent?.path?.replace(/\/+$/, "") ?? "";
-      if (folder === "_deleted" || folder.startsWith("_deleted/")) continue;
+      if (this.isTrashBlobPath(f.path)) continue;
       const m = await readLockedMeta(this.app, f.path);
       if (!m) continue; // no sidecar → the scan still shows it at root (never stranded)
       reg.push({ folder, blob: f.path, parentId: m.parentId, title: m.title, count: m.count, created: m.created, rootId: m.rootId, prevSibling: m.prevSibling });
@@ -8349,7 +8425,8 @@ export default class StashpadPlugin extends Plugin {
    *  could be irreversibly purged / restored into the reserved dir. */
   isTrashBlobPath(p: string): boolean {
     const dir = p.replace(/\/[^/]*$/, "").replace(/\/+$/, "");
-    return dir === "_deleted" || dir.startsWith("_deleted/") || dir === "trash" || dir.endsWith("/trash");
+    // 0.558.0: also a folded folder's merged trash, `<f>/trash/from-<name>/`.
+    return dir === "_deleted" || dir.startsWith("_deleted/") || perFolderTrashDirOf(dir) !== "";
   }
 
   encryptionState(): { live: boolean; trash: boolean } {
@@ -8758,6 +8835,119 @@ export default class StashpadPlugin extends Plugin {
     // 0.517.7: via idsInFolder (same disk scan, up to 8 reads requested at once; still serial on desktop).
     const existing = await this.idsInFolder(folder);
     return unlockBundle(this.app, blobPath, dek, existing, destFolder, this.stashpadFolderTest());
+  }
+
+  /** 0.559.0 (fold): move ONE locked bundle into another folder, re-encrypted
+   *  under the key that owns its new location. Unlocks with the key of the
+   *  folder the blob sits in, writes the notes straight into `destFolder` (never
+   *  through a trash — a cut/paste would leave plaintext copies in the system
+   *  trash), fixes the root's parent, then locks again (`blobFolder` for an
+   *  archive blob). If that lock fails, it locks back under the OLD key into the
+   *  old place, so plaintext is never left behind silently. The undo is
+   *  ciphertext-only: drop the new blob, write the original bytes back.
+   *  Returns `moved` / `left` (nothing changed, or locked back where it was) /
+   *  `plaintext` (both locks failed — the caller must warn loudly). */
+  async relockBundleInto(
+    blobPath: string, destFolder: string,
+    opts: { reparentTo: StashpadId; blobFolder?: string; parentRemap?: Record<string, string> },
+  ): Promise<{ status: "moved" | "left" | "plaintext"; reason?: string; newBlob?: string; rootId?: StashpadId; oldRootId?: StashpadId; undo?: () => Promise<void> }> {
+    const adapter = this.app.vault.adapter;
+    const resident = blobPath.replace(/\/[^/]*$/, "").replace(/\/+$/, "");
+    const dest = destFolder.replace(/\/+$/, "");
+    const keyFolder = (opts.blobFolder ?? dest).replace(/\/+$/, "");
+    const meta = await readLockedMeta(this.app, blobPath);
+    if (!meta?.rootId) return { status: "left", reason: "its sidecar is missing" };
+    if (!(await this.encryption.recheckFolderKeyOnDisk(dest))) return { status: "left", reason: `“${dest.split("/").pop()}” has no encryption key` };
+    const srcKey = await this.ensureFolderUnlocked(resident);
+    if (!srcKey) return { status: "left", reason: "the old folder's key wasn't unlocked" };
+    if (!(await this.ensureFolderUnlocked(keyFolder))) return { status: "left", reason: "the destination's key wasn't unlocked" };
+    const sidecar = blobPath.replace(/\.stashenc$/, ".stashmeta");
+    const blobBytes = await adapter.readBinary(blobPath);
+    const sideText = await adapter.read(sidecar).catch(() => null);
+    const regEntry = (this.settings.lockedSubtrees ?? []).find((e) => e.blob === blobPath);
+    const restoreOriginal = async (): Promise<void> => {
+      // Its folder may be gone by now (an unfold removes the emptied
+      // from-<name> folders), and writeBinary doesn't create parents.
+      await this.ensureVaultFolder(blobPath.slice(0, blobPath.lastIndexOf("/")));
+      if (!(await adapter.exists(blobPath))) await adapter.writeBinary(blobPath, blobBytes);
+      if (sideText !== null && !(await adapter.exists(sidecar))) await adapter.write(sidecar, sideText);
+      if (regEntry && !(this.settings.lockedSubtrees ?? []).some((e) => e.blob === blobPath)) {
+        this.settings.lockedSubtrees = [...(this.settings.lockedSubtrees ?? []), regEntry];
+        await this.saveSettings();
+      }
+    };
+    let rootId: StashpadId;
+    // Everything the unlock writes into the destination (notes + attachments),
+    // so a double lock failure can remove the decrypted copies again.
+    const before = new Set(this.filesUnder(dest));
+    try {
+      const existing = await this.idsInFolder(dest);
+      const r = await unlockBundle(this.app, blobPath, srcKey, existing, dest, this.stashpadFolderTest(), { reparentRootsTo: opts.reparentTo });
+      this.pendingEncBlobs.delete(blobPath);
+      this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== blobPath);
+      await this.saveSettings();
+      rootId = (r.idRemap[meta.rootId] ?? meta.rootId) as StashpadId;
+    } catch (e) {
+      console.warn("[Stashpad] fold: couldn't unlock", blobPath, e);
+      await restoreOriginal();
+      return { status: "left", reason: `unlock failed (${(e as Error).message})` };
+    }
+    let relocked: LockResult | null = null;
+    try {
+      // The root's parent was renamed by the fold (an id clash) → follow it.
+      const mappedParent = meta.parentId ? opts.parentRemap?.[meta.parentId] : undefined;
+      if (mappedParent) {
+        const rootFile = this.resolveNoteFileInFolder(dest, rootId) ?? await this.findNoteFileOnDisk(dest, rootId);
+        if (rootFile) await this.app.fileManager.processFrontMatter(rootFile, (fm) => { fm.parent = mappedParent; });
+      }
+      relocked = await this.lockNoteSubtree(dest, rootId, null, { silent: true, ...(opts.blobFolder ? { blobFolder: opts.blobFolder } : {}) });
+    } catch (e) { console.warn("[Stashpad] fold: re-lock step threw", blobPath, e); relocked = null; }
+    if (relocked) {
+      return {
+        status: "moved", newBlob: relocked.blobPath, rootId, oldRootId: meta.rootId as StashpadId,
+        // Original FIRST, then drop the new copy: if writing the original back
+        // fails, this throws with the new blob still on disk — never zero copies.
+        undo: async () => {
+          await restoreOriginal();
+          if (!(await adapter.exists(blobPath))) throw new Error(`couldn't write ${blobPath} back — kept ${relocked.blobPath}`);
+          if (relocked.blobPath === blobPath) return;
+          try { await adapter.remove(relocked.blobPath); } catch { /* gone */ }
+          try { await adapter.remove(relocked.blobPath.replace(/\.stashenc$/, ".stashmeta")); } catch { /* gone */ }
+          this.settings.lockedSubtrees = (this.settings.lockedSubtrees ?? []).filter((e) => e.blob !== relocked.blobPath);
+          await this.saveSettings();
+        },
+      };
+    }
+    // Couldn't lock under the destination's key: put it back under the old one.
+    let back: LockResult | null = null;
+    try { back = await this.lockNoteSubtree(dest, rootId, null, { silent: true, blobFolder: resident }); }
+    catch (e) { console.warn("[Stashpad] fold: lock-back threw", blobPath, e); }
+    if (back) return { status: "left", reason: "re-locking in the destination failed, so it was locked back in the old folder" };
+    // Both locks failed. The ORIGINAL ciphertext is still in memory: write it
+    // back first, and only once it's safely on disk remove the decrypted copies
+    // this call wrote (permanently, like lockSubtree's own purge — never to a
+    // trash, where plaintext would linger). If the write-back fails, the
+    // plaintext stays as the only copy and the caller warns loudly.
+    try { await restoreOriginal(); } catch (e) { console.warn("[Stashpad] fold: couldn't write the original back", blobPath, e); }
+    if (await adapter.exists(blobPath)) {
+      const created = this.filesUnder(dest).filter((p) => !before.has(p));
+      for (const p of created) {
+        try { await adapter.remove(p); } catch (e) { console.warn("[Stashpad] fold: couldn't remove a decrypted copy", p, e); }
+      }
+      return { status: "left", reason: "re-locking failed twice, so the original locked copy was kept in the old folder" };
+    }
+    return { status: "plaintext", reason: `couldn't re-lock it — its notes are UNLOCKED in “${dest.split("/").pop()}”`, rootId };
+  }
+
+  /** Disk lookup of a note by id directly in `folder` (the metadata cache can
+   *  lag right after an unlock writes the file). */
+  async findNoteFileOnDisk(folder: string, id: StashpadId): Promise<TFile | null> {
+    const clean = folder.replace(/\/+$/, "");
+    for (const f of this.app.vault.getMarkdownFiles()) {
+      if ((f.parent?.path?.replace(/\/+$/, "") ?? "") !== clean) continue;
+      try { if (sameId(splitFrontmatter(await this.app.vault.read(f)).fm.id, id)) return f; } catch { /* unreadable */ }
+    }
+    return null;
   }
 
   async unlockBundleAt(blobPath: string, opts: { silent?: boolean; destFolder?: string } = {}): Promise<boolean> {
@@ -9175,7 +9365,7 @@ export default class StashpadPlugin extends Plugin {
         const destGuess = await deletedRestoreDest(this.app, blobPath, meta);
         // 0.517.7: via idsInFolder (same disk scan, up to 8 reads requested at once; still serial on desktop).
         const existing = await this.idsInFolder(destGuess);
-        const r = await restorePlaintextDeleted(this.app, blobPath, existing, this.stashpadFolderTest());
+        const r = await restorePlaintextDeleted(this.app, blobPath, existing, this.stashpadFolderTest(), this.foldContainerForTrashBlob(blobPath, meta, destGuess));
         this.pendingEncBlobs.delete(blobPath);
         try { await this.newLog().append({ type: "restore", id: meta?.rootId || ROOT_ID, payload: { to: r.restoredTo, from: "trash", encrypted: false } }); } catch { /* log best-effort */ }
         // 0.211.6 (L3): an incomplete restore KEEPS the bundle, so say so — the user
@@ -9382,6 +9572,21 @@ export default class StashpadPlugin extends Plugin {
    *  encrypted-trash listing unions with the legacy _deleted/. */
   trashSubfolderDirs(): string[] {
     return this.discoverStashpadFolders().map((f) => trashSubfolderOf(f));
+  }
+
+  /** 0.558.0: a trash item that came from a FOLDED folder (it sits in
+   *  `<dest>/trash/from-<name>/` and its sidecar names the old folder) restores
+   *  under that fold's container note, where the rest of the folder went —
+   *  not at the destination's top level. Null for any other trash item. */
+  foldContainerForTrashBlob(blobPath: string, meta: DeletedMeta | null, dest: string): StashpadId | null {
+    const dir = blobPath.replace(/\/[^/]*$/, "");
+    if (perFolderTrashDirOf(dir) === dir) return null; // not in a from-* subfolder
+    const map = this.settings.foldedFolders ?? {};
+    const key = (meta?.originalFolder ?? "").replace(/\/+$/, "");
+    // Own keys only — the sidecar is editable plaintext.
+    const fold = key && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+    if (!fold || fold.into !== dest.replace(/\/+$/, "")) return null;
+    return this.resolveNoteFileInFolder(fold.into, fold.containerId) ? fold.containerId : null;
   }
 
   /** List the encrypted-trash contents (blob path + sidecar metadata). */
@@ -10109,7 +10314,7 @@ export default class StashpadPlugin extends Plugin {
   async crossFolderPaste(
     srcFolder: string, rootIds: StashpadId[], destFolder: string,
     destParent: StashpadId, mode: "cut" | "copy",
-  ): Promise<{ rootIds: StashpadId[]; noteCount: number; undo: () => Promise<void>; redo: () => Promise<void> } | null> {
+  ): Promise<{ rootIds: StashpadId[]; noteCount: number; idRemap: Record<string, StashpadId>; undo: () => Promise<void>; redo: () => Promise<void> } | null> {
     const cleanDest = destFolder.replace(/\/+$/, "");
     if (this.isArchiveFolder(cleanDest)) {
       // 0.134.4 (B4): archives default to plaintext now — the block stays (paste
@@ -10188,7 +10393,7 @@ export default class StashpadPlugin extends Plugin {
       ? async () => { await this.restoreSnapshot(destSnapshot); for (const s of srcSnapshot) { const f = this.app.vault.getAbstractFileByPath(s.path); if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* gone */ } } } }
       : async () => { await this.restoreSnapshot(destSnapshot); };
 
-    return { rootIds: newRootIds, noteCount, undo, redo };
+    return { rootIds: newRootIds, noteCount, idRemap: summary.idRemap, undo, redo };
   }
 
   /** Trash (recoverable) the given subtrees in `folder`: every note file plus the
@@ -11239,7 +11444,20 @@ export default class StashpadPlugin extends Plugin {
     // when the caller intends to hand off / report a tally instead.
     if (!folder) return fail("Stashpad link: missing “folder”.");
     const dir = this.app.vault.getAbstractFileByPath(folder);
-    if (!(dir instanceof TFolder)) return fail(`Stashpad link: folder “${folder}” not found.`);
+    if (!(dir instanceof TFolder)) {
+      // 0.558.0: the folder was folded into another Stashpad — follow it there.
+      // Own keys only: a link's folder is untrusted, and "constructor" /
+      // "__proto__" would otherwise hit Object.prototype.
+      const map = this.settings.foldedFolders ?? {};
+      const fold = Object.prototype.hasOwnProperty.call(map, folder) ? map[folder] : undefined;
+      const hops = ((opts as { foldHops?: number }).foldHops ?? 0);
+      if (fold && typeof fold.into === "string" && fold.into && hops < 8 && fold.into !== folder) {
+        const mapped = !noteId || noteId === ROOT_ID ? fold.containerId : (fold.idRemap?.[noteId] ?? noteId);
+        if (!opts.silent && hops === 0) notify(`“${folder.split("/").pop()}” was folded into “${fold.into.split("/").pop()}” — opening it there.`);
+        return this.handleDeepLink({ ...params, folder: fold.into, note: mapped }, { ...opts, foldHops: hops + 1 } as typeof opts);
+      }
+      return fail(`Stashpad link: folder “${folder}” not found.`);
+    }
 
     // 2. Wait for the workspace to settle. On a cross-vault jump Obsidian may
     // still be laying out when the handler fires, so activate/reveal would find

@@ -11,6 +11,7 @@ import { returnToOriginOnClose } from "./leaf-return";
 import { settleNewTab } from "./view-helpers";
 import { notify } from "./notify";
 import { ShowcaseExportModal, buildShowcaseHtml, type ExportComment, type ExportSection } from "./showcase-export";
+import { appendShapeEl, formatFeedbackShape, paintShapeThumb, parseFeedbackShape, shapeAnchor, shapeFromDrag, type FeedbackShape, type ShapeKind } from "./showcase-shapes";
 
 /** 0.530.0: SHOWCASE — one Stashpad level laid out as a single flat page for
  *  reviewing visual work (built for a brochure review between coworkers).
@@ -27,8 +28,9 @@ import { ShowcaseExportModal, buildShowcaseHtml, type ExportComment, type Export
  *    is created through the normal note-creation path as an open task ("[ ]"),
  *    so "resolve" is the existing complete checkbox. It carries `feedback: true`,
  *    plus `feedbackOn: "[[file]]"` when it is about one attachment and
- *    `feedbackPin: "x,y"` when pinned to a spot on that image — all written in
- *    the same create. The normal list shows the target as a chip that opens the
+ *    `feedbackPin: "x,y"` when pinned to a spot on that image (+
+ *    `feedbackShape` when it marks an area or draws an arrow, 0.556.0 — see
+ *    showcase-shapes.ts) — all written in the same create. The normal list shows the target as a chip that opens the
  *    file. Replies to a comment are its children.
  *  - Per-attachment reactions live on the SECTION note as a FLAT list,
  *    `attachmentReactions: ["👍:<authorId>:<vault path>", …]` — flat on purpose
@@ -196,6 +198,13 @@ const PDF_INLINE_LIMIT = 60 * 1024 * 1024;
 const PDF_PAGE_RENDER_MAX = 60;
 /** Widest canvas a page is drawn at (CSS width × devicePixelRatio, capped). */
 const PDF_PAGE_MAX_PX = 2400;
+/** 0.556.0: a press has to move this far (screen px) to draw a shape rather
+ *  than drop a pin; a drawn box is at least MIN_SHAPE_PX each way. */
+const DRAG_MIN_PX = 6;
+const MIN_SHAPE_PX = 10;
+/** A comment's close-up of its area fits inside this (CSS px). */
+const THUMB_MAX_W = 280;
+const THUMB_MAX_H = 150;
 
 interface PdfJsRenderTask { promise: Promise<void>; cancel?: () => void }
 interface PdfJsTextContent { items: Array<{ str?: string; hasEOL?: boolean }> }
@@ -271,6 +280,27 @@ export function parseFeedbackPin(raw: unknown): { x: number; y: number; page?: n
   return Number.isInteger(page) && page >= 1 ? { x, y, page } : null;
 }
 
+/** A draft's `pin` is the pin ("x,y[,page]"), then — for an area or an arrow
+ *  (0.556.0) — "|" and its `feedbackShape`. One string on purpose: every place
+ *  that drops a draft's pin drops its shape with it. */
+function splitDraftPin(raw: string | null | undefined): { pin: string; shape: FeedbackShape | null } | null {
+  if (!raw) return null;
+  const bar = raw.indexOf("|");
+  return bar < 0 ? { pin: raw, shape: null } : { pin: raw.slice(0, bar), shape: parseFeedbackShape(raw.slice(bar + 1)) };
+}
+/** What a draft's pin marks, in words: "spot", "area" or "arrow" (with an
+ *  article when `article`). */
+function spotWord(raw: string | null | undefined, article = false): string {
+  const k = splitDraftPin(raw)?.shape?.kind;
+  const w = k === "rect" ? "area" : k === "arrow" ? "arrow" : "spot";
+  return article ? (w === "spot" ? "a spot" : `an ${w}`) : w;
+}
+/** The pin of a draft's `pin` (see splitDraftPin), parsed. */
+function parseDraftPin(raw: string | null | undefined): ReturnType<typeof parseFeedbackPin> {
+  const p = splitDraftPin(raw);
+  return p ? parseFeedbackPin(p.pin) : null;
+}
+
 /** Lower-case for Find WITHOUT changing the string's length, so every index
  *  still maps back to the same character in the page text. A code point whose
  *  lower-case form is longer ("İ" → "i̇") folds to its base letter ("i") when
@@ -342,6 +372,11 @@ export class StashpadShowcaseView extends ItemView {
   private pinPicking: string | null = null;
   /** The "click the spot" hint from a 📍 click, so a repeat click replaces it. */
   private pinHint: { hide(): void } | null = null;
+  /** 0.556.0: what a DRAG draws while picking (a click is always a pin). */
+  private pinTool: ShapeKind = "rect";
+  /** A drag just placed a shape: swallow the click that follows the release
+   *  (it would place a pin on top, or open the preview). */
+  private suppressClickUntil = 0;
   /** Obscured (blurred) sections the user revealed in this tab, by id. */
   private revealed = new Set<string>();
   private renderTimer: number | null = null;
@@ -838,7 +873,7 @@ export class StashpadShowcaseView extends ItemView {
         // parsed it, and its "changed" event arrives with the same mtime — keyed
         // on mtime alone, the comment stayed "Unknown" / unresolvable.
         const fm = this.fmOf(n.file);
-        const meta = fm ? [fm.completed === true, fm.task === true, "completed" in fm, String(fm.author ?? ""), String(fm.feedbackOn ?? ""), String(fm.feedbackPin ?? ""), String(fm.created ?? "")].join("|") : "?";
+        const meta = fm ? [fm.completed === true, fm.task === true, "completed" in fm, String(fm.author ?? ""), String(fm.feedbackOn ?? ""), String(fm.feedbackPin ?? ""), String(fm.feedbackShape ?? ""), String(fm.created ?? "")].join("|") : "?";
         const who = parseAuthorRef(fm?.author);
         const rec = who ? this.plugin.authorRegistry.get(who.id) : null;
         parts.push(`${depth}:${n.id}:${n.file?.stat.mtime ?? 0}:${this.veiled(n) ? 1 : 0}:${meta}:${rec?.name ?? ""}:${rec?.role ?? ""}`);
@@ -1171,7 +1206,8 @@ export class StashpadShowcaseView extends ItemView {
             if (!item.isConnected) return false;
           }
         }
-        this.flashAttachment(sid, target.path, pin?.page);
+        // 0.556.0: a box / arrow is shown itself (centred, lit); a pin, its file.
+        if (!this.revealShape(c, id)) this.flashAttachment(sid, target.path, pin?.page);
         this.flashComment(c, id, false);
       } else this.flashComment(c, id, true);
       for (const d of Array.from(c.mainEl.querySelectorAll<HTMLElement>(".stashpad-showcase-pin[data-id]"))) {
@@ -1360,10 +1396,19 @@ export class StashpadShowcaseView extends ItemView {
     // like a thumbtack / tab pin), BEFORE full size — the user's order.
     const extLower = a.file.extension.toLowerCase();
     if (isImageExt(extLower) || extLower === "pdf") {
-      const pin = head.createEl("button", { cls: "stashpad-showcase-att-pin", attr: { "aria-label": `Comment on a spot in ${a.file.name}: click this, then click the spot` } });
+      const pin = head.createEl("button", { cls: "stashpad-showcase-att-pin", attr: { "aria-label": `Comment on ${a.file.name}: click this, then click a spot or drag over an area` } });
       pin.createSpan({ cls: "stashpad-showcase-pin-emoji", text: "📍", attr: { "aria-hidden": "true" } });
       pin.createSpan({ cls: "stashpad-showcase-btn-text", text: "Comment" });
       pin.onclick = () => this.startPinOn(s, a);
+      // 0.556.0: while picking, what a drag draws — shown only then (CSS).
+      const tools = head.createDiv({ cls: "stashpad-showcase-drawtools", attr: { role: "group", "aria-label": "Dragging on the picture draws" } });
+      for (const [kind, icon, label, aria] of [["rect", "square", "Box", "Drag to box an area"], ["arrow", "arrow-up-right", "Arrow", "Drag to draw an arrow"]] as const) {
+        const b = tools.createEl("button", { cls: "stashpad-showcase-drawtool", attr: { "aria-pressed": String(this.pinTool === kind), "aria-label": aria } });
+        b.dataset.tool = kind;
+        setIcon(b.createSpan({ cls: "stashpad-showcase-drawtool-icon" }), icon);
+        b.createSpan({ cls: "stashpad-showcase-btn-text", text: label });
+        b.onclick = () => this.setPinTool(kind);
+      }
     }
     const open = head.createEl("button", { cls: "clickable-icon", attr: { "aria-label": `Open ${a.file.name} in the preview` } });
     setIcon(open, "maximize-2");
@@ -1376,9 +1421,11 @@ export class StashpadShowcaseView extends ItemView {
       const img = box.createEl("img", { cls: "stashpad-showcase-img", attr: { alt: a.file.basename, loading: "lazy" } });
       img.src = this.app.vault.getResourcePath(a.file);
       img.onclick = (e) => {
+        if (Date.now() < this.suppressClickUntil) return;
         if (this.pinPicking === s.node.id) { this.placePin(s, a, img, e); return; }
         this.openViewer(s, i);
       };
+      this.bindDraw(img, s, a);
       c.pinHosts.set(a.file.path, box.createDiv({ cls: "stashpad-showcase-pins" }));
     } else if (ext === "pdf") {
       this.renderPdfPages(media, c, s, a, i);
@@ -1447,7 +1494,9 @@ export class StashpadShowcaseView extends ItemView {
     // Back to the viewer (no pins). Drop any page pin layers already made so
     // "Comment on a spot" isn't offered over a viewer that can't take the click.
     const fallback = (): void => {
-      media.closest(".stashpad-showcase-att")?.querySelector(".stashpad-showcase-att-pin")?.remove();
+      const card = media.closest(".stashpad-showcase-att");
+      card?.querySelector(".stashpad-showcase-att-pin")?.remove();
+      card?.querySelector(".stashpad-showcase-drawtools")?.remove(); // nothing to draw on either
       // If the user was mid-pin on this PDF, the viewer can't take the click:
       // end the picking so the section isn't stuck in it.
       const dr = this.drafts.get(s.node.id);
@@ -1487,8 +1536,10 @@ export class StashpadShowcaseView extends ItemView {
           // pdf.js's text-layer CSS rounds its size with these (normally set by
           // its own viewer); 1px = no rounding, so the layer matches the box.
           box.setCssProps({ "--scale-round-x": "1px", "--scale-round-y": "1px" });
+          this.bindDraw(box, s, a, n);
           box.addEventListener("click", (e) => {
             if ((e.target as HTMLElement).closest(".stashpad-showcase-pin")) return;
+            if (Date.now() < this.suppressClickUntil) return;
             if (this.pinPicking === s.node.id) { this.placePin(s, a, box, e, n); return; }
             const win = box.win;
             const selectingText = (): boolean => {
@@ -1590,13 +1641,20 @@ export class StashpadShowcaseView extends ItemView {
           if (!ctx) { release(p); return; } // out of canvas memory: retry on next entry
           ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
           void buildText(p);
+          let ok = false;
           try {
             p.task = p.page.render({ canvasContext: ctx, viewport });
             await p.task.promise;
+            ok = true;
           } catch { /* cancelled, destroyed mid-render, or a bad page: leave it white */ }
           finally {
             if (gen === p.gen) p.task = null;
             try { p.page.cleanup?.(); } catch { /* still rendering elsewhere — pdf.js refuses, fine */ }
+          }
+          // 0.556.0: comments' close-ups of this page copy from the canvas.
+          if (ok && gen === p.gen && canvas.isConnected) {
+            canvas.dataset.ready = "1";
+            this.paintThumbsFor(c, file.path, p.n);
           }
         };
         if (typeof IntersectionObserver === "undefined") { for (const p of pages) void draw(p); }
@@ -1931,12 +1989,25 @@ export class StashpadShowcaseView extends ItemView {
       item.dataset.target = target.path; // 0.550.0: hover lights up this file (linkHover)
       const att = s.atts.find((a) => a.file.path === target.path);
       const pin = parseFeedbackPin(fm?.feedbackPin);
+      const shape = pin ? parseFeedbackShape(fm?.feedbackShape) : null;
       const chip = item.createDiv({ cls: "stashpad-showcase-comment-target", attr: { role: "button", tabindex: "0" } });
       if (pin) chip.createSpan({ cls: "stashpad-showcase-pin-emoji", text: "📍", attr: { "aria-hidden": "true" } }); else setIcon(chip.createSpan(), "image");
-      chip.createSpan({ text: `on ${att?.label ? att.label + " · " : ""}${target.name}${pin?.page ? ` · p. ${pin.page}` : ""}` });
-      const go = (): void => this.flashAttachment(s.node.id, target.path, pin?.page);
+      chip.createSpan({ text: `on ${att?.label ? att.label + " · " : ""}${target.name}${pin?.page ? ` · p. ${pin.page}` : ""}${shape ? (shape.kind === "rect" ? " · area" : " · arrow") : ""}` });
+      // 0.556.0: a box / arrow is shown itself (centred, lit); else the file.
+      const go = (): void => { if (!(shape && this.revealShape(c, n.id))) this.flashAttachment(s.node.id, target.path, pin?.page); };
       chip.onclick = go;
       chip.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+      // 0.556.0: a close-up of the marked area beside the words, so the
+      // comment reads on its own. Not for an obscured section's picture.
+      if (shape && pin && !this.veiled(s.node)) {
+        const thumb = item.createEl("button", { cls: "stashpad-showcase-shape-thumb is-empty", attr: { "aria-label": `Show the ${shape.kind === "rect" ? "marked area" : "arrow"} on ${target.name}` } });
+        thumb.dataset.path = target.path;
+        if (pin.page) thumb.dataset.page = String(pin.page);
+        thumb.dataset.shape = formatFeedbackShape(shape);
+        thumb.createEl("canvas");
+        thumb.onclick = go;
+        this.paintThumb(c, thumb);
+      }
     }
 
     const body = item.createDiv({ cls: "stashpad-showcase-comment-body markdown-rendered" });
@@ -2122,13 +2193,13 @@ export class StashpadShowcaseView extends ItemView {
       // first (the user couldn't find pinning). The click on an image or a
       // PDF page then picks the file.
       if (s.atts.some((x) => this.pinnable(c, x))) {
-        const spot = addRow.createEl("button", { cls: "stashpad-showcase-addfb is-spot", attr: { "aria-label": "Comment on a spot: click this, then click the spot on an image or page" } });
+        const spot = addRow.createEl("button", { cls: "stashpad-showcase-addfb is-spot", attr: { "aria-label": "Comment on a spot: click this, then click a spot or drag over an area on an image or page" } });
         spot.createSpan({ cls: "stashpad-showcase-pin-emoji", text: "📍", attr: { "aria-hidden": "true" } });
         spot.createSpan({ text: "Comment on a spot" });
         spot.onclick = () => {
           d.replyTo = null; d.pin = null; d.target = ""; // parked stays until a pin is placed
           this.pinHint?.hide();
-          this.pinHint = notify("Click the spot on an image or PDF page. A comment box opens right there. Esc cancels.", 4000);
+          this.pinHint = notify(`Click a spot on an image or PDF page, or drag to ${this.pinTool === "arrow" ? "draw an arrow" : "box an area"}. A comment box opens right there. Esc cancels.`, 5000);
           this.setPinPicking(s.node.id);
         };
       }
@@ -2147,10 +2218,10 @@ export class StashpadShowcaseView extends ItemView {
     if (!d.replyTo && this.pinBoxShown(c, s)) {
       const box = el.createDiv({ cls: "stashpad-showcase-composer is-pinned" });
       const att = s.atts.find((a) => a.file.path === d.target);
-      const pinned = d.pin ? parseFeedbackPin(d.pin) : null;
+      const pinned = parseDraftPin(d.pin);
       const chip = box.createDiv({ cls: "stashpad-showcase-composer-chip" });
       chip.createSpan({ cls: "stashpad-showcase-pin-emoji", text: "📍", attr: { "aria-hidden": "true" } });
-      chip.createSpan({ cls: "stashpad-showcase-composer-chip-text", text: `On a spot in ${att?.label || att?.file.name || "the file"}${pinned?.page ? ` · p. ${pinned.page}` : ""}. Write it in the box by the 📍.` });
+      chip.createSpan({ cls: "stashpad-showcase-composer-chip-text", text: `On ${spotWord(d.pin, true)} in ${att?.label || att?.file.name || "the file"}${pinned?.page ? ` · p. ${pinned.page}` : ""}. Write it in the box by the 📍.` });
       const go = chip.createEl("button", { text: d.posting ? "Posting…" : "Go to it" });
       go.disabled = d.posting;
       go.onclick = () => {
@@ -2189,9 +2260,9 @@ export class StashpadShowcaseView extends ItemView {
       if (targetAtt ? this.pinnable(c, targetAtt) : s.atts.some((x) => this.pinnable(c, x))) {
         const pinBtn = row.createEl("button", { cls: "stashpad-showcase-pinbtn" + (d.pin ? " is-set" : "") + (picking ? " is-picking" : "") });
         pinBtn.createSpan({ cls: "stashpad-showcase-pin-emoji", text: "📍", attr: { "aria-hidden": "true" } });
-        const pinned = d.pin ? parseFeedbackPin(d.pin) : null;
-        pinBtn.createSpan({ text: pinned ? (pinned.page ? `On p. ${pinned.page}` : "On a spot") : (picking ? (targetAtt ? "Click the spot…" : "Click an image or page…") : "Comment on a spot") });
-        pinBtn.title = d.pin ? "Click to remove the spot" : "Then click the exact spot on the image or page";
+        const pinned = parseDraftPin(d.pin);
+        pinBtn.createSpan({ text: pinned ? (pinned.page ? `On p. ${pinned.page}` : `On ${spotWord(d.pin, true)}`) : (picking ? (targetAtt ? "Click or drag on it…" : "Click or drag on a picture…") : "Comment on a spot") });
+        pinBtn.title = d.pin ? `Click to remove the ${spotWord(d.pin)}` : "Then click a spot, or drag over an area, on the image or page";
         pinBtn.onclick = () => {
           d.open = true;
           if (d.pin) { d.pin = null; this.setPinPicking(null); c.asideSig = ""; this.scheduleRender(0); return; }
@@ -2293,7 +2364,11 @@ export class StashpadShowcaseView extends ItemView {
     const target = d.replyTo ? "" : d.target;
     const extraFm: Record<string, string | boolean> = { feedback: true };
     if (target) extraFm.feedbackOn = `[[${target}]]`;
-    if (target && d.pin) extraFm.feedbackPin = d.pin;
+    const placed = target ? splitDraftPin(d.pin) : null;
+    if (placed) {
+      extraFm.feedbackPin = placed.pin;
+      if (placed.shape) extraFm.feedbackShape = formatFeedbackShape(placed.shape);
+    }
     // One write: the feedback keys go into the note's YAML at creation, so no
     // follow-up frontmatter write races the create or reads as a coworker's
     // edit. No folder template (a comment isn't a page) and no composer
@@ -2546,14 +2621,15 @@ export class StashpadShowcaseView extends ItemView {
               const target = depth ? null : resolveFeedbackTarget(this.app, nfm, n.file!.path);
               const att = target ? s.atts.find((a) => a.file.path === target.path) : undefined;
               const pin = target ? parseFeedbackPin(nfm?.feedbackPin) : null;
+              const shape = pin ? parseFeedbackShape(nfm?.feedbackShape) : null;
               const who = this.authorLabel(nfm, true);
               const created = typeof nfm?.created === "string" ? mo(nfm.created) : null;
               comments.push({
                 num: depth ? 0 : i + 1, author: who.name, role: who.role,
                 when: created?.isValid() ? created.format("LLL") : "",
-                text, target: target ? `${att?.label ? att.label + " · " : ""}${target.name}${pin?.page ? ` · p. ${pin.page}` : ""}` : "",
+                text, target: target ? `${att?.label ? att.label + " · " : ""}${target.name}${pin?.page ? ` · p. ${pin.page}` : ""}${shape ? (shape.kind === "rect" ? " · area" : " · arrow") : ""}` : "",
                 resolved: this.isResolved(n), depth,
-                pin: pin && target ? { ...pin, path: target.path } : null,
+                pin: pin && target ? { ...pin, path: target.path, shape } : null,
               });
               if (depth < 3) await walk(host.tree.getChildren(n.id).filter((k) => k.file), depth + 1);
             }
@@ -2608,7 +2684,7 @@ export class StashpadShowcaseView extends ItemView {
     d.pin = null;
     d.replyTo = null;
     this.setPinPicking(s.node.id);
-    this.pinHint = notify(`Click the spot on ${a.file.name}. A comment box opens right there. Esc cancels.`, 4000);
+    this.pinHint = notify(`Click a spot on ${a.file.name}, or drag to ${this.pinTool === "arrow" ? "draw an arrow" : "box an area"}. A comment box opens right there. Esc cancels.`, 5000);
   }
 
   private setPinPicking(sectionId: string | null): void {
@@ -2627,14 +2703,89 @@ export class StashpadShowcaseView extends ItemView {
     if (!r.width || !r.height) return;
     const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
     const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height));
+    this.setDraftPin(s, a, `${x.toFixed(4)},${y.toFixed(4)}${page ? `,${page}` : ""}`);
+  }
+
+  /** 0.556.0: a dragged box / arrow → the draft's pin (its anchor) + shape. */
+  private placeShape(s: SectionData, a: Attachment, shape: FeedbackShape, page?: number): void {
+    const at = shapeAnchor(shape);
+    this.setDraftPin(s, a, `${at.x.toFixed(4)},${at.y.toFixed(4)}${page ? `,${page}` : ""}|${formatFeedbackShape(shape)}`);
+  }
+
+  private setDraftPin(s: SectionData, a: Attachment, pin: string): void {
     const d = this.draftFor(s.node.id);
     d.target = a.file.path;
-    d.pin = `${x.toFixed(4)},${y.toFixed(4)}${page ? `,${page}` : ""}`;
+    d.pin = pin;
     // (A parked draft stays parked: this pinned comment is a different one.)
     // The box that opens at the pin takes the caret (renderPinBox).
     d.open = true; d.focus = true;
     this.pinHint?.hide(); this.pinHint = null;
     this.setPinPicking(null);
+  }
+
+  private setPinTool(kind: ShapeKind): void {
+    this.pinTool = kind;
+    this.pageEl?.querySelectorAll<HTMLElement>(".stashpad-showcase-drawtool").forEach((b) => b.setAttr("aria-pressed", String(b.dataset.tool === kind)));
+  }
+
+  /** 0.556.0: while this section is picking, a DRAG on the picture (`el`: the
+   *  image, or a PDF page box) draws the current tool's shape, with a live
+   *  preview; a press that doesn't move is left to the click handler, which
+   *  drops a pin as before. Pointer events, so it works with a finger too
+   *  (picking turns off touch scrolling on the picture — see styles.css). */
+  private bindDraw(el: HTMLElement, s: SectionData, a: Attachment, page?: number): void {
+    // A picture being picked on mustn't start the browser's own image drag.
+    el.addEventListener("dragstart", (e) => { if (this.pinPicking === s.node.id) e.preventDefault(); });
+    el.addEventListener("pointerdown", (e) => {
+      if (this.pinPicking !== s.node.id || e.button !== 0 || !e.isPrimary) return;
+      if ((e.target as HTMLElement | null)?.closest?.(".stashpad-showcase-pin, .stashpad-showcase-pinbox")) return;
+      const r0 = el.getBoundingClientRect();
+      if (!r0.width || !r0.height) return;
+      e.preventDefault(); // no text selection (PDF text layer), no focus jump
+      const kind = this.pinTool;
+      const frac = (ev: PointerEvent): { x: number; y: number; r: DOMRect } => {
+        const r = el.getBoundingClientRect();
+        return { x: (ev.clientX - r.left) / r.width, y: (ev.clientY - r.top) / r.height, r };
+      };
+      const start = frac(e);
+      let dragging = false;
+      let ghost: Element | null = null;
+      const shapeTo = (ev: PointerEvent): FeedbackShape | null => {
+        const p = frac(ev);
+        const sh = shapeFromDrag(kind, start.x, start.y, p.x, p.y);
+        if (sh?.kind !== "rect") return sh;
+        // A box at least MIN_SHAPE_PX each way (a sideways drag isn't a hairline).
+        const minW = MIN_SHAPE_PX / p.r.width; const minH = MIN_SHAPE_PX / p.r.height;
+        const w = Math.min(1, Math.max(sh.w, minW)); const h = Math.min(1, Math.max(sh.h, minH));
+        return { kind: "rect", x: Math.min(sh.x, 1 - w), y: Math.min(sh.y, 1 - h), w, h };
+      };
+      const move = (ev: PointerEvent): void => {
+        if (ev.pointerId !== e.pointerId) return;
+        if (!dragging && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < DRAG_MIN_PX) return;
+        dragging = true;
+        ghost?.remove(); ghost = null;
+        // The pin layer may have been redrawn since the press: look it up live.
+        const layer = this.cache.get(s.node.id)?.pinHosts.get(pinKey(a.file.path, page));
+        const sh = shapeTo(ev);
+        if (sh && layer?.isConnected) ghost = appendShapeEl(layer, sh, `stashpad-showcase-shape is-${sh.kind} is-pending is-ghost`);
+      };
+      const end = (ev: PointerEvent): void => {
+        if (ev.pointerId !== e.pointerId) return;
+        el.removeEventListener("pointermove", move);
+        el.removeEventListener("pointerup", end);
+        el.removeEventListener("pointercancel", end);
+        ghost?.remove(); ghost = null;
+        if (!dragging) return; // a plain press: the click handler places a pin
+        this.suppressClickUntil = Date.now() + 400;
+        if (ev.type === "pointercancel" || this.pinPicking !== s.node.id) return;
+        const sh = shapeTo(ev);
+        if (sh) this.placeShape(s, a, sh, page);
+      };
+      try { el.setPointerCapture(e.pointerId); } catch { /* the pointer is already gone */ }
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", end);
+      el.addEventListener("pointercancel", end);
+    });
   }
 
   /** Numbered dots on images for comments that carry a `feedbackPin`, plus the
@@ -2643,11 +2794,19 @@ export class StashpadShowcaseView extends ItemView {
     for (const [key, host] of c.pinHosts) {
       // Same focus-keeping rule as the reaction bars: skip if nothing changed.
       const d0 = this.drafts.get(s.node.id);
-      const sig = comments.map((n) => { const fm = this.fmOf(n.file); return `${n.id}:${String(fm?.feedbackPin ?? "")}:${String(fm?.feedbackOn ?? "")}:${fm?.completed === true}:${this.veiled(n)}`; }).join(",")
+      const sig = comments.map((n) => { const fm = this.fmOf(n.file); return `${n.id}:${String(fm?.feedbackPin ?? "")}:${String(fm?.feedbackShape ?? "")}:${String(fm?.feedbackOn ?? "")}:${fm?.completed === true}:${this.veiled(n)}`; }).join(",")
         + `|${this.hideResolved}|${this.veiled(s.node)}|${d0?.target ?? ""}|${d0?.pin ?? ""}`;
       if (host.dataset.sig === sig) continue;
       host.dataset.sig = sig;
       host.empty();
+      // 0.556.0: boxes and arrows sit in their own clipped layer UNDER the
+      // dots (a hot box dims the rest of the picture with a shadow, which
+      // must stop at the picture's edge — the dots mustn't be clipped).
+      let regions: HTMLElement | null = null;
+      const regionLayer = (): HTMLElement => {
+        if (!regions) { regions = createDiv({ cls: "stashpad-showcase-regions" }); host.prepend(regions); }
+        return regions;
+      };
       comments.forEach((n, i) => {
         const fm = this.fmOf(n.file);
         const pin = parseFeedbackPin(fm?.feedbackPin);
@@ -2656,6 +2815,11 @@ export class StashpadShowcaseView extends ItemView {
         if (!t || pinKey(t.path, pin.page) !== key) return;
         if (this.hideResolved && this.isResolved(n)) return;
         if (this.veiled(n) || this.veiled(s.node)) return;
+        const shape = parseFeedbackShape(fm?.feedbackShape);
+        if (shape) {
+          const el = appendShapeEl(regionLayer(), shape, `stashpad-showcase-shape is-${shape.kind}` + (this.isResolved(n) ? " is-resolved" : ""));
+          el.setAttribute("data-id", n.id);
+        }
         const dot = host.createEl("button", { cls: "stashpad-showcase-pin" + (this.isResolved(n) ? " is-resolved" : ""), text: String(i + 1) });
         dot.dataset.id = n.id;
         dot.style.left = `${pin.x * 100}%`;
@@ -2664,9 +2828,11 @@ export class StashpadShowcaseView extends ItemView {
         dot.onclick = (e) => { e.stopPropagation(); this.flashComment(c, n.id); };
       });
       const d = this.drafts.get(s.node.id);
-      const draftPin = d?.pin && d.target ? parseFeedbackPin(d.pin) : null;
+      const draftPin = d?.pin && d.target ? parseDraftPin(d.pin) : null;
       const pending = draftPin && pinKey(d!.target, draftPin.page) === key ? draftPin : null;
       if (pending) {
+        const shape = splitDraftPin(d!.pin)?.shape;
+        if (shape) appendShapeEl(regionLayer(), shape, `stashpad-showcase-shape is-${shape.kind} is-pending`);
         const dot = host.createDiv({ cls: "stashpad-showcase-pin is-pending", text: "+" });
         dot.style.left = `${pending.x * 100}%`;
         dot.style.top = `${pending.y * 100}%`;
@@ -2677,7 +2843,7 @@ export class StashpadShowcaseView extends ItemView {
   /** "Comment 4 · Option B · cover.png · p. 2" — the pin box's title. */
   private pinBoxHead(s: SectionData, d: Draft, count: number): string {
     const att = s.atts.find((a) => a.file.path === d.target);
-    const pinned = d.pin ? parseFeedbackPin(d.pin) : null;
+    const pinned = parseDraftPin(d.pin);
     return `Comment ${count + 1} · ${att?.label ? att.label + " · " : ""}${att?.file.name ?? ""}${pinned?.page ? ` · p. ${pinned.page}` : ""}`;
   }
 
@@ -2686,7 +2852,7 @@ export class StashpadShowcaseView extends ItemView {
   private pinBoxShown(c: SectionCache, s: SectionData): boolean {
     const d = this.drafts.get(s.node.id);
     if (!d?.pin || !d.target || d.replyTo || this.veiled(s.node)) return false;
-    const pin = parseFeedbackPin(d.pin);
+    const pin = parseDraftPin(d.pin);
     return !!pin && c.pinHosts.has(pinKey(d.target, pin.page));
   }
 
@@ -2721,16 +2887,16 @@ export class StashpadShowcaseView extends ItemView {
     }
     c.pinBox?.el.remove();
 
-    const box = c.mainEl.createDiv({ cls: "stashpad-showcase-pinbox", attr: { role: "dialog", "aria-label": "Comment on this spot" } });
+    const box = c.mainEl.createDiv({ cls: "stashpad-showcase-pinbox", attr: { role: "dialog", "aria-label": `Comment on this ${spotWord(d.pin)}` } });
     c.pinBox = { el: box, key };
     const head = box.createDiv({ cls: "stashpad-showcase-pinbox-head" });
     head.createSpan({ cls: "stashpad-showcase-pin-emoji", text: "📍", attr: { "aria-hidden": "true" } });
     head.createSpan({ cls: "stashpad-showcase-pinbox-title", text: headText });
-    const ta = box.createEl("textarea", { cls: "stashpad-showcase-input", attr: { rows: "3", placeholder: "What about this spot?", "aria-label": "Your comment on this spot" } });
+    const ta = box.createEl("textarea", { cls: "stashpad-showcase-input", attr: { rows: "3", placeholder: `What about this ${spotWord(d.pin)}?`, "aria-label": `Your comment on this ${spotWord(d.pin)}` } });
     ta.value = d.text;
     ta.oninput = () => { d.text = ta.value; };
     const btns = box.createDiv({ cls: "stashpad-showcase-composer-btns" });
-    const cancel = btns.createEl("button", { text: "Cancel", attr: { "aria-label": "Remove the pin (what you typed is kept)" } });
+    const cancel = btns.createEl("button", { text: "Cancel", attr: { "aria-label": `Remove the ${spotWord(d.pin) === "spot" ? "pin" : spotWord(d.pin)} (what you typed is kept)` } });
     const post = btns.createEl("button", { cls: "mod-cta", text: d.posting ? "Posting…" : "Post" });
     ta.disabled = d.posting; post.disabled = d.posting; cancel.disabled = d.posting;
     const close = (): void => {
@@ -2782,11 +2948,22 @@ export class StashpadShowcaseView extends ItemView {
     const dot = Array.from(c.mainEl.querySelectorAll<HTMLElement>(".stashpad-showcase-pin.is-pending")).find((x) => x.isConnected);
     if (!dot) { box.addClass("is-unplaced"); return; }
     const m = c.mainEl.getBoundingClientRect();
-    const r = dot.getBoundingClientRect();
+    let r = dot.getBoundingClientRect();
     if (!m.width || !r.width) { box.addClass("is-unplaced"); return; }
+    // 0.556.0: a drawn box / arrow: open under (or above) all of it, not
+    // over it — the comment shouldn't hide what it's about.
+    const shape = dot.parentElement?.querySelector(".stashpad-showcase-shape.is-pending:not(.is-ghost)");
+    const sr = (shape?.querySelector(".sp-arrow-line") ?? shape)?.getBoundingClientRect();
+    const hasShape = !!sr && sr.width + sr.height > 0;
+    if (sr && hasShape) {
+      const left = Math.min(r.left, sr.left); const top = Math.min(r.top, sr.top);
+      const right = Math.max(r.right, sr.right); const bottom = Math.max(r.bottom, sr.bottom);
+      r = new DOMRect(left, top, right - left, bottom - top);
+    }
     box.removeClass("is-unplaced");
     const w = Math.min(320, m.width - 8);
-    const left = Math.max(4, Math.min(r.left + r.width / 2 - m.left - 24, m.width - w - 4));
+    // A pin: the box's corner near the dot. A shape: lined up with its left edge.
+    const left = Math.max(4, Math.min((hasShape ? r.left : r.left + r.width / 2 - 24) - m.left, m.width - w - 4));
     box.style.width = `${w}px`;
     box.style.left = `${left}px`;
     // Under the pin; above it when it would hang past the section's bottom
@@ -2841,13 +3018,26 @@ export class StashpadShowcaseView extends ItemView {
     this.hotKey = key;
     if (!key || !section) return;
     const comment = Array.from(section.querySelectorAll<HTMLElement>(".stashpad-showcase-comment:not(.is-reply)")).find((x) => x.dataset.id === id);
-    const pins = Array.from(section.querySelectorAll<HTMLElement>(".stashpad-showcase-pin[data-id]")).filter((x) => x.dataset.id === id);
+    const pins = Array.from(section.querySelectorAll<HTMLElement>(".stashpad-showcase-pin[data-id], .stashpad-showcase-shape[data-id]")).filter((x) => x.getAttribute("data-id") === id);
     const path = comment?.dataset.target;
     const card = path ? Array.from(section.querySelectorAll<HTMLElement>(".stashpad-showcase-att")).find((x) => x.dataset.path === path) : undefined;
     // Only worth lighting when there's a partner to light: a comment with no
     // pin and no file target has nothing to point at.
     if (!pins.length && !card) return;
     for (const h of [comment, ...pins, card]) if (h) { h.addClass("is-hot"); this.hot.push(h); }
+  }
+
+  /** 0.556.0: bring a comment's box / arrow into view, centred, and light it
+   *  for a moment — a lit box dims the rest of the picture, the in-place
+   *  "zoom to the area". False when the comment has none drawn here. */
+  private revealShape(c: SectionCache, id: string): boolean {
+    const el = Array.from(c.mainEl.querySelectorAll<HTMLElement>(".stashpad-showcase-shape[data-id]")).find((x) => x.getAttribute("data-id") === id);
+    if (!el) return false;
+    // An arrow's SVG covers the whole picture: aim at the line itself.
+    (el.querySelector(".sp-arrow-line") ?? el).scrollIntoView({ behavior: "smooth", block: "center" });
+    el.removeClass("is-flash"); void (el as HTMLElement).getBoundingClientRect(); el.addClass("is-flash");
+    window.setTimeout(() => el.removeClass("is-flash"), 2400);
+    return true;
   }
 
   private flashAttachment(sectionId: string, path: string, page?: number): void {
@@ -2859,6 +3049,41 @@ export class StashpadShowcaseView extends ItemView {
     card.scrollIntoView({ behavior: "smooth", block: "center" });
     card.removeClass("is-flash"); void card.offsetWidth; card.addClass("is-flash");
     window.setTimeout(() => card.removeClass("is-flash"), 1600);
+  }
+
+  /** 0.556.0: paint a comment's close-up (paintShapeThumb). An image is
+   *  loaded on its own (the one on the page may still be lazy); a PDF page is
+   *  copied from its drawn canvas, so a page that isn't drawn leaves it empty
+   *  (hidden) until it is — paintThumbsFor, from the page's draw. */
+  private paintThumb(c: SectionCache, thumb: HTMLElement): void {
+    const shape = parseFeedbackShape(thumb.dataset.shape);
+    const cv = thumb.querySelector("canvas");
+    const path = thumb.dataset.path ?? "";
+    if (!shape || !cv || !path) return;
+    const paint = (src: CanvasImageSource, w: number, h: number): void => {
+      if (!thumb.isConnected) return;
+      const color = thumb.win.getComputedStyle(thumb).getPropertyValue(thumb.closest(".is-resolved") ? "--color-green" : "--color-orange").trim() || "#e8590c";
+      if (paintShapeThumb(cv, src, w, h, shape, color, THUMB_MAX_W, THUMB_MAX_H)) thumb.removeClass("is-empty");
+    };
+    const page = Number(thumb.dataset.page) || 0;
+    if (page) {
+      const att = Array.from(c.mainEl.querySelectorAll<HTMLElement>(".stashpad-showcase-att")).find((x) => x.dataset.path === path);
+      const src = att?.querySelector<HTMLCanvasElement>(`.stashpad-showcase-pdfpage[data-page="${page}"] canvas[data-ready]`);
+      if (src) paint(src, src.width, src.height);
+      return;
+    }
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return;
+    const img = createEl("img");
+    img.onload = () => paint(img, img.naturalWidth, img.naturalHeight);
+    img.src = this.app.vault.getResourcePath(file);
+  }
+
+  /** A PDF page just finished drawing: paint the close-ups waiting on it. */
+  private paintThumbsFor(c: SectionCache, path: string, page: number): void {
+    for (const t of Array.from(c.asideEl.querySelectorAll<HTMLElement>(".stashpad-showcase-shape-thumb.is-empty"))) {
+      if (t.dataset.path === path && Number(t.dataset.page) === page) this.paintThumb(c, t);
+    }
   }
 
   private flashComment(c: SectionCache, id: string, scroll = true): void {

@@ -24,7 +24,9 @@ narrow widths) — this page is the canonical, expanded reference. Each setting 
   images and PDFs shown large (several files become *Option A, B, C…*, stacked or
   side by side), quick 👍 👎 ✅ ❌ reactions per section and per option, and a
   feedback column made of the section's child notes. You can target a comment at
-  one file, pin it to a spot on an image, reply, and mark it resolved. **Export**
+  one file, pin it to a spot on an image or PDF page, or drag to box an area or
+  draw an arrow (each comment then shows a close-up of what it marks, and
+  hovering it dims the rest of the picture), reply, and mark it resolved. **Export**
   saves the page as a single web page file that opens in any browser, with
   feedback optional.
 

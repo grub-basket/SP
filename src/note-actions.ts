@@ -48,6 +48,8 @@ export const NOTE_ACTION_CATALOG: readonly NoteActionDef[] = [
   // 0.363.0: outdent as a first-class leaf so the seeded "Move ▸" submenu can
   // list it (and it's addable/renderable like any other action).
   { id: "outdent",          label: "Outdent",                       icon: "outdent",                           group: "Organize" },
+  // 0.562.0: the note's subtree becomes a Stashpad folder of its own.
+  { id: "splitOut",         label: "Split out into its own folder…", icon: "folder-output",                    group: "Organize" },
   { id: "setColor",         label: "Set color…",                    icon: "palette",            button: true,  group: "Organize" },
   { id: "setDue",           label: "Set due date…",                 icon: "calendar-clock",     button: true,  group: "Organize" },
   { id: "blur",             label: "Blur / unblur",                 icon: "eye-off",            button: true,  group: "Organize" },
@@ -212,7 +214,8 @@ export const CONTEXT_LEAF_IDS: readonly string[] = [
  *  renamable / reorderable / nestable / deletable like any user submenu. Every
  *  item id is a real renderCtxLeaf leaf case (see view.ts). */
 export const DEFAULT_CONTEXT_SUBMENUS: Record<string, { name: string; icon: string; items: string[] }> = {
-  move:      { name: "Move",          icon: "move",        items: ["moveInList", "move", "moveHome", "outdent"] },
+  // 0.562.0: splitOut joins Move; the launch top-up appends it for seeded users.
+  move:      { name: "Move",          icon: "move",        items: ["moveInList", "move", "moveHome", "outdent", "splitOut"] },
   pin:       { name: "Pin",           icon: "pin",         items: ["pinSidebar", "pinListTop", "pinListBottom"] },
   advanced:  { name: "Advanced",      icon: "settings-2",  items: ["openObsidian", "history", "split"] },
   reactreply:{ name: "React / Reply", icon: "smile-plus",  items: ["react", "reply", "replyLink"] },

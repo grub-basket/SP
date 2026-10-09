@@ -15,6 +15,7 @@ import {
 } from "./types";
 import { TreeIndex, collectMarkdown } from "./tree-index";
 import { RelinkFolderModal, type MovedFolderGuess } from "./folder-identity";
+import { runSplitOutFlow } from "./folder-split";
 import { perf } from "./perf";
 import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
 import { parseDue, parseDueString, dueTier, dueLabel, dueRelative, nextDueValue, isBareDateDue, type DueInfo } from "./due-warmth";
@@ -6236,6 +6237,7 @@ export class StashpadView extends ItemView {
       case "moveInList":      A("Move in list", icon(id), () => this.cmdInListPicker(), none); return;
       case "replyInList":     A("Reply to… (in-list)", icon(id), () => this.cmdReplyInListPicker(), none); return;
       case "outdent":         A("Outdent", icon(id), () => void this.cmdOutdent(), none); return;
+      case "splitOut":        A("Split out into its own folder…", icon(id), () => this.cmdSplitOut(), none); return;
       case "setColor":        A("Set color…", icon(id), () => this.cmdSetColor(), none); return;
       case "toggleComplete":  A("Toggle complete", icon(id), () => void this.cmdToggleComplete(), none); return;
       case "toggleTask":      A("Toggle task (todo)", icon(id), () => void this.cmdToggleTask(), none); return;
@@ -8859,7 +8861,9 @@ export class StashpadView extends ItemView {
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
       rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "More actions";
-      moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
+      // 0.565.0: in a narrow list the buttons that didn't fit the hover
+      // toolbar (fitRowToolbar) lead this menu.
+      moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node, (m) => this.addToolbarOverflowItems(m, actions)); };
       // Show-More toggle anchors before the first configured button (or the ⋮
       // when the user has hidden every row button).
       toggleAnchor = firstBtn ?? moreBtn;
@@ -12376,6 +12380,130 @@ export class StashpadView extends ItemView {
    *
    *  Row DnD (`dnd.attachRowDnD`) stays per-row: it has its own 0.294.0 cache
    *  logic and dragstart needs the row as its target. */
+  /** 0.565.0: the row whose hover toolbar was last fitted (so the mousemove
+   *  pass runs once per row entry, not on every pointer move). */
+  private tbFitRow: HTMLElement | null = null;
+  /** Button count at that fit — a change means the set changed under the pointer. */
+  private tbFitCount = 0;
+  /** Documents (main window + popouts) already carrying the selectionchange
+   *  listener — the list is rebuilt per render, the document isn't. */
+  private tbSelDocs = new WeakSet<Document>();
+  private tbSelRaf = 0;
+
+  /** 0.565.0: the narrow-list hover toolbar (styles.css, `@container
+   *  (max-width: 700px)`) gets at most this share of the row's width. Buttons
+   *  past it move into the ⋮ menu, rightmost first, so the toolbar condenses
+   *  step by step as the list narrows — down to the ⋮ alone. */
+  private static readonly TOOLBAR_MAX_SHARE = 0.4;
+
+  /** 0.565.0: fit a row's hover toolbar to the row, and pick its placement.
+   *  A no-op in the wide layout (buttons floated in the text, not absolute).
+   *  Runs on hover, so only the row being looked at pays for the measuring. */
+  private fitRowToolbar(row: HTMLElement): void {
+    const actions = row.querySelector<HTMLElement>(":scope > .stashpad-note-main > .stashpad-note-actions");
+    if (!actions) return;
+    const btns = Array.from(actions.children) as HTMLElement[];
+    for (const b of btns) b.removeClass("is-tb-overflow");
+    row.removeClass("is-tb-inside");
+    row.style.removeProperty("--sp-tb-top");
+    if (getComputedStyle(actions).position !== "absolute") return;
+    const more = actions.querySelector<HTMLElement>(":scope > .stashpad-note-more");
+    const budget = row.clientWidth * StashpadView.TOOLBAR_MAX_SHARE;
+    // Rightmost first, skipping ⋮ (the overflow's home), anything already
+    // hidden by some other rule (moving it would surface it in the menu), and
+    // a button that has keyboard focus (hiding it would drop the focus).
+    const focused = row.ownerDocument.activeElement;
+    const hideable = btns.filter((b) => b !== more && b.offsetWidth > 0 && !b.contains(focused)).reverse();
+    for (const b of hideable) {
+      if (actions.offsetWidth <= budget) break;
+      b.addClass("is-tb-overflow");
+    }
+    // Straddling the top edge needs room above the row inside the scroll
+    // window, below the sticky focused-note heading when there is one. The
+    // first row (or one scrolled up against the edge) keeps the toolbar
+    // inside its corner instead — pushed down past the heading if the row's
+    // top is tucked under it, but never past the row's own bottom.
+    const list = this.listEl;
+    if (!list) return;
+    let visTop = list.getBoundingClientRect().top;
+    // Sticky bars drawn over the rows: the focused-note heading, and the
+    // view-in-context bar (context mode).
+    list.querySelectorAll<HTMLElement>(":scope > .stashpad-focused, :scope > .stashpad-context-bar").forEach((bar) => {
+      if (getComputedStyle(bar).position === "sticky") visTop = Math.max(visTop, bar.getBoundingClientRect().bottom);
+    });
+    if (actions.getBoundingClientRect().top >= visTop) return;
+    row.addClass("is-tb-inside");
+    const tucked = Math.ceil(visTop - row.getBoundingClientRect().top) + 4;
+    if (tucked > 4) {
+      const max = Math.max(4, row.offsetHeight - actions.offsetHeight - 4);
+      row.style.setProperty("--sp-tb-top", `${Math.min(tucked, max)}px`);
+    }
+  }
+
+  /** 0.565.0: lead the ⋮ menu with the buttons fitRowToolbar moved out of the
+   *  toolbar. Each item re-shows its button and clicks it there, so actions
+   *  that anchor a popover to their button (react, quick menu) still have a
+   *  real position to anchor to. */
+  private addToolbarOverflowItems(menu: Menu, actions: HTMLElement): void {
+    const hidden = Array.from(actions.querySelectorAll<HTMLElement>(":scope > .is-tb-overflow"))
+      .filter((b) => getComputedStyle(b).display === "none");
+    if (!hidden.length) return;
+    const iconOf = (b: HTMLElement): string | null => {
+      const href = b.querySelector("svg use")?.getAttribute("href");
+      if (href?.startsWith("#sp-icon-")) return href.slice("#sp-icon-".length);
+      const cls = Array.from(b.querySelector("svg")?.classList ?? []).find((c) => c.startsWith("lucide-"));
+      return cls ? cls.slice("lucide-".length) : null;
+    };
+    for (const b of hidden) {
+      const label = b.title || b.getAttribute("aria-label") || b.textContent?.trim() || "Action";
+      const icon = iconOf(b);
+      menu.addItem((item) => {
+        item.setTitle(label);
+        if (icon) item.setIcon(icon);
+        item.onClick(() => {
+          b.removeClass("is-tb-overflow");
+          this.tbFitRow = null; // refit on the next hover, folding it back in
+          const r = b.getBoundingClientRect();
+          b.dispatchEvent(new MouseEvent("click", { cancelable: true, view: b.ownerDocument.defaultView, clientX: r.left + r.width / 2, clientY: r.bottom }));
+        });
+      });
+    }
+    menu.addSeparator();
+  }
+
+  /** 0.565.0: mark the rows a live text selection touches, so their hover
+   *  toolbars stay hidden (styles.css, `.is-in-text-selection`) while you drag
+   *  through them or read what you selected. */
+  private syncSelectionToolbars(): void {
+    const list = this.listEl;
+    if (!list) return;
+    const sel = list.ownerDocument.getSelection();
+    const live = !!sel && sel.rangeCount > 0 && !sel.isCollapsed && sel.containsNode(list, true);
+    if (!live) {
+      list.querySelectorAll(".is-in-text-selection").forEach((r) => r.removeClass("is-in-text-selection"));
+      return;
+    }
+    list.querySelectorAll<HTMLElement>(":scope > .stashpad-note.is-wrap-actions").forEach((r) => {
+      r.toggleClass("is-in-text-selection", this.selectionTouchesRow(sel!, r));
+    });
+  }
+
+  /** Does the selection cover any of this row's text? `containsNode(r, true)`
+   *  alone also counts a row the selection merely ENDS at offset 0 of (a
+   *  triple-click on the row above often ends there) or STARTS at the very end
+   *  of — a boundary touch with nothing of the row actually selected. */
+  private selectionTouchesRow(sel: Selection, r: HTMLElement): boolean {
+    if (!sel.containsNode(r, true)) return false;
+    const range = sel.getRangeAt(0);
+    const hasStart = r.contains(range.startContainer);
+    const hasEnd = r.contains(range.endContainer);
+    if (hasStart && hasEnd) return true;
+    const part = r.ownerDocument.createRange();
+    if (hasEnd) { part.setStart(r, 0); part.setEnd(range.endContainer, range.endOffset); return part.toString().trim() !== ""; }
+    if (hasStart) { part.setStart(range.startContainer, range.startOffset); part.setEnd(r, r.childNodes.length); return part.toString().trim() !== ""; }
+    return true; // the selection runs right through the row
+  }
+
   private attachDelegatedRowListeners(list: HTMLElement): void {
     list.addEventListener("click", (e) => {
       const hit = this.rowFromEvent(list, e);
@@ -12425,6 +12553,45 @@ export class StashpadView extends ItemView {
     });
     list.addEventListener("mouseup", disarm);
     list.addEventListener("dragend", disarm);
+    // 0.565.0: narrow-list hover toolbar — fit it to the row on entry (and on
+    // keyboard focus, which shows it too), and keep it out of the way of a
+    // text selection.
+    // mousemove rather than mouseover so a still-hovered row whose button set
+    // changes gets refitted on the next nudge; the check itself is cheap.
+    list.addEventListener("mousemove", (e) => {
+      const row = (e.target as HTMLElement | null)?.closest?.(".stashpad-note.is-wrap-actions") as HTMLElement | null;
+      if (!row || row.parentElement !== list) return;
+      // Once per row entry — unless the toolbar's button set changed under
+      // the pointer (the Show more toggle is added by a later batched measure).
+      const n = row.querySelector(":scope > .stashpad-note-main > .stashpad-note-actions")?.childElementCount ?? 0;
+      if (row === this.tbFitRow && n === this.tbFitCount) return;
+      this.tbFitRow = row;
+      this.tbFitCount = n;
+      this.fitRowToolbar(row);
+    });
+    list.addEventListener("mouseleave", () => { this.tbFitRow = null; });
+    // Scrolling under a still pointer moves the hovered row toward the edge
+    // (or the sticky heading) without a new mouseover — re-place it.
+    let scrollRaf = 0;
+    list.addEventListener("scroll", () => {
+      if (!this.tbFitRow || scrollRaf) return;
+      scrollRaf = (list.ownerDocument.defaultView ?? window).requestAnimationFrame(() => {
+        scrollRaf = 0;
+        if (this.tbFitRow?.isConnected) this.fitRowToolbar(this.tbFitRow);
+      });
+    }, { passive: true });
+    list.addEventListener("focusin", (e) => {
+      const row = (e.target as HTMLElement | null)?.closest?.(".stashpad-note.is-wrap-actions") as HTMLElement | null;
+      if (row && row.parentElement === list) this.fitRowToolbar(row);
+    });
+    const doc = list.ownerDocument;
+    if (!this.tbSelDocs.has(doc)) {
+      this.tbSelDocs.add(doc);
+      this.registerDomEvent(doc, "selectionchange", () => {
+        if (this.tbSelRaf) return;
+        this.tbSelRaf = (doc.defaultView ?? window).requestAnimationFrame(() => { this.tbSelRaf = 0; this.syncSelectionToolbars(); });
+      });
+    }
     // 0.466.0 (/dump): Mod+hover a row → emit `hover-link` so the core Page
     // Preview plugin shows a preview of that note's source. Gated on the Mod key
     // (matching the registered source's defaultMod). Fires once per row entry;
@@ -16853,6 +17020,14 @@ export class StashpadView extends ItemView {
    *  for now (cross-folder forking deferred). NOTE: distinct from the sheet
    *  "Fork as version" (cmdForkVersion) — that makes a draft within a sheet
    *  group; this makes a separate note you can re-home. */
+  /** 0.562.0: move this note's subtree into a NEW Stashpad folder of its own
+   *  (src/folder-split.ts). Its children become the new folder's top level. */
+  cmdSplitOut(target?: TreeNode): void {
+    const node = target ?? this.getActionTargets()[0];
+    if (!node || node.id === ROOT_ID) { notify("Pick a note to split out (not Home)."); return; }
+    void runSplitOutFlow(this.plugin, this.noteFolder, node.id);
+  }
+
   cmdForkNote(): void {
     const node = this.getActionTargets()[0];
     if (!node?.file) { notify("Nothing to fork."); return; }
@@ -24075,6 +24250,7 @@ export class StashpadView extends ItemView {
       case "moveInList":       this.cmdInListPicker(); break;
       case "move":             this.cmdMovePicker(); break;
       case "moveHome":         void this.changeParent(node, ROOT_ID); break;
+      case "splitOut":         this.cmdSplitOut(node); break;
       case "clone":            void this.cmdClone(); break;
       case "fork":             this.cmdForkNote(); break;
       case "setColor":         this.cmdSetColor(); break;
@@ -24404,6 +24580,7 @@ export class StashpadView extends ItemView {
       // gone — they're now SEEDED user submenus (DEFAULT_CONTEXT_SUBMENUS), rendered
       // through the generic `submenu:` branch above from settings.contextSubmenus.
       case "outdent":      A("Outdent", this.actionIcon("outdent"), () => { focusClicked(); void this.cmdOutdent(); }); break;
+      case "splitOut":     A("Split out into its own folder…", this.actionIcon("splitOut"), () => this.cmdSplitOut(node)); break;
       case "pinListTop": {
         // 0.381.0: flip the label to "Unpin…" when already pinned to this edge
         // (matches the sidebar Pin/Unpin toggle above), instead of leaving a
@@ -24450,10 +24627,11 @@ export class StashpadView extends ItemView {
     }
   }
 
-  private openNoteMenu(evt: MouseEvent, node: TreeNode): void {
+  private openNoteMenu(evt: MouseEvent, node: TreeNode, prepend?: (menu: Menu) => void): void {
     if (!node.file) return;
     const file = node.file;
     const menu = new Menu();
+    prepend?.(menu);
     /** THE invariant of this menu: an item acts on the note that was
      *  right-clicked, even when it isn't the selected one — and, from the
      *  focused-note header, even when it isn't in the list at all. An existing

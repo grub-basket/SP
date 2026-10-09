@@ -547,7 +547,10 @@ export async function lockSubtree(
 export async function unlockBundle(
   app: App, blobPath: string, dek: Uint8Array, existingIds: Set<StashpadId>, destFolder?: string,
   isStashpadFolder?: (folder: string) => boolean,
-): Promise<{ notesWritten: number; restoredTo: string }> {
+  /** 0.558.1: where the bundle's root lands when its parent isn't in the
+   *  destination (a fold relocking into another folder). Default: unchanged. */
+  opts: { reparentRootsTo?: StashpadId | null } = {},
+): Promise<{ notesWritten: number; restoredTo: string; idRemap: Record<string, StashpadId> }> {
   const blob = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
   if (!isEncryptedStash(blob)) throw new Error("Not an encrypted bundle.");
   const zip = await decryptWithKey(blob, dek); // throws on wrong key / tampering
@@ -558,10 +561,10 @@ export async function unlockBundle(
   // reuse it instead of writing a duplicate copy into _attachments on unlock.
   // 0.523.8: only at its recorded origin path (older bundles: never another
   // Stashpad folder's _attachments), so a same-name twin elsewhere isn't linked.
-  const summary = await importStashZip(app, zip, folder, existingIds, { dedupeExisting: true, isStashpadFolder });
+  const summary = await importStashZip(app, zip, folder, existingIds, { dedupeExisting: true, isStashpadFolder, ...(opts.reparentRootsTo ? { reparentRootsTo: opts.reparentRootsTo } : {}) });
   await app.vault.adapter.remove(blobPath);
   try { await app.vault.adapter.remove(sidecarPath(blobPath)); } catch { /* sidecar may not exist */ }
-  return { notesWritten: summary.notesWritten, restoredTo: folder };
+  return { notesWritten: summary.notesWritten, restoredTo: folder, idRemap: summary.idRemap };
 }
 
 // ---------------- Phase 5: encrypted trash (`_deleted/`) ----------------
@@ -620,10 +623,15 @@ export async function deletedRestoreDest(app: App, blobPath: string, meta: Delet
   // with its folder on rename (A→B moves A/trash into B/trash), so a stale
   // sidecar `originalFolder: A` would resurrect a dead folder A and restore
   // there instead of B. Prefer the blob's parent folder in that case.
-  const trashParent = /(^|\/)trash$/.test(blobDir) ? blobDir.replace(/\/?trash$/, "") : "";
+  const trashDir = perFolderTrashDirOf(blobDir);
+  const trashParent = trashDir ? trashDir.replace(/\/?trash$/, "") : "";
   if (origin && trashParent && origin !== trashParent && !(await app.vault.adapter.exists(origin))) {
     origin = trashParent || null;
   }
+  // 0.558.0: a folded folder's merged trash (`<f>/trash/from-<name>/`) now
+  // belongs to <f> — its sidecars still name the old folder, so the blob's
+  // location wins outright (a NEW folder reusing the old name must not get it).
+  if (trashParent && trashDir !== blobDir) origin = trashParent;
   if (origin) {
     // Recreate a missing origin folder rather than falling back: for trash
     // blobs the fallback would be `_deleted/` itself — decrypted plaintext
@@ -637,8 +645,8 @@ export async function deletedRestoreDest(app: App, blobPath: string, meta: Delet
   // 0.137.0: a per-folder trash blob with no usable sidecar restores to the
   // trash's PARENT folder (that IS its origin) — never into the reserved
   // trash/ dir itself, where the plaintext would be hidden from every list.
-  if (/(^|\/)trash$/.test(blobDir)) {
-    const parent = blobDir.replace(/\/?trash$/, "");
+  if (perFolderTrashDirOf(blobDir)) {
+    const parent = perFolderTrashDirOf(blobDir).replace(/\/?trash$/, "");
     if (parent) { if (!(await app.vault.adapter.exists(parent))) await app.vault.adapter.mkdir(parent); return parent; }
     throw new Error("This deleted note's origin folder is unknown (missing or tampered sidecar) — can't restore it safely. The encrypted copy was kept.");
   }
@@ -828,13 +836,16 @@ export async function deletePlaintextSubtree(
 export async function restorePlaintextDeleted(
   app: App, blobPath: string, existingIds: Set<StashpadId>,
   isStashpadFolder?: (folder: string) => boolean,
+  /** 0.558.0: a folded folder's trash restores under its container note
+   *  (instead of the destination's top level) — see src/folder-fold.ts. */
+  reparentRootsTo?: StashpadId | null,
 ): Promise<{ notesWritten: number; restoredTo: string; bundleKept: boolean; warnings: string[] }> {
   const zip = new Uint8Array(await app.vault.adapter.readBinary(blobPath));
   const meta = await readDeletedMeta(app, blobPath);
   // No dek: plaintext bundles never hide their origin, so `originalFolder` (or the
   // blob's own trash-parent fallback) is always the source of truth.
   const dest = await deletedRestoreDest(app, blobPath, meta);
-  const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true, isStashpadFolder });
+  const summary = await importStashZip(app, zip, dest, existingIds, { dedupeExisting: true, isStashpadFolder, ...(reparentRootsTo ? { reparentRootsTo } : {}) });
   // 0.211.6 (L3): the bundle is the ONLY copy of these notes — it was previously
   // removed unconditionally, so an import that wrote nothing, or skipped entries,
   // destroyed the notes it failed to restore. Since 0.211.4 a per-note write failure
@@ -859,9 +870,7 @@ export async function listPlaintextTrashBundles(app: App, dirs: string[]): Promi
   const out: string[] = [];
   for (const dir of dirs) {
     try {
-      if (!(await app.vault.adapter.exists(dir))) continue;
-      const listing = await app.vault.adapter.list(dir);
-      out.push(...listing.files.filter((f) => f.endsWith(`.${STASHPACK_EXT}`)));
+      out.push(...(await listTrashDirFiles(app, dir)).filter((f) => f.endsWith(`.${STASHPACK_EXT}`)));
     } catch { /* skip unreadable dir */ }
   }
   return out;
@@ -1184,15 +1193,39 @@ export function trashSubfolderOf(folder: string): string {
   return `${(folder || "").replace(/\/+$/, "")}/trash`;
 }
 
+/** 0.558.0: the trash dir a blob's directory belongs to, or "" when it isn't
+ *  a per-folder trash. Covers `<f>/trash` and one level down for a folded
+ *  folder's trash (`<f>/trash/from-<name>`, see src/folder-fold.ts). */
+export function perFolderTrashDirOf(dir: string): string {
+  const d = (dir || "").replace(/\/+$/, "");
+  if (/(^|\/)trash$/.test(d)) return d;
+  const m = /^(.*(?:^|\/)trash)\/from-[^/]+$/.exec(d);
+  return m ? m[1] : "";
+}
+
+/** List `dir` and its `from-*` subfolders (a folded folder's merged trash). */
+async function listTrashDirFiles(app: App, dir: string): Promise<string[]> {
+  if (!(await app.vault.adapter.exists(dir))) return [];
+  const listing = await app.vault.adapter.list(dir);
+  const out = [...listing.files];
+  for (const sub of listing.folders) {
+    if (!/\/from-[^/]+$/.test(sub)) continue;
+    try { out.push(...(await app.vault.adapter.list(sub)).files); } catch { /* skip unreadable */ }
+  }
+  return out;
+}
+
 /** All encrypted-deleted blob paths: the legacy vault-level `_deleted/` UNION
  *  (0.137.0) every per-folder `trash/` subfolder passed in `extraDirs`. */
 export async function listDeletedBlobs(app: App, extraDirs: string[] = []): Promise<string[]> {
   const out: string[] = [];
   for (const dir of [DELETED_DIR, ...extraDirs]) {
     try {
-      if (!(await app.vault.adapter.exists(dir))) continue;
-      const listing = await app.vault.adapter.list(dir);
-      out.push(...listing.files.filter((f) => f.endsWith(`.${STASHENC_EXT}`)));
+      // Per-folder trash also looks one level down (a folded folder's from-*).
+      const files = dir === DELETED_DIR
+        ? (await app.vault.adapter.exists(dir) ? (await app.vault.adapter.list(dir)).files : [])
+        : await listTrashDirFiles(app, dir);
+      out.push(...files.filter((f) => f.endsWith(`.${STASHENC_EXT}`)));
     } catch { /* skip unreadable dir */ }
   }
   return out;

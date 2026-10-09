@@ -5,6 +5,10 @@ import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type Stas
 import { ShowRenderGate, renderCountBadge } from "./panels-view";
 import { ConfirmModal, PinAliasModal } from "./modals";
 import { canRevealInOs, osFileManagerName, revealInOsFileManager } from "./os-reveal";
+import { runFoldFlow } from "./folder-fold";
+import { runUnfoldFlow } from "./folder-split";
+import { openFolderSetup } from "./folder-setup-modal";
+import type { FolderPlacement } from "./types";
 
 /** 0.164.0: a pinned item in the folder panel's shared pin order — either a
  *  pinned FOLDER or a pinned NOTE. `at` is the shared numeric order key. */
@@ -833,36 +837,14 @@ export class StashpadFolderPanelView extends ItemView {
   private static clean(folder: string): string { return folder.replace(/\/+$/, ""); }
 
   /** Current placement of a folder. "normal" = in none of the override lists. */
-  private folderState(folder: string): "pinned" | "downranked" | "hidden" | "normal" {
-    const c = StashpadFolderPanelView.clean(folder);
-    const s = this.plugin.settings;
-    if ((s.folderPanelPinned ?? []).includes(c)) return "pinned";
-    if ((s.folderPanelDownranked ?? []).includes(c)) return "downranked";
-    if ((s.folderPanelHidden ?? []).includes(c)) return "hidden";
-    return "normal";
+  private folderState(folder: string): FolderPlacement {
+    return this.plugin.folderPlacement(folder);
   }
 
-  /** Move a folder to a placement, clearing it from the other two lists first.
-   *  "normal" just removes it everywhere. Persists + re-renders. */
-  private async setFolderState(folder: string, state: "pinned" | "downranked" | "hidden" | "normal"): Promise<void> {
-    const c = StashpadFolderPanelView.clean(folder);
-    const s = this.plugin.settings;
-    s.folderPanelPinned = (s.folderPanelPinned ?? []).filter((f) => f !== c);
-    s.folderPanelDownranked = (s.folderPanelDownranked ?? []).filter((f) => f !== c);
-    s.folderPanelHidden = (s.folderPanelHidden ?? []).filter((f) => f !== c);
-    s.folderPanelPinnedAt = s.folderPanelPinnedAt ?? {};
-    if (state === "pinned") {
-      s.folderPanelPinned.push(c);
-      // 0.164.0: newly-pinned folder gets `now` so it lands at the BOTTOM of the
-      // shared pin order (mixed with the most-recent note pins).
-      s.folderPanelPinnedAt[c] = Date.now();
-    } else {
-      // No longer pinned — drop its order key so it doesn't linger.
-      delete s.folderPanelPinnedAt[c];
-      if (state === "downranked") s.folderPanelDownranked.push(c);
-      else if (state === "hidden") s.folderPanelHidden.push(c);
-    }
-    await this.plugin.saveSettings();
+  /** Move a folder to a placement (0.561.0: the logic moved to the plugin as
+   *  setFolderPlacement, shared with the folder setup modal). Re-renders. */
+  private async setFolderState(folder: string, state: FolderPlacement): Promise<void> {
+    await this.plugin.setFolderPlacement(folder, state);
     this.render();
   }
 
@@ -1221,6 +1203,18 @@ export class StashpadFolderPanelView extends ItemView {
     menu.addSeparator();
     menu.addItem((i) => i.setTitle("Rename…").setIcon("pencil")
       .onClick(() => this.renameFolder(folder)));
+    // 0.561.0: icon, placement, blur and encryption in one place.
+    menu.addItem((i) => i.setTitle("Edit folder…").setIcon("settings-2")
+      .onClick(() => openFolderSetup(this.plugin, folder, { mode: "edit", onDone: () => this.render() })));
+    // 0.558.0: merge this folder into another Stashpad (src/folder-fold.ts).
+    menu.addItem((i) => i.setTitle("Fold into another folder…").setIcon("folder-input")
+      .onClick(() => void runFoldFlow(this.plugin, folder)));
+    // 0.560.0: only when something was folded INTO this folder.
+    const cleanFolder = folder.replace(/\/+$/, "");
+    if (Object.values(this.plugin.settings.foldedFolders ?? {}).some((f) => f.into === cleanFolder)) {
+      menu.addItem((i) => i.setTitle("Unfold a folder folded in here…").setIcon("folder-output")
+        .onClick(() => void runUnfoldFlow(this.plugin, undefined, cleanFolder)));
+    }
     // Encryption (Phase 3): lock every top-level note in the folder into separate
     // .stashenc bundles, or unlock them all back. Only when encryption is set up.
     if (this.plugin.encryption?.isConfigured?.()) {
