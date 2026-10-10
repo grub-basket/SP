@@ -3180,7 +3180,15 @@ export default class StashpadPlugin extends Plugin {
     if (capMs !== null) cap = window.setTimeout(run, capMs);
     const afterInit = (): void => mc.onCleanCache!(run);
     if (mc.initialized) { afterInit(); return; }
-    const ref = mc.on("finished", () => { mc.offref(ref); afterInit(); });
+    // 0.567.0: 'finished' is NOT only the end of the initial index — Obsidian
+    // also fires it (debounced `didFinish`) every time the parse queue drains,
+    // e.g. after any edit or synced file. Only the one fired by initialize(),
+    // right after it sets `initialized = true`, means the index is in.
+    const ref = mc.on("finished", () => {
+      if (!mc.initialized) return;
+      mc.offref(ref);
+      afterInit();
+    });
     this.registerEvent(ref);
   }
 

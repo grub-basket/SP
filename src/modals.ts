@@ -9,7 +9,8 @@ import { parseFormatSpans, FORMAT_KINDS, type FormatSpan } from "./formatting-to
 import { buildTimePickerInto } from "./time-picker";
 import { siftMatch, ROOT_ID, type ComposerDraft } from "./types";
 import { generatePassphrase, estimatePasswordStrength } from "./passphrase";
-import { newId } from "./id-service";
+import { newId, readId } from "./id-service";
+import { collectMarkdown } from "./tree-index";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL, parseRecurrence, parseDuration } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { parseNaturalDate, naturalDatePhrases, type NaturalDate } from "./natural-date";
@@ -3336,37 +3337,74 @@ function draftDupTitle(line: string): string {
   return line.replace(/^[#>\-*+\s]+/, "").replace(/^\[[ xX]?\]\s*/, "").trim();
 }
 
+/** 0.567.0: one folder's scanned note titles. `complete` is false when some
+ *  notes couldn't be checked, so "no matches" can't be trusted. */
+interface FolderTitles { titles: { title: string; id: string }[]; complete: boolean }
+
 export class ComposerDraftsModal extends Modal {
   constructor(app: App, private plugin: StashpadPlugin, private folder?: string) { super(app); }
 
   /** 0.507.0: per-folder note-title index, built lazily + cached for the modal's
    *  lifetime so several drafts in the same folder share one scan. Reads files
-   *  (titles are the first body line, not in the metadata cache), so it's capped. */
-  private titleCache = new Map<string, Promise<{ title: string; id: string }[]>>();
-  private static readonly TITLE_SCAN_CAP = 400;
+   *  (titles are the first body line, not in the metadata cache).
+   *
+   *  0.567.0: the scan used to report "no duplicates" for drafts that DID have
+   *  matches. Three holes, all closed here:
+   *  - it ran before Obsidian finished indexing, and skipped any note whose
+   *    frontmatter wasn't parsed yet (no `id` in the cache = "not a Stashpad
+   *    note"). Now it waits for the index (`whenVaultIndexed`), and a note the
+   *    cache still hasn't parsed has its `id` read from the file itself.
+   *  - it stopped at the first 400 files, in no particular order. Now it reads
+   *    every note in the folder.
+   *  - it only looked at files sitting directly in the folder. Now it walks the
+   *    same subtree the list does (`collectMarkdown`).
+   *  If any note still couldn't be read, `complete` is false and the badge says
+   *  so instead of claiming "no duplicates". */
+  private titleCache = new Map<string, Promise<FolderTitles>>();
+  /** Files read at once — enough to hide per-read latency on a network share
+   *  without flooding it. */
+  private static readonly TITLE_SCAN_BATCH = 16;
+  private indexReady: Promise<void> | null = null;
+  private closed = false;
 
-  private folderTitles(folder: string): Promise<{ title: string; id: string }[]> {
+  /** Resolves once Obsidian's initial index is done (or its 60 s cap passes). */
+  private waitForIndex(): Promise<void> {
+    if (!this.indexReady) this.indexReady = new Promise((resolve) => this.plugin.whenVaultIndexed(resolve));
+    return this.indexReady;
+  }
+
+  private folderTitles(folder: string): Promise<FolderTitles> {
     const cached = this.titleCache.get(folder);
     if (cached) return cached;
-    const p = (async (): Promise<{ title: string; id: string }[]> => {
-      const files = this.app.vault.getMarkdownFiles()
-        .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === folder)
-        .slice(0, ComposerDraftsModal.TITLE_SCAN_CAP);
-      const out: { title: string; id: string }[] = [];
-      for (const f of files) {
-        const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as { id?: string } | undefined;
-        const id = typeof fm?.id === "string" ? fm.id : "";
-        if (!id) continue; // not a Stashpad note
-        let title = "";
-        try {
-          const body = splitFrontmatter(await this.app.vault.cachedRead(f)).body;
-          const line = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
-          if (line) title = draftDupTitle(line);
-        } catch { /* fall through to filename */ }
-        if (!title) title = f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
-        out.push({ title, id });
+    const p = (async (): Promise<FolderTitles> => {
+      await this.waitForIndex();
+      // Same enumeration as TreeIndex.rebuild (vault-wide when there's no folder).
+      const files = folder ? collectMarkdown(this.app, folder) : this.app.vault.getMarkdownFiles();
+      const titles: { title: string; id: string }[] = [];
+      let complete = true;
+      const scan = async (f: TFile): Promise<void> => {
+        const cachedFm = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
+        let content: string;
+        try { content = await this.app.vault.cachedRead(f); } catch { complete = false; return; }
+        const { fm, body } = splitFrontmatter(content);
+        // The cache can lag the file (cold index, a note just synced in) —
+        // fall back to the frontmatter in the file itself.
+        const id = readId(cachedFm?.id) ?? readId(fm.id);
+        if (!id) return; // not a Stashpad note
+        const line = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+        const title = (line ? draftDupTitle(line) : "") || f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+        titles.push({ title, id });
+      };
+      for (let i = 0; i < files.length; i += ComposerDraftsModal.TITLE_SCAN_BATCH) {
+        if (this.closed) return { titles, complete: false };
+        await Promise.all(files.slice(i, i + ComposerDraftsModal.TITLE_SCAN_BATCH).map(scan));
       }
-      return out;
+      // The 60 s cap fired before Obsidian's initial load finished, so the
+      // folder's file list itself may not be final yet. (Only `initialized`, not
+      // vaultIndexing(): that is also true while any one note re-parses, e.g.
+      // right after an edit, which doesn't make this scan incomplete.)
+      if ((this.app.metadataCache as unknown as { initialized?: boolean }).initialized === false) complete = false;
+      return { titles, complete };
     })();
     this.titleCache.set(folder, p);
     return p;
@@ -3378,14 +3416,29 @@ export class ComposerDraftsModal extends Modal {
     const firstLine = (d.text || "").split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
     const query = draftDupTitle(firstLine);
     if (query.length < 3) return; // too short to be a meaningful match
-    const badge = host.createSpan({ cls: "stashpad-drafts-dup-badge is-checking", text: "checking…" });
-    void this.folderTitles(d.folder).then((titles) => {
+    const indexing = this.plugin.vaultIndexing();
+    const badge = host.createSpan({
+      cls: "stashpad-drafts-dup-badge is-checking",
+      text: indexing ? "Waiting for index…" : "Checking…",
+    });
+    if (indexing) {
+      badge.setAttr("aria-label", "Obsidian is still indexing the vault. The duplicate check runs once it finishes.");
+      void this.waitForIndex().then(() => {
+        if (!badge.hasClass("is-checking")) return;
+        badge.setText("Checking…");
+        badge.removeAttribute("aria-label");
+      });
+    }
+    void this.folderTitles(d.folder).then(({ titles, complete }) => {
       const matches = titles.filter((t) => t.title && siftMatch(query, t.title));
       badge.removeClass("is-checking");
+      badge.removeAttribute("aria-label");
       badge.empty();
       if (!matches.length) {
         badge.addClass("is-none");
-        badge.setText("no duplicates");
+        if (complete) { badge.setText("No duplicates"); return; }
+        badge.setText("Not fully checked");
+        badge.setAttr("aria-label", "Some notes in this folder couldn't be checked (Obsidian was still indexing, or a file couldn't be read), so there may be matches this check missed.");
         return;
       }
       badge.addClass("is-hit");
@@ -3408,7 +3461,7 @@ export class ComposerDraftsModal extends Modal {
     this.modalEl.addClass("stashpad-drafts-modal");
     this.render();
   }
-  onClose(): void { this.contentEl.empty(); }
+  onClose(): void { this.closed = true; this.contentEl.empty(); }
   private render(): void {
     const c = this.contentEl;
     c.empty();
