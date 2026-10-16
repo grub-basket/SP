@@ -36,6 +36,7 @@ import {
   isWithinMaintenanceWindow, maintenanceSweepObeysWindow, MAINTENANCE_SWEEPS, type MaintenanceSweepId,
 } from "./settings";
 import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId, stripInlineMarkdown } from "./slug-service";
+import { safeFileName } from "./safe-filename";
 import { siftRank } from "./suggest-match";
 import { runFoldFlow } from "./folder-fold";
 import type { FolderPlacement } from "./types";
@@ -62,9 +63,9 @@ import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./str
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { createAliasesForFolder, deriveCleanTitle } from "./alias-service";
-import { NotificationService, buildFileActions, boldFragment, type NotificationAction } from "./notifications";
+import { NotificationService, buildFileActions, boldFragment, type NotificationAction, type NotificationOpen } from "./notifications";
 import { notify, setNotifySink } from "./notify";
-import { visibleDrafts } from "./drafts";
+import { visibleDrafts, mergeDraftMaps } from "./drafts";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
 const SHORTCUT_DIR = "Stashpad Shortcuts";
@@ -273,6 +274,7 @@ export default class StashpadPlugin extends Plugin {
   private static readonly ERROR_BUFFER_MAX = 50;
   private errorBuffer: string[] = [];
   private detachErrorCapture: (() => void) | null = null;
+  private recordedWriteErrors = new WeakSet<object>();
 
   private errorLogPath(): string | null {
     const dir = this.manifest?.dir;
@@ -301,6 +303,18 @@ export default class StashpadPlugin extends Plugin {
       try {
         const reason = e.reason as { stack?: unknown; message?: unknown } | undefined;
         const stack = typeof reason?.stack === "string" ? reason.stack : "";
+        // 0.568.0: a filesystem error (Node errno code: EIO, ENOENT, EACCES,
+        // ETIMEDOUT…) is thrown from Obsidian's adapter, so its stack never
+        // names this plugin, and the filter below dropped every un-caught
+        // write failure (complete, due date, task toggles…) on a network
+        // share. Keep those, tagged "?" because they could be another plugin's.
+        if (e.reason && typeof e.reason === "object" && this.recordedWriteErrors.has(e.reason)) return;
+        const code = (e.reason as { code?: unknown } | undefined)?.code;
+        if (stack && !this.stackIsOurs(stack) && typeof code === "string" && /^E[A-Z]+$/.test(code)) {
+          const msg = typeof reason?.message === "string" ? reason.message : "";
+          this.recordError("fs-rejection?", msg.startsWith(code) ? msg : `${code} ${msg}`, stack);
+          return;
+        }
         if (stack && !this.stackIsOurs(stack)) return;
         if (!stack) return; // an unattributable rejection is almost always another plugin's
         this.recordError("rejection", typeof reason?.message === "string" ? reason.message : String(e.reason), stack);
@@ -320,6 +334,27 @@ export default class StashpadPlugin extends Plugin {
   /** Record one captured error into the ring buffer, collapse an identical
    *  consecutive repeat into a count (a throwing render loop fires every
    *  frame), and append it to the on-disk log. */
+  /** 0.568.0: a CAUGHT write failure (create, body save, frontmatter). These
+   *  never reached the trace or errors.log: the catch turned them into a
+   *  notice, and an uncaught one from Obsidian's own fs code has no plugin
+   *  frame, so the rejection filter drops it. On a network share that left a
+   *  "couldn't save" report with nothing to read. Records to both; never throws. */
+  noteWriteFailure(op: string, path: string, err: unknown): void {
+    try {
+      // A caller that rethrows (writeEditedBody) can leave this same error
+      // unhandled; onRejection skips anything already recorded here.
+      if (err && typeof err === "object") this.recordedWriteErrors.add(err);
+      const e = err as { message?: unknown; code?: unknown; stack?: unknown } | null;
+      const message = typeof e?.message === "string" ? e.message : String(err);
+      const code = typeof e?.code === "string" ? e.code : undefined;
+      this.trace("write:fail", { op, path, code, message: message.slice(0, 200) });
+      if (this.settings && this.settings.captureErrors === false) return;
+      const codePrefix = code && !message.startsWith(code) ? `${code} ` : "";
+      this.recordError("write", `${op} ${path}: ${codePrefix}${message}`,
+        `${typeof e?.stack === "string" ? e.stack : ""}\n${new Error("caught at").stack ?? ""}`);
+    } catch { /* a logger must never throw */ }
+  }
+
   private recordError(kind: string, message: string, stack: string): void {
     const when = new Date().toISOString();
     const os = Platform.isMobileApp ? (Platform.isIosApp ? "iOS" : "Android") : "desktop";
@@ -921,7 +956,10 @@ export default class StashpadPlugin extends Plugin {
    *  case `this.app` isn't ready at field-initialiser time. */
   private _notifications: NotificationService | null = null;
   get notifications(): NotificationService {
-    if (!this._notifications) this._notifications = new NotificationService(this.app);
+    if (!this._notifications) {
+      this._notifications = new NotificationService(this.app);
+      this._notifications.setOpenRouter((t) => this.openNotificationTarget(t));
+    }
     return this._notifications;
   }
   /** 0.337.0: per-note version-history store (see note-history.ts). Lazy so
@@ -1926,7 +1964,7 @@ export default class StashpadPlugin extends Plugin {
         (ok: boolean) => { if (ok) open(); }).open();
       return;
     }
-    this.notifications.show({ message: msg, kind: "warning", category: "system", folder: v.stashpad, actions: [{ label: `Open "${name}"`, onClick: open }] });
+    this.notifications.show({ message: msg, kind: "warning", category: "system", folder: v.stashpad, open: { folder: v.stashpad, button: `Open "${name}"` } });
   }
 
   /** Folder paths whose delete WE initiated (panel delete with undo). The vault
@@ -2245,6 +2283,8 @@ export default class StashpadPlugin extends Plugin {
             window.setTimeout(() => this.suppressedFolderDeletes.delete(cleaned), 5000);
             await adapter.rename(dest, cleaned);
             notify(`Restored “${name}”.`);
+            // notif-open: ok — undo reopens the restored folder in a NEW tab
+            // (activateViewForFolder never reuses or navigates an existing one).
             void this.activateViewForFolder(cleaned);
           } catch (e) {
             console.warn("[Stashpad] folder undo failed", e);
@@ -6297,7 +6337,7 @@ export default class StashpadPlugin extends Plugin {
         folder: file.parent?.path?.replace(/\/+$/, "") ?? undefined,
         affectedIds: id ? [id as StashpadId] : undefined,
         affectedPaths: [file.path],
-        actions: this.adoptionJumpActions([file]),
+        open: this.adoptionOpenTarget([file]),
       });
     } catch (e) {
       console.warn("Stashpad: orphan auto-fix failed", e);
@@ -7167,6 +7207,17 @@ export default class StashpadPlugin extends Plugin {
     const all = { ...(this.settings.composerDrafts ?? {}) };
     if (!(id in all)) return;
     delete all[id];
+    this.settings.composerDrafts = all;
+    await this.saveSettings();
+  }
+
+  /** 0.573.2: discard several drafts with one settings write (the Drafts
+   *  manager's "discard already-sent drafts"). */
+  async deleteComposerDrafts(ids: string[]): Promise<void> {
+    const all = { ...(this.settings.composerDrafts ?? {}) };
+    let changed = false;
+    for (const id of ids) if (id in all) { delete all[id]; changed = true; }
+    if (!changed) return;
     this.settings.composerDrafts = all;
     await this.saveSettings();
   }
@@ -9385,7 +9436,7 @@ export default class StashpadPlugin extends Plugin {
             : `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`,
           kind: r.bundleKept ? "warning" : "success",
           category: "system", folder: r.restoredTo,
-          actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(r.restoredTo) }],
+          open: { folder: r.restoredTo, button: "Go to folder" },
         });
         return true;
       } catch (e) {
@@ -9437,7 +9488,7 @@ export default class StashpadPlugin extends Plugin {
         this.watchReEncrypt({ folder: r.restoredTo, rootId: meta.rootId, title: meta.title || "", count: meta.count ?? r.notesWritten, via: "restore" });
         await this.saveSettings();
       }
-      if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo, actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(r.restoredTo) }] });
+      if (!opts.silent) this.notifications.show({ message: `Restored ${r.notesWritten} note${r.notesWritten === 1 ? "" : "s"} to “${r.restoredTo.split("/").pop()}”.`, kind: "success", category: "system", folder: r.restoredTo, open: { folder: r.restoredTo, button: "Go to folder" } });
       return true;
     } catch (e) {
       console.warn("[Stashpad] restore-from-trash failed", e);
@@ -9524,7 +9575,7 @@ export default class StashpadPlugin extends Plugin {
       let target = `${dest}/${base}`;
       if (await this.app.vault.adapter.exists(target)) target = `${dest}/${base.replace(/\.md$/, "")}-restored-${Date.now()}.md`;
       await this.app.vault.adapter.rename(path, target);
-      this.notifications.show({ message: `Restored "${base}" to ${dest}/. If its parent lives in another folder, move it from there.`, kind: "success", category: "system", folder: dest, actions: [{ label: "Go to folder", onClick: () => void this.activateViewForFolder(dest) }] });
+      this.notifications.show({ message: `Restored "${base}" to ${dest}/. If its parent lives in another folder, move it from there.`, kind: "success", category: "system", folder: dest, open: { folder: dest, button: "Go to folder" } });
       return true;
     } catch (e) {
       notify(`Couldn't restore: ${(e as Error).message}`);
@@ -10093,7 +10144,7 @@ export default class StashpadPlugin extends Plugin {
       for (const d of sub.descendants) { allDescendants.push({ id: d.id, file: d.file }); files.push(d.file); scopeIds.add(d.id); }
     }
     if (!files.length) return [];
-    const safe = (baseName || "okf-export").replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "okf-export";
+    const safe = safeFileName(baseName, { max: 80, fallback: "okf-export" });
     const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
     const exportSub = (this.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
     const exportFolder = `${cleaned}/${exportSub}`;
@@ -10728,11 +10779,89 @@ export default class StashpadPlugin extends Plugin {
     return leaf;
   }
 
-  /** Navigate a (possibly still-loading) Stashpad leaf to a note id. */
-  navigateLeafTo(leaf: WorkspaceLeaf | null, folder: string, id: StashpadId): void {
-    const view = leaf?.view as { navigateTo?: (id: StashpadId) => void; tree?: { get(id: StashpadId): unknown } } | undefined;
+  /** Navigate a (possibly still-loading) Stashpad leaf to a note id.
+   *
+   *  0.569.0: waits on THIS leaf and only this leaf. It used to hand a
+   *  not-yet-ready leaf to a navigateWhenReady poller that picked "the
+   *  folder's preferred tab" (else the last-active Stashpad tab on ANY
+   *  folder) — so a freshly opened tab still loading its tree could have the
+   *  navigation land on the user's OTHER tab instead (the last-active one,
+   *  which is exactly the tab they're on when new tabs open in the
+   *  background). That poller is gone. A null leaf means the open was
+   *  refused, so there's nothing to navigate, and no other tab is touched. */
+  navigateLeafTo(leaf: WorkspaceLeaf | null, folder: string, id: StashpadId, attempts = 40): void {
+    if (!leaf) return;
+    type Nav = { navigateTo?: (id: StashpadId) => void; tree?: { get(id: StashpadId): unknown }; noteFolder?: string };
+    const lazy = leaf as unknown as { isDeferred?: boolean; loadIfDeferred?: () => Promise<void> };
+    if (lazy.isDeferred && lazy.loadIfDeferred) {
+      // A backgrounded tab is a stub until loaded — load it, then try again.
+      void lazy.loadIfDeferred().catch(() => { /* retry below still runs */ });
+    }
+    const view = leaf.view as Nav | undefined;
     if (view?.navigateTo && (!view.tree || view.tree.get(id))) { view.navigateTo(id); return; }
-    this.navigateWhenReady(folder, id);
+    // The tab was closed, or now shows something else: stop rather than steer.
+    if (!this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE).includes(leaf)) return;
+    const onFolder = (view?.noteFolder ?? folder).replace(/\/+$/, "") === folder.replace(/\/+$/, "");
+    if (!onFolder) return;
+    if (attempts > 0) { window.setTimeout(() => this.navigateLeafTo(leaf, folder, id, attempts - 1), 90); return; }
+    view?.navigateTo?.(id); // last resort — navigate anyway (same leaf)
+  }
+
+  /** 0.569.0: THE notification click router. Every notification that opens
+   *  something declares `open: { folder, id? }` and the NotificationService
+   *  sends the click here (toast button, card click, OS notification, and the
+   *  history panel's Open button).
+   *
+   *  The rule: **a notification click never changes what an existing tab is
+   *  showing.** Each one opens in its own fresh tab — clicking three teammate
+   *  toasts for the same folder gives three tabs, not one tab yanked around
+   *  three times. The only reuse is a tab ALREADY showing exactly that note
+   *  (or that folder's home, for a folder target): it's brought forward
+   *  untouched instead of duplicated — e.g. the background tab a move opens on
+   *  its destination. (Filling an empty New tab the user is looking at is the
+   *  exception activateViewForFolder already makes — nothing in it to
+   *  overwrite.) A fresh tab still follows "New tabs open in the background";
+   *  that setting is the user's call. */
+  async openNotificationTarget(target: { folder: string; id?: StashpadId }): Promise<void> {
+    const folder = (target.folder || "").replace(/^\/+|\/+$/g, "");
+    if (!folder) return;
+    const id = target.id && target.id !== ROOT_ID ? target.id : "";
+    // A toast can sit for hours and the history log reopens old ones, so the
+    // folder may be gone (deleted, renamed, folded away). Opening a view on a
+    // missing path would quietly re-create it as a new, empty Stashpad —
+    // refuse instead. The adapter check covers a vault index that lags disk.
+    if (!(this.app.vault.getAbstractFileByPath(folder) instanceof TFolder)
+      && !(await this.app.vault.adapter.exists(folder).catch(() => false))) {
+      notify(`Stashpad: “${folder.split("/").pop()}” isn't there anymore — it was moved, renamed or deleted.`);
+      return;
+    }
+    const showing = this.leafShowingExactly(folder, id || ROOT_ID);
+    this.trace("notif:open", { folder, note: id || null, path: showing ? "already-showing" : "fresh-tab" });
+    if (showing) {
+      await this.app.workspace.revealLeaf(showing);
+      this.app.workspace.setActiveLeaf(showing, { focus: true });
+      return;
+    }
+    await this.openDeepLinkTarget(folder, id, { forceNewTab: true });
+  }
+
+  /** A Stashpad tab whose folder AND focused note are exactly `folder`/`id`
+   *  (ROOT_ID = the home level), deferred tabs included via their saved
+   *  state. Revealing it changes nothing about what it shows. */
+  private leafShowingExactly(folder: string, id: StashpadId): WorkspaceLeaf | null {
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const view = leaf.view as { noteFolder?: string; focusId?: string } | undefined;
+      const live = (view?.noteFolder ?? "").replace(/\/+$/, "");
+      if (live) {
+        if (live === folder && (view?.focusId || ROOT_ID) === id) return leaf;
+        continue;
+      }
+      // A deferred tab on the default folder saves no folderOverride.
+      const st = leaf.getViewState()?.state as { folderOverride?: string | null; focusId?: string } | undefined;
+      const stFolder = (st?.folderOverride || this.settings.folder || "Stashpad").replace(/^\/+|\/+$/g, "");
+      if (stFolder === folder && (st?.focusId || ROOT_ID) === id) return leaf;
+    }
+    return null;
   }
 
   /** 0.93.0: open `folder` in Stashpad — reusing an existing Stashpad tab
@@ -11110,8 +11239,10 @@ export default class StashpadPlugin extends Plugin {
       authorId: author.id,
       affectedIds: [fm.id],
       affectedAuthorIds: [author.id],
-      onBodyClick: () => { void this.revealNoteInStashpad(cur); },
-      actions: [{ label: "Open note", onClick: () => { void this.revealNoteInStashpad(cur); } }],
+      // 0.569.0: through the notification router → always a fresh tab. It used
+      // revealNoteInStashpad, which navigated the tab you already had on that
+      // folder over to the teammate's note.
+      open: { folder: dir, id: fm.id, body: true },
     });
   }
 
@@ -11160,9 +11291,16 @@ export default class StashpadPlugin extends Plugin {
    *  most adopted notes and NAMES it in the label, so the button never lands
    *  somewhere the label didn't promise.
    *
-   *  Returns [] when there's nothing to open — a button that can't resolve a
-   *  target is worse than no button. */
-  adoptionJumpActions(files: TFile[]): NotificationAction[] {
+   *  Returns undefined when there's nothing to open — a button that can't
+   *  resolve a target is worse than no button.
+   *
+   *  0.569.0: returns a notification `open` target (was a hand-built action
+   *  calling revealNoteInStashpad, which navigated an existing tab). The note
+   *  id is resolved now rather than at click time: the cache first, then the
+   *  `-<id>` filename suffix (the cache can lag a just-stamped id); if neither
+   *  has it yet, the button opens the folder's home, which is where the
+   *  adopted note sits. */
+  adoptionOpenTarget(files: TFile[]): NotificationOpen | undefined {
     // Only offer a jump for notes that actually live in a Stashpad folder.
     // `adoptNote` can be run on the active note wherever it sits, and a button
     // that opens a Stashpad view onto a folder that isn't one is worse than no
@@ -11170,29 +11308,26 @@ export default class StashpadPlugin extends Plugin {
     const stashpadFolders = new Set(this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, "")));
     const usable = files.filter((f) =>
       f instanceof TFile && stashpadFolders.has(f.parent?.path?.replace(/\/+$/, "") ?? ""));
-    if (usable.length === 0) return [];
+    if (usable.length === 0) return undefined;
     if (usable.length === 1) {
       const file = usable[0];
-      return [{
-        label: "Open note",
-        onClick: () => { void this.revealNoteInStashpad(file); },
-      }];
+      const folder = file.parent?.path?.replace(/\/+$/, "") ?? "";
+      const id = readId(this.app.metadataCache.getFileCache(file)?.frontmatter?.id)
+        ?? parseIdFromFilename(file.basename);
+      return id ? { folder, id, button: "Open note" } : { folder, button: "Open home" };
     }
     const byFolder = new Map<string, number>();
     for (const f of usable) {
       const dir = f.parent?.path?.replace(/\/+$/, "") ?? "";
       if (dir) byFolder.set(dir, (byFolder.get(dir) ?? 0) + 1);
     }
-    if (byFolder.size === 0) return [];
+    if (byFolder.size === 0) return undefined;
     let target = "";
     let best = -1;
     for (const [dir, n] of byFolder) if (n > best) { target = dir; best = n; }
     const spansFolders = byFolder.size > 1;
     const leaf = target.slice(target.lastIndexOf("/") + 1);
-    return [{
-      label: spansFolders ? `Open ${leaf} home` : "Open home",
-      onClick: () => { void this.revealNoteByRef(target, ROOT_ID); },
-    }];
+    return { folder: target, button: spansFolders ? `Open ${leaf} home` : "Open home" };
   }
 
   /** 0.174.0: Stashpad notes (in a discovered folder, with an id) that reference
@@ -11820,7 +11955,10 @@ export default class StashpadPlugin extends Plugin {
           onClick: async () => {
             // 0.525.0: a holder, for the same flow-analysis reason as `out`.
             const why: { outcome: LinkLogOutcome } = { outcome: "not-found" };
-            const retried = await this.handleDeepLink(parsed, { log: false, onFail: (o) => { why.outcome = o; } });
+            // notif-open: ok — a full deep-link retry (saved views, link log),
+            // which can't be a plain `open:` target; forceNewTab keeps it from
+            // reusing and re-navigating a tab, same as the router.
+            const retried = await this.handleDeepLink(parsed, { log: false, forceNewTab: true, onFail: (o) => { why.outcome = o; } });
             this.updateLinkRecord(id, retried
               ? { outcome: "opened", detail: "opened from the clipboard offer" }
               : { outcome: why.outcome, detail: "retried from the clipboard offer" });
@@ -12259,28 +12397,6 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  /** Poll briefly for the folder's Stashpad view to have `id` in its tree, then
-   *  navigate. One-click open for a not-yet-open folder. */
-  private navigateWhenReady(folder: string, id: string, attempts = 15): void {
-    const clean = folder.replace(/\/+$/, "");
-    // 0.484.1: precedence was backwards. It took the FIRST tab on the folder
-    // (leaf order = tab order) and only fell back to the last-active leaf, so
-    // with two tabs on one folder a deep link / index row navigated the leftmost
-    // tab while the user watched the focused one sit still. The last-active leaf
-    // wins when it is on the right folder; the first-match scan and the
-    // any-folder fallback are unchanged behind it.
-    const view = (preferredStashpadLeafOnFolder(this.app, this, clean, { normalize: true })?.view
-      ?? this.lastActiveStashpadLeaf?.view) as any;
-    if (view && typeof view.navigateTo === "function") {
-      const treeReady = !view.tree || typeof view.tree.get !== "function" || !!view.tree.get(id);
-      if (treeReady) { view.navigateTo(id); return; }
-    }
-    if (attempts > 0) {
-      window.setTimeout(() => this.navigateWhenReady(folder, id, attempts - 1), 90);
-    } else if (view && typeof view.navigateTo === "function") {
-      view.navigateTo(id); // last resort — navigate anyway
-    }
-  }
 
   /** Walk vault markdown frontmatter for notes whose author or
    *  contributors list contains this user's authorId. Group results by
@@ -12717,10 +12833,11 @@ export default class StashpadPlugin extends Plugin {
           kind: "warning", category: "reminder", duration: 0, folder: d.folder, affectedIds: [d.id],
           // 0.171.0: whole card opens the task; the corner Snooze control opens
           // the scheduler/assigner modal instead (layered above, stopPropagation).
-          // 0.185.0 → 0.199.0: always a FRESH tab (focused). Reusing an existing
-          // folder tab navigated that tab to the task — which reads as "my tab
-          // got overwritten". forceNewTab skips the reuse path entirely.
-          onBodyClick: () => void this.openDeepLinkTarget(d.folder, d.id, { forceNewTab: true }),
+          // 0.185.0 → 0.199.0: always a FRESH tab. Reusing an existing folder
+          // tab navigated that tab to the task — which reads as "my tab got
+          // overwritten". 0.569.0: that rule now lives in the notification
+          // router, shared by every toast.
+          open: { folder: d.folder, id: d.id, body: true, button: false },
           overlayAction: {
             label: "Snooze", icon: "alarm-clock-check", title: "Snooze / reschedule…",
             onClick: () => void this.openSchedulerForRef(d.folder, d.id),
@@ -14440,7 +14557,20 @@ export default class StashpadPlugin extends Plugin {
         if (StashpadPlugin.UNION_MERGE_KEYS.includes(k)
           && disk[k] && ours[k] && typeof disk[k] === "object" && typeof ours[k] === "object"
           && !Array.isArray(disk[k]) && !Array.isArray(ours[k])) {
-          const merged = { ...(disk[k] as Record<string, unknown>), ...(ours[k] as Record<string, unknown>) };
+          // 0.573.0: composerDrafts merges per draft against the baseline, so a
+          // draft another device deleted (sent / discarded) stays deleted instead
+          // of being written back from our stale copy. See mergeDraftMaps.
+          let merged: Record<string, unknown> | null = null;
+          if (k === "composerDrafts") {
+            try {
+              merged = mergeDraftMaps(
+                JSON.parse(baseline) as Record<string, ComposerDraft>,
+                disk[k] as Record<string, ComposerDraft>,
+                ours[k] as Record<string, ComposerDraft>,
+              ) as unknown as Record<string, unknown>;
+            } catch { merged = null; /* unreadable baseline: fall back to the union */ }
+          }
+          if (!merged) merged = { ...(disk[k] as Record<string, unknown>), ...(ours[k] as Record<string, unknown>) };
           const mergedStr = JSON.stringify(merged);
           if (mergedStr !== oursStr) {
             ours[k] = merged;
@@ -14674,7 +14804,7 @@ export default class StashpadPlugin extends Plugin {
       kind: failed ? "warning" : "success",
       category: "import",
       affectedPaths: fixedFiles.map((f) => f.path),
-      actions: this.adoptionJumpActions(fixedFiles),
+      open: this.adoptionOpenTarget(fixedFiles),
     });
   }
 
@@ -14802,7 +14932,7 @@ export default class StashpadPlugin extends Plugin {
       category: "import",
       folder: file.parent?.path?.replace(/\/+$/, "") ?? undefined,
       affectedPaths: [file.path],
-      actions: this.adoptionJumpActions([file]),
+      open: this.adoptionOpenTarget([file]),
     });
     // Nudge any open Stashpad views to re-pick up the file. The metadataCache
     // change will trigger their tree rebuild on its own; this is just for the
@@ -14904,6 +15034,11 @@ function normalizeComposerDrafts(raw: any, legacy: Record<string, string>): Reco
         ...(kind === "edit" ? { edit: { id: String(v.edit.id), path: String(v.edit.path ?? ""), title: String(v.edit.title ?? ""), openMd: String(v.edit.openMd ?? "") } } : {}),
         replyTo: v.replyTo && typeof v.replyTo === "object" && typeof v.replyTo.path === "string"
           ? { id: String(v.replyTo.id ?? ""), title: String(v.replyTo.title ?? ""), path: v.replyTo.path } : null,
+        // 0.573.3: keep where the draft was composed (0.484.2). It was dropped
+        // here, so "under <note>" and loading back to it were lost on reload.
+        ...(v.origin && typeof v.origin === "object" && typeof v.origin.id === "string"
+          ? { origin: { id: v.origin.id, title: String(v.origin.title ?? "") } }
+          : v.origin === null ? { origin: null } : {}),
       };
     }
   }

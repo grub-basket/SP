@@ -24,6 +24,7 @@ import { readFolderSubtreeNodes, readLockedMeta, type SubtreeNode } from "./encr
 import { serializeNote, splitFrontmatter } from "./stash-package";
 import { ConfirmModal } from "./modals";
 import { notify } from "./notify";
+import { safeFileName } from "./safe-filename";
 import {
   FOLD_MANIFEST, FOLD_SUBFOLDER_PREFIX, ensureFolder, isEncryptedFile, remapLockedRegistry, removeEmptyFolders,
   runUndoSteps, transferReEncryptWatch, uniqueFilePath, type FoldDirMapEntry, type FoldManifest, type UndoStep,
@@ -443,10 +444,8 @@ export async function runUnfoldFlow(plugin: StashpadPlugin, srcRaw?: string, int
               + (res.relocked ? ` ${res.relocked} locked note${res.relocked === 1 ? "" : "s"} re-locked with its key.` : "")
               + (res.problems.length ? ` Notes: ${res.problems.join("; ")}.` : ""),
             kind: res.problems.length ? "warning" : "success", category: "move", folder: src, duration: 0,
-            actions: [
-              { label: "Undo", onClick: () => void res.undo() },
-              { label: "Open", onClick: () => void plugin.activateViewForFolder(src) },
-            ],
+            open: { folder: src, button: "Open" },
+            actions: [{ label: "Undo", onClick: () => void res.undo() }],
           });
           void plugin.activateViewForFolder(src);
         })();
@@ -465,8 +464,7 @@ export async function runUnfoldFlow(plugin: StashpadPlugin, srcRaw?: string, int
  *  characters a path can't hold are dropped; empty → "Split note". */
 function folderNameFromTitle(body: string): string {
   const first = (body.split("\n").find((l) => l.trim()) ?? "").replace(/^#+\s*/, "").replace(/[*_`~[\]]/g, "");
-  const cleanName = first.replace(/[\\/:*?"<>|#^]/g, " ").replace(/\s+/g, " ").replace(/^\.+/, "").trim().slice(0, 80).trim();
-  return cleanName || "Split note";
+  return safeFileName(first, { max: 80, fallback: "Split note", linkSafe: true });
 }
 
 /** Ask for the new folder's name (prefilled from the note's title). */
@@ -497,7 +495,7 @@ class SplitOutModal extends Modal {
     });
     c.createEl("p", { text: "You can undo this.", cls: "setting-item-description" });
     submit = () => {
-      const n = this.name.replace(/[\\/:*?"<>|#^]/g, " ").replace(/\s+/g, " ").replace(/^\.+/, "").trim();
+      const n = safeFileName(this.name, { max: 80, linkSafe: true });
       if (!n) { notify("Give the folder a name."); return; }
       this.close();
       this.onSubmit(n);
@@ -616,10 +614,8 @@ export async function runSplitOutFlow(plugin: StashpadPlugin, fromRaw: string, n
       message: `Split **${name}** out into its own folder — ${res.noteCount} note${res.noteCount === 1 ? "" : "s"} moved.`
         + (res.problems.length ? ` Stayed behind: ${res.problems.join("; ")}.` : ""),
       kind: res.problems.length ? "warning" : "success", category: "move", folder: from, duration: 0,
-      actions: [
-        { label: "Undo", onClick: () => void res.undo() },
-        { label: "Open", onClick: () => void plugin.activateViewForFolder(res.folder) },
-      ],
+      open: { folder: res.folder, button: "Open" },
+      actions: [{ label: "Undo", onClick: () => void res.undo() }],
     });
     await plugin.activateViewForFolder(res.folder);
     if (plugin.settings.folderSetupOnCreate !== false) {

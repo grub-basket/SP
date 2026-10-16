@@ -14,6 +14,9 @@ const ENTRIES = [
   "scripts/tests/excel-paste.test.ts",
   "scripts/tests/deep-link-markdown.test.ts",
   "scripts/tests/showcase-shapes.test.ts",
+  "scripts/tests/safe-filename.test.ts",
+  "scripts/tests/drafts.test.ts",
+  "scripts/tests/draft-match.test.ts",
 ];
 
 let passed = 0;

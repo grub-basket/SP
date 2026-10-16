@@ -16,6 +16,10 @@ import { ComposerAutocomplete } from "./composer-autocomplete";
 import { parseNaturalDate, naturalDatePhrases, type NaturalDate } from "./natural-date";
 import { renderFormattingToolbar, wrapSelection } from "./formatting-toolbar";
 import { visibleDrafts } from "./drafts";
+import {
+  normalizeForMatch, prepareDraft, prepareNote, compareDraftToNote, compareMatches, wordDiff,
+  STRONG_MATCH_KINDS, VERIFIED_MATCH_KINDS, MATCH_KIND_LABEL, type PreparedNote, type DraftMatch,
+} from "./draft-match";
 import { IconSuggest } from "./icon-suggest";
 import { vaultTagEntries } from "./input-suggest";
 import { siftRank } from "./suggest-match";
@@ -3337,9 +3341,35 @@ function draftDupTitle(line: string): string {
   return line.replace(/^[#>\-*+\s]+/, "").replace(/^\[[ xX]?\]\s*/, "").trim();
 }
 
-/** 0.567.0: one folder's scanned note titles. `complete` is false when some
- *  notes couldn't be checked, so "no matches" can't be trusted. */
-interface FolderTitles { titles: { title: string; id: string }[]; complete: boolean }
+/** 0.567.0: one folder's scanned notes. `complete` is false when some notes
+ *  couldn't be checked, so "no matches" can't be trusted. 0.573.2: each note
+ *  carries its body (for the comparison view) and a prepared form for the
+ *  normalized + fuzzy match (draft-match.ts), not just its title. */
+interface ScannedNote {
+  id: string;
+  title: string;
+  /** `title` normalized, for the first-line (Sift) fallback. */
+  titleNorm: string;
+  /** Body without frontmatter, capped at NOTE_BODY_CAP, for the review. */
+  body: string;
+  prepared: PreparedNote;
+}
+interface FolderTitles { titles: ScannedNote[]; complete: boolean }
+/** One draft's matches, strongest first. */
+interface DraftMatchHit { note: ScannedNote; m: DraftMatch }
+
+/** Longest body kept per scanned note. A leftover draft matches near the start
+ *  of its note, so the tail of a very long note adds cost and nothing else. */
+const NOTE_BODY_CAP = 20_000;
+/** Longest body kept per note for the comparison view (it shows the opening
+ *  stretch only). */
+const NOTE_DISPLAY_CAP = 3_000;
+
+/** Frontmatter `created` → epoch ms (ISO string or number), null if unusable. */
+function parseCreatedMs(v: unknown): number | null {
+  const ms = typeof v === "number" ? v : typeof v === "string" ? Date.parse(v) : NaN;
+  return Number.isFinite(ms) ? ms : null;
+}
 
 export class ComposerDraftsModal extends Modal {
   constructor(app: App, private plugin: StashpadPlugin, private folder?: string) { super(app); }
@@ -3380,7 +3410,7 @@ export class ComposerDraftsModal extends Modal {
       await this.waitForIndex();
       // Same enumeration as TreeIndex.rebuild (vault-wide when there's no folder).
       const files = folder ? collectMarkdown(this.app, folder) : this.app.vault.getMarkdownFiles();
-      const titles: { title: string; id: string }[] = [];
+      const titles: ScannedNote[] = [];
       let complete = true;
       const scan = async (f: TFile): Promise<void> => {
         const cachedFm = this.app.metadataCache.getFileCache(f)?.frontmatter as Record<string, unknown> | undefined;
@@ -3393,7 +3423,11 @@ export class ComposerDraftsModal extends Modal {
         if (!id) return; // not a Stashpad note
         const line = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
         const title = (line ? draftDupTitle(line) : "") || f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
-        titles.push({ title, id });
+        const kept = body.trim().slice(0, NOTE_BODY_CAP);
+        const created = parseCreatedMs(cachedFm?.created ?? fm.created);
+        // 0.573.3: only the opening stretch is ever displayed, so keep a short
+        // copy for the review rather than the 20k used for matching.
+        titles.push({ id, title, titleNorm: normalizeForMatch(title), body: kept.slice(0, NOTE_DISPLAY_CAP), prepared: prepareNote(kept, created) });
       };
       for (let i = 0; i < files.length; i += ComposerDraftsModal.TITLE_SCAN_BATCH) {
         if (this.closed) return { titles, complete: false };
@@ -3410,12 +3444,72 @@ export class ComposerDraftsModal extends Modal {
     return p;
   }
 
-  /** Render the duplicate-match badge for one draft: count of existing notes in
-   *  its folder whose title matches the draft's first line; click to open them. */
-  private renderMatchBadge(host: HTMLElement, d: ComposerDraft): void {
+  /** 0.573.2: per-draft match lists, shared by the badge and the "discard
+   *  already-sent" bulk action so each draft is compared once per modal. */
+  private matchCache = new Map<string, Promise<{ hits: DraftMatchHit[]; complete: boolean }>>();
+
+  /** Every note in the draft's folder that matches it, strongest first:
+   *  normalized exact / prefix / contained / timing / extends / fuzzy-similar
+   *  (draft-match.ts), plus the pre-0.573 first-line Sift match as a fallback so
+   *  nothing that used to match stops matching. */
+  private draftMatches(d: ComposerDraft): Promise<{ hits: DraftMatchHit[]; complete: boolean }> {
+    // 0.573.3: keyed by text too, so a draft edited (or synced in) while the
+    // modal is open is compared afresh, not judged by its old text.
+    const cacheKey = `${d.id}\u0000${d.modified}\u0000${d.text}`;
+    const cached = this.matchCache.get(cacheKey);
+    if (cached) return cached;
+    const p = this.folderTitles(d.folder).then(async ({ titles, complete }) => {
+      // One draft per task, so a big folder with many drafts doesn't hold the
+      // main thread for the whole comparison (the modal stays responsive).
+      await new Promise<void>((r) => window.setTimeout(r, 0));
+      const pd = prepareDraft(d.text || "", d.modified);
+      const firstLine = (d.text || "").split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+      const query = normalizeForMatch(draftDupTitle(firstLine));
+      const hits: DraftMatchHit[] = [];
+      for (const note of titles) {
+        let m = compareDraftToNote(pd, note.prepared);
+        if (!m && query.length >= 3 && note.titleNorm && siftMatch(query, note.titleNorm)) m = { kind: "title", score: 0 };
+        if (m) hits.push({ note, m });
+      }
+      hits.sort((a, b) => compareMatches(a.m, b.m));
+      return { hits, complete };
+    });
+    this.matchCache.set(cacheKey, p);
+    return p;
+  }
+
+  /** 0.573.3: discard only if the draft still holds the text that was
+   *  compared. The modal can sit open while another device extends a draft;
+   *  deleting it then would throw away text nobody reviewed. Returns the ids
+   *  actually discarded. */
+  private async discardIfUnchanged(checked: ComposerDraft[]): Promise<{ done: number; changed: number }> {
+    const live = this.plugin.settings.composerDrafts ?? {};
+    const ok = checked.filter((d) => {
+      const cur = live[d.id];
+      return !!cur && cur.text === d.text && cur.modified === d.modified;
+    });
+    if (ok.length) await this.plugin.deleteComposerDrafts(ok.map((d) => d.id));
+    return { done: ok.length, changed: checked.length - ok.length };
+  }
+
+  /** Discard result → one message, then re-render the list. */
+  private reportDiscard(r: { done: number; changed: number }): void {
+    const parts: string[] = [];
+    if (r.done) parts.push(r.done === 1 ? "Draft discarded." : `${r.done} drafts discarded.`);
+    if (r.changed) parts.push(`${r.changed === 1 ? "A draft" : `${r.changed} drafts`} changed since this list was checked and ${r.changed === 1 ? "was" : "were"} kept. Check again.`);
+    if (parts.length) notify(parts.join(" "));
+    this.render();
+  }
+
+  /** Render the duplicate-match badge for one draft. Strong matches ("Already
+   *  sent") and weaker ones ("N similar") look different; click (or Enter)
+   *  opens the comparison review in `review`, the row's panel below the text. */
+  private renderMatchBadge(host: HTMLElement, review: HTMLElement, d: ComposerDraft): void {
     const firstLine = (d.text || "").split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
     const query = draftDupTitle(firstLine);
-    if (query.length < 3) return; // too short to be a meaningful match
+    // Too short to be a meaningful match (same bar as before; also covers a
+    // draft that normalizes to nothing, e.g. only a tag).
+    if (query.length < 3 && normalizeForMatch(d.text).length < 3) return;
     const indexing = this.plugin.vaultIndexing();
     const badge = host.createSpan({
       cls: "stashpad-drafts-dup-badge is-checking",
@@ -3429,30 +3523,125 @@ export class ComposerDraftsModal extends Modal {
         badge.removeAttribute("aria-label");
       });
     }
-    void this.folderTitles(d.folder).then(({ titles, complete }) => {
-      const matches = titles.filter((t) => t.title && siftMatch(query, t.title));
+    void this.draftMatches(d).then(({ hits, complete }) => {
       badge.removeClass("is-checking");
       badge.removeAttribute("aria-label");
       badge.empty();
-      if (!matches.length) {
+      if (!hits.length) {
         badge.addClass("is-none");
         if (complete) { badge.setText("No duplicates"); return; }
         badge.setText("Not fully checked");
         badge.setAttr("aria-label", "Some notes in this folder couldn't be checked (Obsidian was still indexing, or a file couldn't be read), so there may be matches this check missed.");
         return;
       }
-      badge.addClass("is-hit");
-      setIcon(badge.createSpan({ cls: "stashpad-drafts-dup-icon" }), "copy-check");
-      badge.createSpan({ text: ` ${matches.length} match${matches.length === 1 ? "" : "es"}` });
-      badge.setAttr("aria-label", `${matches.length} existing note${matches.length === 1 ? "" : "s"} match this draft — click to open`);
-      badge.onclick = (e): void => {
-        e.preventDefault(); e.stopPropagation();
-        const menu = new Menu();
-        for (const m of matches.slice(0, 15)) {
-          menu.addItem((it) => it.setTitle(m.title.slice(0, 60) || "(untitled)").setIcon("file-text")
-            .onClick(() => { void this.plugin.openDeepLinkTarget(d.folder, m.id, { forceNewTab: true }); }));
+      const strong = STRONG_MATCH_KINDS.has(hits[0].m.kind);
+      const n = hits.length;
+      badge.addClass(strong ? "is-hit" : "is-similar");
+      setIcon(badge.createSpan({ cls: "stashpad-drafts-dup-icon" }), strong ? "copy-check" : "copy");
+      const label = strong
+        ? `${MATCH_KIND_LABEL[hits[0].m.kind]}${n > 1 ? ` · ${n} matches` : ""}`
+        : `${n} similar`;
+      badge.createSpan({ text: ` ${label}` });
+      badge.setAttr("role", "button");
+      badge.tabIndex = 0;
+      badge.setAttr("aria-expanded", "false");
+      badge.setAttr("aria-label", `${label}. Compare this draft with ${n === 1 ? "the matching note" : `the ${n} matching notes`}.`);
+      const toggle = (): void => {
+        const open = review.hasClass("is-open");
+        if (open) { review.removeClass("is-open"); review.empty(); }
+        else { review.addClass("is-open"); this.renderReview(review, d, hits); }
+        badge.setAttr("aria-expanded", open ? "false" : "true");
+      };
+      badge.onclick = (e): void => { e.preventDefault(); e.stopPropagation(); toggle(); };
+      badge.onkeydown = (e): void => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); toggle(); }
+      };
+    });
+  }
+
+  /** Most matches shown in one review; the rest are counted. */
+  private static readonly REVIEW_CAP = 10;
+
+  /** 0.573.2: the comparison review — for each matching note, what kind of
+   *  match it is, a word-by-word comparison with the draft, and actions. */
+  private renderReview(host: HTMLElement, d: ComposerDraft, hits: DraftMatchHit[]): void {
+    host.empty();
+    host.createDiv({
+      cls: "stashpad-drafts-review-legend",
+      text: "Compared with this draft: underlined words are only in the note, struck-out words are only in the draft.",
+    });
+    for (const { note, m } of hits.slice(0, ComposerDraftsModal.REVIEW_CAP)) {
+      const card = host.createDiv({ cls: `stashpad-drafts-match is-${m.kind}` });
+      const head = card.createDiv({ cls: "stashpad-drafts-match-head" });
+      const pct = m.kind === "similar" || m.kind === "timing" ? ` ${Math.round(m.score * 100)}%` : "";
+      head.createSpan({ cls: "stashpad-drafts-match-kind", text: MATCH_KIND_LABEL[m.kind] + pct });
+      const shortTitle = note.title.length > 70 ? note.title.slice(0, 70).replace(/\s+\S*$/, "") + "…" : note.title;
+      head.createSpan({ cls: "stashpad-drafts-match-title", text: shortTitle || "(untitled)" });
+      const created = note.prepared.created;
+      if (created !== null) {
+        const gap = Math.round((created - d.modified) / 1000);
+        const when = Math.abs(gap) <= 120
+          ? (gap >= 0 ? `created ${gap}s after this draft's last edit` : `created ${-gap}s before this draft's last edit`)
+          : `created ${(moment as unknown as (ms: number) => { fromNow: () => string })(created).fromNow()}`;
+        card.createDiv({ cls: "stashpad-drafts-match-when", text: when });
+      }
+      const cmp = card.createDiv({ cls: "stashpad-drafts-diff" });
+      // Compare against the note's opening stretch: a leftover matches near the
+      // start, and a whole long note would bury the comparison.
+      const noteHead = note.body.split(/\s+/).slice(0, Math.max(60, (d.text || "").split(/\s+/).length * 2 + 20)).join(" ");
+      const diff = wordDiff(d.text || "", noteHead);
+      if (diff) {
+        // 0.573.3: <ins>/<del> carry the meaning semantically, and a hidden
+        // prefix says it out loud: screen readers ignore aria-label on a
+        // plain span, so underline/strike alone told them nothing.
+        for (const part of diff) {
+          if (part.type === "same") cmp.createSpan({ cls: "is-same", text: part.text });
+          else {
+            const el = cmp.createEl(part.type === "add" ? "ins" : "del", { cls: `is-${part.type}` });
+            el.createSpan({ cls: "stashpad-sr-only", text: part.type === "add" ? "only in the note: " : "only in the draft: " });
+            el.appendText(part.text);
+          }
+          cmp.appendText(" ");
         }
-        menu.showAtMouseEvent(e as MouseEvent);
+        if (noteHead.length < note.body.length) cmp.createSpan({ cls: "is-more", text: "…" });
+      } else {
+        cmp.createDiv({ text: `Draft: ${(d.text || "").slice(0, 400)}` });
+        cmp.createDiv({ text: `Note: ${note.body.slice(0, 400)}` });
+      }
+      const actions = card.createDiv({ cls: "stashpad-drafts-match-actions" });
+      const open = actions.createEl("button", { text: "Open note" });
+      open.setAttr("aria-label", `Open the note "${note.title.slice(0, 60)}" in a new tab`);
+      open.onclick = () => { void this.plugin.openDeepLinkTarget(d.folder, note.id, { forceNewTab: true }); };
+      const del = actions.createEl("button", { cls: "mod-warning", text: "Discard draft" });
+      del.setAttr("aria-label", "Discard this draft (the note is kept)");
+      del.onclick = () => { void this.discardIfUnchanged([d]).then((r) => this.reportDiscard(r)); };
+    }
+    if (hits.length > ComposerDraftsModal.REVIEW_CAP) {
+      host.createDiv({ cls: "stashpad-drafts-review-more", text: `${hits.length - ComposerDraftsModal.REVIEW_CAP} more matching notes not shown.` });
+    }
+  }
+
+  /** 0.573.2: once every draft is checked, offer to discard the ones whose
+   *  whole text is verifiably in a note (exact / prefix / contained — not the
+   *  "likely" or "similar" kinds), after a confirmation that lists them. */
+  private renderBulkDiscard(host: HTMLElement, drafts: ComposerDraft[]): void {
+    const candidates = drafts.filter((d) => d.kind !== "edit");
+    if (!candidates.length) return;
+    void Promise.all(candidates.map((d) => this.draftMatches(d).then((r) => ({ d, r })))).then((rows) => {
+      if (this.closed || !host.isConnected) return;
+      const sent = rows.filter(({ r }) => r.hits.length && VERIFIED_MATCH_KINDS.has(r.hits[0].m.kind)).map(({ d }) => d);
+      host.empty();
+      if (!sent.length) return;
+      const btn = host.createEl("button", { text: `Discard ${sent.length} already-sent draft${sent.length === 1 ? "" : "s"}…` });
+      btn.onclick = () => {
+        const list = sent.map((d) => `• ${(d.text || "").trim().split(/\r?\n/)[0].slice(0, 80)}`).join("\n");
+        new ConfirmModal(
+          this.app,
+          `Discard ${sent.length} draft${sent.length === 1 ? "" : "s"}?`,
+          `The whole text of each of these drafts is already in a note, so the notes keep it:\n\n${list}`,
+          "Discard",
+          (ok) => { if (ok) void this.discardIfUnchanged(sent).then((r) => this.reportDiscard(r)); },
+        ).open();
       };
     });
   }
@@ -3470,7 +3659,9 @@ export class ComposerDraftsModal extends Modal {
     // chip count can't diverge (was: chip "2", modal ~10 empty `[[]]` entries).
     const all = visibleDrafts(this.plugin.settings.composerDrafts, this.folder);
     if (!all.length) { c.createDiv({ cls: "stashpad-drafts-empty", text: "No drafts." }); return; }
-    c.createDiv({ cls: "stashpad-drafts-help", text: "Load puts a draft in that folder's composer (whatever is there now is kept as its own draft). Discard is immediate." });
+    c.createDiv({ cls: "stashpad-drafts-help", text: "Load puts a draft in that folder's composer (whatever is there now is kept as its own draft). Discard is immediate. Click a match badge to compare a draft with the notes it matches." });
+    // 0.573.2: filled in once every draft's matches are known.
+    this.renderBulkDiscard(c.createDiv({ cls: "stashpad-drafts-bulk" }), all);
     const me = this.plugin.deviceId();
     let lastFolder: string | null = null;
     for (const d of all) {
@@ -3492,9 +3683,11 @@ export class ComposerDraftsModal extends Modal {
       // 0.507.0: per-draft duplicate badge — how many saved notes in this draft's
       // folder already match it (by title). Only for real drafts (an edit draft
       // trivially matches the note it's editing). Click to open the matches.
-      if (d.kind !== "edit") this.renderMatchBadge(meta, d);
       const preview = (d.text.trim() || "(empty)").split(/\r?\n/).slice(0, 3).join(" ⏎ ");
       row.createDiv({ cls: "stashpad-drafts-preview", text: preview.length > 220 ? preview.slice(0, 220) + "…" : preview });
+      // 0.573.2: the comparison review opens here, between the text and the buttons.
+      const review = row.createDiv({ cls: "stashpad-drafts-review" });
+      if (d.kind !== "edit") this.renderMatchBadge(meta, review, d);
       const actions = row.createDiv({ cls: "stashpad-drafts-actions" });
       const load = actions.createEl("button", { cls: "mod-cta", text: d.kind === "edit" ? "Resume editing" : "Load into composer" });
       load.onclick = () => { void this.plugin.loadComposerDraft(d.id).then(() => this.close()); };
@@ -5373,8 +5566,16 @@ export class NotificationHistoryPanel {
     cat.setText(r.category);
     const msg = row.createDiv({ cls: "stashpad-notif-msg" });
     msg.setText(r.message);
-    if (r.actionLabels.length > 0) {
+    const target = r.open;
+    if (r.actionLabels.length > 0 || target) {
       const acts = row.createDiv({ cls: "stashpad-notif-actions-snapshot" });
+      // 0.569.0: a notification that opened something keeps its target as
+      // data, so the log can reopen it — through the same router as the toast
+      // (a fresh tab, never an existing one).
+      if (target) {
+        const btn = acts.createEl("button", { cls: "stashpad-notif-open", text: target.id ? "Open note" : "Open folder" });
+        btn.addEventListener("click", () => { void this.service.openTarget(target); });
+      }
       for (const label of r.actionLabels) {
         const chip = acts.createSpan({ cls: "stashpad-notif-action-chip" });
         chip.setText(label);

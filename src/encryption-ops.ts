@@ -5,6 +5,7 @@ import { encryptWithKey, decryptWithKey, isEncryptedStash } from "./stash-crypto
 import { type StashpadId } from "./types";
 import { readId } from "./id-service";
 import { unzipFiles, zipFiles } from "./zip";
+import { safeFileName } from "./safe-filename";
 
 /** In-vault locked-bundle extension (NOT `.stash` — `.stash` is an export to
  *  import; `.stashenc` is locked-in-place and must never auto-import). */
@@ -278,7 +279,7 @@ function titleFromFile(file: TFile): string {
   return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || file.basename;
 }
 function safeBlobBase(title: string): string {
-  return (title.replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim() || "locked").slice(0, 60);
+  return safeFileName(title, { max: 60, fallback: "locked" });
 }
 
 /** PERMANENTLY delete a subtree's plaintext: the note files AND the attachments

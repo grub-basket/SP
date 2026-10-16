@@ -10,6 +10,7 @@ import {
   buildAppImport, helperToNote, builtInReferenceNotes, looksLikeNotesJson, APP_ROOTS, DEFAULT_APP_IMPORT_OPTIONS,
   type AppImportOptions, type AppImportResult, type AppImportNote, type HelperFile, type HelperNote,
 } from "./stashpad-app-importer";
+import { safeFileName } from "./safe-filename";
 
 export const APP_IMPORT_VIEW_TYPE = "stashpad-app-import";
 
@@ -44,7 +45,7 @@ const NEW_FOLDER = "/new-folder";
  *  wanting the import somewhere other than the vault root is completely normal.
  *  What is not allowed is escaping the vault: `..` segments are dropped, a
  *  leading slash is stripped so the path stays relative, and each segment loses
- *  the characters Obsidian rejects in a file name. So "../../etc/passwd" becomes
+ *  the characters Windows rejects in a file name (see safeFileName). So "../../etc/passwd" becomes
  *  "etc/passwd" - a real folder inside the vault - rather than a path resolving
  *  somewhere the user never chose.
  *
@@ -53,11 +54,7 @@ const NEW_FOLDER = "/new-folder";
 export function sanitizeFolderName(raw: string): string {
   return raw
     .split("/")
-    .map((seg) => seg
-      .replace(/[\\:*?"<>|]/g, " ")
-      .replace(/\s+/g, " ")
-      .replace(/^[.\s]+|[.\s]+$/g, "")
-      .slice(0, 80))
+    .map((seg) => safeFileName(seg, { max: 80 }))
     .filter((seg) => seg.length > 0)
     .slice(0, 8)
     .join("/");

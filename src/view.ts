@@ -91,6 +91,7 @@ import { guessCommandIcon } from "./icon-guess";
 import { nestBlockMessage, rootRedirectName, withReservedRule, type NestBlocked } from "./nest-guard";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import { dedupeDrafts, draftHasContent, draftDedupKey } from "./drafts";
+import { normalizeForMatch, isLeftoverNormalized } from "./draft-match";
 import { fixDuplicatedEmphasisOpeners, straightenCurlyQuotes } from "./markdown-input";
 import { renderFormattingToolbar } from "./formatting-toolbar";
 import { clipboardToMarkdownTable } from "./excel-paste";
@@ -3340,20 +3341,24 @@ export class StashpadView extends ItemView {
    *  composer keeps whatever you've typed — so a nascent draft that briefly
    *  shadows a recent send is simply not saved until it becomes unique. */
   private draftMatchesRecent(folder: string, text: string): boolean {
-    const d = text.trim();
+    // 0.573.1: compare NORMALIZED text (draft-match.ts). Send straightens curly
+    // quotes, and a note may have gained a `- [ ]`, a tag or `~~`, so the raw
+    // comparison missed the phone's leftover drafts of notes it had just sent.
+    const d = normalizeForMatch(text);
     if (!d) return false;
+    // Recent sends match letter by letter, as before: a flush race can leave a
+    // leftover cut mid-word. Older notes (below) must match whole words.
     for (const raw of this.recentSubmittedFor(folder)) {
-      const s = raw.trim();
-      if (!s) continue;
-      if (d === s || s.startsWith(d)) return true;
+      if (isLeftoverNormalized(d, normalizeForMatch(raw), false)) return true;
     }
     // 0.400.0: also discard a draft that duplicates an EXISTING NOTE in this
     // folder — equals it, or is a leading portion of it. Compared against a
     // capped, pre-built cache of recent-note bodies (buildFolderNoteBlurbs) so
-    // the per-keystroke check stays cheap and doesn't read files.
+    // the per-keystroke check stays cheap and doesn't read files. 0.573.1: the
+    // cache holds bodies already normalized.
     if (this.folderNoteBlurbs && this.folderNoteBlurbs.folder === folder) {
       for (const b of this.folderNoteBlurbs.blurbs) {
-        if (d === b || b.startsWith(d)) return true;
+        if (isLeftoverNormalized(d, b)) return true;
       }
     }
     return false;
@@ -3363,8 +3368,9 @@ export class StashpadView extends ItemView {
   /** 0.400.0: how many of a folder's most-recent notes to scan for the draft
    *  duplicate check. Capped so the scan/index stays fast on big folders. */
   private static readonly NOTE_DEDUP_SCAN_CAP = 150;
-  /** 0.400.0: cached, normalized bodies of the folder's most-recent notes, for
-   *  the draft-vs-existing-note dedup. Rebuilt (fire-and-forget) on folder load. */
+  /** 0.400.0: cached bodies of the folder's most-recent notes, for the
+   *  draft-vs-existing-note dedup. Rebuilt (fire-and-forget) on folder load.
+   *  0.573.1: stored as `normalizeForMatch` output. */
   private folderNoteBlurbs: { folder: string; blurbs: string[] } | null = null;
 
   /** 0.400.0: (re)build the capped note-body cache for the current folder, off
@@ -3381,7 +3387,7 @@ export class StashpadView extends ItemView {
       const blurbs: string[] = [];
       for (const f of files) {
         try {
-          const body = this.stripFrontmatter(await this.app.vault.cachedRead(f)).trim();
+          const body = normalizeForMatch(this.stripFrontmatter(await this.app.vault.cachedRead(f)));
           if (body) blurbs.push(body);
         } catch { /* skip unreadable */ }
       }
@@ -5333,6 +5339,13 @@ export class StashpadView extends ItemView {
           const targetId = scrollPolicy.id;
           const align = scrollPolicy.align;
           const listForScroll = this.listEl;
+          // 0.568.0: an explicit target ends bottom-pinning. The latch was left
+          // set by the level we came from, so the list ResizeObserver and the
+          // pin watchdog yanked the view to the bottom as soon as late layout
+          // grew the list — after this scroll had already landed on the note.
+          // Every scroll-to-id caller is navigation (crumbs, Up, Back), none of
+          // which mean "watch the bottom".
+          this.stickToListBottom = false;
           const apply = () => {
             // 0.266.5: don't chase a target the list has no room to show.
             //
@@ -11696,6 +11709,16 @@ export class StashpadView extends ItemView {
       // draft re-appear on reload if writes were still in flight.
       try { await this.saveDraft(""); } catch { /* ignore */ }
       try { await this.recordLastSubmitted(text); } catch { /* ignore */ }
+      // 0.573.1: sweep on send. saveDraft("") only removes the draft bound to
+      // this composer; an older copy of the same text (a flush race, or one
+      // synced in from another device) would survive as a "draft" of a note
+      // that now exists. The just-recorded send makes it match, so prune now.
+      try {
+        if (this.pruneDuplicateDrafts(this.noteFolder)) {
+          await this.plugin.persistSettingsQuiet("draft-sweep-on-send");
+          this.refreshDraftsChip();
+        }
+      } catch { /* ignore */ }
       // 0.193.0: a block where EVERY line is a checkbox is a task LIST — split it
       // into one task per line even when split-on-newlines is off, since a single
       // note full of checkbox text is almost never the intent (setting-gated).
@@ -15339,6 +15362,7 @@ export class StashpadView extends ItemView {
               else delete fm.color;
             });
           } catch (e) {
+            this.plugin.noteWriteFailure("set-color", t.file.path, e);
             notify(`Couldn't set color for ${t.id}: ${(e as Error).message}`);
           }
         }
@@ -15550,6 +15574,7 @@ export class StashpadView extends ItemView {
           payload: { from: p.oldParent, to: p.isRoot ? newParentId : p.oldParent, crossFolder: { from: this.noteFolder, to: targetDir } },
         });
       } catch (e) {
+        this.plugin.noteWriteFailure("move", p.id, e);
         notify(`Move failed for ${p.id}: ${(e as Error).message}`);
       }
     }
@@ -15618,10 +15643,9 @@ export class StashpadView extends ItemView {
       duration: 0,
       affectedIds: sources.map((s) => s.id),
       folder: this.noteFolder,
-      actions: [{
-        label: destLabel,
-        onClick: () => { void this.switchToFolderAndFocus(targetDir, newParentId); },
-      }],
+      // 0.569.0: through the notification router — it used to switch THIS tab
+      // over to the destination folder.
+      open: { folder: targetDir, id: newParentId, button: destLabel },
     });
 
     // Undo: reverse every rename + restore root parent ids. Stored on
@@ -16312,6 +16336,9 @@ export class StashpadView extends ItemView {
             label: "Show imported notes",
             onClick: () => {
               void (async () => {
+                // notif-open: ok — reveals the tab already on this folder (or opens
+                // one) and only highlights the imported rows; it never changes
+                // which folder or note that tab shows.
                 await this.plugin.openFolderInStashpad(folder);
                 const target = importedIds[0];
                 // Prefer THIS view when it is still showing that folder; otherwise
@@ -16701,6 +16728,9 @@ export class StashpadView extends ItemView {
             label: "Show imported notes",
             onClick: () => {
               void (async () => {
+                // notif-open: ok — reveals the tab already on this folder (or opens
+                // one) and only highlights the imported rows; it never changes
+                // which folder or note that tab shows.
                 await this.plugin.openFolderInStashpad(folder);
                 const target = importedIds[0];
                 const v = (this.noteFolder === folder && this.viewRoot?.isConnected)
@@ -17981,6 +18011,18 @@ export class StashpadView extends ItemView {
       // so returning restores to it via scroll-to-id.
       this.stampSelectedCursor(true);
     }
+    // 0.568.0: going UP to an ancestor (Home crumb, a higher crumb, the levels
+    // modal) must land on the note you came down through, like Up/Backspace
+    // does. It used to rely only on the per-level cursor memory, which the
+    // row's ↳ arrow, search and links never update — so the memory was often
+    // the parent's LAST row, or missing, and you landed at the bottom of the
+    // list. `cameDownThrough` is that path below the target, nearest first.
+    const fromId = this.focusId;
+    const fromPath = this.tree.pathTo(fromId);
+    const targetIdx = id === ROOT_ID ? -1 : fromPath.findIndex((n) => n.id === id);
+    const cameDownThrough = (id === ROOT_ID || targetIdx >= 0) && fromId !== id
+      ? fromPath.slice(targetIdx + 1).map((n) => n.id)
+      : [];
     this.focusId = id;
     this.persistFocus();
     this.defaultCursorToLast();
@@ -18025,8 +18067,50 @@ export class StashpadView extends ItemView {
     // no memory for this focus — fine, since defaultCursorToLast pre-set
     // cursor to last child and the user will see something coherent.
     const savedCursorId = this.lastCursorByFocus.get(id);
+    // The deepest note on the way down that this level actually shows: the
+    // direct child in nested mode, the note you were in under flat/everything
+    // views. Hidden by a filter → fall through to the old behaviour. Skipped
+    // when the caller already named the note to land on (search / reveal in
+    // context set pendingCursorId, applied later in render) — otherwise we'd
+    // scroll to the path note while the cursor lands on theirs.
+    let cameFromId: StashpadId | null = null;
+    // Search / reveal-in-context name their note up front; render applies the
+    // cursor, but nothing scrolled to it, so the list kept the level's old
+    // scroll (often the bottom). Scroll to it when this level shows it.
+    const namedTarget = this.pendingCursorId;
+    let namedVisible = false;
+    if (namedTarget || cameDownThrough.length > 0) {
+      const visible = new Set(this.filterChildren(this.collectViewItems(id)).map((n) => n.id));
+      if (namedTarget) namedVisible = visible.has(namedTarget);
+      else for (let i = cameDownThrough.length - 1; i >= 0; i--) {
+        if (visible.has(cameDownThrough[i])) { cameFromId = cameDownThrough[i]; break; }
+      }
+    }
+    this.plugin.trace("nav:to", {
+      to: id, from: fromId, via: cameFromId, named: namedTarget ?? null, namedVisible,
+      saved: savedCursorId ?? null,
+      savedInTree: savedCursorId ? !!this.tree.get(savedCursorId) : null,
+      heading: landedOnHeading,
+    });
     let navPolicy: ScrollPolicy;
-    if (landedOnHeading) {
+    if (namedTarget && namedVisible) {
+      // render's pendingCursorId block sets cursor + selection; just make sure
+      // nothing else (saved cursor, heading) competes, and scroll there.
+      this.cursorOnHeading = false;
+      this.pendingFocusIds = null;
+      this.firstSelectedId = namedTarget;
+      navPolicy = { kind: "scroll-to-id", id: namedTarget, align: "start" };
+    } else if (cameFromId) {
+      // Overrides landedOnHeading: going up, the target is the note you left
+      // through, not the heading (matches navigateUp).
+      this.cursorOnHeading = false;
+      this.selection.clear();
+      this.selection.add(cameFromId);
+      this.firstSelectedId = cameFromId;
+      this.lastSelected = cameFromId;
+      this.pendingFocusIds = [cameFromId];
+      navPolicy = { kind: "scroll-to-id", id: cameFromId, align: "start" };
+    } else if (landedOnHeading) {
       // 0.279.26: we deliberately put the cursor on the heading above — do NOT
       // let the saved-cursor restore (pendingFocusIds) move it back onto a child,
       // or the first hotkey targets that child again (the "X does nothing the
@@ -18688,6 +18772,7 @@ export class StashpadView extends ItemView {
   private installFmSyncActivityNotice(): void {
     if (this.fmSyncUnsubscribe) return; // already installed
     this.fmSyncUnsubscribe = this.fmSync.onError((path, error) => {
+      this.plugin.noteWriteFailure("frontmatter-sync", path, error);
       this.plugin.notifications.show({
         message: `Stashpad: couldn't update recovery metadata\nFile: \`${path}\`\nError: ${error.message}`,
         kind: "error",
@@ -20665,11 +20750,10 @@ export class StashpadView extends ItemView {
       affectedIds: sourceIds,
       affectedAuthorIds: movedAuthorIds,
       folder,
-      actions: targetParentId === ROOT_ID ? [] : [{
-        // 0.72.1: short verb label; the destination title is in the message.
-        label: "Jump to parent",
-        onClick: () => this.navigateTo(targetParentId),
-      }],
+      // 0.72.1: short verb label; the destination title is in the message.
+      // 0.569.0: through the notification router — it used to navigate THIS
+      // tab in place, even if you'd since moved on to other work in it.
+      open: targetParentId === ROOT_ID ? undefined : { folder, id: targetParentId, button: "Jump to parent" },
     });
 
     // 0.191.0: open the destination parent in a BACKGROUND tab so the moved note's
@@ -21610,7 +21694,18 @@ export class StashpadView extends ItemView {
     // one save cost a full render HERE plus a second slug rename, a second
     // evict and a second repaint from the modify handler.
     this.markBodySelfWrite(originalPath, true);
-    await this.app.vault.modify(file, newContent);
+    // 0.568.0: a failed modify used to vanish — no catch here, and callers
+    // `void` the save, so the rejection (from Obsidian's own fs code, no
+    // plugin frame) was dropped by the error filter. The edit window just sat
+    // there. Record it, say so, and rethrow so callers keep the editor open.
+    try {
+      await this.app.vault.modify(file, newContent);
+    } catch (e) {
+      this.recentBodySelfWrites.delete(originalPath); // nothing was written; don't mask a real external edit
+      this.plugin.noteWriteFailure("save-body", originalPath, e);
+      notify(`Stashpad: couldn't save the note (${(e as Error)?.message ?? String(e)}). Your text is still in the editor.`);
+      throw e;
+    }
     // 0.291.0 (perf): evict here (not in onFileModify) so the repaint below
     // reads fresh content whichever order the modify event lands in.
     this.bodyRenderer.evict(file);
@@ -22273,10 +22368,8 @@ export class StashpadView extends ItemView {
               duration: 0,
               folder,
               affectedIds: [id],
-              actions: [{
-                label: "Jump to note",
-                onClick: () => { void this.switchToFolderAndFocus(folder, id); },
-              }],
+              // 0.569.0: router, not a folder switch of this tab.
+              open: { folder, id, button: "Jump to note" },
             });
           }
           // Layer template frontmatter (color, tags, custom keys). Auto
@@ -22350,6 +22443,7 @@ export class StashpadView extends ItemView {
       }
       return id;
     } catch (e) {
+      this.plugin.noteWriteFailure("create", opts.targetFolder ?? this.noteFolder, e);
       notify(`Stashpad: failed to create note (${(e as Error).message})`);
       return null;
     }
@@ -25173,11 +25267,9 @@ export class StashpadView extends ItemView {
         affectedIds: [node.id],
         affectedAuthorIds: movedAuthorIds,
         folder: this.noteFolder,
-        actions: newParent === ROOT_ID ? [] : [{
-          // 0.72.1: short verb label; the destination title is in the message.
-          label: "Jump to parent",
-          onClick: () => this.navigateTo(newParent),
-        }],
+        // 0.72.1: short verb label; the destination title is in the message.
+        // 0.569.0: router, not an in-place navigate of this tab.
+        open: newParent === ROOT_ID ? undefined : { folder: this.noteFolder, id: newParent, button: "Jump to parent" },
       });
     }
     if (opts.record !== false) {
@@ -25287,10 +25379,8 @@ export class StashpadView extends ItemView {
       affectedIds: targets.map((t) => t.id),
       affectedAuthorIds: this.authorship.collectAuthorIds(targets),
       folder: this.noteFolder,
-      actions: newParent === ROOT_ID ? [] : [{
-        label: "Jump to destination",
-        onClick: () => this.navigateTo(newParent),
-      }],
+      // 0.569.0: router, not an in-place navigate of this tab.
+      open: newParent === ROOT_ID ? undefined : { folder: this.noteFolder, id: newParent, button: "Jump to destination" },
     });
   }
 }

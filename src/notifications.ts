@@ -1,5 +1,5 @@
 import { Notice, Platform, TFile, setIcon, type App } from "obsidian";
-import type { StashpadId } from "./types";
+import { ROOT_ID, type StashpadId } from "./types";
 
 /** Visual severity. Drives the toast's color + the history panel's
  *  icon. "success" reads green, "warning" reads orange, "error" reads
@@ -110,10 +110,41 @@ export interface NotificationAction {
   keepOpen?: boolean;
 }
 
+/** 0.569.0: where a notification takes the user — a Stashpad folder, and
+ *  optionally a note in it. Plain data (no closure), so it survives into the
+ *  persisted history and the history panel can offer the same jump later. */
+export interface NotificationTarget {
+  folder: string;
+  /** Omit (or ROOT_ID) to open the folder at its home note. */
+  id?: StashpadId;
+}
+
+/** 0.569.0: `NotifyOptions.open` — the ONE way a notification opens a note or
+ *  folder. The service wires the click itself and sends it through the
+ *  plugin's notification router (`setOpenRouter`), which never changes what an
+ *  existing tab shows: a fresh tab each time, unless a tab already shows
+ *  exactly that note (then it's just brought forward). Never hand-roll an `onClick` / `onBodyClick` that calls
+ *  revealNoteByRef / openFolderInStashpad / activateViewForFolder / … — those
+ *  reuse or navigate tabs the user already has, which reads as "the toast
+ *  overwrote my tab". `scripts/check-notification-open.mjs` fails the build
+ *  on that. */
+export interface NotificationOpen extends NotificationTarget {
+  /** Label of the open button. Default "Open note" (with an id) or "Open
+   *  folder". `false` = no button (whole-card click only). */
+  button?: string | false;
+  /** Also make the whole card clickable. Off by default: a plain success toast
+   *  people click just to dismiss shouldn't spawn a tab. Turn it on for toasts
+   *  that exist to be opened (teammate activity, due reminders). */
+  body?: boolean;
+}
+
 export interface NotifyOptions {
   /** The headline string shown on the toast. Multi-line OK; the first
    *  line carries the bulk of the visual weight. */
   message: string;
+  /** 0.569.0: where clicking this notification goes — see NotificationOpen.
+   *  Use this instead of a hand-written open handler. */
+  open?: NotificationOpen;
   kind?: NotificationKind;
   category?: NotificationCategory;
   /** 0 = persistent (user has to dismiss). Otherwise, ms. Defaults
@@ -183,6 +214,9 @@ export interface NotificationRecord extends Required<Pick<NotifyOptions, "messag
    *  the click handlers — they'd close over view state that may be
    *  stale by the time the user opens history). */
   actionLabels: string[];
+  /** 0.569.0: the toast's open target, kept as data so the history row can
+   *  reopen it (through the same router). Absent on older records. */
+  open?: NotificationTarget;
 }
 
 const DEFAULT_DURATION: Record<NotificationKind, number> = {
@@ -221,7 +255,23 @@ export class NotificationService {
    *  here" without every call site having to remember to pass it. */
   private defaultAuthorId: string | null = null;
 
+  /** 0.569.0: the plugin's notification click router (set on load). Every
+   *  `open` target — toast button, card click, OS notification, history row —
+   *  goes through it, so the "never overwrite a tab" rule lives in one place. */
+  private openRouter: ((target: NotificationTarget) => Promise<void>) | null = null;
+
   constructor(private app: App) {}
+
+  setOpenRouter(router: ((target: NotificationTarget) => Promise<void>) | null): void {
+    this.openRouter = router;
+  }
+
+  /** Open a notification target through the router. Public so the history
+   *  panel can reopen a past notification the same way the toast did. */
+  async openTarget(target: NotificationTarget): Promise<void> {
+    if (!this.openRouter || !target.folder) return;
+    await this.openRouter({ folder: target.folder, id: target.id });
+  }
 
   setDefaultAuthorId(id: string | null): void {
     this.defaultAuthorId = id || null;
@@ -231,7 +281,8 @@ export class NotificationService {
    *  a handle (e.g. to hide it programmatically). When the category is
    *  muted, the history is still recorded but no toast renders — so
    *  the user can review what would've shown in the history panel. */
-  show(opts: NotifyOptions): Notice | null {
+  show(rawOpts: NotifyOptions): Notice | null {
+    const opts = this.applyOpen(rawOpts);
     const kind = opts.kind ?? "info";
     const category = opts.category ?? "system";
     const record: NotificationRecord = {
@@ -248,7 +299,12 @@ export class NotificationService {
       affectedPaths: opts.affectedPaths ? opts.affectedPaths.slice() : [],
       affectedAuthorIds: opts.affectedAuthorIds ? opts.affectedAuthorIds.slice() : [],
       folder: opts.folder,
-      actionLabels: (opts.actions ?? []).map((a) => a.label),
+      // The open button is left out: the history row gets its own live Open
+      // button from `open`, so listing it as a dead chip too would be noise.
+      actionLabels: (rawOpts.actions ?? []).map((a) => a.label),
+      open: rawOpts.open?.folder
+        ? { folder: rawOpts.open.folder, id: rawOpts.open.id && rawOpts.open.id !== ROOT_ID ? rawOpts.open.id : undefined }
+        : undefined,
     };
     this.pushHistory(record);
 
@@ -276,7 +332,7 @@ export class NotificationService {
         noticeEl.classList.add("stashpad-notice-clickable");
         noticeEl.setAttribute("tabindex", "0");
         noticeEl.setAttribute("role", "button");
-        noticeEl.setAttribute("aria-label", `${opts.message} — activate to open; use the button to snooze`);
+        noticeEl.setAttribute("aria-label", `${opts.message} — activate to open${opts.overlayAction ? `; use the button to ${opts.overlayAction.label.toLowerCase()}` : ""}`);
         const activate = (): void => {
           void Promise.resolve().then(() => onBodyClick())
             .catch((err) => console.warn("[Stashpad] notification body click failed", err));
@@ -303,6 +359,24 @@ export class NotificationService {
     if (opts.desktop) this.maybeDesktop(opts);
 
     return notice;
+  }
+
+  /** 0.569.0: expand `open` into the click wiring it stands for. The open
+   *  button goes FIRST among the actions (it's the toast's main verb), which
+   *  also makes it what a desktop OS notification runs when there's no card
+   *  click. A caller's own onBodyClick wins over `open.body`. */
+  private applyOpen(opts: NotifyOptions): NotifyOptions {
+    const open = opts.open;
+    if (!open?.folder) return opts;
+    const target: NotificationTarget = { folder: open.folder, id: open.id };
+    const go = (): Promise<void> => this.openTarget(target);
+    const out: NotifyOptions = { ...opts };
+    if (open.button !== false) {
+      const label = open.button ?? (open.id && open.id !== ROOT_ID ? "Open note" : "Open folder");
+      out.actions = [{ label, onClick: go }, ...(opts.actions ?? [])];
+    }
+    if (open.body && !opts.onBodyClick) out.onBodyClick = go;
+    return out;
   }
 
   /** OS-level notification (background reach). Fires only with granted

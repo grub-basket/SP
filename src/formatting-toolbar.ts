@@ -284,6 +284,15 @@ export function renderFormattingToolbar(
   opts: FormattingToolbarOpts = {},
 ): HTMLElement {
   const bar = host.createDiv({ cls: "stashpad-composer-toolbar" });
+  // 0.572.1: on mobile, swiping along this horizontally scrolling rail opened
+  // a sidebar. Obsidian's drawer-swipe handler only yields to a scroller that
+  // can still move in the swipe direction, so once the rail hit an end (or the
+  // first move didn't scroll it), the swipe went to the drawer. Obsidian's own
+  // opt-out is `data-ignore-swipe` on an ancestor of the touch target (it sets
+  // it on canvas, graph controls and leaf resize handles); the handler returns
+  // before tracking the touch at all. Applies to every toolbar this builds
+  // (composer, edit modal, quick capture).
+  bar.setAttr("data-ignore-swipe", "true");
   const app = opts.app;
   // 0.346.0: deactivated snippets (enabled === false) render no button and are
   // absent from the Snippets menu.

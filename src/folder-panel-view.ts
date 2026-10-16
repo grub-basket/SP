@@ -1,5 +1,6 @@
 import { App, ItemView, Menu, Modal, Platform, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
 import { notify } from "./notify";
+import { safeFileName } from "./safe-filename";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type StashpadId } from "./types";
 import { ShowRenderGate, renderCountBadge } from "./panels-view";
@@ -1265,7 +1266,7 @@ export class StashpadFolderPanelView extends ItemView {
     if (!(tf instanceof TFolder)) { notify("Couldn't find that folder."); return; }
     const current = tf.name;
     new RenameFolderModal(this.app, current, async (next) => {
-      const safe = next.trim().replace(/[\\/:]+/g, "").trim();
+      const safe = safeFileName(next);
       if (!safe || safe === current) return;
       const parent = tf.parent?.path && tf.parent.path !== "/" ? `${tf.parent.path}/` : "";
       const target = `${parent}${safe}`;

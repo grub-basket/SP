@@ -10,6 +10,7 @@ import { myReactionId, openReactionPicker, readReactions, toggleReaction, type R
 import { returnToOriginOnClose } from "./leaf-return";
 import { settleNewTab } from "./view-helpers";
 import { notify } from "./notify";
+import { safeFileName } from "./safe-filename";
 import { ShowcaseExportModal, buildShowcaseHtml, type ExportComment, type ExportSection } from "./showcase-export";
 import { appendShapeEl, formatFeedbackShape, paintShapeThumb, parseFeedbackShape, shapeAnchor, shapeFromDrag, type FeedbackShape, type ShapeKind } from "./showcase-shapes";
 
@@ -2649,9 +2650,7 @@ export class StashpadShowcaseView extends ItemView {
       const sub = (this.plugin.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
       const folder = `${host.noteFolder}/${sub}`;
       await host.ensureFolder(folder);
-      // Emoji-safe cut (by code point), no leading dots (hidden file).
-      const cleaned = title.replace(/[\\/:*?"<>|#^[\]]+/g, " ").replace(/\s+/g, " ").trim().replace(/^\.+/, "");
-      const safe = Array.from(cleaned).slice(0, 80).join("").trim() || "Showcase";
+      const safe = safeFileName(title, { max: 80, fallback: "Showcase", linkSafe: true });
       const stamp = mo(new Date().toISOString()).format("YYYYMMDD-HHmmss");
       const base = `${folder}/${safe} - page${includeFeedback ? " + feedback" : ""} - ${stamp}`;
       let path = `${base}.html`;

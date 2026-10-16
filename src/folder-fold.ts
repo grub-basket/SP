@@ -689,10 +689,8 @@ export async function runFoldFlow(plugin: StashpadPlugin, srcRaw: string | null,
           + (m.relocked ? ` ${m.relocked} locked note${m.relocked === 1 ? "" : "s"} re-locked with this folder's key.` : "")
           + (m.leftBehind.lockedSubtrees ? ` ${m.leftBehind.lockedSubtrees} locked note${m.leftBehind.lockedSubtrees === 1 ? "" : "s"} stayed in the archived folder${m.relockProblems?.length ? ` (${m.relockProblems.join("; ")})` : ""}.` : ""),
         kind: "success", category: "move", folder: dest, duration: 0,
-        actions: [
-          { label: "Undo", onClick: () => void res.undo() },
-          { label: "Open", onClick: () => void plugin.openDeepLinkTarget(dest, m.containerId, {}) },
-        ],
+        open: { folder: dest, id: m.containerId, button: "Open" },
+        actions: [{ label: "Undo", onClick: () => void res.undo() }],
       });
       void plugin.openDeepLinkTarget(dest, m.containerId, {});
     })()).open();
