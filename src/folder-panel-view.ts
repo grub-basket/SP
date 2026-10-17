@@ -1365,7 +1365,7 @@ class RenameFolderModal extends Modal {
     const submit = () => { this.delivered = true; const v = input.value; this.close(); this.onSubmit(v); };
     go.onclick = submit;
     this.scope.register([], "Enter", (e) => { e.preventDefault(); if (input.value.trim()) submit(); });
-    requestAnimationFrame(() => { input.focus(); input.select(); });
+    window.requestAnimationFrame(() => { input.focus(); input.select(); });
   }
   onClose(): void { this.contentEl.empty(); }
 }

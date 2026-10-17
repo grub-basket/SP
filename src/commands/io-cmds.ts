@@ -14,7 +14,7 @@ import type StashpadPlugin from "../main";
 
 /** Sanitize a user-supplied export base name to a safe filename stem. */
 function safeBaseName(name: string): string {
-  return name.replace(/[^\w.\-]+/g, "_").replace(/^\.+/, "").slice(0, 60) || "stash-export";
+  return name.replace(/[^\w.-]+/g, "_").replace(/^\.+/, "").slice(0, 60) || "stash-export";
 }
 
 export async function cmdExportStash(view: StashpadView, rootNode?: TreeNode): Promise<void> {

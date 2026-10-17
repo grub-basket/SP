@@ -553,7 +553,7 @@ export function buildJdPreviewNotice(
   app: App,
   result: { indexed: IndexEntry[]; nonIndex: TFile[]; skippedStashpadNotes: TFile[]; previewPath: string | null },
 ): Notice {
-  const frag = document.createDocumentFragment();
+  const frag = activeDocument.createDocumentFragment();
   // Heading-style title row.
   const title = frag.createEl("div", { text: "Home note updated" });
   title.setCssStyles({ fontWeight: "600", marginBottom: "6px" });

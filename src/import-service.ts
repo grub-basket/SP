@@ -746,7 +746,7 @@ export class ImportService {
    *  regardless of the auto-import toggle. Uses an <input type=file> so it
    *  works on desktop AND mobile (native file/photo picker). */
   pickFilesInto(folder: string): void {
-    const input = document.createElement("input");
+    const input = activeDocument.createElement("input");
     input.type = "file";
     input.multiple = true;
     input.setCssStyles({ display: "none" });
@@ -1134,7 +1134,7 @@ export class ImportService {
    *  appearing, and without it the watcher and this method would both try to
    *  import the same bundle. */
   private async stageBundle(root: string, name: string, bytes: Uint8Array): Promise<TFile | null> {
-    const safe = name.replace(/[^\w.\-]+/g, "_").replace(/\.stash$/i, "");
+    const safe = name.replace(/[^\w.-]+/g, "_").replace(/\.stash$/i, "");
     let path = root ? `${root}/${safe}.stash` : `${safe}.stash`;
     for (let i = 2; this.app.vault.getAbstractFileByPath(path); i++) {
       path = root ? `${root}/${safe}-${i}.stash` : `${safe}-${i}.stash`;

@@ -68,7 +68,7 @@ export async function fetchLinkMeta(url: string): Promise<FetchResult> {
         throw: false,
       }),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`timed out after ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS)),
+        window.setTimeout(() => reject(new Error(`timed out after ${TIMEOUT_MS / 1000}s`)), TIMEOUT_MS)),
     ]);
   } catch (e) {
     return { ok: false, reason: (e as Error).message || "request failed" };

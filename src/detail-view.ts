@@ -406,7 +406,7 @@ export class StashpadDetailView extends ItemView {
     this.composerDraftForId = sel.id;
     if (this.composerInputEl) this.composerInputEl.value = "";
     await this.render();
-    setTimeout(() => this.composerInputEl?.focus(), 0);
+    window.setTimeout(() => this.composerInputEl?.focus(), 0);
   }
 
   /** Sub-section that lists the note's direct children with an

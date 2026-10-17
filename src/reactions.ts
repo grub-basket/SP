@@ -390,7 +390,7 @@ function buildReactionPickerBody(
   const done = footer.createEl("button", { cls: "stashpad-reaction-done mod-cta", text: "Done" });
   done.onmousedown = (e) => e.preventDefault();
   done.onclick = (e) => { e.preventDefault(); e.stopPropagation(); close(); };
-  if (autofocus) setTimeout(() => input.focus(), 0);
+  if (autofocus) window.setTimeout(() => input.focus(), 0);
 }
 
 /** Reaction picker. Desktop: a small popover anchored to the trigger. Mobile: a
@@ -461,6 +461,6 @@ function installDismiss(pop: HTMLElement, anchor: HTMLElement, cls: string): () 
     doc.removeEventListener("keydown", onKey, true);
   }
   void cls;
-  setTimeout(() => { doc.addEventListener("mousedown", onDoc, true); doc.addEventListener("keydown", onKey, true); }, 0);
+  window.setTimeout(() => { doc.addEventListener("mousedown", onDoc, true); doc.addEventListener("keydown", onKey, true); }, 0);
   return dismiss;
 }

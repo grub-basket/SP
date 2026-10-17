@@ -134,7 +134,7 @@ export class QuickCaptureModal extends Modal {
       this.renderChips();
     });
 
-    setTimeout(() => ta.focus(), 0);
+    window.setTimeout(() => ta.focus(), 0);
   }
 
   private renderChips(): void {

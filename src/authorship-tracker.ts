@@ -40,7 +40,7 @@ export class AuthorshipTracker {
    *  hammering processFrontMatter on every keystroke. The flush also
    *  no-ops if the body matches what we already saw, so the
    *  contribution write itself doesn't recurse. */
-  private contribTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private contribTimers = new Map<string, number>();
   /** 0.72.4: timestamps of writes we INITIATED (processFrontMatter
    *  calls inside maybeRecordContribution). A vault.modify event that
    *  fires within EXTERNAL_WRITE_GRACE_MS of one of these is "ours" —
@@ -99,7 +99,7 @@ export class AuthorshipTracker {
    *  maps so they don't outlive the view (knownBodies in particular holds
    *  full body strings). They rebuild lazily on the next modify event. */
   dispose(): void {
-    for (const t of this.contribTimers.values()) clearTimeout(t);
+    for (const t of this.contribTimers.values()) window.clearTimeout(t);
     this.contribTimers.clear();
     this.knownBodies.clear();
     this.recentSelfWrites.clear();
@@ -121,7 +121,7 @@ export class AuthorshipTracker {
     // 0.77.11: strip characters that would break out of the wikilink alias
     // (`|` starts a new alias segment, `[`/`]` close/extend the link). A
     // name like `a|b]]x` would otherwise corrupt the author frontmatter.
-    const aliasSafe = name.replace(/[\[\]|]/g, "").trim() || safe;
+    const aliasSafe = name.replace(/[[\]|]/g, "").trim() || safe;
     const link = `[[${path}|${aliasSafe}]]`;
     return { link, path, name, id };
   }
@@ -134,7 +134,7 @@ export class AuthorshipTracker {
     const name = bot.name.trim() || bot.id;
     const safe = name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "bot";
     const path = `${this.host.noteFolder}/_authors/${safe}-${bot.id}.md`;
-    const aliasSafe = name.replace(/[\[\]|]/g, "").trim() || safe;   // 0.77.11 escaping
+    const aliasSafe = name.replace(/[[\]|]/g, "").trim() || safe;   // 0.77.11 escaping
     return { link: `[[${path}|${aliasSafe}]]`, path, name, id: bot.id };
   }
 
@@ -257,7 +257,7 @@ export class AuthorshipTracker {
         try { await this.host.app.fileManager.processFrontMatter(f, (m) => mutate(m, paths[i])); }
         catch (e) { console.warn("[Stashpad] claim: frontmatter write failed", paths[i], e); }
       }
-      if ((i + 1) % BATCH === 0) await new Promise((r) => setTimeout(r, DELAY));
+      if ((i + 1) % BATCH === 0) await new Promise((r) => window.setTimeout(r, DELAY));
     }
   }
 
@@ -492,11 +492,11 @@ export class AuthorshipTracker {
    *  while their cursor is in the doc. */
   private scheduleContribution(file: TFile): void {
     const existing = this.contribTimers.get(file.path);
-    if (existing) clearTimeout(existing);
+    if (existing) window.clearTimeout(existing);
     const isActivelyEdited = this.isFileActivelyEdited(file);
     const delay = AuthorshipTracker.CONTRIB_DEBOUNCE_MS
       + (isActivelyEdited ? AuthorshipTracker.CONTRIB_ACTIVE_EDITOR_BONUS_MS : 0);
-    const t = setTimeout(() => {
+    const t = window.setTimeout(() => {
       this.contribTimers.delete(file.path);
       // Double-check at flush time: if the file is STILL being edited
       // (cursor in the editor, last keystroke very recent), defer

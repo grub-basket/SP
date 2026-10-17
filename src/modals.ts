@@ -371,19 +371,19 @@ export class LogPanel {
   }
 
   private renderEvent(ev: LogEv): HTMLElement {
-    const row = document.createElement("div");
+    const row = activeDocument.createElement("div");
     row.className = `stashpad-log-row stashpad-log-${ev.type}`;
 
     const when = (moment as any)(ev.ts).isValid()
       ? (moment as any)(ev.ts).format("YYYY-MM-DD HH:mm:ss")
       : ev.ts;
 
-    const ts = document.createElement("span");
+    const ts = activeDocument.createElement("span");
     ts.className = "stashpad-log-ts";
     ts.textContent = when;
     row.appendChild(ts);
 
-    const type = document.createElement("span");
+    const type = activeDocument.createElement("span");
     type.className = "stashpad-log-type";
     type.textContent = ev.type;
     row.appendChild(type);
@@ -394,13 +394,13 @@ export class LogPanel {
     // performed the action regardless of who originally created the
     // note. Older log lines without this field render as "—" so the
     // column stays aligned.
-    const author = document.createElement("span");
+    const author = activeDocument.createElement("span");
     author.className = "stashpad-log-author";
     author.textContent = ev.author ? ev.author : "—";
     if (!ev.author) author.classList.add("is-empty");
     row.appendChild(author);
 
-    const msg = document.createElement("span");
+    const msg = activeDocument.createElement("span");
     msg.className = "stashpad-log-msg";
     msg.textContent = this.describe(ev);
     row.appendChild(msg);
@@ -957,7 +957,7 @@ export class NoteWorkbench {
     // Width changes rewrap every line, so the heights must be remeasured.
     const ro = new ResizeObserver(() => { paint(); syncScroll(); });
     ro.observe(ta);
-    requestAnimationFrame(paint);
+    window.requestAnimationFrame(paint);
 
     this.lineNumberCleanups.push(() => {
       ta.removeEventListener("input", onInput);
@@ -1611,7 +1611,7 @@ export class NoteWorkbench {
     toggle.onclick = (e) => { e.preventDefault(); e.stopPropagation(); expanded = !expanded; applyState(); sync(); };
     applyState();
     this.clampSyncs.push(sync);
-    requestAnimationFrame(sync);
+    window.requestAnimationFrame(sync);
   }
 
   /** 0.169.1: a copy-to-clipboard icon button. `onmousedown`/`stopPropagation` keep
@@ -1681,7 +1681,7 @@ export class NoteWorkbench {
         renderDiff();
         // 0.302.0: panes just became visible / the diff changed — re-measure so the
         // clamp toggles reflect the real overflow (a hidden pane measures as 0).
-        requestAnimationFrame(() => this.clampSyncs.forEach((s) => s()));
+        window.requestAnimationFrame(() => this.clampSyncs.forEach((s) => s()));
       }
     };
 
@@ -1704,7 +1704,7 @@ export class NoteWorkbench {
     // panels are correctly hidden on a fresh/unedited cursor render — the rAF-only
     // path didn't reliably stick. fit() still runs in the rAF (needs layout).
     syncEdited();
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       fit();
       ta.focus();
       // Edit surface: cursor at END (you're continuing the note). Split cursor
@@ -1789,7 +1789,7 @@ export class NoteWorkbench {
 
     syncEdited();
     showTab("edit");
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       ta.focus();
       const pos = this.surface === "edit" ? ta.value.length : Math.floor(ta.value.length / 2);
       ta.setSelectionRange(pos, pos);
@@ -2434,7 +2434,7 @@ export class ExportStashModal extends Modal {
     });
 
     // Focus + select-all so the prefilled name is ready to type over.
-    requestAnimationFrame(() => { input.focus(); input.select(); });
+    window.requestAnimationFrame(() => { input.focus(); input.select(); });
   }
   private commit(choice: ExportChoice): void {
     const base = choice.baseName.trim() || this.defaultBaseName;
@@ -2495,7 +2495,7 @@ export class StashPasswordModal extends Modal {
     go.onclick = () => this.submit(input.value);
 
     this.scope.register([], "Enter", (e) => { e.preventDefault(); this.submit(input.value); });
-    requestAnimationFrame(() => input.focus());
+    window.requestAnimationFrame(() => input.focus());
   }
   private submit(pw: string): void {
     if (!pw) return; // empty password can't be right; keep the modal open
@@ -2720,7 +2720,7 @@ export class EncryptionPasswordModal extends Modal {
     };
     go.onclick = () => void submit();
     this.scope.register([], "Enter", (e) => { e.preventDefault(); void submit(); });
-    requestAnimationFrame(() => (currentEl ?? nextEl)?.focus());
+    window.requestAnimationFrame(() => (currentEl ?? nextEl)?.focus());
   }
   onClose(): void {
     this.contentEl.empty();
@@ -2788,7 +2788,7 @@ export class TypeToConfirmModal extends Modal {
     };
     go.onclick = () => void run();
     this.scope.register([], "Enter", (e) => { e.preventDefault(); void run(); });
-    requestAnimationFrame(() => (pwInput ?? input).focus());
+    window.requestAnimationFrame(() => (pwInput ?? input).focus());
   }
   onClose(): void { this.contentEl.empty(); }
 }
@@ -2906,7 +2906,7 @@ export class OpenDeepLinkModal extends Modal {
     go.onclick = () => run();
     this.scope.register([], "Enter", (e) => { e.preventDefault(); run(); });
 
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       input.focus();
       // Prefill from the clipboard when it already holds a Stashpad link — the
       // whole point is pasting, so save the paste. Selected so the user can
@@ -2984,7 +2984,7 @@ export class CustomColorModal extends Modal {
     this.scope.register([], "Enter", (e) => { e.preventDefault(); this.commit({ addToPalette: false }); });
     this.scope.register(["Mod"], "Enter", (e) => { e.preventDefault(); this.commit({ addToPalette: true }); });
 
-    requestAnimationFrame(() => hex.focus());
+    window.requestAnimationFrame(() => hex.focus());
   }
   private commit(opts: { addToPalette: boolean }): void {
     this.delivered = true;
@@ -3135,7 +3135,7 @@ export class ColorPickerModal extends Modal {
 
     // After paint, focus the modal so arrow keys land here, not in the
     // background view.
-    requestAnimationFrame(() => (this.modalEl).focus());
+    window.requestAnimationFrame(() => (this.modalEl).focus());
   }
 
   /** Click or Enter on a tile. Preset/saved/none → apply immediately + close.
@@ -3865,7 +3865,7 @@ export class HistoryModal extends Modal {
   }
 
   private stripFm(md: string): string {
-    return md.replace(/^﻿?---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").replace(/^\s+/, "");
+    return md.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").replace(/^\s+/, "");
   }
 
   private authors(): string[] {
@@ -4322,7 +4322,7 @@ export class ConfirmModal extends Modal {
     ok.onclick = () => { this.didChoose = true; this.close(); this.onChoose(true); };
     // Focus the confirm button so Enter accepts — but for destructive confirms
     // focus Cancel instead, so a stray Enter cancels rather than fires. (0.140.6)
-    requestAnimationFrame(() => (this.dangerous ? cancel : ok).focus());
+    window.requestAnimationFrame(() => (this.dangerous ? cancel : ok).focus());
   }
   onClose(): void {
     this.contentEl.empty();
@@ -5078,7 +5078,7 @@ export class DueDatePickerModal extends Modal {
     };
     // 0.544.0: desktop starts in the typed-date box (type + Enter is the fastest
     // path). Mobile keeps the date field, so the keyboard doesn't cover the modal.
-    requestAnimationFrame(() => (Platform.isMobile ? dateInput : nlInput).focus());
+    window.requestAnimationFrame(() => (Platform.isMobile ? dateInput : nlInput).focus());
   }
 
   /** 0.544.0: "Fri, Oct 9, 2026 · 3:00 PM" for the typed-date preview. */
@@ -5283,7 +5283,7 @@ export class DueDatePickerModal extends Modal {
       left: `${Math.max(8, Math.min(rect.left, win.innerWidth - 220))}px`,
       top: `${rect.bottom + 4}px`,
     });
-    setTimeout(() => {
+    window.setTimeout(() => {
       doc.addEventListener("mousedown", outside, true);
       doc.addEventListener("keydown", onKey, true);
       // 0.122.10: re-assert focus on the hour field after the modal's own
@@ -6327,7 +6327,7 @@ export class DuplicateIdsModal extends Modal {
     // because the rows have to exist before there is anything to scroll.
     if (this.listScrollTop) {
       const target = this.listScrollTop;
-      requestAnimationFrame(() => { list.scrollTop = target; });
+      window.requestAnimationFrame(() => { list.scrollTop = target; });
     }
   }
 

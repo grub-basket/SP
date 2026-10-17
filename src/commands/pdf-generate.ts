@@ -43,7 +43,7 @@ async function withHiddenWindow<T>(html: string, js: boolean, fn: (win: any) => 
     await d.fs.promises.writeFile(tmp, html);
     win = new d.BrowserWindow({ show: false, webPreferences: { offscreen: false, sandbox: true, javascript: js } });
     await win.loadFile(tmp);
-    await new Promise((r) => setTimeout(r, 150)); // let layout settle (images are inline data URIs)
+    await new Promise((r) => window.setTimeout(r, 150)); // let layout settle (images are inline data URIs)
     return await fn(win);
   } catch (e) {
     console.warn("[Stashpad] export: hidden-window render failed", e);
@@ -83,7 +83,7 @@ export async function htmlToPng(_view: StashpadView, html: string): Promise<Uint
     );
     const height = Math.max(200, Math.min(Number(raw) || 800, PNG_MAX_HEIGHT));
     win.setContentSize(PNG_WIDTH, height);
-    await new Promise((r) => setTimeout(r, 120)); // reflow after resize
+    await new Promise((r) => window.setTimeout(r, 120)); // reflow after resize
     const img = await win.webContents.capturePage();
     const buf: Buffer = img.toPNG();
     return new Uint8Array(buf);

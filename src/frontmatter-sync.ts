@@ -576,7 +576,7 @@ export async function rebootstrapFolderFrontmatter(
       // one burst. 50ms is half the in-view queue's pacing — the
       // rebootstrap button is an explicit action, slightly more
       // urgent than the background queue.
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
     } catch (e) {
       console.warn("[Stashpad] rebootstrap fm sync failed", entry.file.path, e);
     }

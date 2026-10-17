@@ -601,7 +601,7 @@ export class EncryptionService {
     this.skipRegistryOnce = false;
     const epoch = this.indexEpoch;
     const found = new Map<string, StashKey>();
-    const SKIP = new Set([".git", ".obsidian", "node_modules"]);
+    const SKIP = new Set([".git", this.app.vault.configDir, "node_modules"]);
     let frontier: string[] = [""];
     while (frontier.length) {
       const next: string[] = [];
