@@ -62,7 +62,7 @@ export async function enrichFile(
         : { v: PREVIEW_SCHEMA_VERSION, url, fetchedAt: new Date().toISOString(), ok: false,
             httpStatus: res.httpStatus, reason: res.reason };
       await cache.write(entry);
-      if (opts.delayMs) await new Promise((r) => setTimeout(r, opts.delayMs));
+      if (opts.delayMs) await new Promise((r) => window.setTimeout(r, opts.delayMs));
     }
 
     // Failures get a block too, deliberately. The user is expected to correct

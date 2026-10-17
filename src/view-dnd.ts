@@ -131,7 +131,7 @@ export class ViewDnD {
   private scheduleOver(pending: PendingOver): void {
     this.pendingOver = pending;
     if (this.overRaf) return;
-    this.overRaf = requestAnimationFrame(() => {
+    this.overRaf = window.requestAnimationFrame(() => {
       this.overRaf = 0;
       const p = this.pendingOver;
       this.pendingOver = null;
@@ -366,8 +366,7 @@ export class ViewDnD {
     if (!wasMounted) {
       this.dragPlaceholder.setCssStyles({ height: "0px" });
       // Force layout, then animate to full height.
-       
-      this.dragPlaceholder.offsetHeight;
+      this.dragPlaceholder.getBoundingClientRect();
       this.dragPlaceholder.setCssStyles({ height: `${this.dragRowHeight}px` });
     } else {
       this.dragPlaceholder.setCssStyles({ height: `${this.dragRowHeight}px` });
@@ -380,7 +379,7 @@ export class ViewDnD {
     // Animate collapse, then remove. Keep a reference so a fast next-drag isn't
     // confused (we null out below regardless).
     ph.setCssStyles({ height: "0px", opacity: "0" });
-    setTimeout(() => { if (ph.parentElement) ph.remove(); }, 150);
+    window.setTimeout(() => { if (ph.parentElement) ph.remove(); }, 150);
   }
 
   /** 0.496.0: the three-zone bands for the row the cursor is currently over,

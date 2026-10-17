@@ -266,7 +266,7 @@ function toggleIndexWhenBuilder(
 ): void {
   const existing = filterRow.parentElement?.querySelector(".stashpad-index-when");
   if (existing) { existing.remove(); return; }
-  const panel = document.createElement("div");
+  const panel = activeDocument.createElement("div");
   panel.className = "stashpad-index-when stashpad-when-builder";
   const tabs = panel.createDiv({ cls: "stashpad-when-tabs" });
   const modes: Array<{ id: typeof indexWhenMode; label: string }> = [
@@ -274,9 +274,9 @@ function toggleIndexWhenBuilder(
     { id: "after", label: "After" }, { id: "between", label: "Between" },
   ];
   const body = panel.createDiv({ cls: "stashpad-when-body" });
-  const startInput = document.createElement("input");
+  const startInput = activeDocument.createElement("input");
   startInput.type = "date"; startInput.className = "stashpad-when-input";
-  const endInput = document.createElement("input");
+  const endInput = activeDocument.createElement("input");
   endInput.type = "date"; endInput.className = "stashpad-when-input";
   const rebuildBody = (): void => {
     body.empty();

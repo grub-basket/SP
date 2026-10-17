@@ -533,7 +533,7 @@ export class MediaViewerModal extends Modal {
 
     // Edges first (behind nodes), as one SVG in canvas coordinate space.
     const NS = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(NS, "svg");
+    const svg = activeDocument.createElementNS(NS, "svg");
     svg.classList.add("stashpad-canvas-edges");
     svg.setAttribute("width", `${contentW}`);
     svg.setAttribute("height", `${contentH}`);
@@ -553,7 +553,7 @@ export class MediaViewerModal extends Modal {
       const a = byId.get(e.fromNode), b = byId.get(e.toNode);
       if (!a || !b || typeof a.x !== "number" || typeof b.x !== "number") continue;
       const p1 = sidePoint(a, e.fromSide), p2 = sidePoint(b, e.toSide);
-      const line = document.createElementNS(NS, "line");
+      const line = activeDocument.createElementNS(NS, "line");
       line.setAttribute("x1", `${p1.x + ox}`); line.setAttribute("y1", `${p1.y + oy}`);
       line.setAttribute("x2", `${p2.x + ox}`); line.setAttribute("y2", `${p2.y + oy}`);
       line.classList.add("stashpad-canvas-edge");
@@ -672,7 +672,7 @@ export class MediaViewerModal extends Modal {
     try {
       const data = await this.app.vault.readBinary(file);
       const url = URL.createObjectURL(new Blob([data]));
-      const a = document.createElement("a");
+      const a = activeDocument.createElement("a");
       a.href = url;
       a.download = file.name;
       a.click();
@@ -849,7 +849,7 @@ export class MediaViewerModal extends Modal {
     const ext = file.extension.toLowerCase();
     if (VIEWER_IMG_EXT.has(ext) && this.mediaEl instanceof HTMLImageElement && this.mediaEl.naturalWidth) {
       try {
-        const canvas = document.createElement("canvas");
+        const canvas = activeDocument.createElement("canvas");
         canvas.width = this.mediaEl.naturalWidth;
         canvas.height = this.mediaEl.naturalHeight;
         const ctx = canvas.getContext("2d");
@@ -1557,7 +1557,7 @@ export class MediaViewerModal extends Modal {
       const ply = (c.y - this.ty) / scale;
       const ow = Math.max(1, Math.round(c.w / scale));
       const oh = Math.max(1, Math.round(c.h / scale));
-      const canvas = document.createElement("canvas");
+      const canvas = activeDocument.createElement("canvas");
       canvas.width = ow;
       canvas.height = oh;
       const ctx = canvas.getContext("2d");

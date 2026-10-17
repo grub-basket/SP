@@ -329,14 +329,14 @@ export class ComposerAutocomplete {
     const before = value.slice(0, caret);
 
     // Wikilink: [[ followed by query (no closing ]] before the caret, no newline).
-    const linkMatch = before.match(/\[\[([^\]\[\n]*)$/);
+    const linkMatch = before.match(/\[\[([^\][\n]*)$/);
     if (linkMatch) {
       const query = linkMatch[1];
       // 0.199.2: when the caret sits INSIDE an existing link ("[[fo|o]]", or
       // right before an auto-paired "]]"), extend the replacement over the
       // remainder + its closing brackets. Without this, accepting a suggestion
       // left the old tail behind: "[[Fixed]]o]]" — the four-brackets bug.
-      const rest = value.slice(caret).match(/^([^\]\[\n]*)\]\]/);
+      const rest = value.slice(caret).match(/^([^\][\n]*)\]\]/);
       const replaceEnd = rest ? caret + rest[1].length + 2 : caret;
       // 0.199.2: `[[@` hands over to the date trigger so a date can be
       // inserted AS a link — the query after `@` resolves via NLD, and every
@@ -378,7 +378,7 @@ export class ComposerAutocomplete {
     // list no longer TAKES OVER — a following space/Enter on a bare `#` (or on a
     // brand-new tag with no match) is let through, so `# ` still starts a Markdown
     // heading (see onKeyDown). The `(^|\s)` guard keeps `C#`/`issue#5` mid-word out.
-    const tagMatch = before.match(/(^|\s)#([A-Za-z0-9_/\-]*)$/);
+    const tagMatch = before.match(/(^|\s)#([A-Za-z0-9_/-]*)$/);
     if (tagMatch) {
       const query = tagMatch[2];
       return {
@@ -806,7 +806,7 @@ export class ComposerAutocomplete {
   private onBlur = (): void => {
     // Defer slightly so a click on a popup item still registers before
     // the popup is removed by blur.
-    setTimeout(() => this.close(), 120);
+    window.setTimeout(() => this.close(), 120);
   };
 
   private onDocEscape = (e: KeyboardEvent): void => {

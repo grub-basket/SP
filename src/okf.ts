@@ -98,7 +98,7 @@ export async function rebuildOkfForFolder(app: App, folder: string): Promise<{ c
         if (m.okfTitle === undefined) { m.okfTitle = okfTitleFromFile(e.file); changed = true; }
         if (m.okfTimestamp === undefined) { const ts = e.modified || e.created; if (ts) { m.okfTimestamp = ts; changed = true; } }
       });
-      if (changed) { written += 1; await new Promise((r) => setTimeout(r, 50)); }
+      if (changed) { written += 1; await new Promise((r) => window.setTimeout(r, 50)); }
     } catch (err) { console.warn("[Stashpad] OKF rebuild failed", e.file.path, err); }
   }
   // Regenerate the folder's index.md (OKF requires a per-dir index).
