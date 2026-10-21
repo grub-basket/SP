@@ -17,7 +17,7 @@ import type StashpadPlugin from "./main";
 import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
-import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS, ZAP_ACTIONS, ZAP_ADDABLE, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, type NoteActionDef } from "./note-actions";
+import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, defaultContextOrder, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS, ZAP_ACTIONS, ZAP_ADDABLE, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, type NoteActionDef } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
 import { guessCommandIcon } from "./icon-guess";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal, parseTimeOfDay, formatTimeChip } from "./modals";
@@ -411,6 +411,10 @@ export interface StashpadSettings {
    *  the (unrenamed) "Move" submenu for existing users. The general seed top-up
    *  only APPENDS missing defaults, so without this the item would land last. */
   contextMoveInListFirstV1: boolean;
+  /** 0.575.2: one-time flag — "Attribute to AI…" moved into the Advanced submenu;
+   *  drop its old top-level entry from a saved custom contextMenuOrder so it
+   *  doesn't show twice. */
+  contextAttributeBotAdvancedV1: boolean;
   /** 0.367.0: ids HIDDEN from the ⋮ / right-click menu. Baked-in defaults can't be
    *  truly deleted — the seed re-adds a removed submenu or item next launch — so
    *  instead you HIDE them: they stay in the config but the menu skips rendering
@@ -1382,6 +1386,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   contextMenusSeededV1: false,
   contextMenuOrderRefreshedV2: false,
   contextMoveInListFirstV1: false,
+  contextAttributeBotAdvancedV1: false,
   contextMenuHidden: [],
   zapMenuOrder: [],
   zapSubmenus: {},
@@ -3434,7 +3439,7 @@ export class StashpadSettingTab extends PluginSettingTab {
     const box = host.createDiv({ cls: "stashpad-action-builder" });
     const registry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const get = (): string[] => this.plugin.settings.contextMenuOrder ?? [];
-    const effective = (): string[] => { const c = get(); return c.length ? c : [...CONTEXT_DEFAULT_ORDER]; };
+    const effective = (): string[] => { const c = get(); return c.length ? c : defaultContextOrder(this.plugin.settings); };
     const save = async (ids: string[]) => { this.plugin.settings.contextMenuOrder = ids; await this.plugin.saveSettings(); rebuild(); };
     const rebuild = () => { box.empty(); build(); };
     const extras = new Map(CONTEXT_EXTRA_ACTIONS.map((a) => [a.id, a]));
@@ -3547,7 +3552,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         d.setValue(currentParent());
         d.onChange(async (np) => {
           const order = this.plugin.settings.contextMenuOrder ?? [];
-          const base = order.length ? [...order] : [...CONTEXT_DEFAULT_ORDER];
+          const base = order.length ? [...order] : defaultContextOrder(this.plugin.settings);
           const subs: Record<string, { name: string; icon: string; items: string[] }> = {};
           for (const [k, s] of Object.entries(subsNow())) subs[k] = { ...s, items: s.items.filter((x) => x !== meId) };
           let newOrder = base.filter((x) => x !== meId);
@@ -5979,7 +5984,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
   /** A setting-description fragment with `backtick` → <code>, for setDesc(). */
   private codeDesc(text: string): DocumentFragment {
-    const f = activeDocument.createDocumentFragment();
+    const f = createFragment(); // main-window fragment: setDesc rejects a pop-out's (0.575.1)
     this.appendCode(f, text);
     return f;
   }

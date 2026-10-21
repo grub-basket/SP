@@ -43,7 +43,10 @@ export function renderInlineMarkup(host: HTMLElement, message: string): void {
  *  service. `new Notice(string)` renders verbatim, so a message carrying the
  *  **bold** markers used everywhere else would show literal asterisks. */
 export function boldFragment(message: string): DocumentFragment {
-  const frag = activeDocument.createDocumentFragment();
+  // 0.575.1: createFragment(), NOT activeDocument — Notice/setDesc check
+  // `instanceof DocumentFragment` against the MAIN window's constructor, so a
+  // fragment made in a focused pop-out's document showed "[object DocumentFragment]".
+  const frag = createFragment();
   const span = activeDocument.createElement("span");
   renderInlineMarkup(span, message);
   frag.appendChild(span);
@@ -489,7 +492,7 @@ export class NotificationService {
   }
 
   private buildContent(opts: NotifyOptions, kind: NotificationKind): DocumentFragment {
-    const frag = activeDocument.createDocumentFragment();
+    const frag = createFragment(); // 0.575.1: main-window fragment for Notice (see boldFragment)
     const wrap = activeDocument.createElement("div");
     wrap.className = `stashpad-notice stashpad-notice-${kind}`;
     const msg = activeDocument.createElement("div");

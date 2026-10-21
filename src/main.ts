@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type Events, type TAbstractFile } from "obsidian";
+import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type CachedMetadata, type Events, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId, hasFmValue, newId, readId, sameId } from "./id-service";
 import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
@@ -7087,17 +7087,82 @@ export default class StashpadPlugin extends Plugin {
       const id: unknown = readId(fm?.id);
       if (seen.has(id)) continue;
       seen.add(id);
-      if (fm?.pinned === true) pinned.add(id);
+      if (this.sidebarPinnedFm(f)) pinned.add(id);
     }
     return pinned;
+  }
+
+  /** 0.575.2: sidebar-pin override per file path. The metadata cache lags a
+   *  frontmatter write — on a phone by seconds — so reading `pinned` straight
+   *  from it right after a pin/unpin returned the OLD state: the ⋮ menu reopened
+   *  still said "Pin to sidebar" (user: "doesn't update from pin to unpin on
+   *  mobile"), and a quick Unpin after a Pin hit unpinNote's idempotency guard
+   *  and silently did nothing. Same idea as the view's listPinnedState for list
+   *  pins.
+   *  0.575.3 (blind review): the override is dropped only when a metadata-cache
+   *  CHANGE EVENT for that file carries the overridden value — not merely when
+   *  a read "agrees". After a quick Pin → Unpin the not-yet-updated cache
+   *  already reads "unpinned", so clearing on agreement let the pin's late
+   *  write flip the label back to "Unpin" for a moment (reproduced: ~1.5s with
+   *  slow writes). Change events arrive in write order, so the pin's event
+   *  (pinned) leaves the Unpin override alone and the unpin's event clears it.
+   *  A 30s cap still stops a write that never lands from pinning it forever.
+   *  0.575.4 (second review): `pending` counts this path's writes still in
+   *  flight, and an event may clear the override only once none are. With
+   *  Pin → Unpin → Pin, the FIRST write's event already says "pinned" and
+   *  matched the latest override, so it was dropped and the Unpin write's
+   *  event then showed "unpinned" until the last write landed. Any metadata
+   *  job that runs after the last write reads the final file, so waiting for
+   *  pending === 0 means the event we accept reflects the latest intent. A
+   *  failed write just stops counting; if it was the last one in flight the
+   *  override goes too (the file's real state wins). */
+  private sidebarPinOverride = new Map<string, { pinned: boolean; at: number; pending: number }>();
+  private sidebarPinListener = false;
+  /** 0.575.4: bumped on every override set/clear, so the view's per-render
+   *  pinned-set memo can tell it's stale whatever surface did the pin. */
+  sidebarPinGeneration = 0;
+  private dropSidebarPinOverride(path: string): void {
+    if (this.sidebarPinOverride.delete(path)) this.sidebarPinGeneration++;
+  }
+  private async writeSidebarPin(file: TFile, pinned: boolean, mutate: (fm: any) => void): Promise<void> {
+    const prev = this.sidebarPinOverride.get(file.path);
+    this.sidebarPinOverride.set(file.path, { pinned, at: Date.now(), pending: (prev?.pending ?? 0) + 1 });
+    this.sidebarPinGeneration++;
+    if (!this.sidebarPinListener) {
+      this.sidebarPinListener = true;
+      this.registerEvent(this.app.metadataCache.on("changed", (f: TFile, _data: string, cache: CachedMetadata) => {
+        const ov = this.sidebarPinOverride.get(f.path);
+        if (ov && ov.pending === 0 && (cache?.frontmatter?.pinned === true) === ov.pinned) this.dropSidebarPinOverride(f.path);
+      }));
+    }
+    let failed = false;
+    try {
+      await this.app.fileManager.processFrontMatter(file, mutate);
+    } catch (e) {
+      failed = true;
+      throw e;
+    } finally {
+      const ov = this.sidebarPinOverride.get(file.path);
+      if (ov) {
+        ov.pending = Math.max(0, ov.pending - 1);
+        if (ov.pending === 0 && failed) this.dropSidebarPinOverride(file.path);
+      }
+    }
+  }
+  private sidebarPinnedFm(file: TFile): boolean {
+    const cached = this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned === true;
+    const ov = this.sidebarPinOverride.get(file.path);
+    if (!ov) return cached;
+    if (Date.now() - ov.at > 30_000) { this.dropSidebarPinOverride(file.path); return cached; }
+    return ov.pinned;
   }
 
   /** Pin a note. Idempotent — writes `pinned: true` + `pinnedAt` to its FM. */
   async pinNote(pin: PinnedNoteRef): Promise<void> {
     const file = this.fileForPin(pin.folder, pin.id);
     if (!file) return;
-    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned === true) return;
-    await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+    if (this.sidebarPinnedFm(file)) return;
+    await this.writeSidebarPin(file, true, (fm: any) => {
       fm.pinned = true;
       fm.pinnedAt = Date.now();
     });
@@ -7108,8 +7173,8 @@ export default class StashpadPlugin extends Plugin {
   async unpinNote(pin: PinnedNoteRef): Promise<void> {
     const file = this.fileForPin(pin.folder, pin.id);
     if (!file) return;
-    if (this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned !== true) return;
-    await this.app.fileManager.processFrontMatter(file, (fm: any) => {
+    if (!this.sidebarPinnedFm(file)) return;
+    await this.writeSidebarPin(file, false, (fm: any) => {
       delete fm.pinned;
       delete fm.pinnedAt;
     });
@@ -7119,7 +7184,7 @@ export default class StashpadPlugin extends Plugin {
   isPinned(pin: PinnedNoteRef): boolean {
     const file = this.fileForPin(pin.folder, pin.id);
     if (!file) return false;
-    return this.app.metadataCache.getFileCache(file)?.frontmatter?.pinned === true;
+    return this.sidebarPinnedFm(file);
   }
 
   /** 0.461.0: set (or clear, with "") a pin's nickname — a short label shown in
@@ -7150,8 +7215,10 @@ export default class StashpadPlugin extends Plugin {
       // 0.527.0: readId, so a pinned note with an unquoted all-digit id is
       // listed (it used to be skipped as "no id") under its text form.
       const pinId = readId(fm?.id);
-      if (!fm || fm.pinned !== true || !pinId) continue;
-      const at = typeof fm.pinnedAt === "number" ? fm.pinnedAt : 0;
+      // 0.575.2: through the pin override, so a pin/unpin shows in the panel on
+      // the refresh right after the write rather than once the cache catches up.
+      if (!fm || !pinId || !this.sidebarPinnedFm(f)) continue;
+      const at = typeof fm.pinnedAt === "number" ? fm.pinnedAt : (this.sidebarPinOverride.get(f.path)?.at ?? 0);
       out.push({ folder: dir, id: pinId, pinnedAt: at, file: f });
     }
     out.sort((a, b) => a.pinnedAt - b.pinnedAt || a.file.path.localeCompare(b.file.path));
@@ -12348,7 +12415,8 @@ export default class StashpadPlugin extends Plugin {
     if (!opts?.silent || changed) {
       // Multi-line summary tally, lingering a few seconds so it's readable.
       const remaining = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE).length;
-      const frag = activeDocument.createDocumentFragment() as unknown as { createEl: (t: string, o?: { text?: string }) => HTMLElement };
+      // main-window fragment: Notice rejects one from a focused pop-out (0.575.1)
+      const frag = createFragment() as unknown as { createEl: (t: string, o?: { text?: string }) => HTMLElement };
       frag.createEl("div", { text: changed ? "Stashpad tabs cleaned up:" : "Stashpad tabs - nothing to clean up:" });
       frag.createEl("div", { text: `\u2022  ${closed} duplicate tab${closed === 1 ? "" : "s"} closed` });
       frag.createEl("div", { text: `\u2022  ${pruned} orphaned tab${pruned === 1 ? "" : "s"} pruned (note no longer exists)` });
@@ -13914,6 +13982,7 @@ export default class StashpadPlugin extends Plugin {
       contextMenusSeededV1: data?.contextMenusSeededV1 === true,
       contextMenuOrderRefreshedV2: data?.contextMenuOrderRefreshedV2 === true,
       contextMoveInListFirstV1: data?.contextMoveInListFirstV1 === true,
+      contextAttributeBotAdvancedV1: data?.contextAttributeBotAdvancedV1 === true,
       contextMenuHidden: Array.isArray(data?.contextMenuHidden)
         ? data.contextMenuHidden.filter((x: unknown): x is string => typeof x === "string")
         : [],
@@ -14033,6 +14102,22 @@ export default class StashpadPlugin extends Plugin {
         this.settings.contextSubmenus = subs;
       }
       this.settings.contextMoveInListFirstV1 = true;
+      await this.saveSettings();
+    }
+    // 0.575.2 (user): "Attribute to AI…" lives in the Advanced submenu now. The
+    // top-up above already appended it to an unrenamed Advanced; here, once, drop
+    // its old top-level entry from a saved custom order — but only when Advanced
+    // really holds it, so the item never disappears from the menu altogether.
+    // 0.575.3 (blind review): "really holds it" also means Advanced is REACHABLE
+    // from this order — listed in it and not hidden — or the item would vanish.
+    if (!this.settings.contextAttributeBotAdvancedV1) {
+      const adv = this.settings.contextSubmenus?.advanced;
+      const order = this.settings.contextMenuOrder ?? [];
+      const advReachable = order.includes("submenu:advanced") && !(this.settings.contextMenuHidden ?? []).includes("submenu:advanced");
+      if (adv?.items.includes("attributeBot") && advReachable && order.includes("attributeBot")) {
+        this.settings.contextMenuOrder = order.filter((id) => id !== "attributeBot");
+      }
+      this.settings.contextAttributeBotAdvancedV1 = true;
       await this.saveSettings();
     }
     // 0.366.1: refresh a STALE contextMenuOrder. A snapshot saved before the

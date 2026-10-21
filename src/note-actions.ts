@@ -96,7 +96,8 @@ export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
   // a common action the user didn't want to scroll for). Default order only;
   // existing users keep their saved contextMenuOrder.
   "submenu:move",
-  "submenu:reactreply", "recurrenceSkip", "attributeBot",
+  // 0.575.2: "attributeBot" moved into the Advanced submenu (user request).
+  "submenu:reactreply", "recurrenceSkip",
   // 0.357.0: clone + fork relocated INTO the "Copy ▸" submenu (view.ts, the
   // `copy` case of renderCtxLeaf) — they no longer sit at the top level in the
   // default order. Their catalog leaves survive, so a user who had reordered
@@ -107,6 +108,23 @@ export const CONTEXT_DEFAULT_ORDER: readonly string[] = [
   "submenu:pin", "submenu:appearance",
   "taskSubmenu", "sep", "submenu:advanced", "delete", "moreCommands",
 ];
+/** 0.575.3: the default ⋮ order as this install can actually show it.
+ *  "Attribute to AI…" moved from the top level into the Advanced submenu
+ *  (0.575.2), but a user can rename/repurpose Advanced (the launch top-up then
+ *  skips it) or hide it — in either case the item would be in no reachable
+ *  place, so it keeps its old top-level spot after "recurrenceSkip". Used by
+ *  the ⋮ menu and the settings menu editor so both show the same list. */
+export function defaultContextOrder(s: {
+  contextSubmenus?: Record<string, { items: string[] }>;
+  contextMenuHidden?: string[];
+}): string[] {
+  const adv = s.contextSubmenus?.advanced;
+  const reachable = !!adv?.items.includes("attributeBot") && !(s.contextMenuHidden ?? []).includes("submenu:advanced");
+  const order = [...CONTEXT_DEFAULT_ORDER];
+  if (!reachable) order.splice(order.indexOf("recurrenceSkip") + 1, 0, "attributeBot");
+  return order;
+}
+
 /** Stateful/compound context-menu items that live only in the ⋮ menu (not the
  *  star menu or item buttons). Given labels/icons here so the builder can list
  *  them under "Add action…". */
@@ -217,7 +235,8 @@ export const DEFAULT_CONTEXT_SUBMENUS: Record<string, { name: string; icon: stri
   // 0.562.0: splitOut joins Move; the launch top-up appends it for seeded users.
   move:      { name: "Move",          icon: "move",        items: ["moveInList", "move", "moveHome", "outdent", "splitOut"] },
   pin:       { name: "Pin",           icon: "pin",         items: ["pinSidebar", "pinListTop", "pinListBottom"] },
-  advanced:  { name: "Advanced",      icon: "settings-2",  items: ["openObsidian", "history", "split"] },
+  // 0.575.2: attributeBot joins Advanced; the launch top-up appends it for seeded users.
+  advanced:  { name: "Advanced",      icon: "settings-2",  items: ["openObsidian", "history", "split", "attributeBot"] },
   reactreply:{ name: "React / Reply", icon: "smile-plus",  items: ["react", "reply", "replyLink"] },
   appearance:{ name: "Appearance & privacy", icon: "palette", items: ["setColor", "obscure", "encrypt"] },
 };

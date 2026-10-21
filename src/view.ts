@@ -86,7 +86,7 @@ import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
 import { openShowcaseAtComment, openShowcaseView, renderFeedbackTargetChip, showcaseLanding, spotCommentsHook } from "./showcase-view";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_DEFAULT_ORDER, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS } from "./note-actions";
+import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, defaultContextOrder } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
 import { nestBlockMessage, rootRedirectName, withReservedRule, type NestBlocked } from "./nest-guard";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
@@ -24412,7 +24412,7 @@ export class StashpadView extends ItemView {
         return { icon: custom || guessCommandIcon(nm, getSettings().slugStopWords), label: nm };
       }
       const def = noteAction(id);
-      return def ? { icon: this.actionIcon(id), label: def.label } : null;
+      return def ? (this.statefulActionMeta(id, node, { bulk: true }) ?? { icon: this.actionIcon(id), label: def.label }) : null;
     };
     const resolved = ids.map((id) => ({ id, meta: resolve(id) })).filter((x): x is { id: string; meta: { icon: string; label: string } } => x.meta != null);
     if (!resolved.length) return;
@@ -24422,7 +24422,7 @@ export class StashpadView extends ItemView {
       setIcon(b, meta.icon);
       b.title = meta.label;
       b.setAttr("aria-label", meta.label);
-      b.onclick = (e) => { e.stopPropagation(); this.runQuickAction(id, node, e); };
+      b.onclick = (e) => { e.stopPropagation(); this.runQuickAction(id, node, e); this.repaintStatefulButton(b, id, node); };
       return b;
     };
     const inline = resolved.slice(0, inlineMax);
@@ -24456,7 +24456,7 @@ export class StashpadView extends ItemView {
         return { icon: custom || guessCommandIcon(nm, getSettings().slugStopWords), label: nm };
       }
       const def = noteAction(id);
-      return def ? { icon: this.actionIcon(id), label: def.label } : null;
+      return def ? (this.statefulActionMeta(id, node, { bulk: true }) ?? { icon: this.actionIcon(id), label: def.label }) : null;
     };
     const resolved = ids.map((id) => ({ id, meta: resolve(id) })).filter((x): x is { id: string; meta: { icon: string; label: string } } => x.meta != null);
     if (!resolved.length) return null;
@@ -24468,7 +24468,7 @@ export class StashpadView extends ItemView {
       b.title = meta.label;
       b.setAttr("aria-label", meta.label);
       b.addEventListener("dblclick", (e) => { e.preventDefault(); e.stopPropagation(); });
-      b.onclick = (e) => { e.stopPropagation(); this.runQuickAction(id, node, e); };
+      b.onclick = (e) => { e.stopPropagation(); this.runQuickAction(id, node, e); this.repaintStatefulButton(b, id, node, (el, ic) => rowIcon(el, ic as RowIconName)); };
       return b;
     };
     const inline = resolved.slice(0, inlineMax);
@@ -24481,6 +24481,52 @@ export class StashpadView extends ItemView {
       for (const { id, meta } of overflow) render(bar, id, meta);
     }
     return first;
+  }
+
+  /** 0.575.2: the CURRENT label + icon for a stateful catalog action, or null
+   *  for a plain one (use the catalog's fixed label). The ⋮ menu already words
+   *  these by state (renderCtxLeaf); the quick ★ menu and the row/item buttons
+   *  used the catalog's fixed "Pin to sidebar" even on a pinned note. */
+  private statefulActionMeta(id: string, node: TreeNode, opts?: { bulk?: boolean }): { label: string; icon: string } | null {
+    if (id === "pinSidebar") {
+      // 0.575.3 (blind review): row renders pass `bulk` — isPinned walks the
+      // whole vault (fileForPin), so once per row is O(rows × vault), the
+      // pattern 0.524.0 removed. Bulk reads one shared set instead.
+      const pinned = opts?.bulk
+        ? this.sidebarPinnedSetForRows().has(node.id)
+        : this.plugin.isPinned({ folder: this.noteFolder, id: node.id });
+      return pinned ? { label: "Unpin from sidebar", icon: "pin-off" } : { label: "Pin to sidebar", icon: this.actionIcon("pinSidebar") };
+    }
+    return null;
+  }
+
+  /** 0.575.3: sidebarPinnedIdSet for the current folder, memoised for 300ms so
+   *  one list render builds it once. Override-aware like isPinned. */
+  private pinSetMemo: { folder: string; at: number; gen: number; set: Set<unknown> } | null = null;
+  private sidebarPinnedSetForRows(): Set<unknown> {
+    const m = this.pinSetMemo;
+    // 0.575.4: also keyed on the plugin's pin generation, so a pin from ANY
+    // surface (⋮, ★, hotkey, bulk) invalidates it, not just the row button.
+    const gen = this.plugin.sidebarPinGeneration;
+    if (m && m.folder === this.noteFolder && m.gen === gen && Date.now() - m.at < 300) return m.set;
+    const set = this.plugin.sidebarPinnedIdSet(this.noteFolder);
+    this.pinSetMemo = { folder: this.noteFolder, at: Date.now(), gen, set };
+    return set;
+  }
+
+  /** 0.575.2: repaint a stateful row/item button after its tap (the row isn't
+   *  re-rendered for a pin). pinNote/unpinNote set the pin override before
+   *  their first await, so isPinned already reads the new state here.
+   *  0.575.3: `paint` = the builder's own icon painter (the desktop row uses
+   *  the rowIcon sprite), so the icon doesn't change style after a tap. */
+  private repaintStatefulButton(b: HTMLElement, id: string, node: TreeNode, paint: (el: HTMLElement, icon: string) => void = setIcon): void {
+    const meta = this.statefulActionMeta(id, node);
+    if (!meta) return;
+    this.pinSetMemo = null; // the row set is stale now
+    b.empty();
+    paint(b, meta.icon);
+    b.title = meta.label;
+    b.setAttr("aria-label", meta.label);
   }
 
   /** 0.272.0: the short, user-curated quick menu opened by the star button.
@@ -24512,7 +24558,8 @@ export class StashpadView extends ItemView {
       }
       const def = byId.get(id);
       if (!def) continue;   // stale/unknown id
-      menu.addItem((it: any) => it.setTitle(def.label).setIcon(this.actionIcon(id)).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
+      const live = this.statefulActionMeta(id, node); // 0.575.2: Pin ↔ Unpin
+      menu.addItem((it: any) => it.setTitle(live?.label ?? def.label).setIcon(live?.icon ?? this.actionIcon(id)).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
       added += 1;
     }
     if (added === 0) { this.openNoteMenu(evt, node); return; }   // nothing configured → fall back to full menu
@@ -24746,7 +24793,7 @@ export class StashpadView extends ItemView {
     // items (obscure, pin, task, share/export, encrypt, delete) stay fixed below.
     {
       const custom = (getSettings().contextMenuOrder ?? []).filter((id) => CONTEXT_LEAF_IDS.includes(id) || id.startsWith("cmd:") || id.startsWith("submenu:"));
-      const order = custom.length ? custom : CONTEXT_DEFAULT_ORDER;
+      const order = custom.length ? custom : defaultContextOrder(getSettings());
       // 0.321.3: the WHOLE menu renders from the order now (stateful items are
       // renderCtxLeaf cases too), so nothing is appended below.
       for (const id of order) this.renderCtxLeaf(menu, id, node, file, focusClicked);

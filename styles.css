@@ -3563,6 +3563,13 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    other action buttons' icons. */
 .stashpad-split-enter-mode-btn { display: inline-flex; align-items: center; justify-content: center; align-self: stretch; }
 .stashpad-split-enter-mode-btn svg { width: 14px; height: 14px; }
+/* 0.575.0: on mobile, Cancel / Attach / Pop-out / Advanced are icon-only so the
+   whole action row (plus Save) fits on one line of a phone. Equal, tappable
+   width; the icon centred. */
+.is-mobile .stashpad-split-actions .is-icon-only,
+.is-mobile .stashpad-split-actions .stashpad-split-enter-mode-btn { justify-content: center; min-width: 40px; align-self: stretch; }
+/* …and Save (with the Return-mode button) takes the rest of the row. */
+.is-mobile .stashpad-edit-surface .stashpad-split-actions-right { flex: 1 1 auto; }
 .is-mobile .stashpad-split-esc-hint { display: none; }
 /* Let Save flow inline with the others (wraps to a tidy grid) instead of being
    pushed to its own row by margin-left:auto. */

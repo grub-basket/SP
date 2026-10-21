@@ -1157,12 +1157,25 @@ export class NoteWorkbench {
 
   /** 0.170.0: "Open in a tab" — hand the live state to a full leaf. Only the modal
    *  provides popOut (the tab omits it). */
+  /** 0.575.0: action-bar button label. Desktop shows the word; mobile shows the
+   *  icon only, so Cancel · Attach · Pop-out · Advanced · Save fit on one row of
+   *  a phone. The name stays as the aria-label (screen readers; Obsidian's own
+   *  desktop tooltip). Save keeps its word on purpose.
+   *  0.575.3: `title` only on the icon-only (mobile) buttons — on desktop it
+   *  doubled Obsidian's aria-label tooltip. */
+  private actionLabel(b: HTMLElement, text: string, aria: string): void {
+    if (Platform.isMobile) { b.setAttr("aria-label", aria); b.title = aria; b.addClass("is-icon-only"); return; }
+    // Desktop: exactly as before — the word, plus an aria-label only where it
+    // says more than the word (Cancel never had one, so it gets no tooltip).
+    if (aria !== text) b.setAttr("aria-label", aria);
+    b.createSpan({ text });
+  }
+
   private renderPopOut(actions: HTMLElement): void {
     if (!this.cb.popOut) return;
     const pop = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
     setIcon(pop.createSpan({ cls: "stashpad-split-popout-icon" }), "maximize-2");
-    pop.createSpan({ text: Platform.isMobile ? "Pop-out" : "Open in a tab" });
-    pop.setAttr("aria-label", "Open in a full tab");
+    this.actionLabel(pop, "Open in a tab", "Open in a full tab");
     pop.onmousedown = (e) => e.preventDefault();
     pop.onclick = () => this.cb.popOut!(this.getState());
   }
@@ -1186,8 +1199,7 @@ export class NoteWorkbench {
     if (!this.cb.onOpenExternal) return;
     const b = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
     setIcon(b.createSpan({ cls: "stashpad-split-popout-icon" }), "pencil");
-    b.createSpan({ text: Platform.isMobile ? "Advanced" : "Obsidian editor" });
-    b.setAttr("aria-label", "Open in a full Obsidian editor tab (saves your edits first)");
+    this.actionLabel(b, "Obsidian editor", "Open in a full Obsidian editor tab (saves your edits first)");
     b.onmousedown = (e) => e.preventDefault();
     b.onclick = () => { void this.openExternalSaving(); };
   }
@@ -1221,8 +1233,7 @@ export class NoteWorkbench {
     if (!this.cb.onImportFile) return;
     const b = actions.createEl("button", { cls: "stashpad-split-popout-btn" });
     setIcon(b.createSpan({ cls: "stashpad-split-popout-icon" }), "paperclip");
-    b.createSpan({ text: "Attach" });
-    b.setAttr("aria-label", "Attach files (also works via drag-and-drop or paste)");
+    this.actionLabel(b, "Attach", "Attach files (also works via drag-and-drop or paste)");
     b.onmousedown = (e) => e.preventDefault();
     b.onclick = () => {
       const doc = this.host.ownerDocument ?? document;
@@ -1300,7 +1311,7 @@ export class NoteWorkbench {
     const actions = this.host.createDiv({ cls: "stashpad-split-actions" });
     const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn" });
     setIcon(cancel.createSpan({ cls: "stashpad-split-btn-icon" }), "x");
-    cancel.createSpan({ text: "Cancel" });
+    this.actionLabel(cancel, "Cancel", "Cancel");
     cancel.createSpan({ cls: "stashpad-split-esc-hint", text: " (Esc)" });
     cancel.onmousedown = (e) => e.preventDefault();
     cancel.onclick = () => this.cb.close();
@@ -1504,7 +1515,7 @@ export class NoteWorkbench {
     // corner chip was redundant with both Cancel and the ×).
     const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn" });
     setIcon(cancel.createSpan({ cls: "stashpad-split-btn-icon" }), "x");
-    cancel.createSpan({ text: "Cancel" });
+    this.actionLabel(cancel, "Cancel", "Cancel");
     cancel.createSpan({ cls: "stashpad-split-esc-hint", text: " (Esc)" });
     cancel.onmousedown = (e) => e.preventDefault();
     cancel.onclick = () => this.cb.close();
