@@ -229,7 +229,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
   private closed = false;
   onClose(): void {
     this.closed = true;
-    if (this.recentRecordTimer != null) { clearTimeout(this.recentRecordTimer); this.recentRecordTimer = null; }
+    if (this.recentRecordTimer != null) { window.clearTimeout(this.recentRecordTimer); this.recentRecordTimer = null; }
     while (this.pendingCleanups.length > 0) {
       const cb = this.pendingCleanups.pop();
       try { if (cb) cb(); } catch { /* ignore */ }
@@ -439,7 +439,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     if (this.opts.mode === "search") {
       if (q === "") {
         // An empty box cancels any pending record — nothing to remember.
-        if (this.recentRecordTimer != null) { clearTimeout(this.recentRecordTimer); this.recentRecordTimer = null; }
+        if (this.recentRecordTimer != null) { window.clearTimeout(this.recentRecordTimer); this.recentRecordTimer = null; }
         const head: PickerItem[] = [];
         for (const sv of this.opts.savedSearches?.() ?? []) head.push({ id: `saved:${sv.name}`, label: sv.name, node: null, kind: "saved", query: sv.query, savedName: sv.name });
         for (const rq of this.opts.recentQueries?.() ?? []) head.push({ id: `recent:${rq}`, label: rq, node: null, kind: "recent", query: rq });
@@ -807,7 +807,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     if (ie) {
       ie.dispatchEvent(new Event("input", { bubbles: true }));
       // Bodies arrive async; re-run shortly so body matches surface too.
-      setTimeout(() => ie.dispatchEvent(new Event("input", { bubbles: true })), 250);
+      window.setTimeout(() => ie.dispatchEvent(new Event("input", { bubbles: true })), 250);
     }
   }
 
@@ -1224,9 +1224,9 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           }
         }
       });
-      const row = document.createElement("div");
+      const row = activeDocument.createElement("div");
       row.className = "stashpad-search-filter-row";
-      const label = document.createElement("span");
+      const label = activeDocument.createElement("span");
       label.className = "stashpad-search-filter-label";
       label.textContent = "Filters:";
       row.appendChild(label);
@@ -1234,7 +1234,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       // into a single "When" chip that opens an inline builder panel
       // with a mode selector (Before / On / After / Between). The "in"
       // chip still inserts directly — it has no time semantics.
-      const inChip = document.createElement("button");
+      const inChip = activeDocument.createElement("button");
       inChip.className = "stashpad-search-filter-chip";
       inChip.type = "button";
       inChip.textContent = `in:[parent note]`;
@@ -1257,7 +1257,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
       });
       row.appendChild(inChip);
 
-      const whenChip = document.createElement("button");
+      const whenChip = activeDocument.createElement("button");
       whenChip.className = "stashpad-search-filter-chip stashpad-search-filter-when";
       whenChip.type = "button";
       whenChip.textContent = `when:[date / day / timeframe]`;
@@ -1424,10 +1424,10 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // 0.71.24: stretch the modal so a short results list can't clip the
     // builder. The class on modalEl is removed when the builder closes.
     modalEl?.addClass("is-when-builder-open");
-    const panel = document.createElement("div");
+    const panel = activeDocument.createElement("div");
     panel.className = "stashpad-when-builder";
     // Mode tabs row.
-    const tabs = document.createElement("div");
+    const tabs = activeDocument.createElement("div");
     tabs.className = "stashpad-when-tabs";
     const modes: Array<{ id: "before" | "on" | "after" | "between"; label: string }> = [
       { id: "before", label: "Before" },
@@ -1437,7 +1437,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     ];
     const tabBtns: Record<string, HTMLButtonElement> = {};
     for (const m of modes) {
-      const t = document.createElement("button");
+      const t = activeDocument.createElement("button");
       t.type = "button";
       t.className = "stashpad-when-tab";
       t.textContent = m.label;
@@ -1474,7 +1474,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
     // future commits add Date / Day / Timeframe sub-tabs and richer
     // inputs. For now a single text field (or two for Between) matches
     // today's behavior, just routed through the unified entry point.
-    const body = document.createElement("div");
+    const body = activeDocument.createElement("div");
     body.className = "stashpad-when-body";
     panel.appendChild(body);
 
@@ -1680,7 +1680,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         // Belt-and-suspenders: if the modal closes with this popover
         // still open, ensure the scope is popped on close.
         this.pendingCleanups.push(close);
-        setTimeout(() => doc.addEventListener("mousedown", outside, true), 0);
+        window.setTimeout(() => doc.addEventListener("mousedown", outside, true), 0);
       };
 
       tfBtn.addEventListener("click", (e) => {
@@ -1985,7 +1985,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
    *  A pick still records immediately (onChooseSuggestion) — this only covers the
    *  no-pick path. Cleared on empty box and on close. */
   private scheduleRecordRecent(query: string): void {
-    if (this.recentRecordTimer != null) clearTimeout(this.recentRecordTimer);
+    if (this.recentRecordTimer != null) window.clearTimeout(this.recentRecordTimer);
     if (query.length < 2) return;
     this.recentRecordTimer = window.setTimeout(() => {
       this.recentRecordTimer = null;
@@ -2041,7 +2041,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
         // real folder pick `picked` is still false at close time. Defer the
         // "nothing picked → re-open search" check one tick so onPicked runs first
         // — otherwise the search modal re-opens over the folder we just opened. 0.140.14
-        setTimeout(() => {
+        window.setTimeout(() => {
           if (picked) return;
           const restored = new StashpadSuggest(appRef, tree, titleFn, opts);
           restored.open();
@@ -2049,7 +2049,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           // open. Without explicit focus the modal renders but keyboard
           // focus stays on whatever Obsidian's modal-stack restored to
           // (often the underlying app behind the modal).
-          setTimeout(() => {
+          window.setTimeout(() => {
             const ie = (restored as any).inputEl as HTMLInputElement | undefined;
             if (!ie) return;
             if (savedQuery) {

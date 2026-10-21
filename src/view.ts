@@ -1568,8 +1568,8 @@ export class StashpadView extends ItemView {
     // pass at 1500ms catches the edge case where the first resize is
     // still clamped.
     if (this.tinyMode) {
-      setTimeout(() => this.applyTinyWindow(), 1000);
-      setTimeout(() => this.applyTinyWindow(), 1500);
+      window.setTimeout(() => this.applyTinyWindow(), 1000);
+      window.setTimeout(() => this.applyTinyWindow(), 1500);
     }
     // Flush drafts before the app/window unloads. 0.56.17: also eager-stamp
     // last-selected cursor so reload restores by id even if the debounce
@@ -2007,7 +2007,7 @@ export class StashpadView extends ItemView {
 
   private focusView(): void {
     // Defer to next frame so Obsidian's own focus handling has settled first.
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       if (!this.viewRoot?.isConnected) return;
       if (document.activeElement instanceof HTMLElement
           && (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA")) {
@@ -2051,9 +2051,9 @@ export class StashpadView extends ItemView {
       }
       this.composerInputEl?.focus({ preventScroll: true });
     };
-    requestAnimationFrame(tryFocus);
-    setTimeout(tryFocus, 50);
-    setTimeout(tryFocus, 200);
+    window.requestAnimationFrame(tryFocus);
+    window.setTimeout(tryFocus, 50);
+    window.setTimeout(tryFocus, 200);
   }
 
   /** 0.206.0: hand the current shape to the per-folder structure snapshot —
@@ -2881,14 +2881,14 @@ export class StashpadView extends ItemView {
     tryFocus();
     this.tree.rebuild(this.noteFolder);
     this.render({ kind: "follow-cursor" });
-    setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render({ kind: "follow-cursor" }); }, 100);
-    setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render({ kind: "follow-cursor" }); }, 400);
+    window.setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render({ kind: "follow-cursor" }); }, 100);
+    window.setTimeout(() => { tryFocus(); this.tree.rebuild(this.noteFolder); this.render({ kind: "follow-cursor" }); }, 400);
     // Restored notes carry their pre-delete frontmatter — which may
     // include stale parentLink / children from before the tree
     // evolved. Schedule the restored ids (and any parent they now
     // point at) for re-sync so recovery fields land consistent with
     // the live tree, not the snapshot.
-    setTimeout(() => {
+    window.setTimeout(() => {
       for (const n of snap.notes) {
         const id = this.tree.idForPath(n.path);
         if (id) this.fmSync.schedule(id);
@@ -4132,7 +4132,7 @@ export class StashpadView extends ItemView {
     const row = list.querySelector(`[data-id="${cv.id}"]`);
     if (row instanceof HTMLElement) {
       row.addClass("is-context-target");
-      requestAnimationFrame(() => row.scrollIntoView({ block: "center" }));
+      window.requestAnimationFrame(() => row.scrollIntoView({ block: "center" }));
     }
   }
 
@@ -4249,7 +4249,7 @@ export class StashpadView extends ItemView {
 
   /** Close the find bar, clear the filter, restore the full list. */
   private closeFindInList(): void {
-    if (this.findDebounce != null) { clearTimeout(this.findDebounce); this.findDebounce = null; }
+    if (this.findDebounce != null) { window.clearTimeout(this.findDebounce); this.findDebounce = null; }
     this.findText = null;
     this.findBodyMatches = new Set();
     this.findBarEl?.remove();
@@ -4298,7 +4298,7 @@ export class StashpadView extends ItemView {
       // user pauses, instead of re-rendering on every keystroke — much cheaper on
       // a big list. findText updates immediately so the input stays live.
       this.findText = input.value;
-      if (this.findDebounce != null) clearTimeout(this.findDebounce);
+      if (this.findDebounce != null) window.clearTimeout(this.findDebounce);
       this.findDebounce = window.setTimeout(() => {
         this.refreshList();
         this.updateFindCount();
@@ -4444,7 +4444,7 @@ export class StashpadView extends ItemView {
     const r = anchor.getBoundingClientRect();
     pop.style.left = `${Math.min(r.left, (doc.defaultView?.innerWidth ?? 9999) - 240)}px`;
     pop.style.top = `${r.bottom + 4}px`;
-    setTimeout(() => doc.addEventListener("mousedown", onDoc, true), 0);
+    window.setTimeout(() => doc.addEventListener("mousedown", onDoc, true), 0);
     input.focus();
   }
 
@@ -5216,7 +5216,7 @@ export class StashpadView extends ItemView {
           try { ta.setSelectionRange(c, c); } catch { /* ignore */ }
         }
       } else {
-        requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
           const t = this.composerInputEl;
           if (!t) return;
           t.focus({ preventScroll: true });
@@ -5544,7 +5544,7 @@ export class StashpadView extends ItemView {
    *  written is computed, not a literal, so it doesn't trip the store lint's
    *  no-static-styles-assignment rule. */
   private applyOnAccentText(el: HTMLElement): void {
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       if (!el.isConnected) return;
       const bg = getComputedStyle(el).backgroundColor;
       const parts = (bg.match(/[\d.]+/g) ?? []).slice(0, 3).map(Number);
@@ -5866,7 +5866,7 @@ export class StashpadView extends ItemView {
     });
     this.barOverflowRO.observe(bar);
     // Initial pass after layout settles (fonts/icons can shift widths).
-    requestAnimationFrame(() => reflow());
+    window.requestAnimationFrame(() => reflow());
   }
 
   /** Whether a foldable cluster is currently in a non-default state — used
@@ -5966,7 +5966,7 @@ export class StashpadView extends ItemView {
 
     scope.register([], "Escape", (ev: KeyboardEvent) => { ev.preventDefault(); close(); return false; });
     (this.app as any).keymap?.pushScope(scope);
-    setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
+    window.setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
   }
 
   /** ⋯-menu body for the folder cluster: open the folder picker. */
@@ -6434,7 +6434,7 @@ export class StashpadView extends ItemView {
     (this.app as any).keymap?.pushScope(scope);
 
     renderList();
-    setTimeout(() => { doc.addEventListener("mousedown", outside, true); input.focus(); }, 0);
+    window.setTimeout(() => { doc.addEventListener("mousedown", outside, true); input.focus(); }, 0);
   }
 
   /** Color filter — custom button + popover. Native <select> is unable
@@ -6541,7 +6541,7 @@ export class StashpadView extends ItemView {
     this.populateColorMenuBody(pop, colors, close);
 
     // Defer the listener attach so the click that opened us doesn't immediately close it.
-    setTimeout(() => {
+    window.setTimeout(() => {
       doc.addEventListener("mousedown", outside, true);
     }, 0);
   }
@@ -6632,7 +6632,7 @@ export class StashpadView extends ItemView {
       return false;
     });
     (this.app as any).keymap?.pushScope(scope);
-    setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
+    window.setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
   }
 
   /** Mobile: combined filters button. Replaces the four individual
@@ -6799,7 +6799,7 @@ export class StashpadView extends ItemView {
     const scope = new Scope((this.app as any).scope);
     scope.register([], "Escape", (ev: KeyboardEvent) => { ev.preventDefault(); close(); return false; });
     (this.app as any).keymap?.pushScope(scope);
-    setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
+    window.setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
   }
 
   /** View dropdown — Nested / Flat / Everything. Per-folder. The label
@@ -6861,7 +6861,7 @@ export class StashpadView extends ItemView {
     const scope = new Scope((this.app as any).scope);
     scope.register([], "Escape", (ev: KeyboardEvent) => { ev.preventDefault(); close(); return false; });
     (this.app as any).keymap?.pushScope(scope);
-    setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
+    window.setTimeout(() => { doc.addEventListener("mousedown", outside, true); }, 0);
   }
 
   /** 0.517.6 (perf): this folder's six per-folder filter values in one string —
@@ -7662,7 +7662,7 @@ export class StashpadView extends ItemView {
       this.tinyOpacityPopover = null;
       return;
     }
-    const pop = document.createElement("div");
+    const pop = activeDocument.createElement("div");
     pop.className = "stashpad-tiny-opacity-popover";
     pop.createSpan({ cls: "stashpad-tiny-opacity-label", text: "Transparency" });
     const slider = pop.createEl("input", { type: "range" });
@@ -7701,7 +7701,7 @@ export class StashpadView extends ItemView {
       document.removeEventListener("mousedown", onDoc, true);
       document.removeEventListener("keydown", onKey, true);
     };
-    setTimeout(() => {
+    window.setTimeout(() => {
       document.addEventListener("mousedown", onDoc, true);
       document.addEventListener("keydown", onKey, true);
     }, 0);
@@ -9210,7 +9210,7 @@ export class StashpadView extends ItemView {
   private queueClampMeasure(item: StashpadView["clampBatch"][number]): void {
     this.clampBatch.push(item);
     if (this.clampRaf !== null) return;
-    this.clampRaf = requestAnimationFrame(() => {
+    this.clampRaf = window.requestAnimationFrame(() => {
       this.clampRaf = null;
       const batch = this.clampBatch;
       this.clampBatch = [];
@@ -10388,7 +10388,7 @@ export class StashpadView extends ItemView {
     this.caretGuardObserver = new MutationObserver((records) => {
       for (const rec of records) {
         for (const node of Array.from(rec.addedNodes)) {
-          if (!(node instanceof HTMLElement)) continue;
+          if (!(node.instanceOf(HTMLElement))) continue;
           if (node.matches(".modal-container, .menu") || node.querySelector?.(".modal-container, .menu")) {
             this.blurComposerCaret();
             return;
@@ -10627,7 +10627,7 @@ export class StashpadView extends ItemView {
     };
     if (list) {
       align();
-      requestAnimationFrame(align);
+      window.requestAnimationFrame(align);
       window.setTimeout(align, 60);
       window.setTimeout(align, 200);
     } else {
@@ -11151,7 +11151,7 @@ export class StashpadView extends ItemView {
         // A row within 1.5 list-heights comfortably covers the genuine reflow
         // case; anything farther means the user deliberately scrolled away.
         if (Platform.isMobile && this.cursorIdx >= 0 && this.cursorRowNearViewport()) {
-          setTimeout(() => this.revealCursorRow(), 350);
+          window.setTimeout(() => this.revealCursorRow(), 350);
         }
       });
     }
@@ -11612,7 +11612,7 @@ export class StashpadView extends ItemView {
     // catches the post-layout width, and the observer covers later
     // changes. The extra setTimeout fired on every arrow-key render
     // for no observable benefit.
-    requestAnimationFrame(applyNarrow);
+    window.requestAnimationFrame(applyNarrow);
     const ro = new ResizeObserver(applyNarrow);
     ro.observe(composer);
     this.composerNarrowObserver?.disconnect();
@@ -12944,7 +12944,6 @@ export class StashpadView extends ItemView {
             if (Math.abs(v - prev) > 8) {
               const where = (new Error().stack ?? "").split("\n").slice(2, 5)
                 .map((l) => l.trim().replace(/^at\s+/, "").replace(/\s*\(.*$/, "")).join(" < ");
-              (this as unknown as { __spTrace?: (c: string, d: Record<string, unknown>) => void });
               plugin.trace("scroll:set", { at: label, ms: Math.round(performance.now() - t0), from: Math.round(prev), to: Math.round(v), by: where.slice(0, 120) });
             }
             desc.set!.call(this, v);
@@ -12977,11 +12976,11 @@ export class StashpadView extends ItemView {
         lastTop = el.scrollTop;
         lastH = el.scrollHeight;
       }
-      if (dt < 2000) requestAnimationFrame(tick);
+      if (dt < 2000) window.requestAnimationFrame(tick);
       else untrap();
     };
     this.plugin.trace("scroll:start", { at: label, top: Math.round(start.top), h: start.h, c: start.c });
-    requestAnimationFrame(tick);
+    window.requestAnimationFrame(tick);
   }
 
   private holdListScroll(): () => void {
@@ -12995,7 +12994,7 @@ export class StashpadView extends ItemView {
         el.scrollTop = atBottom ? el.scrollHeight - el.clientHeight : top;
       };
       apply();
-      requestAnimationFrame(apply);
+      window.requestAnimationFrame(apply);
       window.setTimeout(apply, 60);
       // Lazy bodies can still resize rows for a while; a late pass keeps both
       // the pinned-bottom and the fixed-offset cases stable through it.
@@ -13033,9 +13032,9 @@ export class StashpadView extends ItemView {
       else if (rr.bottom > bottomBound) list.scrollTop += rr.bottom - bottomBound;
     };
     doReveal();
-    requestAnimationFrame(doReveal);
-    setTimeout(doReveal, 60);
-    setTimeout(doReveal, 200);
+    window.requestAnimationFrame(doReveal);
+    window.setTimeout(doReveal, 60);
+    window.setTimeout(doReveal, 200);
   }
 
   /** Mobile only. True if a row tap should be absorbed (dismiss-the-keyboard
@@ -13210,8 +13209,8 @@ export class StashpadView extends ItemView {
       if (list) {
         const target = wasAtBottom ? list.scrollHeight : keepScroll;
         list.scrollTop = target;
-        requestAnimationFrame(() => { list.scrollTop = wasAtBottom ? list.scrollHeight : keepScroll; });
-        setTimeout(() => { list.scrollTop = wasAtBottom ? list.scrollHeight : keepScroll; }, 60);
+        window.requestAnimationFrame(() => { list.scrollTop = wasAtBottom ? list.scrollHeight : keepScroll; });
+        window.setTimeout(() => { list.scrollTop = wasAtBottom ? list.scrollHeight : keepScroll; }, 60);
         // The previously-highlighted row's body re-renders async on cancel
         // (renderNoteBody is .then-based). Its body shrinks momentarily,
         // scrollHeight drops, and the browser clamps scrollTop down — which
@@ -13796,7 +13795,7 @@ export class StashpadView extends ItemView {
       this.virtUpdate();
     }
     if (this.plugin.settings.debugTrace && list && before) {
-      requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
         const after = { top: Math.round(list.scrollTop), h: list.scrollHeight, gap: Math.round(list.scrollHeight - list.scrollTop - list.clientHeight) };
         this.plugin.trace("r1:react", { id, before, after, moved: before.top !== after.top });
       });
@@ -15751,8 +15750,8 @@ export class StashpadView extends ItemView {
     if (this.listEl) {
       const list = this.listEl;
       list.scrollTop = keepScroll;
-      requestAnimationFrame(() => { list.scrollTop = keepScroll; });
-      setTimeout(() => { list.scrollTop = keepScroll; }, 60);
+      window.requestAnimationFrame(() => { list.scrollTop = keepScroll; });
+      window.setTimeout(() => { list.scrollTop = keepScroll; }, 60);
     }
   }
 
@@ -15779,8 +15778,8 @@ export class StashpadView extends ItemView {
     if (this.listEl) {
       const list = this.listEl;
       list.scrollTop = keepScroll;
-      requestAnimationFrame(() => { list.scrollTop = keepScroll; });
-      setTimeout(() => { list.scrollTop = keepScroll; }, 60);
+      window.requestAnimationFrame(() => { list.scrollTop = keepScroll; });
+      window.setTimeout(() => { list.scrollTop = keepScroll; }, 60);
     }
   }
 
@@ -15885,8 +15884,8 @@ export class StashpadView extends ItemView {
       this.cursorIdx = idx;
       this.render({ kind: "follow-cursor" });
     };
-    setTimeout(tryReselect, 120);
-    setTimeout(tryReselect, 400);
+    window.setTimeout(tryReselect, 120);
+    window.setTimeout(tryReselect, 400);
   }
 
   async cmdMerge(opts?: { targets?: TreeNode[]; keepId?: StashpadId }): Promise<void> {
@@ -16082,8 +16081,8 @@ export class StashpadView extends ItemView {
         this.cursorIdx = idx;
         this.render({ kind: "follow-cursor" });
       };
-      setTimeout(tryReselect, 120);
-      setTimeout(tryReselect, 400);
+      window.setTimeout(tryReselect, 120);
+      window.setTimeout(tryReselect, 400);
     }
 
   }
@@ -19163,7 +19162,7 @@ export class StashpadView extends ItemView {
     const editor: any = view?.editor;
     if (!editor) return;
     // Wait one frame so the editor has its document loaded.
-    requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       try {
         const last = editor.lastLine();
         const ch = editor.getLine(last)?.length ?? 0;
@@ -20149,7 +20148,7 @@ export class StashpadView extends ItemView {
    *  Skips code/pre, so `||` inside a code block stays literal. */
   private applySpoilers(root: HTMLElement): void {
     if (!getSettings().spoilerMarkup) return;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const walker = activeDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     const targets: Text[] = [];
     for (let n = walker.nextNode(); n; n = walker.nextNode()) {
       const t = n as Text;
@@ -20160,7 +20159,7 @@ export class StashpadView extends ItemView {
     for (const t of targets) {
       const parts = (t.nodeValue ?? "").split(/\|\|([^|]+)\|\|/g);
       if (parts.length < 3) continue;
-      const frag = document.createDocumentFragment();
+      const frag = activeDocument.createDocumentFragment();
       parts.forEach((part, i) => {
         if (!part) return;
         // Odd indices are the captured spoiler bodies.
@@ -20171,7 +20170,7 @@ export class StashpadView extends ItemView {
           span.setAttr("aria-label", "Hidden text — activate to reveal");
           span.title = "Tap to reveal (visual only)";
         } else {
-          frag.appendChild(document.createTextNode(part));
+          frag.appendChild(activeDocument.createTextNode(part));
         }
       });
       t.replaceWith(frag);
@@ -20734,8 +20733,8 @@ export class StashpadView extends ItemView {
       this.cursorIdx = idx;
       this.render({ kind: "follow-cursor" });
     };
-    setTimeout(tryReselect, 120);
-    setTimeout(tryReselect, 400);
+    window.setTimeout(tryReselect, 120);
+    window.setTimeout(tryReselect, 400);
     const movedNodes = sourceIds.map((id) => this.tree.get(id)).filter((n): n is TreeNode => !!n);
     const targetNode = this.tree.get(targetParentId);
     const targetTitle = targetNode ? this.titleForNode(targetNode) : "(root)";
@@ -21135,8 +21134,8 @@ export class StashpadView extends ItemView {
       this.selection.clear(); this.selection.add(parent.id); this.cursorIdx = idx;
       this.render({ kind: "follow-cursor" });
     };
-    setTimeout(reselect, 120);
-    setTimeout(reselect, 400);
+    window.setTimeout(reselect, 120);
+    window.setTimeout(reselect, 400);
   }
 
   /** Delete selection via Obsidian's OWN trash routing (system trash or `.trash`,
@@ -22552,7 +22551,7 @@ export class StashpadView extends ItemView {
 
   private extractAttachments(body: string): string[] {
     const out: string[] = [];
-    const re = /!\[\[([^\]\|]+)(?:\|[^\]]+)?\]\]/g;
+    const re = /!\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(body)) !== null) out.push(m[1]);
     return out;
@@ -23050,7 +23049,7 @@ export class StashpadView extends ItemView {
       // ensureFolder succeeded, and its in-memory "is a folder" check still runs.
       const known = !!folder && !!ensuredDirs?.has(folder);
       if (folder) { await this.ensureFolder(folder, known); ensuredDirs?.add(folder); }
-      const safeName = file.name.replace(/[^\w.\-]+/g, "_");
+      const safeName = file.name.replace(/[^\w.-]+/g, "_");
       const stamp = Date.now().toString(36);
       const leaf = buildAttachmentName(safeName, stamp);
       const path = folder ? `${folder}/${leaf}` : leaf;
@@ -23465,7 +23464,7 @@ export class StashpadView extends ItemView {
         this.virtUpdate();
       };
       tmo = window.setTimeout(tick, 40);
-      v.raf = requestAnimationFrame(tick);
+      v.raf = window.requestAnimationFrame(tick);
     };
     this.virt = v;
     list.addEventListener("scroll", v.onScroll, { passive: true });
@@ -24073,7 +24072,7 @@ export class StashpadView extends ItemView {
       if (moved) apply();
       if (final) { finished = true; done?.(); }
     };
-    requestAnimationFrame(step(false));
+    window.requestAnimationFrame(step(false));
     // If the on-screen keyboard is mid-transition the viewport is still
     // moving; carry the tail past the end of that transition so the last
     // apply sees the height the user will actually be looking at.
@@ -24235,7 +24234,7 @@ export class StashpadView extends ItemView {
         lastH = h;
       }
       if (performance.now() - startedAt < 30000) {
-        this.pinWatchdogRaf = requestAnimationFrame(watchdog);
+        this.pinWatchdogRaf = window.requestAnimationFrame(watchdog);
       } else {
         // Initial paint has long since settled. Releasing the sticky
         // flag here prevents the regression where every subsequent
@@ -24247,7 +24246,7 @@ export class StashpadView extends ItemView {
         this.stickToListBottom = false;
       }
     };
-    this.pinWatchdogRaf = requestAnimationFrame(watchdog);
+    this.pinWatchdogRaf = window.requestAnimationFrame(watchdog);
   }
 
   /** 0.155.1: shared "Share & export ▸" submenu — used by BOTH the desktop note
@@ -25306,8 +25305,8 @@ export class StashpadView extends ItemView {
               this.cursorIdx = idx;
               this.render({ kind: "follow-cursor" });
             };
-            setTimeout(tryReselect, 120);
-            setTimeout(tryReselect, 400);
+            window.setTimeout(tryReselect, 120);
+            window.setTimeout(tryReselect, 400);
           }
         },
         redo: async () => {
@@ -25336,8 +25335,8 @@ export class StashpadView extends ItemView {
               this.cursorIdx = idx;
               this.render({ kind: "follow-cursor" });
             };
-            setTimeout(tryReselect, 120);
-            setTimeout(tryReselect, 400);
+            window.setTimeout(tryReselect, 120);
+            window.setTimeout(tryReselect, 400);
           }
         },
       });

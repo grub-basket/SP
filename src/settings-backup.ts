@@ -9,7 +9,7 @@ export class SettingsBackupStore {
   private root = ".stashpad-settings-backups";
   constructor(private app: App, private cap = 20) {}
 
-  private dir(device: string): string { return `${this.root}/${device.replace(/[^\w.\-]+/g, "_")}`; }
+  private dir(device: string): string { return `${this.root}/${device.replace(/[^\w.-]+/g, "_")}`; }
 
   private async ensureDir(dir: string): Promise<void> {
     const a = this.app.vault.adapter;

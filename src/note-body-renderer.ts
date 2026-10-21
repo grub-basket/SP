@@ -297,7 +297,7 @@ export class NoteBodyRenderer {
       this.drainHandle = window.setTimeout(run, 16);
     } else {
       this.drainViaTimeout = false;
-      this.drainHandle = requestAnimationFrame(run);
+      this.drainHandle = window.requestAnimationFrame(run);
     }
   }
 
@@ -391,7 +391,7 @@ export class NoteBodyRenderer {
     };
     // File embeds → de-embed to a visible link (drop the `!`) + rail. Note
     // embeds are returned untouched so they still transclude.
-    const text = body.replace(/!\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g, (m, p1: string) => {
+    const text = body.replace(/!\[\[(?=[^\]|]*[^\s\]|])([^\]|]+)(?:\|[^\]]+)?\]\]/g, (m, p1: string) => {
       const f = isFile(p1);
       if (!f) return m;               // note transclusion — keep the embed
       attachments.push(f);
@@ -400,7 +400,7 @@ export class NoteBodyRenderer {
     // Plain file links → rail (text already visible). Lookbehind skips the `[[`
     // inside any remaining `![[…]]` (there are none after the replace, but a
     // note embed's inner brackets must not be miscounted).
-    for (const m of text.matchAll(/(?<!!)\[\[(?=[^\]\|]*[^\s\]\|])([^\]\|]+)(?:\|[^\]]+)?\]\]/g)) {
+    for (const m of text.matchAll(/(?<!!)\[\[(?=[^\]|]*[^\s\]|])([^\]|]+)(?:\|[^\]]+)?\]\]/g)) {
       const f = isFile(m[1]); if (f) attachments.push(f);
     }
     // De-dupe: the same file embedded and linked is one rail chip.

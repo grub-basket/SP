@@ -409,7 +409,7 @@ export default class StashpadPlugin extends Plugin {
     if (path) { try { const a = this.app.vault.adapter; if (await a.exists(path)) await a.remove(path); } catch { /* ignore */ } }
   }
   private static readonly TRACE_FLUSH_MS = 1000;
-  private traceFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private traceFlushTimer: number | null = null;
   /** False until this session has moved the previous session's file aside.
    *  Gates every write — see flushTraceToDisk. */
   private traceRotateDone = false;
@@ -481,7 +481,7 @@ export default class StashpadPlugin extends Plugin {
 
   private scheduleTraceFlush(): void {
     if (this.traceFlushTimer !== null) return;
-    this.traceFlushTimer = setTimeout(() => {
+    this.traceFlushTimer = window.setTimeout(() => {
       this.traceFlushTimer = null;
       void this.flushTraceToDisk();
     }, StashpadPlugin.TRACE_FLUSH_MS);
@@ -794,7 +794,7 @@ export default class StashpadPlugin extends Plugin {
     this.debugBuffer = [];
     // Clearing must clear the DISK copy too. Leaving it behind would mean the
     // next copy command hands back lines the user just asked to be rid of.
-    if (this.traceFlushTimer !== null) { clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
+    if (this.traceFlushTimer !== null) { window.clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
     void this.removeTraceFiles();
   }
 
@@ -983,7 +983,7 @@ export default class StashpadPlugin extends Plugin {
     if (this.settings.settingsBackups === false) return;
     const str = (() => { try { return JSON.stringify(core); } catch { return ""; } })();
     if (!str || str === this._lastBackupCore) return;
-    if (this._backupTimer != null) clearTimeout(this._backupTimer);
+    if (this._backupTimer != null) window.clearTimeout(this._backupTimer);
     this._backupTimer = window.setTimeout(() => {
       this._backupTimer = null;
       this._lastBackupCore = str;
@@ -1117,7 +1117,7 @@ export default class StashpadPlugin extends Plugin {
     // where nothing is lost, so take it — the debounced flush may still be
     // pending, and its timer will not survive us.
     try {
-      if (this.traceFlushTimer !== null) { clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
+      if (this.traceFlushTimer !== null) { window.clearTimeout(this.traceFlushTimer); this.traceFlushTimer = null; }
       await this.flushTraceToDisk();
     } catch { /* best-effort */ }
     // 0.292.0 (perf): land a pending folder-MRU write. The write is debounced
@@ -1501,7 +1501,7 @@ export default class StashpadPlugin extends Plugin {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       if (this.discoverStashpadFolders().includes(cleaned)) return;
-      await new Promise((r) => setTimeout(r, 80));
+      await new Promise((r) => window.setTimeout(r, 80));
     }
   }
 
@@ -2409,7 +2409,7 @@ export default class StashpadPlugin extends Plugin {
     const f = (folder || "").trim().replace(/\/+$/, "");
     if (!f || this.sweptFolders.has(f)) return;
     this.sweptFolders.add(f);
-    setTimeout(() => { void this.runSweep(f, { silent: true }); }, 3000);
+    window.setTimeout(() => { void this.runSweep(f, { silent: true }); }, 3000);
   }
 
   /** Manual integrity check — writes log entries for every delta between
@@ -3898,7 +3898,7 @@ export default class StashpadPlugin extends Plugin {
         // before the view's own onOpen/loadConfig has established noteFolder, so
         // reading it synchronously yields "" and the folder is never recorded.
         // (Caught in testing — lastUsedFolder stayed empty with a view open.)
-        setTimeout(() => this.recordFolderUsed(((leaf.view as any)?.noteFolder ?? "").trim()), 0);
+        window.setTimeout(() => this.recordFolderUsed(((leaf.view as any)?.noteFolder ?? "").trim()), 0);
         // 0.74.1: auto-open the right-sidebar detail panel when the
         // user enters a Stashpad view, if the setting is on AND the
         // panel isn't already open. Defer one tick so the leaf is
@@ -3906,7 +3906,7 @@ export default class StashpadPlugin extends Plugin {
         if (this.settings.autoOpenDetailPanel) {
           const existing = this.app.workspace.getLeavesOfType(STASHPAD_DETAIL_VIEW_TYPE);
           if (existing.length === 0) {
-            setTimeout(() => { void openStashpadDetailView(this.app); }, 0);
+            window.setTimeout(() => { void openStashpadDetailView(this.app); }, 0);
           }
         }
         // Always notify selection listeners when the active leaf
@@ -4020,7 +4020,7 @@ export default class StashpadPlugin extends Plugin {
     }));
     // Existing popouts at plugin-load time (e.g. after a reload while
     // a tiny window was open) — walk all known windows and inject.
-    setTimeout(() => {
+    window.setTimeout(() => {
       try {
         const ws = this.app.workspace as any;
         if (typeof ws.iterateAllLeaves === "function") {
@@ -4071,9 +4071,9 @@ export default class StashpadPlugin extends Plugin {
     // Re-measure on a short interval too — the toolbar may mount AFTER
     // initial onload, and there's no clean event for "Obsidian finished
     // attaching the mobile toolbar." A few RAF/timeout passes catch it.
-    requestAnimationFrame(refreshGeometry);
-    setTimeout(refreshGeometry, 250);
-    setTimeout(refreshGeometry, 1000);
+    window.requestAnimationFrame(refreshGeometry);
+    window.setTimeout(refreshGeometry, 250);
+    window.setTimeout(refreshGeometry, 1000);
 
     // 0.208.2: ONE folder-count rule, shared by the ribbon and the open command.
     // They used to disagree — the ribbon showed the picker at >=1 folder while
@@ -5431,7 +5431,7 @@ export default class StashpadPlugin extends Plugin {
         // 0.94.4: focus Obsidian's NATIVE settings search input (the old
         // in-plugin search box is gone — settings are indexed via
         // getSettingDefinitions now).
-        setTimeout(() => {
+        window.setTimeout(() => {
           const inp = setting?.modalEl?.querySelector?.("input[type='search']") as HTMLInputElement | undefined;
           inp?.focus();
         }, 0);
@@ -5466,7 +5466,7 @@ export default class StashpadPlugin extends Plugin {
       setting.open();
       setting.openTabById(this.manifest.id);
       // Scroll to the JD section if the heading is present.
-      setTimeout(() => {
+      window.setTimeout(() => {
         const header = document.getElementById("stashpad-jd-index-section");
         header?.scrollIntoView({ behavior: "smooth", block: "start" });
       }, 100);
@@ -5636,7 +5636,7 @@ export default class StashpadPlugin extends Plugin {
       })) return;
       if (!this.discoverStashpadFolders().includes(dir)) return;
       // Defer to give metadataCache time to parse the frontmatter.
-      setTimeout(() => { void this.fixOrphanParentForFile(file); }, 800);
+      window.setTimeout(() => { void this.fixOrphanParentForFile(file); }, 800);
     };
     // 0.72.5: bare .md files dropped into <stashpad>/<importSub>/ get
     // adopted into the parent Stashpad — move them up to the folder
@@ -5656,7 +5656,7 @@ export default class StashpadPlugin extends Plugin {
       // Defer to let the metadataCache parse the file, then move it
       // up + run the orphan-fix path. Picks a unique filename if a
       // name collision exists at the destination.
-      setTimeout(() => { void this.adoptMarkdownDrop(file, stashFolder); }, 200);
+      window.setTimeout(() => { void this.adoptMarkdownDrop(file, stashFolder); }, 200);
     };
     this.registerEvent(this.app.vault.on("create", (file) => {
       if (file instanceof TFile) { onMaybeOrphan(file); onMaybeMarkdownImport(file); }
@@ -5782,11 +5782,11 @@ export default class StashpadPlugin extends Plugin {
     this.registerInterval(window.setInterval(() => {
       if (this.pendingXvCut) void this.checkXvCutAck();
     }, 3000));
-    setTimeout(() => void this.checkForSyncedBuild(), 5000);
+    window.setTimeout(() => void this.checkForSyncedBuild(), 5000);
     // 0.215.0: one-shot nudge if Obsidian's automatic link updating is off.
     // Late enough not to compete with startup, and it self-suppresses after the
     // user has seen it once (see maybeWarnLinkUpdatesOff).
-    setTimeout(() => this.maybeWarnLinkUpdatesOff(), 9000);
+    window.setTimeout(() => this.maybeWarnLinkUpdatesOff(), 9000);
     // 0.92.2: also poll periodically. Focus + one-shot-at-5s missed the case
     // where a newer build lands WHILE the window stays focused (a fresh deploy,
     // or Sync pushing a build mid-session) — without a refocus nothing
@@ -6250,7 +6250,7 @@ export default class StashpadPlugin extends Plugin {
       const moved = this.app.vault.getAbstractFileByPath(destPath);
       if (moved instanceof TFile) {
         // Small delay so metadataCache catches up to the new path.
-        setTimeout(() => { void this.fixOrphanParentForFile(moved); }, 500);
+        window.setTimeout(() => { void this.fixOrphanParentForFile(moved); }, 500);
       }
       this.notifications.show({
         message: `Imported \`${file.name}\` → \`${stashFolder}\``,
@@ -6360,7 +6360,7 @@ export default class StashpadPlugin extends Plugin {
     if (!this.discoverStashpadFolders().includes(newDir)) return;   // not moved into a Stashpad
     if (this.reHomePending.has(file.path)) return;
     this.reHomePending.add(file.path);
-    setTimeout(() => {
+    window.setTimeout(() => {
       this.reHomePending.delete(file.path);
       void this.reHomeDanglingParent(file, newDir);
     }, 900);
@@ -6834,7 +6834,7 @@ export default class StashpadPlugin extends Plugin {
       try {
         await this.app.fileManager.renameFile(file, newPath);
         renamed += 1;
-        await new Promise((resolve) => setTimeout(resolve, 30));
+        await new Promise((resolve) => window.setTimeout(resolve, 30));
       } catch (e) {
         console.warn(`Stashpad: attachment rebootstrap skipped ${file.path}`, e);
       }
@@ -6935,7 +6935,7 @@ export default class StashpadPlugin extends Plugin {
             }
           }
           moved += 1;
-          await new Promise((resolve) => setTimeout(resolve, 30));
+          await new Promise((resolve) => window.setTimeout(resolve, 30));
         } catch (e) {
           console.warn(`Stashpad: couldn't re-home stray attachment ${from}`, e);
         }
@@ -8773,7 +8773,7 @@ export default class StashpadPlugin extends Plugin {
       const prog = chosen.length > 2 ? notify("", 0) : null;
       for (let i = 0; i < chosen.length; i++) {
         prog?.setMessage(`🔒 Re-encrypting ${i + 1}/${chosen.length}…`);
-        try { (await cands[chosen[i]].run()) ? ok++ : failed++; }
+        try { if (await cands[chosen[i]].run()) ok++; else failed++; }
         catch (e) { failed++; console.warn("[Stashpad] sweep item failed", cands[chosen[i]].label, e); }
       }
       prog?.hide();
@@ -8805,7 +8805,7 @@ export default class StashpadPlugin extends Plugin {
         let ok = 0, failed = 0;
         for (let i = 0; i < cands.length; i++) {
           onProgress(i, cands[i].label);
-          try { (await cands[i].run()) ? ok++ : failed++; }
+          try { if (await cands[i].run()) ok++; else failed++; }
           catch (e) { failed++; console.warn("[Stashpad] encrypt-all item failed", cands[i].label, e); }
         }
         this.notifications.show({ message: `Encrypt-all: ${ok} done${failed ? `, ${failed} FAILED (see console)` : ""}.`, kind: failed ? "warning" : "success", category: "system", folder: "" });
@@ -12348,7 +12348,7 @@ export default class StashpadPlugin extends Plugin {
     if (!opts?.silent || changed) {
       // Multi-line summary tally, lingering a few seconds so it's readable.
       const remaining = this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE).length;
-      const frag = document.createDocumentFragment() as unknown as { createEl: (t: string, o?: { text?: string }) => HTMLElement };
+      const frag = activeDocument.createDocumentFragment() as unknown as { createEl: (t: string, o?: { text?: string }) => HTMLElement };
       frag.createEl("div", { text: changed ? "Stashpad tabs cleaned up:" : "Stashpad tabs - nothing to clean up:" });
       frag.createEl("div", { text: `\u2022  ${closed} duplicate tab${closed === 1 ? "" : "s"} closed` });
       frag.createEl("div", { text: `\u2022  ${pruned} orphaned tab${pruned === 1 ? "" : "s"} pruned (note no longer exists)` });
@@ -12447,7 +12447,7 @@ export default class StashpadPlugin extends Plugin {
   authorRefFor(folder: string, id: string, name: string): string {
     const safe = name.replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-") || "author";
     const path = `${folder.replace(/\/+$/, "")}/_authors/${safe}-${id}.md`;
-    const aliasSafe = name.replace(/[\[\]|]/g, "").trim() || safe;
+    const aliasSafe = name.replace(/[[\]|]/g, "").trim() || safe;
     return `[[${path}|${aliasSafe}]]`;
   }
 
@@ -13239,7 +13239,7 @@ export default class StashpadPlugin extends Plugin {
     const m = raw.match(/^\s*\[\[(.*_authors\/)/);        // every author ref has _authors/
     const prefix = m ? m[1] : "_authors/";
     const safe = this.authorNameToSafe(toName);
-    const aliasSafe = toName.replace(/[\[\]|]/g, "").trim() || safe;   // 0.77.11 escaping
+    const aliasSafe = toName.replace(/[[\]|]/g, "").trim() || safe;   // 0.77.11 escaping
     return `[[${prefix}${safe}-${toId}.md|${aliasSafe}]]`;
   }
 
@@ -15157,7 +15157,7 @@ class NamePromptModal extends Modal {
     this.titleEl.setText(this.title);
     let value = this.initial;
     const setting = new Setting(this.contentEl).setName(this.label);
-    setting.addText((t) => { t.setValue(this.initial).onChange((v) => { value = v; }); t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); this.onSubmit(value); this.close(); } }); setTimeout(() => { t.inputEl.focus(); t.inputEl.select(); }, 0); });
+    setting.addText((t) => { t.setValue(this.initial).onChange((v) => { value = v; }); t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); this.onSubmit(value); this.close(); } }); window.setTimeout(() => { t.inputEl.focus(); t.inputEl.select(); }, 0); });
     new Setting(this.contentEl).addButton((b) => b.setButtonText("Save").setCta().onClick(() => { this.onSubmit(value); this.close(); }));
   }
   onClose(): void { this.contentEl.empty(); }

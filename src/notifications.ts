@@ -43,8 +43,8 @@ export function renderInlineMarkup(host: HTMLElement, message: string): void {
  *  service. `new Notice(string)` renders verbatim, so a message carrying the
  *  **bold** markers used everywhere else would show literal asterisks. */
 export function boldFragment(message: string): DocumentFragment {
-  const frag = document.createDocumentFragment();
-  const span = document.createElement("span");
+  const frag = activeDocument.createDocumentFragment();
+  const span = activeDocument.createElement("span");
   renderInlineMarkup(span, message);
   frag.appendChild(span);
   return frag;
@@ -489,18 +489,18 @@ export class NotificationService {
   }
 
   private buildContent(opts: NotifyOptions, kind: NotificationKind): DocumentFragment {
-    const frag = document.createDocumentFragment();
-    const wrap = document.createElement("div");
+    const frag = activeDocument.createDocumentFragment();
+    const wrap = activeDocument.createElement("div");
     wrap.className = `stashpad-notice stashpad-notice-${kind}`;
-    const msg = document.createElement("div");
+    const msg = activeDocument.createElement("div");
     msg.className = "stashpad-notice-message";
     renderInlineMarkup(msg, opts.message);
     wrap.appendChild(msg);
     if (opts.actions && opts.actions.length > 0) {
-      const row = document.createElement("div");
+      const row = activeDocument.createElement("div");
       row.className = "stashpad-notice-actions";
       for (const action of opts.actions) {
-        const btn = document.createElement("button");
+        const btn = activeDocument.createElement("button");
         btn.className = "stashpad-notice-action";
         btn.textContent = action.label;
         btn.addEventListener("click", (e) => {
@@ -529,10 +529,10 @@ export class NotificationService {
     if (opts.overlayAction) {
       const ov = opts.overlayAction;
       wrap.classList.add("has-overlay");
-      const btn = document.createElement("button");
+      const btn = activeDocument.createElement("button");
       btn.className = "stashpad-notice-overlay";
       if (ov.icon) setIcon(btn, ov.icon);
-      const lbl = document.createElement("span");
+      const lbl = activeDocument.createElement("span");
       lbl.textContent = ov.label;
       btn.appendChild(lbl);
       btn.title = ov.title ?? ov.label;

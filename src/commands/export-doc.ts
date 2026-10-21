@@ -25,7 +25,7 @@ interface ExportItem { node: TreeNode; depth: number; }
 
 /** Mirrors io-cmds.safeBaseName so exports name consistently. */
 function safeBaseName(name: string): string {
-  return name.replace(/[^\w.\-]+/g, "_").replace(/^\.+/, "").slice(0, 60) || "stash-export";
+  return name.replace(/[^\w.-]+/g, "_").replace(/^\.+/, "").slice(0, 60) || "stash-export";
 }
 
 function esc(s: string): string {

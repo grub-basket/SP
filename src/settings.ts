@@ -3566,7 +3566,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       { allowCustom: true, catalogIds: CONTEXT_LEAF_IDS, ctxHide: true });
     // 0.367.0: a BAKED-IN submenu can't be deleted (the seed re-adds it) — offer
     // Hide instead, which sticks. A user-made submenu keeps the real delete below.
-    if (`submenu:${key}` && (key in DEFAULT_CONTEXT_SUBMENUS)) {
+    if (key in DEFAULT_CONTEXT_SUBMENUS) {
       const meId = `submenu:${key}`;
       const hidden = this.ctxIsHidden(meId);
       new Setting(host)
@@ -5979,7 +5979,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
   /** A setting-description fragment with `backtick` → <code>, for setDesc(). */
   private codeDesc(text: string): DocumentFragment {
-    const f = document.createDocumentFragment();
+    const f = activeDocument.createDocumentFragment();
     this.appendCode(f, text);
     return f;
   }
