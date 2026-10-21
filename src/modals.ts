@@ -757,12 +757,43 @@ export class NoteWorkbench {
     new FormatInspectorModal(this.app, ta).open();
   }
 
+  /** 0.574.0: does this keydown SAVE the note (vs add a new line)? Only on the
+   *  Edit surface: plain Enter saves unless the `editEnterNewline` setting is on.
+   *  Shift+Enter is always a new line; ⌘/Ctrl+Enter is the host's commit chord
+   *  (handled by the modal scope / tab keydown, not here). Split mode never
+   *  saves on Enter — its textarea is for picking a split point. */
+  private enterSaves(e: KeyboardEvent): boolean {
+    if (this.surface !== "edit" || e.key !== "Enter" || e.isComposing) return false;
+    if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return false;
+    return !this.enterNewline();
+  }
+
+  /** 0.574.0: this window's Enter mode — the setting, unless the mobile Enter
+   *  button flipped it for this window (a phone keyboard has no Shift+Enter, so
+   *  without the button a new line would be impossible in the default mode). */
+  private enterNewlineOverride: boolean | null = null;
+  private enterNewline(): boolean {
+    return this.enterNewlineOverride ?? getSettings().editEnterNewline;
+  }
+
   private enhanceTextarea(ta: HTMLTextAreaElement): void {
     this.autocomplete?.detach();
-    // 0.202.0: in the workbench, Mod+Enter commits — every other Enter is a
-    // newline, so list continuation always applies.
-    this.autocomplete = new ComposerAutocomplete(this.app, ta, { insertsNewline: () => true });
+    // 0.202.0: Mod+Enter commits. 0.574.0: on the Edit surface plain Enter saves
+    // too (unless editEnterNewline), so list continuation must skip THAT Enter.
+    this.autocomplete = new ComposerAutocomplete(this.app, ta, { insertsNewline: (e) => !this.enterSaves(e) });
     this.autocomplete.attach();
+    // 0.574.0: Enter-to-save. Bubble phase, so anything that already claimed this
+    // Enter (autocomplete pick, list/table continuation, IME) preventDefault'd
+    // first and wins.
+    ta.addEventListener("keydown", (e) => {
+      if (e.defaultPrevented || !this.enterSaves(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // A held-down Enter must not carry into the NEXT queued note's window
+      // (the multi-note edit queue opens it ~80ms after this one closes).
+      if (e.repeat) return;
+      void this.commit();
+    });
 
     // 0.336.0: formatting toolbar above the editor textarea — edit-modal parity
     // with the composer (0.332.0). Inserted before the textarea so it never
@@ -1257,7 +1288,15 @@ export class NoteWorkbench {
     updateCount();
 
     const help = this.host.createDiv({ cls: "stashpad-split-help" });
-    if (!Platform.isPhone) help.setText("Edit the note, then Save.  ·  ⌘/Ctrl+Enter or Save to write  ·  ⌘/Ctrl+S → Split  ·  Esc discards.");
+    // Help line + Save hint follow this window's Enter mode; paintEnterMode()
+    // repaints them in place when the mobile button flips it.
+    const paintHelp = (): void => {
+      if (Platform.isPhone) return;
+      help.setText(!this.enterNewline()
+        ? "Edit the note, then Save.  ·  Enter or Save to write, Shift+Enter for a new line  ·  ⌘/Ctrl+S → Split  ·  Esc discards."
+        : "Edit the note, then Save.  ·  ⌘/Ctrl+Enter or Save to write  ·  ⌘/Ctrl+S → Split  ·  Esc discards.");
+    };
+    paintHelp();
     const actions = this.host.createDiv({ cls: "stashpad-split-actions" });
     const cancel = actions.createEl("button", { cls: "stashpad-split-cancel-btn" });
     setIcon(cancel.createSpan({ cls: "stashpad-split-btn-icon" }), "x");
@@ -1269,11 +1308,38 @@ export class NoteWorkbench {
     this.renderPopOut(actions);
     this.renderOpenExternal(actions);
     const right = actions.createDiv({ cls: "stashpad-split-actions-right" });
+    // 0.574.0: mobile Enter-mode button (same icons as the composer's). A phone
+    // keyboard can't send Shift+Enter, so this is how you get a new line there
+    // while Enter saves. Applies to this window only; the setting is untouched.
+    // Updated IN PLACE (no re-render), so the caret, selection, scroll and the
+    // textarea's undo history all survive the tap.
+    const enterBtn = Platform.isMobile ? right.createEl("button", { cls: "stashpad-split-enter-mode-btn" }) : null;
+    if (enterBtn) {
+      enterBtn.onmousedown = (e) => e.preventDefault();
+      enterBtn.onclick = () => {
+        this.enterNewlineOverride = !this.enterNewline();
+        paintEnterMode();
+        this.cursorTextarea?.focus({ preventScroll: true });
+      };
+    }
     const saveBtn = right.createEl("button", { cls: "stashpad-split-confirm-btn mod-cta" });
     setIcon(saveBtn.createSpan({ cls: "stashpad-split-btn-icon" }), "save");
     saveBtn.createSpan({ text: "Save" });
+    const saveHint = saveBtn.createSpan({ cls: "stashpad-split-esc-hint" });
     saveBtn.onmousedown = (e) => e.preventDefault();
     saveBtn.onclick = () => void this.commit();
+    const paintEnterMode = (): void => {
+      const enterSaves = !this.enterNewline();
+      paintHelp();
+      saveHint.setText(enterSaves ? " (↵)" : Platform.isMacOS ? " (⌘↵)" : " (Ctrl+↵)");
+      if (!enterBtn) return;
+      enterBtn.empty();
+      setIcon(enterBtn, enterSaves ? "corner-down-left" : "arrow-big-down-dash");
+      const label = enterSaves ? "Return saves (tap so Return adds a new line)" : "Return adds a new line (tap so Return saves)";
+      enterBtn.setAttr("aria-label", label);
+      enterBtn.title = label;
+    };
+    paintEnterMode();
   }
 
   /** 0.317.0: "Reply to …" chip on the edit surface (see WorkbenchCallbacks.reply).

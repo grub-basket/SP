@@ -3536,6 +3536,7 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .is-mobile .stashpad-split-cancel-btn,
 .is-mobile .stashpad-split-confirm-btn,
 .is-mobile .stashpad-split-popout-btn,
+.is-mobile .stashpad-split-enter-mode-btn,
 .is-mobile .stashpad-split-case-btn {
   /* Obsidian mobile forces height: 44px on buttons — override to size to content. */
   height: auto;
@@ -3556,7 +3557,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .is-mobile .stashpad-split-modal .stashpad-split-actions { flex-wrap: wrap; gap: 6px; }
 .is-mobile .stashpad-split-cancel-btn,
 .is-mobile .stashpad-split-confirm-btn,
-.is-mobile .stashpad-split-popout-btn { padding: 6px 10px; }
+.is-mobile .stashpad-split-popout-btn,
+.is-mobile .stashpad-split-enter-mode-btn { padding: 6px 10px; }
+/* 0.574.0: icon-only Return-mode button beside Save — icon sized like the
+   other action buttons' icons. */
+.stashpad-split-enter-mode-btn { display: inline-flex; align-items: center; justify-content: center; align-self: stretch; }
+.stashpad-split-enter-mode-btn svg { width: 14px; height: 14px; }
 .is-mobile .stashpad-split-esc-hint { display: none; }
 /* Let Save flow inline with the others (wraps to a tidy grid) instead of being
    pushed to its own row by margin-left:auto. */

@@ -446,6 +446,11 @@ export interface StashpadSettings {
   /** 0.375.0: Markdown table assists in the editor — Tab/Shift+Tab move between
    *  cells (auto-aligning the table), Enter adds a row / exits an empty one. */
   tableAssists: boolean;
+  /** 0.574.0: on the edit surface (edit modal + popped-out edit tab), Enter
+   *  saves and Shift+Enter adds a new line by default. Turning this on swaps
+   *  them back: Enter adds a new line, Shift+Enter does too. ⌘/Ctrl+Enter saves
+   *  either way. Split mode is untouched (Enter is always a new line there). */
+  editEnterNewline: boolean;
   /** 0.378.0: opt-in in-vault config folder. "" = off (settings live in
    *  data.json as always); a path = the large list-type settings (snippets,
    *  saved views, menus, templates, per-folder appearance) live in that vault
@@ -1385,6 +1390,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   showNotePreviewButton: true,
   showExpandToggle: true,
   tableAssists: true,
+  editEnterNewline: false,
   configFolder: "",
   configMirrors: [],
   composerActionCommand: "command-palette:open",
@@ -5089,6 +5095,8 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.newTabsInBackground, (v) => { this.plugin.settings.newTabsInBackground = v; }, ["background", "tab", "focus", "steal", "new"]));
     cats.windowsTabs.push(toggle("Switching folders always brings the tab to the front", "The exception to “New tabs open in the background”: when you switch folders — the folder switcher, the folder menu in a Stashpad tab's header, the folders panel, a folder picked in Search, or the file explorer's “Open folder in Stashpad” — the folder's new tab takes focus, so you land where you chose. Notes, attachments, reminders and other new tabs still open in the background. Only matters while “New tabs open in the background” is on. On by default.",
       () => this.plugin.settings.folderSwitchTakesFocus, (v) => { this.plugin.settings.folderSwitchTakesFocus = v; }, ["folder", "switch", "switcher", "background", "tab", "focus", "steal", "front", "exception"]));
+    cats.composerCopy.push(toggle("Enter adds a new line when editing a note", "Off: in the edit window, Enter saves the note and Shift+Enter adds a new line. On: Enter adds a new line, and you save with ⌘/Ctrl+Enter or the Save button. ⌘/Ctrl+Enter saves either way. Off by default.",
+      () => this.plugin.settings.editEnterNewline, (v) => { this.plugin.settings.editEnterNewline = v; }, ["enter", "return", "shift", "save", "newline", "new line", "edit", "editor", "submit", "key"]));
     cats.composerCopy.push(toggle("Line numbers in the editor", "Show a line-number gutter beside the edit/split editor, and a line count alongside the word and character counts. Desktop only — on a phone the gutter costs width the editor needs more. On by default.",
       () => this.plugin.settings.showEditorLineNumbers, (v) => { this.plugin.settings.showEditorLineNumbers = v; }, ["line", "number", "gutter", "editor", "count"]));
     cats.composerCopy.push(toggle("Auto-pair Markdown syntax", "Brackets, parentheses, quotes (double + single, at word starts only — apostrophes are safe), inline code, **bold**, ~~strikethrough~~ and ==highlight== markers auto-close with the caret between them. Select text first and the character WRAPS it instead of replacing it (press again to nest: [note] → [[note]], *word* → **word**). Typing the closing character steps over an existing one, and Backspace on an empty pair removes both. Applies to the composer and the edit/split textareas. On by default.",
