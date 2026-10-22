@@ -5,6 +5,7 @@ import { renderCountBadge } from "./panels-view";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { formatDateTime, formatDateOnly } from "./format";
 import { parseDueString, isBareDateDue } from "./due-warmth";
+import { titleFromBasename } from "./slug-service";
 import {
   ROOT_ID,
   STASHPAD_DETAIL_VIEW_TYPE,
@@ -587,7 +588,7 @@ export class StashpadDetailView extends ItemView {
 
   private titleFor(file: TFile): string {
     // Strip the trailing -id suffix that Stashpad slug filenames carry.
-    return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+    return titleFromBasename(file.basename);
   }
 
   private stripFrontmatter(raw: string): string {

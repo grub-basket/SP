@@ -23,6 +23,8 @@ export const STASHPAD_AGGREGATE_VIEW_TYPE = "stashpad-aggregate";
 /** 0.364.0: kanban board — property-pivot by color. Each color (+ "No color")
  *  becomes a column, notes are cards, dragging a card sets its color. */
 export const STASHPAD_KANBAN_VIEW_TYPE = "stashpad-kanban";
+/** 0.577.0: Focus view — today's tasks + pomodoro / stopwatch (focus-view.ts). */
+export const STASHPAD_FOCUS_VIEW_TYPE = "stashpad-focus";
 /** 0.530.0: showcase — one level as a flat review page (big images/PDFs + a
  *  feedback column made of the sections' child notes). */
 export const STASHPAD_SHOWCASE_VIEW_TYPE = "stashpad-showcase";
@@ -179,6 +181,14 @@ export const RESERVED_FRONTMATTER: readonly string[] = [
   // Stashpad-managed (rebuilt by the OKF pass). The user-editable OKF fields
   // (okfType/okfTitle/okfTimestamp) are intentionally NOT reserved.
   "okfParent", "okfChildren",
+  // 0.577.0: Focus view (focus-time.ts) — a clone must not land on today's list.
+  // `focusLog` / `focusMinutes` are deliberately NOT reserved: "Merge copies"
+  // and import drop reserved keys, which would throw away time logged on
+  // another device. A clone carrying the log is the lesser problem.
+  "focusDate",
+  // 0.578.0: the "done today" stamp on a rolled repeating task — also per-note
+  // Focus state a clone must not inherit.
+  "focusDone",
 ] as const;
 
 /** Reserved Stashpad subfolder names (machine-managed; not user notes).

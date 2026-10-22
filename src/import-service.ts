@@ -4,7 +4,7 @@ import type StashpadPlugin from "./main";
 import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink, yamlQuote } from "./types";
 import { readId } from "./id-service";
 import { formatDateOnly } from "./format";
-import { bodyToSlug, buildFilename } from "./slug-service";
+import { bodyToSlug, buildFilename, datePrefixFor, createdMsOf } from "./slug-service";
 import { splitFrontmatter, serializeNote, importStashZip, STASH_EXT } from "./stash-package";
 import { resolveStashBytes, isEncryptedStash } from "./stash-crypto";
 import { secretIdForStashName } from "./passphrase";
@@ -439,7 +439,7 @@ export class ImportService {
     // filename is just slug+id — or the note already opens with it).
     const finalBody = typeof fm.id === "string" && fm.id ? body : this.withTitleHeading(file.basename, body);
     const slug = bodyToSlug(finalBody) || file.basename;
-    const notePath = await this.uniquePath(folder, buildFilename(slug, cloneFm.id));
+    const notePath = await this.uniquePath(folder, buildFilename(slug, cloneFm.id, this.datePrefix(cloneFm.created)));
     await this.createNote(notePath, serializeNote(cloneFm, finalBody));
     return { kind: "md", folder, archivePath, notePath, originalName: file.name };
   }
@@ -467,7 +467,7 @@ export class ImportService {
     // 0.79.18: embed the attachment (! prefix) so it previews inline.
     const body = `${title}\n\n![[${attachmentPath}]]\n`;
     const slug = bodyToSlug(title) || title;
-    const notePath = await this.uniquePath(folder, buildFilename(slug, id));
+    const notePath = await this.uniquePath(folder, buildFilename(slug, id, this.datePrefix(fm.created)));
     await this.createNote(notePath, serializeNote(fm, body));
     return { kind: "file", folder, attachmentPath, notePath, originalName: file.name };
   }
@@ -553,7 +553,7 @@ export class ImportService {
       id, parent: parentId, created: new Date().toISOString(), attachments: [],
     };
     const slug = bodyToSlug(title) || title;
-    const notePath = await this.uniquePath(root, buildFilename(slug, id));
+    const notePath = await this.uniquePath(root, buildFilename(slug, id, this.datePrefix(fm.created)));
     await this.createNote(notePath, serializeNote(fm, `${title}\n`));
     notePaths.push(notePath);
     return id;
@@ -619,7 +619,7 @@ export class ImportService {
           // for Stashpad-origin notes (incomingId — filename is slug+id).
           const finalBody = incomingId ? body : this.withTitleHeading(child.basename, body);
           const slug = bodyToSlug(finalBody) || child.basename;
-          const notePath = await this.uniquePath(root, buildFilename(slug, cloneFm.id));
+          const notePath = await this.uniquePath(root, buildFilename(slug, cloneFm.id, this.datePrefix(cloneFm.created)));
           await this.createNote(notePath, serializeNote(cloneFm, finalBody));
           notePaths.push(notePath);
         } else if (NON_NOTE_EXTENSIONS.has(child.extension)) {
@@ -635,7 +635,7 @@ export class ImportService {
           };
           const body = `${child.basename}\n\n![[${child.path}]]\n`;
           const slug = bodyToSlug(child.basename) || child.basename;
-          const notePath = await this.uniquePath(root, buildFilename(slug, id));
+          const notePath = await this.uniquePath(root, buildFilename(slug, id, this.datePrefix(fm.created)));
           await this.createNote(notePath, serializeNote(fm, body));
           notePaths.push(notePath);
         }
@@ -1207,6 +1207,11 @@ export class ImportService {
   }
 
   /** Return `dir/name`, suffixing the stem with -1, -2, … until free. */
+  /** 0.580.0: date-time file-name prefix from the note's created stamp. */
+  private datePrefix(created: unknown): string {
+    return datePrefixFor(this.plugin.settings, createdMsOf(created) ?? Date.now());
+  }
+
   private async uniquePath(dir: string, name: string): Promise<string> {
     const adapter = this.app.vault.adapter;
     const dot = name.lastIndexOf(".");

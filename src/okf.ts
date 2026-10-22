@@ -1,6 +1,7 @@
 import type { App, TFile } from "obsidian";
 import { ROOT_ID } from "./types";
 import { splitFrontmatter } from "./stash-package";
+import { titleFromBasename } from "./slug-service";
 
 /** OKF (Open Knowledge Format) — Phase 2: the complementary frontmatter model +
  *  the template + the per-folder rebuild. See docs/branches/okf.md.
@@ -31,7 +32,7 @@ export const OKF_LEGEND = [
 
 /** Human/LLM-readable label for an OKF link (drop the -<id> filename suffix). */
 export function okfTitleFromFile(file: TFile): string {
-  return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || file.basename;
+  return titleFromBasename(file.basename).trim() || file.basename;
 }
 /** A relative markdown link to a sibling note (Stashpad folders are flat, so the
  *  target is just the filename). Spaces %-encoded so the link is valid. */

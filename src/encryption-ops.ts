@@ -6,6 +6,7 @@ import { type StashpadId } from "./types";
 import { readId } from "./id-service";
 import { unzipFiles, zipFiles } from "./zip";
 import { safeFileName } from "./safe-filename";
+import { titleFromBasename } from "./slug-service";
 
 /** In-vault locked-bundle extension (NOT `.stash` — `.stash` is an export to
  *  import; `.stashenc` is locked-in-place and must never auto-import). */
@@ -276,7 +277,7 @@ async function writeBlobVerified(app: App, blobPath: string, blob: Uint8Array): 
 }
 
 function titleFromFile(file: TFile): string {
-  return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || file.basename;
+  return titleFromBasename(file.basename).trim() || file.basename;
 }
 function safeBlobBase(title: string): string {
   return safeFileName(title, { max: 60, fallback: "locked" });

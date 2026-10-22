@@ -2830,6 +2830,26 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    bug as the react button above — under display:contents it auto-flowed into an
    implicit row and dropped BELOW the note body. Give it a top-row slot. */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-preview { grid-area: preview; }
+/* 0.579.0: the mobile row's configured buttons (settings → Item buttons —
+   mobile: React and any others the user turned on) share one wrapper in the
+   `react` slot, so they stay on the top row in the user's order. Buttons inside
+   match the other top-row buttons' size. */
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-rowbtns {
+  grid-area: react;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-rowbtns > button {
+  align-self: center;
+  width: 22px;
+  height: 22px;
+}
+.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-rowbtns > button .svg-icon {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+}
 /* 0.276.4: the FOCUSED heading-note header crammed its title (in
    .stashpad-focused-body) onto the same row as the timestamp + action buttons
    on mobile. Mirror the body-note layout: timestamp + buttons on top, the
@@ -4099,6 +4119,20 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 /* The open-link (🔗) button sits right of the ⚡ actions button in the cluster on
    every platform, including mobile (0.148.2 — was hidden under 480px before, but
    it's wanted on phones). The same action also stays in the ⚡ actions menu. */
+/* 0.576.0: with the route button back in the cluster (9 fixed-width buttons
+   plus filters + compact), a 360px phone pushed the compact toggle — the only
+   way out of compact mode, since compact hides the breadcrumb — 12px past the
+   edge. On narrow phones the cluster buttons slim to 28px with tighter gaps
+   (saves ~40px; measured: fits at 360). */
+@media (max-width: 380px) {
+  .stashpad-view.is-mobile .stashpad-mobile-actions { gap: 3px; margin-right: 4px; }
+  .stashpad-view.is-mobile .stashpad-mobile-actions .stashpad-mobile-action-btn { width: 28px; }
+}
+/* …and the smallest phones (320px, 1st-gen iPhone SE) a step tighter. */
+@media (max-width: 340px) {
+  .stashpad-view.is-mobile .stashpad-mobile-actions { gap: 2px; margin-right: 3px; }
+  .stashpad-view.is-mobile .stashpad-mobile-actions .stashpad-mobile-action-btn { width: 25px; }
+}
 
 /* Bottom Home/Back/Bookmarks toolbar is redundant now that the
    breadcrumb has a house-icon Home button + Alt+Left for back. Hide
@@ -11826,8 +11860,9 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 .stashpad-cal-loading-icon .svg-icon { width: 16px; height: 16px; }
 @keyframes stashpad-cal-spin { to { transform: rotate(360deg); } }
 
-/* 0.441.0: route (jump-to-level) button at the left of the mobile breadcrumb. */
-.stashpad-breadcrumb .stashpad-crumb-route { flex: 0 0 auto; margin-right: 2px; }
+/* 0.576.0: the mobile route (jump-to-level) button moved from the breadcrumb
+   into the actions cluster (left of the command button); it uses the cluster's
+   standard .stashpad-mobile-action-btn styling, so no rule of its own. */
 
 /* 0.444.0 (/dump): a left bar on rendered blockquotes so it's clear WHY the text
    is indented (a ">" quote). Applies in note rows, the focused heading, previews. */
@@ -12654,3 +12689,84 @@ body.is-mobile .stashpad-showcase .stashpad-showcase-att-pin { min-height: 32px;
 .stashpad-folder-setup-modal .setting-item-control { gap: 8px; }
 .stashpad-folder-setup-icon-preview { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; color: var(--text-muted); flex-shrink: 0; }
 .stashpad-folder-setup-icon-preview svg { width: 18px; height: 18px; }
+
+/* ==========================================================================
+   0.577.0: Focus view — today's tasks + pomodoro / stopwatch (src/focus-view.ts).
+   ========================================================================== */
+.stashpad-focus { display: flex; flex-direction: column; gap: 10px; padding-top: 10px; padding-left: 12px; padding-right: 12px; padding-bottom: calc(16px + var(--sp-safe-bottom)); box-sizing: border-box; max-width: 760px; margin: 0 auto; width: 100%; }
+.stashpad-focus-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.stashpad-focus-heading { display: flex; align-items: baseline; gap: 8px; }
+.stashpad-focus-title { margin: 0; font-size: var(--font-ui-large); }
+.stashpad-focus-date, .stashpad-focus-summary { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.stashpad-focus-summary { flex: 1 1 auto; }
+.stashpad-focus-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.stashpad-focus-btn { display: inline-flex; align-items: center; gap: 6px; }
+.stashpad-focus-btn-icon { display: inline-flex; }
+.stashpad-focus-btn-icon svg { width: 16px; height: 16px; }
+.stashpad-focus-meta { color: var(--text-muted); font-size: var(--font-ui-smaller); }
+.stashpad-focus-hint { color: var(--text-faint); font-size: var(--font-ui-smaller); flex-basis: 100%; }
+
+/* settings strip */
+.stashpad-focus-settings { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 10px 12px; border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); background: var(--background-secondary); }
+.stashpad-focus-setting { display: flex; align-items: center; gap: 6px; font-size: var(--font-ui-small); }
+.stashpad-focus-setting input { width: 4.5em; }
+
+/* carry-over banner */
+.stashpad-focus-carry { padding: 8px 12px; border-radius: var(--radius-m); border: 1px solid color-mix(in srgb, var(--color-orange) 45%, transparent); background: color-mix(in srgb, var(--color-orange) 10%, transparent); }
+.stashpad-focus-carry-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: var(--font-ui-small); }
+.stashpad-focus-carry-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.stashpad-focus-carry-row { display: flex; align-items: center; gap: 8px; }
+.stashpad-focus-carry-row .stashpad-focus-row-title { flex: 1 1 auto; cursor: pointer; }
+
+/* timer card */
+.stashpad-focus-timer { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 16px 14px; border-radius: var(--radius-l); border: 1px solid var(--background-modifier-border); background: var(--background-secondary); text-align: center; }
+.stashpad-focus-timer.is-running { border-color: color-mix(in srgb, var(--interactive-accent) 60%, transparent); }
+.stashpad-focus-timer.is-break { border-color: color-mix(in srgb, var(--color-green) 60%, transparent); background: color-mix(in srgb, var(--color-green) 8%, var(--background-secondary)); }
+.stashpad-focus-modes { display: inline-flex; padding: 2px; border-radius: 999px; background: var(--background-modifier-hover); }
+.stashpad-focus-mode { border: none; box-shadow: none; background: transparent; border-radius: 999px; padding: 2px 12px; height: auto; font-size: var(--font-ui-smaller); color: var(--text-muted); }
+.stashpad-focus-mode.is-active { background: var(--background-primary); color: var(--text-normal); box-shadow: var(--shadow-s); }
+.stashpad-focus-current { display: flex; flex-direction: column; align-items: center; gap: 2px; max-width: 100%; }
+.stashpad-focus-phase { color: var(--text-muted); font-size: var(--font-ui-smaller); text-transform: uppercase; letter-spacing: 0.05em; }
+.stashpad-focus-current-title { font-size: var(--font-ui-medium); font-weight: 600; cursor: pointer; overflow-wrap: anywhere; }
+.stashpad-focus-current-title:hover { text-decoration: underline; }
+.stashpad-focus-clock { font-size: 3.2em; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; letter-spacing: 0.02em; }
+.stashpad-focus-timer.is-idle .stashpad-focus-clock { color: var(--text-faint); }
+.stashpad-focus-controls { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.stashpad-focus-next { color: var(--text-muted); font-size: var(--font-ui-small); }
+.stashpad-focus.is-single .stashpad-focus-timer { padding: 32px 16px; margin-top: 4vh; }
+.stashpad-focus.is-single .stashpad-focus-clock { font-size: 5em; }
+.stashpad-focus.is-single .stashpad-focus-current-title { font-size: var(--font-ui-large); }
+
+/* list */
+.stashpad-focus-section { color: var(--text-muted); font-size: var(--font-ui-smaller); font-weight: 600; margin-top: 6px; }
+.stashpad-focus-list { display: flex; flex-direction: column; gap: 4px; }
+.stashpad-focus-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius-m); border-left: 3px solid var(--stashpad-focus-color, transparent); background: var(--background-primary); }
+.stashpad-focus-row:hover { background: var(--background-modifier-hover); }
+.stashpad-focus-row.is-active { background: color-mix(in srgb, var(--interactive-accent) 12%, var(--background-primary)); }
+.stashpad-focus-row.is-dragging { opacity: 0.4; }
+.stashpad-focus-row.is-dragover { box-shadow: inset 0 2px 0 var(--interactive-accent); }
+.stashpad-focus-check { margin: 0; flex: 0 0 auto; }
+.stashpad-focus-row-body { flex: 1 1 auto; min-width: 0; cursor: pointer; }
+.stashpad-focus-row-title { overflow-wrap: anywhere; }
+.stashpad-focus-row.is-completed .stashpad-focus-row-title { text-decoration: line-through; color: var(--text-muted); }
+.stashpad-focus-row-clock { font-variant-numeric: tabular-nums; font-size: var(--font-ui-smaller); color: var(--interactive-accent); font-weight: 600; }
+.stashpad-focus-play, .stashpad-focus-remove { flex: 0 0 auto; }
+.stashpad-focus-remove { opacity: 0.5; }
+.stashpad-focus-row:hover .stashpad-focus-remove, .stashpad-focus-remove:focus-visible { opacity: 1; }
+.is-mobile .stashpad-focus-remove { opacity: 0.8; }
+.stashpad-focus-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 24px 0; color: var(--text-muted); }
+
+/* status bar ticker */
+.stashpad-focus-status { display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; max-width: 260px; }
+.stashpad-focus-status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-focus-status-icon { display: inline-flex; }
+.stashpad-focus-status-icon svg { width: 13px; height: 13px; }
+.stashpad-focus-status.is-break { color: var(--color-green); }
+.stashpad-focus-status.is-paused { color: var(--text-faint); }
+
+/* picker */
+.stashpad-focus-pick { display: flex; align-items: flex-start; gap: 8px; }
+.stashpad-focus-pick-box { display: inline-flex; padding-top: 2px; color: var(--text-muted); }
+.stashpad-focus-pick.is-picked .stashpad-focus-pick-box { color: var(--interactive-accent); }
+.stashpad-focus-pick-body { min-width: 0; }
+.stashpad-focus-picker-foot { display: flex; justify-content: flex-end; padding: 8px 12px; border-top: 1px solid var(--background-modifier-border); }

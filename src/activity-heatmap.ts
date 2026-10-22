@@ -2,6 +2,7 @@ import { App, moment, setIcon } from "obsidian";
 import type StashpadPlugin from "./main";
 import type { LogEvent, LogEventType } from "./types";
 import { collectIndexRows } from "./aggregate-index";
+import { titleFromBasename } from "./slug-service";
 
 /** 0.274.0: the ACTIVITY HEATMAP — a GitHub-style calendar of how much you
  *  touched your notes each day, read from the action log (log.jsonl). Answers
@@ -325,4 +326,4 @@ function describeEvent(ev: LogEvent, title?: string): string {
   }
 }
 
-function basename(p: string): string { return (p.split("/").pop() || p).replace(/-[a-z0-9]{4,12}\.md$/, "").replace(/\.md$/, "").replace(/-/g, " ") || p; }
+function basename(p: string): string { return titleFromBasename((p.split("/").pop() || p).replace(/\.md$/, "")) || p; }

@@ -1,5 +1,7 @@
 import { App, TFile } from "obsidian";
 import { newId } from "./id-service";
+import { FOCUS_KEYS } from "./focus-time";
+import { redateStem, createdMsOf } from "./slug-service";
 
 /** 0.197.0 — clone a repeating task into its NEXT occurrence.
  *
@@ -27,7 +29,11 @@ export async function spawnNextOccurrence(
   try {
     const id = mintId();
     // Keep the human part of the filename, swap the trailing -<id>.
-    const stem = src.basename.replace(/-[a-z0-9]{4,12}$/, "") || "task";
+    // 0.580.0: the copy is a new note made now, so a date prefix on the source is
+    // re-dated to now (same separator) rather than copied stale. The archive
+    // snapshot below keeps its prefix: it IS the old occurrence.
+    const srcCreated = createdMsOf(app.metadataCache.getFileCache(src)?.frontmatter?.created);
+    const stem = redateStem(src.basename.replace(/-[a-z0-9]{4,12}$/, "") || "task", Date.now(), srcCreated);
     const dir = src.parent?.path ? `${src.parent.path}/` : "";
     let path = `${dir}${stem}-${id}.md`;
     for (let i = 2; await app.vault.adapter.exists(path); i++) path = `${dir}${stem}-${id}-${i}.md`;
@@ -44,6 +50,9 @@ export async function spawnNextOccurrence(
       delete fm.missedAt;
       delete fm.modified;
       delete fm.contributors;
+      // 0.578.0: the next occurrence isn't on today's Focus list and hasn't been
+      // worked on yet — don't copy the original's focusDate / time log.
+      for (const k of FOCUS_KEYS) delete fm[k];
     });
     return copy;
   } catch (e) {
@@ -113,6 +122,9 @@ export async function archiveOccurrenceSnapshot(
       delete fm.repeatMode;
       delete fm.remindEvery;
       delete fm.autoDoneAfter;
+      // 0.578.0: the snapshot is history, not a Focus item (the live note keeps
+      // its own focusLog — copying it here would only duplicate it).
+      for (const k of FOCUS_KEYS) delete fm[k];
     });
     return copy;
   } catch (e) {

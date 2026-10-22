@@ -143,6 +143,7 @@ import { renderInlineMarkup } from "./notifications";
 import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
 import { clipboardToMarkdownTable } from "./excel-paste";
 import { richClipboardToMarkdown } from "./rich-paste";
+import { titleFromBasename } from "./slug-service";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
 const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
@@ -1526,8 +1527,12 @@ export class NoteWorkbench {
     const nestWrap = right.createEl("label", { cls: "stashpad-split-nest" });
     const nestCb = nestWrap.createEl("input", { type: "checkbox" });
     nestCb.checked = this.nest;
-    nestWrap.createSpan({ text: "Nest lines under each part" });
+    // 0.576.0: on mobile the short label "Nest" keeps the Split row on one line
+    // of a phone (the full label wrapped it); the full meaning stays in the
+    // aria-label and, on mobile, the title (long-press).
+    nestWrap.createSpan({ text: Platform.isMobile ? "Nest" : "Nest lines under each part" });
     nestWrap.setAttr("aria-label", "Nest lines under each part: each part's first line becomes a note and its remaining lines become that note's children");
+    if (Platform.isMobile) nestWrap.title = "Nest lines under each part";
     // Update just the help line — a full re-render would drop the cursor caret.
     nestCb.onchange = () => { this.nest = nestCb.checked; setHelp(); };
 
@@ -3499,7 +3504,7 @@ export class ComposerDraftsModal extends Modal {
         const id = readId(cachedFm?.id) ?? readId(fm.id);
         if (!id) return; // not a Stashpad note
         const line = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
-        const title = (line ? draftDupTitle(line) : "") || f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+        const title = (line ? draftDupTitle(line) : "") || titleFromBasename(f.basename);
         const kept = body.trim().slice(0, NOTE_BODY_CAP);
         const created = parseCreatedMs(cachedFm?.created ?? fm.created);
         // 0.573.3: only the opening stretch is ever displayed, so keep a short

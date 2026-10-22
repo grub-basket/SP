@@ -2,6 +2,7 @@ import { App, TFile } from "obsidian";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, fmHasTag, parseAssignees, parseAuthorRef } from "./types";
 import { parseDueString } from "./due-warmth";
+import { splitDatePrefix } from "./slug-service";
 
 /** 0.126.0: a task surfaced from any Stashpad folder. Shared by the Tasks
  *  panel and the Daily-review modal so both read tasks identically. */
@@ -39,7 +40,9 @@ export interface TaskItem {
  *  to the old blind `-[a-z0-9]{4,12}$` strip. When no id is available, fall back
  *  to stripping only an exact id-shaped token (id-service alphabet, 6 chars). */
 export function titleFromTaskFile(file: TFile, id?: string | null): string {
-  let base = file.basename;
+  // 0.580.0: drop a date-time file-name prefix first (unless it is the whole title).
+  const sp = splitDatePrefix(file.basename);
+  let base = sp && sp.rest && !(id && sp.rest === id) ? sp.rest : file.basename;
   if (id && base.endsWith(`-${id}`)) {
     base = base.slice(0, -(id.length + 1));
   } else if (!id) {

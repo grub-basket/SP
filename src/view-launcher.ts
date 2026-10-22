@@ -77,6 +77,14 @@ export const LAUNCHER_ENTRIES: LauncherEntry[] = [
     command: "stashpad:stashpad-open-all-tasks",
   },
   {
+    id: "focus",
+    label: "Focus (today)",
+    keywords: "focus today pomodoro timer stopwatch time tracking track punch clock daily plan tasks one at a time",
+    hint: "Today's tasks with a pomodoro / stopwatch — time is logged to each note",
+    icon: "target",
+    command: "stashpad:stashpad-open-focus",
+  },
+  {
     id: "timeline",
     label: "Task timeline",
     keywords: "aggregate timeline tasks created completed span axis gantt",

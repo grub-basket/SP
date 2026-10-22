@@ -16,6 +16,7 @@ import { renderActivityHeatmap, defaultHeatmapState, type HeatmapState } from ".
 import { renderAggModeBar, type AggMode } from "./agg-modes";
 import { returnToOriginOnClose } from "./leaf-return";
 import { settleNewTab } from "./view-helpers";
+import { titleFromBasename } from "./slug-service";
 
 // Obsidian types `moment` as a namespace (not callable); cast to a callable.
 const momentFn = moment as unknown as (...args: unknown[]) => { fromNow: () => string };
@@ -377,7 +378,7 @@ export class StashpadAggregateView extends ItemView {
   private archivePlainRow(container: HTMLElement, f: TFile): void {
     const row = container.createDiv({ cls: "stashpad-trash-row" });
     const main = row.createDiv({ cls: "stashpad-trash-row-main" });
-    main.createSpan({ cls: "stashpad-trash-title", text: f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || f.basename });
+    main.createSpan({ cls: "stashpad-trash-title", text: titleFromBasename(f.basename).trim() || f.basename });
     main.createSpan({ cls: "stashpad-trash-sub", text: `archived ${momentFn(f.stat.mtime).fromNow()}` });
     const restore = row.createEl("button", { cls: "stashpad-trash-restore", text: "Restore" });
     setIcon(restore.createSpan({ cls: "stashpad-btn-icon" }), "rotate-ccw");

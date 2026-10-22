@@ -324,8 +324,147 @@ export function bodyToSlug(body: string, stopwords: string[] = DEFAULT_STOPWORDS
   return `${slug}${markerSuffix}`;
 }
 
-export function buildFilename(slug: string, id: string): string {
-  return `${slug}-${id}.md`;
+/** `prefix` is the optional date-time prefix (see formatDatePrefix); "" = none. */
+export function buildFilename(slug: string, id: string, prefix = ""): string {
+  return prefix ? `${prefix}-${slug}-${id}.md` : `${slug}-${id}.md`;
+}
+
+// ── Date-time file-name prefix (0.580.0) ─────────────────────────────────────
+// `2026-10-22-1430-Grocery-List-k7m3pq.md`: the creation time in front so a
+// plain file explorer sorts notes and attachments by when they were made.
+// Year-month-day order is fixed (it is the only order that sorts correctly by
+// name); the user picks the separator between the date parts, or none.
+//
+// THE NO-FIGHT RULE. Title-change renames (reslug, Rebootstrap's slug pass)
+// decide "is this name up to date?" with noteNameMatches, which accepts the
+// `<slug>-<id>.md` tail with OR without the note's own date prefix in front. So
+// the prefix is never the reason for a title rename, a title rename never adds
+// or strips one (it carries the existing prefix over verbatim), and only the
+// explicit add/remove-dates command changes the prefix on an existing file.
+//
+// "The note's own date prefix" = a leading date-time whose minute is the note's
+// `created` time (allowing whole-hour time-zone shifts), so a TITLE that starts
+// with some other date-time ("2026-10-22 1500 standup", made at 14:30) is never
+// mistaken for one. The bulk sweep goes further and reads each note's title.
+
+export type DatePrefixSep = "-" | "." | "_" | "";
+export const DATE_PREFIX_SEPS: readonly DatePrefixSep[] = ["-", ".", "_", ""];
+
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+
+/** Local-time `YYYY<sep>MM<sep>DD-HHmm` for `ms`. */
+export function formatDatePrefix(ms: number, sep: DatePrefixSep): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}${sep}${pad2(d.getMonth() + 1)}${sep}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}`;
+}
+
+/** The prefix for a NEW file made at `ms`, or "" when the setting is off. */
+export function datePrefixFor(
+  s: { fileDatePrefix?: boolean; fileDatePrefixSep?: DatePrefixSep },
+  ms: number,
+): string {
+  if (!s.fileDatePrefix || !Number.isFinite(ms)) return "";
+  const sep = DATE_PREFIX_SEPS.includes(s.fileDatePrefixSep as DatePrefixSep) ? s.fileDatePrefixSep! : "-";
+  return formatDatePrefix(ms, sep);
+}
+
+// Any separator variant, followed by the joining dash. The date separator must
+// repeat (`\2`) so `2026-10.22` is not a prefix.
+const DATE_PREFIX_RE = /^(\d{4})([-._]?)(\d{2})\2(\d{2})-(\d{2})(\d{2})-/;
+
+/** Split a leading date-time prefix off `name` by SHAPE alone. `prefix` excludes
+ *  the joining dash; `ms` is its local time. Null when there is none or the
+ *  numbers are not a real date. Shape alone cannot tell a prefix from a title
+ *  that starts with a date — callers that care check `ms` against the note's
+ *  created time (prefixFitsCreated). */
+export function splitDatePrefix(name: string): { prefix: string; rest: string; ms: number } | null {
+  const m = name.match(DATE_PREFIX_RE);
+  if (!m) return null;
+  const y = +m[1], mo = +m[3], d = +m[4], h = +m[5], mi = +m[6];
+  if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59) return null;
+  const date = new Date(y, mo - 1, d, h, mi);
+  if (date.getMonth() !== mo - 1) return null; // 2026-02-31
+  return { prefix: m[0].slice(0, -1), rest: name.slice(m[0].length), ms: date.getTime() };
+}
+
+/** `stem` (a basename without its `-<id>`) with its date prefix re-dated to
+ *  `ms`, keeping the separator it was written with. Unchanged when it has no
+ *  prefix that fits `createdMs` (e.g. a title that merely starts with a date). */
+export function redateStem(stem: string, ms: number, createdMs: number | null): string {
+  const sp = splitDatePrefix(stem);
+  if (!sp || !sp.rest || !prefixFitsCreated(sp.ms, createdMs)) return stem;
+  const sep = (/^\d{4}([-._])/.exec(sp.prefix)?.[1] ?? "") as DatePrefixSep;
+  return `${formatDatePrefix(ms, sep)}-${sp.rest}`;
+}
+
+/** Could `prefixMs` be this file's own creation stamp? The prefix is `created`
+ *  cut to the minute in SOME time zone, so the gap must be a whole number of
+ *  quarter hours (every real UTC offset is one: +5:30, +5:45, …) up to 14h,
+ *  give or take that minute. A title time that is merely close (14:20 vs 14:30)
+ *  does not fit. With no created time to check against, the shape is trusted.
+ *  (The bulk sweep does not rely on this for notes: it reads the title.) */
+export function prefixFitsCreated(prefixMs: number, createdMs: number | null): boolean {
+  if (createdMs == null) return true;
+  const diff = Math.abs(prefixMs - createdMs);
+  for (let q = 0; q <= 56; q++) if (Math.abs(diff - q * 900_000) < 60_000) return true;
+  return false;
+}
+
+/** Is `name` already the right file name for this slug + id? True for
+ *  `<slug>-<id>.md` and for `<any date prefix>-<slug>-<id>.md`. This is the
+ *  check every title-change rename must use (see THE NO-FIGHT RULE above). */
+export function noteNameMatches(name: string, slug: string, id: string, createdMs: number | null = null): boolean {
+  const tail = `${slug}-${id}.md`;
+  if (name === tail) return true;
+  if (!name.endsWith(`-${tail}`)) return false;
+  const sp = splitDatePrefix(name.slice(0, name.length - tail.length));
+  return !!sp && sp.rest === "" && prefixFitsCreated(sp.ms, createdMs);
+}
+
+/** The new name for a title-change rename, or null when `current` is already
+ *  right. The file's own date prefix (if any) is carried over verbatim: a title
+ *  edit never adds, strips or reformats it — that is the bulk command's job. */
+export function reslugName(current: string, slug: string, id: string, createdMs: number | null): string | null {
+  if (noteNameMatches(current, slug, id, createdMs)) return null;
+  const sp = splitDatePrefix(current);
+  // Only keep it when it is this note's own stamp, not a title that starts with
+  // a date (e.g. "2026-03-01 1200 standup" → slug starts with digits).
+  const prefix = sp && sp.rest && prefixFitsCreated(sp.ms, createdMs) ? sp.prefix : "";
+  const next = buildFilename(slug, id, prefix);
+  return next === current ? null : next;
+}
+
+/** A display title from a note's basename (fallback when the body is not
+ *  available): drops the date prefix and the `-<id>` tail, dashes → spaces.
+ *  Callers trim. */
+export function titleFromBasename(basename: string): string {
+  const sp = splitDatePrefix(basename);
+  // Keep the "prefix" when nothing but the id follows it: then it IS the title.
+  const base = sp && sp.rest && !/^[a-z0-9]{4,12}$/.test(sp.rest) ? sp.rest : basename;
+  return base.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+}
+
+/** Frontmatter `created` → epoch ms (ISO string or number), null if unusable.
+ *  A date-only value ("2026-03-05", common in imported notes) is LOCAL midnight:
+ *  Date.parse reads it as UTC midnight, which is the previous day west of UTC. */
+export function createdMsOf(v: unknown): number | null {
+  if (v instanceof Date) v = v.getTime();
+  if (typeof v === "string") {
+    const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v.trim());
+    if (d) return new Date(+d[1], +d[2] - 1, +d[3]).getTime();
+  }
+  const ms = typeof v === "number" ? v : typeof v === "string" ? Date.parse(v) : NaN;
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** An attachment's upload time from its `-<stamp>` suffix (base36 ms, see
+ *  buildAttachmentName), or null. `stem` is the name without its extension. */
+export function attachmentStampMs(stem: string): number | null {
+  const m = stem.match(/-([0-9a-z]{7,9})$/);
+  if (!m) return null;
+  const ts = parseInt(m[1], 36);
+  if (!Number.isFinite(ts) || ts < 1.42e12 || ts > Date.now() + 86_400_000) return null;
+  return ts;
 }
 
 export function parseIdFromFilename(basename: string): string | null {
@@ -354,10 +493,12 @@ export function isNoteId(id: unknown): id is string {
  *  Files with no extension just get `-<stamp>` appended. 0.109.0 — the stamp
  *  used to be a prefix (`lqf3k2a9-photo.png`); suffixing keeps the readable
  *  name first and the original extension last. */
-export function buildAttachmentName(originalName: string, stamp: string): string {
+export function buildAttachmentName(originalName: string, stamp: string, prefix = ""): string {
   const dot = originalName.lastIndexOf(".");
-  if (dot > 0) return `${originalName.slice(0, dot)}-${stamp}${originalName.slice(dot)}`;
-  return `${originalName}-${stamp}`;
+  const name = dot > 0
+    ? `${originalName.slice(0, dot)}-${stamp}${originalName.slice(dot)}`
+    : `${originalName}-${stamp}`;
+  return prefix ? `${prefix}-${name}` : name;
 }
 
 /** Detect a legacy *prefix*-stamped attachment name (`<stamp>-<rest>`) so

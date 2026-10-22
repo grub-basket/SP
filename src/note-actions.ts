@@ -65,6 +65,12 @@ export function defaultActionIcon(id: string): string { return BY_ID.get(id)?.ic
 /** LEGACY export kept so existing imports (settings/view) don't break — the
  *  quick menu now draws from the full catalog. `QUICK_MENU_MORE` unchanged. */
 export const QUICK_ACTION_CATALOG = NOTE_ACTION_CATALOG;
+/** 0.579.1: menu-only actions (CONTEXT_EXTRA_ACTIONS) the star menu can also run
+ *  — i.e. ones view.ts `runNoteActionInner` handles. The default star menu
+ *  lists "moveInList", but the star menu resolved ids against the catalog only
+ *  and silently dropped it, while settings showed it. Add an id
+ *  here only together with its runNoteActionInner case. */
+export const QUICK_MENU_EXTRA_IDS: readonly string[] = ["moveInList"];
 export type QuickActionDef = NoteActionDef;
 export const QUICK_MENU_MORE = { label: "More commands…", icon: "ellipsis" };
 
@@ -74,9 +80,33 @@ export const BUTTON_ACTION_CATALOG = NOTE_ACTION_CATALOG.filter((a) => a.button)
 /** 0.475.0: the built-in DESKTOP row buttons, as the default `settings.itemButtons`
  *  order — so the item-buttons settings editor lists them and the user can hide or
  *  reorder them (parity with the other menu editors). Existing installs are
- *  migrated to prepend these (see main.ts). Mobile keeps its own minimal row and
- *  ignores these ids. `react` is rendered specially (it opens the picker). */
+ *  migrated to prepend these (see main.ts). Mobile has its own list
+ *  (`itemButtonsMobile`, below). `react` is rendered specially (it opens the picker). */
 export const DEFAULT_ROW_BUTTONS: readonly string[] = ["edit", "focus", "reply", "react"];
+
+/** 0.579.0: the default MOBILE row buttons (`settings.itemButtonsMobile`). A phone
+ *  row is narrow, so only React is on by default (Edit / Focus / Reply live in the
+ *  ⋮ menu); the user can turn the others on in settings. */
+export const DEFAULT_MOBILE_ROW_BUTTONS: readonly string[] = ["react"];
+
+/** 0.579.0: the mobile list an install gets before it has ever saved one: React
+ *  plus the user's own custom buttons from the desktop list — exactly what the
+ *  mobile row showed before it had its own list, so nothing moves on upgrade. */
+export function deriveMobileRowButtons(desktop: readonly string[]): string[] {
+  return [...DEFAULT_MOBILE_ROW_BUTTONS, ...desktop.filter((id) => !DEFAULT_ROW_BUTTONS.includes(id))];
+}
+
+/** 0.579.0: the row-button list in effect for a platform. The mobile list stays
+ *  UNSET (undefined) until the user edits it, and is derived from the desktop
+ *  list on every read until then — never stored. Storing a derived copy went
+ *  stale whenever the desktop list changed underneath it (a config folder that
+ *  syncs in after startup, another device's edit), and the stale copy then won
+ *  the next save (blind review). Unset also lets the settings collision guard
+ *  adopt another device's saved mobile list instead of overwriting it. */
+export function rowButtonsFor(s: { itemButtons?: readonly string[]; itemButtonsMobile?: readonly string[] }, mobile: boolean): string[] {
+  if (!mobile) return [...(s.itemButtons ?? [])];
+  return s.itemButtonsMobile ? [...s.itemButtonsMobile] : deriveMobileRowButtons(s.itemButtons ?? DEFAULT_ROW_BUTTONS);
+}
 
 /** 0.320.0: the LARGE context menu's reorderable top block. Only these plain,
  *  non-stateful actions are user-reorderable; the stateful items below them in
@@ -166,6 +196,7 @@ export const ZAP_ACTIONS: readonly NoteActionDef[] = [
   { id: "replyInList",       label: "Reply to… (in-list)",               icon: "reply",              group: "Actions menu (⚡)" },
   { id: "toggleComplete",    label: "Toggle complete",                   icon: "check-circle",       group: "Actions menu (⚡)" },
   { id: "toggleTask",        label: "Toggle task (todo)",                icon: "square-check-big",   group: "Actions menu (⚡)" },
+  { id: "addToFocus",        label: "Add to / remove from Today",        icon: "target",             group: "Actions menu (⚡)" },
   { id: "assign",            label: "Assign to…",                        icon: "user-plus",          group: "Actions menu (⚡)" },
   { id: "copyOtherVault",    label: "Copy for another vault",            icon: "copy",               group: "Actions menu (⚡)" },
   { id: "cutOtherVault",     label: "Cut for another vault",             icon: "scissors",           group: "Actions menu (⚡)" },
@@ -209,7 +240,7 @@ export const ZAP_DEFAULT_ORDER: readonly string[] = [
 ];
 
 export const DEFAULT_ZAP_SUBMENUS: Record<string, { name: string; icon: string; items: string[] }> = {
-  organize: { name: "Organize",        icon: "folder-tree",  items: ["outdent", "replyInList", "setColor", "setDue", "assign", "toggleTask", "blur"] },
+  organize: { name: "Organize",        icon: "folder-tree",  items: ["outdent", "replyInList", "setColor", "setDue", "assign", "toggleTask", "addToFocus", "blur"] },
   open:     { name: "Open",            icon: "external-link", items: ["openNewTab", "openObsidian", "launchView", "openLink"] },
   share:    { name: "Copy & share",    icon: "share",        items: ["copyOtherVault", "cutOtherVault", "shareExport", "insertTemplate"] },
   merge:    { name: "Merge & split",   icon: "merge",        items: ["merge", "mergeWith", "mergeParent", "split", "forkVersion", "markVersionFinal"] },
@@ -221,6 +252,10 @@ export const CONTEXT_LEAF_IDS: readonly string[] = [
   "edit", "focus", "openNewTab", "openObsidian",
   "react", "reply", "replyLink", "split", "attributeBot",
   "copy", "clone", "fork", "setColor", "move", "moveHome", "outdent", "setDue", "largeText", "archive", "pinSidebar",
+  // 0.579.2: in the default Move ▸ submenu since 0.562.0 and rendered by the ⋮
+  // menu, but missing here — so it was dropped from a top-level custom order and
+  // couldn't be added in the editors.
+  "splitOut",
   ...CONTEXT_EXTRA_ACTIONS.map((a) => a.id),
 ];
 
@@ -240,3 +275,106 @@ export const DEFAULT_CONTEXT_SUBMENUS: Record<string, { name: string; icon: stri
   reactreply:{ name: "React / Reply", icon: "smile-plus",  items: ["react", "reply", "replyLink"] },
   appearance:{ name: "Appearance & privacy", icon: "palette", items: ["setColor", "obscure", "encrypt"] },
 };
+
+/** 0.579.2: every id reachable from a menu `order`, following submenu
+ *  references (`<prefix><key>`, e.g. "submenu:" for ⋮, "zapsub:" for ⚡) into
+ *  `submenus[key].items`, recursively. Cycle-safe. */
+export function reachableMenuIds(order: readonly string[], submenus: Record<string, { items: readonly string[] }>, prefix: string): Set<string> {
+  const out = new Set<string>();
+  const visited = new Set<string>();
+  const walk = (ids: readonly string[]): void => {
+    for (const id of ids) {
+      out.add(id);
+      if (!id.startsWith(prefix)) continue;
+      const key = id.slice(prefix.length);
+      if (visited.has(key)) continue;
+      visited.add(key);
+      const sm = submenus[key];
+      if (sm) walk(sm.items);
+    }
+  };
+  walk(order);
+  return out;
+}
+
+/** 0.579.2: put each `missing` id into a saved custom `order` where the default
+ *  has it — right after the nearest earlier default item the order still holds
+ *  (dividers don't count as anchors), or at the front when none does. Ids are
+ *  placed in default order, so several new ones keep their relative order. */
+export function insertMissingDefaults(order: readonly string[], defaults: readonly string[], missing: readonly string[]): string[] {
+  const out = [...order];
+  defaults.forEach((id, i) => {
+    if (!missing.includes(id) || out.includes(id)) return;
+    let at = 0;
+    for (let j = i - 1; j >= 0; j--) {
+      if (defaults[j] === "sep") continue;
+      const k = out.lastIndexOf(defaults[j]);
+      if (k >= 0) { at = k + 1; break; }
+    }
+    out.splice(at, 0, id);
+  });
+  return out;
+}
+
+/** 0.579.2: the ⋮ menu's built-in top-level items (and built-in submenus) that a
+ *  saved CUSTOM order can no longer reach. Built-ins can't be deleted from that
+ *  menu — the settings editor only HIDES them (contextMenuHidden), which keeps
+ *  them in the order — so a missing one was never the user's choice: it is a
+ *  built-in added after they customized (e.g. "Appearance & privacy ▸"), and
+ *  without this it was invisible in both the menu and its settings editor. */
+export function missingContextBuiltins(order: readonly string[], submenus: Record<string, { items: readonly string[] }>, defaults: readonly string[]): string[] {
+  if (!order.length) return [];   // empty = the live default, which has everything
+  const reach = reachableMenuIds(order, submenus, "submenu:");
+  return defaults.filter((id) => id !== "sep" && !reach.has(id));
+}
+
+/** 0.579.2: the ⚡ menu's built-in entries as signatures: top-level ids, plus
+ *  `<submenuKey>/<itemId>` for each default submenu's items. The ⚡ menu lets the
+ *  user REMOVE built-ins, so new defaults are only offered once: settings keep
+ *  `zapDefaultsSeen` and a signature not in it is new since the last load. */
+export function zapDefaultSignatures(): string[] {
+  const top = ZAP_DEFAULT_ORDER.filter((id) => id !== "sep");
+  const subs = Object.entries(DEFAULT_ZAP_SUBMENUS).flatMap(([k, v]) => v.items.map((it) => `${k}/${it}`));
+  return [...top, ...subs];
+}
+/** Defaults added to the ⚡ menu after it became customizable (0.529.0) but
+ *  before `zapDefaultsSeen` existed — treated as unseen on an install's first
+ *  reconcile so they reach users who had already customized. */
+export const ZAP_DEFAULTS_ADDED_BEFORE_TRACKING: readonly string[] = ["organize/addToFocus"];
+
+/** 0.579.2: bring NEW ⚡ defaults into a customized ⚡ menu, once each. Returns
+ *  the updated order / submenu overrides and the new `seen` list. A new
+ *  top-level default goes into a saved custom order (where the default has it);
+ *  a new item of a default submenu goes into the user's saved override of that
+ *  submenu. Either is skipped when the item is already reachable somewhere in
+ *  the menu (the user moved it), and an empty order / un-overridden submenu
+ *  already shows the live default. */
+export function reconcileZapDefaults(s: {
+  zapMenuOrder?: readonly string[];
+  zapSubmenus?: Record<string, { name: string; icon: string; items: string[] }>;
+  zapDefaultsSeen?: readonly string[];
+}): { order: string[]; submenus: Record<string, { name: string; icon: string; items: string[] }>; seen: string[]; changed: boolean } {
+  const all = zapDefaultSignatures();
+  const seenList = Array.isArray(s.zapDefaultsSeen) ? s.zapDefaultsSeen : all.filter((x) => !ZAP_DEFAULTS_ADDED_BEFORE_TRACKING.includes(x));
+  const seen = new Set(seenList);
+  const fresh = all.filter((x) => !seen.has(x));
+  let order = [...(s.zapMenuOrder ?? [])];
+  const submenus = { ...(s.zapSubmenus ?? {}) };
+  const reach = reachableMenuIds(order.length ? order : ZAP_DEFAULT_ORDER, { ...DEFAULT_ZAP_SUBMENUS, ...submenus }, "zapsub:");
+  let changed = false;
+  const topNew = fresh.filter((x) => !x.includes("/") && !reach.has(x));
+  if (order.length && topNew.length) { order = insertMissingDefaults(order, ZAP_DEFAULT_ORDER, topNew); changed = true; }
+  for (const sig of fresh) {
+    const slash = sig.indexOf("/");
+    if (slash < 0) continue;
+    const key = sig.slice(0, slash);
+    const item = sig.slice(slash + 1);
+    const cur = submenus[key];
+    if (!cur || reach.has(item)) continue;
+    submenus[key] = { ...cur, items: insertMissingDefaults(cur.items, DEFAULT_ZAP_SUBMENUS[key]?.items ?? [], [item]) };
+    reach.add(item);
+    changed = true;
+  }
+  const seenChanged = !Array.isArray(s.zapDefaultsSeen) || fresh.length > 0;
+  return { order, submenus, seen: all, changed: changed || seenChanged };
+}

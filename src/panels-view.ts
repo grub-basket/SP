@@ -7,7 +7,7 @@ import {
   STASHPAD_PANELS_VIEW_TYPE,
   STASHPAD_VIEW_TYPE,
   fmHasTag,
-  parseAssignees, writeCompletedFm,
+  parseAssignees,
   parseAuthorRef,
   type PinnedNoteRef,
   type StashpadId,
@@ -19,6 +19,7 @@ import { PinAliasModal } from "./modals";
 import { collectTasks as collectTasksShared, titleFromTaskFile, type TaskItem } from "./task-collect";
 import { isFailedTask } from "./task-render";
 import { TaskReviewModal } from "./task-review-modal";
+import { toggleTaskFile } from "./task-complete";
 
 /** 0.74.3: render a child-count badge into `host` (replaces the old
  *  caret expander in the Pinned + detail panels). Collapsed shows a
@@ -1319,12 +1320,11 @@ export class StashpadPanelsView extends ItemView {
 
   /** 0.76.3: flip a task's `completed` field straight from the panel
    *  checkbox — no need to open the note. Re-renders so the row moves
-   *  to/from the Completed section. */
+   *  to/from the Completed section. 0.578.0: through toggleTaskFile, so a
+   *  REPEATING task rolls forward / spawns its next occurrence like the list. */
   private async toggleTaskCompleted(t: TaskItem): Promise<void> {
     try {
-      await this.app.fileManager.processFrontMatter(t.file, (m: any) => {
-        writeCompletedFm(m, !(m.completed === true));
-      });
+      await toggleTaskFile(this.app, t.file, () => this.plugin.mintNoteId());
     } catch (e) {
       notify(`Couldn't update task: ${(e as Error).message}`);
       return;

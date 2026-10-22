@@ -32,7 +32,7 @@ import { Modal, Setting, SuggestModal, TFile, TFolder, type App } from "obsidian
 import type StashpadPlugin from "./main";
 import { ROOT_ID, siftMatch, type FolderPlacement, type StashpadId } from "./types";
 import { readFolderSubtreeNodes } from "./encryption-ops";
-import { bodyToSlug, buildFilename } from "./slug-service";
+import { bodyToSlug, buildFilename, datePrefixFor } from "./slug-service";
 import { serializeNote, splitFrontmatter } from "./stash-package";
 import { notify } from "./notify";
 
@@ -197,7 +197,7 @@ async function writeNote(
   const fm: Record<string, unknown> = { id, parent, created: new Date().toISOString(), attachments: [], ...extraFm };
   const title = body.split("\n")[0] ?? "";
   const slug = bodyToSlug(title) || "note";
-  const path = await uniqueFilePath(plugin.app, `${folder}/${buildFilename(slug, id)}`);
+  const path = await uniqueFilePath(plugin.app, `${folder}/${buildFilename(slug, id, datePrefixFor(plugin.settings, Date.now()))}`);
   await plugin.app.vault.create(path, serializeNote(fm, body.endsWith("\n") ? body : `${body}\n`));
   return { id, path };
 }

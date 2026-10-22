@@ -40,7 +40,7 @@ import {
  *  sync anyway (one device's "already notified you about this reminder" shouldn't
  *  silence another's). */
 export const SPLIT_FILES: Record<string, readonly string[]> = {
-  "history.json": ["notifiedDueKeys", "persistReminderLog", "lastSubmitted", "drafts"],
+  "history.json": ["notifiedDueKeys", "persistReminderLog", "lastSubmitted", "drafts", "focusTimer", "focusOrder"],
 };
 
 /** Flat list of every key that no longer belongs in data.json. */
@@ -68,6 +68,11 @@ export class SettingsStore {
   /** 0.378.0: the in-vault config folder ("" / null = off, everything classic).
    *  Set from the data.json pointer at load, or by enable/disable/relocate. */
   private configFolder: string | null = null;
+  /** 0.579.5: true when the config folder is enabled but was NOT present at load
+   *  (deleted, or not synced to this device yet) — its keys are showing defaults.
+   *  Load-time migrations that would record "seen" state against those defaults
+   *  (the ⚡-menu reconcile) skip the launch. */
+  configFolderUnavailableAtLoad = false;
   /** 0.379.0: additional folders that config WRITES fan out to — redundant,
    *  synced mirrors (e.g. the previous folder kept after a relocate). Read is
    *  always from the primary `configFolder`; mirrors are write-only backups. */
@@ -333,7 +338,9 @@ export class SettingsStore {
     this.configMirrors = Array.isArray(base["configMirrors"])
       ? (base["configMirrors"] as unknown[]).filter((m): m is string => typeof m === "string" && !!m && m !== this.configFolder)
       : [];
+    this.configFolderUnavailableAtLoad = false;
     if (this.configFolder && !(await this.sentinelPresent(this.configFolder))) {
+      this.configFolderUnavailableAtLoad = true;
       // The folder is enabled but not present (deleted, or not synced to this
       // device yet). Reads fall back to defaults and — because the sentinel
       // guard skips writes to a missing folder — edits to these settings won't

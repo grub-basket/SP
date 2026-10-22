@@ -2,7 +2,7 @@ import { App, setIcon } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { collectTasks, titleFromTaskFile, type TaskItem } from "./task-collect";
-import { writeCompletedFm } from "./types";
+import { toggleTaskFile } from "./task-complete";
 import { formatDateOnly, formatTimeOnly } from "./format";
 import { dueDeadlineMs, isBareDateDue } from "./due-warmth";
 
@@ -260,7 +260,8 @@ export function renderTaskTriage(
   }
 
   const toggleCompleted = async (t: TaskItem): Promise<void> => {
-    try { await app.fileManager.processFrontMatter(t.file, (m: any) => { writeCompletedFm(m, !(m.completed === true)); }); }
+    // 0.578.0: repeat-aware (rolls forward / spawns the next occurrence like the list).
+    try { await toggleTaskFile(app, t.file, () => plugin.mintNoteId()); }
     catch (e) { notify(`Couldn't update task: ${(e as Error).message}`); return; }
     rerender();
   };

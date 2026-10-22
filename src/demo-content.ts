@@ -13,7 +13,7 @@
  */
 import { normalizePath, type App } from "obsidian";
 import type StashpadPlugin from "./main";
-import { bodyToSlug, buildFilename } from "./slug-service";
+import { bodyToSlug, buildFilename, datePrefixFor } from "./slug-service";
 import { ROOT_ID } from "./types";
 import { buildHomeFilename } from "./view-helpers";
 import { nestBlockMessage } from "./nest-guard";
@@ -193,7 +193,7 @@ export async function seedDemoContent(app: App, plugin: StashpadPlugin, folder: 
   for (const note of DEMO_NOTES) {
     const id = idFor.get(note.key)!;
     const parentId = note.parent ? idFor.get(note.parent)! : ROOT_ID;
-    const path = `${dir}/${buildFilename(bodyToSlug(note.name), id)}`;
+    const path = `${dir}/${buildFilename(bodyToSlug(note.name), id, datePrefixFor(plugin.settings, Date.now()))}`;
     if (await adapter.exists(path)) {
       skipped++;
       continue;

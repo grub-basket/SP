@@ -2,7 +2,7 @@ import { App, Modal, Notice, Setting, TFile, TFolder } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import type { StashpadSettings } from "./settings";
-import { bodyToSlug, buildFilename } from "./slug-service";
+import { bodyToSlug, buildFilename, datePrefixFor } from "./slug-service";
 import { ROOT_ID } from "./types";
 import { readId } from "./id-service";
 
@@ -343,7 +343,7 @@ export async function buildJdIndexNotes(
       const id = plugin.mintNoteId();
       prefixToId.set(prefix, id);
       const slug = bodyToSlug(title, settings.slugStopWords);
-      const filename = buildFilename(slug, id);
+      const filename = buildFilename(slug, id, datePrefixFor(settings, Date.now()));
       const targetPath = `${destFolder}/${filename}`;
       const frontmatter = [
         "---",

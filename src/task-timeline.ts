@@ -2,7 +2,7 @@ import { App, moment, setIcon, TFile } from "obsidian";
 import { dueDeadlineMs } from "./due-warmth";
 import type StashpadPlugin from "./main";
 import { collectTasks, type TaskItem } from "./task-collect";
-import { writeCompletedFm } from "./types";
+import { applyCompleteFm, applyUncompleteFm, finishCompletion, type CompletionPlan } from "./task-complete";
 import { formatDateOnly } from "./format";
 
 /** 0.273.1: the task TIMELINE — each task as a horizontal span from its
@@ -145,12 +145,17 @@ export function renderTaskTimeline(
   // task-triage toggle (processFrontMatter + writeCompletedFm); an explicit
   // `atMs` sets a chosen completion date (and marks it complete) for anyone who
   // wants the bar to end on the real day, not "now".
+  // 0.578.0: completing goes through applyCompleteFm, so a REPEATING task rolls
+  // forward / spawns its next occurrence like the list.
   const setComplete = async (t: TaskItem, on: boolean, atMs?: number): Promise<void> => {
     try {
+      let plan = null as CompletionPlan | null;
       await app.fileManager.processFrontMatter(t.file, (m: Record<string, unknown>) => {
-        writeCompletedFm(m, on);
-        if (on && atMs != null) m.completedAt = new Date(atMs).toISOString();
+        if (!on) { applyUncompleteFm(m); return; }
+        plan = applyCompleteFm(m);
+        if (atMs != null && m.completed === true) m.completedAt = new Date(atMs).toISOString();
       });
+      if (plan) await finishCompletion(app, t.file, plan, () => plugin.mintNoteId());
     } catch (e) { console.warn("[Stashpad] timeline completion write failed", e); }
     // The aggregate view's modify listener refreshes when visible; rerender now
     // for immediacy (the metadata cache catches up within a tick).

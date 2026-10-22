@@ -17,6 +17,10 @@ const ENTRIES = [
   "scripts/tests/safe-filename.test.ts",
   "scripts/tests/drafts.test.ts",
   "scripts/tests/draft-match.test.ts",
+  "scripts/tests/focus-time.test.ts",
+  "scripts/tests/task-complete.test.ts",
+  "scripts/tests/note-actions.test.ts",
+  "scripts/tests/date-prefix.test.ts",
 ];
 
 let passed = 0;

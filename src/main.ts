@@ -13,8 +13,10 @@ import { StashpadTrashView, openTrashView } from "./trash-view";
 import { ReEncryptScheduler } from "./reencrypt-scheduler";
 import { StashpadAggregateView, openAggregateView } from "./aggregate-view";
 import { cmdExportLockedBlob } from "./commands/io-cmds";
-import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_KANBAN_VIEW_TYPE, STASHPAD_SHOWCASE_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
+import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_KANBAN_VIEW_TYPE, STASHPAD_FOCUS_VIEW_TYPE, STASHPAD_SHOWCASE_VIEW_TYPE, STASHPAD_LOG_VIEW_TYPE, STASHPAD_NOTIFICATIONS_VIEW_TYPE, RESERVED_FRONTMATTER } from "./types";
 import { StashpadKanbanView, openKanbanView } from "./kanban-view";
+import { StashpadFocusView, openFocusView } from "./focus-view";
+import { FocusService } from "./focus-service";
 import { StashpadShowcaseView, installAttachmentRenameSync, openShowcaseView } from "./showcase-view";
 import { StashpadLogView, StashpadNotificationsView, openStashpadLogView, openStashpadNotificationsView } from "./activity-views";
 import { StashpadPanelsView, openStashpadPanelsView, openStashpadSinglePanel, PANEL_REGISTRY, type PanelId } from "./panels-view";
@@ -35,14 +37,14 @@ import {
   buildDefaultBindings, COMMAND_META, type CommandBindingMap, isWithinObscureSchedule,
   isWithinMaintenanceWindow, maintenanceSweepObeysWindow, MAINTENANCE_SWEEPS, type MaintenanceSweepId,
 } from "./settings";
-import { DEFAULT_STOPWORDS, bodyToSlug, buildFilename, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId, stripInlineMarkdown } from "./slug-service";
+import { DEFAULT_STOPWORDS, bodyToSlug, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId, stripInlineMarkdown, createdMsOf, reslugName, titleFromBasename, splitDatePrefix } from "./slug-service";
 import { safeFileName } from "./safe-filename";
 import { siftRank } from "./suggest-match";
 import { runFoldFlow } from "./folder-fold";
 import type { FolderPlacement } from "./types";
 import { openFolderSetup } from "./folder-setup-modal";
 import { runUnfoldFlow } from "./folder-split";
-import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, DEFAULT_ROW_BUTTONS } from "./note-actions";
+import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, DEFAULT_ROW_BUTTONS, defaultContextOrder, insertMissingDefaults, missingContextBuiltins, reconcileZapDefaults } from "./note-actions";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { writeXvClipboard, readXvAck, writeXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
@@ -62,6 +64,7 @@ import { OrderStore } from "./order-store";
 import { StructureSnapshotStore, indexByPath, parentForFrontmatter } from "./structure-snapshot";
 import { UndoStack } from "./undo-stack";
 import { rebootstrapFolderFrontmatter } from "./frontmatter-sync";
+import { planDatePrefixRenames, executeDatePrefixRenames, DatePrefixConfirmModal, datePrefixProgressNotice, describeRun, type DatePrefixMode } from "./date-prefix-rename";
 import { createAliasesForFolder, deriveCleanTitle } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction, type NotificationOpen } from "./notifications";
 import { notify, setNotifySink } from "./notify";
@@ -104,7 +107,7 @@ class AttachmentParentPicker extends FuzzySuggestModal<TFile> {
   getItems(): TFile[] { return this.notes; }
   getItemText(f: TFile): string {
     const heading = this.app.metadataCache.getFileCache(f)?.headings?.[0]?.heading;
-    const title = (heading || f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ")).trim();
+    const title = (heading || titleFromBasename(f.basename)).trim();
     const folder = f.parent?.path ?? "";
     return folder ? `${title} — ${folder}` : title;
   }
@@ -132,6 +135,8 @@ interface DeepLinkLanding {
 
 export default class StashpadPlugin extends Plugin {
   settings: StashpadSettings = { ...DEFAULT_SETTINGS };
+  /** 0.577.0: Focus view timer + Today-list writes (focus-service.ts). */
+  focus: FocusService = new FocusService(this);
   /** 0.488.0 (perf): Stashpad folders whose on-disk infrastructure (the folder, its
    *  Home note, the import/export subfolders, the null-parent migration) has been
    *  ensured in THIS session. The work is idempotent and folder-scoped, but the
@@ -901,6 +906,14 @@ export default class StashpadPlugin extends Plugin {
    *  wikilink rewrites Obsidian does when slug-renames move files — never
    *  bump `modified` (or add the local user as a contributor). */
   rebootstrapInProgress = false;
+  /** 0.580.0: true while the add/remove-dates sweep runs. The sweep and
+   *  Rebootstrap never run at the same time (each refuses while the other
+   *  holds its flag), and only one sweep runs at once. */
+  datePrefixRenameRunning = false;
+  /** 0.580.0: notes whose links the add/remove-dates sweep is rewriting, with
+   *  the time (ms) until which their body changes are not the user's edits.
+   *  Per note, so the user's real edits elsewhere still count during a sweep. */
+  linkRewriteQuiet = new WeakMap<TFile, number>();
   /** 0.537.1: ONE "lots of files are changing" notice for every Stashpad tab.
    *  Each view detects its own file-event burst, so with several tabs open
    *  (background tabs and pop-outs included) a single sync burst used to
@@ -3810,6 +3823,13 @@ export default class StashpadPlugin extends Plugin {
       STASHPAD_KANBAN_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new StashpadKanbanView(leaf, this),
     );
+    // 0.577.0: Focus — today's tasks + pomodoro/stopwatch. The timer lives in
+    // the service (status-bar ticker), so it runs with the tab closed.
+    this.registerView(
+      STASHPAD_FOCUS_VIEW_TYPE,
+      (leaf: WorkspaceLeaf) => new StashpadFocusView(leaf, this),
+    );
+    this.focus.init(() => void openFocusView(this));
     // 0.530.0: showcase — a level as one flat review page.
     this.registerView(
       STASHPAD_SHOWCASE_VIEW_TYPE,
@@ -4441,6 +4461,30 @@ export default class StashpadPlugin extends Plugin {
       name: "Open showcase (page view with feedback) for this level",
       callback: () => void this.openShowcaseForActiveLevel(),
     });
+    // 0.577.0: Focus view + timer controls (plugin-level: no Stashpad tab needed).
+    this.addCommand({
+      id: "stashpad-open-focus",
+      name: "Open Focus view (today's tasks, pomodoro / time tracking)",
+      callback: () => void openFocusView(this),
+    });
+    this.addCommand({
+      id: "stashpad-focus-toggle-timer",
+      name: "Focus: start / pause the timer",
+      checkCallback: (checking) => {
+        if (!this.focus.state) return false;
+        if (!checking) void this.focus.toggle();
+        return true;
+      },
+    });
+    this.addCommand({
+      id: "stashpad-focus-stop-timer",
+      name: "Focus: stop the timer (logs the time so far)",
+      checkCallback: (checking) => {
+        if (!this.focus.state) return false;
+        if (!checking) void this.focus.stop();
+        return true;
+      },
+    });
     // 0.273.1: each task as a created→completed span on a time axis.
     this.addCommand({
       id: "stashpad-open-task-timeline",
@@ -4952,6 +4996,7 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({ id: "stashpad-open-in-new-tab", name: "Open in new Stashpad tab", callback: () => call("cmdOpenInNewStashpadTab") });
     this.addCommand({ id: "stashpad-toggle-complete", name: "Toggle complete (strikethrough)", callback: () => call("cmdToggleComplete") });
     this.addCommand({ id: "stashpad-toggle-task", name: "Toggle task (todo)", callback: () => call("cmdToggleTask") });
+    this.addCommand({ id: "stashpad-add-to-focus", name: "Add selection to / remove from Today (Focus list)", callback: () => call("cmdAddToFocus") });
     this.addCommand({ id: "stashpad-set-due", name: "Set due date…", callback: () => call("cmdSetDue") });
     this.addCommand({ id: "stashpad-reply", name: "Reply to selection", callback: () => call("cmdReply") });
     this.addCommand({ id: "stashpad-attribute-bot", name: "Attribute to AI author / bot (Claude, ChatGPT…) as contributor", callback: () => call("cmdAttributeBot") });
@@ -5320,6 +5365,17 @@ export default class StashpadPlugin extends Plugin {
       id: "stashpad-sync-authors",
       name: "Sync authors across all folders (multiplayer)",
       callback: () => void this.syncAuthorsAcrossFolders(),
+    });
+    // 0.580.0: add / remove the date-time prefix on existing file names.
+    this.addCommand({
+      id: "add-dates-to-file-names",
+      name: "Add dates to existing file names (so a file manager sorts them by date)",
+      callback: () => { void this.runDatePrefixRename("add"); },
+    });
+    this.addCommand({
+      id: "remove-dates-from-file-names",
+      name: "Remove dates from file names (undoes adding dates)",
+      callback: () => { void this.runDatePrefixRename("remove"); },
     });
     this.addCommand({
       id: "stashpad-rebootstrap-all",
@@ -6520,7 +6576,34 @@ export default class StashpadPlugin extends Plugin {
    *  per folder, weighted by note count) that's replaced in place by a
    *  persistent success (or error) Notice. Shared by the settings button + the
    *  command so both get the same feedback. */
-  async runRebootstrapWithUI(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
+  /** 0.580.0: the "Add / Remove dates on file names" command: check
+   *  everything (read-only), show what would change, and only on confirm rename
+   *  the files one at a time behind a progress notice with a Stop button. */
+  async runDatePrefixRename(mode: DatePrefixMode): Promise<void> {
+    if (this.datePrefixRenameRunning) { notify("Stashpad: file names are already being updated. Wait for that to finish first.", 6000); return; }
+    if (this.rebootstrapInProgress) { notify("Stashpad: Rebootstrap is running. Wait for it to finish, then try again.", 6000); return; }
+    this.datePrefixRenameRunning = true;
+    try {
+      const checking = new Notice("Checking file names…", 0);
+      let plan;
+      try { plan = await planDatePrefixRenames(this, mode); } finally { checking.hide(); }
+      const modal = new DatePrefixConfirmModal(this.app, plan);
+      modal.open();
+      if (!(await modal.result)) return;
+      const ui = datePrefixProgressNotice(mode === "add" ? "Adding dates to file names…" : "Removing dates from file names…");
+      try {
+        const r = await executeDatePrefixRenames(this, plan, { onProgress: ui.update, shouldStop: ui.stopRequested });
+        if (r.failed.length) console.warn("[Stashpad] date prefix: files skipped during the run", r.failed);
+        ui.finish(true, r.stopped ? "Stopped" : "✓ Done", describeRun(mode, r));
+      } catch (e) {
+        ui.finish(false, "Could not update file names", (e as Error).message);
+      }
+    } finally {
+      this.datePrefixRenameRunning = false;
+    }
+  }
+
+  async runRebootstrapWithUI(): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number; datesAdded: number }> {
     const notice = new Notice("", 0); // persistent until we replace/dismiss it
     const el = notice.noticeEl;
     el.empty();
@@ -6538,7 +6621,7 @@ export default class StashpadPlugin extends Plugin {
       const r = await this.rebootstrapAllFolders(onProgress);
       // 0.118.9: lead with the outcome, and say so explicitly when nothing
       // needed changing (so an empty-looking summary isn't ambiguous).
-      const changes = r.imported + r.attachmentsLinked + r.attachmentsRenamed + r.fmWritten + r.slugsRenamed;
+      const changes = r.imported + r.attachmentsLinked + r.attachmentsRenamed + r.fmWritten + r.slugsRenamed + r.datesAdded;
       const parts: string[] = [];
       parts.push(`Checked ${r.touched.length} folder${r.touched.length === 1 ? "" : "s"} (${r.fmChecked} note${r.fmChecked === 1 ? "" : "s"})`);
       if (changes === 0) {
@@ -6549,6 +6632,7 @@ export default class StashpadPlugin extends Plugin {
         if (r.imported > 0) parts.push(`imported ${r.imported} loose file${r.imported === 1 ? "" : "s"}`);
         if (r.attachmentsLinked > 0) parts.push(`linked attachments on ${r.attachmentsLinked} note${r.attachmentsLinked === 1 ? "" : "s"}`);
         if (r.attachmentsRenamed > 0) parts.push(`renamed ${r.attachmentsRenamed} attachment${r.attachmentsRenamed === 1 ? "" : "s"}`);
+        if (r.datesAdded > 0) parts.push(`added dates to ${r.datesAdded} file name${r.datesAdded === 1 ? "" : "s"}`);
       }
       if (r.authors > 0) parts.push(`${r.authors} author${r.authors === 1 ? "" : "s"} in registry`);
       // Replace the progress notice in place with a persistent success notice.
@@ -6573,7 +6657,11 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  async rebootstrapAllFolders(onProgress?: (done: number, total: number, label: string) => void): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
+  async rebootstrapAllFolders(onProgress?: (done: number, total: number, label: string) => void): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number; datesAdded: number }> {
+    // 0.580.0: never alongside the add/remove-dates sweep (both rename files).
+    if (this.datePrefixRenameRunning) {
+      throw new Error("Adding or removing dates on file names is still running. Wait for it to finish (or stop it), then run Rebootstrap again.");
+    }
     // 0.79.19: suppress contribution stamping for the duration (+ a short
     // tail to catch async link-rewrite modify events) so rebootstrap never
     // bumps `modified`/`created` or adds contributors.
@@ -6594,7 +6682,7 @@ export default class StashpadPlugin extends Plugin {
     }
   }
 
-  private async rebootstrapAllFoldersInner(onProgress?: (done: number, total: number, label: string) => void): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number }> {
+  private async rebootstrapAllFoldersInner(onProgress?: (done: number, total: number, label: string) => void): Promise<{ touched: string[]; fmChecked: number; fmWritten: number; slugsRenamed: number; authors: number; imported: number; attachmentsLinked: number; attachmentsRenamed: number; attachmentsSkipped: number; datesAdded: number }> {
     const ROOT_ID = "__root__";
     const seen = new Set<string>();
     for (const f of this.app.vault.getMarkdownFiles()) {
@@ -6719,6 +6807,30 @@ export default class StashpadPlugin extends Plugin {
     let strays = { moved: 0, shared: 0, unreferenced: 0, sharedPaths: [] as string[] };
     try { strays = await this.rehomeStrayAttachments(touched); }
     catch (e) { console.warn("Stashpad: stray-attachment re-home failed", e); }
+    // 0.580.0: opt-in (fileDatePrefixInRebootstrap) — date the existing file
+    // names too. Same plan-then-paced-rename sweep as the command, minus the
+    // confirm step (turning the setting on is the consent). Skipped, with a
+    // warning, when Obsidian would not update links. Runs AFTER the attachment
+    // passes above, so attachment lists are already links and moved strays are
+    // already in their final folder.
+    let datesAdded = 0;
+    if (this.settings.fileDatePrefixInRebootstrap) {
+      try {
+        const plan = await planDatePrefixRenames(this, "add");
+        if (plan.items.length && !plan.linkUpdatesOn) {
+          notify(`Stashpad: ${plan.items.length} file name${plan.items.length === 1 ? "" : "s"} could get a date, but were skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links”, then rebootstrap again.`, 12000);
+        } else if (plan.items.length) {
+          this.datePrefixRenameRunning = true;
+          try {
+            const r = await executeDatePrefixRenames(this, plan, {
+              onProgress: (d, t) => onProgress?.(progressTotal, progressTotal, `Adding dates to file names (${d} of ${t})`),
+            });
+            datesAdded = r.renamed;
+            if (r.failed.length) console.warn("[Stashpad] date prefix: skipped during rebootstrap", r.failed);
+          } finally { this.datePrefixRenameRunning = false; }
+        }
+      } catch (e) { console.warn("Stashpad: adding dates to file names during rebootstrap failed", e); }
+    }
     // 0.219.8: duplicate ids are exactly the kind of thing a maintenance sweep
     // should surface — but NOT silently repair. Re-minting changes note
     // identity, and a sync conflict copy may hold edits worth reading first, so
@@ -6758,7 +6870,7 @@ export default class StashpadPlugin extends Plugin {
     if (idsQuoted > 0 || idsUnsafe > 0) {
       void this.newLog().append({ type: "id_maintenance", id: "", payload: { what: "quote-numeric-ids", trigger: "rebootstrap", quoted: idsQuoted, unsafe: idsUnsafe, folders: touched.length } });
     }
-    return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped };
+    return { touched, fmChecked, fmWritten, slugsRenamed, authors, imported, attachmentsLinked, attachmentsRenamed, attachmentsSkipped, datesAdded };
   }
 
   /** Walk every Stashpad note in `folder`. For each one whose filename
@@ -6775,7 +6887,8 @@ export default class StashpadPlugin extends Plugin {
       return p === dir;
     });
     for (const file of files) {
-      const fmIdRaw = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+      const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+      const fmIdRaw = fm?.id;
       const fmId = typeof fmIdRaw === "string" ? fmIdRaw : null;
       // Prefer the filename's `-<id>` suffix; fall back to the FRONTMATTER id
       // when the filename lacks one — but ONLY if it's a real 6-char note id, so
@@ -6792,8 +6905,10 @@ export default class StashpadPlugin extends Plugin {
           ? raw.slice(raw.indexOf("\n---", 3) + 4).replace(/^\r?\n/, "")
           : raw;
         const newSlug = bodyToSlug(body, stopwords);
-        const desired = buildFilename(newSlug, id);
-        if (file.name === desired) continue;
+        // 0.580.0: a date prefix is never added or stripped here; a title
+        // rename carries it over (THE NO-FIGHT RULE in slug-service.ts).
+        const desired = reslugName(file.name, newSlug, id, createdMsOf(fm?.created));
+        if (!desired) continue;
         const newPath = file.parent ? `${file.parent.path}/${desired}` : desired;
         if (this.app.vault.getAbstractFileByPath(newPath)) continue;
         await this.app.fileManager.renameFile(file, newPath);
@@ -7963,7 +8078,7 @@ export default class StashpadPlugin extends Plugin {
     // 0.118.3: optionally surface pinned notes so the switcher can jump
     // straight to one. Title from the filename (sync), same as the folder panel.
     const titleFromFile = (f: TFile): string =>
-      f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || f.basename;
+      titleFromBasename(f.basename).trim() || f.basename;
     const pinnedItems: Item[] = this.settings.folderSwitcherIncludePinned
       ? this.listPinnedNotes().map((p) => ({
           kind: "pinned" as const,
@@ -9620,7 +9735,7 @@ export default class StashpadPlugin extends Plugin {
         const fm = fmMatch[1];
         if (!/^id:\s*\S/m.test(fm) || !/^parent:\s*/m.test(fm)) continue; // Stashpad-origin heuristic
         const base = p.split("/").pop() || p;
-        const title = base.replace(/\.md$/, "").replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || base;
+        const title = titleFromBasename(base.replace(/\.md$/, "")).trim() || base;
         let mtime = 0;
         try { mtime = (await this.app.vault.adapter.stat(p))?.mtime ?? 0; } catch { /* ignore */ }
         out.push({ path: p, name: base, title, mtime });
@@ -11318,7 +11433,9 @@ export default class StashpadPlugin extends Plugin {
   private deriveNoteTitle(file: TFile, _fm: Record<string, unknown>): string {
     const h = this.app.metadataCache.getFileCache(file)?.headings?.[0]?.heading?.trim();
     if (h) return h;
-    const base = file.basename.replace(/-[a-z0-9]{6,}$/i, "").replace(/[-_]+/g, " ").trim();
+    // 0.580.0: skip a date-time file-name prefix; otherwise the same rule as before.
+    const named = splitDatePrefix(file.basename)?.rest || file.basename;
+    const base = named.replace(/-[a-z0-9]{6,}$/i, "").replace(/[-_]+/g, " ").trim();
     return base || file.basename;
   }
 
@@ -12891,7 +13008,7 @@ export default class StashpadPlugin extends Plugin {
         const line = body.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
         if (line) return line.replace(/^[#>\-*\s]+/, "").slice(0, 60);
       } catch { /* fall through to filename */ }
-      return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+      return titleFromBasename(file.basename);
     };
     if (due.length <= 3) {
       for (const d of due) {
@@ -13549,6 +13666,11 @@ export default class StashpadPlugin extends Plugin {
    *  `rebootstrapFolderSlugs` rebootstrap uses, without the full-vault sweep. */
   async runFolderSlugPass(folder: string): Promise<void> {
     const label = folder.split("/").pop() || folder;
+    // 0.580.0: never alongside the add/remove-dates sweep (both rename files).
+    if (this.datePrefixRenameRunning) {
+      this.notifications.show({ message: "Stashpad: file names are being updated. Run the title pass again when that finishes.", kind: "info", category: "system", folder });
+      return;
+    }
     let n = 0;
     try { n = await this.rebootstrapFolderSlugs(folder); }
     catch (e) {
@@ -13959,6 +14081,13 @@ export default class StashpadPlugin extends Plugin {
       itemButtons: Array.isArray(data?.itemButtons)
         ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string")
         : [...DEFAULT_ROW_BUTTONS],
+      // 0.579.0: absent stays UNSET (undefined) — rowButtonsFor() derives the
+      // mobile row from the desktop list until the user edits this one. No seeded
+      // flag and no stored derived copy: either goes stale when the desktop list
+      // arrives later (config folder syncing in, another device's edit).
+      itemButtonsMobile: Array.isArray(data?.itemButtonsMobile)
+        ? data.itemButtonsMobile.filter((x: unknown): x is string => typeof x === "string")
+        : undefined,
       contextMenuOrder: Array.isArray(data?.contextMenuOrder) ? data.contextMenuOrder.filter((x: unknown): x is string => typeof x === "string") : [],
       customCommandIds: Array.isArray(data?.customCommandIds) ? data.customCommandIds.filter((x: unknown): x is string => typeof x === "string") : [],
       savedSearches: Array.isArray(data?.savedSearches) ? data.savedSearches.filter((x: any) => x && typeof x.query === "string").map((x: any) => ({ name: typeof x.name === "string" && x.name ? x.name : x.query, query: x.query })) : [],
@@ -14139,6 +14268,36 @@ export default class StashpadPlugin extends Plugin {
       }
       this.settings.contextMenuOrderRefreshedV2 = true;
       await this.saveSettings();
+    }
+    // 0.579.2: a CUSTOM ⋮ order never received built-ins added after it was saved
+    // (e.g. "Appearance & privacy ▸", "Skip to next occurrence"): they showed in
+    // neither the menu nor its settings editor, and only "Reset menu" got them
+    // back. Built-ins can only be hidden there, never removed, so a missing one
+    // is never the user's choice — put it back where the default has it (a
+    // hidden one stays hidden). Every load, idempotent; a no-op once converged.
+    {
+      const order = this.settings.contextMenuOrder ?? [];
+      const missing = missingContextBuiltins(order, this.settings.contextSubmenus ?? {}, defaultContextOrder(this.settings));
+      if (missing.length) {
+        this.settings.contextMenuOrder = insertMissingDefaults(order, defaultContextOrder(this.settings), missing);
+        console.debug(`[Stashpad] restored ⋮-menu built-ins missing from a custom order: ${missing.join(", ")}`);
+        await this.saveSettings();
+      }
+    }
+    // 0.579.2: the ⚡ menu lets users REMOVE built-ins, so new defaults (e.g. 0.577's
+    // "Add to / remove from Today" in Organize) are brought into a customized ⚡
+    // menu ONCE each, tracked by `zapDefaultsSeen` (see reconcileZapDefaults).
+    // 0.579.5: skipped while the config folder is enabled but missing — the ⚡
+    // keys are showing defaults, and recording "seen" against those would stop
+    // a new default from ever reaching the real (custom) menu once it syncs in.
+    if (!this.store.configFolderUnavailableAtLoad) {
+      const r = reconcileZapDefaults(this.settings);
+      if (r.changed) {
+        this.settings.zapMenuOrder = r.order;
+        this.settings.zapSubmenus = r.submenus;
+        this.settings.zapDefaultsSeen = r.seen;
+        await this.saveSettings();
+      }
     }
     // Sync the notification service's mute set from settings. Safe to
     // call before any toasts fire — the service no-ops on empty mute
@@ -14620,7 +14779,19 @@ export default class StashpadPlugin extends Plugin {
         if (k === "settingsRev" || churn.has(k)) continue;   // bookkeeping / per-device
         if (disk[k] === undefined) continue;
         const baseline = this.settingsBaseline[k];
-        if (baseline === undefined) continue;                // never seen it — don't guess
+        if (baseline === undefined) {                        // never seen it — don't guess…
+          // 0.579.0 (blind review): …unless WE have no value at all and disk does.
+          // Taking theirs then isn't a guess, and skipping it meant our write
+          // dropped the key — erasing another device's value for a setting that
+          // starts unset here (e.g. `itemButtonsMobile`, unset until edited).
+          if (ours[k] === undefined) {
+            ours[k] = disk[k];
+            const ds = JSON.stringify(disk[k]);
+            if (ds !== undefined) curStr.set(k, ds);
+            adopted.push(k);
+          }
+          continue;
+        }
         // 0.292.0 (perf): reuse the per-key string computed above (churn keys are
         // already skipped, so every key reaching here is in the cache unless it
         // stringifies to undefined — in which case the fallback matches the old

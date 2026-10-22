@@ -1,4 +1,4 @@
-import { stripInlineMarkdown } from "./slug-service";
+import { stripInlineMarkdown, titleFromBasename } from "./slug-service";
 import { parseNaturalDate } from "./natural-date";
 import { App, FuzzySuggestModal, Platform, Scope, SuggestModal, TFile, moment, setIcon } from "obsidian";
 import { notify } from "./notify";
@@ -383,7 +383,7 @@ export class StashpadSuggest extends SuggestModal<PickerItem> {
           // 0.317.3: a slug-derived title (body not in the render cache yet)
           // is upgraded to the real first line once the body is read, so
           // title-band ranking works for notes never shown in a Stashpad view.
-          const slug = n.cross?.file?.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+          const slug = (n.cross?.file ? titleFromBasename(n.cross.file.basename) : undefined);
           if (n.title === slug) {
             const first = n.body.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
             const clean = first ? stripInlineMarkdown(first.replace(/^#+\s*/, "")) : "";

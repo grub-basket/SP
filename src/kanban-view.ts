@@ -5,6 +5,8 @@ import type StashpadPlugin from "./main";
 import { STASHPAD_KANBAN_VIEW_TYPE, type StashpadId, fmAddTag, fmRemoveTag, writeCompletedFm } from "./types";
 import { collectIndexRows, type IndexRow } from "./aggregate-index";
 import { ColorPickerModal } from "./modals";
+import { applyCompleteFm, finishCompletion, type CompletionPlan } from "./task-complete";
+import { FOCUS_DONE_KEY } from "./focus-time";
 import { returnToOriginOnClose } from "./leaf-return";
 import { settleNewTab } from "./view-helpers";
 
@@ -140,6 +142,8 @@ export class StashpadKanbanView extends ItemView {
     let backward: (fm: Record<string, unknown>) => void;
     let localFwd: () => void;
     let localBack: () => void;
+    /** 0.578.0: run after the first forward write (spawn / archive a repeat). */
+    let afterFirstWrite: (() => Promise<void>) | null = null;
 
     if (this.groupBy === "color") {
       const prev = card.color; const next = toKey === NONE ? null : toKey;
@@ -161,16 +165,45 @@ export class StashpadKanbanView extends ItemView {
         else if (v === false) { fm.completed = false; delete fm.completedAt; } // a to-do task (stays a task)
         else writeCompletedFm(fm, false); // delete → not a task
       };
-      forward = (fm) => setFm(fm, next);
-      backward = (fm) => setFm(fm, prev);
-      localFwd = () => { card.completed = next; }; localBack = () => { card.completed = prev; };
+      if (next === true) {
+        // 0.578.0: Done goes through applyCompleteFm, so a REPEATING task rolls
+        // forward (stays To do, with its next due) or spawns its next occurrence,
+        // exactly like the list. Undo restores the due + Focus stamp a roll changed.
+        let plan: CompletionPlan | null = null;
+        let before: { due: unknown; focusDone: unknown } | null = null;
+        forward = (fm) => {
+          if (!before) before = { due: fm.due, focusDone: fm[FOCUS_DONE_KEY] };
+          plan = applyCompleteFm(fm);
+        };
+        backward = (fm) => {
+          if (plan?.rolledTo != null && before) {
+            if (before.due === undefined) delete fm.due; else fm.due = before.due;
+            if (before.focusDone === undefined) delete fm[FOCUS_DONE_KEY]; else fm[FOCUS_DONE_KEY] = before.focusDone;
+          }
+          setFm(fm, prev);
+        };
+        localFwd = () => { card.completed = plan?.rolledTo != null ? false : true; };
+        localBack = () => { card.completed = prev; };
+        afterFirstWrite = async () => {
+          if (plan && (plan.spawnNextIso || plan.archive)) {
+            await finishCompletion(this.app, file, plan, () => this.plugin.mintNoteId());
+            this.rows = null; // a new occurrence card exists now
+          }
+        };
+      } else {
+        forward = (fm) => setFm(fm, next);
+        backward = (fm) => setFm(fm, prev);
+        localFwd = () => { card.completed = next; }; localBack = () => { card.completed = prev; };
+      }
     }
 
     const write = async (fn: (fm: Record<string, unknown>) => void): Promise<void> => {
       await this.app.fileManager.processFrontMatter(file, fn);
     };
     try { await write(forward); } catch (e) { notify(`Stashpad: couldn't update note (${(e as Error).message})`); return; }
-    localFwd(); await this.render();
+    localFwd();
+    if (afterFirstWrite) await afterFirstWrite();
+    await this.render();
     // 0.365.1: undo/redo may run after a Refresh re-collected `rows`, leaving
     // the `card` this closure holds as an orphan — mutating it then changed
     // nothing on screen until the next refresh. Mirror the closure card's state

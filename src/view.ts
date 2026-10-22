@@ -1,4 +1,7 @@
 import { notify } from "./notify";
+import { FOCUS_DATE_KEY, FOCUS_DONE_KEY, dayKey, normFocusDate } from "./focus-time";
+import { applyCompleteFm, applyUncompleteFm, finishCompletion, type CompletionPlan } from "./task-complete";
+import { openFocusView } from "./focus-view";
 import { addCopyTabLinkItem } from "./tab-link-menu";
 import {
   App, ItemView, Keymap, MarkdownRenderer, Menu, Modal, Notice, Platform,
@@ -28,7 +31,7 @@ import { buildFileActions, boldFragment } from "./notifications";
 import { newId, readId, sameId } from "./id-service";
 import { seedDemoContent } from "./demo-content";
 import { preferredStashpadLeafOnFolder } from "./leaf-lookup";
-import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, stripInlineMarkdown, DEFAULT_STOPWORDS } from "./slug-service";
+import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, stripInlineMarkdown, DEFAULT_STOPWORDS, datePrefixFor, createdMsOf, reslugName, titleFromBasename } from "./slug-service";
 import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
 import { getSettings, getTemplatesFormats, onSettingsChange, isWithinObscureSchedule } from "./settings";
@@ -86,7 +89,7 @@ import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
 import { openShowcaseAtComment, openShowcaseView, renderFeedbackTargetChip, showcaseLanding, spotCommentsHook } from "./showcase-view";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_LEAF_IDS, DEFAULT_ROW_BUTTONS, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, defaultContextOrder } from "./note-actions";
+import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_LEAF_IDS, CONTEXT_EXTRA_ACTIONS, QUICK_MENU_EXTRA_IDS, DEFAULT_ROW_BUTTONS, rowButtonsFor, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, defaultContextOrder } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
 import { nestBlockMessage, rootRedirectName, withReservedRule, type NestBlocked } from "./nest-guard";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
@@ -6058,9 +6061,9 @@ export class StashpadView extends ItemView {
     if (!canGoFwd) fwdBtn.addClass("is-disabled");
     fwdBtn.onclick = (e) => { e.preventDefault(); this.navigateForward(); };
 
-    // 0.441.0 (/dump): the jump-to-level (route) button moved OUT of the bottom
-    // actions cluster to the LEFT of the breadcrumb bar (see renderBreadcrumb) —
-    // easier to reach up top, next to the path it navigates.
+    // 0.441.0 moved the jump-to-level (route) button to the left of the
+    // breadcrumb; 0.576.0 (user) brought it back here on mobile, rendered just
+    // LEFT of the command button below (or last, when that button is off).
 
     const selectBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn" });
     const inSelect = this.mobileSelectMode;
@@ -6149,6 +6152,16 @@ export class StashpadView extends ItemView {
     // 0.363.2: action-bar button that runs a configurable Obsidian command —
     // defaults to the command palette (settings.composerActionCommand). Empty
     // string hides it. Third-party-palette users can repoint it in settings.
+    // 0.576.0 (user): mobile jump-to-level (route) button, immediately left of
+    // the command button (was at the left of the breadcrumb since 0.441.0).
+    // Desktop keeps its breadcrumb "all levels" button (renderBreadcrumbLevelsButton).
+    if (Platform.isMobile) {
+      const routeBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn stashpad-route-btn" });
+      setIconSafe(routeBtn, "route", "⋔");
+      routeBtn.title = "Jump to a level in the path";
+      routeBtn.setAttr("aria-label", "Jump to a level in the path");
+      routeBtn.onclick = (e) => { e.preventDefault(); this.openBreadcrumbLevelsModal(); };
+    }
     const cmdId = this.plugin.settings.composerActionCommand;
     if (cmdId) {
       const cmdBtn = actions.createEl("button", { cls: "stashpad-mobile-action-btn stashpad-composer-command-btn" });
@@ -6254,6 +6267,7 @@ export class StashpadView extends ItemView {
       case "setColor":        A("Set color…", icon(id), () => this.cmdSetColor(), none); return;
       case "toggleComplete":  A("Toggle complete", icon(id), () => void this.cmdToggleComplete(), none); return;
       case "toggleTask":      A("Toggle task (todo)", icon(id), () => void this.cmdToggleTask(), none); return;
+      case "addToFocus":      A("Add to / remove from Today", icon(id), () => void this.cmdAddToFocus(), none); return;
       case "blur":            A("Obscure / reveal (visual only)", icon(id), () => void this.cmdToggleObscured(), none); return;
       case "setDue":          A("Set due date…", icon(id), () => this.cmdSetDue(), none); return;
       case "assign":          A("Assign to…", icon(id), () => this.cmdAssign(), none); return;
@@ -7887,15 +7901,9 @@ export class StashpadView extends ItemView {
     // (back/forward/select/⚡) moves into the bottom toolbar (time-filter-bar),
     // next to the ⋯ filters + compact buttons; the breadcrumb keeps just the trail.
     if (!Platform.isMobile) this.renderActionsCluster(bar);
-    // 0.441.0 (/dump): jump-to-level (route) at the LEFT of the breadcrumb on
-    // mobile — moved up from the bottom actions cluster so it sits with the path.
-    if (Platform.isMobile) {
-      const routeBtn = bar.createEl("button", { cls: "stashpad-mobile-action-btn stashpad-crumb-route" });
-      setIconSafe(routeBtn, "route", "⋔");
-      routeBtn.title = "Jump to a level in the path";
-      routeBtn.setAttr("aria-label", "Jump to a level in the path");
-      routeBtn.onclick = (e) => { e.preventDefault(); this.openBreadcrumbLevelsModal(); };
-    }
+    // 0.441.0 put jump-to-level (route) at the LEFT of the breadcrumb on mobile.
+    // 0.576.0 (user): it moved back into the mobile actions cluster, just left
+    // of the command button — see renderActionsCluster.
     const homeBtn = bar.createSpan({ cls: "stashpad-crumb stashpad-crumb-home" });
     if (Platform.isMobile) {
       // Mobile: render as a house icon to save horizontal space.
@@ -8330,7 +8338,9 @@ export class StashpadView extends ItemView {
       moreBtn.title = "Actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
       toggleAnchor = moreBtn;
-      this.addReactionButton(actions, node); // 0.287.0 (teams)
+      // 0.579.0 (user): React follows the platform's row-button list here too, so
+      // hiding it in settings hides it on the focused note as well as the rows.
+      if (this.rowListHasReact()) this.addReactionButton(actions, node); // 0.287.0 (teams)
       this.maybeAddQuickButton(actions, node, moreBtn);
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-pencil" });
@@ -8347,7 +8357,7 @@ export class StashpadView extends ItemView {
       setIcon(dupBtn, "copy");
       dupBtn.title = "Open this Stashpad in a new tab (clone)";
       dupBtn.onclick = () => this.cmdOpenInNewStashpadTab(node);
-      this.addReactionButton(actions, node); // 0.287.0 (teams)
+      if (this.rowListHasReact()) this.addReactionButton(actions, node); // 0.287.0 (teams); 0.579.0: follows the list
       toggleAnchor = pencil;
     }
 
@@ -8537,7 +8547,7 @@ export class StashpadView extends ItemView {
     const firstLine = bodyText?.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
     // Strip AFTER picking the line: a line that is only syntax (e.g. "**") would
     // otherwise strip to empty and silently win over the filename fallback.
-    const slug = (): string => node.file!.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
+    const slug = (): string => titleFromBasename(node.file!.basename) || "Untitled";
     // 0.294.0 (perf): a title derived from real body text is stable for this
     // mtime, so it memoizes. A line that strips to empty falls through to the
     // slug and does NOT — same reason as the cold-cache case below.
@@ -8841,14 +8851,22 @@ export class StashpadView extends ItemView {
       // edit buttons were too cramped on a phone). Press-and-hold is avoided
       // deliberately (it would fight drag-reorder / nesting).
       this.maybeAddPreviewButton(actions, node); // 0.374.0
-      this.addReactionButton(actions, node); // 0.287.0 (teams)
+      // 0.579.0 (user): the mobile row's buttons come from its OWN settings list
+      // (`itemButtonsMobile`). React used to be hardcoded here, so hiding it in
+      // settings did nothing on a phone. They render into ONE wrapper because the
+      // mobile row is a fixed CSS grid (styles.css "meta toggle react quick
+      // preview more"): the wrapper takes the `react` slot, so any number of
+      // buttons stays on the top row in the user's order instead of auto-flowing
+      // into free cells (or below the body).
+      const rowBtns = actions.createDiv({ cls: "stashpad-note-rowbtns" });
+      this.renderConfiguredRowButtons(rowBtns, body, node, rowButtonsFor(getSettings(), true), 3);
+      if (!rowBtns.childElementCount) rowBtns.remove();
       this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
       rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "Actions";
       moreBtn.onclick = (e) => { e.stopPropagation(); this.openNoteMenu(e, node); };
-      this.maybeAddItemButtons(actions, body, node, moreBtn);
-      toggleAnchor = moreBtn;
+      toggleAnchor = moreBtn;   // unchanged: Show More sits just before the ⋮ on mobile
     } else {
       // 0.475.0: the primary row buttons (edit / focus / reply / react by
       // default) now come from the configurable `itemButtons` list — hideable and
@@ -13475,6 +13493,7 @@ export class StashpadView extends ItemView {
       if (matchBinding(e, sb.listPinBottom)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleListPin("bottom"); return; }
       if (matchBinding(e, sb.previewNote)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdPreviewSelected(); return; }
       if (matchBinding(e, sb.toggleTask)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdToggleTask(); return; }
+      if (matchBinding(e, sb.addToFocus)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); void this.cmdAddToFocus(); return; }
       if (matchBinding(e, sb.setDue)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdSetDue(); return; }
       // 0.300.0: R replies to the cursor row; pressing R on another note switches the target.
       if (matchBinding(e, sb.reply)) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); this.cmdReply(); return; }
@@ -13837,6 +13856,14 @@ export class StashpadView extends ItemView {
    *  buttons (stable — no hover expand/shrink), sits in the action cluster next
    *  to the quick/more menu buttons, and opens the emoji picker anchored to
    *  itself. Replaces the old under-the-timestamp hover "＋". */
+  /** 0.579.0: whether this platform's row-button list (Settings → Note actions &
+   *  menus → Item buttons) has React switched on. The focused-note header and the
+   *  preview window have their own fixed button sets but honour this one choice,
+   *  so hiding React hides it everywhere a note's buttons appear. */
+  private rowListHasReact(): boolean {
+    return rowButtonsFor(getSettings(), Platform.isMobile).includes("react");
+  }
+
   private addReactionButton(actions: HTMLElement, node: TreeNode): void {
     const btn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-react" });
     btn.dataset.id = node.id;
@@ -14554,7 +14581,7 @@ export class StashpadView extends ItemView {
             return;
           }
           const id = (item.crossId ?? item.id.replace(/^cross:/, "")) as StashpadId;
-          bind(file, id, file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " "), item.crossFolder);
+          bind(file, id, titleFromBasename(file.basename), item.crossFolder);
           return;
         }
         const node = this.tree.get(item.id);
@@ -14763,7 +14790,7 @@ export class StashpadView extends ItemView {
           const folderName = item.crossFolder.split("/").pop() || item.crossFolder;
           const noteTitle = targetId === ROOT_ID
             ? "Home"
-            : (item.crossFile?.basename ?? "note").replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ");
+            : titleFromBasename(item.crossFile?.basename ?? "note");
           this.nextDestinationLabel = `${folderName} ▸ ${noteTitle}`;
           this.refreshDestButton();
           this.composerInputEl?.focus();
@@ -15171,7 +15198,7 @@ export class StashpadView extends ItemView {
     const text = this.plugin.renderCacheStore.get(file.path)?.text;
     const firstLine = text?.slice(0, 200).split(/\r?\n/).map((s) => s.trim()).find(Boolean);
     if (firstLine) { const s = stripInlineMarkdown(firstLine); if (s) return s; }
-    return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ") || "Untitled";
+    return titleFromBasename(file.basename) || "Untitled";
   }
 
   private collectCrossFolderNotes(folderList?: string[]): import("./note-picker").CrossFolderNote[] {
@@ -15222,9 +15249,7 @@ export class StashpadView extends ItemView {
         if (parentId && parentId !== ROOT_ID) {
           const parentFile = byId.get(parentId);
           if (parentFile) {
-            parentBlurb = parentFile.basename
-              .replace(/-[a-z0-9]{4,12}$/, "")
-              .replace(/-/g, " ");
+            parentBlurb = titleFromBasename(parentFile.basename);
           }
         }
         out.push({ file, folder, id, title, body: "", parentBlurb, parentId: parentId ?? null });
@@ -16535,7 +16560,7 @@ export class StashpadView extends ItemView {
       // turns spaces into hyphens, so any literal comparison against the title
       // silently never matches - which is exactly what the first version did.
       const norm = (x: string): string => x.toLowerCase().replace(/[^a-z0-9]+/g, "");
-      if (norm(f.basename.replace(/-[a-z0-9]{6}$/i, "")).startsWith(norm(APP_REFERENCE_TITLE))) return true;
+      if (norm(titleFromBasename(f.basename)).startsWith(norm(APP_REFERENCE_TITLE))) return true;
     }
     return false;
   }
@@ -16889,14 +16914,14 @@ export class StashpadView extends ItemView {
     const sourceFm = (this.app.metadataCache.getFileCache(sourceFile)?.frontmatter ?? {}) as Record<string, any>;
 
     const cloneId = this.plugin.mintNoteId();
-    const slug = bodyToSlug(body, this.activeStopwords());
-    const filename = buildFilename(slug, cloneId);
-    const path = `${this.noteFolder}/${filename}`;
     const nowIso = new Date().toISOString();
     // With `preserveCreated` (a fork) the copy keeps the source's `created` and
     // records `modified` = now. All other callers (Clone, insert-template, note
     // paste) keep the default new-note `created`.
     const created = opts.preserveCreated && source.created ? source.created : nowIso;
+    const slug = bodyToSlug(body, this.activeStopwords());
+    const filename = buildFilename(slug, cloneId, datePrefixFor(this.plugin.settings, createdMsOf(created) ?? Date.now()));
+    const path = `${this.noteFolder}/${filename}`;
     const attachments = this.extractAttachments(body);
 
     // Minimal initial file — just enough to be a valid Stashpad note. The
@@ -19474,7 +19499,7 @@ export class StashpadView extends ItemView {
     const newState = anyIncomplete; // true means "mark complete"
     // 0.140.1: capture the pre-toggle due + whether it rolled, so undo/redo can
     // reverse a recurrence roll (not just the `completed` flag).
-    const priorStates: { id: StashpadId; path: string; was: boolean; dueBefore: string | null; rolledTo: string | null }[] = [];
+    const priorStates: { id: StashpadId; path: string; was: boolean; dueBefore: string | null; rolledTo: string | null; focusDoneBefore: unknown; focusDoneAfter: unknown; completedRaw: unknown }[] = [];
 
     const changedIds: StashpadId[] = [];
     const rolled: Array<{ title: string; when: number }> = []; // recurring tasks rescheduled
@@ -19487,7 +19512,7 @@ export class StashpadView extends ItemView {
       const was = this.isCompleted(t);
       const rec0 = this.app.metadataCache.getFileCache(t.file)?.frontmatter;
       const dueBefore = rec0?.due != null ? String(rec0.due) : null;
-      const ps = { id: t.id, path: t.file.path, was, dueBefore, rolledTo: null as string | null };
+      const ps = { id: t.id, path: t.file.path, was, dueBefore, rolledTo: null as string | null, focusDoneBefore: rec0?.[FOCUS_DONE_KEY] as unknown, focusDoneAfter: rec0?.[FOCUS_DONE_KEY] as unknown, completedRaw: rec0?.completed as unknown };
       priorStates.push(ps);
       if (was === newState) continue;
       let didRoll = false;
@@ -19503,29 +19528,17 @@ export class StashpadView extends ItemView {
       // would otherwise schedule is redundant, and that is the render whose
       // anchor restore lands slightly off and scrolls the list.
       this.markFmSelfWrite(t.file.path, true); // body unchanged → no placeholder flash
+      // 0.578.0: the repeat-aware completion now lives in task-complete.ts
+      // (applyCompleteFm) so the Focus view, Tasks panel and kanban do exactly
+      // what this does. Behaviour here is unchanged, plus the Focus "done
+      // today" stamp on a rolled task that's on today's Focus list.
       await this.app.fileManager.processFrontMatter(t.file, (fm) => {
-        const rec = newState ? parseRecurrence(fm.repeat as string | undefined) : null;
-        const mode = parseRepeatMode(fm.repeatMode);
-        if (rec) {
-          const oldDue = fm.due != null ? parseDueString(String(fm.due)) : NaN;
-          const next = nextDueOnComplete(rec, Number.isFinite(oldDue) ? oldDue : null, Date.now());
-          const nextIso = nextDueValue(fm.due, next); // 0.546.2: date-only stays date-only
-          if (mode === "complete" || mode === "interval") {
-            // This occurrence is genuinely finished — it stays completed, and a
-            // fresh incomplete one is created for the next interval.
-            writeCompletedFm(fm, true);
-            delete fm.missed;
-            spawnNextIso = nextIso;
-          } else {
-            // rollForward / archive: the same note moves to the next date.
-            fm.due = nextIso;
-            delete fm.completed;
-            ps.rolledTo = nextIso;
-            didRoll = true;
-            if (mode === "archive") archiveThis = true;
-          }
-          rolled.push({ title: (t.file!.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim()) || "task", when: next });
-        } else writeCompletedFm(fm, newState);
+        if (!newState) { applyUncompleteFm(fm); ps.focusDoneAfter = undefined; return; }
+        const plan = applyCompleteFm(fm);
+        ps.focusDoneAfter = fm[FOCUS_DONE_KEY];
+        if (plan.spawnNextIso) spawnNextIso = plan.spawnNextIso;
+        if (plan.rolledTo != null) { ps.rolledTo = plan.rolledTo; didRoll = true; archiveThis = plan.archive; }
+        if (plan.nextWhen != null) rolled.push({ title: (titleFromBasename(t.file!.basename).trim()) || "task", when: plan.nextWhen });
       });
       if (spawnNextIso) {
         const made = await spawnNextOccurrence(this.app, t.file, spawnNextIso, () => this.plugin.mintNoteId());
@@ -19590,9 +19603,12 @@ export class StashpadView extends ItemView {
               // 0.140.1: reverse a recurrence roll — restore the old due, keep
               // it an active (incomplete) task.
               if (p.dueBefore != null) fm.due = p.dueBefore; else delete fm.due;
-              delete fm.completed;
+              // 0.578.0: restore the raw value (a to-do's completed:false stays).
+              if (p.completedRaw === undefined || p.completedRaw === true) delete fm.completed; else fm.completed = p.completedRaw;
             } else if (p.was) fm.completed = true;
             else delete fm.completed;
+            // 0.578.0: and the Focus "done today" stamp (set by a roll, cleared by un-complete).
+            if (p.focusDoneBefore === undefined) delete fm[FOCUS_DONE_KEY]; else fm[FOCUS_DONE_KEY] = p.focusDoneBefore;
           });
           if (changedIds.includes(p.id)) reverted.push(p.id);
         }
@@ -19611,9 +19627,11 @@ export class StashpadView extends ItemView {
           const f = this.app.vault.getAbstractFileByPath(p.path) as TFile | null;
           if (!f) continue;
           await this.processOwnFrontMatter(f, (fm) => {
-            if (p.rolledTo != null) { fm.due = p.rolledTo; delete fm.completed; } // re-roll
+            if (p.rolledTo != null) { fm.due = p.rolledTo; if (fm.completed !== false) delete fm.completed; } // re-roll (keeps a to-do's completed:false, like applyCompleteFm)
             else if (newState) fm.completed = true;
             else delete fm.completed;
+            // 0.578.0: re-apply the Focus "done today" stamp exactly as the first time.
+            if (p.focusDoneAfter === undefined) delete fm[FOCUS_DONE_KEY]; else fm[FOCUS_DONE_KEY] = p.focusDoneAfter;
           });
         }
         if (changedIds.length > 0) {
@@ -19973,6 +19991,38 @@ export class StashpadView extends ItemView {
    *  done. Unmarking strips the tag + the completed field. Mixed
    *  selections resolve toward "make all tasks." Undo/redo via a
    *  frontmatter snapshot. Bound to H by default. */
+  /** 0.577.0: put the selection (or cursor row) on today's Focus list — they
+   *  become tasks — or take it off when every target is already on it. The
+   *  write + undo live in FocusService so the Focus view and this share them. */
+  async cmdAddToFocus(): Promise<void> {
+    let targets = this.getActionTargets();
+    if (targets.length === 0) {
+      const focused = this.tree.get(this.focusId);
+      if (focused?.file && focused.id !== ROOT_ID) targets = [focused];
+    }
+    const nodes = targets.filter((t) => !!t.file && t.id !== ROOT_ID);
+    if (nodes.length === 0) { notify("Nothing to add to Today."); return; }
+    const today = dayKey(Date.now());
+    const fmOf = (t: TreeNode): any => this.app.metadataCache.getFileCache(t.file!)?.frontmatter;
+    const remove = nodes.every((t) => normFocusDate(fmOf(t)?.[FOCUS_DATE_KEY]) === today);
+    const n = await this.plugin.focus.setFocus(nodes.map((t) => t.file!), !remove);
+    if (!remove) {
+      // Adding makes them tasks: same structural repaint as cmdToggleTask.
+      for (const t of nodes) {
+        this.completedState.set(t.file!.path, false); // adding reopens a done task
+        this.taskTaggedState.set(t.file!.path, true);
+      }
+      const restore = this.holdListScroll();
+      this.render();
+      restore();
+    }
+    this.plugin.notifications.show({
+      message: remove ? `Removed ${n} from today's Focus list.` : `Added ${n} to today's Focus list.`,
+      kind: "success", category: "edit", folder: this.noteFolder,
+      actions: remove ? [] : [{ label: "Open Focus", onClick: () => void openFocusView(this.plugin) }],
+    });
+  }
+
   async cmdToggleTask(): Promise<void> {
     let targets = this.getActionTargets();
     if (targets.length === 0) {
@@ -20098,21 +20148,36 @@ export class StashpadView extends ItemView {
     // modify handler neither evicts the render cache nor schedules the render
     // that moves the list.
     this.markFmSelfWrite(path, true);
-    /** Prior completion stamp, restored verbatim on undo so re-completing via
-     *  undo doesn't falsify WHEN the task was actually finished. 0.273.1 */
-    let wasAt: unknown;
+    /** Every key a completion can touch, captured raw so undo restores them
+     *  EXACTLY — including the real `completedAt` (0.273.1: re-completing via
+     *  undo mustn't falsify WHEN the task was finished) and, since 0.578.0, the
+     *  due / to-do marker / Focus stamp a repeating task's roll changes. */
+    const SNAP_KEYS = ["completed", "completedAt", "due", "missed", FOCUS_DONE_KEY] as const;
+    const before: Record<string, unknown> = {};
+    // 0.578.0: the row / detail-panel / showcase checkbox goes through the shared
+    // repeat-aware rule (task-complete.ts) like Toggle complete — before this,
+    // ticking a daily task's CHECKBOX left it done forever with no next one.
+    let plan = null as CompletionPlan | null;
     await this.app.fileManager.processFrontMatter(node.file, (m: any) => {
-      wasAt = m.completedAt;
-      writeCompletedFm(m, !was);
+      for (const k of SNAP_KEYS) before[k] = k in m ? m[k] : undefined;
+      if (was) applyUncompleteFm(m); else plan = applyCompleteFm(m);
     });
-    this.completedState.set(path, !was); // authoritative, pre-cache-event
+    const rolled = plan?.rolledTo != null;
+    this.completedState.set(path, was ? false : !rolled); // authoritative, pre-cache-event
+    let spawned: TFile | null = null;
+    if (plan && (plan.spawnNextIso || plan.archive)) spawned = await finishCompletion(this.app, node.file, plan, () => this.plugin.mintNoteId());
     await this.log.append({ type: was ? "uncomplete" : "complete", id: node.id });
+    if (plan?.nextWhen != null) {
+      const title = titleFromBasename(node.file.basename).trim() || "task";
+      this.plugin.notifications.show({ message: `🔁 ${plan.spawnNextIso ? "Next up" : "Rescheduled"}: “${title}” → ${formatDateTime(plan.nextWhen, this.plugin.settings)}.`, kind: "success", category: "system", folder: this.noteFolder });
+    }
     // 0.218.0: ticking an EXISTING checkbox swaps an icon and a class — repaint
     // it in place so the list never moves. The note stays a task either way, so
     // the checkbox is already there; the guarded fallback covers the cases the
     // fast path can't see (row scrolled out of the rendered set, no checkbox).
+    // A repeat that rolled (new due) or spawned / archived a copy is structural.
     this.traceScroll("completed");
-    if (!this.repaintCompletedState([node.id])) this.render();
+    if (rolled || spawned || plan?.archive || !this.repaintCompletedState([node.id])) this.render();
     else this.refreshParentProgress(node); // 0.325.0: tick the parent's done/total in place
     const folder = this.noteFolder;
     this.plugin.getUndoStack(folder).push({
@@ -20122,12 +20187,12 @@ export class StashpadView extends ItemView {
         if (!f) return;
         this.markFmSelfWrite(path, true);
         await this.app.fileManager.processFrontMatter(f, (m: any) => {
-          writeCompletedFm(m, was);
-          if (was && wasAt !== undefined) m.completedAt = wasAt;   // restore the real stamp
+          for (const k of SNAP_KEYS) { if (before[k] === undefined) delete m[k]; else m[k] = before[k]; }
         });
         this.completedState.set(path, was);
         this.tree.rebuild(folder);
-        if (!this.repaintCompletedState([node.id])) this.render();
+        // A rolled due coming back is structural (the row's due changes), like the forward roll.
+        if (rolled || !this.repaintCompletedState([node.id])) this.render();
         else this.refreshParentProgress(this.tree.get(node.id) ?? node); // 0.523.7: same as the forward toggle
       },
     });
@@ -22203,17 +22268,18 @@ export class StashpadView extends ItemView {
       }
     }
 
+    // createdOverride lets callers (e.g. split) preserve the source
+    // note's created time for the second half so it sorts in the same
+    // chronological position as its sibling.
+    const created = opts.createdOverride ?? new Date().toISOString();
     const slug = bodyToSlug(body, this.activeStopwords());
-    const filename = buildFilename(slug, id);
+    // 0.580.0: date-time prefix from the note's own created time.
+    const filename = buildFilename(slug, id, datePrefixFor(this.plugin.settings, createdMsOf(created) ?? Date.now()));
     const path = `${folder}/${filename}`;
     // For remote sends parentOverride is always supplied (the picked
     // remote parent); falling back to this.focusId would be wrong (it
     // belongs to the current folder).
     const parentId = parentOverride ?? this.focusId;
-    // createdOverride lets callers (e.g. split) preserve the source
-    // note's created time for the second half so it sorts in the same
-    // chronological position as its sibling.
-    const created = opts.createdOverride ?? new Date().toISOString();
     const attachments = this.extractAttachments(body);
     // Author stamping. Only stamp when the user has set a name in
     // settings (otherwise leave authorship out so non-multiplayer
@@ -22863,7 +22929,7 @@ export class StashpadView extends ItemView {
    *  the row carries, MINUS expand-collapse and preview (redundant in the modal).
    *  Edit / open / reply stay reachable through the ⋮ menu. */
   private renderPreviewActions(host: HTMLElement, node: TreeNode, dismiss?: () => void): void {
-    this.addReactionButton(host, node);
+    if (this.rowListHasReact()) this.addReactionButton(host, node); // 0.579.0: follows the list
     this.maybeAddQuickButton(host, node);
     // 0.414.0: quick-capture a nested note under THIS previewed note (or pick a
     // destination). Doesn't dismiss the preview — the capture modal stacks over it.
@@ -23050,8 +23116,9 @@ export class StashpadView extends ItemView {
       const known = !!folder && !!ensuredDirs?.has(folder);
       if (folder) { await this.ensureFolder(folder, known); ensuredDirs?.add(folder); }
       const safeName = file.name.replace(/[^\w.-]+/g, "_");
-      const stamp = Date.now().toString(36);
-      const leaf = buildAttachmentName(safeName, stamp);
+      const now = Date.now();
+      const stamp = now.toString(36);
+      const leaf = buildAttachmentName(safeName, stamp, datePrefixFor(this.plugin.settings, now));
       const path = folder ? `${folder}/${leaf}` : leaf;
       try {
         await this.app.vault.createBinary(path, buf);
@@ -23815,6 +23882,13 @@ export class StashpadView extends ItemView {
     return this.plugin.settings.slugStopWords ?? DEFAULT_STOPWORDS;
   }
 
+  /** 0.580.0: the file name a title change should produce, or null when the
+   *  current name is already right. A date prefix is never a reason to rename
+   *  and is carried over as-is (see reslugName / THE NO-FIGHT RULE). */
+  private slugRenameTarget(file: TFile, slug: string, id: string, created: unknown): string | null {
+    return reslugName(file.name, slug, id, createdMsOf(created));
+  }
+
   private scheduleSlugRename(file: TFile): void {
     let d = this.slugDebouncers.get(file.path);
     if (d) d.cancel();
@@ -23826,14 +23900,15 @@ export class StashpadView extends ItemView {
    *  path if it renamed, else null. Like maybeRenameForSlug but takes a known body
    *  (used by the Edit-surface Save so it doesn't wait on the cache). */
   private async reslugFile(file: TFile, body: string): Promise<string | null> {
-    const fmIdRaw = this.app.metadataCache.getFileCache(file)?.frontmatter?.id;
+    const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+    const fmIdRaw = fm?.id;
     const fmId = typeof fmIdRaw === "string" ? fmIdRaw : null;
     const fnId = parseIdFromFilename(file.basename);
     const id = fnId ?? (isNoteId(fmId ?? "") ? fmId : null);
     if (!id || id === ROOT_ID) return null;
     if (fmId !== id) return null;
-    const desired = buildFilename(bodyToSlug(body, this.activeStopwords()), id);
-    if (file.name === desired) return null;
+    const desired = this.slugRenameTarget(file, bodyToSlug(body, this.activeStopwords()), id, fm?.created);
+    if (!desired) return null;
     const newPath = file.parent ? `${file.parent.path}/${desired}` : desired;
     if (this.app.vault.getAbstractFileByPath(newPath)) return null;
     const oldPath = file.path;
@@ -23859,8 +23934,9 @@ export class StashpadView extends ItemView {
     const raw = await this.app.vault.cachedRead(file);
     const body = this.stripFrontmatter(raw);
     const newSlug = bodyToSlug(body, this.activeStopwords());
-    const desired = buildFilename(newSlug, id);
-    if (file.name === desired) return;
+    const created = this.app.metadataCache.getFileCache(file)?.frontmatter?.created;
+    const desired = this.slugRenameTarget(file, newSlug, id, created);
+    if (!desired) return;
     const newPath = file.parent ? `${file.parent.path}/${desired}` : desired;
     if (this.app.vault.getAbstractFileByPath(newPath)) return;
     const oldPath = file.path;
@@ -24341,6 +24417,9 @@ export class StashpadView extends ItemView {
       // getActionTargets() (scope-aware), so a multi-select export isn't lost.
       case "exportHtml":       this.cmdExportDoc(); break;
       case "moveInList":       this.cmdInListPicker(); break;
+      // 0.579.2 (blind review): a catalog action (addable to the star menu and row
+      // buttons) that had no case here, so clicking it there did nothing.
+      case "outdent":          void this.cmdOutdent(); break;
       case "move":             this.cmdMovePicker(); break;
       case "moveHome":         void this.changeParent(node, ROOT_ID); break;
       case "splitOut":         this.cmdSplitOut(node); break;
@@ -24349,6 +24428,7 @@ export class StashpadView extends ItemView {
       case "setColor":         this.cmdSetColor(); break;
       case "blur":             void this.cmdToggleObscured(); break;
       case "setDue":           this.cmdSetDue(); break;
+      case "addToFocus":       void this.cmdAddToFocus(); break;
       case "attributeBot":     this.attributeSelectionToBot(false); break;
       case "archive":          void this.cmdMoveToArchive(); break;
       case "largeText":        this.cmdRevealLargeText(node); break;
@@ -24396,11 +24476,11 @@ export class StashpadView extends ItemView {
    *  overflow spills to a full-width bar at the bottom of the note that wraps.
    *  `inlineMax` is platform-aware (a phone row has less room). */
   private maybeAddItemButtons(actions: HTMLElement, body: HTMLElement, node: TreeNode, before: HTMLElement): void {
-    // 0.475.0: the built-in row buttons (edit/focus/reply/react) now live in
-    // `itemButtons` too, but they are the DESKTOP row's job (renderConfiguredRowButtons).
-    // Here — mobile + the preview modal — render only the CUSTOM ids, so those
-    // surfaces stay exactly as they were (they have their own react/⋮/etc.).
-    const ids = (getSettings().itemButtons ?? []).filter((id) => !DEFAULT_ROW_BUTTONS.includes(id));
+    // 0.475.0: the built-in row buttons (edit/focus/reply/react) live in the
+    // lists too, but the preview modal (the only caller since 0.579.0 — rows use
+    // renderConfiguredRowButtons) has its own react/⋮, so render only the CUSTOM
+    // ids. 0.579.0: from the list for THIS platform.
+    const ids = rowButtonsFor(getSettings(), Platform.isMobile).filter((id) => !DEFAULT_ROW_BUTTONS.includes(id));
     if (!ids.length) return;
     const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const resolve = (id: string): { icon: string; label: string } | null => {
@@ -24442,8 +24522,9 @@ export class StashpadView extends ItemView {
    *  slot); every other id renders like a custom item button and dispatches via
    *  runQuickAction. Inline up to a cap, the rest wrap to a bar under the note.
    *  Returns the first inline button, for the Show-More toggle's anchor. */
-  private renderConfiguredRowButtons(actions: HTMLElement, body: HTMLElement, node: TreeNode): HTMLElement | null {
-    const ids = getSettings().itemButtons ?? [];
+  private renderConfiguredRowButtons(actions: HTMLElement, body: HTMLElement, node: TreeNode, ids: readonly string[] = getSettings().itemButtons ?? [], inlineMax = 8): HTMLElement | null {
+    // 0.579.0: `ids` / `inlineMax` let the mobile row render its own list
+    // (`itemButtonsMobile`, a smaller inline cap) through the same code.
     if (!ids.length) return null;
     const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const resolve = (id: string): { icon: string; label: string } | null => {
@@ -24460,8 +24541,7 @@ export class StashpadView extends ItemView {
     };
     const resolved = ids.map((id) => ({ id, meta: resolve(id) })).filter((x): x is { id: string; meta: { icon: string; label: string } } => x.meta != null);
     if (!resolved.length) return null;
-    const inlineMax = 8; // a desktop row fits the four built-ins + a few customs
-    const render = (host: HTMLElement, id: string, meta: { icon: string; label: string }): HTMLElement => {
+    const render =(host: HTMLElement, id: string, meta: { icon: string; label: string }): HTMLElement => {
       if (id === "react") { this.addReactionButton(host, node); return host.lastElementChild as HTMLElement; }
       const b = host.createEl("button", { cls: "stashpad-pencil stashpad-note-itembtn" });
       rowIcon(b, meta.icon as RowIconName); // sprite when registered, setIcon fallback otherwise
@@ -24542,7 +24622,9 @@ export class StashpadView extends ItemView {
     // commandIcons["cmd:<id>"]).
     const cfg = getSettings();
     const ids = cfg.quickMenuActions ?? [];
-    const byId = new Map(NOTE_ACTION_CATALOG.map((a) => [a.id, a]));
+    // 0.579.1: catalog + the menu-only actions the dispatcher can run (moveInList,
+    // in the default list) — the catalog alone dropped them while settings listed them.
+    const byId = new Map([...NOTE_ACTION_CATALOG, ...CONTEXT_EXTRA_ACTIONS.filter((a) => QUICK_MENU_EXTRA_IDS.includes(a.id))].map((a) => [a.id, a]));
     const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const menu = new Menu();
     let added = 0;
@@ -24558,6 +24640,7 @@ export class StashpadView extends ItemView {
       }
       const def = byId.get(id);
       if (!def) continue;   // stale/unknown id
+      if (id === "moveInList" && node.id === this.focusId) continue;   // 0.579.2: see renderCtxLeaf
       const live = this.statefulActionMeta(id, node); // 0.575.2: Pin ↔ Unpin
       menu.addItem((it: any) => it.setTitle(live?.label ?? def.label).setIcon(live?.icon ?? this.actionIcon(id)).onClick((e: MouseEvent | KeyboardEvent) => this.runQuickAction(id, node, e)));
       added += 1;
@@ -24590,6 +24673,9 @@ export class StashpadView extends ItemView {
         target.addItem((it: any) => it.setTitle("Turn into task").setIcon("square-check-big").onClick(() => taskAct(() => this.cmdToggleTask())));
       }
       target.addItem((it: any) => it.setTitle("Assign / schedule…").setIcon("user-plus").onClick(() => taskAct(() => this.cmdAssign())));
+      // 0.577.0: today's Focus list (focus-view.ts).
+      const onToday = !!node.file && normFocusDate(this.app.metadataCache.getFileCache(node.file)?.frontmatter?.[FOCUS_DATE_KEY]) === dayKey(Date.now());
+      target.addItem((it: any) => it.setTitle(onToday ? "Remove from Today (Focus)" : "Add to Today (Focus)").setIcon("target").onClick(() => taskAct(() => this.cmdAddToFocus())));
       if (isTaskNote) {
         target.addItem((it: any) => it.setTitle("Snooze (reschedule)…").setIcon("alarm-clock").onClick(() => taskAct(() => this.cmdSnooze(node))));
         target.addItem((it: any) => it.setTitle("Remove from tasks").setIcon("square").onClick(() => taskAct(() => this.cmdToggleTask())));
@@ -24670,7 +24756,9 @@ export class StashpadView extends ItemView {
         break;
       case "largeText":    A("Reveal in large text", this.actionIcon("largeText"), () => this.cmdRevealLargeText(node)); break;
       case "archive":      A("Move to archive", this.actionIcon("archive"), () => { focusClicked(); void this.cmdMoveToArchive(); }); break;
-      case "moveInList":   A("Move in list", this.actionIcon("moveInList"), () => { focusClicked(); this.cmdInListPicker(); }); break;
+      // 0.579.2: not for the focused note's own header — it isn't IN the list it
+      // heads (the picker would offer its own children as parents, or do nothing).
+      case "moveInList":   if (node.id !== this.focusId) A("Move in list", this.actionIcon("moveInList"), () => { focusClicked(); this.cmdInListPicker(); }); break;
       case "move":         A("Move to…", this.actionIcon("move"), () => { focusClicked(); this.cmdMovePicker(); }); break;
       case "moveHome":     A("Move to Home", this.actionIcon("moveHome"), async () => { await this.changeParent(node, ROOT_ID); if (this.plugin.settings.autoNavOnMoveOut && this.focusId !== ROOT_ID) this.navigateTo(ROOT_ID); }); break;
       case "setColor":     A("Set color…", this.actionIcon("setColor"), () => { focusClicked(); this.cmdSetColor(); }); break;

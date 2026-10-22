@@ -561,6 +561,9 @@ export class AuthorshipTracker {
     // add contributors. knownBodies is already updated above, so the next
     // genuine edit is still detected correctly.
     if (this.host.plugin.rebootstrapInProgress) return;
+    // 0.580.0: same for the link rewrites of the add/remove-dates sweep — only
+    // on the notes it is rewriting, so real edits elsewhere still count.
+    if ((this.host.plugin.linkRewriteQuiet.get(file) ?? 0) > Date.now()) return;
     const author = this.currentAuthorLink();
     // 0.337.0: capture a history version on a genuine body change. Done here (not
     // gated on `author`) so history works even when the user hasn't set a name —

@@ -10,6 +10,7 @@ import { runFoldFlow } from "./folder-fold";
 import { runUnfoldFlow } from "./folder-split";
 import { openFolderSetup } from "./folder-setup-modal";
 import type { FolderPlacement } from "./types";
+import { titleFromBasename } from "./slug-service";
 
 /** 0.164.0: a pinned item in the folder panel's shared pin order — either a
  *  pinned FOLDER or a pinned NOTE. `at` is the shared numeric order key. */
@@ -807,7 +808,7 @@ export class StashpadFolderPanelView extends ItemView {
   }
 
   private titleFromFile(file: TFile): string {
-    return file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim() || file.basename;
+    return titleFromBasename(file.basename).trim() || file.basename;
   }
 
   // ---------- folders (bottom) ----------

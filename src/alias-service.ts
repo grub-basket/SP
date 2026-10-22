@@ -1,5 +1,5 @@
 import type { App, TFile } from "obsidian";
-import { stripInlineMarkdown } from "./slug-service";
+import { stripInlineMarkdown, titleFromBasename } from "./slug-service";
 
 /** 0.271.7: aliases for Stashpad notes.
  *
@@ -39,7 +39,7 @@ export async function deriveCleanTitle(app: App, file: TFile): Promise<string | 
     const t = stripInlineMarkdown(firstLine).trim();
     if (t) return t;
   }
-  const fromName = file.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ").trim();
+  const fromName = titleFromBasename(file.basename).trim();
   return fromName && fromName.toLowerCase() !== "untitled" ? fromName : null;
 }
 

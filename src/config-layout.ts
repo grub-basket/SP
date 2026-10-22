@@ -45,9 +45,15 @@ export const CONFIG_FILES: Record<string, readonly string[]> = {
   "menus/menus.json": [
     "contextSubmenus", "contextMenuOrder", "contextMenuHidden",
     "itemButtons", "quickMenuActions", "quickMenuCustom",
+    // 0.579.0: the mobile row's own list (absent = derived at load).
+    "itemButtonsMobile",
     "commandIcons", "toolbarButtons",
     // 0.529.0: the ⚡ actions menu (new keys — nothing to migrate).
     "zapMenuOrder", "zapSubmenus",
+    // (0.579.5: `zapDefaultsSeen` deliberately stays in data.json — an older build
+    // rewriting this file drops keys it doesn't know, which would re-offer a
+    // default the user removed; data.json keeps unknown keys. The "config folder
+    // not synced yet" case is handled by skipping the reconcile that launch.)
   ],
   "templates/templates.json": ["noteTemplates"],
   "appearance/appearance.json": [

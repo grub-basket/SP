@@ -17,7 +17,7 @@ import type StashpadPlugin from "./main";
 import { type ComposerDraft, RESERVED_FRONTMATTER, type ViewMode } from "./types";
 import { type SplitMode } from "./view-helpers";
 import { QUICK_ACTION_CATALOG } from "./quick-actions";
-import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, defaultContextOrder, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS, ZAP_ACTIONS, ZAP_ADDABLE, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, type NoteActionDef } from "./note-actions";
+import { NOTE_ACTION_CATALOG, BUTTON_ACTION_CATALOG, CONTEXT_EXTRA_ACTIONS, noteAction, defaultActionIcon, defaultContextOrder, CONTEXT_LEAF_IDS, DEFAULT_CONTEXT_SUBMENUS, DEFAULT_ROW_BUTTONS, DEFAULT_MOBILE_ROW_BUTTONS, rowButtonsFor, QUICK_MENU_EXTRA_IDS, reachableMenuIds, ZAP_ACTIONS, ZAP_ADDABLE, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, type NoteActionDef } from "./note-actions";
 import { CommandPickModal } from "./command-pick";
 import { guessCommandIcon } from "./icon-guess";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal, parseTimeOfDay, formatTimeChip } from "./modals";
@@ -25,7 +25,7 @@ import { makeSnippet } from "./snippets";
 import { resolveToolbarButtons, type ToolbarButtonConfig } from "./formatting-toolbar";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
-import { DEFAULT_STOPWORDS } from "./slug-service";
+import { DEFAULT_STOPWORDS, DATE_PREFIX_SEPS, formatDatePrefix, type DatePrefixSep } from "./slug-service";
 import { newId } from "./id-service";
 import { COPY_TS_MODIFIER_ORDER, type CopyTsModifier, parseModifierTokens, serializeModifierTokens, copyTimestampStatus, humanCombo } from "./view-keys";
 import { formatDateTime } from "./format";
@@ -79,7 +79,7 @@ export type CommandId =
   | "swapWithParent"
   | "togglePin" | "listPin" | "listPinBottom"
   | "previewNote" | "previewHome"
-  | "toggleTask" | "setDue" | "openAllTasks" | "reply"
+  | "toggleTask" | "addToFocus" | "setDue" | "openAllTasks" | "reply"
   | "jumpToTop" | "jumpToBottom"
   | "lockSelection" | "unlockAll" | "moveToArchive" | "encryptDelete"
   | "copyNotes" | "cutNotes" | "pasteNotes"
@@ -167,6 +167,7 @@ export const COMMAND_META: CommandMeta[] = [
   { id: "previewNote",     label: "Preview selected note",         desc: "Default: Shift+Space — open the cursor row (or selection) in the note-preview viewer.", defaultPrimary: "Shift+Space" },
   { id: "previewHome",     label: "Preview home note",             desc: "Default: Alt+Shift+Space (Option+Shift+Space on macOS) — open the current list's home (focused) note in the note-preview viewer. (The old Mod+Shift+Space default collided with macOS / 1Password system shortcuts.)", defaultPrimary: "Alt+Shift+Space" },
   { id: "toggleTask",      label: "Toggle task (todo)",            desc: "Default: G — mark the selection (or cursor row) as a task / todo, or clear it. Tasks appear in the Tasks panel.", defaultPrimary: "G" },
+  { id: "addToFocus",      label: "Add to / remove from Today (Focus)", desc: "No default — put the selection (or cursor row) on today's Focus list as tasks, or take it off when it's all there already. Open the list with \"Open Focus view\".", defaultPrimary: "" },
   { id: "reply",           label: "Reply to selection",            desc: "Default: R — start a reply to the cursor row (or selection): the composer's next send links back to it and shows a quote. Press R on another note to switch the reply target.", defaultPrimary: "R" },
   { id: "setDue",          label: "Set due date…",                 desc: "Default: D — open a date+time picker to set (or clear) the due date on the selection. Setting a due date also marks the note as a task.", defaultPrimary: "D" },
   { id: "openAllTasks",    label: "Open all tasks (aggregate view)", desc: "Default: Shift+T — open the aggregate “All tasks” view collecting tasks across every Stashpad folder.", defaultPrimary: "Shift+T" },
@@ -353,8 +354,15 @@ export interface StashpadSettings {
    *  command id>`), left-to-right; overflow wraps to a row at the bottom of the
    *  note. 0.475.0: this now ALSO holds the built-in desktop row buttons (edit /
    *  focus / reply / react) so they can be hidden + reordered — DEFAULT_ROW_BUTTONS
-   *  seeds it. Empty = no buttons (just the ⋮). Mobile ignores the built-in ids. */
+   *  seeds it. Empty = no buttons (just the ⋮). Desktop only since 0.579.0. */
   itemButtons: string[];
+  /** 0.579.0: the MOBILE row's buttons, same id format as `itemButtons`. Before
+   *  this, mobile drew a fixed React button plus only the custom ids from
+   *  `itemButtons`, so hiding React (or showing Edit) in settings did nothing on
+   *  a phone. UNSET until the user edits it; read it only through
+   *  `rowButtonsFor()`, which derives it from `itemButtons` while unset
+   *  (reproducing the old mobile row). Never store a derived copy. */
+  itemButtonsMobile?: string[];
   /** 0.475.0: one-time migration flag — existing installs had `itemButtons` as
    *  CUSTOM-only (built-ins were hardcoded). On first load after the upgrade the
    *  built-ins are prepended (see main.ts) and this is set, so we never re-seed
@@ -431,6 +439,10 @@ export interface StashpadSettings {
    *  back to its default, so only EDITED submenus are stored. Separate from the
    *  ⋮ menu's contextSubmenus — the two menus are edited independently. */
   zapSubmenus: Record<string, { name: string; icon: string; items: string[] }>;
+  /** 0.579.2: the ⚡ defaults (zapDefaultSignatures) this install has already
+   *  been offered, so a new default reaches a customized ⚡ menu once and a
+   *  built-in the user removes stays removed. Absent until the first load. */
+  zapDefaultsSeen?: string[];
   /** 0.395.0: folders (vault paths) whose composer shows the "N drafts" reminder
    *  chip. Toggled per-folder by the composer's Drafts button. A composer draft is
    *  NEVER auto-restored into the text box any more (that resurfaced already-sent
@@ -496,6 +508,16 @@ export interface StashpadSettings {
    *  round-trip and a move triggers several); Rebootstrap backfills them on
    *  demand, and the canonical id/parent is unaffected. */
   writeRecoveryLinks: boolean;
+  /** 0.580.0 — put the creation date-time in front of NEW note and attachment
+   *  file names (`2026-10-22-1430-Title-<id>.md`) so a plain file explorer
+   *  sorts them by when they were made. Existing files are only changed by the
+   *  "Add dates to file names" command (or Rebootstrap, when
+   *  fileDatePrefixInRebootstrap is on). Default true. */
+  fileDatePrefix: boolean;
+  /** Separator between year, month and day in the prefix; "" = none. */
+  fileDatePrefixSep: DatePrefixSep;
+  /** Rebootstrap also adds dates to existing file names. Default false. */
+  fileDatePrefixInRebootstrap: boolean;
   useTemplatesFormat: boolean;
   /** 0.278.0 — modifier gesture that adds each note's timestamp when copying.
    *  Stored as a canonical `+`-joined subset of "mod"/"ctrl"/"alt"/"shift"
@@ -630,6 +652,20 @@ export interface StashpadSettings {
    *  entries live in that view's "Removed from watchlist" section (a
    *  recoverable dismissal, not a delete). */
   reEncryptWatch: ReEncryptWatchEntry[];
+  /** 0.577.0 (Focus view): pomodoro lengths in minutes, and how often a long
+   *  break replaces a short one (0 = never). Synced — a preference. */
+  focusWorkMin: number;
+  focusShortBreakMin: number;
+  focusLongBreakMin: number;
+  focusLongBreakEvery: number;
+  /** Which timer the Focus view starts with. */
+  focusDefaultMode: "pomodoro" | "stopwatch";
+  /** 0.577.0: the running/paused Focus timer. DEVICE-LOCAL (history.json): a
+   *  timer ticking on the laptop must not appear to run on the phone. */
+  focusTimer: import("./focus-time").FocusTimerState | null;
+  /** 0.577.0: Today-list order as `folder::id` keys, device-local. Notes not in
+   *  it (added on another device) sort after, by title. */
+  focusOrder: string[];
   /** 0.138.0: on startup, if the watchlist has active entries, show a Notice
    *  with a Review button that opens the review view. Default OFF. */
   reEncryptNudge: boolean;
@@ -1375,6 +1411,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   quickMenuActions: ["edit", "moveInList", "copy", "move", "blur", "largeText"],
   quickMenuCustom: [],
   itemButtons: [...DEFAULT_ROW_BUTTONS],
+  // itemButtonsMobile: deliberately absent (unset = derived; see rowButtonsFor)
   itemButtonsSeeded: true,
   itemButtonsRepairedV1: true,
   commandIcons: {},
@@ -1421,6 +1458,9 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   linkPreviewDelayMs: 300,
   linkPreviewAuto: false,
   linkPreviewCollapsed: false,
+  fileDatePrefix: true,
+  fileDatePrefixSep: "-",
+  fileDatePrefixInRebootstrap: false,
   useTemplatesFormat: false,
   copyTimestampModifiers: "",
   copyTreeLevelMarkers: false,
@@ -1449,6 +1489,13 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   migratedTrashToSubfolders: false,
   numericIdQuoteSweepDone: false,
   reEncryptWatch: [],
+  focusWorkMin: 25,
+  focusShortBreakMin: 5,
+  focusLongBreakMin: 15,
+  focusLongBreakEvery: 4,
+  focusDefaultMode: "pomodoro",
+  focusTimer: null,
+  focusOrder: [],
   reEncryptNudge: false,
   reEncryptAfterMin: 0,
   dueQuickAdjusts: ["5m", "15m", "30m", "1h", "1d", "1w"],
@@ -1831,6 +1878,11 @@ const RENDER_IRRELEVANT_KEYS: ReadonlySet<string> = new Set([
   // on the broadcast to repaint a list.
   "viewModes", "includeAttachmentsInEverything", "encryptionFilter",
   "hideChildlessNotes", "hideCompletedNotes", "attachmentsOnlyNotes",
+  // 0.577.0: Focus view state + prefs. Only the Focus view and its status-bar
+  // ticker read these, and both repaint themselves on change; no Stashpad list
+  // render touches them. focusTimer is saved on every start/pause/phase change.
+  "focusTimer", "focusOrder", "focusWorkMin", "focusShortBreakMin",
+  "focusLongBreakMin", "focusLongBreakEvery", "focusDefaultMode",
   // DELIBERATELY NOT EXCLUDED: `pinnedFilterMode`. It is a single GLOBAL scalar
   // read by every view's render, and it has a settings-tab dropdown that relies
   // on the broadcast to repaint open lists. It also changes rarely (an explicit
@@ -3101,15 +3153,24 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.actionListBuilder(host,
           () => this.plugin.settings.quickMenuActions ?? [],
           (ids) => { this.plugin.settings.quickMenuActions = ids; },
-          "No actions yet — the star button is hidden. Add some below.");
+          "No actions yet — the star button is hidden. Add some below.",
+          // 0.579.1: the same set the star menu can show (catalog + runnable extras).
+          { defs: [...NOTE_ACTION_CATALOG, ...CONTEXT_EXTRA_ACTIONS.filter((a) => QUICK_MENU_EXTRA_IDS.includes(a.id))] });
   }
 
   /** 0.320.0: item-button builder — user command buttons ON each note row. */
   private itemButtonsBody(host: HTMLElement, rebuild: () => void): void {
-        this.sectionHeader(host, "🔘 Item buttons (on every note row)", "The icon buttons on each note's action row (desktop). The built-in Edit / Focus / Reply / React buttons are listed here too — reorder them, use the eye to hide or show one, or add your own (a catalog action or any command) for one-tap Copy, Move, etc. A hidden built-in stays listed below the others so you can always bring it back. The first several sit inline; extras drop to a bar under the note. The ⋮ menu is always last. (Mobile keeps its own compact row.)");
+        this.sectionHeader(host, "🔘 Item buttons — desktop", "The icon buttons on each note's action row on desktop. The built-in Edit / Focus / Reply / React buttons are listed here too — reorder them, use the eye to hide or show one, or add your own (a catalog action or any command) for one-tap Copy, Move, etc. A hidden built-in stays listed below the others so you can always bring it back. The first several sit inline; extras drop to a bar under the note. Phones and tablets use the mobile list below.");
         this.actionListBuilder(host,
           () => this.plugin.settings.itemButtons ?? [],
-          (ids) => { this.plugin.settings.itemButtons = ids; },
+          (ids) => {
+            this.plugin.settings.itemButtons = ids;
+            // 0.579.0 (blind review): an unset mobile list is DERIVED from this one,
+            // so the mobile editor below (and its saved-on-click closure) is stale
+            // after this edit — redraw the whole page so it shows, and saves from,
+            // the current derived list. Deferred: this builder still has to save.
+            if (!this.plugin.settings.itemButtonsMobile) window.setTimeout(rebuild, 0);
+          },
           "Every button is hidden — only the ⋮ menu shows on a note row. Click an eye below to bring one back.",
           {
             catalogIds: BUTTON_ACTION_CATALOG.map((a) => a.id),
@@ -3118,12 +3179,38 @@ export class StashpadSettingTab extends PluginSettingTab {
             alwaysList: DEFAULT_ROW_BUTTONS,
             resetTo: DEFAULT_ROW_BUTTONS,
           });
+        this.rowButtonsFixedNote(host, "desktop");
+        // 0.579.0 (user): mobile gets its OWN list. It used to draw a fixed React
+        // button plus only the custom ids from the desktop list, so hiding React
+        // here did nothing on a phone.
+        this.sectionHeader(host, "📱 Item buttons — mobile", "The icon buttons on each note's row on a phone or tablet. Same controls as the desktop list, kept separate because a phone row has much less room: by default only React is on, and Edit / Focus / Reply are listed but hidden (they're also in the ⋮ menu). The first few sit inline; extras drop to a bar under the note.");
+        this.actionListBuilder(host,
+          () => rowButtonsFor(this.plugin.settings, true),
+          (ids) => { this.plugin.settings.itemButtonsMobile = ids; },
+          "Every button is hidden — only the ⋮ menu shows on a note row on mobile. Click an eye below to bring one back.",
+          {
+            catalogIds: BUTTON_ACTION_CATALOG.map((a) => a.id),
+            alwaysList: DEFAULT_ROW_BUTTONS,
+            resetTo: DEFAULT_MOBILE_ROW_BUTTONS,
+          });
+        this.rowButtonsFixedNote(host, "mobile");
+  }
+
+  /** 0.579.0: name the row buttons that are NOT in the list above, so the
+   *  settings page accounts for every button the row actually shows. */
+  private rowButtonsFixedNote(host: HTMLElement, platform: "desktop" | "mobile"): void {
+    const parts: string[] = [];
+    if (this.plugin.settings.showNotePreviewButton) parts.push("⤢ Preview (turn off with \"Note preview button\" under List & Display)");
+    if (platform === "desktop") parts.push("↳ Make child (Flat and Everything views only)");
+    if ((this.plugin.settings.quickMenuActions ?? []).length) parts.push("⭐ Star menu (empty the star menu above to hide it)");
+    parts.push("⋮ More actions (always last)");
+    host.createEl("p", { cls: "setting-item-description", text: `Also on every ${platform} row, outside this list: ${parts.join(" · ")}.` });
   }
 
   /** 0.320.0: the large context-menu top-block builder (reorderable leaf
    *  actions; stateful items stay fixed below them in the menu). */
   private contextMenuBody(host: HTMLElement, rebuild: () => void): void {
-        this.sectionHeader(host, "☰ Right-click / ⋮ menu", "The full menu you get from right-clicking a note (or its ⋮ button). Reorder actions, add commands, and build your own submenus. Built-in items and submenus can't be deleted (they return on restart) — use the eye button to HIDE one instead, which sticks; commands and your own submenus you added keep the ✕ to remove them.");
+        this.sectionHeader(host, "☰ Right-click / ⋮ menu", "The full menu you get from right-clicking a note (or its ⋮ button). Reorder actions, add commands, and build your own submenus. Built-in items and submenus can't be deleted (they return on restart) — use the eye button to HIDE one instead, which sticks; commands and your own submenus you added keep the ✕ to remove them. Hiding an item hides it everywhere in this menu, inside submenus too. A few items open a fixed submenu, only show when they apply, or change their label with the note — their rows say so. On desktop, the ⋮ button on a narrow row also lists the row buttons that didn't fit.");
         this.contextMenuBuilder(host);
   }
 
@@ -3188,7 +3275,7 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  icon section auto-lists a command as soon as it's used. */
   private usedCustomCmdIds(): string[] {
     const s = this.plugin.settings;
-    const all = [...(s.quickMenuActions ?? []), ...(s.itemButtons ?? []), ...(s.contextMenuOrder ?? []),
+    const all = [...(s.quickMenuActions ?? []), ...(s.itemButtons ?? []), ...rowButtonsFor(s, true), ...(s.contextMenuOrder ?? []),
       ...(s.zapMenuOrder ?? []), ...Object.values(s.zapSubmenus ?? {}).flatMap((m) => m.items)];
     return [...new Set(all.filter((id) => id.startsWith("cmd:")).map((id) => id.slice(4)))];
   }
@@ -3283,6 +3370,42 @@ export class StashpadSettingTab extends PluginSettingTab {
     if (id.startsWith("submenu:")) return id.slice(8) in DEFAULT_CONTEXT_SUBMENUS;
     return true; // a baked-in catalog / extra leaf
   }
+  /** 0.579.4: a short note for a menu editor row whose menu entry isn't a plain
+   *  one-click item — it opens a submenu the code builds (its contents aren't
+   *  editable here), only shows when it applies, or changes its label with the
+   *  note's state. Without these the editors listed items the menu seemed to
+   *  lack, and the menu showed children the editors never mentioned. */
+  /** 0.579.4: the ⋮ menu draws some catalog actions under a different title than
+   *  their catalog label — "copy" is the "Copy ▸" submenu there, not "Copy text".
+   *  The ⋮ editors use this so their rows read like the menu. */
+  private ctxItemName(id: string): string | null {
+    return id === "copy" ? "Copy ▸" : null;
+  }
+
+  private menuItemNote(id: string, menu: "ctx" | "zap"): string | null {
+    if (menu === "zap") {
+      if (id === "forkVersion" || id === "markVersionFinal")
+        return `Only shown when “Sheet versions (alternate drafts)” is on${this.plugin.settings.enableSheetVersions ? "." : " — it's off now."}`;
+      return null;
+    }
+    switch (id) {
+      case "copy": return "Opens a fixed submenu: Copy text, Copy tree, Copy tree with level markers, Copy focused subtree, the “with timestamps” versions, Clone, Fork.";
+      case "taskSubmenu": return "Opens a fixed submenu of task actions — complete, turn into a task, assign / schedule, Today, snooze, remove from tasks (which ones depends on the note).";
+      case "shareExport": return "Opens a fixed submenu: Copy Stashpad link, Export…, Export to HTML / PDF…, Reveal in file manager.";
+      case "pinList": return "Opens a fixed submenu: Top of list, Bottom of list, and Unpin when the note is pinned.";
+      case "attributeBot": return "Opens a fixed submenu: As contributor, As author.";
+      case "replyLink": return "When the note already has a reply link, “Remove reply link” shows next to it.";
+      case "recurrenceSkip": return "Only shown on repeating notes.";
+      case "encrypt": return `Only shown once encryption is set up${this.plugin.encryption?.isConfigured?.() ? "." : " — it isn't yet."}`;
+      case "moveInList": return "Not shown on the focused note's own header (it isn't in the list it heads).";
+      case "pinSidebar": return "Reads “Unpin from sidebar” on a pinned note.";
+      case "pinListTop": case "pinListBottom": return "Reads “Unpin…” when the note is already pinned there.";
+      case "obscure": return "Reads “Stop obscuring” or “Hide again” on an obscured note.";
+    }
+    if (id !== "sep" && !id.startsWith("cmd:") && !id.startsWith("submenu:") && !CONTEXT_LEAF_IDS.includes(id))
+      return "Not available in this menu, so it never shows here.";
+    return null;
+  }
   private ctxIsHidden(id: string): boolean { return (this.plugin.settings.contextMenuHidden ?? []).includes(id); }
   private async ctxToggleHidden(id: string): Promise<void> {
     const set = new Set(this.plugin.settings.contextMenuHidden ?? []);
@@ -3307,7 +3430,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         defaultOrder: ZAP_DEFAULT_ORDER,
         labelFor: (id) => this.zapLabel(id),
         rowExtra: (row, id) => {
-          if (!id.startsWith("zapsub:")) return;
+          if (!id.startsWith("zapsub:")) { const note = this.menuItemNote(id, "zap"); if (note) row.setDesc(note); return; } // 0.579.4
           const key = id.slice(7);
           const sm = subs()[key];
           row.settingEl.addClass("is-submenu");
@@ -3381,6 +3504,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       {
         defs: ZAP_ADDABLE,
         labelFor: (id) => this.zapLabel(id),
+        rowExtra: (row, id) => { const note = this.menuItemNote(id, "zap"); if (note) row.setDesc(note); }, // 0.579.4
         addExtra: (addRow, ids, commit) => {
           addRow.addButton((b) => b.setButtonText("Add divider").onClick(async () => { await commit([...ids(), "sep"]); }));
         },
@@ -3447,7 +3571,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       if (id.startsWith("submenu:")) { const sm = this.plugin.settings.contextSubmenus?.[id.slice(8)]; return { icon: sm?.icon || "folder", name: (sm?.name || "Submenu") + " ▸" }; }
       if (id.startsWith("cmd:")) { const cid = id.slice(4); const nm = registry[cid]?.name || cid; return { icon: this.plugin.settings.commandIcons?.[id] || guessCommandIcon(nm, this.plugin.settings.slugStopWords), name: nm + (registry[cid] ? "" : " (not installed)") }; }
       const ex = extras.get(id); if (ex) return { icon: this.plugin.settings.commandIcons?.[id] || ex.icon, name: ex.label };
-      const def = noteAction(id); return { icon: this.plugin.settings.commandIcons?.[id] || def?.icon || "terminal", name: def?.label || id };
+      const def = noteAction(id); return { icon: this.plugin.settings.commandIcons?.[id] || def?.icon || "terminal", name: this.ctxItemName(id) ?? def?.label ?? id };
     };
     const build = (): void => {
       const ids = effective();
@@ -3460,6 +3584,9 @@ export class StashpadSettingTab extends PluginSettingTab {
           row.addExtraButton((b) => b.setIcon("pencil").setTooltip("Edit submenu").onClick(() => this.editContextSubmenu(key, rebuild)));
           row.settingEl.addClass("is-submenu");
           if (sm) row.setDesc(`${sm.items.length} item${sm.items.length === 1 ? "" : "s"}`);
+        } else {
+          const note = this.menuItemNote(id, "ctx"); // 0.579.4
+          if (note) row.setDesc(note);
         }
         row.addExtraButton((b) => b.setIcon("arrow-up").setTooltip("Move up").setDisabled(i === 0).onClick(async () => { const n = ids.slice(); [n[i-1], n[i]] = [n[i], n[i-1]]; await save(n); }));
         row.addExtraButton((b) => b.setIcon("arrow-down").setTooltip("Move down").setDisabled(i === ids.length - 1).onClick(async () => { const n = ids.slice(); [n[i+1], n[i]] = [n[i], n[i+1]]; await save(n); }));
@@ -3470,10 +3597,20 @@ export class StashpadSettingTab extends PluginSettingTab {
       const add = new Setting(box);
       add.addButton((b) => b.setButtonText("Add action…").onClick((e) => {
         const cur = effective(); const menu = new Menu();
-        for (const def of NOTE_ACTION_CATALOG) { if (!CONTEXT_LEAF_IDS.includes(def.id) || cur.includes(def.id)) continue; menu.addItem((it: any) => it.setTitle(def.label).setIcon(this.plugin.settings.commandIcons?.[def.id] || def.icon).onClick(async () => { await save([...cur, def.id]); })); }
+        for (const def of NOTE_ACTION_CATALOG) { if (!CONTEXT_LEAF_IDS.includes(def.id) || cur.includes(def.id)) continue; menu.addItem((it: any) => it.setTitle(this.ctxItemName(def.id) ?? def.label).setIcon(this.plugin.settings.commandIcons?.[def.id] || def.icon).onClick(async () => { await save([...cur, def.id]); })); }
         // Menu-only items (submenus, task/pin/obscure/share/encrypt/delete, divider).
         menu.addSeparator();
         for (const ex of CONTEXT_EXTRA_ACTIONS) { if (ex.id !== "sep" && cur.includes(ex.id)) continue; menu.addItem((it: any) => it.setTitle(ex.label).setIcon(this.plugin.settings.commandIcons?.[ex.id] || ex.icon).onClick(async () => { await save([...effective(), ex.id]); })); }
+        // 0.579.2: submenus that exist but aren't in the menu anywhere (e.g. after
+        // "Reset menu", whose text promises you can re-add them) — there was no way
+        // to put one back. Empty user submenus are left out (nothing to show).
+        const reach = reachableMenuIds(cur, this.plugin.settings.contextSubmenus ?? {}, "submenu:");
+        const orphans = Object.entries(this.plugin.settings.contextSubmenus ?? {})
+          .filter(([k, s]) => !reach.has(`submenu:${k}`) && (k in DEFAULT_CONTEXT_SUBMENUS || s.items.length > 0));
+        if (orphans.length) {
+          menu.addSeparator();
+          for (const [k, s] of orphans) menu.addItem((it: any) => it.setTitle(`${s.name || "Submenu"} ▸`).setIcon(s.icon || "folder").onClick(async () => { await save([...effective(), `submenu:${k}`]); }));
+        }
         menu.addSeparator();
         menu.addItem((it: any) => it.setTitle("Custom command…").setIcon("terminal").onClick(() => {
           const exclude = new Set(cur.filter((i) => i.startsWith("cmd:")).map((i) => i.slice(4)));
@@ -3492,7 +3629,7 @@ export class StashpadSettingTab extends PluginSettingTab {
       }));
       add.addExtraButton((b) => b.setIcon("rotate-ccw").setTooltip("Reset the menu to its default").onClick(() => {
         new ConfirmModal(this.app, "Reset the right-click menu?",
-          "This restores the default order and items. Your custom submenus are kept but removed from the menu (re-add them from “New submenu…”). This can't be undone from here.",
+          "This restores the default order and items. Your custom submenus are kept but removed from the menu (re-add them from “Add action…”). This can't be undone from here.",
           "Reset menu", (ok: boolean) => { if (ok) void save([]); }, "Cancel").open();
       }));
     };
@@ -3568,7 +3705,14 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => sm.items,
       (ids) => { sm.items = ids; void persist(); },
       "No items yet. Add actions, commands, or other submenus below.",
-      { allowCustom: true, catalogIds: CONTEXT_LEAF_IDS, ctxHide: true });
+      // 0.579.2: offer the menu-only actions too (Move in list, History, Delete,
+      // Obscure, …) — the built-in submenus contain them, but `catalogIds` only
+      // ever offered catalog actions, so a hidden-then-lost one couldn't come back.
+      { allowCustom: true, ctxHide: true, defs: [
+        ...NOTE_ACTION_CATALOG.filter((a) => CONTEXT_LEAF_IDS.includes(a.id)),
+        ...CONTEXT_EXTRA_ACTIONS.filter((a) => a.id !== "sep"),
+      ], rowExtra: (row, id) => { const note = this.menuItemNote(id, "ctx"); if (note) row.setDesc(note); }, // 0.579.4
+      labelFor: (id) => { const name = this.ctxItemName(id); return name ? { icon: this.plugin.settings.commandIcons?.[id] || noteAction(id)?.icon || "terminal", name } : null; } });
     // 0.367.0: a BAKED-IN submenu can't be deleted (the seed re-adds it) — offer
     // Hide instead, which sticks. A user-made submenu keeps the real delete below.
     if (key in DEFAULT_CONTEXT_SUBMENUS) {
@@ -4608,6 +4752,34 @@ export class StashpadSettingTab extends PluginSettingTab {
           t.onChange(async (v) => { this.plugin.settings.taskTagSuggestions = parseTags(v); await set(); });
         });
       }, ["tag", "tags", "suggest", "autocomplete", "task", "due", "assign"]));
+      // 0.580.0: date-time prefix on file names.
+      const sepLabel: Record<DatePrefixSep, string> = { "-": "Dash", ".": "Dot", "_": "Underscore", "": "None" };
+      const fileNameSample = (): string =>
+        `${formatDatePrefix(Date.now(), this.plugin.settings.fileDatePrefixSep ?? "-")}-Grocery-List-k7m3pq.md`;
+      cats.datesTime.push(this.renderDef("Put the date in front of file names", "New notes and attachments get the date and time they were made at the start of their file name, so a regular file explorer (Finder, File Explorer) sorts them by when they were made. Year, month, day order, so sorting by name is sorting by date. Existing files keep their names until you run \"Add dates to existing file names\" below.", (s) => {
+        s.addToggle((t) => t.setValue(this.plugin.settings.fileDatePrefix).onChange(async (v) => {
+          this.plugin.settings.fileDatePrefix = v; await set();
+        }));
+      }, ["file", "name", "filename", "date", "time", "prefix", "timestamp", "sort", "finder", "explorer"]));
+      cats.datesTime.push(this.renderDef("Date separator in file names", "What goes between the year, month and day. The time always follows as HHmm (24-hour).", (s) => {
+        const note = s.descEl.createDiv({ cls: "stashpad-settings-note" });
+        const refresh = () => note.setText(`Example: ${fileNameSample()}`);
+        s.addDropdown((d) => {
+          for (const sep of DATE_PREFIX_SEPS) d.addOption(sep || "none", `${sepLabel[sep]} (${formatDatePrefix(Date.now(), sep)})`);
+          d.setValue(this.plugin.settings.fileDatePrefixSep || "none");
+          d.onChange(async (v) => {
+            this.plugin.settings.fileDatePrefixSep = (v === "none" ? "" : v) as DatePrefixSep;
+            await set(); refresh();
+          });
+        });
+        refresh();
+      }, ["file", "name", "date", "separator", "dash", "dot", "underscore", "prefix"]));
+      cats.datesTime.push(this.renderDef("Add dates to existing file names", "Looks at every note and attachment in every Stashpad folder first and shows you what would change. Nothing is renamed until you confirm, and then the files are renamed one at a time with a short pause between each. Also fixes dates written with a different separator. Needs Obsidian's \"Automatically update internal links\" setting on, so links follow the renamed files.", (s) => {
+        s.addButton((b) => b.setButtonText("Add dates…").onClick(() => { void this.plugin.runDatePrefixRename("add"); }));
+        s.addButton((b) => b.setButtonText("Remove dates…").onClick(() => { void this.plugin.runDatePrefixRename("remove"); }));
+      }, ["file", "name", "date", "rename", "existing", "bulk", "prefix", "remove", "undo"]));
+      cats.datesTime.push(toggle("Rebootstrap adds dates to file names", "When on, Rebootstrap also adds dates to existing file names (without asking first). Off by default; you can always run \"Add dates to existing file names\" on its own.",
+        () => this.plugin.settings.fileDatePrefixInRebootstrap, (v) => { this.plugin.settings.fileDatePrefixInRebootstrap = v; }, ["rebootstrap", "file", "name", "date", "prefix"]));
       cats.datesTime.push({
         name: "Date sample", searchable: false,
         render: (s: Setting) => {

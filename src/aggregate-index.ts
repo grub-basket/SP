@@ -1,8 +1,9 @@
 import { App, TFile, moment, setIcon } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
-import { ROOT_ID, siftMatch, parseAuthorRef, writeCompletedFm } from "./types";
-import { stripInlineMarkdown } from "./slug-service";
+import { ROOT_ID, siftMatch, parseAuthorRef } from "./types";
+import { completeTaskFile, applyUncompleteFm } from "./task-complete";
+import { stripInlineMarkdown, titleFromBasename } from "./slug-service";
 import { readId } from "./id-service";
 import { ConfirmModal } from "./modals";
 import { parseSearchQuery } from "./note-picker";
@@ -185,7 +186,7 @@ export async function collectIndexRows(
 
     const firstLine = body.slice(0, 400).split(/\r?\n/).map((s) => s.trim()).find(Boolean) ?? "";
     const title = stripInlineMarkdown(heading ?? firstLine).trim()
-      || f.basename.replace(/-[a-z0-9]{4,12}$/, "").replace(/-/g, " ")
+      || titleFromBasename(f.basename)
       || "Untitled";
 
     const links = cache?.links ?? [];
@@ -507,8 +508,10 @@ export async function renderMasterIndex(
       b.onclick = run;
     };
     act("Open", "external-link", () => { for (const r of selectedRows()) opts.onOpen(r.folder, r.id); });
-    act("Complete", "check", () => void applyToSelected((r) => app.fileManager.processFrontMatter(r.file, (m) => writeCompletedFm(m as Record<string, unknown>, true)), "Complete"));
-    act("Reopen", "rotate-ccw", () => void applyToSelected((r) => app.fileManager.processFrontMatter(r.file, (m) => writeCompletedFm(m as Record<string, unknown>, false)), "Reopen"));
+    // 0.578.0: repeat-aware — a repeating task rolls forward / spawns its next
+    // occurrence like the list does, instead of staying done forever.
+    act("Complete", "check", () => void applyToSelected(async (r) => { await completeTaskFile(app, r.file, () => plugin.mintNoteId()); }, "Complete"));
+    act("Reopen", "rotate-ccw", () => void applyToSelected((r) => app.fileManager.processFrontMatter(r.file, (m) => applyUncompleteFm(m as Record<string, unknown>)), "Reopen"));
     act("Copy links", "copy", () => {
       const md = selectedRows().map((r) => `[[${r.file.path.replace(/\.md$/, "")}|${r.title}]]`).join("\n");
       void navigator.clipboard.writeText(md); notify(`Copied ${state.selected.size} link${state.selected.size === 1 ? "" : "s"}.`);
