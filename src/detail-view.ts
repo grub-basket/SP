@@ -6,6 +6,8 @@ import { ComposerAutocomplete } from "./composer-autocomplete";
 import { formatDateTime, formatDateOnly } from "./format";
 import { parseDueString, isBareDateDue } from "./due-warmth";
 import { titleFromBasename } from "./slug-service";
+import { ReblurTimers, reblurDelayMs } from "./obscure-reblur";
+import { isAnyModalOpen } from "./view-helpers";
 import {
   ROOT_ID,
   STASHPAD_DETAIL_VIEW_TYPE,
@@ -49,6 +51,33 @@ export class StashpadDetailView extends ItemView {
   /** 0.272.4: path of the obscured note the user revealed in this panel, if any.
    *  A different note re-blurs (reveal is per-note, in-memory). */
   private detailObscureRevealed: string | null = null;
+  /** 0.587.0: the obscured note's scroll area in the CURRENT render (null when
+   *  the shown note isn't obscured), and whether a mouse is resting on it — so
+   *  the re-blur timer can hold, and cover it again without a re-render (which
+   *  would rebuild the composer under someone typing). */
+  private detailObscureEl: { path: string; el: HTMLElement } | null = null;
+  private detailMouseOver = false;
+  /** 0.587.0: the delay setting changed — re-time the running countdown. */
+  retimeObscureReblur(): void { this.detailReblur.retime(); }
+  private detailReblur = new ReblurTimers<string>({
+    delayMs: () => reblurDelayMs(this.plugin.settings.obscureReblurSeconds),
+    isRevealed: (path) => this.detailObscureRevealed === path,
+    // Held by a resting mouse, an open pop-up, or typing in the panel's
+    // composer (it sits below the note, outside the covered area, and writes
+    // a child of the note you are looking at).
+    isHeld: () => {
+      const doc = this.containerEl.ownerDocument;
+      if (this.detailMouseOver && doc.hasFocus()) return true;
+      if (this.composerInputEl && doc.activeElement === this.composerInputEl) return true;
+      return isAnyModalOpen(this.containerEl);
+    },
+    reblur: (path) => {
+      this.detailObscureRevealed = null;
+      if (this.detailObscureEl?.path === path) this.detailObscureEl.el.addClass("is-obscured");
+    },
+    setTimer: (fn, ms) => window.setTimeout(fn, ms),
+    clearTimer: (h) => window.clearTimeout(h as number),
+  });
   /** 0.74.2: ids of children-list rows currently expanded into their
    *  own subtrees — same pattern as StashpadPanelsView.expanded. Key
    *  is "<folder>|<id>" so expansion state is scoped per folder
@@ -141,6 +170,8 @@ export class StashpadDetailView extends ItemView {
     this.composerAutocomplete?.detach();
     this.composerAutocomplete = null;
     this.composerInputEl = null;
+    this.detailReblur.clear();
+    this.detailObscureEl = null;
     if (this.renderTimer != null) {
       window.clearTimeout(this.renderTimer);
       this.renderTimer = null;
@@ -253,13 +284,31 @@ export class StashpadDetailView extends ItemView {
     // applies here too (the detail panel only ever blurred). The class rides on
     // the panel root; the CSS has a solid variant scoped under it.
     root.toggleClass("obscure-solid", this.plugin.settings.obscureStyle === "solid");
-    if (this.plugin.isFileObscured(file) && this.detailObscureRevealed !== file.path) {
-      scroll.addClass("is-obscured");
+    // 0.587.0: the tap-to-reveal listener now goes on even when the note is
+    // already revealed, because the re-blur timer can cover it again without
+    // a re-render and it must still be tappable then.
+    this.detailObscureEl = null;
+    this.detailMouseOver = false;
+    if (this.plugin.isFileObscured(file)) {
+      const path = file.path;
+      this.detailObscureEl = { path, el: scroll };
+      if (this.detailObscureRevealed !== path) scroll.addClass("is-obscured");
       scroll.addEventListener("click", (e) => {
+        if (!scroll.hasClass("is-obscured")) return;
         if ((e.target as HTMLElement | null)?.closest("button, a, input")) return;
-        this.detailObscureRevealed = file.path;
+        this.detailObscureRevealed = path;
         scroll.removeClass("is-obscured");
+        this.detailReblur.start(path);
       });
+      // Using the revealed note restarts its countdown; a resting mouse holds it.
+      scroll.addEventListener("pointermove", (e) => {
+        if (e.pointerType === "mouse") this.detailMouseOver = true;
+        this.detailReblur.touch(path);
+      });
+      scroll.addEventListener("pointerleave", () => { this.detailMouseOver = false; });
+      for (const type of ["pointerdown", "wheel", "touchmove", "keydown", "input"] as const) {
+        scroll.addEventListener(type, () => this.detailReblur.touch(path), { passive: true });
+      }
     }
 
     // Header — title + small metadata row + open-in-tab button.

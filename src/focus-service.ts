@@ -3,6 +3,7 @@ import type StashpadPlugin from "./main";
 import { ROOT_ID, fmAddTag, fmHasTag, type StashpadId } from "./types";
 import { applyCompleteFm, finishCompletion, type CompletionPlan } from "./task-complete";
 import { titleFromTaskFile } from "./task-collect";
+import { stripInlineMarkdown } from "./slug-service";
 import { stashpadLeaves } from "./leaf-lookup";
 import { notify } from "./notify";
 import {
@@ -29,6 +30,10 @@ export interface FocusNote {
   due: string | null;
   repeats: boolean;
   color: string | null;
+  /** 0.589.0: parent note id (null at the folder root) and file mtime — the
+   *  picker shows "under <parent>" and dates to tell look-alike tasks apart. */
+  parent: string | null;
+  modified: number;
   /** Tracked seconds today / all time, from `timeLog`. */
   todaySec: number;
   totalSec: number;
@@ -36,6 +41,13 @@ export interface FocusNote {
 }
 
 export type FocusChange = "tick" | "change";
+
+/** 0.583.0: a note's display title from its text: the first non-empty line,
+ *  minus heading / list / checkbox markers and inline markdown ("" if none). */
+export function titleFromText(text: string): string {
+  const line = text.slice(0, 300).split(/\r?\n/).map((x) => x.trim()).find(Boolean) ?? "";
+  return stripInlineMarkdown(line.replace(/^#+\s*/, "").replace(/^[-*+]\s+(\[.\]\s+)?/, "")).trim();
+}
 
 export const focusKey = (folder: string, id: string): string => `${folder}::${id}`;
 
@@ -125,7 +137,7 @@ export class FocusService {
         file: f,
         folder: dir,
         id,
-        title: titleFromTaskFile(f, id),
+        title: this.titleOf(f, id),
         task: fmHasTag(fm, "task") || fm.task === true || fm.completed !== undefined,
         completed: fm.completed === true,
         focusDate: normFocusDate(fm[FOCUS_DATE_KEY]),
@@ -137,12 +149,52 @@ export class FocusService {
         due: fm.due != null ? String(fm.due) : null,
         repeats: typeof fm.repeat === "string" && fm.repeat.trim() !== "",
         color: typeof fm.color === "string" ? fm.color : null,
+        parent: fm.parent == null || String(fm.parent) === "" || String(fm.parent) === ROOT_ID ? null : String(fm.parent),
+        modified: f.stat.mtime,
         todaySec: logSeconds(log, today),
         totalSec: logSeconds(log),
         created: (() => { const t = Date.parse(String(fm.created ?? "")); return Number.isFinite(t) ? t : 0; })(),
       });
     }
     return out;
+  }
+
+  /** 0.583.0: what a note reads as — the FIRST LINE of its body (a heading
+   *  there counts; a heading further down doesn't), from a background read or
+   *  the render cache, else the filename. The filename alone loses stopwords
+   *  and carries a date prefix in some folders. */
+  private titleOf(f: TFile, id: string): string {
+    // A read title wins even when stale (a timer log write bumps mtime; the
+    // first line rarely changes) — warmTitles refreshes it in the background.
+    const read = this.readTitles.get(f.path);
+    if (read) return read.title;
+    return titleFromText(this.plugin.renderCacheStore.get(f.path)?.text ?? "") || titleFromTaskFile(f, id);
+  }
+
+  /** First lines read from disk for notes the render cache doesn't know yet
+   *  (e.g. a task just made from the picker), keyed by path + mtime. */
+  private readTitles = new Map<string, { mtime: number; title: string }>();
+
+  /** Read the first line of any of `notes` with no fresh read,
+   *  then emit one change so views repaint with real titles. Meant for the few
+   *  notes on screen (today + leftovers), not the whole vault. */
+  async warmTitles(notes: FocusNote[]): Promise<void> {
+    const { app } = this.plugin;
+    const todo = notes.filter((n) => {
+      const r = this.readTitles.get(n.file.path);
+      return !r || r.mtime !== n.file.stat.mtime;
+    });
+    if (!todo.length) return;
+    let changed = false;
+    await Promise.allSettled(todo.map(async (n) => {
+      const md = await app.vault.cachedRead(n.file);
+      const end = md.startsWith("---") ? md.indexOf("\n---", 3) : -1;
+      const title = titleFromText(end === -1 ? md : md.slice(end + 4)) || n.title;
+      this.readTitles.set(n.file.path, { mtime: n.file.stat.mtime, title });
+      const prev = n.title;
+      if (title !== prev) changed = true;
+    }));
+    if (changed) this.emit();
   }
 
   /** Today's list in the user's order (device-local), unknown ones after by title. */
@@ -209,16 +261,18 @@ export class FocusService {
     return snaps.size;
   }
 
-  /** Put notes on (or take them off) a day's list. Adding also makes each one an
-   *  OPEN task, mirroring "Toggle task" (task tag, unfilled checkbox, legacy flag
-   *  dropped) — and reopening it if it was done. Also keeps the device-local
+  /** Put notes on (or take them off) a day's list. Adding also makes each one a
+   *  task, mirroring "Toggle task" (task tag, unfilled checkbox, legacy flag
+   *  dropped); a task that's already done stays done. Also keeps the device-local
    *  Today order: added notes go to the END (in the order given), removed ones
    *  drop out, and keys of notes no longer on today's list are pruned, so the
    *  order never outgrows one day's list. */
   async setFocus(files: TFile[], on: boolean, day = dayKey(Date.now())): Promise<number> {
     const { app } = this.plugin;
     const keyOf = (f: TFile): string | null => {
-      const id = app.metadataCache.getFileCache(f)?.frontmatter?.id;
+      // A note created a moment ago isn't parsed yet: fall back to the -<id>
+      // filename suffix (slug-service buildFilename) so it still gets ordered.
+      const id = app.metadataCache.getFileCache(f)?.frontmatter?.id ?? /-([a-z0-9]{4,12})$/.exec(f.basename)?.[1];
       return id == null ? null : focusKey(f.parent?.path ?? "", String(id));
     };
     const changed = new Set(files.map(keyOf).filter((k): k is string => !!k));
@@ -226,18 +280,22 @@ export class FocusService {
       if (on) {
         fm[FOCUS_DATE_KEY] = day;
         fmAddTag(fm, "task");
-        // Picking a DONE task to focus on means working on it again: reopen it
-        // (undo restores the old completed/completedAt exactly).
-        if (fm.completed !== false) { fm.completed = false; delete fm.completedAt; }
+        // 0.589.0: a task that's already DONE stays done (it lands in today's
+        // Done section, shown checked) — the user's call, reversing 0.577.0's
+        // reopen. Only a note that wasn't a task gets the unfilled checkbox.
+        if (fm.completed === undefined) fm.completed = false;
         delete fm.task;
         delete fm[FOCUS_DONE_KEY]; // a fresh day on the list: not done yet
       } else {
         delete fm[FOCUS_DATE_KEY];
       }
     });
+    // Save today's list in the order it's SHOWN (ordered ones, then the rest by
+    // title), minus the changed notes, then append added ones at the end. Saving
+    // only the old order let an added note jump ahead of never-ordered ones.
     const today = dayKey(Date.now());
-    const stillToday = new Set(this.collectNotes().filter((x) => x.focusDate === today).map((x) => focusKey(x.folder, x.id)));
-    const kept = (this.plugin.settings.focusOrder ?? []).filter((k) => !changed.has(k) && stillToday.has(k));
+    const shown = this.sortToday(this.collectNotes().filter((x) => x.focusDate === today));
+    const kept = shown.map((x) => focusKey(x.folder, x.id)).filter((k) => !changed.has(k));
     this.setOrder(on && day === today ? [...kept, ...changed] : kept);
     return n;
   }
@@ -369,7 +427,7 @@ export class FocusService {
     let st = this.state;
     if (note && (!st || st.path !== note.file.path)) {
       if (st) await this.bank(st, now);
-      const mode: FocusMode = st?.mode ?? this.plugin.settings.focusDefaultMode ?? "pomodoro";
+      const mode: FocusMode = st?.mode ?? this.plugin.settings.focusDefaultMode ?? "stopwatch";
       st = {
         folder: note.folder, id: note.id, path: note.file.path, title: note.title,
         mode, phase: "work", running: false, segStart: null, elapsedMs: 0, rounds: 0, breakMs: 0,

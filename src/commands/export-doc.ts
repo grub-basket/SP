@@ -1,9 +1,11 @@
-import { Component, MarkdownRenderer, Notice, Platform, TFile, moment } from "obsidian";
+import { Component, MarkdownRenderer, Notice, Platform, TFile, moment, parseLinktext } from "obsidian";
 import type { StashpadId, TreeNode } from "../types";
 import type { StashpadView } from "../view";
 import { htmlToPdf, htmlToPng } from "./pdf-generate";
+import { obsidianPdfExportAvailable, openAndExportPdf } from "./pdf-handoff";
 import { ExportDocModal, type DocExportChoice } from "../export-doc-modal";
 import { DEFAULT_EXPORT_THEME } from "../export-theme";
+import { stripInlineMarkdown } from "../slug-service";
 
 /** Export to HTML / PDF. Design + decisions: docs/export-pdf-html-plan.md.
  *
@@ -199,8 +201,44 @@ ${body}
 </html>`;
 }
 
-/** One rendered note: its title, tree depth, and the rendered body DOM. */
-export interface RenderedPiece { title: string; depth: number; bodyEl: HTMLElement; }
+/** 0.585.0: a Stashpad note's title IS its first line, so exports used to show
+ *  it twice — once as the section heading, again as the body's first line.
+ *  This turns that first line into the section heading (`level`), keeping its
+ *  inline formatting and links. Returns null — the caller then adds a separate
+ *  heading as before — unless ALL of these hold, so no other content changes:
+ *  - the first non-empty line is not indented (an indented line is code);
+ *  - it is an ATX heading, or a ONE-LINE paragraph (blank line or end after it:
+ *    rules out multi-line paragraphs, setext headings and pipe-less tables);
+ *  - it isn't a fence, table, quote, list item, math/comment fence, raw HTML,
+ *    rule, link/footnote definition, or anything holding an embed;
+ *  - it is the text Stashpad uses as the title (`firstHeading` — the note's
+ *    first heading anywhere — when there is one; titleForNode prefers that),
+ *    so a note titled by a later "## Section" keeps its opening paragraph. */
+function promoteTitleLine(bodyMd: string, level: number, firstHeading: string | undefined): string | null {
+  const lines = bodyMd.split("\n");
+  const i = lines.findIndex((l) => l.trim() !== "");
+  if (i < 0) return null;
+  const raw = lines[i].replace(/\r$/, "");
+  if (/^\s/.test(raw)) return null;
+  const line = raw.trimEnd();
+  const atx = /^#{1,6}\s+(.*?)(\s+#+)?\s*$/.exec(line);
+  if (!atx) {
+    if ((lines[i + 1] ?? "").trim() !== "") return null;
+    if (/^(`{3,}|~{3,}|\||>|[-*+]\s|\d+[.)]\s|\$\$|%%|<|\[[^\]]*\]:)/.test(line)) return null;
+    if (/^([-*_])(\s*\1){2,}\s*$/.test(line)) return null; // thematic break
+    if (line.includes("![")) return null;
+  }
+  const text = atx ? atx[1] : line;
+  if (!text.trim()) return null;
+  if (firstHeading !== undefined && stripInlineMarkdown(text).trim() !== stripInlineMarkdown(firstHeading).trim()) return null;
+  lines.splice(0, i + 1, `${"#".repeat(level)} ${text}`);
+  return lines.join("\n");
+}
+
+/** One rendered note: its title, tree depth, the rendered body DOM, and — when
+ *  the note's first line was promoted to its heading — that heading's rendered
+ *  inner HTML (lifted out of the body so it isn't shown twice). */
+export interface RenderedPiece { title: string; depth: number; bodyEl: HTMLElement; titleHtml?: string; }
 
 /** Render every item's body to a detached DOM (through a throwaway component),
  *  handling attachments per `assetMode`. The caller consumes `bodyEl` (serialize
@@ -220,15 +258,28 @@ async function renderPieces(
     for (const { node, depth } of items) {
       const file = node.file;
       if (!file) continue;
-      const bodyMd = view.stripFrontmatter(await view.app.vault.cachedRead(file));
+      const rawMd = view.stripFrontmatter(await view.app.vault.cachedRead(file));
+      const level = Math.min(depth + 2, 6);
+      const promoted = promoteTitleLine(rawMd, level, view.app.metadataCache.getFileCache(file)?.headings?.[0]?.heading);
       const bodyEl = createDiv();
+      let titleHtml: string | undefined;
       try {
-        await MarkdownRenderer.render(view.app, bodyMd, bodyEl, file.path, comp);
+        await MarkdownRenderer.render(view.app, promoted ?? rawMd, bodyEl, file.path, comp);
         await handleAttachments(view, bodyEl, file.path, assetMode, assetsAbsFolder, assetsRelDir, copied);
+        // The promoted line is the first block, so the first heading is it.
+        const h = promoted ? bodyEl.querySelector<HTMLElement>(`h${level}`) : null;
+        if (h) {
+          h.querySelectorAll(".collapse-indicator, .heading-collapse-indicator").forEach((x) => x.remove());
+          titleHtml = h.innerHTML.trim() || undefined;
+          // Drop a wrapper the renderer may put around a block, if it held only this heading.
+          const wrap = h.parentElement;
+          h.remove();
+          if (wrap && wrap !== bodyEl && !wrap.textContent?.trim() && !wrap.querySelector("img")) wrap.remove();
+        }
       } catch (e) {
         console.warn("[Stashpad] export: render failed for", file.path, e);
       }
-      pieces.push({ title: view.titleForNode(node).trim() || file.basename, depth, bodyEl });
+      pieces.push({ title: view.titleForNode(node).trim() || file.basename, depth, bodyEl, titleHtml });
     }
   } finally {
     comp.unload();
@@ -240,9 +291,133 @@ async function renderPieces(
 function piecesToHtml(title: string, pieces: RenderedPiece[], splitPerItem: boolean): string {
   const sections = pieces.map((p) => {
     const hLevel = Math.min(p.depth + 2, 6);
-    return `<h${hLevel} class="sp-note-title">${esc(p.title)}</h${hLevel}>\n<div class="sp-body">${p.bodyEl.innerHTML}</div>`;
+    // titleHtml is the note's own first line, rendered by MarkdownRenderer like the body.
+    return `<h${hLevel} class="sp-note-title">${p.titleHtml ?? esc(p.title)}</h${hLevel}>\n<div class="sp-body">${p.bodyEl.innerHTML}</div>`;
   });
   return assembleDocument(title, sections, pieces.map((p) => p.depth), splitPerItem);
+}
+
+/** Page break that Obsidian's PDF export honours (inline style survives its
+ *  HTML sanitizer). Used for "split each top-level item onto its own page". */
+const MD_PAGE_BREAK = '<div style="page-break-after: always;"></div>';
+
+/** The alias the user actually WROTE in a link, read from its source text:
+ *  `[[a|b]]` → "b", `[text](a.md)` / `![alt|300](a.png)` → the bracket text.
+ *  Deliberately not the cache's `displayText`, which Obsidian fills in even
+ *  without an alias (`Note > Heading` for `[[Note#Heading]]`). */
+function writtenAlias(original: string): string | undefined {
+  const wiki = /^!?\[\[([^\]]*)\]\]$/.exec(original);
+  if (wiki) {
+    const bar = wiki[1].indexOf("|");
+    return bar >= 0 ? wiki[1].slice(bar + 1) : undefined;
+  }
+  const md = /^!?\[([^\]]*)\]\(/.exec(original);
+  return md?.[1] || undefined;
+}
+
+/** One note's body as markdown for the mobile PDF hand-off note at `targetPath`.
+ *  Internal links and embeds (`![[img.png]]`, `![](sub/img.png)`,
+ *  `[spec](sub/spec.pdf)`, note transclusions) are re-linked so they resolve
+ *  from the export folder, not the source note's folder. Works on the raw file
+ *  (the metadata cache's offsets are for the whole file) and skips any link
+ *  whose cached text no longer matches, so a stale cache leaves that link as
+ *  written instead of corrupting the note. */
+async function noteMarkdownFor(view: StashpadView, file: TFile, targetPath: string): Promise<string> {
+  const raw = await view.app.vault.cachedRead(file);
+  const cache = view.app.metadataCache.getFileCache(file);
+  const refs = [
+    ...(cache?.embeds ?? []).map((r) => ({ r, embed: true })),
+    ...(cache?.links ?? []).map((r) => ({ r, embed: false })),
+  ].sort((a, b) => b.r.position.start.offset - a.r.position.start.offset); // back to front
+  let out = raw;
+  for (const { r, embed } of refs) {
+    const from = r.position.start.offset;
+    const to = r.position.end.offset;
+    if (raw.slice(from, to) !== r.original) continue;
+    const { path, subpath } = parseLinktext(r.link);
+    const dest = view.app.metadataCache.getFirstLinkpathDest(path, file.path);
+    if (!dest) continue; // unresolved — leave as written
+    const link = view.app.fileManager.generateMarkdownLink(dest, targetPath, subpath || undefined, writtenAlias(r.original));
+    const bare = link.startsWith("!") ? link.slice(1) : link;
+    out = out.slice(0, from) + (embed ? `!${bare}` : bare) + out.slice(to);
+  }
+  return view.stripFrontmatter(out).trim();
+}
+
+/** Keep one note's markup from spilling into the next once they share a single
+ *  markdown source (the HTML/desktop path renders each note separately, so it
+ *  never needed this): close an unclosed code fence, `$$` math block or `%%`
+ *  comment, and prefix footnote labels per note so `[^1]` in two notes stays
+ *  two footnotes. Fenced code is left untouched. */
+function isolateNoteMarkdown(md: string, noteIdx: number): string {
+  const lines = md.split("\n");
+  let fence: string | null = null;
+  let math = 0;
+  let comments = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^\s*(`{3,}|~{3,})/.exec(lines[i]);
+    if (fence) {
+      const close = /^\s*(`{3,}|~{3,})\s*$/.exec(lines[i]);
+      if (close && close[1][0] === fence[0] && close[1].length >= fence.length) fence = null;
+      continue;
+    }
+    if (m) { fence = m[1]; continue; }
+    math += (lines[i].match(/\$\$/g) ?? []).length;
+    comments += (lines[i].match(/%%/g) ?? []).length;
+    lines[i] = lines[i].replace(/\[\^([^\]\s]+)\]/g, `[^n${noteIdx}-$1]`);
+  }
+  if (fence) lines.push(fence);
+  if (math % 2) lines.push("$$");
+  if (comments % 2) lines.push("%%");
+  return lines.join("\n");
+}
+
+/** The whole export as one markdown note: title, meta line, then each note under
+ *  a heading one level per tree depth — the same shape as the HTML export. */
+async function buildHandoffMarkdown(view: StashpadView, items: ExportItem[], title: string, splitPerItem: boolean, targetPath: string): Promise<string> {
+  const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim();
+  const stamp = (moment as unknown as () => { format(f: string): string })().format("YYYY-MM-DD HH:mm");
+  const n = items.length;
+  const parts: string[] = [`# ${oneLine(title)}`, "", `*Exported from Stashpad · ${stamp} · ${n} note${n === 1 ? "" : "s"}*`, ""];
+  let sawTopLevel = false;
+  for (const [idx, { node, depth }] of items.entries()) {
+    const file = node.file;
+    if (!file) continue;
+    if (depth === 0) {
+      if (splitPerItem && sawTopLevel) parts.push(MD_PAGE_BREAK, "");
+      sawTopLevel = true;
+    }
+    let body = "";
+    try { body = isolateNoteMarkdown(await noteMarkdownFor(view, file, targetPath), idx + 1); }
+    catch (e) { console.warn("[Stashpad] export: read failed for", file.path, e); }
+    const level = Math.min(depth + 2, 6);
+    const promoted = body ? promoteTitleLine(body, level, view.app.metadataCache.getFileCache(file)?.headings?.[0]?.heading) : null;
+    if (promoted) {
+      parts.push(promoted, "");
+    } else {
+      parts.push(`${"#".repeat(level)} ${oneLine(view.titleForNode(node)) || file.basename}`, "");
+      if (body) parts.push(body, "");
+    }
+  }
+  return parts.join("\n");
+}
+
+/** Mobile PDF: write the export as a plain note in the export folder, open it,
+ *  and start Obsidian's own Export to PDF (share sheet). The note has no
+ *  frontmatter, so Stashpad never treats it as one of its notes. */
+async function exportPdfViaObsidian(view: StashpadView, items: ExportItem[], c: DocExportChoice, exportFolder: string, outBase: string): Promise<void> {
+  const mdPath = `${exportFolder}/${outBase}.md`;
+  const md = await buildHandoffMarkdown(view, items, c.baseName, c.splitPerItem, mdPath);
+  const file = await view.app.vault.create(mdPath, md);
+  await view.log.append({ type: "stash_export", id: items[0].node.id, payload: { path: mdPath, format: "pdf", via: "obsidian", noteCount: items.length } });
+  const started = await openAndExportPdf(view, file);
+  view.plugin.notifications.show({
+    message: started
+      ? `Opened ${items.length} note${items.length === 1 ? "" : "s"} as one note and started Obsidian's Export to PDF. The note is kept at \`${mdPath}\`.`
+      : `Opened ${items.length} note${items.length === 1 ? "" : "s"} as one note at \`${mdPath}\`. To make the PDF, use the ⋯ menu → Export to PDF.`,
+    kind: started ? "success" : "info", category: "export",
+    affectedPaths: [mdPath], folder: view.noteFolder,
+  });
 }
 
 /** Open the export dialog, then run the chosen export. Entry point for the menu
@@ -316,12 +491,20 @@ async function runExport(view: StashpadView, c: DocExportChoice): Promise<void> 
       finishNotice(view, items[0].node.id, htmlPath, "html", items.length, assetCount);
       return;
     }
-    // PDF and PNG are desktop-only (rendered via a hidden Electron window). Images
-    // embed as data URIs (self-contained render); non-image attachments still copy
-    // to the helper folder + link. On mobile the modal hides these — guard anyway.
+    // Desktop PDF and PNG render via a hidden Electron window. Images embed as
+    // data URIs (self-contained render); non-image attachments still copy to the
+    // helper folder + link. Mobile PDF hands a note to Obsidian's own Export to
+    // PDF (1.15+); PNG stays desktop-only. The modal only offers what works —
+    // guard anyway.
     if (Platform.isMobile) {
+      if (c.format === "pdf" && obsidianPdfExportAvailable(view.app)) {
+        await exportPdfViaObsidian(view, items, c, exportFolder, outBase);
+        return;
+      }
       view.plugin.notifications.show({
-        message: "PDF / image export is desktop-only — export to HTML on mobile (it opens/prints anywhere).",
+        message: c.format === "pdf"
+          ? "PDF export on mobile needs Obsidian 1.15 or later — update Obsidian, or export to HTML (it opens/prints anywhere)."
+          : "Image export is desktop-only — export to HTML on mobile (it opens/prints anywhere).",
         kind: "warning", category: "export",
       });
       return;

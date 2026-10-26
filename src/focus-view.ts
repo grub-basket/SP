@@ -1,14 +1,15 @@
-import { ItemView, SuggestModal, WorkspaceLeaf, setIcon, type App, type Menu, type ViewStateResult } from "obsidian";
+import { ItemView, Menu, SuggestModal, WorkspaceLeaf, setIcon, type App, type TFile, type ViewStateResult } from "obsidian";
+import { siftRank } from "./suggest-match";
 import type StashpadPlugin from "./main";
 import { STASHPAD_FOCUS_VIEW_TYPE, siftMatch, type StashpadId } from "./types";
 import { addCopyTabLinkItem } from "./tab-link-menu";
 import { returnToOriginOnClose } from "./leaf-return";
 import { settleNewTab } from "./view-helpers";
 import { notify } from "./notify";
-import { focusKey, type FocusNote, type FocusService } from "./focus-service";
+import { focusKey, titleFromText, type FocusNote, type FocusService } from "./focus-service";
 import { dayKey, formatSpent, type FocusMode } from "./focus-time";
 import { parseDueString } from "./due-warmth";
-import { formatDateOnly } from "./format";
+import { formatDateOnly, formatDateTime } from "./format";
 
 interface FocusViewState { single?: boolean }
 
@@ -28,6 +29,9 @@ const plural = (n: number, w: string): string => `${n} ${w}${n === 1 ? "" : "s"}
  *  doesn't stop it; the status bar keeps ticking. */
 export class StashpadFocusView extends ItemView {
   private single = false;
+  /** 0.583.0: the task picked with "Choose task" in One-at-a-time mode while
+   *  no timer runs (`folder::id`). Falls back to the first open task. */
+  private chosenKey: string | null = null;
   private showSettings = false;
   private showCarry = false;
   private notes: FocusNote[] | null = null;
@@ -130,6 +134,9 @@ export class StashpadFocusView extends ItemView {
 
     const { today, open, done, carry } = this.lists();
     const st = this.svc.state;
+    // 0.583.0: real first-line titles for on-screen notes the render cache
+    // doesn't know yet (emits one change → re-render when any title differs).
+    void this.svc.warmTitles([...today, ...carry]);
 
     // ---- header ----
     const bar = root.createDiv({ cls: "stashpad-focus-bar" });
@@ -156,9 +163,14 @@ export class StashpadFocusView extends ItemView {
     if (carry.length && !this.single) this.renderCarry(root, carry);
 
     // ---- timer card ----
+    if (st) this.chosenKey = null; // a running/paused timer supersedes the "Choose task" pick
     const current = st ? (today.find((n) => n.file.path === st.path) ?? null) : null;
-    const nextUp = open.find((n) => n.file.path !== st?.path) ?? null;
-    this.renderTimer_(root, current, open[0] ?? null, nextUp);
+    const chosen = this.chosenKey ? (open.find((n) => focusKey(n.folder, n.id) === this.chosenKey) ?? null) : null;
+    const firstUp = chosen ?? open[0] ?? null;
+    // "Up next" never repeats the task the card already shows (timed or up first).
+    const shownPath = st?.path ?? firstUp?.file.path;
+    const nextUp = open.find((n) => n.file.path !== shownPath) ?? null;
+    this.renderTimer_(root, current, firstUp, nextUp, open);
 
     if (this.single) return;
 
@@ -235,7 +247,7 @@ export class StashpadFocusView extends ItemView {
   private folderName(folder: string): string { return folder.split("/").pop() || folder || "/"; }
 
   /** The timer card. `current` = the timed note if it's on today's list. */
-  private renderTimer_(root: HTMLElement, current: FocusNote | null, firstOpen: FocusNote | null, nextUp: FocusNote | null): void {
+  private renderTimer_(root: HTMLElement, current: FocusNote | null, firstOpen: FocusNote | null, nextUp: FocusNote | null, open: FocusNote[]): void {
     const st = this.svc.state;
     const card = root.createDiv({ cls: "stashpad-focus-timer" + (st ? "" : " is-idle") });
     if (st) {
@@ -243,11 +255,14 @@ export class StashpadFocusView extends ItemView {
       card.toggleClass("is-break", st.phase === "break");
     }
 
-    // Mode switch (pomodoro / stopwatch).
+    // Mode switch. 0.589.0: Stopwatch first (the everyday timer), and a big
+    // segmented control with icons rather than a small pill.
     const modeRow = card.createDiv({ cls: "stashpad-focus-modes", attr: { role: "radiogroup", "aria-label": "Timer type" } });
-    const mode: FocusMode = st?.mode ?? this.plugin.settings.focusDefaultMode ?? "pomodoro";
-    for (const [m, label] of [["pomodoro", "Pomodoro"], ["stopwatch", "Stopwatch"]] as [FocusMode, string][]) {
-      const b = modeRow.createEl("button", { cls: "stashpad-focus-mode" + (m === mode ? " is-active" : ""), text: label, attr: { role: "radio", "aria-checked": String(m === mode) } });
+    const mode: FocusMode = st?.mode ?? this.plugin.settings.focusDefaultMode ?? "stopwatch";
+    for (const [m, label, icon] of [["stopwatch", "Stopwatch", "watch"], ["pomodoro", "Pomodoro", "timer"]] as [FocusMode, string, string][]) {
+      const b = modeRow.createEl("button", { cls: "stashpad-focus-mode" + (m === mode ? " is-active" : ""), attr: { role: "radio", "aria-checked": String(m === mode) } });
+      setIcon(b.createSpan({ cls: "stashpad-focus-mode-icon" }), icon);
+      b.createSpan({ text: label });
       b.onclick = () => void this.svc.setMode(m);
     }
 
@@ -291,7 +306,31 @@ export class StashpadFocusView extends ItemView {
       this.button(ctl, "plus", "Add tasks", "Search notes and tasks to add to today", () => this.openPicker(), true);
     }
 
+    // 0.583.0: One at a time — pick which open task to focus on.
+    if (this.single && open.length > 1) {
+      const shown = st?.path ?? target?.file.path ?? null;
+      const b = this.button(ctl, "list-checks", "Choose task", "Pick which task to focus on", () => {
+        const menu = new Menu();
+        for (const n of open) {
+          menu.addItem((it) => it.setTitle(n.title || "Untitled").setChecked(n.file.path === shown).onClick(() => void this.chooseTask(n)));
+        }
+        const r = b.getBoundingClientRect();
+        menu.showAtPosition({ x: r.left, y: r.bottom });
+      });
+    }
+
     if (this.single && nextUp) card.createDiv({ cls: "stashpad-focus-next", text: `Up next: ${nextUp.title}` });
+  }
+
+  /** "Choose task": a running timer switches to the task (its time so far is
+   *  logged to the old one); a paused or no timer makes it the task up first. */
+  private async chooseTask(n: FocusNote): Promise<void> {
+    const st = this.svc.state;
+    if (st && st.path === n.file.path) return;
+    if (st?.running) { await this.svc.start(n); return; }
+    if (st) await this.svc.stop(); // paused: its time is already logged
+    this.chosenKey = focusKey(n.folder, n.id);
+    this.render();
   }
 
   private renderRow(list: HTMLElement, n: FocusNote, reorderable: FocusNote[] | null): void {
@@ -352,34 +391,85 @@ export class StashpadFocusView extends ItemView {
   }
 
   private openPicker(): void {
-    new FocusPickerModal(this.app, this.svc, async (picked) => {
+    new FocusPickerModal(this.app, this.plugin, async (picked) => {
       if (!picked.length) return;
       const count = await this.svc.setFocus(picked.map((n) => n.file), true);
       notify(`Added ${plural(count, "task")} to today.`, { kind: "success" });
+    }, async (file, text) => {
+      // 0.583.0: a note made from the picker's "Create new" — onto today's list as a task.
+      await this.svc.setFocus([file], true);
+      notify(`Created “${text}” and added it to today.`, { kind: "success" });
     }).open();
   }
 }
 
-/** Multi-select search over every Stashpad note. Enter toggles the highlighted
- *  row; Mod+Enter (or the button) adds the selection. Open tasks lead when the
- *  query is empty; notes already on today's list are left out. Sift matching. */
-export class FocusPickerModal extends SuggestModal<FocusNote> {
-  private all: FocusNote[];
+/** One picker row: an existing note, or the "Create new" offer. */
+type PickItem =
+  | { kind: "note"; n: FocusNote; title: string; body: string; hit: string }
+  | { kind: "create"; text: string };
+
+const stripFm = (md: string): string => {
+  if (!md.startsWith("---")) return md;
+  const end = md.indexOf("\n---", 3);
+  return end === -1 ? md : md.slice(end + 4).replace(/^\r?\n/, "");
+};
+
+/** Multi-select search over every Stashpad note, with the same "Create new"
+ *  offer as Stashpad's other pickers (0.583.0).
+ *
+ *  - Empty query: open tasks only (earlier days' first, then newest).
+ *  - Typing: the FULL note search — titles (first heading / first line) Sift-
+ *    ranked, then body-only hits (with the matching line), open tasks before
+ *    other notes before done ones. Bodies load in the background and the query
+ *    re-runs once they're in, like the global search.
+ *  - `Create new: "…"` at the end when nothing matches the query exactly;
+ *    Shift+Enter creates even when something does. A new note is created in the
+ *    "New tasks go to" folder (footer), as a task on today's list, right away —
+ *    the picker stays open for more.
+ *  - Enter / click toggles a note; Mod+Enter or the button adds the selection.
+ *  Notes already on today's list are left out. */
+export class FocusPickerModal extends SuggestModal<PickItem> {
+  private rows: Array<{ n: FocusNote; title: string; body: string }>;
+  /** 0.589.0: every note's title by `folder::id`, for the "under <parent>" hint. */
+  private titleByKey: Map<string, string>;
+  private createBtn: HTMLButtonElement | null = null;
+  private todayTitles: Set<string>;
   private picked = new Map<string, FocusNote>();
   private rowEls = new Map<string, HTMLElement>();
   private addBtn: HTMLButtonElement | null = null;
   private done = false;
+  private closed = false;
+  private creating = false;
+  private createFolder: string;
 
-  constructor(app: App, svc: FocusService, private onDone: (picked: FocusNote[]) => void | Promise<void>) {
+  constructor(
+    app: App,
+    private plugin: StashpadPlugin,
+    private onDone: (picked: FocusNote[]) => void | Promise<void>,
+    private onCreated: (file: TFile, text: string) => Promise<void>,
+  ) {
     super(app);
     const today = dayKey(Date.now());
-    this.all = svc.collectNotes().filter((n) => n.focusDate !== today);
-    this.limit = 200;
+    const cacheStore = plugin.renderCacheStore;
+    // n.title is already the first line (read or cached) / filename.
+    const all = plugin.focus.collectNotes();
+    this.rows = all.filter((n) => n.focusDate !== today)
+      .map((n) => ({ n, title: n.title, body: cacheStore.get(n.file.path)?.text ?? "" }));
+    // Titles already on today's list too: "Create new" mustn't offer a duplicate of them.
+    this.todayTitles = new Set(all.filter((n) => n.focusDate === today).map((n) => n.title.trim().toLowerCase()));
+    this.titleByKey = new Map(all.map((n) => [focusKey(n.folder, n.id), n.title]));
+    const folders = plugin.discoverStashpadFolders();
+    const saved = plugin.settings.focusCreateFolder;
+    // Only ever a folder the dropdown lists, so what it shows is where notes go.
+    const active = plugin.activeStashpadFolder();
+    this.createFolder = saved && folders.includes(saved) ? saved : active && folders.includes(active) ? active : (folders[0] ?? "");
+    this.limit = 100;
     this.emptyStateText = "No matching notes.";
-    this.setPlaceholder("Search notes and tasks to focus on today…");
+    this.setPlaceholder("Search notes and tasks, or type a new task…");
     this.setInstructions([
       { command: "↵", purpose: "select / unselect" },
       { command: "mod ↵", purpose: "add selected to today" },
+      { command: "shift ↵", purpose: "create new" },
       { command: "esc", purpose: "cancel" },
     ]);
     this.scope.register(["Mod"], "Enter", (e) => {
@@ -387,18 +477,68 @@ export class FocusPickerModal extends SuggestModal<FocusNote> {
       this.finish();
       return false;
     });
+    // Same force-create chord as StashpadSuggest: even when a note matches.
+    this.scope.register(["Shift"], "Enter", () => { void this.createNew(this.inputEl.value); return false; });
+    this.loadBodies();
+  }
+
+  /** Read every candidate's body in the background, then re-run the query. */
+  private loadBodies(): void {
+    const reads = this.rows.map((r) => this.app.vault.cachedRead(r.n.file).then((md) => {
+      r.body = stripFm(md);
+      // The body's real first line wins over a cached / filename title — also
+      // for the "› parent" hint other rows show.
+      const line = titleFromText(r.body);
+      if (line) { r.title = line; this.titleByKey.set(focusKey(r.n.folder, r.n.id), line); }
+    }, () => { /* unreadable: title-only */ }));
+    void Promise.allSettled(reads).then(() => {
+      if (this.closed) return;
+      if (this.inputEl.value.trim()) this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+    });
   }
 
   onOpen(): void {
     super.onOpen();
     this.modalEl.addClass("stashpad-focus-picker");
     const foot = this.modalEl.createDiv({ cls: "stashpad-focus-picker-foot" });
+    const where = foot.createEl("label", { cls: "stashpad-focus-picker-where" });
+    where.createSpan({ text: "New tasks go to" });
+    const sel = where.createEl("select", { cls: "dropdown" });
+    for (const f of this.plugin.discoverStashpadFolders()) {
+      const o = sel.createEl("option", { text: f.split("/").pop() || f });
+      o.value = f; o.title = f;
+      if (f === this.createFolder) o.selected = true;
+    }
+    sel.onchange = () => {
+      this.createFolder = sel.value;
+      this.plugin.settings.focusCreateFolder = sel.value;
+      void this.plugin.saveSettings();
+      this.inputEl.focus();
+      this.inputEl.dispatchEvent(new Event("input", { bubbles: true })); // repaint the create row's folder
+    };
+    // 0.589.0: an always-visible Create button whenever something is typed —
+    // the "Create new" row can sit below many results in a big vault.
+    this.createBtn = foot.createEl("button", { cls: "stashpad-focus-picker-create" });
+    this.createBtn.onclick = () => void this.createNew(this.inputEl.value);
+    this.inputEl.addEventListener("input", () => this.syncCreateBtn());
+    this.syncCreateBtn();
     this.addBtn = foot.createEl("button", { cls: "mod-cta" });
     this.addBtn.onclick = () => this.finish();
     this.syncButton();
   }
 
+  private syncCreateBtn(): void {
+    if (!this.createBtn) return;
+    const q = this.inputEl.value.trim();
+    this.createBtn.empty();
+    setIcon(this.createBtn.createSpan({ cls: "stashpad-focus-btn-icon" }), "plus");
+    this.createBtn.createSpan({ text: q ? `Create “${q.length > 32 ? q.slice(0, 31) + "…" : q}”` : "Type to create a task" });
+    this.createBtn.disabled = !q;
+    this.createBtn.setAttr("aria-label", q ? `Create a new task “${q}” in ${this.createFolder} and add it to today` : "Type a title to create a new task");
+  }
+
   onClose(): void {
+    this.closed = true;
     super.onClose();
     this.contentEl.empty();
   }
@@ -418,37 +558,114 @@ export class FocusPickerModal extends SuggestModal<FocusNote> {
     void this.onDone(picks);
   }
 
-  getSuggestions(query: string): FocusNote[] {
-    const q = query.trim();
-    const rank = (n: FocusNote): number => (n.task && !n.completed ? 0 : !n.task ? 1 : 2);
-    const pool = q
-      ? this.all.filter((n) => siftMatch(q, `${n.title} ${n.folder}`))
-      : this.all.filter((n) => n.task && !n.completed);
-    return pool.sort((a, b) =>
-      rank(a) - rank(b)
-      || (b.focusDate ?? "").localeCompare(a.focusDate ?? "")
-      || b.created - a.created,
-    ).slice(0, this.limit);
+  /** Create a note from `raw` in the chosen folder and put it on today's list. */
+  private async createNew(raw: string): Promise<void> {
+    const text = raw.trim();
+    if (!text || this.creating) return;
+    // Never a second copy of something already on today's list (the button and
+    // Shift+Enter force-create past other notes, not past today's own tasks).
+    if (this.todayTitles.has(text.toLowerCase())) { notify(`“${text}” is already on today's list.`); return; }
+    if (!this.createFolder) { notify("No Stashpad folder to create the task in."); return; }
+    this.creating = true;
+    try {
+      const file = await this.plugin.createNoteInFolder(this.createFolder, text);
+      if (!file) { notify(`Couldn't create “${text}”.`, { kind: "error" }); return; }
+      await this.onCreated(file, text);
+      if (this.closed) return;
+      if (this.inputEl.value.trim() !== text) return; // typed something else meanwhile — keep it
+      this.todayTitles.add(text.toLowerCase());
+      this.inputEl.value = "";
+      this.inputEl.dispatchEvent(new Event("input", { bubbles: true }));
+      this.inputEl.focus();
+    } finally {
+      this.creating = false;
+    }
   }
 
-  renderSuggestion(n: FocusNote, el: HTMLElement): void {
-    const key = focusKey(n.folder, n.id);
+  getSuggestions(query: string): PickItem[] {
+    const q = query.trim();
+    const bucket = (n: FocusNote): number => (n.task && !n.completed ? 0 : !n.task ? 1 : 2);
+    if (!q) {
+      return this.rows
+        .filter((r) => r.n.task && !r.n.completed)
+        .sort((a, b) => (b.n.focusDate ?? "").localeCompare(a.n.focusDate ?? "") || b.n.created - a.n.created)
+        .slice(0, this.limit)
+        .map((r) => ({ kind: "note" as const, ...r, hit: "" }));
+    }
+    // Title hits first, then body-only hits (newest first); within each band,
+    // open tasks → other notes → done — except an exact title, which leads.
+    // siftRank's key is the title alone, so its exact/prefix tiers judge the title.
+    const byTitle = siftRank(q, this.rows, (r) => `${r.title} ${r.n.folder}`, (r) => r.title);
+    const ql = q.toLowerCase();
+    const isExact = (r: { title: string }): number => (r.title.trim().toLowerCase() === ql ? 0 : 1);
+    const titleRank = new Map(byTitle.map((r, i) => [r, i]));
+    const bodyOnly = this.rows.filter((r) => !titleRank.has(r) && siftMatch(q, `${r.title}\n${r.body}`));
+    const first = q.toLowerCase().split(/\s+/)[0] ?? "";
+    const items: PickItem[] = [...byTitle, ...bodyOnly]
+      .sort((a, b) => {
+        const ta = titleRank.has(a) ? 0 : 1, tb = titleRank.has(b) ? 0 : 1;
+        return ta - tb || (ta === 0 ? isExact(a) - isExact(b) : 0) || bucket(a.n) - bucket(b.n)
+          || (ta === 0 ? (titleRank.get(a)! - titleRank.get(b)!) : b.n.file.stat.mtime - a.n.file.stat.mtime);
+      })
+      // One slot short of the cap, so the Create row (added below) is never the
+      // one SuggestModal trims off.
+      .slice(0, this.limit - 1)
+      .map((r) => ({
+        kind: "note" as const, ...r,
+        hit: titleRank.has(r) ? "" : (r.body.split(/\r?\n/).map((x) => x.trim()).find((x) => x.toLowerCase().includes(first)) ?? ""),
+      }));
+    const exact = this.todayTitles.has(ql) || this.rows.some((r) => r.title.trim().toLowerCase() === ql);
+    // 0.589.0: with no TITLE match the offer leads (body hits are rarely what
+    // you meant); otherwise it trails the matches, like Stashpad's other pickers.
+    if (!exact) {
+      if (byTitle.length === 0) items.unshift({ kind: "create", text: q });
+      else items.push({ kind: "create", text: q });
+    }
+    return items;
+  }
+
+  renderSuggestion(item: PickItem, el: HTMLElement): void {
     el.addClass("stashpad-focus-pick");
+    if (item.kind === "create") {
+      el.addClass("is-create");
+      setIcon(el.createSpan({ cls: "stashpad-focus-pick-box" }), "plus");
+      const body = el.createDiv({ cls: "stashpad-focus-pick-body" });
+      body.createDiv({ cls: "stashpad-focus-pick-title", text: `Create new: "${item.text}"` });
+      body.createDiv({ cls: "stashpad-focus-meta", text: `New task in ${this.createFolder.split("/").pop() || this.createFolder}, added to today` });
+      return;
+    }
+    const { n } = item;
+    const key = focusKey(n.folder, n.id);
     el.toggleClass("is-picked", this.picked.has(key));
+    el.toggleClass("is-done", n.completed);
     const box = el.createSpan({ cls: "stashpad-focus-pick-box" });
     setIcon(box, this.picked.has(key) ? "check-square" : "square");
     const body = el.createDiv({ cls: "stashpad-focus-pick-body" });
-    body.createDiv({ cls: "stashpad-focus-pick-title", text: n.title || "Untitled" });
-    const meta: string[] = [n.folder.split("/").pop() || n.folder];
-    meta.push(n.completed ? "done" : n.task ? "task" : "note — becomes a task");
-    if (n.focusDate) meta.push(`was on ${n.focusDate}`);
+    const head = body.createDiv({ cls: "stashpad-focus-pick-head" });
+    head.createSpan({ cls: "stashpad-focus-pick-title", text: item.title || "Untitled" });
+    // 0.589.0: a status chip, so done / open / plain notes read at a glance.
+    const chip = n.completed ? ["is-done", "check", "Done"] : n.task ? ["is-task", "circle", "Task"] : ["is-note", "file-text", "Note"];
+    const c = head.createSpan({ cls: `stashpad-focus-pick-chip ${chip[0]}` });
+    setIcon(c.createSpan({ cls: "stashpad-focus-pick-chip-icon" }), chip[1]);
+    c.createSpan({ text: chip[2] });
+    // 0.589.0: details that tell look-alike tasks apart — where it lives
+    // (folder › parent note), when it was made, its due date, time tracked.
+    const where = n.folder.split("/").pop() || n.folder;
+    const parentTitle = n.parent ? this.titleByKey.get(focusKey(n.folder, n.parent)) : undefined;
+    const meta: string[] = [parentTitle ? `${where} › ${parentTitle.length > 40 ? parentTitle.slice(0, 39) + "…" : parentTitle}` : where];
+    if (n.created) meta.push(`created ${formatDateTime(n.created, this.plugin.settings)}`);
+    if (n.due) { const ms = parseDueString(n.due); if (Number.isFinite(ms)) meta.push(`due ${formatDateOnly(ms, this.plugin.settings)}`); }
     if (n.totalSec) meta.push(`${formatSpent(n.totalSec)} tracked`);
+    if (n.focusDate) meta.push(`on Focus ${n.focusDate}`);
     body.createDiv({ cls: "stashpad-focus-meta", text: meta.join(" · ") });
+    if (item.hit) body.createDiv({ cls: "stashpad-focus-pick-hit", text: item.hit.slice(0, 140) });
     this.rowEls.set(key, el);
   }
 
-  /** Toggle instead of choose-and-close. */
-  selectSuggestion(n: FocusNote): void {
+  /** Toggle a note (or create one) instead of choose-and-close. */
+  selectSuggestion(item: PickItem): void {
+    if (item.kind === "create") { void this.createNew(item.text); return; }
+    const { n } = item;
     const key = focusKey(n.folder, n.id);
     if (this.picked.has(key)) this.picked.delete(key); else this.picked.set(key, n);
     const el = this.rowEls.get(key);

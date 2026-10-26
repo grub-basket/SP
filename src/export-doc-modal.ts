@@ -1,5 +1,6 @@
 import { App, Modal, Platform } from "obsidian";
 import type { ExportFormat, ExportScope } from "./commands/export-doc";
+import { obsidianPdfExportAvailable } from "./commands/pdf-handoff";
 
 export interface DocExportChoice {
   baseName: string;
@@ -42,13 +43,17 @@ export class ExportDocModal extends Modal {
     input.addClass("stashpad-export-name");
     input.value = this.opts.defaultBaseName;
 
-    // Format — PDF and PNG (image) are desktop-only (rendered via Electron); hidden
-    // on mobile, which only offers HTML.
+    // Format — desktop renders PDF and PNG (image) via Electron. Mobile offers PDF
+    // only when Obsidian has its own Export to PDF (1.15+), which Stashpad hands
+    // the export to; PNG stays desktop-only. With HTML alone there's no choice
+    // to show.
     let format: ExportFormat = "html";
-    const formatOpts = Platform.isMobile
-      ? [{ id: "html", label: "HTML" }]
-      : [{ id: "html", label: "HTML" }, { id: "pdf", label: "PDF" }, { id: "png", label: "Image (PNG)" }];
-    if (!Platform.isMobile) {
+    const formatOpts = !Platform.isMobile
+      ? [{ id: "html", label: "HTML" }, { id: "pdf", label: "PDF" }, { id: "png", label: "Image (PNG)" }]
+      : obsidianPdfExportAvailable(this.app)
+        ? [{ id: "html", label: "HTML" }, { id: "pdf", label: "PDF" }]
+        : [{ id: "html", label: "HTML" }];
+    if (formatOpts.length > 1) {
       this.segment(this.contentEl, "Format", formatOpts, format, (id) => { format = id as ExportFormat; });
     }
 

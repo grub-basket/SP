@@ -18,6 +18,14 @@ const RESERVED_SUBFOLDERS = new Set([
   "archive", "trash", // 0.136.0: per-folder archive/trash subfolders
 ]);
 
+/** 0.584.1: the export folder is a setting ("_exports" by default), and a renamed
+ *  one must stay reserved too — otherwise a loose-folder sweep imports export
+ *  files (HTML exports, OKF, the mobile PDF hand-off note) as notes. Returns the
+ *  configured subfolder's FIRST segment, or "" when unset. */
+export function exportSubfolderName(exportFolder: string | undefined): string {
+  return (exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "").split("/")[0] ?? "";
+}
+
 /** Extensions that must NEVER be turned into a note/attachment by any import
  *  path. `.stash` is handled by the dedicated stash-import path (not a note);
  *  `.edtz` (Obsidian's encrypted export bundle) must always be skipped — at the
@@ -94,6 +102,15 @@ export class ImportService {
 
   constructor(private plugin: StashpadPlugin) {}
 
+  /** A reserved subfolder name: the fixed set plus the configured export folder.
+   *  ONLY for a direct child of a Stashpad folder (the export folder lives there).
+   *  Don't use it for nested folders of a dropped folder, or for a Stashpad
+   *  folder's own name: a plain-word export setting ("Exports", "pdf") would then
+   *  swallow a user's real folder of that name. */
+  private isReservedSubfolder(name: string): boolean {
+    return RESERVED_SUBFOLDERS.has(name) || name === exportSubfolderName(this.plugin.settings.exportFolder);
+  }
+
   private get app() { return this.plugin.app; }
 
   /** 0.136.0: import originals live in the folder's own archive subfolder,
@@ -128,7 +145,7 @@ export class ImportService {
     if (this.suppressed.has(folder.path)) return;
     const parent = folder.parent?.path?.replace(/\/+$/, "") ?? "";
     if (!this.plugin.discoverStashpadFolders().includes(parent)) return;
-    if (RESERVED_SUBFOLDERS.has(folder.name)) return;
+    if (this.isReservedSubfolder(folder.name)) return;
     this.pendingFolders.set(folder.path, Date.now());
     this.arm();
   }
@@ -846,7 +863,7 @@ export class ImportService {
     const rootFolder = this.app.vault.getAbstractFileByPath(root);
     if (!(rootFolder instanceof TFolder)) return 0;
     const subs = rootFolder.children.filter(
-      (c): c is TFolder => c instanceof TFolder && !RESERVED_SUBFOLDERS.has(c.name),
+      (c): c is TFolder => c instanceof TFolder && !this.isReservedSubfolder(c.name),
     );
     if (subs.length === 0) return 0;
     await this.plugin.importLog.load();

@@ -174,7 +174,7 @@ export interface ToolbarBuiltin {
   glyph: string;
   title: string;
   cls?: string;
-  gate?: "spoilers" | "drafts" | "checkDup" | "multiInsert";
+  gate?: "spoilers" | "drafts" | "checkDup" | "multiInsert" | "aiContributor";
   run?: (ta: HTMLTextAreaElement) => void;
   menu?: (e: MouseEvent, getTa: () => HTMLTextAreaElement | null) => void;
 }
@@ -219,6 +219,11 @@ export const TOOLBAR_BUILTINS: ToolbarBuiltin[] = [
   // opts.multiInsert (composer + edit modal). No `run` — wired specially in the
   // renderer, since it drives a stateful MultiInsert session on the textarea.
   { id: "multiInsert", icon: "text-cursor-input", glyph: "⌖", title: "Insert text at multiple points", cls: "stashpad-toolbar-multiinsert", gate: "multiInsert" },
+  // 0.581.0 (user): the composer's "tag notes you write as AI-assisted" (🤖)
+  // button. It used to be appended to the bar by view.ts outside this list, so
+  // the Toolbar buttons settings couldn't hide or move it. Composer only (gated
+  // on opts.aiContributor); no `run` — the view wires its stateful click.
+  { id: "aiContributor", icon: "bot", glyph: "🤖", title: "Tag notes you write as AI-assisted", cls: "stashpad-composer-bot-btn", gate: "aiContributor" },
 ];
 
 /** 0.351.0: resolve the effective built-in button list from a saved config —
@@ -272,6 +277,10 @@ export interface FormattingToolbarOpts {
    *  Set on the composer + edit-modal toolbars. The button drives a MultiInsert
    *  session on the current textarea. */
   multiInsert?: boolean;
+  /** 0.581.0: enables the composer-only "tag as AI-assisted" (🤖) button (gated
+   *  builtin). Called with the created button so the view can wire its sticky
+   *  on/off state. Absent in the edit modal and quick capture. */
+  aiContributor?: (btn: HTMLElement) => void;
 }
 
 /** Render the toolbar into `host`, acting on the textarea returned by `getTa`.
@@ -326,6 +335,7 @@ export function renderFormattingToolbar(
     if (def.gate === "drafts" && !opts.drafts) continue;
     if (def.gate === "checkDup" && !opts.checkDup) continue;
     if (def.gate === "multiInsert" && !opts.multiInsert) continue;
+    if (def.gate === "aiContributor" && !opts.aiContributor) continue;
     const cls = "stashpad-composer-toolbar-btn" + (def.cls ? " " + def.cls : "");
     const b = bar.createEl("button", { cls, attr: { "aria-label": def.title, tabindex: "-1" } });
     setIconSafe(b, icon, def.glyph);
@@ -342,6 +352,10 @@ export function renderFormattingToolbar(
       paint();
       b.onclick = (e) => { e.preventDefault(); d.toggle(); paint(); };
       b.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); d.open(); };
+      continue;
+    }
+    if (def.gate === "aiContributor" && opts.aiContributor) {
+      opts.aiContributor(b); // the view sets the click handler + active state
       continue;
     }
     if (def.gate === "checkDup" && opts.checkDup) {

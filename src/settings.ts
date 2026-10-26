@@ -31,6 +31,7 @@ import { COPY_TS_MODIFIER_ORDER, type CopyTsModifier, parseModifierTokens, seria
 import { formatDateTime } from "./format";
 import { type EncryptionConfig, defaultEncryptionConfig } from "./encryption-service";
 import { getActiveView } from "./active-view";
+import { DEFAULT_REBLUR_SECONDS, REBLUR_SECONDS_CHOICES, reblurChoiceLabel, reblurDelayMs } from "./obscure-reblur";
 
 export interface ShortcutMap {
   move: string;        // M  — move selection via picker
@@ -373,6 +374,11 @@ export interface StashpadSettings {
    *  defaults restored ONCE (see main.ts). Set thereafter, so deliberately hiding
    *  every button sticks. */
   itemButtonsRepairedV1: boolean;
+  /** 0.581.2: one-time flag — saved row-button lists got the row-only buttons
+   *  (Make child / Preview / Star menu), which used to be fixed slots, appended
+   *  (seedRowOnlyButtons in main.ts). Set thereafter, so hiding one sticks.
+   *  0.581.5: a config-folder key (menus.json), so it syncs with the lists. */
+  rowOnlyButtonsSeededV1?: boolean;
   /** 0.320.0: user icon overrides for catalog actions, keyed by action id →
    *  lucide icon name. Missing = the catalog default (so "reset" = delete key).
    *  Custom Obsidian commands are keyed `cmd:<id>`. */
@@ -666,6 +672,9 @@ export interface StashpadSettings {
   /** 0.577.0: Today-list order as `folder::id` keys, device-local. Notes not in
    *  it (added on another device) sort after, by title. */
   focusOrder: string[];
+  /** 0.583.0: folder the Focus picker's "Create new" puts new tasks in ("" =
+   *  the active Stashpad folder). Synced — a preference. */
+  focusCreateFolder: string;
   /** 0.138.0: on startup, if the watchlist has active entries, show a Notice
    *  with a Review button that opens the review view. Default OFF. */
   reEncryptNudge: boolean;
@@ -929,6 +938,10 @@ export interface StashpadSettings {
    *  On = Signal-like (reveal is momentary). Off = revealing sticks for the
    *  session. */
   obscureReHides: boolean;
+  /** 0.587.0: blur a revealed note again after it has gone this many seconds
+   *  unused (no scroll/tap/typing in it, mouse not resting on it, not being
+   *  edited). 0 = never. Default 15. See src/obscure-reblur.ts. */
+  obscureReblurSeconds: number;
   /** 0.267.0: obscure EVERY note, in every folder, regardless of the per-note
    *  flag. A panic switch rather than a preference — for handing someone your
    *  screen, or working somewhere overlooked. Individual notes can still be
@@ -1251,6 +1264,10 @@ export interface StashpadSettings {
   /** 0.319.0: composer drafts keyed by draft id (see ComposerDraft). Several
    *  per folder are allowed (other devices, stashed text, an edit in progress). */
   composerDrafts: Record<string, ComposerDraft>;
+  /** 0.586.0: deleted draft id → when it was deleted (draft-tombstones.ts), so
+   *  a deletion survives another device saving its older copy of the draft.
+   *  Synced with data.json; entries expire after DRAFT_TOMBSTONE_TTL_MS. */
+  deletedDrafts: Record<string, number>;
   /** 0.223.0: per-folder append target (frontmatter id) that rides along with
    *  the draft, so binding a target then reloading doesn't silently turn the
    *  append into a new note. Cleared whenever the target is cleared. */
@@ -1493,9 +1510,10 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   focusShortBreakMin: 5,
   focusLongBreakMin: 15,
   focusLongBreakEvery: 4,
-  focusDefaultMode: "pomodoro",
+  focusDefaultMode: "stopwatch", // 0.589.0: stopwatch is the everyday timer
   focusTimer: null,
   focusOrder: [],
+  focusCreateFolder: "",
   reEncryptNudge: false,
   reEncryptAfterMin: 0,
   dueQuickAdjusts: ["5m", "15m", "30m", "1h", "1d", "1w"],
@@ -1567,6 +1585,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   mediaViewerExcludedExtensions: "",
   mediaViewerAllFileTypes: false,
   obscureReHides: true,
+  obscureReblurSeconds: DEFAULT_REBLUR_SECONDS,
   obscureAll: false,
   obscureFolders: {},
   foldedFolders: {},
@@ -1635,6 +1654,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   okfTemplatePath: "",
   drafts: {},
   composerDrafts: {},
+  deletedDrafts: {},
   editRouting: {
     toComposer: false,
     desktop: { composer: 500, modal: 8000, tab: 60000 },
@@ -1857,7 +1877,7 @@ export function describeMaintenanceWindow(s: MaintenanceWindowSettings): string 
  *  is "no faster", never "stale UI". Drafts are safe to skip because the
  *  listener syncs the composer's text directly and reports whether it did. */
 const RENDER_IRRELEVANT_KEYS: ReadonlySet<string> = new Set([
-  "drafts", "composerDrafts", "lastSubmitted", "draftAppendTargets",
+  "drafts", "composerDrafts", "deletedDrafts", "lastSubmitted", "draftAppendTargets",
   "notifiedDueKeys", "persistReminderLog", "settingsRev",
   // 0.292.0 (perf): device-local MRU state. Neither key is read by any render
   // path — the only consumers are main.ts `recordFolderUsed` (the writer),
@@ -1882,7 +1902,7 @@ const RENDER_IRRELEVANT_KEYS: ReadonlySet<string> = new Set([
   // ticker read these, and both repaint themselves on change; no Stashpad list
   // render touches them. focusTimer is saved on every start/pause/phase change.
   "focusTimer", "focusOrder", "focusWorkMin", "focusShortBreakMin",
-  "focusLongBreakMin", "focusLongBreakEvery", "focusDefaultMode",
+  "focusLongBreakMin", "focusLongBreakEvery", "focusDefaultMode", "focusCreateFolder",
   // DELIBERATELY NOT EXCLUDED: `pinnedFilterMode`. It is a single GLOBAL scalar
   // read by every view's render, and it has a settings-tab dropdown that relies
   // on the broadcast to repaint open lists. It also changes rarely (an explicit
@@ -2622,7 +2642,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         this.reactionsBody(h, rebuild);
       };
       buildAll(box);
-    }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu", "actions menu", "zap", "lightning", "toolbar", "reaction", "reactions", "emoji", "favorite", "favorites", "preset", "presets"])];
+    }, ["quick", "menu", "star", "item", "button", "context", "right click", "icon", "registry", "custom command", "submenu", "actions menu", "zap", "lightning", "toolbar", "reaction", "reactions", "emoji", "favorite", "favorites", "preset", "presets", "preview", "preview button", "make child", "mobile"])];
   }
 
   /** 0.459.0: manage the emoji reaction picker's Favorites (pinned emoji shown
@@ -3142,7 +3162,7 @@ export class StashpadSettingTab extends PluginSettingTab {
   }
 
   private quickMenuBody(host: HTMLElement, rebuild: () => void): void {
-        this.sectionHeader(host, "⭐ Star menu (quick actions)", "The ⭐ button on each note opens this short, tap-friendly menu. Reorder it or add commands (including any Obsidian command). Empty it to hide the star button entirely.");
+        this.sectionHeader(host, "⭐ Star menu (quick actions)", "The ⭐ button on each note opens this short, tap-friendly menu. Reorder it or add commands (including any Obsidian command). Hide or move the star button itself under Item buttons below; it also stays hidden while this menu is empty.");
         new Setting(host)
           .setName("End with \"More commands…\"")
           .setDesc("Append an item that opens the full ⋮ menu, so nothing is out of reach.")
@@ -3199,12 +3219,9 @@ export class StashpadSettingTab extends PluginSettingTab {
   /** 0.579.0: name the row buttons that are NOT in the list above, so the
    *  settings page accounts for every button the row actually shows. */
   private rowButtonsFixedNote(host: HTMLElement, platform: "desktop" | "mobile"): void {
-    const parts: string[] = [];
-    if (this.plugin.settings.showNotePreviewButton) parts.push("⤢ Preview (turn off with \"Note preview button\" under List & Display)");
-    if (platform === "desktop") parts.push("↳ Make child (Flat and Everything views only)");
-    if ((this.plugin.settings.quickMenuActions ?? []).length) parts.push("⭐ Star menu (empty the star menu above to hide it)");
-    parts.push("⋮ More actions (always last)");
-    host.createEl("p", { cls: "setting-item-description", text: `Also on every ${platform} row, outside this list: ${parts.join(" · ")}.` });
+    // 0.581.2 (user): Preview, Make child and the Star menu are list entries now,
+    // so only ⋮ is left outside the list.
+    host.createEl("p", { cls: "setting-item-description", text: `The ⋮ button always comes last on every ${platform} row: it opens the full note menu, so every action stays reachable. “Make child of…” only shows in the Flat and Everything views, and the ⭐ Star menu button only while the star menu has items.` });
   }
 
   /** 0.320.0: the large context-menu top-block builder (reorderable leaf
@@ -4480,8 +4497,9 @@ export class StashpadSettingTab extends PluginSettingTab {
 
     // 0.374.0: the note-preview button + the expand/collapse toggle — two
     // independent per-row affordances for reading a long note.
-    cats.listDisplay.push(toggle("Note preview button", "Show a “Preview” button on each note row that opens the note in the file-preview modal — the note itself as the first slide (scrollable), its attachments in the rail after. Hiding the button doesn't remove the note slide from the modal; you still reach it by opening any attachment.",
-      () => this.plugin.settings.showNotePreviewButton, (v) => { this.plugin.settings.showNotePreviewButton = v; }, ["preview", "modal", "note", "row", "button", "expand"]));
+    // 0.581.2 (user): the "Note preview button" toggle is retired — the Preview
+    // button is an entry in Note actions & menus → Item buttons (desktop and
+    // mobile lists), seeded from this toggle's last value on upgrade.
     cats.listDisplay.push(toggle("Show more / less toggle", "Show the inline expand/collapse (“Show more” / “Show less”) control on note rows whose body is clamped. Turn it off if you'd rather read long notes through the preview modal than expand them in the list.",
       () => this.plugin.settings.showExpandToggle, (v) => { this.plugin.settings.showExpandToggle = v; }, ["expand", "collapse", "show more", "clamp", "toggle"]));
 
@@ -4796,6 +4814,21 @@ export class StashpadSettingTab extends PluginSettingTab {
       () => this.plugin.settings.autoNavOnMoveIn, (v) => { this.plugin.settings.autoNavOnMoveIn = v; }, ["navigate", "move", "in"]));
     cats.privacy.push(toggle("Re-hide obscured notes when you leave", "An obscured note goes back to blurred when you navigate away, switch folders, or reload — revealing it is momentary, like Signal. Off keeps it revealed until you re-hide it or restart. On by default. Note: obscuring is VISUAL ONLY; see the description on the obscure command.",
       () => this.plugin.settings.obscureReHides, (v) => { this.plugin.settings.obscureReHides = v; }, ["obscure", "blur", "hide", "spoiler", "privacy", "rehide"]));
+    cats.privacy.push(this.renderDef("Blur revealed notes again after", "A note you tap to reveal blurs itself again once you've stopped using it for this long. Scrolling, tapping or typing in it restarts the countdown, and it waits while your mouse rests on the note or you're editing it. 15 seconds by default. \"Never\" keeps it revealed until you leave (see the setting above).", (st) => {
+      st.addDropdown((d) => {
+        for (const s of REBLUR_SECONDS_CHOICES) d.addOption(String(s), reblurChoiceLabel(s));
+        const cur = reblurDelayMs(this.plugin.settings.obscureReblurSeconds) / 1000;
+        // A hand-edited value that isn't one of the choices still shows, rather
+        // than the dropdown silently displaying the first option.
+        if (!(REBLUR_SECONDS_CHOICES as readonly number[]).includes(cur)) d.addOption(String(cur), reblurChoiceLabel(cur));
+        d.setValue(String(cur));
+        d.onChange(async (v) => {
+          this.plugin.settings.obscureReblurSeconds = Number(v);
+          await this.plugin.saveSettings();
+          this.plugin.retimeObscureReblurAllViews();
+        });
+      });
+    }, ["obscure", "blur", "hide", "timer", "timeout", "seconds", "auto", "privacy", "rehide", "reblur"]));
     cats.privacy.push(toggle("Obscure every note, everywhere", "Blur every note in every Stashpad \u2014 for handing someone your screen, or working somewhere overlooked. This OVERRIDES everything else while it is on: a folder set to Never and a note set not to obscure are both covered. Nothing is rewritten, so they come back exactly as they were when you turn it off. Tapping a note still reveals it one at a time. VISUAL ONLY: the text is unchanged in the file and still turns up in search.",
       () => this.plugin.getObscureAll(), (v) => { void this.plugin.setObscureAll(v); }, ["obscure", "blur", "hide", "all", "global", "privacy", "panic"]));
     cats.attachmentsMedia.push(toggle("Put the file name in front of an attachment", "When you attach a file, the note reads \"report.pdf\" followed by the file itself, separated by a space. Without it the note is a link and nothing else, so it shows up blank in the list and is hard to search for. On by default.",

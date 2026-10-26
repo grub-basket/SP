@@ -47,6 +47,12 @@ export const CONFIG_FILES: Record<string, readonly string[]> = {
     "itemButtons", "quickMenuActions", "quickMenuCustom",
     // 0.579.0: the mobile row's own list (absent = derived at load).
     "itemButtonsMobile",
+    // 0.581.5: the row-only-buttons upgrade marker travels WITH the lists it
+    // describes, so a device upgrading later sees the lists were already
+    // upgraded (and that a missing button was hidden on purpose). An older build
+    // rewriting this file may drop it; the upgrade's "list already holds one"
+    // check is the fallback then.
+    "rowOnlyButtonsSeededV1",
     "commandIcons", "toolbarButtons",
     // 0.529.0: the ⚡ actions menu (new keys — nothing to migrate).
     "zapMenuOrder", "zapSubmenus",

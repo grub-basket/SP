@@ -81,20 +81,63 @@ export const BUTTON_ACTION_CATALOG = NOTE_ACTION_CATALOG.filter((a) => a.button)
  *  order — so the item-buttons settings editor lists them and the user can hide or
  *  reorder them (parity with the other menu editors). Existing installs are
  *  migrated to prepend these (see main.ts). Mobile has its own list
- *  (`itemButtonsMobile`, below). `react` is rendered specially (it opens the picker). */
-export const DEFAULT_ROW_BUTTONS: readonly string[] = ["edit", "focus", "reply", "react"];
+ *  (`itemButtonsMobile`, below). `react` is rendered specially (it opens the picker).
+ *  0.581.2: + the row-only buttons below (Make child, Preview, Star menu), which
+ *  used to sit in fixed slots outside the list. */
+export const DEFAULT_ROW_BUTTONS: readonly string[] = ["edit", "focus", "reply", "react", "makeChild", "preview", "quick"];
+
+/** 0.581.2 (user): row buttons that aren't note actions anywhere else, so they
+ *  have no catalog entry — they used to be hardcoded slots that settings could
+ *  only mention. Labels/icons here feed the item-button editors via
+ *  noteAction(); the row renders each specially (view.ts
+ *  renderConfiguredRowButtons). `makeChild` shows only in Flat / Everything
+ *  views; `quick` only while the star menu has items. */
+export const ROW_ONLY_IDS: ReadonlySet<string> = new Set(["makeChild", "preview", "quick"]);
+export const ROW_ONLY_BUTTONS: readonly NoteActionDef[] = [
+  { id: "makeChild", label: "Make child of… (Flat / Everything views)", icon: "corner-down-right", group: "Organize" },
+  { id: "preview",   label: "Preview note",                              icon: "maximize-2",        group: "Open & navigate" },
+  { id: "quick",     label: "⭐ Star menu",                               icon: "star",              group: "Open & navigate" },
+];
 
 /** 0.579.0: the default MOBILE row buttons (`settings.itemButtonsMobile`). A phone
  *  row is narrow, so only React is on by default (Edit / Focus / Reply live in the
- *  ⋮ menu); the user can turn the others on in settings. */
-export const DEFAULT_MOBILE_ROW_BUTTONS: readonly string[] = ["react"];
+ *  ⋮ menu); the user can turn the others on in settings. 0.581.2: + Star menu and
+ *  Preview, in the order the mobile row always showed them. */
+export const DEFAULT_MOBILE_ROW_BUTTONS: readonly string[] = ["react", "quick", "preview"];
 
-/** 0.579.0: the mobile list an install gets before it has ever saved one: React
- *  plus the user's own custom buttons from the desktop list — exactly what the
- *  mobile row showed before it had its own list, so nothing moves on upgrade. */
+/** 0.579.0: the mobile list an install gets before it has ever saved one: React,
+ *  the user's own custom buttons from the desktop list, then the Star menu and
+ *  Preview — exactly the mobile row as it was, so nothing moves on upgrade.
+ *  0.581.2: Star / Preview follow the desktop list (each shows on mobile only
+ *  while it's on in the desktop list), until the mobile list is edited. */
 export function deriveMobileRowButtons(desktop: readonly string[]): string[] {
-  return [...DEFAULT_MOBILE_ROW_BUTTONS, ...desktop.filter((id) => !DEFAULT_ROW_BUTTONS.includes(id))];
+  const tail = ["quick", "preview"].filter((id) => desktop.includes(id));
+  return ["react", ...desktop.filter((id) => !DEFAULT_ROW_BUTTONS.includes(id)), ...tail];
 }
+
+/** 0.581.2: one-time upgrade for SAVED lists that predate the row-only buttons
+ *  (they were fixed slots then, shown after every listed button): append the
+ *  ones a list lacks at the end, in the old visual order — desktop: Make child,
+ *  Preview, Star menu; mobile: Star menu, Preview. Preview is left out (= hidden,
+ *  still listed in the editor) when the old "Note preview button" setting was
+ *  off. Unset mobile lists need nothing (they're derived). */
+export function seedRowOnlyButtons(list: readonly string[], mobile: boolean, previewWasOn: boolean): string[] {
+  const order = mobile ? ["quick", "preview"] : ["makeChild", "preview", "quick"];
+  // A list that already holds ANY of them was upgraded (on this or another
+  // device — the lists sync through the config folder, the per-device flag
+  // doesn't), so leave it alone: re-adding would undo a deliberate hide.
+  // (0.581.5: checked against ALL row-only ids on both platforms — the mobile
+  // editor offers Make child too, so a mobile list holding only it is upgraded.)
+  if ([...ROW_ONLY_IDS].some((id) => list.includes(id))) return [...list];
+  const add = order.filter((id) => id !== "preview" || previewWasOn);
+  return [...list, ...add];
+}
+
+/** 0.581.2: the four built-ins the desktop list held before the row-only
+ *  buttons joined it. The legacy load paths (0.475.0 seed, 0.492.0 repair,
+ *  missing-key fallback) fill a list with THESE, so seedRowOnlyButtons then adds
+ *  the row-only ones in their old place and honours the old Preview toggle. */
+export const LEGACY_ROW_BUTTONS: readonly string[] = ["edit", "focus", "reply", "react"];
 
 /** 0.579.0: the row-button list in effect for a platform. The mobile list stays
  *  UNSET (undefined) until the user edits it, and is derived from the desktop
@@ -215,7 +258,8 @@ export const ZAP_ACTIONS: readonly NoteActionDef[] = [
  *  showed the right one. Declared after both arrays (const, no hoist).
  *  0.529.0: the ⚡-only actions too. */
 const BY_ID = new Map<string, NoteActionDef>(
-  [...NOTE_ACTION_CATALOG, ...CONTEXT_EXTRA_ACTIONS, ...ZAP_ACTIONS].map((a) => [a.id, a]),
+  // 0.581.2: + ROW_ONLY_BUTTONS, so the item-button editors label them.
+  [...NOTE_ACTION_CATALOG, ...CONTEXT_EXTRA_ACTIONS, ...ZAP_ACTIONS, ...ROW_ONLY_BUTTONS].map((a) => [a.id, a]),
 );
 
 /** 0.529.0: everything the ⚡ menu builder can add (besides `cmd:` commands and

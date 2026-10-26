@@ -2793,12 +2793,15 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
    areas. Scoped to NON-compact mobile (compact has its own dense layout). */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note,
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note.is-task {
-  grid-template-columns: 1fr auto auto auto auto auto;
+  /* 0.581.2: `react` holds the whole configured button group (.stashpad-note-rowbtns:
+     React, Star menu, Preview, custom buttons — the user's mobile list), so the
+     separate quick/preview columns are gone (they'd leave empty gaps). */
+  grid-template-columns: 1fr auto auto auto;
   grid-template-areas:
-    "meta   toggle react  quick  preview more"
-    "body   body   body   body   body   body"
-    "foot   foot   foot   foot   foot    foot"
-    "reacts reacts reacts reacts reacts  reacts";
+    "meta   toggle react  more"
+    "body   body   body   body"
+    "foot   foot   foot   foot"
+    "reacts reacts reacts reacts";
   align-items: center;
   row-gap: 2px;
   column-gap: 8px;
@@ -2819,17 +2822,14 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note-body { grid-area: body; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note-meta-bottom { grid-area: foot; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-expand-toggle { grid-area: toggle; }
-.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-quick { grid-area: quick; }
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-more { grid-area: more; }
 /* 0.316.4: the reaction button (.stashpad-note-react, added 0.287.0) never got a
    grid-area, so under display:contents it auto-flowed into an implicit row and
    dropped BELOW the body on long/multi-line notes instead of staying up top with
    the toggle/quick/more buttons. Give it its own slot on the top row. */
 .stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-react { grid-area: react; }
-/* 0.380.0: the per-row Preview button (0.374.0) had the SAME missing-grid-area
-   bug as the react button above — under display:contents it auto-flowed into an
-   implicit row and dropped BELOW the note body. Give it a top-row slot. */
-.stashpad-view.is-mobile:not(.is-compact) .stashpad-note .stashpad-note-preview { grid-area: preview; }
+/* (0.581.2: the Star menu and Preview buttons no longer have grid slots of their
+   own — they live in the .stashpad-note-rowbtns group below.) */
 /* 0.579.0: the mobile row's configured buttons (settings → Item buttons —
    mobile: React and any others the user turned on) share one wrapper in the
    `react` slot, so they stay on the top row in the user's order. Buttons inside
@@ -4066,8 +4066,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
   padding: 2px 8px;
   cursor: pointer;
 }
-/* 0.501.0: composer "tag as AI-assisted" button — lit when a bot is pending. */
-.stashpad-composer-bot-btn.is-active {
+/* 0.501.0: composer "tag as AI-assisted" button — lit when a bot is pending.
+   0.581.1: the toolbar-entry selector out-ranks `.stashpad-composer-toolbar-btn:hover`
+   (same 2-class weight, later in the file), which otherwise hid the "on" state
+   under the pointer — and on iOS, where hover sticks after a tap. */
+.stashpad-composer-bot-btn.is-active,
+.stashpad-composer-toolbar-btn.stashpad-composer-bot-btn.is-active {
   color: var(--text-on-accent);
   background: var(--interactive-accent);
 }
@@ -12770,3 +12774,32 @@ body.is-mobile .stashpad-showcase .stashpad-showcase-att-pin { min-height: 32px;
 .stashpad-focus-pick.is-picked .stashpad-focus-pick-box { color: var(--interactive-accent); }
 .stashpad-focus-pick-body { min-width: 0; }
 .stashpad-focus-picker-foot { display: flex; justify-content: flex-end; padding: 8px 12px; border-top: 1px solid var(--background-modifier-border); }
+
+/* 0.583.0: Focus picker — body-hit line, "Create new" row, destination folder. */
+.stashpad-focus-pick-hit { color: var(--text-faint); font-size: var(--font-ui-smaller); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stashpad-focus-pick.is-create .stashpad-focus-pick-box { color: var(--interactive-accent); }
+.stashpad-focus-pick.is-create .stashpad-focus-pick-title { color: var(--text-accent); }
+.stashpad-focus-picker-foot { align-items: center; gap: 10px; flex-wrap: wrap; }
+.stashpad-focus-picker-where { display: flex; align-items: center; gap: 6px; margin-right: auto; color: var(--text-muted); font-size: var(--font-ui-small); }
+.stashpad-focus-picker-where select { max-width: 200px; }
+
+/* 0.589.0: Focus — big Stopwatch / Pomodoro switch; picker status chips,
+   done styling, Create button. (Later rules override the 0.577.0 pill.) */
+.stashpad-focus-modes { display: flex; width: 100%; max-width: 420px; padding: 4px; gap: 4px; border-radius: var(--radius-l); background: var(--background-modifier-hover); }
+.stashpad-focus-mode { flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: auto; padding: 10px 16px; border-radius: var(--radius-m); font-size: var(--font-ui-medium); font-weight: 600; color: var(--text-muted); }
+.stashpad-focus-mode-icon { display: inline-flex; }
+.stashpad-focus-mode-icon svg { width: 20px; height: 20px; }
+.stashpad-focus-mode.is-active { background: var(--interactive-accent); color: var(--text-on-accent); box-shadow: var(--shadow-s); }
+.stashpad-focus-mode:not(.is-active):hover { color: var(--text-normal); background: var(--background-modifier-active-hover); }
+.stashpad-focus.is-single .stashpad-focus-modes { max-width: 520px; }
+
+.stashpad-focus-pick-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.stashpad-focus-pick-head .stashpad-focus-pick-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.stashpad-focus-pick-chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 3px; padding: 0 7px; border-radius: 999px; font-size: var(--font-ui-smaller); line-height: 1.6; color: var(--text-muted); background: var(--background-modifier-hover); }
+.stashpad-focus-pick-chip-icon { display: inline-flex; }
+.stashpad-focus-pick-chip-icon svg { width: 11px; height: 11px; }
+.stashpad-focus-pick-chip.is-done { color: var(--color-green); background: color-mix(in srgb, var(--color-green) 14%, transparent); }
+.stashpad-focus-pick-chip.is-task { color: var(--interactive-accent); background: color-mix(in srgb, var(--interactive-accent) 12%, transparent); }
+.stashpad-focus-pick.is-done .stashpad-focus-pick-title { text-decoration: line-through; color: var(--text-muted); }
+.stashpad-focus-picker-create { display: inline-flex; align-items: center; gap: 6px; }
+.stashpad-focus-picker-create:disabled { opacity: 0.5; }

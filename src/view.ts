@@ -58,6 +58,7 @@ import { ViewDnD } from "./view-dnd";
 import { NoteBodyRenderer, OV_MEMO_VERSION } from "./note-body-renderer";
 import type { RenderEntry } from "./note-body-renderer";
 import { returnToOriginOnClose } from "./leaf-return";
+import { exportSubfolderName } from "./import-service";
 import { computeSortedIds } from "./view-sort";
 import {
   SHEET_KEY,
@@ -89,17 +90,18 @@ import { importStashZip } from "./stash-package";
 import { MediaViewerModal, mediaItemsFor, viewerHandles, type MediaItem } from "./media-viewer";
 import { openShowcaseAtComment, openShowcaseView, renderFeedbackTargetChip, showcaseLanding, spotCommentsHook } from "./showcase-view";
 import { fileKindFor, isImageExt, pickRailMode, type RailMode } from "./file-kinds";
-import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_LEAF_IDS, CONTEXT_EXTRA_ACTIONS, QUICK_MENU_EXTRA_IDS, DEFAULT_ROW_BUTTONS, rowButtonsFor, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, defaultContextOrder } from "./note-actions";
+import { QUICK_ACTION_CATALOG, QUICK_MENU_MORE, NOTE_ACTION_CATALOG, noteAction, defaultActionIcon, CONTEXT_LEAF_IDS, CONTEXT_EXTRA_ACTIONS, QUICK_MENU_EXTRA_IDS, DEFAULT_ROW_BUTTONS, ROW_ONLY_IDS, rowButtonsFor, ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS, defaultContextOrder } from "./note-actions";
 import { guessCommandIcon } from "./icon-guess";
 import { nestBlockMessage, rootRedirectName, withReservedRule, type NestBlocked } from "./nest-guard";
 import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arraysEqual, splitIntoChunks, SPLIT_MODE_LABELS, settleNewTab, buildHomeFilename, type SplitMode, rankTags, TAG_FILTER_TAGGED, TAG_FILTER_UNTAGGED } from "./view-helpers";
 import { dedupeDrafts, draftHasContent, draftDedupKey } from "./drafts";
 import { normalizeForMatch, isLeftoverNormalized } from "./draft-match";
 import { fixDuplicatedEmphasisOpeners, straightenCurlyQuotes } from "./markdown-input";
-import { renderFormattingToolbar } from "./formatting-toolbar";
+import { renderFormattingToolbar, resolveToolbarButtons } from "./formatting-toolbar";
 import { clipboardToMarkdownTable } from "./excel-paste";
 import { richClipboardToMarkdown } from "./rich-paste";
 import type { BotDef } from "./bots";
+import { ReblurTimers, reblurDelayMs } from "./obscure-reblur";
 import type StashpadPlugin from "./main";
 
 const IMG_EXT = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
@@ -517,6 +519,10 @@ export class StashpadView extends ItemView {
    *  bound to (per folder; remembered per device in local storage), and the
    *  host of the "N drafts" / "Editing: …" chip. */
   private activeDraftId: string | null = null;
+  /** 0.586.0: the bound draft's text as last SAVED (composerDraft follows every
+   *  keystroke). Lets the settings listener tell "the box still shows exactly
+   *  the draft that was just deleted elsewhere" from "the user typed more". */
+  private boundDraftText: string | null = null;
   private draftsChipHost: HTMLElement | null = null;
   /** 0.463.0: the floating quick-capture window (write while reading), if open.
    *  Lives outside this view's DOM (on document.body), so it's torn down in
@@ -536,6 +542,21 @@ export class StashpadView extends ItemView {
    *  blurred if the note has any), second reveals media — so a glance doesn't
    *  dump every image at once. A note with no media reveals fully in one tap. */
   private mediaRevealedObscured = new Set<StashpadId>();
+  /** 0.587.0: blur a revealed note again once it has sat unused for the
+   *  "Blur revealed notes again after" delay. Rules live in obscure-reblur.ts;
+   *  this view supplies what "used" and "held" mean for its rows. */
+  private obscureReblur = new ReblurTimers<StashpadId>({
+    delayMs: () => reblurDelayMs(getSettings().obscureReblurSeconds),
+    isRevealed: (id) => this.revealedObscured.has(id),
+    isHeld: (id) => this.isObscureRevealHeld(id),
+    reblur: (id) => this.reblurRevealedNote(id),
+    setTimer: (fn, ms) => window.setTimeout(fn, ms),
+    clearTimer: (h) => window.clearTimeout(h as number),
+  });
+  /** The note a MOUSE pointer is resting on, for holding its re-blur. Touch and
+   *  pen never set it: a tapped element keeps :hover on mobile, so a "hover"
+   *  there would hold a note revealed forever. */
+  private obscureMouseOverId: StashpadId | null = null;
   private composerAppendBtn: HTMLButtonElement | null = null;
   /** 0.76.15: when the chosen destination lives in ANOTHER Stashpad
    *  folder, this holds that folder (and a display label). The next
@@ -1410,7 +1431,33 @@ export class StashpadView extends ItemView {
       // 0.319.0: our bound draft may have been deleted elsewhere (submit in
       // another tab, the drafts modal, another device) — drop the binding so the
       // next save mints a fresh id instead of resurrecting the deleted one.
-      if (this.activeDraftId && !this.plugin.settings.composerDrafts?.[this.activeDraftId]) { this.activeDraftId = null; this.setDraftPointer(null); }
+      if (this.activeDraftId && !this.plugin.settings.composerDrafts?.[this.activeDraftId]) {
+        const goneId = this.activeDraftId;
+        this.activeDraftId = null; this.setDraftPointer(null);
+        // 0.586.0: a deletion record says it was sent or discarded (on another
+        // device, or from the Drafts list) and the box still shows exactly the
+        // text we last saved for it → clear the box. Leaving it there meant the
+        // next blur saved it again under a NEW id, which no deletion record
+        // covers, so the sent draft came back everywhere. Text typed since the
+        // last save differs, so it is kept (and saved as a new draft) as before.
+        const live = this.composerInputEl?.value ?? this.composerDraft;
+        if (this.plugin.settings.deletedDrafts?.[goneId] !== undefined
+          && this.boundDraftText !== null && live !== "" && live === this.boundDraftText) {
+          // Clear it the way a send does: a pending debounced save would
+          // otherwise land after this and save the sent text again (with
+          // nothing bound, under a new id), and a leftover reply target would
+          // make the NEXT note a reply to the old one.
+          this.debouncedSaveDraft?.cancel();
+          this.composerDraft = "";
+          if (this.composerInputEl) this.composerInputEl.value = "";
+          this.replyTarget = null;
+          this.refreshReplyChip();
+          touched = true;
+        }
+        this.boundDraftText = null;
+      } else if (this.activeDraftId) {
+        this.boundDraftText = this.activeDraft()?.text ?? this.boundDraftText;
+      }
       const persisted = this.activeDraft()?.text ?? "";
       this.refreshDraftsChip();
       const liveText = this.composerInputEl?.value ?? "";
@@ -1579,6 +1626,7 @@ export class StashpadView extends ItemView {
     // hasn't fired.
     this.registerDomEvent(window, "beforeunload", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
     this.registerDomEvent(window, "blur", () => { void this.flushDrafts(); this.stampSelectedCursor(true); });
+    this.installObscureReblurActivity();
     // 0.278.2: mobile — the focused composer <textarea>'s NATIVE caret paints
     // above overlays (the webview draws it on the top layer regardless of z-index),
     // so it flashes over the sidebar drawers and over our custom modals (edit,
@@ -2107,6 +2155,7 @@ export class StashpadView extends ItemView {
 
   async onClose(): Promise<void> {
     this.hideInstantTooltip();
+    this.obscureReblur.clear(); // 0.587.0: no re-blur firing into a closed view
     this.floatingCapture?.close(); // 0.463.0: it lives on document.body, not our DOM
     this.floatingCapture = null;
     this.endInListPickerBanner(); // 0.366.0: don't strand the picker's cancel banner
@@ -3103,6 +3152,7 @@ export class StashpadView extends ItemView {
           replyTo: this.replyTarget ? { id: this.replyTarget.id, title: this.replyTarget.title, path: this.replyTarget.path } : null,
         };
         if (!cur) { this.activeDraftId = id; this.setDraftPointer(id); }
+        this.boundDraftText = text;
       }
       this.plugin.settings.composerDrafts = next;
       // Cleared drafts (post-submit) broadcast via saveSettings so OTHER
@@ -3135,6 +3185,7 @@ export class StashpadView extends ItemView {
     this.activeDraftId = id;
     this.setDraftPointer(id);
     this.composerDraft = d.text;
+    this.boundDraftText = d.text;
     // 0.484.2: go back to the note this draft was started under, so it lands
     // where it was meant to rather than under whatever you happen to be viewing.
     // BEFORE touching the textarea on purpose: navigateTo re-renders, which can
@@ -3249,6 +3300,7 @@ export class StashpadView extends ItemView {
     this.activeDraftId = id;
     this.setDraftPointer(id);
     this.composerDraft = body;
+    this.boundDraftText = body;
     if (this.composerInputEl) this.composerInputEl.value = body;
     this.replyTarget = null;
     this.refreshReplyChip();
@@ -3701,7 +3753,8 @@ export class StashpadView extends ItemView {
     if (!(root instanceof TFolder)) return [];
     const includeAtts = this.currentIncludeAttachments();
     const embedded = includeAtts ? new Set<string>() : this.collectEmbeddedAttachmentPaths();
-    const RESERVED_SUBFOLDERS = new Set(["_authors", "_imports", "_exports", "_processed", "_attachments", "_archive", ".archive"]);
+    const RESERVED_SUBFOLDERS = new Set(["_authors", "_imports", "_exports", "_processed", "_attachments", "_archive", ".archive",
+      exportSubfolderName(this.plugin.settings.exportFolder)]); // 0.584.1: a renamed export folder too
     const out: TFile[] = [];
     const stack: TFolder[] = [root];
     while (stack.length) {
@@ -8091,20 +8144,17 @@ export class StashpadView extends ItemView {
     if (!node) return;
     const menu = new Menu();
     // "Open in new tab" listed first (user preference, 2026-07-14).
+    // 0.581.4 (user: "a lot of unhelpful or unrelated buttons"): trimmed to the
+    // four that fit a path level. Dropped "Navigate here" (tapping the crumb
+    // does that) and React / Reply / Make a reply to… / Reply to… (in-list) /
+    // Remove reply link — still in the note's own ⋮ menu once you're there.
     menu.addItem((it: any) => it.setTitle("Open in new Stashpad tab").setIcon("list-tree").onClick(() => { onAction?.(); this.cmdOpenInNewStashpadTab(node); }));
-    menu.addItem((it: any) => it.setTitle("Navigate here").setIcon("arrow-right-circle").onClick(() => { onAction?.(); this.navigateTo(id); }));
     // 0.483.0: a link to THIS level of the path, not to wherever the view
     // happens to be focused. Every crumb is an ancestor, so the breadcrumb is
     // the natural place to ask for "a link to that bit of the path" — one
     // right-click instead of navigating there, copying, and navigating back.
     menu.addItem((it: any) => it.setTitle("Copy Stashpad link").setIcon("link").onClick(() => { onAction?.(); void this.cmdCopyCrumbLink(id); }));
     if (node.file) {
-      menu.addItem((it: any) => it.setTitle("React…").setIcon("smile-plus").onClick(() => { onAction?.(); this.cmdReact(node); }));
-      menu.addItem((it: any) => it.setTitle("Reply").setIcon("reply").onClick(() => { onAction?.(); this.cmdReply(node); }));
-      // 0.317.0: retro-link an existing note as a reply (+ remove when it is one).
-      menu.addItem((it: any) => it.setTitle("Make a reply to\u2026").setIcon("corner-up-left").onClick(() => { onAction?.(); this.cmdReplyLinkPicker(node); }));
-      menu.addItem((it: any) => it.setTitle("Reply to\u2026 (in-list)").setIcon("reply").onClick(() => { onAction?.(); this.cmdReplyInListPicker(node); }));
-      if (this.hasReplyLink(node)) menu.addItem((it: any) => it.setTitle("Remove reply link").setIcon("unlink").onClick(() => { onAction?.(); void this.setReplyLink(node, null); }));
       menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => { onAction?.(); void this.cmdEdit(node); }));
       menu.addItem((it: any) => it.setTitle("Open in Obsidian editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
     }
@@ -8219,11 +8269,15 @@ export class StashpadView extends ItemView {
     // global or per-folder default it is a hole: the pinned heading is the
     // largest text on screen, and leaving it readable while everything under it
     // blurs defeats the entire point of the switch.
-    if (this.isObscured(node) && !this.isFullyRevealed(node.id)) {
-      wrap.addClass("is-obscured");
-      if (this.revealedObscured.has(node.id)) wrap.addClass("is-text-revealed");
+    if (this.isObscured(node)) {
+      if (!this.isFullyRevealed(node.id)) {
+        wrap.addClass("is-obscured");
+        if (this.revealedObscured.has(node.id)) wrap.addClass("is-text-revealed");
+      }
       // Same contract as a row: a tap reveals and does nothing else, so you can
       // look without also acting — now in two steps (text, then media).
+      // 0.587.0: attached even when drawn revealed — the re-blur timer covers
+      // it again in place, with no redraw, and it must still be tappable then.
       wrap.addEventListener("click", (e) => {
         const t = e.target as HTMLElement | null;
         if (t?.closest("button, a, input, .stashpad-note-check")) return;
@@ -8340,8 +8394,8 @@ export class StashpadView extends ItemView {
       toggleAnchor = moreBtn;
       // 0.579.0 (user): React follows the platform's row-button list here too, so
       // hiding it in settings hides it on the focused note as well as the rows.
-      if (this.rowListHasReact()) this.addReactionButton(actions, node); // 0.287.0 (teams)
-      this.maybeAddQuickButton(actions, node, moreBtn);
+      if (this.rowListHas("react")) this.addReactionButton(actions, node); // 0.287.0 (teams)
+      if (this.rowListHas("quick")) this.maybeAddQuickButton(actions, node, moreBtn); // 0.581.2: follows the list
     } else {
       const pencil = actions.createEl("button", { cls: "stashpad-pencil stashpad-focused-pencil" });
       setIcon(pencil, "pencil");
@@ -8357,7 +8411,7 @@ export class StashpadView extends ItemView {
       setIcon(dupBtn, "copy");
       dupBtn.title = "Open this Stashpad in a new tab (clone)";
       dupBtn.onclick = () => this.cmdOpenInNewStashpadTab(node);
-      if (this.rowListHasReact()) this.addReactionButton(actions, node); // 0.287.0 (teams); 0.579.0: follows the list
+      if (this.rowListHas("react")) this.addReactionButton(actions, node); // 0.287.0 (teams); 0.579.0: follows the list
       toggleAnchor = pencil;
     }
 
@@ -8850,7 +8904,8 @@ export class StashpadView extends ItemView {
       // carries Focus / Open in editor / everything (the two separate focus +
       // edit buttons were too cramped on a phone). Press-and-hold is avoided
       // deliberately (it would fight drag-reorder / nesting).
-      this.maybeAddPreviewButton(actions, node); // 0.374.0
+      // 0.581.2 (user): Preview and the Star menu are list entries now (they were
+      // fixed slots around the list, so settings could only mention them).
       // 0.579.0 (user): the mobile row's buttons come from its OWN settings list
       // (`itemButtonsMobile`). React used to be hardcoded here, so hiding it in
       // settings did nothing on a phone. They render into ONE wrapper because the
@@ -8859,9 +8914,9 @@ export class StashpadView extends ItemView {
       // buttons stays on the top row in the user's order instead of auto-flowing
       // into free cells (or below the body).
       const rowBtns = actions.createDiv({ cls: "stashpad-note-rowbtns" });
+      // Inline cap 3 (React + 2 custom buttons, as before); Star / Preview don't count.
       this.renderConfiguredRowButtons(rowBtns, body, node, rowButtonsFor(getSettings(), true), 3);
       if (!rowBtns.childElementCount) rowBtns.remove();
-      this.maybeAddQuickButton(actions, node);
       const moreBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-more" });
       rowIcon(moreBtn, "ellipsis-vertical");   // 0.296.0 (perf)
       moreBtn.title = "Actions";
@@ -8872,20 +8927,9 @@ export class StashpadView extends ItemView {
       // default) now come from the configurable `itemButtons` list — hideable and
       // reorderable in Settings → Note Actions & Menus → Item buttons. This
       // replaces the hardcoded pencil / arrow / reply / react buttons (whose
-      // behaviors still run via runQuickAction). child / preview / quick / ⋮ keep
-      // their own (gated) slots after it.
+      // behaviors still run via runQuickAction). 0.581.2 (user): Make child,
+      // Preview and the Star menu are list entries too; only ⋮ stays fixed.
       const firstBtn = this.renderConfiguredRowButtons(actions, body, node);
-      // 0.456.0 (/dump): in a FLATTENED view (Flat / Everything) the tree isn't
-      // visible, so offer a quick "make this a child of…" — the structural
-      // counterpart to Reply. Hidden in Nested view (drag/nest already obvious there).
-      if (this.currentViewMode() !== "nested") {
-        const childBtn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-makechild" });
-        rowIcon(childBtn, "corner-down-right");
-        childBtn.title = "Make this a child of another note…";
-        childBtn.onclick = (e) => { e.stopPropagation(); this.cmdMakeChildOf(node); };
-      }
-      this.maybeAddPreviewButton(actions, node); // 0.374.0
-      this.maybeAddQuickButton(actions, node);
       // "More actions" button — opens the same context menu as right-click
       // (Copy Stashpad link, Delete, Split, Move, …). One menu button keeps the
       // row uncluttered as the action set grows, instead of a button per action.
@@ -8986,6 +9030,9 @@ export class StashpadView extends ItemView {
       },
       // 0.506.0: composer-only manual duplicate check (edit modal passes no `checkDup`).
       checkDup: () => this.cmdCheckDuplicates(),
+      // 0.581.0: the 🤖 "tag as AI-assisted" button is a toolbar entry now, so the
+      // Toolbar buttons settings can hide / reorder / re-icon it.
+      aiContributor: (b) => this.wireComposerBotButton(b),
     });
   }
 
@@ -10945,6 +10992,7 @@ export class StashpadView extends ItemView {
     // 0.332.0: formatting toolbar — a full-width row at the TOP of the composer
     // column (above the textarea row), so it never shrinks the text box. On
     // mobile it sits above the input, clear of the bottom-right Send button.
+    this.composerBotBtn = null; // 0.581.1: set again below if the 🤖 button renders
     const composerToolbarBar = this.renderComposerToolbar(composer);
 
     const composerRow = composer.createDiv({ cls: "stashpad-composer-row" });
@@ -11392,10 +11440,17 @@ export class StashpadView extends ItemView {
     // jump-to-level (route) controls live here at the bottom-left of the
     // composer (moved out of the top toolbar / breadcrumb).
     if (Platform.isMobile) this.renderComposerNavCluster(btnRail);
-    // 0.506.0: the bot (AI-contributor) button now lives at the END of the
-    // formatting toolbar when the toolbar is shown; falls back to the button rail
-    // when the toolbar is hidden so it never disappears.
-    this.renderComposerBotButton(composerToolbarBar ?? btnRail);
+    // 0.506.0: the bot (AI-contributor) button lives on the formatting toolbar.
+    // 0.581.0: it's a toolbar entry now (rendered by renderComposerToolbar), so
+    // only the FALLBACK is left here: with the whole toolbar turned off it goes
+    // on the button rail — unless the user hid it in Toolbar buttons.
+    if (!composerToolbarBar && !resolveToolbarButtons(getSettings().toolbarButtons).find((r) => r.def.id === "aiContributor")?.hidden) {
+      this.renderComposerBotButton(btnRail);
+    }
+    // 0.581.1 (blind review): no 🤖 button this build (hidden in Toolbar buttons)
+    // → stop tagging. Otherwise a bot picked before hiding kept stamping every
+    // new note with nothing on screen to show it or turn it off.
+    if (!this.composerBotBtn) this.pendingComposerBot = null;
     // Mobile: secondary buttons (split/dest/enter/clip) live inside a
     // collapsible group. A chevron-left button at the head of the rail
     // toggles their visibility — collapsed at rest to keep the composer
@@ -11868,21 +11923,59 @@ export class StashpadView extends ItemView {
       lastSubmitAt = now;
       void submit();
     };
-    sendBtn.onclick = () => fireSubmit();
+    // 0.582.0: set when a hold opens the destination menu, so the click from that
+    // same press's release never sends — the 600ms lastSubmitAt guard alone let a
+    // desktop hold longer than ~1.1s send on release (to the OLD destination,
+    // with the menu still open). Cleared by the next press on the button; the
+    // time cap covers a release that landed on the menu instead of the button.
+    let holdFiredAt = 0;
+    sendBtn.onclick = (e) => {
+      // Also keep the release click from bubbling: the menu reads a click that
+      // reaches the document as "clicked outside" and closes itself.
+      if (holdFiredAt && Date.now() - holdFiredAt < 10_000) { holdFiredAt = 0; e.stopPropagation(); return; }
+      holdFiredAt = 0;
+      fireSubmit();
+    };
     // 0.361.0: press-and-hold the Send button to pick the destination first (same
     // picker as the map-pin button). Setting lastSubmitAt when the hold fires makes
     // the click/tap that follows the release fall inside the 600ms guard, so the
-    // note isn't sent — you just get the destination menu.
+    // release itself doesn't send.
+    // 0.582.0: picking a destination from the hold menu then SENDS the note
+    // straight there — the hold is "send to…", so a second tap on Send was
+    // redundant with the map-pin button. "Clear destination" and dismissing the
+    // menu still send nothing. An empty composer just keeps the destination
+    // (submit() returns early on no text), same as picking it via the map pin.
     let holdTimer = 0;
     const clearHold = (): void => { if (holdTimer) { window.clearTimeout(holdTimer); holdTimer = 0; } };
     const startHold = (): void => {
       clearHold();
+      holdFiredAt = 0; // a new press — any earlier hold's release is long gone
       holdTimer = window.setTimeout(() => {
         holdTimer = 0;
         lastSubmitAt = Date.now(); // swallow the release-submit
+        holdFiredAt = Date.now();
         const wasFocused = document.activeElement === ta;
         const r = sendBtn.getBoundingClientRect();
-        this.openQuickDestinationMenu(new MouseEvent("click", { clientX: Math.round(r.left), clientY: Math.round(r.top) }), wasFocused);
+        const sendAfterPick = (): void => {
+          // Editing a note or appending to one: Send saves in place and never
+          // reads the destination, so "send to X" can't be honoured. Keep the
+          // old behaviour — the pick applies to the next new note.
+          if (this.activeDraft()?.kind === "edit" || this.appendTarget) {
+            if (wasFocused) this.composerInputEl?.focus();
+            return;
+          }
+          // Same keyboard rule as a plain tap on Send (see the touchend handler):
+          // keep the keyboard up only when the setting asks for it. iOS needs the
+          // focus() inside the pick's gesture, so do it before the async submit.
+          // With the setting off, blur instead: the full picker's onClose has
+          // already refocused the composer (SuggestModal closes before it
+          // reports the pick), which would leave the keyboard up.
+          if (wasFocused && getSettings().autofocusComposerAfterSend) this.composerInputEl?.focus({ preventScroll: true });
+          else if (document.activeElement === ta) ta.blur();
+          lastSubmitAt = Date.now();
+          void submit();
+        };
+        this.openQuickDestinationMenu(new MouseEvent("click", { clientX: Math.round(r.left), clientY: Math.round(r.top) }), wasFocused, sendAfterPick);
       }, 500);
     };
     sendBtn.addEventListener("mousedown", startHold);
@@ -13859,9 +13952,10 @@ export class StashpadView extends ItemView {
   /** 0.579.0: whether this platform's row-button list (Settings → Note actions &
    *  menus → Item buttons) has React switched on. The focused-note header and the
    *  preview window have their own fixed button sets but honour this one choice,
-   *  so hiding React hides it everywhere a note's buttons appear. */
-  private rowListHasReact(): boolean {
-    return rowButtonsFor(getSettings(), Platform.isMobile).includes("react");
+   *  so hiding React hides it everywhere a note's buttons appear.
+   *  0.581.2: generalized — the Star menu ("quick") follows the list the same way. */
+  private rowListHas(id: string): boolean {
+    return rowButtonsFor(getSettings(), Platform.isMobile).includes(id);
   }
 
   private addReactionButton(actions: HTMLElement, node: TreeNode): void {
@@ -14716,10 +14810,14 @@ export class StashpadView extends ItemView {
    *  Sends to the folder's HOME (ROOT_ID) — a quick send means "put this in
    *  that folder", not "under a particular note", which is the picker's job.
    *  The draft never moves: this sets a destination for the NEXT send, so the
-   *  collision problem that dogged the carry-the-draft idea never arises. */
-  private openQuickDestinationMenu(e: MouseEvent, wasFocused: boolean): void {
+   *  collision problem that dogged the carry-the-draft idea never arises.
+   *
+   *  0.582.0: `afterPick` (the Send-button hold passes one) runs once a
+   *  destination is set, in place of the composer refocus — it sends the note.
+   *  Not called for "Clear destination" or a dismissed menu. */
+  private openQuickDestinationMenu(e: MouseEvent, wasFocused: boolean, afterPick?: () => void): void {
     const folders = this.plugin.quickDestinationFolders(this.noteFolder);
-    if (!folders.length) { this.openDestinationPicker(wasFocused); return; }
+    if (!folders.length) { this.openDestinationPicker(wasFocused, afterPick); return; }
     const menu = new Menu();
     if (this.nextDestination) {
       menu.addItem((i: any) => i.setTitle("Clear destination").setIcon("x").onClick(() => {
@@ -14745,18 +14843,21 @@ export class StashpadView extends ItemView {
           this.refreshDestButton();
           // Straight back to typing — the point is not to lose the mobile
           // keyboard over a one-tap decision.
-          if (wasFocused) this.composerInputEl?.focus();
+          if (afterPick) afterPick();
+          else if (wasFocused) this.composerInputEl?.focus();
         }));
     }
     menu.addSeparator();
     menu.addItem((i: any) => i
       .setTitle("More… (pick a note)")
       .setIcon("search")
-      .onClick(() => this.openDestinationPicker(wasFocused)));
+      .onClick(() => this.openDestinationPicker(wasFocused, afterPick)));
     menu.showAtMouseEvent(e);
   }
 
-  openDestinationPicker(refocusComposerOnDismiss = false): void {
+  /** 0.582.0: `afterPick` runs after a pick (or a create-as-destination) in
+   *  place of the composer refocus — the Send-button hold uses it to send. */
+  openDestinationPicker(refocusComposerOnDismiss = false, afterPick?: () => void): void {
     // 0.76.36: do NOT blur the composer here. On iOS, blur() dismisses the
     // soft keyboard, and once dismissed a programmatic focus() on the
     // picker input can't bring it back (iOS only re-summons the keyboard
@@ -14793,14 +14894,16 @@ export class StashpadView extends ItemView {
             : titleFromBasename(item.crossFile?.basename ?? "note");
           this.nextDestinationLabel = `${folderName} ▸ ${noteTitle}`;
           this.refreshDestButton();
-          this.composerInputEl?.focus();
+          if (afterPick) afterPick();
+          else this.composerInputEl?.focus();
           return;
         }
         this.nextDestination = item.id;
         this.nextDestinationFolder = null;
         this.nextDestinationLabel = null;
         this.refreshDestButton();
-        this.composerInputEl?.focus();
+        if (afterPick) afterPick();
+        else this.composerInputEl?.focus();
       },
       onCreate: async (q) => {
         picked = true;
@@ -14810,7 +14913,8 @@ export class StashpadView extends ItemView {
           this.nextDestinationFolder = null;
           this.nextDestinationLabel = null;
           this.render();
-          this.composerInputEl?.focus();
+          if (afterPick) afterPick();
+          else this.composerInputEl?.focus();
         }
       },
       crossFolderNotes: () => this.collectCrossFolderDestinations(),
@@ -18006,7 +18110,7 @@ export class StashpadView extends ItemView {
     // 0.237.0: leaving the level re-blurs anything revealed here, when the
     // setting says reveals are momentary. Signal-like: you looked, you left,
     // it is hidden again.
-    if (getSettings().obscureReHides) { this.revealedObscured.clear(); this.mediaRevealedObscured.clear(); }
+    if (getSettings().obscureReHides) { this.clearObscureReveals(); }
     // 0.258.0: the heading is about to become a DIFFERENT note, so a cursor
     // parked on it must not silently carry over and target the new one.
     this.cursorOnHeading = false;
@@ -20009,7 +20113,9 @@ export class StashpadView extends ItemView {
     if (!remove) {
       // Adding makes them tasks: same structural repaint as cmdToggleTask.
       for (const t of nodes) {
-        this.completedState.set(t.file!.path, false); // adding reopens a done task
+        // 0.589.0: a done task stays done. Prefer our own authoritative override —
+        // the cache lags a just-toggled checkbox (slow drives especially).
+        this.completedState.set(t.file!.path, this.completedState.get(t.file!.path) ?? fmOf(t)?.completed === true);
         this.taskTaggedState.set(t.file!.path, true);
       }
       const restore = this.holdListScroll();
@@ -20376,8 +20482,8 @@ export class StashpadView extends ItemView {
     // The badge is an explicit control, so it reveals/hides FULLY in one tap
     // (text + media) — the gradual two-step is for tapping the blurred body.
     const revealing = !this.revealedObscured.has(node.id);
-    if (revealing) { this.revealedObscured.add(node.id); this.mediaRevealedObscured.add(node.id); }
-    else { this.revealedObscured.delete(node.id); this.mediaRevealedObscured.delete(node.id); }
+    if (revealing) { this.revealedObscured.add(node.id); this.mediaRevealedObscured.add(node.id); this.obscureReblur.start(node.id); }
+    else { this.revealedObscured.delete(node.id); this.mediaRevealedObscured.delete(node.id); this.obscureReblur.cancel(node.id); }
     // Repaint the affected row in place rather than re-rendering the list: this
     // is a viewing state, it changes one element, and a full render here would
     // move the list under a finger that just tapped a small target.
@@ -20455,7 +20561,67 @@ export class StashpadView extends ItemView {
 
   /** Drop every "I peeked at this" reveal in THIS view. Called when the obscure
    *  settings change, so a switch turned on covers notes revealed before it. */
-  clearObscureReveals(): void { this.revealedObscured.clear(); this.mediaRevealedObscured.clear(); }
+  clearObscureReveals(): void { this.revealedObscured.clear(); this.mediaRevealedObscured.clear(); this.obscureReblur.clear(); }
+
+  /** 0.587.0: the re-blur timer ran out — hide `id` again, in place. Goes
+   *  through the badge's hide path so the row, the heading and the badge all
+   *  agree. A note that stopped being obscured meanwhile is just forgotten. */
+  private reblurRevealedNote(id: StashpadId): void {
+    const node = this.tree.get(id);
+    if (node && this.isObscured(node) && this.revealedObscured.has(id)) { this.toggleObscureForNode(node); return; }
+    this.revealedObscured.delete(id);
+    this.mediaRevealedObscured.delete(id);
+  }
+
+  /** 0.587.0: in use in a way no event marks continuously, so the re-blur
+   *  waits: a mouse resting on it (in a focused window — someone who walked
+   *  away from a Mac still "rests" the pointer), the note open in the
+   *  composer's edit mode, or any pop-up window (the edit window, a preview)
+   *  open over the list. */
+  private isObscureRevealHeld(id: StashpadId): boolean {
+    const doc = this.containerEl.ownerDocument;
+    if (this.obscureMouseOverId === id && doc.hasFocus()) return true;
+    const cur = this.activeDraft();
+    if (cur?.kind === "edit" && cur.edit?.id === id) return true;
+    return isAnyModalOpen(this.containerEl);
+  }
+
+  /** 0.587.0: the delay setting changed — re-time running countdowns so a
+   *  shorter delay applies to notes already revealed. */
+  retimeObscureReblur(): void { this.obscureReblur.retime(); }
+
+  /** The obscured-note id an event landed on: a list row, or the heading. */
+  private obscureIdAt(target: EventTarget | null): StashpadId | null {
+    const el = target as HTMLElement | null;
+    if (!el?.closest) return null;
+    const row = el.closest<HTMLElement>(".stashpad-note[data-id]");
+    if (row) return row.dataset.id ?? null;
+    return el.closest(".stashpad-focused") ? this.headingNode()?.id ?? null : null;
+  }
+
+  /** 0.587.0: using a revealed note restarts its re-blur countdown. One set of
+   *  delegated listeners on the view; each is a cheap no-op while nothing is
+   *  revealed. */
+  private installObscureReblurActivity(): void {
+    const used = (e: Event): void => {
+      if (this.revealedObscured.size === 0) return;
+      const id = this.obscureIdAt(e.target);
+      if (id) this.obscureReblur.touch(id);
+    };
+    this.registerDomEvent(this.containerEl, "pointermove", (e: PointerEvent) => {
+      // Tracked even while nothing is revealed: the mouse is already resting
+      // on a note when the click that reveals it lands, and a still mouse
+      // sends no further moves.
+      if (e.pointerType === "mouse") this.obscureMouseOverId = this.obscureIdAt(e.target);
+      if (this.revealedObscured.size === 0) return;
+      const id = e.pointerType === "mouse" ? this.obscureMouseOverId : this.obscureIdAt(e.target);
+      if (id) this.obscureReblur.touch(id);
+    });
+    this.registerDomEvent(this.containerEl, "pointerleave", () => { this.obscureMouseOverId = null; });
+    for (const type of ["pointerdown", "wheel", "touchmove", "keydown", "input"] as const) {
+      this.registerDomEvent(this.containerEl, type, used, { passive: true });
+    }
+  }
 
   /** True once a note is FULLY revealed (text + media), so it should no longer
    *  carry `is-obscured`. */
@@ -20475,6 +20641,8 @@ export class StashpadView extends ItemView {
    *  (no re-render — a peek stays cheap). First call reveals text; second
    *  reveals media. A note with no media is fully revealed in one call. */
   private advanceObscureReveal(node: TreeNode, el: HTMLElement): void {
+    // 0.587.0: each step (re)starts the re-blur countdown.
+    this.obscureReblur.start(node.id);
     if (!this.revealedObscured.has(node.id)) {
       this.revealedObscured.add(node.id);
       // Solid-cover mode paints one opaque bar over everything, so a text-only
@@ -20549,15 +20717,6 @@ export class StashpadView extends ItemView {
     }
     if (targets.length === 0) { notify("Nothing to obscure."); return; }
 
-    // 0.267.7: with the global cover on, nothing per-note can change what you
-    // SEE — the switch overrides every note. Writing the flag anyway would look
-    // like the command silently failed, so say what is actually going on rather
-    // than editing files to no visible effect.
-    if (this.plugin.getObscureAll()) {
-      notify("Everything is covered by the global switch — turn it off to change notes individually.", 6000);
-      return;
-    }
-
     // 0.267.0: RE-HIDE first. If a target is obscured and currently revealed,
     // this control's obvious job is to put it back — not to strip the flag and
     // unhide it permanently, which is what it used to do and is very hard to
@@ -20568,8 +20727,27 @@ export class StashpadView extends ItemView {
     // does this fall through to actually changing the notes.
     const revealed = targets.filter((t) => this.isObscured(t) && this.revealedObscured.has(t.id));
     if (revealed.length > 0) {
-      for (const t of revealed) this.revealedObscured.delete(t.id);
+      // 0.587.1: drop the MEDIA reveal too. Leaving it made isFullyRevealed()
+      // stay true, so the redraw drew the row uncovered and the command looked
+      // like it did nothing (same two sets the badge's hide clears).
+      for (const t of revealed) {
+        this.revealedObscured.delete(t.id);
+        this.mediaRevealedObscured.delete(t.id);
+        this.obscureReblur.cancel(t.id);
+      }
       this.render();
+      return;
+    }
+
+    // 0.267.7: with the global cover on, nothing per-note can change what you
+    // SEE — the switch overrides every note. Writing the flag anyway would look
+    // like the command silently failed, so say what is actually going on rather
+    // than editing files to no visible effect.
+    // 0.587.1: checked AFTER the re-hide above. Hiding a revealed note again
+    // writes nothing, so the switch has no reason to block it; doing this first
+    // made the hotkey refuse what the ⋯ menu's item did.
+    if (this.plugin.getObscureAll()) {
+      notify("Everything is covered by the global switch — turn it off to change notes individually.", 6000);
       return;
     }
 
@@ -20592,7 +20770,7 @@ export class StashpadView extends ItemView {
       this.obscuredState.set(t.file.path, willBe);
       // Revealing is a viewing state; turning obscuring ON must clear it, or
       // the note stays visible until you navigate away.
-      if (makeObscured) this.revealedObscured.delete(t.id);
+      if (makeObscured) { this.revealedObscured.delete(t.id); this.mediaRevealedObscured.delete(t.id); }
     }
     const apply = async (rows: { id: StashpadId; path: string; was: unknown }[]): Promise<void> => {
       for (const r of rows) {
@@ -22157,9 +22335,15 @@ export class StashpadView extends ItemView {
 
   private renderComposerBotButton(rail: HTMLElement): void {
     const btn = rail.createEl("button", { cls: "clickable-icon stashpad-composer-bot-btn" });
-    this.composerBotBtn = btn;
     setIcon(btn, "bot");
     btn.addEventListener("mousedown", (e) => e.preventDefault()); // don't blur the textarea
+    this.wireComposerBotButton(btn);
+  }
+  /** 0.581.0: the 🤖 button's behaviour, for both the toolbar entry and the
+   *  rail fallback: click picks a bot (sticky for the next sends), click again
+   *  stops. */
+  private wireComposerBotButton(btn: HTMLElement): void {
+    this.composerBotBtn = btn;
     btn.addEventListener("click", (e) => {
       e.preventDefault(); e.stopPropagation();
       if (this.pendingComposerBot) { this.pendingComposerBot = null; this.updateComposerBotButton(); return; }
@@ -22171,9 +22355,11 @@ export class StashpadView extends ItemView {
     const btn = this.composerBotBtn; if (!btn) return;
     const on = !!this.pendingComposerBot;
     btn.toggleClass("is-active", on);
-    btn.setAttr("aria-label", on
+    const label = on
       ? `New notes tagged with 🤖 ${this.pendingComposerBot!.name} — click to stop`
-      : "Tag notes you write as AI-assisted");
+      : "Tag notes you write as AI-assisted";
+    btn.setAttr("aria-label", label);
+    btn.title = label; // 0.581.1: the toolbar entry sets a title; keep it in step
   }
   /** After a composer send, stamp the pending bot onto the new note. The
    *  metadata cache lags file creation, so fileByFrontmatterId is retried. */
@@ -22929,8 +23115,8 @@ export class StashpadView extends ItemView {
    *  the row carries, MINUS expand-collapse and preview (redundant in the modal).
    *  Edit / open / reply stay reachable through the ⋮ menu. */
   private renderPreviewActions(host: HTMLElement, node: TreeNode, dismiss?: () => void): void {
-    if (this.rowListHasReact()) this.addReactionButton(host, node); // 0.579.0: follows the list
-    this.maybeAddQuickButton(host, node);
+    if (this.rowListHas("react")) this.addReactionButton(host, node); // 0.579.0: follows the list
+    if (this.rowListHas("quick")) this.maybeAddQuickButton(host, node); // 0.581.2: follows the list
     // 0.414.0: quick-capture a nested note under THIS previewed note (or pick a
     // destination). Doesn't dismiss the preview — the capture modal stacks over it.
     const capture = host.createEl("button", { cls: "stashpad-pencil stashpad-note-capture" });
@@ -22956,7 +23142,8 @@ export class StashpadView extends ItemView {
   /** 0.374.0: the per-row "Preview" button (setting-gated). Opens the note in the
    *  file-preview modal at its own slide. Lives beside the other row actions. */
   private maybeAddPreviewButton(actions: HTMLElement, node: TreeNode): void {
-    if (!getSettings().showNotePreviewButton) return;
+    // 0.581.2: shown/hidden by the item-button lists now ("preview"), not the
+    // retired showNotePreviewButton toggle (the upgrade seeds the lists from it).
     if (!node.file) return;
     const btn = actions.createEl("button", { cls: "stashpad-pencil stashpad-note-preview" });
     setIcon(btn, "maximize-2"); // not in the rowIcon sprite set; one setIcon per row is fine
@@ -24523,12 +24710,19 @@ export class StashpadView extends ItemView {
    *  runQuickAction. Inline up to a cap, the rest wrap to a bar under the note.
    *  Returns the first inline button, for the Show-More toggle's anchor. */
   private renderConfiguredRowButtons(actions: HTMLElement, body: HTMLElement, node: TreeNode, ids: readonly string[] = getSettings().itemButtons ?? [], inlineMax = 8): HTMLElement | null {
+    // 0.581.2: the cap counts everything except the row-only buttons (below).
     // 0.579.0: `ids` / `inlineMax` let the mobile row render its own list
     // (`itemButtonsMobile`, a smaller inline cap) through the same code.
     if (!ids.length) return null;
     const cmdRegistry: Record<string, { name?: string }> = (this.app as any).commands?.commands ?? {};
     const resolve = (id: string): { icon: string; label: string } | null => {
       if (id === "react") return { icon: "smile-plus", label: "Add reaction" }; // rendered specially
+      // 0.581.2: the row-only buttons (rendered specially below), each skipped
+      // where it never applied: Preview without a file, the Star menu while it's
+      // empty, Make child in the Nested view (drag/nest is already obvious there).
+      if (id === "preview") return node.file ? { icon: "maximize-2", label: "Preview note" } : null;
+      if (id === "quick") return (getSettings().quickMenuActions ?? []).length ? { icon: "star", label: "Quick actions" } : null;
+      if (id === "makeChild") return this.currentViewMode() !== "nested" ? { icon: "corner-down-right", label: "Make this a child of another note…" } : null;
       if (id.startsWith("cmd:")) {
         const cid = id.slice(4);
         if (!cmdRegistry[cid]) return null; // uninstalled/disabled
@@ -24543,6 +24737,17 @@ export class StashpadView extends ItemView {
     if (!resolved.length) return null;
     const render =(host: HTMLElement, id: string, meta: { icon: string; label: string }): HTMLElement => {
       if (id === "react") { this.addReactionButton(host, node); return host.lastElementChild as HTMLElement; }
+      if (id === "preview") { this.maybeAddPreviewButton(host, node); return host.lastElementChild as HTMLElement; }
+      if (id === "quick") { this.maybeAddQuickButton(host, node); return host.lastElementChild as HTMLElement; }
+      if (id === "makeChild") {
+        // 0.456.0 (/dump): in a FLATTENED view the tree isn't visible, so offer
+        // "make this a child of…" — the structural counterpart to Reply.
+        const childBtn = host.createEl("button", { cls: "stashpad-pencil stashpad-note-makechild" });
+        rowIcon(childBtn, "corner-down-right");
+        childBtn.title = meta.label;
+        childBtn.onclick = (e) => { e.stopPropagation(); this.cmdMakeChildOf(node); };
+        return childBtn;
+      }
       const b = host.createEl("button", { cls: "stashpad-pencil stashpad-note-itembtn" });
       rowIcon(b, meta.icon as RowIconName); // sprite when registered, setIcon fallback otherwise
       b.title = meta.label;
@@ -24551,8 +24756,18 @@ export class StashpadView extends ItemView {
       b.onclick = (e) => { e.stopPropagation(); this.runQuickAction(id, node, e); this.repaintStatefulButton(b, id, node, (el, ic) => rowIcon(el, ic as RowIconName)); };
       return b;
     };
-    const inline = resolved.slice(0, inlineMax);
-    const overflow = resolved.slice(inlineMax);
+    // 0.581.2 (blind review): the row-only buttons (Make child / Preview / Star)
+    // always stay inline and don't count toward the cap — they were fixed inline
+    // slots before, so counting them pushed Preview into the bottom bar on rows
+    // with many custom buttons. The cap applies to the other buttons, as it did.
+    const inline: typeof resolved = [];
+    const overflow: typeof resolved = [];
+    let counted = 0;
+    for (const r of resolved) {
+      if (ROW_ONLY_IDS.has(r.id)) inline.push(r);
+      else if (counted < inlineMax) { inline.push(r); counted++; }
+      else overflow.push(r);
+    }
     let first: HTMLElement | null = null;
     for (const { id, meta } of inline) { const el = render(actions, id, meta); if (!first) first = el; }
     if (overflow.length) {

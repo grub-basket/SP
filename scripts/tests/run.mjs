@@ -16,11 +16,13 @@ const ENTRIES = [
   "scripts/tests/showcase-shapes.test.ts",
   "scripts/tests/safe-filename.test.ts",
   "scripts/tests/drafts.test.ts",
+  "scripts/tests/draft-tombstones.test.ts",
   "scripts/tests/draft-match.test.ts",
   "scripts/tests/focus-time.test.ts",
   "scripts/tests/task-complete.test.ts",
   "scripts/tests/note-actions.test.ts",
   "scripts/tests/date-prefix.test.ts",
+  "scripts/tests/obscure-reblur.test.ts",
 ];
 
 let passed = 0;

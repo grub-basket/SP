@@ -44,7 +44,7 @@ import { runFoldFlow } from "./folder-fold";
 import type { FolderPlacement } from "./types";
 import { openFolderSetup } from "./folder-setup-modal";
 import { runUnfoldFlow } from "./folder-split";
-import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, DEFAULT_ROW_BUTTONS, defaultContextOrder, insertMissingDefaults, missingContextBuiltins, reconcileZapDefaults } from "./note-actions";
+import { DEFAULT_CONTEXT_SUBMENUS, CONTEXT_DEFAULT_ORDER, LEGACY_ROW_BUTTONS, DEFAULT_ROW_BUTTONS, defaultContextOrder, insertMissingDefaults, missingContextBuiltins, reconcileZapDefaults, seedRowOnlyButtons } from "./note-actions";
 import { getActiveView, onActiveViewChange } from "./active-view";
 import { importStashZip, buildStashZip, resolveNoteAttachmentFiles, STASH_EXT, splitFrontmatter } from "./stash-package";
 import { writeXvClipboard, readXvAck, writeXvAck, XV_MAX_BYTES } from "./cross-vault-clipboard";
@@ -68,7 +68,8 @@ import { planDatePrefixRenames, executeDatePrefixRenames, DatePrefixConfirmModal
 import { createAliasesForFolder, deriveCleanTitle } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction, type NotificationOpen } from "./notifications";
 import { notify, setNotifySink } from "./notify";
-import { visibleDrafts, mergeDraftMaps } from "./drafts";
+import { visibleDrafts } from "./drafts";
+import { applyTombstones, diskNeedsDraftRewrite, draftTimes, mergeDraftsNewest, mergeTombstones, normalizeTombstones, recordDraftDeletions, type DraftTombstones } from "./draft-tombstones";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
 const SHORTCUT_DIR = "Stashpad Shortcuts";
@@ -1015,7 +1016,35 @@ export default class StashpadPlugin extends Plugin {
       const moved = this.store.movedKeys(); // 0.378.0: dynamic (history + config)
       for (const [k, v] of Object.entries(this.settings as unknown as Record<string, unknown>)) if (!moved.has(k)) cur[k] = v;
       await this.settingsBackup.save(`${this.deviceId()}-before-restore`, cur);
-      await this.saveData(snap);
+      // 0.586.0: restoring a backup brings its drafts back on purpose, so mark
+      // every restored draft as edited now. Otherwise a deletion record (ours,
+      // the backup's, or one still on its way from another device) would delete
+      // it again. Drafts are merged draft by draft now, so drafts made since the
+      // backup are kept alongside the restored ones.
+      const bag = snap as Record<string, unknown>;
+      const restored = bag.composerDrafts as Record<string, ComposerDraft> | undefined;
+      if (restored && typeof restored === "object" && !Array.isArray(restored)) {
+        // Record deletions made here but not saved yet FIRST, so the re-read
+        // that our own saveData() below triggers finds them already covered
+        // instead of stamping them "now", after the restored edit time.
+        this.settings.deletedDrafts = this.collectDraftTombstones(undefined);
+        const tombs = mergeTombstones(this.settings.deletedDrafts, bag.deletedDrafts, Date.now());
+        const now = Date.now();
+        const next: Record<string, ComposerDraft> = {};
+        for (const [id, d] of Object.entries(restored)) {
+          if (d && typeof d === "object") next[id] = { ...d, modified: Math.max(now, (tombs[id] ?? 0) + 1) };
+        }
+        bag.composerDrafts = next;
+        // Write the merged records, not the backup's older set, so a reload
+        // before the next save can't lose this device's records.
+        bag.deletedDrafts = tombs;
+      }
+      // 0.586.0: in the settings write queue, so a save already in flight
+      // (which read the disk before this) can't land after us and write the
+      // pre-restore state over the restored file.
+      const write = this.writeChain.then(() => this.saveData(snap));
+      this.writeChain = write.catch(() => {});
+      await write;
       notify("Settings restored. Reload Obsidian (Cmd/Ctrl+R) to apply everywhere.");
       return true;
     } catch (e) { notify(`Restore failed: ${(e as Error).message}`); return false; }
@@ -2751,6 +2780,10 @@ export default class StashpadPlugin extends Plugin {
     const dir = file.parent?.path?.replace(/\/+$/, "") ?? "";
     const folders = this.discoverStashpadFolders().map((f) => f.replace(/\/+$/, ""));
     if (!folders.some((f) => dir === f || dir.startsWith(f + "/"))) return;
+    // 0.584.0: never enrich an export (the mobile PDF hand-off writes a plain .md
+    // there) — the kept note must stay what was exported.
+    const exportSub = (this.settings.exportFolder || "_exports").trim().replace(/^\/+|\/+$/g, "");
+    if (exportSub && folders.some((f) => dir === `${f}/${exportSub}` || dir.startsWith(`${f}/${exportSub}/`))) return;
     this.autoPreviewQueue.add(file.path);
     if (this.autoPreviewTimer != null) window.clearTimeout(this.autoPreviewTimer);
     this.autoPreviewTimer = window.setTimeout(() => { void this.drainAutoPreviews(); }, 8000);
@@ -7602,6 +7635,16 @@ export default class StashpadPlugin extends Plugin {
     document.body.style.setProperty("--stashpad-note-font-scale", scale);
   }
 
+  /** 0.587.0: the "Blur revealed notes again after" delay changed — re-time
+   *  the countdowns already running in every list and detail panel. */
+  retimeObscureReblurAllViews(): void {
+    for (const type of [STASHPAD_VIEW_TYPE, STASHPAD_DETAIL_VIEW_TYPE]) {
+      for (const leaf of this.app.workspace.getLeavesOfType(type)) {
+        (leaf.view as { retimeObscureReblur?: () => void }).retimeObscureReblur?.();
+      }
+    }
+  }
+
   /** 0.267.6: re-render every view AND drop the "I already peeked at this"
    *  state first.
    *
@@ -11093,12 +11136,8 @@ export default class StashpadPlugin extends Plugin {
   async runQuickCapture(folder: string, text: string, files: File[], split = false): Promise<boolean> {
     const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
     if (!cleaned) { notify("Pick a Stashpad to capture into."); return false; }
-    let leaf = await this.findStashpadLeafForFolder(cleaned);
-    if (!leaf) leaf = await this.activateViewForFolder(cleaned);
-    if (!leaf) { notify(`Couldn't open “${cleaned}”.`); return false; }
-    try { await (leaf as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.(); } catch { /* reveal still works */ }
-    const view = leaf.view;
-    if (!(view instanceof StashpadView)) { notify("Stashpad view not ready — try again."); return false; }
+    const view = await this.captureViewFor(cleaned);
+    if (!view) return false;
     let body = text;
     for (const f of files) {
       const link = await view.captureImport(f);
@@ -11119,6 +11158,37 @@ export default class StashpadPlugin extends Plugin {
       this.notifications.show({ message: made > 1 ? `Captured ${made} notes to “${where}”` : `Captured to “${where}”`, kind: "success", category: "system", folder: cleaned });
     }
     return made > 0;
+  }
+
+  /** 0.583.0: the Stashpad view that new notes for `folder` are created
+   *  through — an open tab on that folder if there is one (the note lands
+   *  WITHOUT navigating you there), else the folder opened. Shared by quick
+   *  capture and the Focus picker's "Create new". Notifies and returns null on
+   *  failure. */
+  private async captureViewFor(folder: string): Promise<StashpadView | null> {
+    let leaf = await this.findStashpadLeafForFolder(folder);
+    if (!leaf) leaf = await this.activateViewForFolder(folder);
+    if (!leaf) { notify(`Couldn't open “${folder}”.`); return null; }
+    try { await (leaf as unknown as { loadIfDeferred?: () => Promise<void> }).loadIfDeferred?.(); } catch { /* reveal still works */ }
+    const view = leaf.view;
+    if (!(view instanceof StashpadView)) { notify("Stashpad view not ready — try again."); return null; }
+    return view;
+  }
+
+  /** 0.583.0: create one note at `folder`'s root through the normal composer
+   *  path (createNoteUnder: template, author, undo, synthetic row) and return
+   *  its file. Used by the Focus picker's "Create new". */
+  async createNoteInFolder(folder: string, text: string): Promise<TFile | null> {
+    const cleaned = (folder || "").replace(/^\/+|\/+$/g, "");
+    if (!cleaned || !text.trim()) return null;
+    const view = await this.captureViewFor(cleaned);
+    if (!view) return null;
+    const id = await view.captureNote(text.trim());
+    if (!id) return null;
+    const viaTree = view.tree.get(id)?.file ?? null;
+    if (viaTree) return viaTree;
+    // Fallback: filenames end in -<id> (slug-service buildFilename).
+    return this.app.vault.getMarkdownFiles().find((f) => (f.parent?.path ?? "") === cleaned && f.basename.endsWith(`-${id}`)) ?? null;
   }
 
   private async findStashpadLeafForFolder(folder: string): Promise<WorkspaceLeaf | null> {
@@ -13950,7 +14020,7 @@ export default class StashpadPlugin extends Plugin {
       const existing: string[] = Array.isArray(data.itemButtons)
         ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string")
         : [];
-      data.itemButtons = [...DEFAULT_ROW_BUTTONS, ...existing.filter((id) => !DEFAULT_ROW_BUTTONS.includes(id))];
+      data.itemButtons = [...LEGACY_ROW_BUTTONS, ...existing.filter((id) => !LEGACY_ROW_BUTTONS.includes(id))];
       data.itemButtonsSeeded = true;
     }
     // 0.492.0: ONE-TIME repair of the "every row button vanished" state. An
@@ -13963,12 +14033,14 @@ export default class StashpadPlugin extends Plugin {
     // Settings → Note actions & menus → Item buttons) is never re-seeded.
     if (data && data.itemButtonsRepairedV1 !== true) {
       if (!Array.isArray(data.itemButtons) || data.itemButtons.length === 0) {
-        data.itemButtons = [...DEFAULT_ROW_BUTTONS];
+        data.itemButtons = [...LEGACY_ROW_BUTTONS];
       }
       data.itemButtonsRepairedV1 = true;
     }
     if (data?.shortcuts && data.shortcuts.openEditor === "E") data.shortcuts.openEditor = "Mod+Shift+E";
     if (data?.bindings?.openEditor && data.bindings.openEditor.primary === "E") data.bindings.openEditor.primary = "Mod+Shift+E";
+    // 0.586.0: synced draft deletion records ∪ this device's own copy.
+    const tombsAtLoad = mergeTombstones(data?.deletedDrafts, this.loadLocalTombstones(), Date.now());
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...data,
@@ -14043,7 +14115,15 @@ export default class StashpadPlugin extends Plugin {
       // 0.319.0: legacy per-folder strings migrate into composerDrafts (id-keyed)
       // and the legacy map is cleared so it can't re-migrate a since-edited draft.
       drafts: {},
-      composerDrafts: normalizeComposerDrafts(data?.composerDrafts, normalizeDrafts(data?.drafts)),
+      // 0.586.0: drafts a deletion record covers (synced, or this device's own
+      // copy) stay deleted.
+      // A draft with no time ranks oldest (0), as in the sync merges, so it
+      // can't outrank a deletion record by being stamped "now" at every load.
+      composerDrafts: applyTombstones(
+        normalizeComposerDrafts(data?.composerDrafts, normalizeDrafts(data?.drafts), 0),
+        tombsAtLoad,
+      ),
+      deletedDrafts: tombsAtLoad,
       // 0.545.0: collapsed-preview lines + measure/count mode, per platform.
       previewClamp: (() => {
         const d = DEFAULT_SETTINGS.previewClamp; const r = data?.previewClamp ?? {};
@@ -14078,9 +14158,13 @@ export default class StashpadPlugin extends Plugin {
       // hand-edited data.json, an older build that round-tripped the file) wiped
       // every row button for good: `itemButtonsSeeded` stays true, so the 0.475.0
       // seed below could never repair it.
+      // 0.581.5 (blind review): the legacy 4 only when the row-only upgrade below
+      // will actually run (it then appends Make child / Preview / Star). If it
+      // won't — already upgraded, or the config folder is missing this launch —
+      // a missing list falls back to the full current default, as it did before.
       itemButtons: Array.isArray(data?.itemButtons)
         ? data.itemButtons.filter((x: unknown): x is string => typeof x === "string")
-        : [...DEFAULT_ROW_BUTTONS],
+        : (data?.rowOnlyButtonsSeededV1 !== true && !this.store.configFolderUnavailableAtLoad ? [...LEGACY_ROW_BUTTONS] : [...DEFAULT_ROW_BUTTONS]),
       // 0.579.0: absent stays UNSET (undefined) — rowButtonsFor() derives the
       // mobile row from the desktop list until the user edits this one. No seeded
       // flag and no stored derived copy: either goes stale when the desktop list
@@ -14146,6 +14230,13 @@ export default class StashpadPlugin extends Plugin {
       if (now !== diskAtLoad[k]) migratedAtLoad[k] = diskAtLoad[k];
     }
     this.snapshotSettingsBaseline(undefined, migratedAtLoad);
+    // 0.586.0: if the file we just loaded lags behind this device's deletion
+    // records (another device's stale copy replaced it while we were closed),
+    // write the repaired state back now instead of waiting for some later save.
+    this.saveLocalTombstones(tombsAtLoad);
+    if (diskNeedsDraftRewrite(data?.deletedDrafts, data?.composerDrafts, tombsAtLoad, undefined, Date.now())) {
+      void this.persistSettingsQuiet("draft-tombstones-load");
+    }
     // 0.124.1: one-time migration of the "Toggle task" default H → G. Installs
     // persist the FULL bindings map, so changing the default alone never reaches
     // existing users. Flip a still-default `H` to `G` once, then mark it done so
@@ -14283,6 +14374,20 @@ export default class StashpadPlugin extends Plugin {
         console.debug(`[Stashpad] restored ⋮-menu built-ins missing from a custom order: ${missing.join(", ")}`);
         await this.saveSettings();
       }
+    }
+    // 0.581.2 (user): Make child / Preview / the Star menu became item-button list
+    // entries (they were fixed slots around the list). Append them ONCE to saved
+    // lists, where they used to show — Preview only if the retired "Note preview
+    // button" toggle was on. An unset mobile list is derived and needs nothing.
+    // Skipped while the config folder is missing (the lists show the full
+    // defaults then). 0.581.5: the flag lives with the lists (menus.json when the
+    // config folder is on), so another device sees they were already upgraded.
+    if (!this.settings.rowOnlyButtonsSeededV1 && !this.store.configFolderUnavailableAtLoad) {
+      const previewOn = this.settings.showNotePreviewButton !== false;
+      this.settings.itemButtons = seedRowOnlyButtons(this.settings.itemButtons ?? [], false, previewOn);
+      if (this.settings.itemButtonsMobile) this.settings.itemButtonsMobile = seedRowOnlyButtons(this.settings.itemButtonsMobile, true, previewOn);
+      this.settings.rowOnlyButtonsSeededV1 = true;
+      await this.saveSettings();
     }
     // 0.579.2: the ⚡ menu lets users REMOVE built-ins, so new defaults (e.g. 0.577's
     // "Add to / remove from Today" in Organize) are brought into a customized ⚡
@@ -14555,7 +14660,14 @@ export default class StashpadPlugin extends Plugin {
    *  per-device reminder/draft churn lives in history.json so a reminder firing no
    *  longer rewrites the whole settings blob. See docs/data-split-plan.md. */
   private store = new SettingsStore(this);
-  private externalReloadDebounced = debounce(() => void this.onExternalDataJsonChange(), 600, false);
+  /** 0.586.0: the re-read runs IN the write queue, never alongside a save. A
+   *  save snapshots its baseline after its awaits; a re-read landing inside
+   *  them had its bookkeeping overwritten by that snapshot (so a draft taken
+   *  from another device could later be deleted without a deletion record). */
+  private externalReloadDebounced = debounce(() => {
+    const run = this.writeChain.then(() => this.onExternalDataJsonChange());
+    this.writeChain = run.catch(() => {});
+  }, 600, false);
 
   // 0.378.0: public wrappers for the config-folder feature (the settings UI +
   // commands drive it through these; the store does the file work).
@@ -14607,12 +14719,24 @@ export default class StashpadPlugin extends Plugin {
       if (rep.any) anyChanged = true;
     } catch { /* non-fatal: split files are device-local churn */ }
 
-    let disk: Record<string, unknown> | null = null;
-    try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { disk = null; }
+    // 0.586.0: null when the file is exactly what we last wrote (our own save
+    // landing, which fires this after every save, typing included): nothing
+    // to adopt, so skip the full pass and its stringify cost.
+    const disk = await this.store.readCoreIfForeign();
     const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
-    // Only walk data.json's protected keys when it actually moved on disk; our own
-    // writes never raise diskRev above lastSeen.
-    if (disk && diskRev > this.lastSeenSettingsRev) {
+    // 0.586.0: walk the keys on EVERY foreign change, not only when diskRev passed ours.
+    // Two devices that both saved from rev N both write N+1, so the other
+    // device's file arrived with a rev we had already "seen" and was ignored
+    // until our next save (the same collision 0.140.2 fixed in guardedSave). Our
+    // own writes still change nothing here: each key below is compared by
+    // content, and a key that matches ours is skipped.
+    if (disk) {
+      // 0.586.0: collect draft deletions BEFORE adopting anything: a deletion
+      // made here but not saved yet is only visible as "in the baseline, gone
+      // from ours", and the baseline snapshot at the end of this pass erases it.
+      const tombs = this.collectDraftTombstones(disk.deletedDrafts);
+      if (JSON.stringify(tombs) !== JSON.stringify(s.deletedDrafts)) { s.deletedDrafts = tombs; anyChanged = true; }
+      this.saveLocalTombstones(tombs);
       // 0.211.1: pick up EVERY key a synced write changed, not just the protected
       // eight. This is the live watcher; if it ignores a key, our in-memory copy
       // stays stale and the next save writes that staleness back — which is how the
@@ -14623,6 +14747,7 @@ export default class StashpadPlugin extends Plugin {
       const candidates = new Set([...Object.keys(s), ...Object.keys(disk)]);
       for (const k of candidates) {
         if (k === "settingsRev" || churn.has(k)) continue;
+        if (k === "deletedDrafts" || k === "composerDrafts") continue; // 0.586.0: merged below
         if (disk[k] === undefined) continue;
         if (JSON.stringify(disk[k]) === JSON.stringify(s[k])) continue;
         const baseline = this.settingsBaseline[k];
@@ -14632,8 +14757,42 @@ export default class StashpadPlugin extends Plugin {
         if (PEER_RENDER_KEYS.has(k)) forceRender = true;
         if (k === "bindings") this.healAdoptedBindings();
         if (k.startsWith("folderPanel")) panelChanged = true;
+        // 0.586.0: re-baseline only what we adopted (after healing, so a
+        // re-derived value doesn't read as our edit). This pass used to snapshot
+        // EVERY key, which made a change of ours not yet saved look unchanged —
+        // and the next save then let the file overwrite it. It runs on every
+        // change of the file now (our own writes too), so that matters more.
+        this.settingsBaseline[k] = JSON.stringify(s[k]);
       }
-      this.lastSeenSettingsRev = diskRev;
+      // 0.586.0: drafts merge draft by draft (every draft on either side kept,
+      // the later edit wins), then deletion records remove what they cover.
+      // Adopting the file wholesale is what failed both ways: a device that
+      // hadn't seen a deletion put the deleted draft straight back on screen
+      // here, and a stale copy erased drafts made here since.
+      const drafts = applyTombstones(
+        mergeDraftsNewest(s.composerDrafts as Record<string, ComposerDraft> | undefined,
+          normalizeComposerDrafts(disk.composerDrafts, {}, 0)),
+        tombs,
+      );
+      if (drafts !== s.composerDrafts) { s.composerDrafts = drafts; anyChanged = true; }
+      // The deletion baseline is now "the drafts we know of", so deleting one
+      // we just took from the other device still gets recorded.
+      this.baselineDraftTimes = draftTimes(drafts);
+      if (diskRev > this.lastSeenSettingsRev) this.lastSeenSettingsRev = diskRev;
+      // 0.586.0: the file that just landed lags behind what we hold (a deletion
+      // record, or a draft made or edited here). Write ours back now rather than
+      // at some later save: on a phone the app is often closed first, and the
+      // next load would read the stale drafts back from this file. Stops once the
+      // file carries everything (diskNeedsDraftRewrite), so devices don't ping-pong.
+      // Only when ANOTHER writer touched the drafts: if the file still holds what
+      // we last wrote, anything newer here is ordinary unsaved typing, which the
+      // composer's own save handles (a rewrite per keystroke batch would not do).
+      const othersWrote =
+        JSON.stringify(disk.composerDrafts) !== this.store.savedJson("composerDrafts")
+        || JSON.stringify(disk.deletedDrafts) !== this.store.savedJson("deletedDrafts");
+      if (othersWrote && diskNeedsDraftRewrite(disk.deletedDrafts, disk.composerDrafts, tombs, drafts, Date.now())) {
+        void this.persistSettingsQuiet("draft-tombstones");
+      }
     }
     // 0.519.5 (perf): a synced `importExcludePrefixes` change must drop the
     // folder memo — no setter ran on this device, so saveSettings' check never
@@ -14655,7 +14814,8 @@ export default class StashpadPlugin extends Plugin {
       // ONLY when one of those per-folder keys was adopted — a synced MRU or
       // other render-irrelevant key must not repaint every leaf.
       setSettings(this.settings, forceRender);
-      this.snapshotSettingsBaseline();
+      // 0.586.0: no full snapshotSettingsBaseline() here any more; adopted keys
+      // were re-baselined one by one above.
       if (panelChanged) this.refreshFolderPanels();
     }
   }
@@ -14686,6 +14846,40 @@ export default class StashpadPlugin extends Plugin {
     try { s.bindings = mergeBindings(s.bindings, undefined, undefined); } catch { /* keep what we have */ }
   }
 
+  /** 0.586.0: a DEVICE-LOCAL copy of the draft deletion records (vault-scoped
+   *  local storage, which sync never touches). The synced copy lives in
+   *  data.json, and another device's stale data.json can replace it while this
+   *  app is closed (a phone), leaving the record nowhere. Unioned in at load. */
+  private static readonly LOCAL_TOMBSTONES_KEY = "stashpad-draft-tombstones";
+  private localTombstonesJson: string | null = null;
+  private loadLocalTombstones(): unknown {
+    try {
+      const raw = this.app.loadLocalStorage(StashpadPlugin.LOCAL_TOMBSTONES_KEY) as unknown;
+      return typeof raw === "string" ? JSON.parse(raw) : null;
+    } catch { return null; }
+  }
+  private saveLocalTombstones(t: DraftTombstones): void {
+    const json = JSON.stringify(t);
+    if (json === this.localTombstonesJson) return;
+    this.localTombstonesJson = json;
+    try { this.app.saveLocalStorage(StashpadPlugin.LOCAL_TOMBSTONES_KEY, json); } catch { /* best-effort */ }
+  }
+
+  /** 0.586.0: our draft deletion records, plus one for every draft deleted on
+   *  this device since the baseline (in it, gone from memory), unioned with
+   *  `diskTombs` (the other device's records). See draft-tombstones.ts. */
+  private collectDraftTombstones(diskTombs: unknown): DraftTombstones {
+    const now = Date.now();
+    const s = this.settings as unknown as Record<string, unknown>;
+    const ours = recordDraftDeletions(this.baselineDraftTimes, s.composerDrafts as Record<string, ComposerDraft> | undefined,
+      normalizeTombstones(s.deletedDrafts, now), now);
+    return mergeTombstones(ours, diskTombs, now);
+  }
+  /** 0.586.0: id → modified of the drafts we last knew of (the baseline for
+   *  finding deletions). Kept beside settingsBaseline instead of re-parsing its
+   *  composerDrafts string on every save. */
+  private baselineDraftTimes: Record<string, { modified: number }> = {};
+
   /** 0.292.0 (perf): `cur` is an optional cache of already-computed
    *  JSON.stringify(all[k]), valid ONLY for keys not owned by a split file —
    *  saveSplit can adopt a moved key from disk after the cache was built, so
@@ -14709,6 +14903,11 @@ export default class StashpadPlugin extends Plugin {
       const cached = moved && !moved.has(k) ? cur?.get(k) : undefined;
       this.settingsBaseline[k] = cached ?? JSON.stringify(all[k]);
     }
+    // 0.586.0: the drafts we know of, for finding deletions. guardedSave
+    // overrides this right after with the map it actually wrote.
+    let fromDisk: Record<string, ComposerDraft> | undefined;
+    try { fromDisk = diskRaw?.composerDrafts ? JSON.parse(diskRaw.composerDrafts) as Record<string, ComposerDraft> : undefined; } catch { fromDisk = undefined; }
+    this.baselineDraftTimes = draftTimes(fromDisk ?? (all.composerDrafts as Record<string, ComposerDraft> | undefined));
   }
 
   /** Map-like settings where two machines editing DIFFERENT entries should keep
@@ -14749,6 +14948,15 @@ export default class StashpadPlugin extends Plugin {
       const s = JSON.stringify(ours0[k]);
       if (s !== undefined) curStr.set(k, s);
     }
+    // 0.586.0: deletion records for drafts. Record every draft deleted here since
+    // we last read/wrote (in the baseline, gone from ours), then union with the
+    // records on disk. Always a union, never "ours vs theirs": a deletion made on
+    // any device must reach every device. Applied to composerDrafts after the
+    // per-key merge below. See draft-tombstones.ts.
+    const tombs = this.collectDraftTombstones(disk?.deletedDrafts);
+    ours0.deletedDrafts = tombs;
+    curStr.set("deletedDrafts", JSON.stringify(tombs));
+    this.saveLocalTombstones(tombs);
     const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
     // 0.140.2: adopt on CONTENT change, not just a higher rev. Two instances
     // that both loaded rev N and write near-simultaneously both stamp N+1, so a
@@ -14777,6 +14985,7 @@ export default class StashpadPlugin extends Plugin {
       const candidates = new Set([...Object.keys(ours), ...Object.keys(disk)]);
       for (const k of candidates) {
         if (k === "settingsRev" || churn.has(k)) continue;   // bookkeeping / per-device
+        if (k === "deletedDrafts" || k === "composerDrafts") continue; // 0.586.0: merged below
         if (disk[k] === undefined) continue;
         const baseline = this.settingsBaseline[k];
         if (baseline === undefined) {                        // never seen it — don't guess…
@@ -14813,20 +15022,9 @@ export default class StashpadPlugin extends Plugin {
         if (StashpadPlugin.UNION_MERGE_KEYS.includes(k)
           && disk[k] && ours[k] && typeof disk[k] === "object" && typeof ours[k] === "object"
           && !Array.isArray(disk[k]) && !Array.isArray(ours[k])) {
-          // 0.573.0: composerDrafts merges per draft against the baseline, so a
-          // draft another device deleted (sent / discarded) stays deleted instead
-          // of being written back from our stale copy. See mergeDraftMaps.
-          let merged: Record<string, unknown> | null = null;
-          if (k === "composerDrafts") {
-            try {
-              merged = mergeDraftMaps(
-                JSON.parse(baseline) as Record<string, ComposerDraft>,
-                disk[k] as Record<string, ComposerDraft>,
-                ours[k] as Record<string, ComposerDraft>,
-              ) as unknown as Record<string, unknown>;
-            } catch { merged = null; /* unreadable baseline: fall back to the union */ }
-          }
-          if (!merged) merged = { ...(disk[k] as Record<string, unknown>), ...(ours[k] as Record<string, unknown>) };
+          // (composerDrafts no longer comes through here: 0.586.0 merges it
+          // below, draft by draft, with deletions carried as tombstones.)
+          const merged = { ...(disk[k] as Record<string, unknown>), ...(ours[k] as Record<string, unknown>) };
           const mergedStr = JSON.stringify(merged);
           if (mergedStr !== oursStr) {
             ours[k] = merged;
@@ -14835,6 +15033,24 @@ export default class StashpadPlugin extends Plugin {
           }
         }
       }
+      // 0.586.0: drafts merge draft by draft — every draft on either side is
+      // kept, the later edit wins — and only then do deletion records remove
+      // anything. The old "we didn't touch it, take theirs" rule read a draft
+      // missing from a stale copy as deleted, which erased drafts made here.
+      const mergedDrafts = applyTombstones(
+        mergeDraftsNewest(ours.composerDrafts as Record<string, ComposerDraft> | undefined,
+          normalizeComposerDrafts(disk.composerDrafts, {}, 0)),
+        tombs,
+      );
+      if (mergedDrafts !== ours.composerDrafts) {          // same object back = nothing changed
+        ours.composerDrafts = mergedDrafts;
+        curStr.set("composerDrafts", JSON.stringify(mergedDrafts));
+        adopted.push("composerDrafts (merged)");
+      }
+      // 0.586.0: the file can lag behind us even when nothing changed HERE (a
+      // stale copy from another device landed on top of ours). Rewrite it, or a
+      // reload reads the stale drafts back from it.
+      if (diskNeedsDraftRewrite(disk.deletedDrafts, disk.composerDrafts, tombs, mergedDrafts, Date.now())) adoptedAny = true;
       const protectedSet = new Set<string>(StashpadPlugin.COLLISION_PROTECTED_KEYS as readonly string[]);
       const critical = adopted.filter((k) => protectedSet.has(k.replace(" (merged)", "")));
       if (adopted.length) {
@@ -14861,6 +15077,11 @@ export default class StashpadPlugin extends Plugin {
     // actually changed), and data.json is written WITHOUT them. The guarded-merge
     // logic above still governs data.json's collision-protected keys.
     const all = this.settings as unknown as Record<string, unknown>;
+    // 0.586.0: the drafts the file holds after this save — what the deletion
+    // baseline must be. NOT the live map after the awaits below: a draft deleted
+    // while this write is in flight is still in the file, and baselining
+    // without it meant the next save recorded no deletion and took it back.
+    let writtenDrafts = all.composerDrafts as Record<string, ComposerDraft> | undefined;
     // Isolated: history.json is per-device churn, so a failure there must never
     // block the (more important) data.json write that follows.
     try {
@@ -14872,6 +15093,7 @@ export default class StashpadPlugin extends Plugin {
       const core: Record<string, unknown> = {};
       const moved = this.store.movedKeys(); // 0.378.0: history keys + config keys (when the folder is on)
       for (const [k, v] of Object.entries(all)) if (!moved.has(k)) core[k] = v;
+      writtenDrafts = core.composerDrafts as Record<string, ComposerDraft> | undefined;
       await this.store.saveCore(core); // 0.349.0: atomic write (temp + rename) — an
       // interrupted save can no longer zero data.json.
       this.lastSeenSettingsRev = rev;
@@ -14879,6 +15101,7 @@ export default class StashpadPlugin extends Plugin {
       this.scheduleSettingsBackup(core); // 0.341.0: device-local backup
     }
     this.snapshotSettingsBaseline(curStr);
+    this.baselineDraftTimes = draftTimes(writtenDrafts);
   }
 
   async saveSettings(): Promise<void> {
@@ -15275,7 +15498,10 @@ function mergeBindings(
 /** 0.319.0: validate the id-keyed draft map and fold LEGACY per-folder strings
  *  in as `legacy:<folder>` entries (skipped when an entry with the same folder +
  *  text already exists, e.g. after a partial sync). */
-function normalizeComposerDrafts(raw: any, legacy: Record<string, string>): Record<string, ComposerDraft> {
+/** `missingTime` stands in for a missing created/modified. Load uses now; the
+ *  0.586.0 sync merges pass 0, so a malformed or legacy draft with no time
+ *  ranks OLDEST instead of beating every edit and deletion record each merge. */
+function normalizeComposerDrafts(raw: any, legacy: Record<string, string>, missingTime?: number): Record<string, ComposerDraft> {
   const out: Record<string, ComposerDraft> = {};
   if (raw && typeof raw === "object") {
     for (const [id, v] of Object.entries(raw as Record<string, any>)) {
@@ -15283,8 +15509,8 @@ function normalizeComposerDrafts(raw: any, legacy: Record<string, string>): Reco
       const kind: "new" | "edit" = v.kind === "edit" && v.edit && typeof v.edit.id === "string" ? "edit" : "new";
       out[id] = {
         id, folder: v.folder, text: v.text,
-        created: typeof v.created === "number" ? v.created : Date.now(),
-        modified: typeof v.modified === "number" ? v.modified : Date.now(),
+        created: typeof v.created === "number" ? v.created : (missingTime ?? Date.now()),
+        modified: typeof v.modified === "number" ? v.modified : (missingTime ?? Date.now()),
         device: typeof v.device === "string" ? v.device : "unknown",
         kind,
         ...(kind === "edit" ? { edit: { id: String(v.edit.id), path: String(v.edit.path ?? ""), title: String(v.edit.title ?? ""), openMd: String(v.edit.openMd ?? "") } } : {}),

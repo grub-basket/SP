@@ -1,6 +1,6 @@
 /* Pure tests for src/note-actions.ts */
 import {
-  DEFAULT_ROW_BUTTONS, DEFAULT_MOBILE_ROW_BUTTONS, deriveMobileRowButtons, rowButtonsFor,
+  DEFAULT_ROW_BUTTONS, DEFAULT_MOBILE_ROW_BUTTONS, deriveMobileRowButtons, rowButtonsFor, seedRowOnlyButtons,
   reachableMenuIds, insertMissingDefaults, missingContextBuiltins, reconcileZapDefaults, zapDefaultSignatures,
   ZAP_DEFAULT_ORDER, DEFAULT_ZAP_SUBMENUS,
 } from "../../src/note-actions";
@@ -11,7 +11,9 @@ declare const __eq: (a: unknown, b: unknown, m: string) => void;
 // 0.579.0: an install with no saved mobile list gets the row it had before the
 // list existed — React plus the custom buttons from the desktop list, never the
 // desktop-only built-ins.
-__eq(deriveMobileRowButtons(DEFAULT_ROW_BUTTONS), ["react"], "default desktop list → just React");
+__eq(deriveMobileRowButtons(DEFAULT_ROW_BUTTONS), ["react", "quick", "preview"], "default desktop list → React, Star menu, Preview (the old mobile row)");
+// 0.581.2: Star / Preview follow the desktop list while the mobile list is unset.
+__eq(deriveMobileRowButtons(["edit", "react", "makeChild", "quick", "copy"]), ["react", "copy", "quick"], "Preview off on desktop → off on mobile; makeChild never derived; customs before the star");
 __eq(deriveMobileRowButtons(["edit", "focus", "reply", "react", "copy", "cmd:app:open-settings"]), ["react", "copy", "cmd:app:open-settings"], "customs carried over in order");
 __eq(deriveMobileRowButtons(["copy", "edit"]), ["react", "copy"], "React stays even if hidden on desktop (it always showed on mobile before)");
 __eq(deriveMobileRowButtons([]), ["react"], "empty desktop list → just React");
@@ -22,7 +24,16 @@ __eq(rowButtonsFor({ itemButtons: ["edit", "copy"] }, true), ["react", "copy"], 
 __eq(rowButtonsFor({ itemButtons: ["edit", "move"] }, true), ["react", "move"], "…and follows a later desktop change");
 __eq(rowButtonsFor({ itemButtons: ["edit", "copy"], itemButtonsMobile: ["copy"] }, true), ["copy"], "a saved mobile list wins (React hidden)");
 __eq(rowButtonsFor({ itemButtons: ["edit"], itemButtonsMobile: [] }, true), [], "an EMPTY saved mobile list means no buttons, not unset");
-__eq(rowButtonsFor({}, true), ["react"], "nothing loaded → default mobile row");
+__eq(rowButtonsFor({}, true), ["react", "quick", "preview"], "nothing loaded → default mobile row");
+// 0.581.2: seedRowOnlyButtons appends the former fixed slots to SAVED lists,
+// once, in their old visual order; Preview only if its old toggle was on.
+__eq(seedRowOnlyButtons(["edit", "focus", "reply", "react", "copy"], false, true), ["edit", "focus", "reply", "react", "copy", "makeChild", "preview", "quick"], "desktop: appended after everything, old order");
+__eq(seedRowOnlyButtons(["react", "copy"], true, true), ["react", "copy", "quick", "preview"], "mobile: Star then Preview");
+__eq(seedRowOnlyButtons(["edit"], false, false), ["edit", "makeChild", "quick"], "old Preview toggle off → Preview starts hidden");
+__eq(seedRowOnlyButtons(["quick", "edit"], false, true), ["quick", "edit"], "a list holding any of them was already upgraded (maybe on another device): untouched, so a hide sticks");
+__eq(seedRowOnlyButtons(["react", "preview"], true, true), ["react", "preview"], "mobile: same rule");
+__eq(seedRowOnlyButtons(["react", "makeChild"], true, true), ["react", "makeChild"], "mobile: Make child counts too (the mobile editor offers it)");
+__eq(seedRowOnlyButtons([], false, true), ["makeChild", "preview", "quick"], "an all-hidden list still gets the slots it always showed");
 __assert(DEFAULT_MOBILE_ROW_BUTTONS.every((id) => DEFAULT_ROW_BUTTONS.includes(id)), "mobile defaults are built-ins the settings editor always lists");
 
 // --- 0.579.2: built-ins reaching customized menus ---------------------------

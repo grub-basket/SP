@@ -229,7 +229,23 @@ export class SettingsStore {
   /** 0.349.0: atomically write the data.json-owned core (replaces the plugin's
    *  non-atomic saveData for the settings blob). */
   async saveCore(core: Bag): Promise<void> {
-    await this.atomicWrite(this.pathFor("data.json"), JSON.stringify(core));
+    const body = JSON.stringify(core);
+    await this.atomicWrite(this.pathFor("data.json"), body);
+    this.lastCoreText = body;
+  }
+
+  /** 0.586.0: the exact data.json text we last wrote, so the sync watcher can
+   *  skip its full pass when the "change" is just our own write landing (it
+   *  fires after every save, typing included). */
+  private lastCoreText: string | null = null;
+
+  /** 0.586.0: data.json as it is on disk now, or null when it is ours (the text
+   *  we last wrote) or unreadable. */
+  async readCoreIfForeign(): Promise<Bag | null> {
+    let raw: string;
+    try { raw = await this.plugin.app.vault.adapter.read(this.pathFor("data.json")); } catch { return null; }
+    if (raw === this.lastCoreText) return null;
+    try { return JSON.parse(raw) as Bag; } catch { return null; }
   }
 
   /** djb2 hash of a string → short hex, for naming a corrupt backup by CONTENT so an
@@ -483,6 +499,10 @@ export class SettingsStore {
     }
     return false;
   }
+
+  /** 0.586.0: the JSON of `key` as we last wrote (or loaded) it. Lets the sync
+   *  watcher tell "another device wrote this" from "our own write landing". */
+  savedJson(key: string): string | undefined { return this.baseline[key]; }
 
   /** Re-baseline the data.json-owned keys after the caller writes them. */
   markCoreSaved(settings: Bag): void {
