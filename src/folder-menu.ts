@@ -5,6 +5,7 @@ import type StashpadPlugin from "./main";
 import { ConfirmModal } from "./modals";
 import { isInReservedSubfolder, siftMatch } from "./types";
 import { nestBlockMessage, withReservedRule } from "./nest-guard";
+import { clearEncryptionPending, encryptPendingFolder, folderEncryptionState, markEncryptionPending, unlockFolderForRelocation } from "./folder-encryption-move";
 import { canRevealInOs, osFileManagerName, revealInOsFileManager } from "./os-reveal";
 import { runFoldFlow } from "./folder-fold";
 import { runUnfoldFlow } from "./folder-split";
@@ -21,6 +22,16 @@ import { openFolderSetup } from "./folder-setup-modal";
 export function fillFolderMenu(plugin: StashpadPlugin, menu: Menu, folder: string, onChanged?: () => void): void {
   const app = plugin.app;
   const changed = () => onChanged?.();
+  // 0.600.2: a folder that was unlocked to be moved/renamed leads with the way
+  // back to encrypted, so the reminder can't be missed from here either.
+  const pendingKey = folder.replace(/\/+$/, "");
+  if (plugin.settings.encryptionPendingFolders?.[pendingKey]) {
+    menu.addItem((i) => i.setTitle("🔒 Encrypt again (unlocked to move)").setIcon("lock")
+      .onClick(() => void encryptPendingFolder(plugin, pendingKey).then(changed)));
+    menu.addItem((i) => i.setTitle("Stop reminding me to encrypt it").setIcon("bell-off")
+      .onClick(() => void clearEncryptionPending(plugin, pendingKey).then(changed)));
+    menu.addSeparator();
+  }
   // Order: non-destructive navigation first, then rename, then delete (isolated).
   menu.addItem((i) => i.setTitle("Open in new tab").setIcon("plus-square")
     .onClick(() => void plugin.activateViewForFolder(folder, { folderSwitch: true })));
@@ -146,16 +157,23 @@ export function renameFolderFlow(plugin: StashpadPlugin, folder: string): void {
     // 0.140.3 (review): re-validate — the folder could've moved/been deleted
     // by sync while the rename modal sat open.
     if (!(app.vault.getAbstractFileByPath(cleaned) instanceof TFolder)) { notify("That folder no longer exists."); return; }
+    // 0.600.2: same unlock-first workflow as Move folder for an encrypted folder.
+    const enc = folderEncryptionState(plugin, cleaned);
+    const unlockedFor = enc.blobs.length || enc.prefsOn ? await unlockFolderForRelocation(plugin, cleaned, "rename") : undefined;
+    if (unlockedFor === null) return;
+    let renamed = false;
     try {
       await app.fileManager.renameFile(tf, target);
       // 0.140.3: carry ALL path-keyed settings (default folder + placement +
       // archive + per-folder prefs, incl. descendants) to the new path.
       await plugin.remapFolderPathInSettings(cleaned, target);
+      renamed = true;
       notify(`Renamed to "${safe}".`);
     } catch (err) {
       console.warn("[Stashpad] folder rename failed", err);
       notify("Rename failed (see console).");
     }
+    if (unlockedFor) await markEncryptionPending(plugin, renamed ? target : cleaned, cleaned, "renamed", unlockedFor);
   }).open();
 }
 
@@ -263,18 +281,31 @@ class MoveFolderModal extends SuggestModal<{ path: string; label: string }> {
  *  vault rename listener and the explicit call below carry every folder-keyed
  *  setting and re-point open tabs (remapFolderPathInSettings). Returns the new
  *  path, or null when refused / failed (already said why). */
-export async function relocateFolder(plugin: StashpadPlugin, from: string, dest: string): Promise<string | null> {
+/** 0.600.2: why `from` can't move into `dest` right now, or null. Run BEFORE
+ *  any unlock-for-move, so a refused move never unlocks notes for nothing. */
+export function relocationRefusal(plugin: StashpadPlugin, from: string, dest: string): string | null {
   const app = plugin.app;
   const src = from.replace(/\/+$/, "");
   const tf = app.vault.getAbstractFileByPath(src);
-  if (!(tf instanceof TFolder)) { notify("That folder no longer exists."); return null; }
+  if (!(tf instanceof TFolder)) return "That folder no longer exists.";
   const target = dest ? `${dest}/${tf.name}` : tf.name;
-  if (target === src) return null;
-  if (app.vault.getAbstractFileByPath(target)) { notify(`“${dest || "Vault root"}” already has a folder called “${tf.name}”.`); return null; }
-  if (dest && !(app.vault.getAbstractFileByPath(dest) instanceof TFolder)) { notify(`“${dest}” no longer exists.`); return null; }
+  if (target === src) return "It's already there.";
+  if (app.vault.getAbstractFileByPath(target)) return `“${dest || "Vault root"}” already has a folder called “${tf.name}”.`;
+  if (dest && !(app.vault.getAbstractFileByPath(dest) instanceof TFolder)) return `“${dest}” no longer exists.`;
   // Re-check at move time: the picker's list can be stale (sync, another tab).
   const verdict = withReservedRule(plugin.nestGuard()(target), target);
-  if (!verdict.ok) { notify(nestBlockMessage(verdict)); return null; }
+  if (!verdict.ok) return nestBlockMessage(verdict);
+  return null;
+}
+
+export async function relocateFolder(plugin: StashpadPlugin, from: string, dest: string): Promise<string | null> {
+  const app = plugin.app;
+  const src = from.replace(/\/+$/, "");
+  const refusal = relocationRefusal(plugin, src, dest);
+  if (refusal) { notify(refusal); return null; }
+  const tf = app.vault.getAbstractFileByPath(src);
+  if (!(tf instanceof TFolder)) return null; // relocationRefusal already checked; narrows the type
+  const target = dest ? `${dest}/${tf.name}` : tf.name;
   try {
     await app.fileManager.renameFile(tf, target);
     await plugin.remapFolderPathInSettings(src, target);
@@ -297,7 +328,15 @@ export function moveFolderFlow(plugin: StashpadPlugin, folder: string): void {
   const oldParent = tf.parent && tf.parent.path !== "/" ? tf.parent.path : "";
   const options = moveFolderDestinations(plugin, src);
   new MoveFolderModal(app, name, options, (dest) => void (async () => {
+    const refusal = relocationRefusal(plugin, src, dest);
+    if (refusal) { notify(refusal); return; }
+    // 0.600.2: an encrypted folder is unlocked into a plain one first (the user
+    // can cancel), and flagged to be encrypted again at its new place.
+    const enc = folderEncryptionState(plugin, src);
+    const unlockedFor = enc.blobs.length || enc.prefsOn ? await unlockFolderForRelocation(plugin, src, "move") : undefined;
+    if (unlockedFor === null) return;
     const moved = await relocateFolder(plugin, src, dest);
+    if (unlockedFor) await markEncryptionPending(plugin, moved ?? src, src, "moved", unlockedFor);
     if (!moved) return;
     const undo = async (): Promise<void> => {
       const back = await relocateFolder(plugin, moved, oldParent);

@@ -230,21 +230,39 @@ export class SettingsStore {
    *  non-atomic saveData for the settings blob). */
   async saveCore(core: Bag): Promise<void> {
     const body = JSON.stringify(core);
+    // 0.600.2: remembered BEFORE the write. The vault modify event for this very
+    // write fires while atomicWrite is still running, so the sync watcher used to
+    // compare the new file against the PREVIOUS text, call our own write
+    // "foreign", and adopt its values over anything changed in memory since this
+    // save began. In a burst of saves that silently reverted the newest change
+    // (seen live: an encrypted folder's "encrypt again" reminder vanished right
+    // after a move). The last few texts are kept because saves queue back to back.
+    this.ownCoreTexts.push(body);
+    if (this.ownCoreTexts.length > 8) this.ownCoreTexts.shift();
     await this.atomicWrite(this.pathFor("data.json"), body);
     this.lastCoreText = body;
+    // 0.600.3: re-baseline from exactly what was WRITTEN. The caller used to do
+    // it afterwards from the LIVE settings object, which by then could hold a
+    // change made while this write was in flight; that change was then counted
+    // as saved (coreDirty false, so the next save skipped the file), and the
+    // save after it saw the older file as "another device changed it" and put
+    // the old value back. Seen live: an encrypted folder's reminder vanished.
+    try { this.markCoreSaved(JSON.parse(body) as Bag); } catch { /* body is our own JSON */ }
   }
 
   /** 0.586.0: the exact data.json text we last wrote, so the sync watcher can
    *  skip its full pass when the "change" is just our own write landing (it
    *  fires after every save, typing included). */
   private lastCoreText: string | null = null;
+  /** 0.600.2: the texts of our most recent writes, including one still in flight. */
+  private ownCoreTexts: string[] = [];
 
-  /** 0.586.0: data.json as it is on disk now, or null when it is ours (the text
-   *  we last wrote) or unreadable. */
+  /** 0.586.0: data.json as it is on disk now, or null when it is ours (one of the
+   *  texts we just wrote or are writing) or unreadable. */
   async readCoreIfForeign(): Promise<Bag | null> {
     let raw: string;
     try { raw = await this.plugin.app.vault.adapter.read(this.pathFor("data.json")); } catch { return null; }
-    if (raw === this.lastCoreText) return null;
+    if (raw === this.lastCoreText || this.ownCoreTexts.includes(raw)) return null;
     try { return JSON.parse(raw) as Bag; } catch { return null; }
   }
 

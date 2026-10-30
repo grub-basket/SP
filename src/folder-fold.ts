@@ -551,6 +551,49 @@ export async function runUndoSteps(steps: UndoStep[]): Promise<{ failed: string[
   return { failed, aborted: false };
 }
 
+/** 0.600.0: a folder that something was MERGED INTO was renamed or moved
+ *  (`from` → `to`, covering the folder and anything under it). For each such
+ *  merge, rewrite the merge's manifest (dest, container, settings note, the
+ *  files it moved and the archive/trash folders it made) and THEN the settings
+ *  record's `into`, so the two keep agreeing: Unmerge refuses when they differ,
+ *  and old links to the merged folder redirect through `into`. The record's key
+ *  (the merged folder's original path) is left alone on purpose. A manifest
+ *  that doesn't describe this merge, or can't be read or written, is skipped
+ *  and its record left as it was. Mutates settings; returns whether anything
+ *  changed (the caller saves). */
+export async function retargetMergesIntoMovedFolder(plugin: StashpadPlugin, fromRaw: string, toRaw: string): Promise<boolean> {
+  const from = clean(fromRaw), to = clean(toRaw);
+  if (!from || !to || from === to) return false;
+  const remap = (p: unknown): unknown => (typeof p !== "string" ? p : p === from ? to : p.startsWith(`${from}/`) ? to + p.slice(from.length) : p);
+  const folds = plugin.settings.foldedFolders ?? {};
+  const a = plugin.app.vault.adapter;
+  let changed = false;
+  for (const [src, fold] of Object.entries(folds)) {
+    if (!fold || typeof fold.into !== "string") continue;
+    const into = clean(fold.into);
+    if (into !== from && !into.startsWith(`${from}/`)) continue;
+    const newInto = remap(into) as string;
+    const path = `${clean(fold.shell)}/${FOLD_MANIFEST}`;
+    let m: FoldManifest;
+    try { m = JSON.parse(await a.read(path)) as FoldManifest; } catch { continue; }
+    if (m.src !== src || clean(m.dest) !== into) continue; // not this merge's record
+    const next: FoldManifest = {
+      ...m,
+      dest: newInto,
+      containerPath: remap(m.containerPath) as string,
+      settingsNotePath: (remap(m.settingsNotePath) as string | null) ?? null,
+      moved: (Array.isArray(m.moved) ? m.moved : []).map((x) => ({ ...x, to: remap(x.to) as string })),
+      ...(Array.isArray(m.dirMap) ? { dirMap: m.dirMap.map((d) => ({ ...d, to: remap(d.to) as string })) } : {}),
+      // 0.560.0-era manifests name the made archive/trash folders here instead.
+      ...(m.bases ? { bases: { ...(m.bases.archive ? { archive: remap(m.bases.archive) as string } : {}), ...(m.bases.trash ? { trash: remap(m.bases.trash) as string } : {}) } } : {}),
+    };
+    try { await a.write(path, JSON.stringify(next, null, 2)); } catch { continue; }
+    plugin.settings.foldedFolders = { ...plugin.settings.foldedFolders, [src]: { ...fold, into: newInto } };
+    changed = true;
+  }
+  return changed;
+}
+
 /** Repoint locked-subtree records (and their blob paths) from folder `from`
  *  (and anything under it) to `to`. Only matching entries change. */
 export function remapLockedRegistry(plugin: StashpadPlugin, from: string, to: string): void {

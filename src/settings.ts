@@ -7,6 +7,7 @@ function osFileManagerName(): string {
 import { buildJdIndexPreview, buildJdIndexNotes, scanForJdNotes, JdBuildConfirmModal, buildJdPreviewNotice } from "./index-builder";
 import { FolderSuggest } from "./folder-suggest";
 import { nestBlockMessage, rootRedirectName } from "./nest-guard";
+import { clearEncryptionPending, encryptPendingFolder } from "./folder-encryption-move";
 import { StringSuggest, vaultTagEntries, vaultExtensionEntries, timezoneNames, CALLOUT_TYPES } from "./input-suggest";
 import { siftRank } from "./suggest-match";
 import { isValidConfigFolder } from "./config-layout";
@@ -233,6 +234,20 @@ export interface ReEncryptWatchEntry {
    *  (minutes). Wins over the per-folder + global settings. 0 = off for this
    *  note; undefined = fall through to folder/global. */
   peekMin?: number;
+}
+
+/** 0.600.2: see `encryptionPendingFolders`. */
+export interface EncryptionPendingFolder {
+  /** Where the folder was before the move / rename. */
+  from: string;
+  /** ISO time it was unlocked and moved. */
+  at: string;
+  /** "moved" / "renamed" through Stashpad. */
+  how: "moved" | "renamed";
+  /** Locked notes that were unlocked for the move. */
+  unlocked: number;
+  /** Its encryption settings before (restored by "Encrypt again"). */
+  prefs?: FolderEncPrefs;
 }
 
 export interface FolderEncPrefs {
@@ -658,6 +673,12 @@ export interface StashpadSettings {
    *  entries live in that view's "Removed from watchlist" section (a
    *  recoverable dismissal, not a delete). */
   reEncryptWatch: ReEncryptWatchEntry[];
+  /** 0.600.2: folders that were encrypted and got unlocked so they could be
+   *  moved or renamed, keyed by their CURRENT path. Each stays here (and its
+   *  reminder keeps coming back) until the user encrypts it again or dismisses
+   *  it. `prefs` is the folder's encryption settings from before, restored by
+   *  "Encrypt again". */
+  encryptionPendingFolders: Record<string, EncryptionPendingFolder>;
   /** 0.577.0 (Focus view): pomodoro lengths in minutes, and how often a long
    *  break replaces a short one (0 = never). Synced — a preference. */
   focusWorkMin: number;
@@ -1506,6 +1527,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   migratedTrashToSubfolders: false,
   numericIdQuoteSweepDone: false,
   reEncryptWatch: [],
+  encryptionPendingFolders: {},
   focusWorkMin: 25,
   focusShortBreakMin: 5,
   focusLongBreakMin: 15,
@@ -5337,6 +5359,26 @@ export class StashpadSettingTab extends PluginSettingTab {
   private encryptionItems(): SettingDefinitionItem[] {
     const enc = this.plugin.encryption;
     const items: SettingDefinitionItem[] = [];
+
+    // 0.600.2: folders that were unlocked so they could be moved or renamed. Shown
+    // first, and only while there are any, so it can't be scrolled past.
+    const pending = Object.entries(this.plugin.settings.encryptionPendingFolders ?? {});
+    if (pending.length) {
+      items.push(this.sectionDef("Folders waiting to be encrypted again", "These were encrypted, and Stashpad unlocked them so they could be moved or renamed. They stay unencrypted until you encrypt them again.", (host) => {
+        for (const [folder, e] of pending) {
+          const exists = !!this.app.vault.getAbstractFileByPath(folder);
+          new Setting(host)
+            .setName(`🔓 ${folder}`)
+            .setDesc(`${e.how === "renamed" ? "Renamed" : "Moved"} from “${e.from}” on ${new Date(e.at).toLocaleString()}${e.unlocked ? ` · ${e.unlocked} note${e.unlocked === 1 ? "" : "s"} unlocked` : ""}${exists ? "" : " · folder not found"}`)
+            .addButton((b) => b.setButtonText("Encrypt again").setCta().setDisabled(!exists)
+              .onClick(async () => { await encryptPendingFolder(this.plugin, folder); this.update(); }))
+            .addButton((b) => b.setButtonText("Open").setDisabled(!exists)
+              .onClick(() => void this.plugin.openFolderInStashpad(folder)))
+            .addButton((b) => b.setButtonText("Stop reminding")
+              .onClick(async () => { await clearEncryptionPending(this.plugin, folder); this.update(); }));
+        }
+      }));
+    }
 
     items.push(this.sectionDef("Vault Encryption", "Encrypt notes per folder with a password you choose. Keep that password in a password manager — there is no recovery if it is lost.", (host) => {
       host.addClass("stashpad-encryption-section");

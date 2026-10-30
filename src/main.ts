@@ -40,8 +40,9 @@ import {
 import { DEFAULT_STOPWORDS, bodyToSlug, buildAttachmentName, parseLegacyAttachmentPrefix, parseIdFromFilename, isNoteId, stripInlineMarkdown, createdMsOf, reslugName, titleFromBasename, splitDatePrefix } from "./slug-service";
 import { safeFileName } from "./safe-filename";
 import { siftRank } from "./suggest-match";
-import { runFoldFlow } from "./folder-fold";
+import { runFoldFlow, retargetMergesIntoMovedFolder } from "./folder-fold";
 import { moveFolderFlow } from "./folder-menu";
+import { remindPendingEncryption } from "./folder-encryption-move";
 import type { FolderPlacement } from "./types";
 import { openFolderSetup } from "./folder-setup-modal";
 import { runUnfoldFlow } from "./folder-split";
@@ -916,6 +917,23 @@ export default class StashpadPlugin extends Plugin {
    *  the time (ms) until which their body changes are not the user's edits.
    *  Per note, so the user's real edits elsewhere still count during a sweep. */
   linkRewriteQuiet = new WeakMap<TFile, number>();
+  /** 0.600.0: Stashpad is about to rename `file` (the re-slug after an edit), so
+   *  Obsidian will rewrite the links to it in other notes: the parent's
+   *  `children` list, each child's `parentLink`, and any `[[link]]` in a body.
+   *  Mark those notes quiet for a few seconds, so the rewrite isn't recorded as
+   *  "edited outside Stashpad" (onFileModify) or stamped as an edit
+   *  (AuthorshipTracker). `extra` adds notes known to link even if the metadata
+   *  cache hasn't resolved them yet (the view passes the parent and children). */
+  markLinkersQuiet(file: TFile, extra: readonly TFile[] = [], ms = 5000): void {
+    const until = Date.now() + ms;
+    for (const f of extra) this.linkRewriteQuiet.set(f, until);
+    const resolved = this.app.metadataCache.resolvedLinks as Record<string, Record<string, number>>;
+    for (const [src, targets] of Object.entries(resolved)) {
+      if (!targets || !(file.path in targets)) continue;
+      const sf = this.app.vault.getAbstractFileByPath(src);
+      if (sf instanceof TFile) this.linkRewriteQuiet.set(sf, until);
+    }
+  }
   /** 0.537.1: ONE "lots of files are changing" notice for every Stashpad tab.
    *  Each view detects its own file-event burst, so with several tabs open
    *  (background tabs and pop-outs included) a single sync burst used to
@@ -2147,7 +2165,14 @@ export default class StashpadPlugin extends Plugin {
       return { ...l, folder: remapOne(l.folder.replace(/\/+$/, "")), blob: blob.startsWith(from + "/") ? to + blob.slice(from.length) : l.blob };
     });
     s.reEncryptWatch = (s.reEncryptWatch ?? []).map((w) => (w && typeof w.folder === "string" ? { ...w, folder: remapOne(w.folder.replace(/\/+$/, "")) } : w));
-    if (fields() !== snap) await this.saveSettings();
+    // 0.600.0: merges INTO the moved folder: manifest first, then `into`
+    // (retargetMergesIntoMovedFolder keeps the two in step; the record key, the
+    // merged folder's original path, stays). Idempotent: the second pass of a
+    // rename finds `into` already moved and does nothing.
+    const mergesMoved = await retargetMergesIntoMovedFolder(this, from, to);
+    // 0.600.2: folders waiting to be encrypted again follow a later move too.
+    if (s.encryptionPendingFolders) s.encryptionPendingFolders = remapRec(s.encryptionPendingFolders) ?? s.encryptionPendingFolders;
+    if (mergesMoved || fields() !== snap) await this.saveSettings();
   }
 
   // --- 0.541.0: rename-proof folders (see folder-identity.ts) -----------------
@@ -3777,6 +3802,10 @@ export default class StashpadPlugin extends Plugin {
         const b = n.noticeEl.createEl("button", { text: "Review" });
         b.onclick = () => { n.hide(); void openAggregateView(this, "watch"); };
       }, 8000);
+      // 0.600.2: NOT opt-in — a folder that was unlocked to be moved or renamed
+      // is reminded about on every start until it is encrypted again or the user
+      // says stop (folder gear menu / Encryption settings).
+      window.setTimeout(() => remindPendingEncryption(this), 9000);
       // 0.99.19: fire reminders for tasks that came due while Obsidian was
       // closed (delay so the metadata cache is populated), then re-check on an
       // interval so tasks coming due while it's open also surface.
@@ -5863,6 +5892,10 @@ export default class StashpadPlugin extends Plugin {
         // 0.541.1: only for Stashpads — a plain folder rename isn't a move to follow.
         if (this.knownStashpadFolders.has(oldPath.replace(/\/+$/, "")) || readFolderIdMap(this.app)[file.path]) recordFolderMove(this.app, oldPath, file.path);
         this.retargetStashpadViewsForFolderRename(oldPath, file.path);
+        // 0.600.2: the encryption key caches follow too, so a locked folder moved
+        // OUTSIDE Stashpad's unlock-first workflow (file explorer, sync) keeps its
+        // unlocked session and its key instead of stranding its locked notes.
+        try { this.encryption?.renameFolderPath(oldPath, file.path); } catch (e) { console.warn("[Stashpad] encryption key re-key on folder rename failed", e); }
         void this.remapFolderPathInSettings(oldPath, file.path);
       }
     }));
@@ -15176,7 +15209,8 @@ export default class StashpadPlugin extends Plugin {
       await this.store.saveCore(core); // 0.349.0: atomic write (temp + rename) — an
       // interrupted save can no longer zero data.json.
       this.lastSeenSettingsRev = rev;
-      this.store.markCoreSaved(all);
+      // 0.600.3: saveCore now re-baselines from the text it wrote; marking `all`
+      // here (live, possibly changed during the write) is what lost changes.
       this.scheduleSettingsBackup(core); // 0.341.0: device-local backup
     }
     this.snapshotSettingsBaseline(curStr);

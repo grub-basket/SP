@@ -271,6 +271,49 @@ export class EncryptionService {
     if (!this.registry().has(f)) { this.registry().add(f); this.schedulePersist(); }
   }
 
+  /** 0.600.2: a folder was renamed or moved (by Stashpad, Obsidian's file
+   *  explorer or sync). Its `.stashkey` moved with it, but the unlocked session
+   *  key, the key index, the key registry and the negative-probe cache are keyed
+   *  by folder path, so they would have pointed at the old place: the next unlock
+   *  asked for the password again, and a subfolder could lose track of the key it
+   *  inherits. Re-key them for the folder and everything under it. In-memory plus
+   *  the persisted registry; nothing on disk is touched. */
+  renameFolderPath(oldPath: string, newPath: string): void {
+    const from = this.cleanFolder(oldPath), to = this.cleanFolder(newPath);
+    if (!from || !to || from === to) return;
+    const re = (p: string): string | null => (p === from ? to : p.startsWith(`${from}/`) ? to + p.slice(from.length) : null);
+    for (const m of [this.folderSessionKeys, this.folderKeyFiles, this.negativeProbes] as Map<string, unknown>[]) {
+      for (const k of [...m.keys()]) {
+        const n = re(k);
+        if (n === null || m.has(n)) continue;
+        m.set(n, m.get(k));
+        m.delete(k);
+      }
+    }
+    // 0.600.4 (review): a folder still keyed through the legacy keyfile is looked
+    // up by path too (owningFolder reads kf.folderKeys). Re-keyed in memory for
+    // this session; the keyfile itself is the read-only transition copy, and the
+    // start-up migration moves such keys into the folder's own `.stashkey`.
+    const fks = this.kf?.folderKeys;
+    if (fks) {
+      for (const k of Object.keys(fks)) {
+        const n = re(k);
+        if (n === null || fks[n]) continue;
+        // folderPath too: the unlock path files the session key under it.
+        fks[n] = { ...fks[k], folderPath: n };
+        delete fks[k];
+      }
+    }
+    const reg = this.registry();
+    let moved = false;
+    for (const k of [...reg]) {
+      const n = re(k);
+      if (n === null) continue;
+      reg.delete(k); reg.add(n); moved = true;
+    }
+    if (moved) this.schedulePersist();
+  }
+
   /** Drop a folder from the live index and the registry (its key was removed). */
   private forgetKeyFolder(folder: string): void {
     const f = this.cleanFolder(folder);

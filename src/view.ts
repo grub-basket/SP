@@ -23773,7 +23773,11 @@ export class StashpadView extends ItemView {
     // logging it as one is the "edited with an external editor when it wasn't"
     // the log wrongly showed. The in-app write already logged a proper `edit`.
     const bodySelf = this.wasRecentBodySelfWrite(file.path);
-    if (!bodySelf.hit) this.logExternalEdit(file);
+    // 0.600.0: nor a link rewrite Obsidian makes because Stashpad renamed a note
+    // this one links to (markLinkersQuiet). Everything else below still runs, so
+    // the row repaints with the rewritten link.
+    const linkRewrite = (this.plugin.linkRewriteQuiet.get(file) ?? 0) > Date.now();
+    if (!bodySelf.hit && !linkRewrite) this.logExternalEdit(file);
     // 0.122.6 (#13): drop this file's (possibly stale-content-but-fresh-mtime)
     // render-cache entry so the debounced re-render below recomputes from fresh
     // content — fixes the truncated/attachment-less "earlier version" render
@@ -24273,6 +24277,7 @@ export class StashpadView extends ItemView {
     if (this.app.vault.getAbstractFileByPath(newPath)) return null;
     const oldPath = file.path;
     try {
+      this.quietLinkersBeforeRename(file, id); // 0.600.0
       // 0.279.29 diag: the rename makes Obsidian rewrite every link pointing at
       // this note across the whole vault — the suspected multi-second cost on a
       // big vault when the edit-modal save re-slugs. Behind the perf flag.
@@ -24301,9 +24306,24 @@ export class StashpadView extends ItemView {
     if (this.app.vault.getAbstractFileByPath(newPath)) return;
     const oldPath = file.path;
     try {
+      this.quietLinkersBeforeRename(file, id); // 0.600.0
       await this.app.fileManager.renameFile(file, newPath);
       await this.log.append({ type: "rename", id, payload: { from: oldPath, to: newPath } });
     } catch { /* ignore */ }
+  }
+
+  /** 0.600.0: before Stashpad renames a note, mark the notes whose links to it
+   *  Obsidian is about to rewrite (the parent's `children`, the children's
+   *  `parentLink`, body links) so that rewrite isn't logged as an outside edit
+   *  of those notes, once per open tab (seen as `external_edit __root__` for the
+   *  Home note after every retitle). See StashpadPlugin.markLinkersQuiet. */
+  private quietLinkersBeforeRename(file: TFile, id: StashpadId): void {
+    const node = this.tree.get(id);
+    const extra: TFile[] = [];
+    const parentFile = node?.parent ? this.tree.get(node.parent)?.file : null;
+    if (parentFile) extra.push(parentFile);
+    for (const c of node ? this.tree.getChildren(id) : []) if (c.file) extra.push(c.file);
+    this.plugin.markLinkersQuiet(file, extra);
   }
 
   /** 0.227.0: record a not-by-us body edit in the per-folder action log.
