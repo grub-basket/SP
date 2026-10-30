@@ -1564,7 +1564,10 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   mutedFolders: [],
   showAuthor: true,
   showContributors: true,
-  showLastEdit: true,
+  // 0.592.0: off by default. Most people use Stashpad alone, and the row
+  // already shows its date; a second time under the title read as clutter.
+  // New installs only: saved settings are spread over these defaults.
+  showLastEdit: false,
   authorNamesAsLinks: false,
   viewModes: {},
   includeAttachmentsInEverything: {},

@@ -179,15 +179,15 @@ function sanitizeManifest(m: FoldManifest, src: string, dest: string, dirMap: Fo
 /** Why `src` can't be unfolded right now, or null. */
 export async function unfoldRefusal(plugin: StashpadPlugin, src: string, m: FoldManifest | null): Promise<string | null> {
   const a = plugin.app.vault.adapter;
-  if (!m) return `No fold record found for “${baseName(src)}”.`;
+  if (!m) return `No merge record found for “${baseName(src)}”.`;
   const fold = plugin.settings.foldedFolders?.[src];
   // The manifest must describe THIS fold (it's a plain, editable file).
   if (!fold || m.src !== src || m.dest !== fold.into || m.shell !== fold.shell || String(m.containerId) !== String(fold.containerId)) {
-    return `The fold record for “${baseName(src)}” doesn't match — not unfolding it automatically.`;
+    return `The merge record for “${baseName(src)}” doesn't match — not unmerging it automatically.`;
   }
   if (await a.exists(src)) return `A folder called “${src}” exists again — rename or move it first.`;
   if (!(await a.exists(m.shell))) return `The archived folder “${m.shell}” is gone, so there's nothing to bring back.`;
-  if (!(plugin.app.vault.getAbstractFileByPath(m.dest) instanceof TFolder)) return `“${m.dest}” (where it was folded) no longer exists.`;
+  if (!(plugin.app.vault.getAbstractFileByPath(m.dest) instanceof TFolder)) return `“${m.dest}” (where it was merged) no longer exists.`;
   return null;
 }
 
@@ -200,7 +200,7 @@ export async function unfoldStashpadFolder(plugin: StashpadPlugin, srcRaw: strin
   const src = clean(srcRaw);
   const m = await readFoldManifest(plugin, src);
   const refusal = await unfoldRefusal(plugin, src, m);
-  if (refusal || !m) { notify(refusal ?? "Can't unfold."); return null; }
+  if (refusal || !m) { notify(refusal ?? "Can't unmerge."); return null; }
   const { dest, shell, containerId } = m;
   const name = baseName(src);
   const safe = sanitizeManifest(m, src, dest, foldDirMap(plugin, m));
@@ -281,7 +281,7 @@ export async function unfoldStashpadFolder(plugin: StashpadPlugin, srcRaw: strin
       noteCount = r.noteCount;
       relocked += r.relocked;
       problems.push(...r.left, ...r.plaintext);
-      if (r.plaintext.length) notify(`⚠️ Unfold: ${r.plaintext.length} locked note${r.plaintext.length === 1 ? " is" : "s are"} now UNLOCKED in “${name}” — re-locking failed:\n${r.plaintext.join("\n")}`, { duration: 0 });
+      if (r.plaintext.length) notify(`⚠️ Unmerge: ${r.plaintext.length} locked note${r.plaintext.length === 1 ? " is" : "s are"} now UNLOCKED in “${name}” — re-locking failed:\n${r.plaintext.join("\n")}`, { duration: 0 });
     } else {
       problems.push(`the “${name}” note in “${baseName(dest)}” is gone, so no notes came back`);
     }
@@ -373,12 +373,12 @@ export async function unfoldStashpadFolder(plugin: StashpadPlugin, srcRaw: strin
     return {
       noteCount, relocked, problems,
       undo: async () => {
-        if (undone) { notify(`The unfold of “${name}” was already undone.`); return; }
+        if (undone) { notify(`The unmerge of “${name}” was already undone.`); return; }
         // Still THIS unfold? A re-fold or a new folder at the archived path since
         // then makes the steps below wrong.
         const live = await a.exists(src) && !(await a.exists(shell)) && !plugin.settings.foldedFolders?.[src];
         undone = true;
-        if (!live) { notify(`Nothing to undo: “${name}” was folded again or changed since this unfold.`); return; }
+        if (!live) { notify(`Nothing to undo: “${name}” was merged again or changed since this unmerge.`); return; }
         const { failed, aborted } = await runUndoSteps(steps);
         plugin.invalidateStashpadFoldersMemo();
         plugin.refreshOpenViewsForFolder(dest);
@@ -401,7 +401,7 @@ export async function unfoldStashpadFolder(plugin: StashpadPlugin, srcRaw: strin
 class FoldedFolderModal extends SuggestModal<string> {
   constructor(app: App, private plugin: StashpadPlugin, private only: string | null, private onPick: (src: string) => void) {
     super(app);
-    this.setPlaceholder("Unfold which folder?");
+    this.setPlaceholder("Unmerge which folder?");
   }
   getSuggestions(query: string): string[] {
     const q = query.trim();
@@ -413,7 +413,7 @@ class FoldedFolderModal extends SuggestModal<string> {
   renderSuggestion(src: string, el: HTMLElement): void {
     const f = this.plugin.settings.foldedFolders?.[src];
     el.createDiv({ text: baseName(src) });
-    if (f) el.createEl("small", { text: `folded into ${baseName(f.into)} · ${new Date(f.at).toLocaleDateString()}` });
+    if (f) el.createEl("small", { text: `merged into ${baseName(f.into)} · ${new Date(f.at).toLocaleDateString()}` });
   }
   onChooseSuggestion(src: string): void { this.onPick(src); }
 }
@@ -424,23 +424,23 @@ export async function runUnfoldFlow(plugin: StashpadPlugin, srcRaw?: string, int
   const go = async (src: string): Promise<void> => {
     const m = await readFoldManifest(plugin, src);
     const refusal = await unfoldRefusal(plugin, src, m);
-    if (refusal || !m) { notify(refusal ?? "Can't unfold."); return; }
+    if (refusal || !m) { notify(refusal ?? "Can't unmerge."); return; }
     const name = baseName(src);
     new ConfirmModal(
       plugin.app,
-      `Unfold “${name}” out of “${baseName(m.dest)}”?`,
+      `Unmerge “${name}” out of “${baseName(m.dest)}”?`,
       `Everything under the “${name}” note in **${baseName(m.dest)}** — including notes added since — moves back into its own folder, **${src}**, as its top level.\n`
         + `Its archive, trash, attachments and locked notes come back too (locked notes re-lock with ${name}'s key; you may be asked for passwords).\n`
         + "You can undo this.",
-      "Unfold",
+      "Unmerge",
       (ok) => {
         if (!ok) return;
         void (async () => {
           const res = await unfoldStashpadFolder(plugin, src);
           if (!res) return;
-          plugin.getUndoStack(src).push({ label: `Unfold “${name}”`, undo: res.undo });
+          plugin.getUndoStack(src).push({ label: `Unmerge “${name}”`, undo: res.undo });
           plugin.notifications.show({
-            message: `Unfolded **${name}** — ${res.noteCount} note${res.noteCount === 1 ? "" : "s"} back in their own folder.`
+            message: `Unmerged **${name}** — ${res.noteCount} note${res.noteCount === 1 ? "" : "s"} back in their own folder.`
               + (res.relocked ? ` ${res.relocked} locked note${res.relocked === 1 ? "" : "s"} re-locked with its key.` : "")
               + (res.problems.length ? ` Notes: ${res.problems.join("; ")}.` : ""),
             kind: res.problems.length ? "warning" : "success", category: "move", folder: src, duration: 0,
@@ -454,7 +454,7 @@ export async function runUnfoldFlow(plugin: StashpadPlugin, srcRaw?: string, int
   };
   if (srcRaw) { await go(clean(srcRaw)); return; }
   const entries = Object.entries(plugin.settings.foldedFolders ?? {}).filter(([, f]) => !into || clean(f.into) === clean(into));
-  if (!entries.length) { notify(into ? `Nothing has been folded into “${baseName(into)}”.` : "No folded folders to unfold."); return; }
+  if (!entries.length) { notify(into ? `Nothing has been merged into “${baseName(into)}”.` : "No merged folders to unmerge."); return; }
   new FoldedFolderModal(plugin.app, plugin, into ? clean(into) : null, (s) => void go(s)).open();
 }
 

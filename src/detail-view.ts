@@ -621,8 +621,16 @@ export class StashpadDetailView extends ItemView {
         .map((c: string) => this.stripWikiLink(c));
       if (list.length > 0) lines.push({ label: "Contributors", value: list.join(", ") });
     }
-    if (typeof fm.modified === "string") lines.push({ label: "Modified", value: this.formatTime(fm.modified) });
     if (typeof fm.created === "string") lines.push({ label: "Created", value: this.formatTime(fm.created) });
+    // 0.593.0: "Edited" (the row footer's word) under Created, and only for a
+    // real edit: a `modified` within a second of `created` is the creation
+    // stamp, which would just repeat the line above.
+    if (typeof fm.modified === "string") {
+      const m = Date.parse(fm.modified);
+      const c = typeof fm.created === "string" ? Date.parse(fm.created) : NaN;
+      const sameAsCreated = !Number.isNaN(m) && !Number.isNaN(c) && m - c < 1000;
+      if (!sameAsCreated) lines.push({ label: "Edited", value: this.formatTime(fm.modified) });
+    }
     lines.push({ label: "Path", value: file.path });
     lines.push({ label: "ID", value: sel.id });
     if (lines.length === 0) { meta.remove(); return; }

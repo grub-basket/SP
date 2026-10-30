@@ -1,7 +1,7 @@
 import { App, TFile } from "obsidian";
 import { notify } from "./notify";
 import { ConfirmModal } from "./modals";
-import type { TreeNode } from "./types";
+import { STASHPAD_VIEW_TYPE, type TreeNode } from "./types";
 import type { TreeIndex } from "./tree-index";
 import type StashpadPlugin from "./main";
 
@@ -17,7 +17,22 @@ export interface AuthorshipHost {
   ensureFolder(path: string): Promise<void>;
   stripFrontmatter(md: string): string;
   debouncedRender: () => void;
+  /** Mark a frontmatter-only write as the view's own, so its modify event
+   *  re-renders the row instead of being logged as an external edit. */
+  markFmSelfWrite(path: string, repainted?: boolean): void;
+  /** Drop that marker again when the write failed. */
+  clearFmSelfWrite(path: string): void;
 }
+
+/** 0.597.2: the last body each note was stamped for, shared by every tracker
+ *  (one per Stashpad tab) so one edit gets one stamp. Entries age out in
+ *  pruneContribMaps. */
+const stampedBodies = new Map<string, { body: string; at: number }>();
+/** 0.597.2: the `modified` value this device last saw (or wrote) per note, also
+ *  shared by every tracker so all tabs agree. An edit that shows up with a
+ *  DIFFERENT value was stamped where it was made (another device), so it isn't
+ *  stamped again here. Aged out in pruneContribMaps. */
+const seenModified = new Map<string, { mod: string; at: number }>();
 
 /** Owns the authorship / multiplayer-contribution subsystem extracted from
  *  StashpadView: retroactive claim stamping, lazy author-stub creation,
@@ -70,13 +85,26 @@ export class AuthorshipTracker {
    *  neither a contribution stamp reliably nor a history version. */
   seedKnownBody(path: string, body: string): void {
     if (!this.knownBodies.has(path)) this.knownBodies.set(path, body);
+    // 0.599.3 (review): seed the `modified` this device has seen too. Without it
+    // the "already stamped on another device" check (seenModified) has nothing to
+    // compare against for a note seeded on file-open, so a synced edit arriving
+    // while the note sat open in the editor got stamped a second time here.
+    if (!seenModified.has(path)) {
+      const f = this.host.app.vault.getAbstractFileByPath(path);
+      const mod = f instanceof TFile ? this.host.app.metadataCache.getFileCache(f)?.frontmatter?.modified : undefined;
+      seenModified.set(path, { mod: typeof mod === "string" ? mod : "", at: Date.now() });
+    }
   }
 
   handleRename(oldPath: string, newPath: string): void {
     if (oldPath === newPath) return;
     const t = this.contribTimers.get(oldPath);
     if (t !== undefined) { this.contribTimers.set(newPath, t); this.contribTimers.delete(oldPath); }
-    for (const map of [this.knownBodies, this.recentSelfWrites, this.lastExternalModify] as Map<string, unknown>[]) {
+    // 0.597.2: the two shared maps too (the first tracker to see the rename moves
+    // them; the rest find nothing to move). A save re-slugs the file right after
+    // writing it, so without this the stamp would look the note up by its new
+    // name and find no history.
+    for (const map of [this.knownBodies, this.recentSelfWrites, this.lastExternalModify, stampedBodies, seenModified] as Map<string, unknown>[]) {
       if (map.has(oldPath)) { map.set(newPath, map.get(oldPath)!); map.delete(oldPath); }
     }
   }
@@ -447,6 +475,16 @@ export class AuthorshipTracker {
     for (const [path, ts] of this.lastExternalModify) {
       if (now - ts > EXT_TTL) this.lastExternalModify.delete(path);
     }
+    // Long enough for every tab's tracker to have seen the edit (they park at
+    // most a few quiescence windows); holds whole bodies, so don't keep forever.
+    for (const [path, e] of stampedBodies) {
+      if (now - e.at > 5 * 60_000) stampedBodies.delete(path);
+    }
+    // Small strings; keep longer so a note edited now and again later in the
+    // session still knows its last value (an aged-out entry just means stamp).
+    for (const [path, e] of seenModified) {
+      if (now - e.at > 60 * 60_000) seenModified.delete(path);
+    }
     if (this.knownBodies.size > 64) {
       for (const path of this.knownBodies.keys()) {
         if (!this.host.tree.idForPath(path)) this.knownBodies.delete(path);
@@ -554,6 +592,11 @@ export class AuthorshipTracker {
     const body = this.host.stripFrontmatter(raw);
     const prev = this.knownBodies.get(file.path);
     this.knownBodies.set(file.path, body);
+    // 0.597.2: the `modified` this device last saw on the note (see below).
+    const fmMod = this.host.app.metadataCache.getFileCache(file)?.frontmatter?.modified;
+    const curMod = typeof fmMod === "string" ? fmMod : "";
+    const prevMod = seenModified.get(file.path)?.mod;
+    seenModified.set(file.path, { mod: curMod, at: Date.now() });
     if (prev === undefined) return;       // first sighting — no contribution
     if (prev === body) return;            // frontmatter-only write — skip
     // 0.79.19: never stamp during rebootstrap — its frontmatter writes and
@@ -564,13 +607,33 @@ export class AuthorshipTracker {
     // 0.580.0: same for the link rewrites of the add/remove-dates sweep — only
     // on the notes it is rewriting, so real edits elsewhere still count.
     if ((this.host.plugin.linkRewriteQuiet.get(file) ?? 0) > Date.now()) return;
+    // 0.597.2: every Stashpad tab has its own tracker, and each one sees the
+    // same edit, so two tabs on a folder stamped the note twice (and each saw
+    // the other's stamp as a fresh edit). The first tracker to act on a given
+    // body claims it; the rest skip. Keyed on the body, not a time window,
+    // because the other tracker can fire several seconds later (it parks while
+    // it thinks someone else is writing).
+    if (stampedBodies.get(file.path)?.body === body) return;
+    stampedBodies.set(file.path, { body, at: Date.now() });
     const author = this.currentAuthorLink();
     // 0.337.0: capture a history version on a genuine body change. Done here (not
     // gated on `author`) so history works even when the user hasn't set a name —
     // the entry just records an empty author then. Best-effort inside.
     try { this.host.plugin.captureNoteHistory(file, body, author ? { id: author.id, name: author.name } : null); } catch { /* never block */ }
-    if (!author) return;                  // user opted out of stamping
-    void this.ensureAuthorFile(author);
+    // 0.597.2: an edit that arrives with its `modified` ALREADY moved was stamped
+    // where it was made — another synced device, or Stashpad elsewhere on a
+    // shared drive. Stamping it again here would add a second frontmatter write
+    // from a second device for the same edit (a sync-conflict risk, and the time
+    // would be when it ARRIVED, not when it was made). Edits made on this device
+    // (Stashpad's own saves, Obsidian's editor) leave `modified` alone, so they
+    // still get stamped. Unknown previous value → stamp, as before.
+    if (prevMod !== undefined && curMod !== prevMod) return;
+    // 0.591.0: `modified` is stamped on every real body edit, name or not. It
+    // used to sit behind the author check, so anyone who never set a name (most
+    // solo users) got an edit time that never moved: the row's "edited" label
+    // and the details panel's edit date stayed at the creation time. Only the
+    // contributor list needs a name.
+    if (author) void this.ensureAuthorFile(author);
     const now = new Date().toISOString();
     // 0.72.4: stamp BEFORE the write so the resulting vault.modify
     // event (which fires asynchronously) can be classified as ours
@@ -578,20 +641,46 @@ export class AuthorshipTracker {
     // logged as an external modify, parking the next stamp
     // unnecessarily.
     this.recentSelfWrites.set(file.path, Date.now());
+    // 0.591.0: tell the VIEW too. Without this its modify handler took the
+    // stamp for someone else's edit: it logged an `external_edit` for every
+    // stamp (seen live: one ~5s after each in-app save) and re-rendered before
+    // the new `modified` was parsed, so the row's "edited" label stayed stale
+    // until the next full render. As an own frontmatter write it skips the log
+    // and re-renders once the change lands, like a colour change.
+    // 0.597.2: and every OTHER Stashpad tab, since each one runs its own modify
+    // handler and would log this stamp as an external edit. Deferred tabs have
+    // no view yet (no handler either), hence the method check. Marked inside
+    // the callback, i.e. only once the frontmatter parsed and the write is
+    // about to happen, and cleared again if it throws: a marker for a write
+    // that never landed would swallow a real outside edit for 2.5s.
+    const views = (): Partial<AuthorshipHost>[] => {
+      const out: Partial<AuthorshipHost>[] = [this.host];
+      for (const leaf of this.host.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+        const v = leaf.view as unknown as Partial<AuthorshipHost> | undefined;
+        if (v && v !== this.host && typeof v.markFmSelfWrite === "function") out.push(v);
+      }
+      return out;
+    };
+    const path = file.path;
     try {
       await this.host.app.fileManager.processFrontMatter(file, (m: any) => {
+        for (const v of views()) v.markFmSelfWrite?.(path);
         m.modified = now;
+        const who = author;
+        if (!who) return;
         const a = typeof m.author === "string" ? m.author : "";
         const contributors: string[] = Array.isArray(m.contributors)
           ? m.contributors.filter((c: unknown): c is string => typeof c === "string")
           : [];
-        const idTag = `-${author.id}`;
+        const idTag = `-${who.id}`;
         const isAuthor = a.includes(idTag);
         const already = contributors.some((c) => c.includes(idTag));
-        if (!isAuthor && !already) contributors.push(author.link);
+        if (!isAuthor && !already) contributors.push(who.link);
         m.contributors = contributors;
       });
+      seenModified.set(path, { mod: now, at: Date.now() }); // ours, so the next local edit still stamps
     } catch (e) {
+      for (const v of views()) v.clearFmSelfWrite?.(path);
       console.warn("[Stashpad] maybeRecordContribution failed", e);
     }
   }

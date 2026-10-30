@@ -19,6 +19,8 @@ import {
 import { TreeIndex, collectMarkdown } from "./tree-index";
 import { RelinkFolderModal, type MovedFolderGuess } from "./folder-identity";
 import { runSplitOutFlow } from "./folder-split";
+import { fillFolderMenu, moveFolderFlow } from "./folder-menu";
+import { runFoldFlow } from "./folder-fold";
 import { perf } from "./perf";
 import { formatDateTime, formatDateOnly, formatTimeOnly } from "./format";
 import { parseDue, parseDueString, dueTier, dueLabel, dueRelative, nextDueValue, isBareDateDue, type DueInfo } from "./due-warmth";
@@ -1640,6 +1642,17 @@ export class StashpadView extends ItemView {
     if (getSettings().focusComposerOnOpen) this.focusComposer(); else this.focusView();
     // Re-focus whenever this Stashpad leaf becomes the active one (e.g. user closes
     // a sibling tab via Cmd+W and lands back here, or switches into a Stashpad tab).
+    // 0.599.4: a note of this folder opened in Obsidian's own editor: give the
+    // authorship tracker its current body now. The tracker learns bodies lazily
+    // from modify events and skips a note's first one ("first sighting"), so the
+    // first edit made in the editor after a restart never moved the edit time.
+    // Seeding is a no-op when the tracker already knows the note.
+    this.registerEvent(this.app.workspace.on("file-open", (f) => {
+      if (!f || f.extension !== "md" || !f.path.startsWith(this.noteFolder + "/")) return;
+      if (this.nestBlockHere()) return;
+      const path = f.path;
+      void this.app.vault.cachedRead(f).then((raw) => this.authorship.seedKnownBody(path, this.stripFrontmatter(raw)), () => { /* unreadable: stay lazy */ });
+    }));
     // Also release the sticky-bottom flag when the user switches AWAY from this
     // Stashpad — leaving the tab signals their attention has moved; coming back
     // shouldn't yank the view to the bottom on the next render. Re-arming the flag
@@ -2691,7 +2704,33 @@ export class StashpadView extends ItemView {
       .setTitle("New folder…")
       .setIcon("folder-plus")
       .onClick(() => this.openFolderPicker()));
+    // 0.595.0: folder management from the switcher too. On a phone this is the
+    // only way in (no room for the desktop gear in the composer row); on
+    // desktop it is a second, more discoverable door. Opens where this menu was.
+    menu.addSeparator();
+    menu.addItem((i: any) => i
+      .setTitle("Manage this folder…")
+      .setIcon("settings")
+      .onClick(() => this.openFolderManageMenu(e)));
     menu.showAtMouseEvent(e);
+  }
+
+  /** 0.595.0: the folder management menu (rename, delete, fold, placement,
+   *  encryption …) for THIS tab's folder, from src/folder-menu.ts — the same
+   *  menu as the Folders sidebar, so the main view never needs the sidebar. */
+  private openFolderManageMenu(e: MouseEvent): void {
+    const folder = (this.noteFolder || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!folder) return;
+    const menu = new Menu();
+    fillFolderMenu(this.plugin, menu, folder, () => this.render());
+    // showAtPosition, not showAtMouseEvent: a keyboard-activated button or a
+    // menu item hands us a synthetic event whose coordinates can be 0,0; fall
+    // back to the clicked element's box.
+    const t = e.target as HTMLElement | null;
+    const box = t?.getBoundingClientRect?.();
+    const x = e.clientX || box?.left || 0;
+    const y = e.clientY || (box ? box.bottom : 0);
+    menu.showAtPosition({ x, y });
   }
 
   private listVaultFolders(): string[] {
@@ -5644,6 +5683,14 @@ export class StashpadView extends ItemView {
       // 0.301.0: quick menu (recent/pinned + "search all") instead of the full
       // modal directly — the full picker stays reachable via the menu.
       folderBtn.onclick = (e) => { e.preventDefault(); this.openQuickFolderMenu(e); };
+      // 0.595.0: folder management gear, joined to the switcher's right edge
+      // (CSS squares the shared corners). Same menu as the Folders sidebar's
+      // row gear / right-click, so rename, delete, fold etc. no longer need the
+      // sidebar open.
+      const gearBtn = bar.createEl("button", { cls: "stashpad-folder-gear", attr: { "aria-label": "Manage this folder" } });
+      setIconSafe(gearBtn, "settings", "⚙");
+      gearBtn.title = `Manage folder: ${this.noteFolder}`;
+      gearBtn.onclick = (e) => { e.preventDefault(); this.openFolderManageMenu(e); };
 
       // 0.68.4: icon-only Search button between the folder switcher and
       // the tags dropdown. Mirrors the Mod+F binding for mouse users.
@@ -5821,7 +5868,7 @@ export class StashpadView extends ItemView {
       displayIdx: number;    // L→R position (nav=0 … window=4)
     };
     const GROUPS: Group[] = [
-      { key: "nav",     icon: "folder-search",      title: "Folder & search", memberSel: [".stashpad-folder-btn", ".stashpad-search-btn"], memberKeys: ["folder", "search"], collapsePrio: 5, displayIdx: 0 },
+      { key: "nav",     icon: "folder-search",      title: "Folder & search", memberSel: [".stashpad-folder-btn", ".stashpad-folder-gear", ".stashpad-search-btn"], memberKeys: ["folder", "search"], collapsePrio: 5, displayIdx: 0 },
       { key: "filter",  icon: "filter",             title: "Tag & color",     memberSel: [".stashpad-tag-filter-btn", ".stashpad-color-filter-btn"], memberKeys: ["tag", "color"], collapsePrio: 3, displayIdx: 1 },
       { key: "arrange", icon: "sliders-horizontal", title: "Sort & view",     memberSel: [".stashpad-sort-btn", ".stashpad-view-btn"], memberKeys: ["sort", "view"], collapsePrio: 4, displayIdx: 2 },
       { key: "time",    icon: "clock",              title: "Time",            memberSel: [".stashpad-time-filter-btns"], memberKeys: ["time"], collapsePrio: 2, displayIdx: 3 },
@@ -6030,6 +6077,11 @@ export class StashpadView extends ItemView {
     const row = container.createDiv({ cls: "stashpad-sort-popover-row" });
     row.createSpan({ cls: "stashpad-sort-popover-label", text: this.folderOverride ? "Change folder (override active)…" : "Change folder for this tab…" });
     row.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onPicked(); this.openFolderPicker(); };
+    // 0.595.0: the gear folds away with the folder button, so its menu needs a
+    // way in from here too.
+    const manage = container.createDiv({ cls: "stashpad-sort-popover-row" });
+    manage.createSpan({ cls: "stashpad-sort-popover-label", text: "Manage this folder…" });
+    manage.onclick = (e) => { e.preventDefault(); e.stopPropagation(); onPicked(); this.openFolderManageMenu(e); };
   }
 
   /** ⋯-menu body for the search cluster: open the search modal. */
@@ -8157,6 +8209,18 @@ export class StashpadView extends ItemView {
     if (node.file) {
       menu.addItem((it: any) => it.setTitle("Edit in Stashpad").setIcon("pencil-line").onClick(() => { onAction?.(); void this.cmdEdit(node); }));
       menu.addItem((it: any) => it.setTitle("Open in Obsidian editor (new tab)").setIcon("pencil").onClick(() => { onAction?.(); this.cmdOpenInEditor(node); }));
+    }
+    // 0.599.2: Move is back on the breadcrumb (user ask). A note crumb moves
+    // that note (with its children) to a new parent, the same picker as the
+    // row's ⋮ menu but aimed at the crumb, not the selection. The Home crumb
+    // is the folder itself, so it offers the folder's own Move and Merge.
+    if (id !== ROOT_ID && node.file) {
+      menu.addItem((it: any) => it.setTitle("Move…").setIcon("folder-input").onClick(() => { onAction?.(); this.cmdMovePicker([node]); }));
+    } else if (id === ROOT_ID && this.noteFolder) {
+      const folder = this.noteFolder;
+      menu.addSeparator();
+      menu.addItem((it: any) => it.setTitle("Move folder…").setIcon("folder-tree").onClick(() => { onAction?.(); moveFolderFlow(this.plugin, folder); }));
+      menu.addItem((it: any) => it.setTitle("Merge into another folder…").setIcon("folder-input").onClick(() => { onAction?.(); void runFoldFlow(this.plugin, folder); }));
     }
     if (evt && (evt.clientX > 0 || evt.clientY > 0)) {
       menu.showAtMouseEvent(evt);
@@ -11011,7 +11075,7 @@ export class StashpadView extends ItemView {
     // only while empty (`:placeholder-shown` sibling rule). aria-hidden — the
     // textarea's native placeholder is still the accessible label.
     this.composerPlaceholderEl = taWrap.createDiv({ cls: "stashpad-composer-placeholder", attr: { "aria-hidden": "true" } });
-    this.composerPlaceholderEl.setText(this.composerPlaceholder(enterSubmits, splitMode));
+    this.fillComposerPlaceholder(this.composerPlaceholderEl, enterSubmits, splitMode);
 
     // 0.267.1 (CONFIRMED on device): keep a selection drag inside the composer
     // from reaching Obsidian's sidebar gesture.
@@ -12124,14 +12188,33 @@ export class StashpadView extends ItemView {
     modal.open();
   }
 
-  private composerPlaceholder(enterSubmits: boolean, split: boolean): string {
+  /** The placeholder while the composer HAS focus (also the native placeholder
+   *  attribute, i.e. the accessible label). */
+  private composerPlaceholder(_enterSubmits: boolean, split: boolean): string {
     // Short placeholder on mobile — the long send/newline hint is desktop
     // chrome that mobile users don't need (and that wraps to two lines on
     // narrow screens).
     if (Platform.isMobile) return split ? "New notes (split on newlines)" : "New note";
-    const send = enterSubmits ? "Enter" : "Shift+Enter";
-    const newline = enterSubmits ? "Shift+Enter" : "Enter";
-    return `Type a note. ${send} = send, ${newline} = newline${split ? " (each line → a note)" : ""}…`;
+    // 0.594.0: no key hints here any more. The helper line under the composer
+    // already says which key sends and which adds a line, and repeating it in
+    // the box read as clutter (friend feedback).
+    return split ? "Type notes, one per line…" : "Type a note…";
+  }
+  /** 0.594.0: the placeholder while the composer does NOT have focus. Desktop
+   *  only: Space jumps into the composer from anywhere in the view (keydown
+   *  handler), and this is the one place that shortcut can teach itself.
+   *  Phones have no such shortcut, so they keep the focused text. */
+  private composerIdlePlaceholder(enterSubmits: boolean, split: boolean): string {
+    if (Platform.isMobile) return this.composerPlaceholder(enterSubmits, split);
+    return "Hit Space and start typing…";
+  }
+  /** Fill the visible overlay with both texts; CSS shows the idle one until
+   *  the textarea is focused (`:focus ~` sibling rule), so focus changes need
+   *  no JS. */
+  private fillComposerPlaceholder(el: HTMLElement, enterSubmits: boolean, split: boolean): void {
+    el.empty();
+    el.createSpan({ cls: "stashpad-composer-placeholder-idle", text: this.composerIdlePlaceholder(enterSubmits, split) });
+    el.createSpan({ cls: "stashpad-composer-placeholder-focused", text: this.composerPlaceholder(enterSubmits, split) });
   }
   private composerHelperText(enterSubmits: boolean, split: boolean): string {
     const send = enterSubmits ? "Enter" : "Shift+Enter";
@@ -12448,6 +12531,9 @@ export class StashpadView extends ItemView {
     const newContent = split.fm + lines.join("\n");
     if (newContent === current) return;
     this.markBodySelfWrite(file.path);
+    // 0.597.2: like the edit-modal save, so the first tick after a restart
+    // moves the edit time too (see seedKnownBody).
+    this.authorship.seedKnownBody(file.path, this.stripFrontmatter(current));
     await this.app.vault.modify(file, newContent);
     this.bodyRenderer.evict(file); // cache holds the old checkbox state
     void this.log.append({ type: "edit", id: node.id, payload: { path: file.path } });
@@ -14572,7 +14658,7 @@ export class StashpadView extends ItemView {
     // 0.363.3: keep BOTH in sync — the native placeholder (transparent, drives
     // the `:placeholder-shown` visibility rule) and the visible overlay text.
     if (this.composerInputEl) this.composerInputEl.placeholder = this.composerPlaceholderText;
-    if (this.composerPlaceholderEl) this.composerPlaceholderEl.setText(this.composerPlaceholderText);
+    if (this.composerPlaceholderEl) this.fillComposerPlaceholder(this.composerPlaceholderEl, enter, split);
     if (this.composerHelperEl) this.composerHelperEl.setText(this.composerHelperText(enter, split));
   }
 
@@ -15555,8 +15641,10 @@ export class StashpadView extends ItemView {
     ).open();
   }
 
-  cmdMovePicker(): void {
-    const targets = this.getActionTargets();
+  /** `only`: move exactly these notes (the breadcrumb's "Move…" passes the
+   *  crumb's note) instead of the selection / cursor row. */
+  cmdMovePicker(only?: TreeNode[]): void {
+    const targets = only ?? this.getActionTargets();
     if (!targets.length) return;
     new StashpadSuggest(this.app, this.tree, (n) => this.titleForNode(n), {
       mode: "pick", placeholder: "Move to which note?", allowCreate: true,
@@ -15587,7 +15675,20 @@ export class StashpadView extends ItemView {
         }
       },
       onCreate: async (q) => {
-        const newId = await this.createNoteUnder(q, this.focusId);
+        // 0.599.3 (review): the new destination normally goes under the focused
+        // note, but when the focus IS one of the notes being moved or sits inside
+        // one (the breadcrumb's Move… on the current note or an ancestor; the
+        // heading row), that would put the destination inside the thing being
+        // moved: the move is refused as a cycle and an empty note is left behind.
+        // Then create it beside the (first) moved note instead.
+        const moving = new Set(targets.map((t) => t.id));
+        let inside = false;
+        for (let cur: TreeNode | undefined = this.tree.get(this.focusId); cur; cur = cur.parent ? this.tree.get(cur.parent) : undefined) {
+          if (moving.has(cur.id)) { inside = true; break; }
+          if (cur.id === ROOT_ID) break;
+        }
+        const createUnder = inside ? (targets[0].parent ?? ROOT_ID) : this.focusId;
+        const newId = await this.createNoteUnder(q, createUnder);
         if (!newId) return;
         const childCounts = new Map(targets.map((t) => [t.id, this.tree.getChildren(t.id).length]));
         const movedTargets: TreeNode[] = [];
@@ -21936,6 +22037,12 @@ export class StashpadView extends ItemView {
     // one save cost a full render HERE plus a second slug rename, a second
     // evict and a second repaint from the modify handler.
     this.markBodySelfWrite(originalPath, true);
+    // 0.591.0: tell the authorship tracker what the body was BEFORE this save.
+    // It only stamps `modified` when it has seen a previous body to compare
+    // against, and it learns bodies lazily from modify events, so the first
+    // edit of a note after Obsidian starts was a "first sighting" and never
+    // moved the edit time. No-op when it already knows this note.
+    this.authorship.seedKnownBody(originalPath, this.stripFrontmatter(current));
     // 0.568.0: a failed modify used to vanish — no catch here, and callers
     // `void` the save, so the rejection (from Obsidian's own fs code, no
     // plugin frame) was dropped by the error filter. The edit window just sat
@@ -21944,6 +22051,7 @@ export class StashpadView extends ItemView {
       await this.app.vault.modify(file, newContent);
     } catch (e) {
       this.recentBodySelfWrites.delete(originalPath); // nothing was written; don't mask a real external edit
+      this.tellPeersSelfWrite(originalPath, true);    // 0.599.3: nor in the other tabs
       this.plugin.noteWriteFailure("save-body", originalPath, e);
       notify(`Stashpad: couldn't save the note (${(e as Error)?.message ?? String(e)}). Your text is still in the editor.`);
       throw e;
@@ -21969,6 +22077,11 @@ export class StashpadView extends ItemView {
     if (renamedTo) {
       const pending = this.recentBodySelfWrites.get(originalPath);
       if (pending) { this.recentBodySelfWrites.delete(originalPath); this.recentBodySelfWrites.set(renamedTo, pending); }
+      // 0.599.3: the peer tabs' markers follow the same way, still only while unconsumed.
+      for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+        const v = leaf.view as unknown as { followPeerRename?: (a: string, b: string) => void } | undefined;
+        if (v && v !== (this as unknown) && typeof v.followPeerRename === "function") v.followPeerRename(originalPath, renamedTo);
+      }
     }
     // 0.274.0: record the in-app edit so the activity heatmap can count it.
     // `external_edit` covers writes from elsewhere; this is the matching entry
@@ -23383,7 +23496,18 @@ export class StashpadView extends ItemView {
     const contributorsRaw: string[] = Array.isArray(fm.contributors)
       ? fm.contributors.filter((c: unknown): c is string => typeof c === "string" && c.trim() !== "")
       : [];
-    const modifiedRaw = typeof fm.modified === "string" ? fm.modified : (typeof fm.created === "string" ? fm.created : "");
+    // 0.592.0: "edited" only when the note really was edited after it was made.
+    // This used to fall back to `created` when there was no `modified`, so a
+    // never-edited note showed "edited <creation time>", the same moment as the
+    // row's own date. A `modified` within a second of `created` is the creation
+    // stamp itself, not an edit.
+    const modifiedRaw = (() => {
+      if (typeof fm.modified !== "string") return "";
+      const m = Date.parse(fm.modified);
+      const c = typeof fm.created === "string" ? Date.parse(fm.created) : NaN;
+      if (!Number.isNaN(m) && !Number.isNaN(c) && m - c < 1000) return "";
+      return fm.modified;
+    })();
 
     // The due date shares this line with the edit time. Desktop: due first (the
     // actionable date), then the edit. Mobile: the line has no room for both, so
@@ -23479,6 +23603,11 @@ export class StashpadView extends ItemView {
   markFmSelfWrite(path: string, repainted = false): void {
     this.recentFmSelfWrites.set(path, { at: Date.now(), repainted });
   }
+  /** 0.597.2: drop a marker whose write never happened (it threw), so it can't
+   *  swallow a real outside edit's modify event for the next 2.5s. */
+  clearFmSelfWrite(path: string): void {
+    this.recentFmSelfWrites.delete(path);
+  }
   private wasRecentFmSelfWrite(path: string): { hit: boolean; repainted: boolean } {
     const e = this.recentFmSelfWrites.get(path);
     if (!e) return { hit: false, repainted: false };
@@ -23498,7 +23627,50 @@ export class StashpadView extends ItemView {
    *  row — onFileModify then skips all three instead of doing them a second time.
    *  Callers that only mark the write (e.g. the checkbox toggle) leave it false and
    *  keep the previous behaviour. */
-  markBodySelfWrite(path: string, owned = false): void { this.recentBodySelfWrites.set(path, { at: Date.now(), owned }); }
+  markBodySelfWrite(path: string, owned = false): void {
+    this.recentBodySelfWrites.set(path, { at: Date.now(), owned });
+    this.tellPeersSelfWrite(path);
+  }
+  /** 0.599.3: ANOTHER Stashpad tab just wrote this note from inside Stashpad.
+   *  Each tab runs its own modify handler, so with two tabs on one folder the
+   *  second one logged every in-app save as "edited outside Stashpad". The peer
+   *  gets an owned=false marker: no log line, but it still evicts and repaints
+   *  its own copy of the row. Same guards as processOwnFrontMatter's marker: only
+   *  for notes in this tab's folder, never when a pending fmSync / own-frontmatter
+   *  marker would make onFileModify return before consuming it, and never over a
+   *  fresh marker of this tab's own. */
+  acceptPeerSelfWrite(path: string): void {
+    if (!path.startsWith(this.noteFolder + "/")) return;
+    if (this.fmSync.hasRecentSelfWrite(path)) return;
+    const fmSelf = this.recentFmSelfWrites.get(path);
+    if (fmSelf && Date.now() - fmSelf.at < 2500) return;
+    const own = this.recentBodySelfWrites.get(path);
+    if (own && Date.now() - own.at < 2500) return;
+    this.recentBodySelfWrites.set(path, { at: Date.now(), owned: false });
+  }
+  /** 0.599.3: a peer tab's save re-slugged the file before its modify event
+   *  arrived; move this tab's unconsumed peer marker along with it. */
+  followPeerRename(oldPath: string, newPath: string): void {
+    const m = this.recentBodySelfWrites.get(oldPath);
+    if (!m) return;
+    this.recentBodySelfWrites.delete(oldPath);
+    this.recentBodySelfWrites.set(newPath, m);
+  }
+  private tellPeersSelfWrite(path: string, drop = false): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      const v = leaf.view as unknown as { acceptPeerSelfWrite?: (p: string) => void; dropPeerSelfWrite?: (p: string) => void } | undefined;
+      if (!v || v === (this as unknown)) continue;
+      if (drop) { if (typeof v.dropPeerSelfWrite === "function") v.dropPeerSelfWrite(path); }
+      else if (typeof v.acceptPeerSelfWrite === "function") v.acceptPeerSelfWrite(path);
+    }
+  }
+  /** 0.599.3 (review): the peer's write failed, so no modify event will consume
+   *  the marker it handed us; drop it (only a fresh owned=false one, which is the
+   *  kind peers hand out) so it can't hide a real outside edit for 2.5s. */
+  dropPeerSelfWrite(path: string): void {
+    const m = this.recentBodySelfWrites.get(path);
+    if (m && !m.owned && Date.now() - m.at < 2500) this.recentBodySelfWrites.delete(path);
+  }
   private wasRecentBodySelfWrite(path: string): { hit: boolean; owned: boolean } {
     const e = this.recentBodySelfWrites.get(path);
     if (!e) return { hit: false, owned: false };
@@ -23542,11 +23714,12 @@ export class StashpadView extends ItemView {
         if (body && body.owned && Date.now() - body.at < 2500) return;
         mark.at = Date.now();
         this.recentBodySelfWrites.set(path, mark);
+        this.tellPeersSelfWrite(path); // 0.599.3: other tabs on this folder too
       });
     } catch (e) {
       // The write failed, so no modify event will consume our marker. Drop it
       // (only if it is still ours) so it can't hide a later outside edit.
-      if (this.recentBodySelfWrites.get(file.path) === mark) this.recentBodySelfWrites.delete(file.path);
+      if (this.recentBodySelfWrites.get(file.path) === mark) { this.recentBodySelfWrites.delete(file.path); this.tellPeersSelfWrite(file.path, true); }
       throw e;
     }
   }
@@ -24287,6 +24460,9 @@ export class StashpadView extends ItemView {
         return `${d.format(fmt.dateFormat)} ${d.format(tf)}`;
       }
     }
+    // 24-hour clock WITH the AM/PM marker ("17:05:00 PM") on purpose: it is the
+    // format of the user's own timestamped note lines, and it sorts correctly as
+    // text, which pasted logs rely on. (0.592.0 briefly switched to 12-hour; reverted.)
     return `${d.format("YYYY.MM.DD")} ${d.format("HH:mm:ss A")}`;
   }
   /** 0.270.1: run a positional scroll (`restore` / `scroll-to-id`) now, then

@@ -204,13 +204,13 @@ async function writeNote(
 
 /** Why a fold of `src` into `dest` can't run, or null when it can. */
 export function foldRefusal(plugin: StashpadPlugin, src: string, dest: string): string | null {
-  if (!src || !dest) return "Pick a folder to fold into.";
-  if (src === dest) return "A folder can't be folded into itself.";
+  if (!src || !dest) return "Pick a folder to merge into.";
+  if (src === dest) return "A folder can't be merged into itself.";
   if (dest.startsWith(`${src}/`) || src.startsWith(`${dest}/`)) return "One of these folders is inside the other.";
   if (!(plugin.app.vault.getAbstractFileByPath(src) instanceof TFolder)) return `“${src}” no longer exists.`;
   if (!(plugin.app.vault.getAbstractFileByPath(dest) instanceof TFolder)) return `“${dest}” no longer exists.`;
-  if (plugin.isArchiveFolder(dest)) return `“${baseName(dest)}” is an archive folder — fold into a regular Stashpad.`;
-  if (plugin.isArchiveFolder(src)) return `“${baseName(src)}” is an archive folder and can't be folded.`;
+  if (plugin.isArchiveFolder(dest)) return `“${baseName(dest)}” is an archive folder — merge into a regular Stashpad.`;
+  if (plugin.isArchiveFolder(src)) return `“${baseName(src)}” is an archive folder and can't be merged.`;
   return null;
 }
 
@@ -296,7 +296,7 @@ export async function foldStashpadFolder(plugin: StashpadPlugin, srcRaw: string,
       const body = [
         `Folder settings from ${name}`,
         "",
-        `“${name}” was folded into “${baseName(dest)}” on ${new Date().toLocaleString()}. These were its own settings; they don't carry over, because this folder keeps its own.`,
+        `“${name}” was merged into “${baseName(dest)}” on ${new Date().toLocaleString()}. These were its own settings; they don't carry over, because this folder keeps its own.`,
         "",
         ...(settingLines.length ? settingLines : ["- (no folder-specific settings)"]),
         "",
@@ -495,19 +495,19 @@ export async function foldStashpadFolder(plugin: StashpadPlugin, srcRaw: string,
       try { await plugin.encryption.forceFullKeyScan(); } catch (e) { console.warn("[Stashpad] fold: key re-scan failed", e); }
     }
     if (relock.plaintext.length) {
-      notify(`⚠️ Fold: ${relock.plaintext.length} locked note${relock.plaintext.length === 1 ? " is" : "s are"} now UNLOCKED in “${baseName(dest)}” — re-locking failed. Lock ${relock.plaintext.length === 1 ? "it" : "them"} by hand:\n${relock.plaintext.join("\n")}`, { duration: 0 });
+      notify(`⚠️ Merge: ${relock.plaintext.length} locked note${relock.plaintext.length === 1 ? " is" : "s are"} now UNLOCKED in “${baseName(dest)}” — re-locking failed. Lock ${relock.plaintext.length === 1 ? "it" : "them"} by hand:\n${relock.plaintext.join("\n")}`, { duration: 0 });
     }
 
     let undone = false;
     const undo = async (): Promise<void> => {
-      if (undone) { notify(`The fold of “${name}” was already undone.`); return; }
+      if (undone) { notify(`The merge of “${name}” was already undone.`); return; }
       // Still THIS fold? An Unfold (or a new folder at the old path) since then
       // makes every step below wrong — and some of them overwrite newer files.
       const live = plugin.settings.foldedFolders?.[src]?.at === manifest.at
         && await app.vault.adapter.exists(shell) && !(await app.vault.adapter.exists(src));
       if (!live) {
         undone = true;
-        notify(`Nothing to undo: “${name}” was unfolded or changed since this fold.`);
+        notify(`Nothing to undo: “${name}” was unmerged or changed since this merge.`);
         return;
       }
       undone = true;
@@ -519,7 +519,7 @@ export async function foldStashpadFolder(plugin: StashpadPlugin, srcRaw: string,
         ? `Stopped undoing the fold of “${name}”: ${failed[failed.length - 1]} failed, and the rest depends on it. Nothing else was changed — see the console.`
         : failed.length
           ? `Undid the fold of “${name}”, but some steps failed (${failed.join(", ")}) — see the console.`
-          : `Undid the fold: “${name}” is back as its own Stashpad.`);
+          : `Undid the merge: “${name}” is back as its own Stashpad.`);
     };
     return { manifest, undo };
   } catch (e) {
@@ -612,7 +612,7 @@ export async function trashPath(app: App, path: string): Promise<void> {
 export class FoldTargetModal extends SuggestModal<string> {
   constructor(app: App, private plugin: StashpadPlugin, private src: string, private onPick: (dest: string) => void) {
     super(app);
-    this.setPlaceholder(`Fold “${baseName(src)}” into…`);
+    this.setPlaceholder(`Merge “${baseName(src)}” into…`);
   }
   getSuggestions(query: string): string[] {
     const q = query.trim();
@@ -639,7 +639,7 @@ export class FoldConfirmModal extends Modal {
   ) { super(app); }
   onOpen(): void {
     this.modalEl.addClass("stashpad-compact-modal");
-    this.titleEl.setText(`Fold “${baseName(this.src)}” into “${baseName(this.dest)}”?`);
+    this.titleEl.setText(`Merge “${baseName(this.src)}” into “${baseName(this.dest)}”?`);
     const c = this.contentEl;
     const n = this.counts.notes;
     c.createEl("p", { text: (n
@@ -660,7 +660,7 @@ export class FoldConfirmModal extends Modal {
     c.createEl("p", { text: "You can undo this.", cls: "setting-item-description" });
     new Setting(c)
       .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
-      .addButton((b) => b.setButtonText("Fold").setCta().onClick(() => { this.chose = true; this.close(); this.onConfirm(); }));
+      .addButton((b) => b.setButtonText("Merge").setCta().onClick(() => { this.chose = true; this.close(); this.onConfirm(); }));
   }
   onClose(): void { this.contentEl.empty(); void this.chose; }
 }
@@ -669,7 +669,7 @@ export class FoldConfirmModal extends Modal {
  *  given) → confirm → fold → notify with Undo / Open. */
 export async function runFoldFlow(plugin: StashpadPlugin, srcRaw: string | null, destRaw?: string): Promise<void> {
   const src = clean(srcRaw ?? "");
-  if (!src) { notify("Open the Stashpad you want to fold first."); return; }
+  if (!src) { notify("Open the Stashpad you want to merge first."); return; }
   const go = async (dest: string): Promise<void> => {
     const refusal = foldRefusal(plugin, src, dest);
     if (refusal) { notify(refusal); return; }
@@ -683,9 +683,9 @@ export async function runFoldFlow(plugin: StashpadPlugin, srcRaw: string | null,
       const res = await foldStashpadFolder(plugin, src, dest);
       if (!res) return;
       const m = res.manifest;
-      plugin.getUndoStack(dest).push({ label: `Fold “${baseName(src)}” into this folder`, undo: res.undo });
+      plugin.getUndoStack(dest).push({ label: `Merge “${baseName(src)}” into this folder`, undo: res.undo });
       plugin.notifications.show({
-        message: `Folded **${baseName(src)}** into **${baseName(dest)}** — ${m.noteCount} note${m.noteCount === 1 ? "" : "s"} moved.`
+        message: `Merged **${baseName(src)}** into **${baseName(dest)}** — ${m.noteCount} note${m.noteCount === 1 ? "" : "s"} moved.`
           + (m.relocked ? ` ${m.relocked} locked note${m.relocked === 1 ? "" : "s"} re-locked with this folder's key.` : "")
           + (m.leftBehind.lockedSubtrees ? ` ${m.leftBehind.lockedSubtrees} locked note${m.leftBehind.lockedSubtrees === 1 ? "" : "s"} stayed in the archived folder${m.relockProblems?.length ? ` (${m.relockProblems.join("; ")})` : ""}.` : ""),
         kind: "success", category: "move", folder: dest, duration: 0,

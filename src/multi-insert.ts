@@ -84,6 +84,19 @@ export class MultiInsert {
   private countEl: HTMLElement | null = null;
   private doc: Document;
   private onChange: ((active: boolean) => void) | null = null;
+  /** 0.566.0: textarea box + scroll at the last repaint, and the rAF loop that
+   *  compares against it. Pins are fixed-positioned, so anything that MOVES the
+   *  textarea without scrolling it (the mobile composer lift returning 0.4s after
+   *  the textarea blurs, the docked panel or list re-laying out) left them
+   *  stranded in the old spot. Watching the geometry catches every cause. */
+  private lastGeom = "";
+  private rafId = 0;
+  /** 0.590.0: caret coords per mark, valid while the text and width are
+   *  unchanged. caretCoords lays out a mirror of the whole text, and the watcher
+   *  can repaint every frame while the composer moves (momentum scroll), so
+   *  without this a long note with many marks did N full layouts per frame. */
+  private coordsKey = "";
+  private coords = new Map<number, { x: number; y: number; height: number }>();
 
   private constructor(private ta: HTMLTextAreaElement) {
     this.doc = ta.ownerDocument ?? document;
@@ -118,6 +131,7 @@ export class MultiInsert {
     this.doc.addEventListener("keydown", this.onKeyDown, true);
     this.doc.defaultView?.addEventListener("resize", this.repaint);
     this.repaint();
+    this.rafId = this.doc.defaultView?.requestAnimationFrame(this.watch) ?? 0;
     // No mark is seeded — the user clicks every spot explicitly, so nothing is
     // ever inserted somewhere they didn't point at. Focus the input so they can
     // type the text while they click.
@@ -198,12 +212,47 @@ export class MultiInsert {
     this.repaint();
   }
 
+  private geom(rect: DOMRect): string {
+    return `${rect.left},${rect.top},${rect.width},${rect.height},${this.ta.scrollLeft},${this.ta.scrollTop}`;
+  }
+
+  /** Once per frame while the session is live: repaint if the textarea moved,
+   *  resized or scrolled since the last paint. One rect read + a string compare. */
+  private watch = (): void => {
+    this.rafId = 0;
+    if (!this.active) return;
+    // 0.590.0: check for a removed textarea/panel every frame, not only on a
+    // geometry change. A textarea hidden (tab switched away) and THEN detached
+    // (tab closed) reads all-zero both times, so no repaint fired and the session
+    // lived on until the next keypress. orphaned() is two isConnected reads.
+    if (this.orphaned()) return;
+    if (this.geom(this.ta.getBoundingClientRect()) !== this.lastGeom) this.repaint();
+    if (this.active) this.rafId = this.doc.defaultView?.requestAnimationFrame(this.watch) ?? 0;
+  };
+
   private repaint = (): void => {
     if (!this.active || !this.layer || !this.countEl || this.orphaned()) return;
     const rect = this.ta.getBoundingClientRect();
+    this.lastGeom = this.geom(rect);
+    // 0.566.0: clip the layer to the textarea's visible inner box (inside the
+    // border, minus any scrollbar). A pin whose line is only a few pixels into
+    // view used to be drawn at full height, hanging out past the textarea onto
+    // the toolbar or the composer's bottom row. Insets are measured against the
+    // layer's own box rather than innerWidth/innerHeight, which can differ from a
+    // fixed inset-0 box on iOS while the keyboard is up.
+    const lr = this.layer.getBoundingClientRect();
+    const boxTop = rect.top + this.ta.clientTop;
+    const boxLeft = rect.left + this.ta.clientLeft;
+    const boxBottom = boxTop + this.ta.clientHeight;
+    const boxRight = boxLeft + this.ta.clientWidth;
+    this.layer.style.clipPath = `inset(${boxTop - lr.top}px ${lr.right - boxRight}px ${lr.bottom - boxBottom}px ${boxLeft - lr.left}px)`;
     this.layer.empty();
+    const key = `${this.ta.clientWidth}\u0000${this.ta.value}`;
+    if (key !== this.coordsKey) { this.coordsKey = key; this.coords.clear(); }
     for (const off of this.marks) {
-      const { x, y, height } = caretCoords(this.ta, off);
+      let c = this.coords.get(off);
+      if (!c) { c = caretCoords(this.ta, off); this.coords.set(off, c); }
+      const { x, y, height } = c;
       const left = rect.left + x - this.ta.scrollLeft;
       const top = rect.top + y - this.ta.scrollTop;
       // Only draw pins whose caret is within the visible textarea box.
@@ -257,6 +306,9 @@ export class MultiInsert {
     this.ta.removeEventListener("scroll", this.repaint);
     this.doc.removeEventListener("keydown", this.onKeyDown, true);
     this.doc.defaultView?.removeEventListener("resize", this.repaint);
+    if (this.rafId) { this.doc.defaultView?.cancelAnimationFrame(this.rafId); this.rafId = 0; }
+    this.lastGeom = "";
+    this.coordsKey = ""; this.coords.clear();
     this.layer?.remove(); this.layer = null;
     this.panel?.remove(); this.panel = null;
     this.input = null; this.countEl = null;

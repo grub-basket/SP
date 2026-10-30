@@ -153,11 +153,16 @@ export class NoteHistoryStore {
     if (!folder || !id) return;
     // 0.346.0: cheap in-memory guard BEFORE any disk I/O — if this body matches
     // the last one we captured for this note, it's a no-op, so skip read + write.
+    // 0.597.2: compare WITHOUT trailing whitespace. An in-app save captures the
+    // edited text as typed, and the authorship tracker then captures the same
+    // edit as read back from the file, which ends in a newline — so every edit
+    // was stored twice, one copy a "\n" longer. Stored text is unchanged.
+    const same = (a: string | undefined, b: string) => a !== undefined && a.replace(/\s+$/, "") === b.replace(/\s+$/, "");
     const key = this.bodyKey(folder, id);
-    if (this.lastBody.get(key) === body) return; // unchanged since last capture
+    if (same(this.lastBody.get(key), body)) return; // unchanged since last capture
     try {
       const prev = await this.read(folder, id);
-      if (prev.length && prev[prev.length - 1].b === body) { this.lastBody.set(key, body); return; } // unchanged
+      if (prev.length && same(prev[prev.length - 1].b, body)) { this.lastBody.set(key, body); return; } // unchanged
       const entry: NoteHistoryEntry = { t: Date.now(), a: author?.id ?? "", n: author?.name ?? "", b: body };
       let next = [...prev, entry];
       const cap = Math.max(2, this.cap());

@@ -41,6 +41,7 @@ import { DEFAULT_STOPWORDS, bodyToSlug, buildAttachmentName, parseLegacyAttachme
 import { safeFileName } from "./safe-filename";
 import { siftRank } from "./suggest-match";
 import { runFoldFlow } from "./folder-fold";
+import { moveFolderFlow } from "./folder-menu";
 import type { FolderPlacement } from "./types";
 import { openFolderSetup } from "./folder-setup-modal";
 import { runUnfoldFlow } from "./folder-split";
@@ -2083,7 +2084,10 @@ export default class StashpadPlugin extends Plugin {
     // moved — this method now runs twice per rename (folder-panel call + the vault
     // rename listener), and an idempotent second pass must not spawn a redundant
     // saveData (which bumps settingsRev + can fire a spurious collision notice).
-    const snap = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter, s.hideCompletedNotes, s.hideChildlessNotes, s.attachmentsOnlyNotes, s.includeAttachmentsInEverything, s.folderIcons, s.noteTemplates, s.colorAliases, s.obscureFolders]);
+    const fields = (): string => JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter, s.hideCompletedNotes, s.hideChildlessNotes, s.attachmentsOnlyNotes, s.includeAttachmentsInEverything, s.folderIcons, s.noteTemplates, s.colorAliases, s.obscureFolders,
+      s.lastUsedFolder, s.recentFolders, s.pinnedNotes, s.lockedSubtrees, s.reEncryptWatch,
+      s.watchedFolders, s.mutedFolders, s.draftsSurfacedFolders, s.folderPanelPinnedAt, s.folderPanelGroupItemOrder]);
+    const snap = fields();
     s.folderPanelPinned = remapArr(s.folderPanelPinned) ?? s.folderPanelPinned;
     s.folderPanelDownranked = remapArr(s.folderPanelDownranked) ?? s.folderPanelDownranked;
     s.folderPanelHidden = remapArr(s.folderPanelHidden) ?? s.folderPanelHidden;
@@ -2105,8 +2109,45 @@ export default class StashpadPlugin extends Plugin {
     s.noteTemplates = remapRec(s.noteTemplates) ?? s.noteTemplates;
     s.colorAliases = remapRec(s.colorAliases) ?? s.colorAliases;
     s.obscureFolders = remapRec(s.obscureFolders) ?? s.obscureFolders;
-    const after = JSON.stringify([s.folderPanelPinned, s.folderPanelDownranked, s.folderPanelHidden, s.archiveFolders, s.searchIncludedFolders, s.searchExcludedFolders, s.defaultArchiveFolder, s.folder, s.folderEncPrefs, s.viewModes, s.encryptionFilter, s.hideCompletedNotes, s.hideChildlessNotes, s.attachmentsOnlyNotes, s.includeAttachmentsInEverything, s.folderIcons, s.noteTemplates, s.colorAliases, s.obscureFolders]);
-    if (after !== snap) await this.saveSettings();
+    // 0.599.0: the remaining folder-keyed records, found while adding Move
+    // folder. Locked (encrypted) notes and the re-encrypt reminders lost track
+    // of their folder after a rename or move, so a locked note could no longer
+    // be found to unlock; pinned notes and the recent / last-used folder lists
+    // pointed at the old path. 0.599.3 (review): also the watched / muted
+    // folders (teammate notifications started again for a moved muted folder),
+    // the drafts reminder list, and the Folders panel's pin times and group
+    // order (whose item keys embed the path as "f:<folder>" / "n:<folder>:<id>").
+    // NOT foldedFolders: a merge redirect is keyed by the merged folder's OLD
+    // path on purpose (old links must keep resolving), and Unmerge checks the
+    // record against the merge's manifest, which keeps the original paths, so
+    // rewriting it broke both. Entries missing a field are passed through.
+    const str = (v: unknown): string => (typeof v === "string" ? v : "");
+    if (s.lastUsedFolder) s.lastUsedFolder = remapOne(s.lastUsedFolder.replace(/\/+$/, ""));
+    // Deduped (first occurrence wins): the open tab records the NEW path as used
+    // the moment it follows the move, so the remapped old entry would repeat it.
+    if (Array.isArray(s.recentFolders)) s.recentFolders = [...new Set(s.recentFolders.map(remapOne))];
+    s.watchedFolders = remapArr(s.watchedFolders) ?? s.watchedFolders;
+    s.mutedFolders = remapArr(s.mutedFolders) ?? s.mutedFolders;
+    s.draftsSurfacedFolders = remapArr(s.draftsSurfacedFolders) ?? s.draftsSurfacedFolders;
+    s.folderPanelPinnedAt = remapRec(s.folderPanelPinnedAt) ?? s.folderPanelPinnedAt;
+    if (s.folderPanelGroupItemOrder) {
+      const item = (k: string): string => {
+        if (k.startsWith("f:")) return `f:${remapOne(k.slice(2))}`;
+        const m = /^n:(.*):([^:]+)$/.exec(k);
+        return m ? `n:${remapOne(m[1])}:${m[2]}` : k;
+      };
+      const out: Record<string, string[]> = {};
+      for (const [k, arr] of Object.entries(s.folderPanelGroupItemOrder)) out[remapOne(k)] = Array.isArray(arr) ? arr.map((x) => (typeof x === "string" ? item(x) : x)) : arr;
+      s.folderPanelGroupItemOrder = out;
+    }
+    s.pinnedNotes = (s.pinnedNotes ?? []).map((p) => (typeof p?.folder === "string" ? { ...p, folder: remapOne(p.folder) } : p));
+    s.lockedSubtrees = (s.lockedSubtrees ?? []).map((l) => {
+      if (!l || typeof l.folder !== "string") return l;
+      const blob = str(l.blob);
+      return { ...l, folder: remapOne(l.folder.replace(/\/+$/, "")), blob: blob.startsWith(from + "/") ? to + blob.slice(from.length) : l.blob };
+    });
+    s.reEncryptWatch = (s.reEncryptWatch ?? []).map((w) => (w && typeof w.folder === "string" ? { ...w, folder: remapOne(w.folder.replace(/\/+$/, "")) } : w));
+    if (fields() !== snap) await this.saveSettings();
   }
 
   // --- 0.541.0: rename-proof folders (see folder-identity.ts) -----------------
@@ -4181,12 +4222,33 @@ export default class StashpadPlugin extends Plugin {
         if (!list || list.querySelector(".stashpad-empty-tab-action")) continue;
         // Created through the list so it belongs to that window's document
         // (an empty tab can live in a pop-out window).
-        const row = list.createDiv({ cls: "empty-state-action tappable stashpad-empty-tab-action", text: "Open Stashpad" });
-        row.addEventListener("click", () => {
+        // 0.597.0: Obsidian 1.14 rebuilt these rows as icon + label pills
+        // (`text-icon-button mod-pill`, an icon span and a label span), and a
+        // plain text row stood out as the one without an icon. Copy whichever
+        // shape the neighbouring rows use, so older versions keep the old look.
+        const modern = !!list.querySelector(".text-icon-button.empty-state-action");
+        let row: HTMLElement;
+        if (modern) {
+          row = list.createDiv({
+            cls: "text-icon-button tappable mod-pill empty-state-action stashpad-empty-tab-action",
+            attr: { tabindex: "0", role: "button", "aria-label": "Open Stashpad" },
+          });
+          setIcon(row.createSpan({ cls: "text-button-icon" }), "square-stack"); // the ribbon's icon
+          row.createSpan({ cls: "text-button-label", text: "Open Stashpad" });
+        } else {
+          row = list.createDiv({ cls: "empty-state-action tappable stashpad-empty-tab-action", text: "Open Stashpad" });
+        }
+        const open = (): void => {
           this.emptyTabTarget = leaf;
           openStashpadEntryPoint();
+        };
+        row.addEventListener("click", open);
+        // The built-in rows are focusable buttons; make Enter / Space work here too.
+        row.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); }
         });
-        // Above "Close", like the other open/create actions.
+        // Above "Close", like the other open/create actions. (1.14 has no Close
+        // row: querySelector returns null and insertBefore appends at the end.)
         list.insertBefore(row, list.querySelector(".mod-close"));
       }
     };
@@ -5234,13 +5296,23 @@ export default class StashpadPlugin extends Plugin {
     this.addCommand({
       // 0.558.0: merge the open Stashpad into another one (src/folder-fold.ts).
       id: "fold-folder",
-      name: "Fold (merge) this folder into another folder…",
+      name: "Merge (fold) this folder into another folder…",
       callback: () => void runFoldFlow(this, this.activeStashpadFolder()),
+    });
+    this.addCommand({
+      // 0.599.1: put the open Stashpad folder inside another folder (src/folder-menu.ts).
+      id: "move-folder",
+      name: "Move this folder into another folder…",
+      callback: () => {
+        const f = this.activeStashpadFolder();
+        if (!f) { notify("Open the Stashpad folder you want to move first."); return; }
+        moveFolderFlow(this, f);
+      },
     });
     this.addCommand({
       // 0.560.0: the durable reverse of a fold (src/folder-split.ts).
       id: "unfold-folder",
-      name: "Unfold a folded folder (split it back out)…",
+      name: "Unmerge (unfold) a merged folder: split it back out…",
       callback: () => void runUnfoldFlow(this),
     });
     this.addCommand({
@@ -10857,6 +10929,11 @@ export default class StashpadPlugin extends Plugin {
     const oldDir = (slash >= 0 ? oldPath.slice(0, slash) : "").replace(/\/+$/, "");
     if (newDir === oldDir) return;                      // in-folder rename, not a move-in
     if (!this.isArchiveFolder(newDir)) return;
+    // 0.599.3: already archived before AND after: its whole Stashpad was renamed
+    // or moved (Move folder…), so this is not a note arriving in the archive.
+    // Treating it as one locked every archived note the user had left plain
+    // whenever "Encrypt archived notes" was on.
+    if (isArchiveSubfolderPath(oldDir)) return;
     // 0.294.0 (perf): only trust a NEGATIVE answer once the `.stashkey` index is
     // complete. Before that "not configured" means "don't know yet", and
     // dropping the move-in here would silently leave an arriving note plaintext
@@ -14062,7 +14139,9 @@ export default class StashpadPlugin extends Plugin {
       authorDepartment: typeof data?.authorDepartment === "string" ? data.authorDepartment : "",
       showAuthor: typeof data?.showAuthor === "boolean" ? data.showAuthor : true,
       showContributors: typeof data?.showContributors === "boolean" ? data.showContributors : true,
-      showLastEdit: typeof data?.showLastEdit === "boolean" ? data.showLastEdit : true,
+      // 0.597.2: fall back to the default (off since 0.592.0), not a hard `true`
+      // that silently overrode it for new installs.
+      showLastEdit: typeof data?.showLastEdit === "boolean" ? data.showLastEdit : DEFAULT_SETTINGS.showLastEdit,
       viewModes: (data?.viewModes && typeof data.viewModes === "object" && !Array.isArray(data.viewModes))
         ? data.viewModes
         : {},

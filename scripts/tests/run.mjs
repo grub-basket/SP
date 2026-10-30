@@ -23,6 +23,7 @@ const ENTRIES = [
   "scripts/tests/note-actions.test.ts",
   "scripts/tests/date-prefix.test.ts",
   "scripts/tests/obscure-reblur.test.ts",
+  "scripts/tests/conflict-copy.test.ts",
 ];
 
 let passed = 0;

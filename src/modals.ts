@@ -144,6 +144,7 @@ import type { NotificationCategory, NotificationRecord, NotificationService } fr
 import { clipboardToMarkdownTable } from "./excel-paste";
 import { richClipboardToMarkdown } from "./rich-paste";
 import { titleFromBasename } from "./slug-service";
+import { isConflictCopy } from "./conflict-copy";
 // Obsidian types `moment` as the namespace (not callable); a callable view.
 const momentFn = moment as unknown as (...args: unknown[]) => moment.Moment;
 
@@ -6245,21 +6246,6 @@ export interface DuplicateIdsModalOpts {
   rescan?: () => DuplicateIdsFolder[];
   /** 0.262.0: fold one copy into another, then discard the source. */
   onMerge?: (sourcePath: string, targetPath: string, folder: string) => Promise<boolean>;
-}
-
-/** 0.261.0: a copy whose filename marks it as a sync conflict.
- *
- *  Obsidian Sync writes "(conflicted copy ...)"; other tools use
- *  "sync-conflict" or a bare "conflict". Matching the word alone covers all of
- *  them, and a false positive costs only sort ORDER — nothing is decided by
- *  this beyond where the row sits. */
-function isConflictCopy(path: string): boolean {
-  // 0.272.4: match the PARENTHETICAL sync-conflict marker Obsidian (and similar
-  // tools) append — `Note (conflicted copy <device> <timestamp>).md` — not a
-  // bare "conflict" anywhere in the name. A note legitimately titled
-  // "…conflict…" is not a conflict copy, which the old /conflict/i mislabelled.
-  const name = path.slice(path.lastIndexOf("/") + 1);
-  return /\((?:conflicted copy|sync[- ]?conflict)\b/i.test(name);
 }
 
 /** How one copy compares to the note being shown. Computed for every row up

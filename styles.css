@@ -174,6 +174,31 @@
 }
 /* The icon carries the accent, so the state still reads at a glance. */
 .stashpad-folder-btn.is-override .stashpad-btn-icon { color: var(--interactive-accent); }
+/* 0.595.0: folder management gear, joined flush to the switcher's right edge
+   like a split button: the shared corners are squared, the negative margin
+   cancels the bar/group gap, and only the switcher draws the divider border. */
+.stashpad-folder-btn:has(+ .stashpad-folder-gear) {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.stashpad-folder-gear {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  margin-left: -6px;
+  padding: 0 6px;
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  border: 1px solid var(--background-modifier-border);
+  border-left: none;
+  border-radius: 0 6px 6px 0;
+  box-shadow: none;
+  cursor: pointer;
+}
+.stashpad-folder-gear:hover { background: var(--background-modifier-hover); color: var(--text-normal); }
+.stashpad-folder-gear .svg-icon { width: 14px; height: 14px; }
 .stashpad-time-filter-btns {
   display: flex;
   gap: 4px;
@@ -2655,6 +2680,12 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 }
 /* Hide the overlay the moment the box has text. */
 .stashpad-composer-input:not(:placeholder-shown) ~ .stashpad-composer-placeholder { display: none; }
+/* 0.594.0: two texts in the overlay. Unfocused: "Hit Space and start typing…"
+   (teaches the Space shortcut). Focused: "Type a note…" (Space would just type
+   a space there). Swapped by the sibling :focus rule, no JS. */
+.stashpad-composer-placeholder-focused { display: none; }
+.stashpad-composer-input:focus ~ .stashpad-composer-placeholder .stashpad-composer-placeholder-idle { display: none; }
+.stashpad-composer-input:focus ~ .stashpad-composer-placeholder .stashpad-composer-placeholder-focused { display: inline; }
 
 .stashpad-composer {
   flex: 0 0 auto;

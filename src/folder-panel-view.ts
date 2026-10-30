@@ -1,14 +1,11 @@
-import { App, ItemView, Menu, Modal, Platform, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
+import { App, ItemView, Menu, Platform, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import { notify } from "./notify";
-import { safeFileName } from "./safe-filename";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_VIEW_TYPE, type StashpadId } from "./types";
 import { ShowRenderGate, renderCountBadge } from "./panels-view";
 import { ConfirmModal, PinAliasModal } from "./modals";
 import { canRevealInOs, osFileManagerName, revealInOsFileManager } from "./os-reveal";
-import { runFoldFlow } from "./folder-fold";
-import { runUnfoldFlow } from "./folder-split";
-import { openFolderSetup } from "./folder-setup-modal";
+import { fillFolderMenu } from "./folder-menu";
 import type { FolderPlacement } from "./types";
 import { titleFromBasename } from "./slug-service";
 
@@ -1151,224 +1148,17 @@ export class StashpadFolderPanelView extends ItemView {
     void this.plugin.openFolderInStashpad(folder, { folderSwitch: true });
   }
 
-  private revealFolder(folder: string): void {
-    const tf = this.app.vault.getAbstractFileByPath(folder.replace(/\/+$/, ""));
-    if (!(tf instanceof TFolder)) { notify("Couldn't find that folder."); return; }
-    const leaf = this.app.workspace.getLeavesOfType("file-explorer")[0];
-    if (!leaf) { notify("File explorer isn't available."); return; }
-    this.app.workspace.revealLeaf(leaf);
-    (leaf.view as any)?.revealInFolder?.(tf);
-  }
-
   private openFolderMenu(e: MouseEvent, folder: string): void {
+    // 0.595.0: the menu itself lives in src/folder-menu.ts, shared with the
+    // main view's folder gear (sidebars are supplemental).
     const menu = new Menu();
-    // Order: non-destructive navigation first, then rename, then delete (isolated).
-    menu.addItem((i) => i.setTitle("Open in new tab").setIcon("plus-square")
-      .onClick(() => void this.plugin.activateViewForFolder(folder, { folderSwitch: true })));
-    menu.addItem((i) => i.setTitle("Reveal in file explorer").setIcon("folder-search")
-      .onClick(() => this.revealFolder(folder)));
-    // 0.215.0: hand off to the OS file manager. Desktop only — mobile has no
-    // file manager to reveal into, so the entry is hidden rather than shown
-    // and failing. Distinct from the entry above, which reveals in Obsidian's
-    // OWN file explorer view.
-    if (canRevealInOs()) {
-      menu.addItem((i) => i.setTitle(`Open in ${osFileManagerName()}`).setIcon("app-window")
-        .onClick(() => revealInOsFileManager(this.app, folder)));
-    }
-    menu.addSeparator();
-    // Placement (pin / downrank / hide). Each is a toggle; setFolderState clears
-    // the other two so a folder is in at most one state.
-    const state = this.folderState(folder);
-    menu.addItem((i) => i.setTitle(state === "pinned" ? "Unpin" : "Pin to top").setIcon("pin")
-      .onClick(() => void this.setFolderState(folder, state === "pinned" ? "normal" : "pinned")));
-    menu.addItem((i) => i.setTitle(state === "downranked" ? "Remove downrank" : "Downrank").setIcon("arrow-down")
-      .onClick(() => void this.setFolderState(folder, state === "downranked" ? "normal" : "downranked")));
-    menu.addItem((i) => i.setTitle("Hide from list").setIcon("eye-off")
-      .onClick(() => void this.setFolderState(folder, "hidden")));
-    // 0.267.0: per-folder obscure default. Lives here rather than in settings
-    // because it is a property OF THIS FOLDER, and this menu is where the
-    // folder's other properties (placement, icon, encryption) already are —
-    // a settings page listing every folder would be a second place to look.
-    const obs = this.plugin.settings.obscureFolders?.[folder.replace(/\/+$/, "")];
-    menu.addItem((i) => i
-      .setTitle(obs === true ? "Don't obscure notes by default" : "Obscure notes by default")
-      .setIcon(obs === true ? "eye" : "eye-off")
-      .onClick(() => void this.plugin.setFolderObscured(folder, obs !== true)));
-    // Only offered once the folder HAS an opinion, since that is the only time
-    // clearing it does anything. Without this there is no way back to
-    // "follow the global switch" — an explicit no would silently outrank it
-    // forever, which is a trap rather than a preference.
-    if (typeof obs === "boolean") {
-      menu.addItem((i) => i.setTitle("Obscuring: follow the global setting").setIcon("rotate-ccw")
-        .onClick(() => void this.plugin.setFolderObscured(folder, null)));
-    }
-    menu.addSeparator();
-    menu.addItem((i) => i.setTitle("Rename…").setIcon("pencil")
-      .onClick(() => this.renameFolder(folder)));
-    // 0.561.0: icon, placement, blur and encryption in one place.
-    menu.addItem((i) => i.setTitle("Edit folder…").setIcon("settings-2")
-      .onClick(() => openFolderSetup(this.plugin, folder, { mode: "edit", onDone: () => this.render() })));
-    // 0.558.0: merge this folder into another Stashpad (src/folder-fold.ts).
-    menu.addItem((i) => i.setTitle("Fold into another folder…").setIcon("folder-input")
-      .onClick(() => void runFoldFlow(this.plugin, folder)));
-    // 0.560.0: only when something was folded INTO this folder.
-    const cleanFolder = folder.replace(/\/+$/, "");
-    if (Object.values(this.plugin.settings.foldedFolders ?? {}).some((f) => f.into === cleanFolder)) {
-      menu.addItem((i) => i.setTitle("Unfold a folder folded in here…").setIcon("folder-output")
-        .onClick(() => void runUnfoldFlow(this.plugin, undefined, cleanFolder)));
-    }
-    // Encryption (Phase 3): lock every top-level note in the folder into separate
-    // .stashenc bundles, or unlock them all back. Only when encryption is set up.
-    if (this.plugin.encryption?.isConfigured?.()) {
-      menu.addSeparator();
-      // 0.276.5: per-folder encryption ON/OFF. Marks the folder as one whose
-      // notes should be encrypted — the Encrypt-all sweep locks any plaintext
-      // in it. Setting it is non-destructive (it does not encrypt on its own);
-      // the two actions below still lock/unlock immediately.
-      const cleanF = folder.replace(/\/+$/, "");
-      const encOn = (this.plugin.settings.folderEncPrefs?.[cleanF])?.encryptContent === true;
-      menu.addItem((i) => i.setTitle(encOn ? "Encryption: ON for this folder" : "Turn on encryption for this folder")
-        .setIcon(encOn ? "shield-check" : "shield")
-        .onClick(async () => {
-          const prefs = this.plugin.settings.folderEncPrefs ?? {};
-          this.plugin.settings.folderEncPrefs = { ...prefs, [cleanF]: { ...(prefs[cleanF] ?? {}), encryptContent: !encOn } };
-          await this.plugin.saveSettings();
-          notify(!encOn
-            ? "Encryption on for this folder. Run “Encrypt (lock) all notes” or Encrypt-all to lock its existing notes."
-            : "Encryption off for this folder.");
-          this.render();
-        }));
-      menu.addItem((i) => i.setTitle("Encrypt (lock) all notes in folder").setIcon("lock")
-        .onClick(() => void this.plugin.lockFolder(folder)));
-      if (this.app.vault.getFiles().some((f) => f.extension === "stashenc" && (f.parent?.path?.replace(/\/+$/, "") ?? "") === folder.replace(/\/+$/, ""))) {
-        menu.addItem((i) => i.setTitle("Decrypt (unlock) all notes in folder").setIcon("unlock")
-          .onClick(() => void this.plugin.unlockFolder(folder)));
-      }
-      // (0.136.0: "Mark as archive folder" is gone — every folder owns an
-      // `archive/` subfolder now; use "Move selection to archive" in a list, or
-      // the aggregated Archived view to browse. Encryption of archived notes is
-      // the per-folder "Encrypt archived notes" setting.)
-
-      // 0.98.31: open the encrypted-trash tab (recoverable secure-deleted notes).
-      menu.addItem((i) => i.setTitle("Open trash").setIcon("rotate-ccw")
-        .onClick(() => this.plugin.openEncryptedTrash()));
-    }
-    menu.addSeparator();
-    menu.addItem((i) => {
-      i.setTitle("Delete folder…").setIcon("trash").onClick(() => this.deleteFolder(folder));
-      (i as any).setWarning?.(true);
-    });
+    fillFolderMenu(this.plugin, menu, folder, () => this.render());
     menu.showAtMouseEvent(e);
-  }
-
-  private renameFolder(folder: string): void {
-    const cleaned = folder.replace(/\/+$/, "");
-    const tf = this.app.vault.getAbstractFileByPath(cleaned);
-    if (!(tf instanceof TFolder)) { notify("Couldn't find that folder."); return; }
-    const current = tf.name;
-    new RenameFolderModal(this.app, current, async (next) => {
-      const safe = safeFileName(next);
-      if (!safe || safe === current) return;
-      const parent = tf.parent?.path && tf.parent.path !== "/" ? `${tf.parent.path}/` : "";
-      const target = `${parent}${safe}`;
-      if (this.app.vault.getAbstractFileByPath(target)) { notify(`"${safe}" already exists.`); return; }
-      // 0.140.3 (review): re-validate — the folder could've moved/been deleted
-      // by sync while the rename modal sat open.
-      if (!(this.app.vault.getAbstractFileByPath(cleaned) instanceof TFolder)) { notify("That folder no longer exists."); return; }
-      try {
-        await this.app.fileManager.renameFile(tf, target);
-        // 0.140.3: carry ALL path-keyed settings (default folder + placement +
-        // archive + per-folder prefs, incl. descendants) to the new path.
-        await this.plugin.remapFolderPathInSettings(cleaned, target);
-        notify(`Renamed to "${safe}".`);
-      } catch (err) {
-        console.warn("[Stashpad] folder rename failed", err);
-        notify("Rename failed (see console).");
-      }
-    }).open();
-  }
-
-  private deleteFolder(folder: string): void {
-    const cleaned = folder.replace(/\/+$/, "");
-    const tf = this.app.vault.getAbstractFileByPath(cleaned);
-    if (!(tf instanceof TFolder)) { notify("Couldn't find that folder."); return; }
-    const noteCount = this.app.vault.getMarkdownFiles()
-      .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === cleaned
-        || (f.path.startsWith(cleaned + "/"))).length;
-    const name = tf.name;
-    // 0.213.2: deleting a folder takes its _attachments with it, so notes in
-    // OTHER folders that embed those files lose their images with no warning
-    // and no obvious cause. Say so before the delete, not after — this is the
-    // one moment the user can still act on it.
-    const outside = this.plugin.outsideReferencesToFolderAttachments(cleaned);
-    const lines = [
-      `This moves the entire folder — about ${noteCount} note${noteCount === 1 ? "" : "s"} plus its attachments and exports — to the trash.`,
-      "You can restore it from your system/Obsidian trash.",
-    ];
-    if (outside.paths.length) {
-      lines.push(
-        "",
-        `⚠️ ${outside.paths.length} attachment${outside.paths.length === 1 ? "" : "s"} in **${name}** ${outside.paths.length === 1 ? "is" : "are"} used by notes in ${outside.folders.length} other folder${outside.folders.length === 1 ? "" : "s"}: ${outside.folders.map((f) => `**${f}**`).join(", ")}.`,
-        `Deleting **${name}** breaks ${outside.paths.length === 1 ? "that embed" : "those embeds"} — the notes stay, but the ${outside.paths.length === 1 ? "image" : "images"} stop resolving.`,
-        // 0.214.2: the files themselves are rendered below as CLICKABLE rows
-        // (setFileList) rather than inlined here as text. The user is being
-        // asked to decide about these specific files, which they cannot do
-        // without looking at them — and the list is unbounded, so it needs its
-        // own capped scroll region rather than growing the modal.
-        `Click any of them to open it${outside.paths.length > 1 ? "" : ""}:`,
-        `To keep ${outside.paths.length === 1 ? "it" : "them"}, move ${outside.paths.length === 1 ? "the file" : "those files"} out of **${name}** first, or restore the folder from the trash afterwards.`,
-      );
-    }
-    const modal = new ConfirmModal(
-      this.app,
-      `Delete "${name}"?`,
-      lines.join("\n"),
-      "Delete folder",
-      async (confirmed) => {
-        if (!confirmed) return;
-        // Closes open tabs, moves the folder to .trash, and posts a persistent
-        // notification with an Undo action (move-back). The vault "delete"
-        // listener is suppressed for this path so it won't double-notify.
-        await this.plugin.deleteStashpadFolderWithUndo(tf);
-      },
-      "Cancel",
-      // Focus Cancel when this delete would break notes elsewhere, so a stray
-      // Enter can't confirm it.
-      outside.paths.length > 0,
-    );
-    // Every affected file, not a truncated sample — the scroll region makes a
-    // long list safe, so there is no reason to hide any of them.
-    if (outside.paths.length) modal.setFileList(outside.paths);
-    modal.open();
   }
 
   /** 0.140.3 (review): run any in-flight divider-drag cleanup on view close so
    *  a mid-drag detach doesn't leak the document pointer listeners. */
   async onClose(): Promise<void> { this.dividerCleanup?.(); this.contentEl.empty(); }
-}
-
-/** Tiny single-input modal for renaming a folder. */
-class RenameFolderModal extends Modal {
-  private delivered = false;
-  constructor(app: App, private current: string, private onSubmit: (next: string) => void) {
-    super(app);
-  }
-  onOpen(): void {
-    this.modalEl.addClass("stashpad-compact-modal");
-    this.contentEl.empty();
-    this.titleEl.setText("Rename folder");
-    const input = this.contentEl.createEl("input", { type: "text" });
-    input.addClass("stashpad-folderpanel-rename-input");
-    input.value = this.current;
-    const footer = this.contentEl.createDiv({ cls: "stashpad-folderpanel-rename-footer" });
-    footer.createEl("button", { text: "Cancel" }).onclick = () => this.close();
-    const go = footer.createEl("button", { cls: "mod-cta", text: "Rename" });
-    const submit = () => { this.delivered = true; const v = input.value; this.close(); this.onSubmit(v); };
-    go.onclick = submit;
-    this.scope.register([], "Enter", (e) => { e.preventDefault(); if (input.value.trim()) submit(); });
-    window.requestAnimationFrame(() => { input.focus(); input.select(); });
-  }
-  onClose(): void { this.contentEl.empty(); }
 }
 
 /** Open the folder panel in the LEFT sidebar (reuse if already open). */
