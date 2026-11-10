@@ -24,6 +24,8 @@ const ENTRIES = [
   "scripts/tests/date-prefix.test.ts",
   "scripts/tests/obscure-reblur.test.ts",
   "scripts/tests/conflict-copy.test.ts",
+  "scripts/tests/notification-text.test.ts",
+  "scripts/tests/attachment-split.test.ts",
 ];
 
 let passed = 0;

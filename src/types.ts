@@ -263,6 +263,21 @@ export function isReservedSubfolderName(name: string): boolean {
   return RESERVED_SUBFOLDER_NAMES.has(name) || SUBFOLDER_ONLY_RESERVED_NAMES.has(name);
 }
 
+/** 0.604.0: the Stashpad folder a directory belongs to: the nearest of `folders`
+ *  at or above `dir`, or null when it isn't inside any of them. A subfolder
+ *  (`archive/`, `trash/`, a plain subfolder) belongs to the Stashpad holding it,
+ *  and a nested Stashpad owns its own contents. */
+export function owningFolder(dir: string, folders: ReadonlySet<string>): string | null {
+  let d = (dir || "").replace(/\/+$/, "");
+  while (d) {
+    if (folders.has(d)) return d;
+    const i = d.lastIndexOf("/");
+    if (i < 0) return null;
+    d = d.slice(0, i);
+  }
+  return null;
+}
+
 /** 0.136.0: the archive subfolder for a Stashpad folder. */
 export function archiveSubfolderOf(folder: string): string {
   return `${(folder || "").replace(/\/+$/, "")}/archive`;

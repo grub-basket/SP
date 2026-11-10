@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type CachedMetadata, type Events, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId, hasFmValue, newId, readId, sameId } from "./id-service";
-import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, parseAuthorRef, toAttachmentLink, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
+import { type ComposerDraft, STASHPAD_DETAIL_VIEW_TYPE, STASHPAD_FOLDER_PANEL_VIEW_TYPE, STASHPAD_PANELS_VIEW_TYPE, STASHPAD_VIEW_TYPE, STASHPAD_HOVER_SOURCE, parseAuthorRef, toAttachmentLink, owningFolder, isInReservedSubfolder, isArchiveSubfolderPath, archiveSubfolderOf, type PinnedNoteRef, type StashpadId , isReservedSubfolderName} from "./types";
 import { StashpadDetailView, openStashpadDetailView } from "./detail-view";
 import { StashpadView, properCaseFolderPath, DeletedTrashSuggestModal } from "./view";
 import { QuickCaptureModal } from "./quick-capture";
@@ -70,6 +70,9 @@ import { planDatePrefixRenames, executeDatePrefixRenames, DatePrefixConfirmModal
 import { createAliasesForFolder, deriveCleanTitle } from "./alias-service";
 import { NotificationService, buildFileActions, boldFragment, type NotificationAction, type NotificationOpen } from "./notifications";
 import { notify, setNotifySink } from "./notify";
+import { AttachmentPickerModal, SplitPreviewModal, executeAttachmentSplit, findSplitRuns, notifySplitResult, otherCopiesOf, planAttachmentSplit, repointRestoredNotes, showOtherCopiesWarning, undoSplitRun } from "./attachment-split";
+import { renamedPathList } from "./attachment-split-core";
+import { formatGroupedPaths } from "./notification-text";
 import { visibleDrafts } from "./drafts";
 import { applyTombstones, diskNeedsDraftRewrite, draftTimes, mergeDraftsNewest, mergeTombstones, normalizeTombstones, recordDraftDeletions, type DraftTombstones } from "./draft-tombstones";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
@@ -913,10 +916,27 @@ export default class StashpadPlugin extends Plugin {
    *  Rebootstrap never run at the same time (each refuses while the other
    *  holds its flag), and only one sweep runs at once. */
   datePrefixRenameRunning = false;
+  /** 0.605.0: true while a shared-attachment split or its undo runs. Like the
+   *  date sweep, it never overlaps Rebootstrap. */
+  attachmentSplitRunning = false;
   /** 0.580.0: notes whose links the add/remove-dates sweep is rewriting, with
    *  the time (ms) until which their body changes are not the user's edits.
    *  Per note, so the user's real edits elsewhere still count during a sweep. */
   linkRewriteQuiet = new WeakMap<TFile, number>();
+  /** 0.604.0: every file and folder that existed when the current Rebootstrap
+   *  started; null when none is running. Anything else appeared mid-run (a drop,
+   *  a sync download, a note the user just wrote), may still be half written,
+   *  and is left for the next run. Compares TFile objects, not timestamps: a
+   *  sync resets creation times, and an object keeps its identity when a later
+   *  step renames it. */
+  private rebootstrapKnownFiles: Set<TAbstractFile> | null = null;
+  /** 0.604.0: what this run left alone, for the summary. */
+  private rebootstrapLeftAlone = new Set<TAbstractFile>();
+  private readonly rebootstrapIgnores = (f: TAbstractFile): boolean => {
+    if (!this.rebootstrapKnownFiles || this.rebootstrapKnownFiles.has(f)) return false;
+    this.rebootstrapLeftAlone.add(f);
+    return true;
+  };
   /** 0.600.0: Stashpad is about to rename `file` (the re-slug after an edit), so
    *  Obsidian will rewrite the links to it in other notes: the parent's
    *  `children` list, each child's `parentLink`, and any `[[link]]` in a body.
@@ -2359,6 +2379,16 @@ export default class StashpadPlugin extends Plugin {
     let dest = `${trashDir}/${name}`;
     for (let n = 1; await adapter.exists(dest); n++) dest = `${trashDir}/${name} (${n})`;
 
+    // 0.605.5: found now, while the files can still be read; said once the delete
+    // has worked. Copies inside this folder are going too, so they don't count.
+    const inFolder = `${cleaned}/`;
+    const survivors = await otherCopiesOf(
+      this,
+      this.app.vault.getFiles().filter((f) => f.path.startsWith(inFolder) && f.extension !== "md" && f.extension !== "json"
+        && (f.path.includes("/_attachments/") || f.path.includes("/_attachment-originals/"))),
+      (f) => f.path.startsWith(inFolder),
+    );
+
     this.suppressedFolderDeletes.add(cleaned);
     window.setTimeout(() => this.suppressedFolderDeletes.delete(cleaned), 5000);
     const closed = this.closeStashpadTabsFor(cleaned);
@@ -2376,6 +2406,7 @@ export default class StashpadPlugin extends Plugin {
     const msg = closed > 0
       ? `Deleted “${name}” — closed ${closed} open tab${closed === 1 ? "" : "s"}.`
       : `Deleted “${name}”.`;
+    showOtherCopiesWarning(this, survivors);
     this.notifications.show({
       message: msg,
       kind: "warning",
@@ -2391,6 +2422,27 @@ export default class StashpadPlugin extends Plugin {
             window.setTimeout(() => this.suppressedFolderDeletes.delete(cleaned), 5000);
             await adapter.rename(dest, cleaned);
             notify(`Restored “${name}”.`);
+            // 0.605.4: an attachment may have been split while this was in the
+            // trash. The vault picks up an adapter-level move gradually, so wait
+            // until the folder's note count has held for a few checks, then go
+            // again shortly after in case indexing had only paused. A repeat only
+            // touches links that still need it.
+            void (async () => {
+              const prefix = `${cleaned}/`;
+              const sleep = (ms: number): Promise<void> => new Promise((r) => window.setTimeout(r, ms));
+              const notes = (): TFile[] => this.app.vault.getMarkdownFiles().filter((f) => f.path.startsWith(prefix));
+              let last = -1;
+              let steady = 0;
+              for (let i = 0; i < 60 && steady < 3; i++) {
+                await sleep(500);
+                const n = notes().length;
+                steady = n > 0 && n === last ? steady + 1 : 0;
+                last = n;
+              }
+              await repointRestoredNotes(this, notes(), [cleaned]);
+              await sleep(5000);
+              await repointRestoredNotes(this, notes(), [cleaned]);
+            })();
             // notif-open: ok — undo reopens the restored folder in a NEW tab
             // (activateViewForFolder never reuses or navigates an existing one).
             void this.activateViewForFolder(cleaned);
@@ -3621,6 +3673,11 @@ export default class StashpadPlugin extends Plugin {
     // RenderCacheStore.rename): the file's content is unchanged by a rename.
     this.registerEvent(this.app.vault.on("delete", (f) => this.renderCacheStore.evict(f.path, { flush: true })));
     this.registerEvent(this.app.vault.on("rename", (f, oldPath) => this.renderCacheStore.rename(oldPath, f.path)));
+    // 0.605.0: "always keep shared" follows a renamed file or folder.
+    this.registerEvent(this.app.vault.on("rename", (f, oldPath) => {
+      const next = renamedPathList(this.settings.attachmentAlwaysShared ?? [], oldPath, f.path);
+      if (next) { this.settings.attachmentAlwaysShared = next; void this.saveSettings(); }
+    }));
     // Fork siblings: when a family member is deleted (single / subtree / multi /
     // fork-undo), drop it from every other member's `fork-siblings`. Debounced
     // so a burst of deletes triggers one vault scan. (Renames are handled by
@@ -4179,8 +4236,96 @@ export default class StashpadPlugin extends Plugin {
       if (vv) kbH = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
       document.body.style.setProperty("--stashpad-vv-bottom-gap", `${kbH}px`);
       document.body.classList.toggle("stashpad-keyboard-open", kbH > 100);
+      refreshNavbarOverlap(kbH > 100);
     };
+    // 0.606.0: how far Obsidian's phone bottom bar (.mobile-navbar) reaches up
+    // over the bottom of the workspace. styles.css lifts the composer by this
+    // much (+ a small gap) instead of the old hand-tuned 110px, which was
+    // ~64px too much under Obsidian 1.15's overlay bar and 144px too much
+    // where the bar sits in normal flow (the view already ends above it).
+    //   --stashpad-navbar-overlap : px of the workspace the bar covers (0 when
+    //                               the bar is in flow; fixed bars overlay).
+    //   body.stashpad-has-navbar  : a bar is displayed at all (tablets hide
+    //                               it), so CSS knows whether to fall back to
+    //                               the bare home-indicator inset.
+    // Measured from the bar's RESTING box: the translateY Obsidian applies when
+    // it auto-hides the bar on scroll (.is-hidden-nav) is subtracted, so the
+    // composer does not jump while the bar slides away and back. Not
+    // re-measured while the keyboard is up: the floating bar rides the
+    // keyboard then, and the composer drops its lift while focused anyway.
+    let lastOverlap = -1;
+    let lastHasBar: boolean | null = null;
+    let navDisposed = false;
+    const refreshNavbarOverlap = (keyboardOpen: boolean): void => {
+      // A late timeout (the 250/1000ms passes below, the mode-change re-check)
+      // can land after unload; don't re-publish what the cleanup removed.
+      if (navDisposed || keyboardOpen) return;
+      // visualViewport doesn't always report the keyboard (a webview that
+      // resizes itself leaves kbH ~0), so also honour Obsidian's own
+      // --keyboard-height, which is what moves the floating bar.
+      const obsKb = parseFloat(getComputedStyle(document.body).getPropertyValue("--keyboard-height"));
+      if (obsKb > 0) return;
+      const bar = document.querySelector(".mobile-navbar") as HTMLElement | null;
+      let hasBar = false;
+      let overlap = 0;
+      if (bar && bar.isConnected) {
+        const cs = getComputedStyle(bar);
+        if (cs.display !== "none" && bar.offsetHeight > 0) {
+          hasBar = true;
+          const r = bar.getBoundingClientRect();
+          let ty = 0;
+          if (cs.transform && cs.transform !== "none") {
+            try { ty = new DOMMatrixReadOnly(cs.transform).m42; } catch { ty = 0; }
+          }
+          const restingTop = r.top - ty;
+          // Two lookups, not one selector list: a list returns the first match
+          // in DOCUMENT order, which would be the outer .workspace.
+          const ws = (document.querySelector(".workspace-split.mod-root")
+            ?? document.querySelector(".workspace")) as HTMLElement | null;
+          const wsBottom = ws ? ws.getBoundingClientRect().bottom : window.innerHeight;
+          overlap = Math.max(0, Math.round(wsBottom - restingTop));
+        }
+      }
+      if (overlap !== lastOverlap) {
+        lastOverlap = overlap;
+        document.body.style.setProperty("--stashpad-navbar-overlap", `${overlap}px`);
+      }
+      if (hasBar !== lastHasBar) {
+        lastHasBar = hasBar;
+        document.body.classList.toggle("stashpad-has-navbar", hasBar);
+      }
+    };
+    this.register(() => {
+      navDisposed = true;
+      document.body.style.removeProperty("--stashpad-navbar-overlap");
+      document.body.classList.remove("stashpad-has-navbar");
+    });
     refreshGeometry();
+    if (Platform.isMobile) {
+      // The bar's mode is a body class Obsidian flips from Settings → Appearance
+      // (is-floating-nav / auto-full-screen) or on scroll (is-hidden-nav), with
+      // no event. Watch only those classes so our own body-class writes above
+      // can't feed back into the observer.
+      const NAV_CLASSES = ["is-floating-nav", "auto-full-screen", "is-hidden-nav", "is-phone", "is-tablet"];
+      const navSig = (): string => NAV_CLASSES.filter((c) => document.body.classList.contains(c)).join(" ");
+      let lastNavSig = navSig();
+      const navObserver = new MutationObserver(() => {
+        const sig = navSig();
+        if (sig === lastNavSig) return;
+        lastNavSig = sig;
+        refreshGeometry();
+        // The bar animates margin/transform for ~0.3s after a mode change.
+        window.setTimeout(refreshGeometry, 350);
+      });
+      navObserver.observe(document.body, { attributes: true, attributeFilter: ["class"] });
+      this.register(() => navObserver.disconnect());
+      // The floating bar slides back down when the keyboard closes (a
+      // margin-bottom transition); settle on its final position.
+      this.registerDomEvent(document, "transitionend", (e: TransitionEvent) => {
+        const t = e.target as HTMLElement | null;
+        if (t && t.classList && t.classList.contains("mobile-navbar")) refreshGeometry();
+      });
+    }
     if (vv) {
       vv.addEventListener("resize", refreshGeometry);
       vv.addEventListener("scroll", refreshGeometry);
@@ -5512,6 +5657,21 @@ export default class StashpadPlugin extends Plugin {
       callback: () => { void this.runDatePrefixRename("remove"); },
     });
     this.addCommand({
+      id: "split-shared-attachments",
+      name: "Give each folder its own copy of shared attachments (split, duplicate)",
+      callback: () => { void this.runAttachmentSplit(); },
+    });
+    this.addCommand({
+      id: "undo-attachment-split",
+      name: "Undo the last shared attachment split",
+      callback: () => { void this.undoAttachmentSplit(); },
+    });
+    this.addCommand({
+      id: "delete-all-attachment-copies",
+      name: "Find and delete all copies of an attachment",
+      callback: () => { new AttachmentPickerModal(this.app, this).open(); },
+    });
+    this.addCommand({
       id: "stashpad-rebootstrap-all",
       name: "Rebootstrap all Stashpad folders (backfill metadata + rename stale titles)",
       // 0.118.4: progress + success feedback lives in runRebootstrapWithUI
@@ -6714,10 +6874,90 @@ export default class StashpadPlugin extends Plugin {
    *  per folder, weighted by note count) that's replaced in place by a
    *  persistent success (or error) Notice. Shared by the settings button + the
    *  command so both get the same feedback. */
+  /** 0.605.0: is another bulk file job in the way? Says so if it is. */
+  private attachmentSplitBlocked(): boolean {
+    if (this.attachmentSplitRunning) { notify("Stashpad: shared attachments are already being updated. Wait for that to finish first.", 6000); return true; }
+    if (this.rebootstrapInProgress) { notify("Stashpad: Rebootstrap is running. Wait for it to finish, then try again.", 6000); return true; }
+    if (this.datePrefixRenameRunning) { notify("Stashpad: file names are being updated. Wait for that to finish, then try again.", 6000); return true; }
+    return false;
+  }
+
+  private repaintStashpadViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(STASHPAD_VIEW_TYPE)) {
+      (leaf.view as { forceReconcileRender?: () => void })?.forceReconcileRender?.();
+    }
+  }
+
+  /** 0.605.0: check everything (read-only), show the preview, and only on
+   *  confirm copy the chosen files, one at a time, behind a Stop button.
+   *  `quiet` is for the end of Rebootstrap: no message when there's nothing to do. */
+  async runAttachmentSplit(opts: { quiet?: boolean } = {}): Promise<void> {
+    // Rebootstrap holds its flag for a short tail after it finishes.
+    for (let i = 0; i < 40 && this.rebootstrapInProgress; i++) await new Promise((r) => window.setTimeout(r, 100));
+    if (this.attachmentSplitBlocked()) return;
+    let plan;
+    try { plan = await planAttachmentSplit(this); }
+    catch (e) { notify(`Stashpad: couldn't check shared attachments: ${(e as Error).message}`, 8000); return; }
+    if (!plan.supported) {
+      if (!opts.quiet) notify("Stashpad: attachments are stored in one shared place, so there is nothing to split. This only applies to the “Per-Stashpad” storage setting.", 8000);
+      return;
+    }
+    if (!plan.items.length && (opts.quiet || !plan.keptShared.length)) {
+      if (!opts.quiet) notify("Stashpad: no attachments are shared between folders.", 6000);
+      return;
+    }
+    const modal = new SplitPreviewModal(this.app, this, plan);
+    modal.open();
+    const items = await modal.result;
+    if (!items?.length || this.attachmentSplitBlocked()) return;
+    this.attachmentSplitRunning = true;
+    const ui = datePrefixProgressNotice("Copying shared attachments…");
+    try {
+      const r = await executeAttachmentSplit(this, items, { onProgress: ui.update, shouldStop: ui.stopRequested });
+      ui.hide();
+      this.repaintStashpadViews();
+      notifySplitResult(this, r, () => { void this.undoAttachmentSplit(r.runId); });
+    } catch (e) {
+      ui.finish(false, "Could not finish copying", (e as Error).message);
+    } finally {
+      this.attachmentSplitRunning = false;
+    }
+  }
+
+  /** 0.605.0: put a split back. No id means the most recent one not yet undone. */
+  async undoAttachmentSplit(runId?: string): Promise<void> {
+    if (this.attachmentSplitBlocked()) return;
+    const runs = await findSplitRuns(this);
+    const run = runId ? runs.find((r) => r.runId === runId) : runs.find((r) => !r.undone);
+    if (!run || run.undone) { notify("Stashpad: there is no attachment split to undo.", 6000); return; }
+    const count = run.logs.reduce((n, l) => n + l.log.entries.filter((e) => e.status === "done" || e.status === "partial").length, 0);
+    const ok = await new Promise<boolean>((resolve) => {
+      new ConfirmModal(this.app, "Undo attachment split", `Put ${count} attachment${count === 1 ? "" : "s"} back as shared files? Originals return from the archive, links point at them again, and the copies move to the trash. A copy that was edited since is kept.`, "Undo split", resolve).open();
+    });
+    if (!ok || this.attachmentSplitBlocked()) return;
+    this.attachmentSplitRunning = true;
+    try {
+      const r = await undoSplitRun(this, run);
+      this.repaintStashpadViews();
+      const lines = [`Put ${r.restored} attachment${r.restored === 1 ? "" : "s"} back as shared.`];
+      if (r.keptCopies.length) {
+        lines.push(`Kept ${r.keptCopies.length} cop${r.keptCopies.length === 1 ? "y" : "ies"}:`);
+        for (const k of r.keptCopies) lines.push(`• ${k.path}: ${k.reason}`);
+      }
+      for (const p of r.problems) lines.push(`• ${p.path.split("/").pop()}: ${p.reason}`);
+      this.notifications.show({ message: lines.join("\n"), kind: r.keptCopies.length || r.problems.length ? "warning" : "success", category: "attachment", duration: r.problems.length ? 0 : 8000 });
+    } catch (e) {
+      this.notifications.show({ message: `Could not finish undoing the split: ${(e as Error).message}`, kind: "error", category: "attachment", duration: 0 });
+    } finally {
+      this.attachmentSplitRunning = false;
+    }
+  }
+
   /** 0.580.0: the "Add / Remove dates on file names" command: check
    *  everything (read-only), show what would change, and only on confirm rename
    *  the files one at a time behind a progress notice with a Stop button. */
   async runDatePrefixRename(mode: DatePrefixMode): Promise<void> {
+    if (this.attachmentSplitRunning) { notify("Stashpad: shared attachments are still being copied. Wait for that to finish first.", 6000); return; }
     if (this.datePrefixRenameRunning) { notify("Stashpad: file names are already being updated. Wait for that to finish first.", 6000); return; }
     if (this.rebootstrapInProgress) { notify("Stashpad: Rebootstrap is running. Wait for it to finish, then try again.", 6000); return; }
     this.datePrefixRenameRunning = true;
@@ -6773,6 +7013,8 @@ export default class StashpadPlugin extends Plugin {
         if (r.datesAdded > 0) parts.push(`added dates to ${r.datesAdded} file name${r.datesAdded === 1 ? "" : "s"}`);
       }
       if (r.authors > 0) parts.push(`${r.authors} author${r.authors === 1 ? "" : "s"} in registry`);
+      const leftAlone = this.rebootstrapLeftAlone.size;
+      if (leftAlone > 0) parts.push(`left ${leftAlone} file${leftAlone === 1 ? "" : "s"} that appeared during the run for next time`);
       // Replace the progress notice in place with a persistent success notice.
       // (No need to animate the bar to 100% — el.empty() below removes it
       // synchronously before the browser can paint, so it would never show.)
@@ -6784,6 +7026,9 @@ export default class StashpadPlugin extends Plugin {
       if (r.attachmentsSkipped > 0) {
         notify(`Stashpad: ${r.attachmentsSkipped} attachment${r.attachmentsSkipped === 1 ? "" : "s"} need renaming, but skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links”, then rebootstrap again.`, 12000);
       }
+      // 0.605.0: not awaited, so Rebootstrap's own callers don't sit waiting on
+      // a preview the user may leave open.
+      if (this.settings.attachmentSplitInRebootstrap) void this.runAttachmentSplit({ quiet: true });
       return r;
     } catch (e) {
       el.empty();
@@ -6800,13 +7045,25 @@ export default class StashpadPlugin extends Plugin {
     if (this.datePrefixRenameRunning) {
       throw new Error("Adding or removing dates on file names is still running. Wait for it to finish (or stop it), then run Rebootstrap again.");
     }
+    if (this.attachmentSplitRunning) {
+      throw new Error("Shared attachments are still being copied. Wait for that to finish (or stop it), then run Rebootstrap again.");
+    }
+    // 0.604.0: one at a time. Two overlapping runs would act on each other's
+    // half-finished renames, and the first run's tail timer below would lift
+    // the second run's suppression early.
+    if (this.rebootstrapInProgress) {
+      throw new Error("Rebootstrap is still running or has only just finished. Try again in a moment.");
+    }
     // 0.79.19: suppress contribution stamping for the duration (+ a short
     // tail to catch async link-rewrite modify events) so rebootstrap never
     // bumps `modified`/`created` or adds contributors.
     this.rebootstrapInProgress = true;
+    this.rebootstrapLeftAlone.clear();
+    this.rebootstrapKnownFiles = new Set(this.app.vault.getAllLoadedFiles());
     try {
       return await this.rebootstrapAllFoldersInner(onProgress);
     } finally {
+      this.rebootstrapKnownFiles = null;
       window.setTimeout(() => {
         this.rebootstrapInProgress = false;
         // Suppression is lifted — repaint open Stashpad views ONCE so they
@@ -6883,8 +7140,16 @@ export default class StashpadPlugin extends Plugin {
         // adoption fixes — same code path as the standalone command.
         if (this.settings.autoImport) {
           try {
-            const swept = await this.importService.importLooseInto(folder);
+            const made = new Set<string>();
+            const swept = await this.importService.importLooseInto(folder, { skip: this.rebootstrapIgnores, made });
             imported += swept.files + swept.folders + swept.stashes;
+            // 0.604.1: the notes the sweep reports creating are this run's own
+            // work, and the backfill below is meant to stamp them. Only those:
+            // anything else that turned up meanwhile stays left alone.
+            for (const p of made) {
+              const f = this.app.vault.getAbstractFileByPath(p);
+              if (f) this.rebootstrapKnownFiles?.add(f);
+            }
           } catch (e) { console.warn("Stashpad: loose sweep failed", folder, e); }
         }
         // Standalone (no-view-required) frontmatter backfill: reads
@@ -6894,7 +7159,7 @@ export default class StashpadPlugin extends Plugin {
         // 0.271.7: a full rebootstrap also backfills readable aliases
         // (append-only). This is the "run rebootstrap again" path the user
         // means; the narrower recovery-link backfill stays alias-free.
-        const stats = await rebootstrapFolderFrontmatter(this.app, folder, { writeAliases: true });
+        const stats = await rebootstrapFolderFrontmatter(this.app, folder, { writeAliases: true, skip: this.rebootstrapIgnores });
         fmChecked += stats.checked;
         fmWritten += stats.written;
         idsQuoted += stats.quoted;
@@ -6913,7 +7178,7 @@ export default class StashpadPlugin extends Plugin {
         // "Rebuild" button is just a scoped shortcut to this same pass — not an
         // alias for the whole rebootstrap.
         if (okfSet.has(folder.replace(/\/+$/, ""))) {
-          try { await rebuildOkfForFolder(this.app, folder); } catch (e) { console.warn("Stashpad: OKF rebuild during rebootstrap failed", folder, e); }
+          try { await rebuildOkfForFolder(this.app, folder, { skip: this.rebootstrapIgnores }); } catch (e) { console.warn("Stashpad: OKF rebuild during rebootstrap failed", folder, e); }
         }
         touched.push(folder);
       } catch (e) {
@@ -6954,7 +7219,7 @@ export default class StashpadPlugin extends Plugin {
     let datesAdded = 0;
     if (this.settings.fileDatePrefixInRebootstrap) {
       try {
-        const plan = await planDatePrefixRenames(this, "add");
+        const plan = await planDatePrefixRenames(this, "add", this.rebootstrapIgnores);
         if (plan.items.length && !plan.linkUpdatesOn) {
           notify(`Stashpad: ${plan.items.length} file name${plan.items.length === 1 ? "" : "s"} could get a date, but were skipped to protect links. Enable Settings → Files & Links → “Automatically update internal links”, then rebootstrap again.`, 12000);
         } else if (plan.items.length) {
@@ -6986,22 +7251,26 @@ export default class StashpadPlugin extends Plugin {
         });
       }
     } catch (e) { console.warn("Stashpad: duplicate-id scan during rebootstrap failed", e); }
-    if (strays.moved || strays.shared) {
+    // 0.605.0: files the user chose to keep shared aren't news. With the
+    // Rebootstrap offer turned on, the preview is about to list them anyway.
+    const keptShared = new Set(this.settings.attachmentAlwaysShared ?? []);
+    const sharedPaths = this.settings.attachmentSplitInRebootstrap ? [] : strays.sharedPaths.filter((p) => !keptShared.has(p));
+    if (strays.moved || sharedPaths.length) {
       const lines: string[] = [];
       if (strays.moved) lines.push(`Moved ${strays.moved} attachment${strays.moved === 1 ? "" : "s"} into the folder whose notes actually use ${strays.moved === 1 ? "it" : "them"}.`);
-      if (strays.shared) {
+      if (sharedPaths.length) {
+        const one = sharedPaths.length === 1;
         lines.push(
-          `${strays.shared} attachment${strays.shared === 1 ? " is" : "s are"} shared across SEVERAL folders, so ${strays.shared === 1 ? "it was" : "they were"} left where ${strays.shared === 1 ? "it is" : "they are"} — there is no single correct home, and moving ${strays.shared === 1 ? "it" : "them"} would break the other folders' notes. Deleting a folder that holds one of these breaks the notes elsewhere that link to it.`,
+          `${sharedPaths.length} attachment${one ? " is" : "s are"} shared across several folders and ${one ? "was" : "were"} left in place. Deleting ${one ? "it" : "one"}, or the folder holding ${one ? "it" : "one"}, breaks the notes elsewhere that link to ${one ? "it" : "them"}.`,
+          formatGroupedPaths(sharedPaths),
         );
-        for (const p of strays.sharedPaths.slice(0, 10)) lines.push(`• \`${p}\``);
-        if (strays.sharedPaths.length > 10) lines.push(`• …+${strays.sharedPaths.length - 10} more (see console)`);
-        if (strays.sharedPaths.length > 10) console.warn("[Stashpad] shared attachments:", strays.sharedPaths);
       }
       this.notifications.show({
         message: lines.join("\n"),
-        kind: strays.shared ? "warning" : "success",
+        kind: sharedPaths.length ? "warning" : "success",
         category: "attachment",
-        duration: strays.shared ? 0 : 6000,
+        duration: sharedPaths.length ? 0 : 6000,
+        actions: sharedPaths.length ? [{ label: "Give each folder a copy…", onClick: () => { void this.runAttachmentSplit(); } }] : [],
       });
     }
     // 0.527.0: record any bare all-digit ids Rebootstrap quoted (or had to skip).
@@ -7025,6 +7294,7 @@ export default class StashpadPlugin extends Plugin {
       return p === dir;
     });
     for (const file of files) {
+      if (this.rebootstrapIgnores(file)) continue; // 0.604.0
       const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
       const fmIdRaw = fm?.id;
       const fmId = typeof fmIdRaw === "string" ? fmIdRaw : null;
@@ -7077,6 +7347,7 @@ export default class StashpadPlugin extends Plugin {
     let renamed = 0;
     let skipped = 0;
     for (const file of files) {
+      if (this.rebootstrapIgnores(file)) continue; // 0.604.0
       const legacy = parseLegacyAttachmentPrefix(file.name);
       if (!legacy) continue;
       const desired = buildAttachmentName(legacy.rest, legacy.stamp);
@@ -7125,10 +7396,22 @@ export default class StashpadPlugin extends Plugin {
     const refFolders = new Map<string, Set<string>>();
     const refNotes = new Map<string, Set<string>>();
     const links = this.app.metadataCache.resolvedLinks ?? {};
+    // 0.604.0: count by Stashpad folder, not by immediate parent. A note in
+    // `A/archive` used to count as a different folder from `A`, so a file used
+    // only inside A was reported as shared across several folders.
+    const folderSet = new Set(folders.map((f) => f.replace(/\/+$/, "")));
+    // 0.604.1: a file a mid-run note links to waits for the next run. That note
+    // shouldn't decide where the file goes, and moving the file without
+    // rewriting the note would break its link.
+    const linkedFromNewNote = new Set<string>();
     for (const [src, targets] of Object.entries(links)) {
-      const srcDir = src.includes("/") ? src.slice(0, src.lastIndexOf("/")) : "";
+      const rawDir = src.includes("/") ? src.slice(0, src.lastIndexOf("/")) : "";
+      const srcDir = owningFolder(rawDir, folderSet) ?? rawDir;
+      const srcFile = this.app.vault.getAbstractFileByPath(src);
+      const fromNewNote = !!srcFile && this.rebootstrapIgnores(srcFile);
       for (const target of Object.keys(targets ?? {})) {
         if (!target.includes("/_attachments/")) continue;
+        if (fromNewNote) { linkedFromNewNote.add(target); continue; }
         let set = refFolders.get(target);
         if (!set) { set = new Set(); refFolders.set(target, set); }
         set.add(srcDir);
@@ -7147,6 +7430,7 @@ export default class StashpadPlugin extends Plugin {
       // Snapshot — renaming mutates the live children listing mid-loop.
       const files = af.children.filter((c): c is TFile => c instanceof TFile);
       for (const file of files) {
+        if (this.rebootstrapIgnores(file) || linkedFromNewNote.has(file.path)) continue; // 0.604.0
         const refs = refFolders.get(file.path);
         if (!refs || refs.size === 0) { unreferenced += 1; continue; }
         if (refs.size > 1) { shared += 1; sharedPaths.push(file.path); continue; }
@@ -7178,11 +7462,11 @@ export default class StashpadPlugin extends Plugin {
             const nf = this.app.vault.getAbstractFileByPath(notePath);
             if (!(nf instanceof TFile)) continue;
             try {
-              const body = await this.app.vault.read(nf);
-              const next = body
+              // 0.604.0: process, not read then modify, so an edit landing in
+              // between (the user typing, a sync) can't be overwritten.
+              await this.app.vault.process(nf, (body) => body
                 .split(`[[${from}]]`).join(`[[${target}]]`)
-                .split(`[[${from}|`).join(`[[${target}|`);
-              if (next !== body) await this.app.vault.modify(nf, next);
+                .split(`[[${from}|`).join(`[[${target}|`));
             } catch (e) {
               console.warn(`Stashpad: couldn't repoint ${notePath} after re-homing ${from}`, e);
             }
@@ -13722,6 +14006,7 @@ export default class StashpadPlugin extends Plugin {
         const fdir = f.parent?.path?.replace(/\/+$/, "") ?? "";
         if (fdir !== dir && !fdir.startsWith(dir + "/")) continue;
         if (isInReservedSubfolder(f.path)) continue; // skip _archive/_attachments/…
+        if (this.rebootstrapIgnores(f)) continue; // 0.604.0
         const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as any;
         if (!fm || typeof fm.id !== "string" || !fm.id) continue;
         const att: any = fm.attachments;

@@ -1,6 +1,7 @@
 import { App, moment } from "obsidian";
 import { getTemplatesFormats } from "./settings";
 import { newId } from "./id-service";
+import type { ToolbarPlatform } from "./formatting-toolbar";
 
 /** 0.338.0: a user text snippet. May be surfaced as a toolbar button and/or
  *  auto-expanded when its `trigger` is typed. `value` may contain template
@@ -27,6 +28,9 @@ export interface Snippet {
    *  "start" (before the built-in buttons) or "end" (after them, the default).
    *  Only meaningful when `button` is on. `undefined` (legacy) = "end". */
   buttonPlacement?: "start" | "end";
+  /** 0.602.0: which devices show the toolbar button. On the other kind of
+   *  device the snippet sits in the Snippets menu instead. `undefined` = both. */
+  buttonPlatform?: ToolbarPlatform;
 }
 
 export function makeSnippet(partial: Partial<Snippet> = {}): Snippet {
@@ -40,6 +44,7 @@ export function makeSnippet(partial: Partial<Snippet> = {}): Snippet {
     enabled: partial.enabled,
     caseSensitive: partial.caseSensitive,
     buttonPlacement: partial.buttonPlacement,
+    buttonPlatform: partial.buttonPlatform,
   };
 }
 
@@ -63,6 +68,8 @@ export function normalizeSnippet(x: unknown): Snippet | null {
     caseSensitive: typeof o.caseSensitive === "boolean" ? o.caseSensitive : undefined,
     // 0.351.0: preserve only a recognized value; undefined (legacy) = "end".
     buttonPlacement: o.buttonPlacement === "start" || o.buttonPlacement === "end" ? o.buttonPlacement : undefined,
+    // 0.602.0: preserve only a one-device choice; anything else = both.
+    buttonPlatform: o.buttonPlatform === "desktop" || o.buttonPlatform === "mobile" ? o.buttonPlatform : undefined,
   };
 }
 

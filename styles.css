@@ -3762,14 +3762,39 @@ body.is-phone .modal.stashpad-compact-modal.stashpad-breadcrumb-modal {
 /* 0.239.0: + the home-indicator inset. 110px was tuned against a simulator
    where the inset is 0, so on a real iPhone the composer sat that much closer
    to the bottom edge than intended. */
+/* 0.606.0: the hand-tuned 110px is gone. What the lift has to clear is
+   Obsidian's phone bottom bar (.mobile-navbar), and how much of the view that
+   bar covers depends on its mode: in Obsidian 1.15 with "auto full screen" or
+   the floating pill it is position:fixed and OVERLAYS the bottom ~80px / ~84px
+   of the view; otherwise it sits in normal flow and the view already ends
+   above it (covers 0). 110px + inset left a ~62px blank band above the
+   overlay bar on an iPhone, and 144px in the in-flow case.
+   src/main.ts now measures the overlap from the bar's resting box and
+   publishes --stashpad-navbar-overlap plus body.stashpad-has-navbar:
+   - bar shown  → lift = overlap + 8px. The overlap of a fixed bar already
+     includes the home-indicator area (it is the bar's own bottom padding),
+     and an in-flow bar covers the indicator itself, so the inset is NOT added
+     again.
+   - no bar (iPad hides it, or JS has not measured yet) → clear the home
+     indicator only. Obsidian's own --view-bottom-spacing (0 unless a phone
+     bar overlays the view) is folded in so a fixed bar is still cleared in
+     the moment before the first measurement.
+   Longhands only (a margin shorthand below would reset this). The focus rule
+   and the delayed restore below are unchanged. */
 .stashpad-view.is-mobile .stashpad-composer {
-  margin-bottom: calc(110px + var(--sp-safe-bottom));
+  margin-bottom: calc(max(var(--sp-safe-bottom), var(--view-bottom-spacing, 0px)) + 8px);
   /* When the textarea blurs (keyboard dismisses), Obsidian's leaf
      resize lags ~300ms behind the focus change — restoring the full
      lift instantly leaves the composer momentarily off-screen until
      the user taps something else and forces a re-layout. Delay the
      restoration so the leaf has time to grow back. */
   transition: margin-bottom 0s linear 0.4s;
+}
+/* 0.606.0: a phone bar is shown → clear exactly what it covers (see above).
+   Specificity (0,4,1) stays below the focus rule's (0,5,0), so focusing the
+   textarea still drops the lift to 0. */
+body.stashpad-has-navbar .stashpad-view.is-mobile .stashpad-composer {
+  margin-bottom: calc(var(--stashpad-navbar-overlap, 0px) + 8px);
 }
 /* Drop the lift ONLY when the composer textarea itself has focus.
    Using :focus-within on the view caught any focus shift inside the
@@ -5611,6 +5636,15 @@ body.is-mobile .stashpad-notice-overlay {
 .stashpad-notif-msg {
   grid-column: 2;
   white-space: pre-wrap;
+}
+/* 0.603.0: the whole text of a long notification. */
+.stashpad-notif-full {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+  max-height: 60vh;
+  overflow-y: auto;
 }
 .stashpad-notif-actions-snapshot {
   grid-column: 2;
@@ -10860,6 +10894,8 @@ button.stashpad-reaction-chip,
 /* 0.397.0: the Drafts toolbar button lights up when the current folder surfaces
    its drafts reminder chip. */
 .stashpad-composer-toolbar-btn.stashpad-toolbar-drafts.is-active { color: var(--interactive-accent); }
+/* 0.601.0: keyboard lock on — accent icon, like Drafts. */
+.stashpad-composer-toolbar-btn.stashpad-toolbar-kblock.is-active { color: var(--interactive-accent); }
 .stashpad-reply-chip-host { display: none; }
 .stashpad-reply-chip-host.is-active { display: block; padding: 2px 2px 6px; }
 /* 0.298.0: two-line reply chip — "Reply to" label row + cancel, title beneath. */
@@ -11346,6 +11382,14 @@ body.theme-dark .stashpad-note-text mark[data-highlight="purple"] { background: 
 
 /* 0.320.5: icon-registry input width (store lint forbids literal el.style.width). */
 .stashpad-cmdicon-input { width: 10em; }
+
+/* 0.602.0: Toolbar buttons rows on mobile. With arrows, a toggle, the device
+   dropdown, the icon field and reset, the controls squeezed the button's name to
+   nothing at phone width. Put the controls on their own line under the name. */
+.is-mobile .stashpad-toolbar-btn-row { flex-wrap: wrap; }
+.is-mobile .stashpad-toolbar-btn-row > .setting-item-info { flex: 1 1 100%; }
+.is-mobile .stashpad-toolbar-btn-row > .setting-item-control { flex: 1 1 100%; min-width: 0; max-width: 100%; box-sizing: border-box; flex-wrap: nowrap; justify-content: flex-start; }
+.is-mobile .stashpad-toolbar-btn-row .stashpad-cmdicon-input { width: auto; min-width: 0; flex: 1 1 4em; }
 
 /* 0.321.2: submenu row in the ⋮-menu builder + the submenu editor modal. */
 .stashpad-action-builder .setting-item.is-submenu { border-left: 2px solid var(--interactive-accent); padding-left: 8px; }
@@ -12834,3 +12878,27 @@ body.is-mobile .stashpad-showcase .stashpad-showcase-att-pin { min-height: 32px;
 .stashpad-focus-pick.is-done .stashpad-focus-pick-title { text-decoration: line-through; color: var(--text-muted); }
 .stashpad-focus-picker-create { display: inline-flex; align-items: center; gap: 6px; }
 .stashpad-focus-picker-create:disabled { opacity: 0.5; }
+
+/* 0.605.0: shared-attachment split preview and "delete all copies". */
+.stashpad-attsplit-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.stashpad-attsplit-holder {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  margin-top: 12px;
+}
+.stashpad-attsplit-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.stashpad-attsplit-main { display: flex; align-items: flex-start; gap: 8px; flex: 1 1 220px; min-width: 0; }
+.stashpad-attsplit-text { min-width: 0; }
+.stashpad-attsplit-name { overflow-wrap: anywhere; }
+.stashpad-attsplit-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); overflow-wrap: anywhere; }
+.stashpad-attsplit-keep { font-size: var(--font-ui-smaller); }
+.stashpad-attsplit-kept { margin-top: 12px; }

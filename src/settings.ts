@@ -23,7 +23,7 @@ import { CommandPickModal } from "./command-pick";
 import { guessCommandIcon } from "./icon-guess";
 import { LogModal, ColorPickerModal, NotificationHistoryModal, EncryptionPasswordModal, TypeToConfirmModal, ConfirmModal, SnippetEditModal, SnippetImportModal, parseTimeOfDay, formatTimeChip } from "./modals";
 import { makeSnippet } from "./snippets";
-import { resolveToolbarButtons, type ToolbarButtonConfig } from "./formatting-toolbar";
+import { TOOLBAR_PLATFORM_LABELS, TOOLBAR_PLATFORM_SHORT, readToolbarPlatform, resolveToolbarButtons, type ToolbarButtonConfig } from "./formatting-toolbar";
 import { CATEGORY_LABELS, type NotificationCategory } from "./notifications";
 import { startHotkeyRecording, prettifyChord } from "./hotkey-recorder";
 import { DEFAULT_STOPWORDS, DATE_PREFIX_SEPS, formatDatePrefix, type DatePrefixSep } from "./slug-service";
@@ -600,10 +600,22 @@ export interface StashpadSettings {
   attachmentLocation: "per-folder" | "universal" | "obsidian";
   /** Destination for attachmentLocation === "universal". */
   attachmentUniversalFolder: string;
+  /** 0.605.0: after Rebootstrap, offer to give each folder its own copy of any
+   *  attachment several folders share. Always shows the preview first. */
+  attachmentSplitInRebootstrap: boolean;
+  /** 0.605.0: files at or above this size (MB) start unticked in the split
+   *  preview. 0 turns the warning off. */
+  attachmentSplitWarnMB: number;
+  /** 0.605.0: vault paths the user chose to always keep shared. */
+  attachmentAlwaysShared: string[];
   /** When true (default), the composer textarea is re-focused after each
    *  Enter-submit so you can keep typing the next note. Off = focus stays
    *  in the list so arrow-keys keep working without an extra click. */
   autofocusComposerAfterSend: boolean;
+  /** 0.601.0 (mobile): the formatting toolbar's lock button. While on, tapping
+   *  or scrolling the list doesn't close the keyboard, and a send keeps it up
+   *  (as if autofocusComposerAfterSend were on). Off by default; remembered. */
+  composerKeyboardLock: boolean;
   /** 0.132.0: focus the COMPOSER when a Stashpad note/view is opened or
    *  re-activated. Off (default) focuses the list instead, so you can keyboard-
    *  navigate immediately rather than the composer grabbing focus every time.
@@ -1513,7 +1525,11 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   linkUpdateWarningShown: false,
   attachmentLocation: "per-folder",
   attachmentUniversalFolder: "Attachments",
+  attachmentSplitInRebootstrap: false,
+  attachmentSplitWarnMB: 25,
+  attachmentAlwaysShared: [],
   autofocusComposerAfterSend: true,
+  composerKeyboardLock: false,
   focusComposerOnOpen: false,
   searchOpensInContext: true,
   popoutDuplicates: true,
@@ -2821,7 +2837,7 @@ export class StashpadSettingTab extends PluginSettingTab {
         if (list.length === 0) h.createEl("p", { cls: "setting-item-description", text: "No snippets yet — add one below." });
         for (const sn of list) {
           const off = sn.enabled === false; // 0.346.0
-          const desc = [sn.trigger ? `trigger “${sn.trigger}”${sn.caseSensitive ? " (case-sensitive)" : ""}` : null, sn.button ? "toolbar button" : "in menu", off ? "disabled" : null].filter(Boolean).join(" · ");
+          const desc = [sn.trigger ? `trigger “${sn.trigger}”${sn.caseSensitive ? " (case-sensitive)" : ""}` : null, sn.button ? (sn.buttonPlatform ? `toolbar button (${sn.buttonPlatform} only)` : "toolbar button") : "in menu", off ? "disabled" : null].filter(Boolean).join(" · ");
           const row = new Setting(h).setName(`${sn.name || "(unnamed)"}${off ? " (off)" : ""}`).setDesc(desc);
           if (off) row.setClass("stashpad-snippet-off"); // 0.346.0: muted when deactivated
           // 0.431.0: show the snippet's toolbar icon in its row (it was invisible
@@ -2881,15 +2897,17 @@ export class StashpadSettingTab extends PluginSettingTab {
    *  full effective order is persisted the moment anything is touched, so a saved
    *  config always carries the complete ordering (unconfigured = default order). */
   private toolbarButtonsBody(host: HTMLElement, rebuild: () => void): void {
-    this.sectionHeader(host, "🧰 Toolbar buttons", "The built-in buttons on the formatting toolbar (above the composer and note editor). Drag with the arrows to reorder, toggle a button off to hide it, or type a Lucide icon name to change its icon. Snippet buttons are managed below and can be placed at the start or end of the bar per snippet.");
+    this.sectionHeader(host, "🧰 Toolbar buttons", "The built-in buttons on the formatting toolbar (above the composer and note editor). Drag with the arrows to reorder, toggle a button off to hide it, choose whether it shows on desktop, mobile or both, or type a Lucide icon name to change its icon. Snippet buttons are managed below and can be placed at the start or end of the bar per snippet.");
     const listBox = host.createDiv({ cls: "stashpad-action-builder" });
     // Persist the full current effective order (all built-ins, in order) so
     // reorder / hide / icon all round-trip; an empty override array = defaults.
     const persist = async (rows: ReturnType<typeof resolveToolbarButtons>): Promise<void> => {
-      this.plugin.settings.toolbarButtons = rows.map(({ def, hidden, icon }) => {
+      this.plugin.settings.toolbarButtons = rows.map(({ def, hidden, icon, platform }) => {
         const entry: ToolbarButtonConfig = { id: def.id };
         if (hidden) entry.hidden = true;
         if (icon && icon !== def.icon) entry.icon = icon;
+        // 0.602.0: a fixed `onlyOn` button isn't a choice, so it isn't saved.
+        if (!def.onlyOn && platform !== "both") entry.platform = platform;
         return entry;
       });
       await this.plugin.saveSettings();
@@ -2914,6 +2932,21 @@ export class StashpadSettingTab extends PluginSettingTab {
         row.addToggle((t) => t.setValue(!hidden).setTooltip("Show on toolbar").onChange(async (v) => {
           const n = rows.slice(); n[i] = { ...n[i], hidden: !v }; await persist(n);
         }));
+        // 0.602.0: which devices show it. A button that only works on one kind
+        // of device (the keyboard lock) says so instead of offering a choice.
+        row.setClass("stashpad-toolbar-btn-row");
+        if (def.onlyOn) {
+          const fixed = row.controlEl.createSpan({ cls: "setting-item-description", text: TOOLBAR_PLATFORM_SHORT[def.onlyOn] });
+          fixed.title = `${TOOLBAR_PLATFORM_LABELS[def.onlyOn]} — this button only works there`;
+        } else {
+          row.addDropdown((d) => {
+            for (const p of ["both", "desktop", "mobile"] as const) d.addOption(p, TOOLBAR_PLATFORM_SHORT[p]);
+            d.selectEl.title = "Show this button on desktop, mobile or both";
+            d.setValue(r.platform).onChange(async (v) => {
+              const n = rows.slice(); n[i] = { ...n[i], platform: readToolbarPlatform(v) }; await persist(n);
+            });
+          });
+        }
         row.addText((t) => {
           new IconSuggest(this.app, t.inputEl);
           t.setValue(icon).setPlaceholder(def.icon);
@@ -5258,6 +5291,40 @@ export class StashpadSettingTab extends PluginSettingTab {
         });
       }),
       ["attachment", "attachments", "shared", "universal", "folder"],
+    ));
+    cats.foldersStorage.push(this.renderDef(
+      "Give each folder its own copy of shared attachments",
+      "Finds attachments used by more than one Stashpad folder and shows them to you first. Each folder then gets its own copy with its links updated, and the original moves to its folder's archive, so deleting a file only affects one folder. You can undo a run.",
+      (s) => s.addButton((b) => b.setButtonText("Review…").onClick(() => { void this.plugin.runAttachmentSplit(); })),
+      ["attachment", "attachments", "shared", "split", "copy", "duplicate", "copies"],
+    ));
+    cats.foldersStorage.push(this.renderDef(
+      "Rebootstrap offers to split shared attachments",
+      "When on, Rebootstrap finishes by showing the same review. Nothing is copied until you confirm.",
+      (s) => s.addToggle((t) => {
+        t.setValue(this.plugin.settings.attachmentSplitInRebootstrap ?? false);
+        t.onChange(async (v) => {
+          this.plugin.settings.attachmentSplitInRebootstrap = v;
+          await this.plugin.saveSettings();
+        });
+      }),
+      ["rebootstrap", "attachment", "shared", "split", "copy"],
+    ));
+    cats.foldersStorage.push(this.renderDef(
+      "Ask before copying files over this size (MB)",
+      "Larger shared attachments start unticked in the review, because each copy takes the same space again and has to sync. Set 0 to turn this off.",
+      (s) => s.addText((t) => {
+        t.inputEl.type = "number";
+        t.inputEl.min = "0";
+        t.setValue(String(this.plugin.settings.attachmentSplitWarnMB ?? 25));
+        t.inputEl.addEventListener("blur", async () => {
+          const n = Number(t.getValue());
+          this.plugin.settings.attachmentSplitWarnMB = Number.isFinite(n) && n >= 0 ? n : 25;
+          t.setValue(String(this.plugin.settings.attachmentSplitWarnMB));
+          await this.plugin.saveSettings();
+        });
+      }),
+      ["attachment", "size", "large", "warning", "split", "copy"],
     ));
 
     // 0.229.0: the search-scope pills become a declarative GROUP of real

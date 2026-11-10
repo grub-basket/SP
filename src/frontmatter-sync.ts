@@ -430,7 +430,7 @@ export class FrontmatterSyncQueue {
 export async function rebootstrapFolderFrontmatter(
   app: App,
   folder: string,
-  opts?: { onlyIds?: ReadonlySet<string>; writeAliases?: boolean },
+  opts?: { onlyIds?: ReadonlySet<string>; writeAliases?: boolean; skip?: (f: TFile) => boolean },
 ): Promise<{ checked: number; written: number; quoted: number; unsafeIds: number }> {
   type Entry = { file: TFile; id: string; parent: string; created: string };
 
@@ -520,6 +520,9 @@ export async function rebootstrapFolderFrontmatter(
     // move dirties a handful of notes; rewriting the folder is what made
     // one move look like a whole-folder re-upload to Obsidian Sync.
     if (opts?.onlyIds && !opts.onlyIds.has(entry.id)) continue;
+    // 0.604.0: a note Rebootstrap must leave alone is still indexed above, so
+    // its parent's children list stays complete. It just isn't written to.
+    if (opts?.skip?.(entry.file)) continue;
     checked += 1;
     // 0.527.0: quote a bare all-digit `id:` / `parent:` (value unchanged; see
     // numeric-id-quote.ts). A cache-only check, so ordinary notes cost no IO.

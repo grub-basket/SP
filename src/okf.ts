@@ -62,7 +62,7 @@ export function okfFolders(noteTemplates: Record<string, string> | undefined, te
  *  link fields (okfParent/okfChildren) are always reconciled; okfType/okfTitle/
  *  okfTimestamp are only filled when absent (user owns them after). Reads from
  *  DISK (cache lags after edits), skip-if-equal, paced writes. */
-export async function rebuildOkfForFolder(app: App, folder: string): Promise<{ checked: number; written: number }> {
+export async function rebuildOkfForFolder(app: App, folder: string, opts?: { skip?: (f: TFile) => boolean }): Promise<{ checked: number; written: number }> {
   const cleaned = folder.replace(/\/+$/, "");
   type E = { file: TFile; id: string; parent: string; modified: string; created: string };
   const byId = new Map<string, E>();
@@ -81,6 +81,7 @@ export async function rebuildOkfForFolder(app: App, folder: string): Promise<{ c
   let checked = 0, written = 0;
   for (const e of byId.values()) {
     if (e.id === ROOT_ID) continue; // the home note is represented by index.md (Phase 3)
+    if (opts?.skip?.(e.file)) continue; // 0.604.0: appeared mid-Rebootstrap; indexed above, not written
     checked += 1;
     const parentLink = (e.parent && e.parent !== ROOT_ID && byId.get(e.parent)) ? okfLink(byId.get(e.parent)!.file) : null;
     const childLinks = (childrenByParent.get(e.id) ?? []).map((cid) => byId.get(cid)).filter((x): x is E => !!x).map((x) => okfLink(x.file));

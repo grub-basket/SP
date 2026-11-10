@@ -1,4 +1,4 @@
-import { TFile, TFolder } from "obsidian";
+import { TFile, TFolder, type TAbstractFile } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, RESERVED_FRONTMATTER, toAttachmentLink, yamlQuote } from "./types";
@@ -35,6 +35,13 @@ export function exportSubfolderName(exportFolder: string | undefined): string {
 // note or auto-imported (unlike `.stash`, which is an export to import). It just
 // sits locked until the user explicitly unlocks it.
 const NON_NOTE_EXTENSIONS = new Set([STASH_EXT, "edtz", "stashenc", "stashmeta"]);
+
+/** 0.604.1: how a sweep cooperates with Rebootstrap. `skip` names what it must
+ *  leave alone; `made` collects the note paths it really created. */
+export interface SweepGuard {
+  skip?: (f: TAbstractFile) => boolean;
+  made?: Set<string>;
+}
 
 /** One processed import, kept so the batch can be undone. */
 type ImportRecord =
@@ -820,10 +827,10 @@ export class ImportService {
    *  the number imported. This is what lets us retire "Everything" mode:
    *  once loose files are swept into notes, there's nothing left for that
    *  mode to surface. */
-  async importLooseFilesIn(folder: string): Promise<number> {
+  async importLooseFilesIn(folder: string, guard: SweepGuard = {}): Promise<number> {
     const root = folder.replace(/\/+$/, "");
     const candidates = this.app.vault.getFiles()
-      .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === root);
+      .filter((f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === root && !guard.skip?.(f));
     const files: TFile[] = [];
     for (const f of candidates) {
       if (await this.isStillImportable(f)) files.push(f);
@@ -837,10 +844,12 @@ export class ImportService {
         const rec = f.extension === "md" ? await this.importMarkdown(f) : await this.importOtherFile(f);
         if (rec) {
           n++;
+          const notePaths = rec.kind === "folder" ? rec.notePaths : [rec.notePath];
+          for (const p of notePaths) guard.made?.add(p);
           this.plugin.importLog.append({
             ts: new Date().toISOString(), folder: rec.folder, kind: rec.kind,
             originalName: f.name, size, sourcePath: f.path,
-            notePaths: rec.kind === "folder" ? rec.notePaths : [rec.notePath],
+            notePaths,
           });
         }
       } catch (e) {
@@ -858,12 +867,17 @@ export class ImportService {
    *  "import loose files" command so a folder pasted in via Finder (which the
    *  live watcher's create event often misses) still gets converted. Returns
    *  the number of folders imported. No batch confirm — explicit action. */
-  async importLooseFoldersIn(folder: string): Promise<number> {
+  async importLooseFoldersIn(folder: string, guard: SweepGuard = {}): Promise<number> {
     const root = folder.replace(/\/+$/, "");
     const rootFolder = this.app.vault.getAbstractFileByPath(root);
     if (!(rootFolder instanceof TFolder)) return 0;
+    // 0.604.1: a folder still arriving waits whole. Importing it would read
+    // children that may be half written and then move the folder away.
+    const skip = guard.skip;
+    const stillArriving = (f: TFolder): boolean => !!skip && (skip(f)
+      || f.children.some((c) => (c instanceof TFolder ? stillArriving(c) : skip(c))));
     const subs = rootFolder.children.filter(
-      (c): c is TFolder => c instanceof TFolder && !this.isReservedSubfolder(c.name),
+      (c): c is TFolder => c instanceof TFolder && !this.isReservedSubfolder(c.name) && !stillArriving(c),
     );
     if (subs.length === 0) return 0;
     await this.plugin.importLog.load();
@@ -874,6 +888,7 @@ export class ImportService {
         const rec = await this.importFolder(sub);
         if (rec && rec.kind === "folder") {
           n++;
+          for (const p of rec.notePaths) guard.made?.add(p);
           this.plugin.importLog.append({
             ts: new Date().toISOString(), folder: rec.folder, kind: rec.kind,
             originalName: sub.name, size: null, sourcePath,
@@ -973,6 +988,7 @@ export class ImportService {
   private async importOneStash(
     file: TFile, root: string, existingIds: Set<string>, auto: boolean,
     promptOpts: { allowLater?: boolean; onLater?: () => void } = {},
+    made?: Set<string>,
   ): Promise<boolean> {
     try {
       const rawBytes = new Uint8Array(await this.app.vault.readBinary(file));
@@ -984,6 +1000,7 @@ export class ImportService {
       const buf = await resolveStashBytes(this.app, rawBytes, { ...promptOpts, secretId: secretIdForStashName(file.basename) });
       if (!buf) return false; // cancelled / "remind me later" — leave the file
       const summary = await importStashZip(this.app, buf, root, existingIds, { stripReserved: true });
+      for (const p of summary.notePaths) made?.add(p); // 0.605.2
       // Merge any hex→name color aliases the bundle carried (e.g. from the web
       // importer) into the destination folder, so the names show in the color UI.
       if (summary.colorAliases) {
@@ -1162,16 +1179,16 @@ export class ImportService {
     return f instanceof TFile ? f : null;
   }
 
-  async importLooseStashesIn(folder: string, opts: { auto?: boolean } = {}): Promise<number> {
+  async importLooseStashesIn(folder: string, opts: { auto?: boolean } & SweepGuard = {}): Promise<number> {
     const root = folder.replace(/\/+$/, "");
     const stashes = this.app.vault.getFiles().filter(
-      (f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === root && f.extension === STASH_EXT,
+      (f) => (f.parent?.path?.replace(/\/+$/, "") ?? "") === root && f.extension === STASH_EXT && !opts.skip?.(f),
     );
     if (stashes.length === 0) return 0;
     const existingIds = this.liveRootIds(root);
     let n = 0;
     for (const file of stashes) {
-      if (await this.importOneStash(file, root, existingIds, !!opts.auto)) n++;
+      if (await this.importOneStash(file, root, existingIds, !!opts.auto, {}, opts.made)) n++;
     }
     return n;
   }
@@ -1182,9 +1199,9 @@ export class ImportService {
    *  "import loose files & folders" command and rebootstrap's provisioning step
    *  call this, so the import behavior (and any fix to it) stays in ONE place
    *  for both. Returns per-kind counts. */
-  async importLooseInto(folder: string, opts: { auto?: boolean } = {}): Promise<{ files: number; folders: number; stashes: number }> {
-    const files = await this.importLooseFilesIn(folder);
-    const folders = await this.importLooseFoldersIn(folder);
+  async importLooseInto(folder: string, opts: { auto?: boolean } & SweepGuard = {}): Promise<{ files: number; folders: number; stashes: number }> {
+    const files = await this.importLooseFilesIn(folder, opts);
+    const folders = await this.importLooseFoldersIn(folder, opts);
     const stashes = await this.importLooseStashesIn(folder, opts);
     return { files, folders, stashes };
   }

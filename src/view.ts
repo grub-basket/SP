@@ -30,9 +30,10 @@ import { OrderStore } from "./order-store";
 import { SortStore, SORT_MODE_LABELS, SORT_MODES_ORDER } from "./sort-store";
 import { FrontmatterSyncQueue, rebootstrapFolderFrontmatter } from "./frontmatter-sync";
 import { buildFileActions, boldFragment } from "./notifications";
+import { DeleteCopiesModal, isRetiredContent, repointRestoredNotes, retiredAttachments, warnAboutOtherCopies } from "./attachment-split";
 import { newId, readId, sameId } from "./id-service";
 import { seedDemoContent } from "./demo-content";
-import { preferredStashpadLeafOnFolder } from "./leaf-lookup";
+import { preferredStashpadLeafOnFolder, stashpadLeaves } from "./leaf-lookup";
 import { bodyToSlug, buildFilename, buildAttachmentName, parseIdFromFilename, isNoteId, stripInlineMarkdown, DEFAULT_STOPWORDS, datePrefixFor, createdMsOf, reslugName, titleFromBasename } from "./slug-service";
 import { StashpadLog } from "./log";
 import { IntegrityWatcher } from "./integrity-watcher";
@@ -99,7 +100,7 @@ import { setIconSafe, isAnyModalOpen, properCaseFolderPath, computeReorder, arra
 import { dedupeDrafts, draftHasContent, draftDedupKey } from "./drafts";
 import { normalizeForMatch, isLeftoverNormalized } from "./draft-match";
 import { fixDuplicatedEmphasisOpeners, straightenCurlyQuotes } from "./markdown-input";
-import { renderFormattingToolbar, resolveToolbarButtons } from "./formatting-toolbar";
+import { paintKeyboardLockButton, renderFormattingToolbar, resolveToolbarButtons, showsOnThisDevice } from "./formatting-toolbar";
 import { clipboardToMarkdownTable } from "./excel-paste";
 import { richClipboardToMarkdown } from "./rich-paste";
 import type { BotDef } from "./bots";
@@ -1129,6 +1130,24 @@ export class StashpadView extends ItemView {
     this.registerEvent(this.app.vault.on("create", dropDupCross));
     this.registerEvent(this.app.vault.on("delete", dropDupCross));
     this.registerEvent(this.app.vault.on("rename", dropDupCross));
+    // 0.601.0: keyboard lock (mobile). A tap's default mousedown action moves
+    // focus off the composer, which closes the keyboard. While the lock is on
+    // and the composer has focus, cancel that default for taps on anything that
+    // isn't itself a text field — the same trick the toolbar buttons use. Only
+    // the default is cancelled (not propagation), so a tap still selects the
+    // row, presses the button, etc. Capture phase so it runs before any
+    // handler below that stops propagation.
+    this.viewRoot.addEventListener("mousedown", (e) => {
+      if (!this.keyboardLocked()) return;
+      const ta = this.composerInputEl;
+      if (!ta || ta.ownerDocument.activeElement !== ta) return;
+      const t = e.target as HTMLElement | null;
+      // Text fields still take focus. Checkboxes, radios, sliders and buttons
+      // are not text fields, so they fall through and keep the keyboard up.
+      const field = t?.closest?.("input, textarea, select, [contenteditable]:not([contenteditable='false'])");
+      if (field && !(field instanceof HTMLInputElement && ["checkbox", "radio", "range", "button", "submit", "reset", "color", "file", "image"].includes(field.type))) return;
+      e.preventDefault();
+    }, true);
     this.viewRoot.addEventListener("focusin", () => setActiveView(this));
     this.viewRoot.addEventListener("click", () => setActiveView(this));
     // Mouse side-buttons: button 3 = back, button 4 = forward.
@@ -2934,13 +2953,18 @@ export class StashpadView extends ItemView {
     snap: { notes: { path: string; content: string }[]; attachments: { path: string; data: ArrayBuffer }[] },
     focusIds?: StashpadId[],
   ): Promise<void> {
+    // 0.605.4: don't resurrect an original a split has since retired. The note
+    // is pointed at its folder's copy below instead.
+    const retired = snap.attachments.length ? await retiredAttachments(this.plugin) : new Map<string, TFile>();
     for (const a of snap.attachments) {
       try {
+        if (await isRetiredContent(this.app, retired, a.path, a.data)) continue;
         if (!(await this.app.vault.adapter.exists(a.path))) {
           await this.app.vault.createBinary(a.path, a.data);
         }
       } catch { /* ignore */ }
     }
+    const restoredNotes: TFile[] = [];
     for (const n of snap.notes) {
       try {
         // 0.140.9: guard against re-minting a DUPLICATE id. Undo closures capture
@@ -2953,10 +2977,12 @@ export class StashpadView extends ItemView {
         const nid = idm?.[1] as StashpadId | undefined;
         if (nid && this.tree.get(nid)?.file) continue;
         if (!(await this.app.vault.adapter.exists(n.path))) {
-          await this.app.vault.create(n.path, n.content);
+          restoredNotes.push(await this.app.vault.create(n.path, n.content));
         }
       } catch { /* ignore */ }
     }
+    // 0.605.4: an attachment may have been split since this snapshot was taken.
+    await repointRestoredNotes(this.plugin, restoredNotes);
     // Re-apply pendingFocusIds on every pass so the cursor lands on the restored
     // notes once the metadata cache catches up. Stop once they're found.
     // 0.56.6: follow-cursor policy on each render so the restored note is
@@ -9097,7 +9123,43 @@ export class StashpadView extends ItemView {
       // 0.581.0: the 🤖 "tag as AI-assisted" button is a toolbar entry now, so the
       // Toolbar buttons settings can hide / reorder / re-icon it.
       aiContributor: (b) => this.wireComposerBotButton(b),
+      // 0.601.0: mobile-only "keep the keyboard open" lock (see keyboardLocked).
+      keyboardLock: Platform.isMobile ? {
+        active: () => getSettings().composerKeyboardLock,
+        toggle: () => {
+          const on = !this.plugin.settings.composerKeyboardLock;
+          this.plugin.settings.composerKeyboardLock = on;
+          void this.plugin.saveSettings();
+          // The composer is reused across renders, so other tabs' buttons
+          // would keep their old highlight; repaint them all.
+          for (const leaf of stashpadLeaves(this.app)) {
+            const root = (leaf.view as unknown as { viewRoot?: HTMLElement }).viewRoot;
+            root?.querySelectorAll<HTMLElement>(".stashpad-toolbar-kblock").forEach((b) => paintKeyboardLockButton(b, on));
+          }
+        },
+      } : undefined,
     });
+  }
+
+  /** 0.601.0: the composer's keyboard lock is on (mobile only). Only while its
+   *  button is actually on the toolbar: hiding the button (or the whole
+   *  toolbar) must not leave an invisible lock with no way to turn it off. */
+  private keyboardLocked(): boolean {
+    const s = getSettings();
+    if (!Platform.isMobile || !s.composerKeyboardLock || !s.showComposerToolbar) return false;
+    return !resolveToolbarButtons(s.toolbarButtons).some((r) => r.def.id === "keyboardLock" && r.hidden);
+  }
+  /** 0.601.0: the list's usual "take focus" after a row tap or navigation —
+   *  skipped while the keyboard lock holds the composer, so the keyboard stays
+   *  up. */
+  private focusListUnlessKeyboardLocked(): void {
+    if (this.keyboardLocked() && document.activeElement === this.composerInputEl) return;
+    this.viewRoot.focus({ preventScroll: true });
+  }
+  /** 0.601.0: does a send keep the composer focused (keyboard up)? The
+   *  "focus composer after send" setting, or the keyboard lock. */
+  private refocusComposerAfterSend(): boolean {
+    return getSettings().autofocusComposerAfterSend || this.keyboardLocked();
   }
 
   private addTaskCheckbox(parent: HTMLElement, node: TreeNode): void {
@@ -10352,6 +10414,9 @@ export class StashpadView extends ItemView {
         menu.addItem((it: any) => it.setTitle(a.label).setIcon(a.label.startsWith("Reveal") ? "folder-open" : "arrow-up-right").onClick(() => void a.onClick()));
       }
     }
+    if (file && file.extension !== "md") {
+      menu.addItem((it: any) => it.setTitle("Find and delete all copies…").setIcon("trash-2").onClick(() => { new DeleteCopiesModal(this.plugin, file).open(); }));
+    }
     menu.addItem((it: any) => it.setTitle("Copy path").setIcon("link").onClick(() => void navigator.clipboard?.writeText(path).then(() => new Notice("Path copied."), () => {})));
     menu.showAtMouseEvent(evt);
   }
@@ -10465,7 +10530,7 @@ export class StashpadView extends ItemView {
       // wouldn't rebuild the bar until an unrelated composer rebuild happened.
       getSettings().showComposerToolbar ? "1" : "0",
       getSettings().spoilerMarkup ? "1" : "0",
-      (getSettings().snippets ?? []).map((sn) => `${sn.id}:${sn.button ? 1 : 0}:${sn.enabled === false ? 0 : 1}:${sn.icon}:${sn.name}:${sn.buttonPlacement ?? "end"}`).join(","),
+      (getSettings().snippets ?? []).map((sn) => `${sn.id}:${sn.button ? 1 : 0}:${sn.enabled === false ? 0 : 1}:${sn.icon}:${sn.name}:${sn.buttonPlacement ?? "end"}:${sn.buttonPlatform ?? "both"}`).join(","),
       // 0.351.0: the built-in toolbar customization (order / hidden / icon) is
       // baked into the composer build too, so it must invalidate the signature.
       JSON.stringify(getSettings().toolbarButtons ?? []),
@@ -11508,7 +11573,9 @@ export class StashpadView extends ItemView {
     // 0.581.0: it's a toolbar entry now (rendered by renderComposerToolbar), so
     // only the FALLBACK is left here: with the whole toolbar turned off it goes
     // on the button rail — unless the user hid it in Toolbar buttons.
-    if (!composerToolbarBar && !resolveToolbarButtons(getSettings().toolbarButtons).find((r) => r.def.id === "aiContributor")?.hidden) {
+    // 0.602.0: …or set it to the other kind of device.
+    const botCfg = resolveToolbarButtons(getSettings().toolbarButtons).find((r) => r.def.id === "aiContributor");
+    if (!composerToolbarBar && !botCfg?.hidden && showsOnThisDevice(botCfg?.platform)) {
       this.renderComposerBotButton(btnRail);
     }
     // 0.581.1 (blind review): no 🤖 button this build (hidden in Toolbar buttons)
@@ -11830,7 +11897,7 @@ export class StashpadView extends ItemView {
       if (bound?.kind === "edit") {
         this.debouncedSaveDraft?.cancel();
         const ok = await this.submitComposerEdit(bound, text);
-        if (ok && getSettings().autofocusComposerAfterSend) this.composerInputEl?.focus();
+        if (ok && this.refocusComposerAfterSend()) this.composerInputEl?.focus();
         return;
       }
       ta.value = "";
@@ -11877,7 +11944,7 @@ export class StashpadView extends ItemView {
         // now belongs to the note we just wrote into. Leaving the set populated
         // would let a later send rehome those attachments out from under it.
         this.composerCreatedAttachments.clear();
-        if (getSettings().autofocusComposerAfterSend) this.composerInputEl?.focus();
+        if (this.refocusComposerAfterSend()) this.composerInputEl?.focus();
         return;
       }
       const lineSplit = this.modeSplit ?? getSettings().splitOnLines;
@@ -11958,7 +12025,7 @@ export class StashpadView extends ItemView {
       this.refreshDupPanel(""); // 0.282.0 (teams): the composer emptied
       // Keep focus in the composer so the user can keep typing without
       // re-clicking — unless the user disabled this in settings.
-      if (getSettings().autofocusComposerAfterSend) {
+      if (this.refocusComposerAfterSend()) {
         this.focusComposerOnNextRender = true;
         // 0.76.15: remote sends already rendered inside createNoteUnder
         // (before this flag was set), so restore focus directly.
@@ -12034,7 +12101,7 @@ export class StashpadView extends ItemView {
           // With the setting off, blur instead: the full picker's onClose has
           // already refocused the composer (SuggestModal closes before it
           // reports the pick), which would leave the keyboard up.
-          if (wasFocused && getSettings().autofocusComposerAfterSend) this.composerInputEl?.focus({ preventScroll: true });
+          if (wasFocused && this.refocusComposerAfterSend()) this.composerInputEl?.focus({ preventScroll: true });
           else if (document.activeElement === ta) ta.blur();
           lastSubmitAt = Date.now();
           void submit();
@@ -12072,7 +12139,7 @@ export class StashpadView extends ItemView {
         //    while we're still in the touchend gesture. reuseComposer keeps this
         //    same textarea across the send, so the focus set now survives into
         //    the emptied composer and the keyboard never drops.
-        if (composerFocusedAtTouch && getSettings().autofocusComposerAfterSend) {
+        if (composerFocusedAtTouch && this.refocusComposerAfterSend()) {
           this.composerInputEl?.focus({ preventScroll: true });
         }
         fireSubmit(); // released before the hold fired → normal send
@@ -13059,7 +13126,7 @@ export class StashpadView extends ItemView {
     // The Mod-deselect branch already chose a fallback lastSelected
     // (or cleared it); the plain/shift/add paths set it inline.
     if (this.selection.has(node.id)) this.lastSelected = node.id;
-    this.viewRoot.focus({ preventScroll: true });
+    this.focusListUnlessKeyboardLocked();
     // 0.73.4 perf: row clicks only mutate selection state — same
     // cheap-repaint path as arrow-key nav. Skips the full
     // this.render() that previously rebuilt every row's DOM (markdown
@@ -18355,7 +18422,7 @@ export class StashpadView extends ItemView {
     }
     this.render(navPolicy);
     this.refreshHeaderTitle();
-    this.viewRoot.focus({ preventScroll: true });
+    this.focusListUnlessKeyboardLocked();
     // 0.74.6: drilling into a different note is a genuine selection
     // change — the detail panel should follow. (render() above only
     // fires content-changed, which keeps the panel pinned.)
@@ -18422,7 +18489,7 @@ export class StashpadView extends ItemView {
     }
     this.render(policy);
     this.refreshHeaderTitle();
-    this.viewRoot.focus({ preventScroll: true });
+    this.focusListUnlessKeyboardLocked();
     // 0.122.7 (F2): back/forward changed the cursor — notify so the detail panel
     // re-resolves to the new selection instead of staying pinned to the old one.
     this.plugin.notifyStashpadSelectionChanged();
@@ -21623,6 +21690,7 @@ export class StashpadView extends ItemView {
               kind: "info", category: "delete", folder: this.noteFolder, duration: 7000,
             });
           }
+          await warnAboutOtherCopies(this.plugin, attFiles.filter((f) => inSnap.has(f.path))); // 0.605.0
           for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
             {
               try {
@@ -25356,6 +25424,7 @@ export class StashpadView extends ItemView {
               kind: "info", category: "delete", folder: this.noteFolder, duration: 7000,
             });
         }
+        await warnAboutOtherCopies(this.plugin, attFiles.filter((f) => inSnap.has(f.path))); // 0.605.0
         for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
           {
             try {

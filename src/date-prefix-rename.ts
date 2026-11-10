@@ -83,7 +83,7 @@ function attachmentDirs(plugin: StashpadPlugin, folders: string[]): { dirs: stri
 }
 
 /** Phase 1: decide every rename. Read-only (reads each note to know its title). */
-export async function planDatePrefixRenames(plugin: StashpadPlugin, mode: DatePrefixMode): Promise<DatePrefixPlan> {
+export async function planDatePrefixRenames(plugin: StashpadPlugin, mode: DatePrefixMode, skip?: (f: TFile) => boolean): Promise<DatePrefixPlan> {
   const app = plugin.app;
   const s = plugin.settings;
   // The sweep always writes the CURRENT format, even when new-file prefixes are
@@ -102,6 +102,7 @@ export async function planDatePrefixRenames(plugin: StashpadPlugin, mode: DatePr
     file: TFile, kind: "note" | "attachment", ms: number | null, stemFloor: string,
     known?: { has: boolean; bare: string },
   ): void => {
+    if (skip?.(file)) return; // 0.604.0: appeared during this Rebootstrap
     // `known`: the split is certain (the note's title is known). Otherwise guess
     // from the shape plus the created time. `stemFloor`: what must remain after
     // removing a prefix for it to count as one (a whole-date title keeps it).
@@ -398,6 +399,7 @@ export function datePrefixProgressNotice(title: string): {
   update: (done: number, total: number) => void;
   stopRequested: () => boolean;
   finish: (ok: boolean, heading: string, detail: string) => void;
+  hide: () => void;
 } {
   const notice = new Notice("", 0);
   const el = notice.noticeEl;
@@ -430,6 +432,7 @@ export function datePrefixProgressNotice(title: string): {
       el.createDiv({ cls: "stashpad-progress-title", text: heading });
       el.createDiv({ cls: "stashpad-progress-sub", text: detail });
     },
+    hide: () => notice.hide(),
   };
 }
 

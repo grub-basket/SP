@@ -1,4 +1,5 @@
-import { Notice, Platform, TFile, setIcon, type App } from "obsidian";
+import { Modal, Notice, Platform, TFile, setIcon, type App } from "obsidian";
+import { DESKTOP_TOAST_LIMITS, MOBILE_TOAST_LIMITS, shortenForToast, type ToastLimits } from "./notification-text";
 import { ROOT_ID, type StashpadId } from "./types";
 
 /** Visual severity. Drives the toast's color + the history panel's
@@ -263,7 +264,7 @@ export class NotificationService {
    *  goes through it, so the "never overwrite a tab" rule lives in one place. */
   private openRouter: ((target: NotificationTarget) => Promise<void>) | null = null;
 
-  constructor(private app: App) {}
+  constructor(readonly app: App) {}
 
   setOpenRouter(router: ((target: NotificationTarget) => Promise<void>) | null): void {
     this.openRouter = router;
@@ -497,12 +498,20 @@ export class NotificationService {
     wrap.className = `stashpad-notice stashpad-notice-${kind}`;
     const msg = activeDocument.createElement("div");
     msg.className = "stashpad-notice-message";
-    renderInlineMarkup(msg, opts.message);
+    // 0.603.0: a long message is cut short here (a phone has little room) and
+    // the full text is one tap away. History always keeps the full message.
+    const short = shortenForToast(opts.message, toastLimits());
+    renderInlineMarkup(msg, short.text);
     wrap.appendChild(msg);
-    if (opts.actions && opts.actions.length > 0) {
+    // The toast closes when the modal opens (toasts draw above modals and would
+    // cover it), so the modal carries the toast's own buttons along.
+    const actions: NotificationAction[] = short.shortened
+      ? [...(opts.actions ?? []), { label: "View full", onClick: () => { new NotificationFullModal(this.app, opts.message, opts.actions ?? []).open(); } }]
+      : (opts.actions ?? []);
+    if (actions.length > 0) {
       const row = activeDocument.createElement("div");
       row.className = "stashpad-notice-actions";
-      for (const action of opts.actions) {
+      for (const action of actions) {
         const btn = activeDocument.createElement("button");
         btn.className = "stashpad-notice-action";
         btn.textContent = action.label;
@@ -552,6 +561,38 @@ export class NotificationService {
     }
     frag.appendChild(wrap);
     return frag;
+  }
+}
+
+/** 0.603.0: how much of a message fits on a toast or a history row here. */
+export function toastLimits(): ToastLimits {
+  return Platform.isMobile ? MOBILE_TOAST_LIMITS : DESKTOP_TOAST_LIMITS;
+}
+
+/** 0.603.0: the whole text of a long notification, for reading or copying. */
+export class NotificationFullModal extends Modal {
+  constructor(app: App, private message: string, private actions: NotificationAction[] = []) { super(app); }
+
+  onOpen(): void {
+    this.setTitle("Notification");
+    const body = this.contentEl.createDiv({ cls: "stashpad-notif-full" });
+    renderInlineMarkup(body, this.message);
+    const row = this.contentEl.createDiv({ cls: "modal-button-container" });
+    for (const action of this.actions) {
+      row.createEl("button", { text: action.label }).addEventListener("click", () => {
+        void Promise.resolve().then(() => action.onClick())
+          .catch((err) => console.warn("[Stashpad] notification action failed", err));
+        if (!action.keepOpen) this.close();
+      });
+    }
+    row.createEl("button", { text: "Copy text" }).addEventListener("click", () => {
+      void navigator.clipboard?.writeText(this.message).then(() => new Notice("Copied."), () => new Notice("Couldn't copy."));
+    });
+    row.createEl("button", { cls: "mod-cta", text: "Close" }).addEventListener("click", () => this.close());
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }
 

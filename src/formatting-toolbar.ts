@@ -1,4 +1,4 @@
-import { App, Menu } from "obsidian";
+import { App, Menu, Platform } from "obsidian";
 import { setIconSafe } from "./view-helpers";
 import { type Snippet, expandSnippet } from "./snippets";
 import { MultiInsert } from "./multi-insert";
@@ -162,6 +162,38 @@ export interface ToolbarButtonConfig {
   id: string;
   hidden?: boolean;
   icon?: string;
+  /** 0.602.0: which devices show it. Missing = "both" (no migration needed). */
+  platform?: ToolbarPlatform;
+}
+
+/** 0.602.0: where a toolbar button shows — every device, desktop only, or
+ *  mobile (phone/tablet) only. Used by built-ins and snippet buttons. */
+export type ToolbarPlatform = "both" | "desktop" | "mobile";
+
+export const TOOLBAR_PLATFORM_LABELS: Record<ToolbarPlatform, string> = {
+  both: "Desktop and mobile",
+  desktop: "Desktop only",
+  mobile: "Mobile only",
+};
+
+/** Short forms for the crowded Toolbar buttons rows (a phone-width row also
+ *  holds arrows, a toggle and an icon field). */
+export const TOOLBAR_PLATFORM_SHORT: Record<ToolbarPlatform, string> = {
+  both: "Both",
+  desktop: "Desktop",
+  mobile: "Mobile",
+};
+
+/** Coerce a stored value; anything unrecognized means "both". */
+export function readToolbarPlatform(v: unknown): ToolbarPlatform {
+  return v === "desktop" || v === "mobile" ? v : "both";
+}
+
+/** Does a button set to `p` show on this device? */
+export function showsOnThisDevice(p: ToolbarPlatform | undefined): boolean {
+  if (p === "desktop") return !Platform.isMobile;
+  if (p === "mobile") return Platform.isMobile;
+  return true;
 }
 
 /** 0.351.0: a built-in formatting-toolbar button. `id` is the stable, persisted
@@ -174,7 +206,10 @@ export interface ToolbarBuiltin {
   glyph: string;
   title: string;
   cls?: string;
-  gate?: "spoilers" | "drafts" | "checkDup" | "multiInsert" | "aiContributor";
+  gate?: "spoilers" | "drafts" | "checkDup" | "multiInsert" | "aiContributor" | "keyboardLock";
+  /** 0.602.0: a button that only works on one kind of device. Its platform is
+   *  fixed (the settings show it instead of offering a choice). */
+  onlyOn?: "desktop" | "mobile";
   run?: (ta: HTMLTextAreaElement) => void;
   menu?: (e: MouseEvent, getTa: () => HTMLTextAreaElement | null) => void;
 }
@@ -224,29 +259,42 @@ export const TOOLBAR_BUILTINS: ToolbarBuiltin[] = [
   // the Toolbar buttons settings couldn't hide or move it. Composer only (gated
   // on opts.aiContributor); no `run` — the view wires its stateful click.
   { id: "aiContributor", icon: "bot", glyph: "🤖", title: "Tag notes you write as AI-assisted", cls: "stashpad-composer-bot-btn", gate: "aiContributor" },
+  // 0.601.0 (user): mobile composer only (gated on opts.keyboardLock). Keeps the
+  // keyboard up while you scroll/tap the list and across sends. No `run` — the
+  // renderer wires it like Drafts (sticky on/off highlight).
+  { id: "keyboardLock", icon: "lock", glyph: "🔒", title: "Keep the keyboard open", cls: "stashpad-toolbar-kblock", gate: "keyboardLock", onlyOn: "mobile" },
 ];
 
 /** 0.351.0: resolve the effective built-in button list from a saved config —
  *  every built-in, in effective order, with its hidden flag and resolved icon.
  *  Configured ids come first in their saved order; any built-in the config
  *  doesn't mention is appended in default order. Unknown/stale config ids are
- *  ignored. Used by both the renderer and the settings UI. */
-export function resolveToolbarButtons(config?: ToolbarButtonConfig[]): { def: ToolbarBuiltin; hidden: boolean; icon: string }[] {
+ *  ignored. Used by both the renderer and the settings UI.
+ *  0.602.0: also the button's platform — a fixed `onlyOn` wins over the saved
+ *  choice. */
+export function resolveToolbarButtons(config?: ToolbarButtonConfig[]): ResolvedToolbarButton[] {
   const byId = new Map(TOOLBAR_BUILTINS.map((d) => [d.id, d]));
   const cfg = config ?? [];
   const seen = new Set<string>();
-  const out: { def: ToolbarBuiltin; hidden: boolean; icon: string }[] = [];
+  const out: ResolvedToolbarButton[] = [];
   for (const c of cfg) {
     const def = byId.get(c.id);
     if (!def || seen.has(c.id)) continue;
     seen.add(c.id);
-    out.push({ def, hidden: c.hidden === true, icon: c.icon || def.icon });
+    out.push({ def, hidden: c.hidden === true, icon: c.icon || def.icon, platform: def.onlyOn ?? readToolbarPlatform(c.platform) });
   }
   for (const def of TOOLBAR_BUILTINS) {
     if (seen.has(def.id)) continue;
-    out.push({ def, hidden: false, icon: def.icon });
+    out.push({ def, hidden: false, icon: def.icon, platform: def.onlyOn ?? "both" });
   }
   return out;
+}
+
+export interface ResolvedToolbarButton {
+  def: ToolbarBuiltin;
+  hidden: boolean;
+  icon: string;
+  platform: ToolbarPlatform;
 }
 
 export interface FormattingToolbarOpts {
@@ -281,6 +329,19 @@ export interface FormattingToolbarOpts {
    *  builtin). Called with the created button so the view can wire its sticky
    *  on/off state. Absent in the edit modal and quick capture. */
   aiContributor?: (btn: HTMLElement) => void;
+  /** 0.601.0: enables the "Keep the keyboard open" lock button (gated builtin).
+   *  Only the mobile composer passes it. `active` drives the highlight; a click
+   *  `toggle`s it. */
+  keyboardLock?: { active: () => boolean; toggle: () => void };
+}
+
+/** 0.601.0: draw the keyboard-lock button's on/off state. Shared so the view can
+ *  repaint the button in every open Stashpad tab when the lock flips. */
+export function paintKeyboardLockButton(b: HTMLElement, on: boolean): void {
+  b.toggleClass("is-active", on);
+  b.title = on ? "Keyboard stays open · tap to let it close again" : "Keep the keyboard open while you scroll and send";
+  b.setAttr("aria-label", b.title);
+  b.setAttr("aria-pressed", on ? "true" : "false");
 }
 
 /** Render the toolbar into `host`, acting on the textarea returned by `getTa`.
@@ -306,6 +367,9 @@ export function renderFormattingToolbar(
   // 0.346.0: deactivated snippets (enabled === false) render no button and are
   // absent from the Snippets menu.
   const snippets = (opts.snippets ?? []).filter((s) => s.enabled !== false);
+  // 0.602.0: a snippet whose button is set to the other kind of device has no
+  // button here; it falls back to the Snippets menu so it's still reachable.
+  const hasButton = (s: Snippet): boolean => s.button && showsOnThisDevice(s.buttonPlatform);
   const insertSnippet = (ta: HTMLTextAreaElement, sn: Snippet): void => {
     if (!app) return;
     const text = expandSnippet(app, sn.value, { title: opts.titleFor?.() });
@@ -326,16 +390,17 @@ export function renderFormattingToolbar(
   };
 
   // 0.351.0: "start"-placed snippet buttons render before the built-ins.
-  if (app) for (const sn of snippets.filter((s) => s.button && s.buttonPlacement === "start")) snippetBtn(sn);
+  if (app) for (const sn of snippets.filter((s) => hasButton(s) && s.buttonPlacement === "start")) snippetBtn(sn);
 
   // Built-in buttons in the user's effective order, skipping hidden + gated-off.
-  for (const { def, hidden, icon } of resolveToolbarButtons(opts.toolbarButtons)) {
-    if (hidden) continue;
+  for (const { def, hidden, icon, platform } of resolveToolbarButtons(opts.toolbarButtons)) {
+    if (hidden || !showsOnThisDevice(platform)) continue;
     if (def.gate === "spoilers" && !opts.spoilers) continue;
     if (def.gate === "drafts" && !opts.drafts) continue;
     if (def.gate === "checkDup" && !opts.checkDup) continue;
     if (def.gate === "multiInsert" && !opts.multiInsert) continue;
     if (def.gate === "aiContributor" && !opts.aiContributor) continue;
+    if (def.gate === "keyboardLock" && !opts.keyboardLock) continue;
     const cls = "stashpad-composer-toolbar-btn" + (def.cls ? " " + def.cls : "");
     const b = bar.createEl("button", { cls, attr: { "aria-label": def.title, tabindex: "-1" } });
     setIconSafe(b, icon, def.glyph);
@@ -352,6 +417,12 @@ export function renderFormattingToolbar(
       paint();
       b.onclick = (e) => { e.preventDefault(); d.toggle(); paint(); };
       b.oncontextmenu = (e) => { e.preventDefault(); e.stopPropagation(); d.open(); };
+      continue;
+    }
+    if (def.gate === "keyboardLock" && opts.keyboardLock) {
+      const k = opts.keyboardLock;
+      paintKeyboardLockButton(b, k.active());
+      b.onclick = (e) => { e.preventDefault(); k.toggle(); paintKeyboardLockButton(b, k.active()); };
       continue;
     }
     if (def.gate === "aiContributor" && opts.aiContributor) {
@@ -385,8 +456,8 @@ export function renderFormattingToolbar(
   // 0.338.0: "end"-placed snippet buttons (the default) render after the
   // built-ins; snippets without a button live in a "Snippets" menu button.
   if (app && snippets.length) {
-    for (const sn of snippets.filter((s) => s.button && s.buttonPlacement !== "start")) snippetBtn(sn);
-    const menuless = snippets.filter((s) => !s.button);
+    for (const sn of snippets.filter((s) => hasButton(s) && s.buttonPlacement !== "start")) snippetBtn(sn);
+    const menuless = snippets.filter((s) => !hasButton(s));
     if (menuless.length) {
       const b = bar.createEl("button", { cls: "stashpad-composer-toolbar-btn stashpad-toolbar-snippets", attr: { "aria-label": "Snippets", tabindex: "-1" } });
       setIconSafe(b, "notebook-text", "⌘");

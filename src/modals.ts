@@ -14,7 +14,7 @@ import { collectMarkdown } from "./tree-index";
 import { REPEAT_MODES, parseRepeatMode, parseWeekdayList, withWeekdays, parseMonthDayList, withMonthDays, monthDayLabel, WEEKDAY_SHORT, WEEKDAY_INITIAL, parseRecurrence, parseDuration } from "./recurrence";
 import { ComposerAutocomplete } from "./composer-autocomplete";
 import { parseNaturalDate, naturalDatePhrases, type NaturalDate } from "./natural-date";
-import { renderFormattingToolbar, wrapSelection } from "./formatting-toolbar";
+import { TOOLBAR_PLATFORM_LABELS, readToolbarPlatform, renderFormattingToolbar, wrapSelection } from "./formatting-toolbar";
 import { visibleDrafts } from "./drafts";
 import {
   normalizeForMatch, prepareDraft, prepareNote, compareDraftToNote, compareMatches, wordDiff,
@@ -139,7 +139,8 @@ export function parseAdjustMinutes(raw: string): number | null {
   const unit = { m: 1, h: 60, d: 1440, w: 10080 }[m[2].toLowerCase()] ?? 1;
   return n * unit;
 }
-import { renderInlineMarkup } from "./notifications";
+import { NotificationFullModal, renderInlineMarkup, toastLimits } from "./notifications";
+import { shortenForToast } from "./notification-text";
 import type { NotificationCategory, NotificationRecord, NotificationService } from "./notifications";
 import { clipboardToMarkdownTable } from "./excel-paste";
 import { richClipboardToMarkdown } from "./rich-paste";
@@ -3835,6 +3836,16 @@ export class SnippetEditModal extends Modal {
         .setValue(this.draft.buttonPlacement === "start" ? "start" : "end")
         .onChange((v) => { this.draft.buttonPlacement = v === "start" ? "start" : "end"; }));
 
+    // 0.602.0: which devices show the button. On the other kind of device the
+    // snippet is in the Snippets menu instead.
+    new Setting(contentEl).setName("Show button on")
+      .setDesc("Which devices get the toolbar button. On other devices, pick it from the toolbar's snippet menu.")
+      .addDropdown((d) => {
+        for (const p of ["both", "desktop", "mobile"] as const) d.addOption(p, TOOLBAR_PLATFORM_LABELS[p]);
+        d.setValue(readToolbarPlatform(this.draft.buttonPlatform))
+          .onChange((v) => { const p = readToolbarPlatform(v); this.draft.buttonPlatform = p === "both" ? undefined : p; });
+      });
+
     const actions = new Setting(contentEl);
     actions.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
     actions.addButton((b) => b.setButtonText("Save").setCta().onClick(() => {
@@ -5648,10 +5659,17 @@ export class NotificationHistoryPanel {
     const cat = meta.createSpan({ cls: `stashpad-notif-cat stashpad-notif-cat-${r.category}` });
     cat.setText(r.category);
     const msg = row.createDiv({ cls: "stashpad-notif-msg" });
-    msg.setText(r.message);
+    // 0.603.0: same limits and same "View full" as the toast, so a long entry
+    // doesn't take over the list.
+    const short = shortenForToast(r.message, toastLimits());
+    renderInlineMarkup(msg, short.text);
     const target = r.open;
-    if (r.actionLabels.length > 0 || target) {
+    if (r.actionLabels.length > 0 || target || short.shortened) {
       const acts = row.createDiv({ cls: "stashpad-notif-actions-snapshot" });
+      if (short.shortened) {
+        const full = acts.createEl("button", { cls: "stashpad-notif-open", text: "View full" });
+        full.addEventListener("click", () => { new NotificationFullModal(this.service.app, r.message).open(); });
+      }
       // 0.569.0: a notification that opened something keeps its target as
       // data, so the log can reopen it — through the same router as the toast
       // (a fresh tab, never an existing one).
