@@ -68,6 +68,11 @@ export const CONFIG_FILES: Record<string, readonly string[]> = {
     // (healAdoptedBindings / refreshFolderPanels) that only runs on the data.json
     // path, so they stay in data.json. Encryption + identity + bootstrap stay too.
     "folderIcons", "obscureFolders", "colorAliases", "customPalette",
+    // 0.607.0: the icons' set/clear times live in the SAME file as the icons, so
+    // whichever copy of the file a sync delivers, its icons and times match.
+    // (An older build rewriting this file drops it; the merge then treats those
+    // icons as untimed and keeps them rather than removing any.)
+    "folderIconStamps",
   ],
   "search/search.json": ["searchIncludedFolders", "searchExcludedFolders"],
 };

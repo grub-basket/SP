@@ -26,6 +26,7 @@ const ENTRIES = [
   "scripts/tests/conflict-copy.test.ts",
   "scripts/tests/notification-text.test.ts",
   "scripts/tests/attachment-split.test.ts",
+  "scripts/tests/folder-icon-merge.test.ts",
 ];
 
 let passed = 0;

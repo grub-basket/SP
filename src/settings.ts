@@ -762,6 +762,12 @@ export interface StashpadSettings {
    *  folder panel + folder switcher) show this icon instead of the default
    *  "list-tree". Empty/absent → default icon. */
   folderIcons: Record<string, string>;
+  /** 0.607.0: folder → its last icon change: { t: ms, icon: the icon it was set
+   *  to, or null = cleared }. Lets two synced devices merge `folderIcons` folder
+   *  by folder, so a stale copy from the other device can't wipe icons; where a
+   *  folder has a stamp, the stamp says what its icon is. Stamped automatically
+   *  on save; see src/folder-icon-merge.ts. Travels with `folderIcons` (same file). */
+  folderIconStamps: Record<string, { t: number; icon: string | null }>;
   /** 0.118.3: when true, the folder switcher / creator modal also lists pinned
    *  notes (jump straight to one). Off by default to keep the picker focused on
    *  folders. */
@@ -1564,6 +1570,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   archiveFolders: [],
   folderEncPrefs: {},
   folderIcons: {},
+  folderIconStamps: {},
   folderSwitcherIncludePinned: false,
   foldersAlwaysNewTab: false,
   importExcludePrefixes: "_",

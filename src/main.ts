@@ -75,6 +75,7 @@ import { renamedPathList } from "./attachment-split-core";
 import { formatGroupedPaths } from "./notification-text";
 import { visibleDrafts } from "./drafts";
 import { applyTombstones, diskNeedsDraftRewrite, draftTimes, mergeDraftsNewest, mergeTombstones, normalizeTombstones, recordDraftDeletions, type DraftTombstones } from "./draft-tombstones";
+import { changedIconFolders, cleanIconState, cleanIcons, cleanStamps, iconStateKey, mergeFolderIcons, stampIconEdits, type FolderIconState, type FolderIcons } from "./folder-icon-merge";
 /** Where quick-switcher shortcut stubs live. One folder so they never mix
  *  with real notes and are trivial to delete en masse. */
 const SHORTCUT_DIR = "Stashpad Shortcuts";
@@ -1077,6 +1078,18 @@ export default class StashpadPlugin extends Plugin {
         // Write the merged records, not the backup's older set, so a reload
         // before the next save can't lose this device's records.
         bag.deletedDrafts = tombs;
+      }
+      // 0.607.0: a restore is a deliberate edit of the icons: stamp every folder
+      // whose icon the restore changes (or clears) as edited now, so the restored
+      // icons win the merge here and on the other devices instead of losing to
+      // their newer times. (Config-folder mode keeps icons out of data.json, so
+      // a snapshot without them leaves them alone.)
+      if (bag.folderIcons !== undefined && !this.store.movedKeys().has("folderIcons")) {
+        const now = Date.now();
+        const cur = cleanIcons(this.settings.folderIcons);
+        const next = cleanIcons(bag.folderIcons);
+        bag.folderIcons = next;
+        bag.folderIconStamps = stampIconEdits(cur, next, cleanStamps(this.settings.folderIconStamps, now), now);
       }
       // 0.586.0: in the settings write queue, so a save already in flight
       // (which read the disk before this) can't land after us and write the
@@ -6081,8 +6094,16 @@ export default class StashpadPlugin extends Plugin {
     // guard in onExternalDataJsonChange.
     // 0.189.0: watch every file the settings store owns, not just data.json — the
     // split files need the same "another window wrote this" adoption path.
-    const ownedPaths = new Set(this.store.watchPaths());
+    // 0.608.0: the set is rebuilt whenever the config folder changes. It used to be
+    // computed once here, at startup, so turning the config folder on (or moving
+    // it) mid-session left its files unwatched until the plugin reloaded — other
+    // devices' changes to snippets, views, menus, templates and folder appearance
+    // weren't picked up live. Checking the folder per event is one string compare.
+    let watchedFor: string | null | undefined;
+    let ownedPaths = new Set<string>();
     this.registerEvent((this.app.vault as any).on("raw", (changedPath: string) => {
+      const cf = this.store.getConfigFolder();
+      if (cf !== watchedFor) { ownedPaths = new Set(this.store.watchPaths()); watchedFor = cf; }
       if (ownedPaths.has(changedPath)) this.scheduleExternalDataJsonReload();
     }));
 
@@ -14627,6 +14648,13 @@ export default class StashpadPlugin extends Plugin {
       if (now !== diskAtLoad[k]) migratedAtLoad[k] = diskAtLoad[k];
     }
     this.snapshotSettingsBaseline(undefined, migratedAtLoad);
+    // 0.607.0: what we just loaded is the stamp base (nothing edited yet), then
+    // merge in this device's own copy of the icons: if another device's stale
+    // file replaced ours while we were closed, the icons set here come back and
+    // the repaired file is written now.
+    this.iconStampBase = cleanIcons(this.settings.folderIcons);
+    const iconsAtLoad = this.reconcileFolderIcons(this.loadLocalIconState(Date.now()));
+    if (iconsAtLoad.changed) void this.persistSettingsQuiet("folder-icons-load");
     // 0.586.0: if the file we just loaded lags behind this device's deletion
     // records (another device's stale copy replaced it while we were closed),
     // write the repaired state back now instead of waiting for some later save.
@@ -15056,7 +15084,13 @@ export default class StashpadPlugin extends Plugin {
   /** 0.189.0: persistence layer. data.json keeps everything that must sync; the
    *  per-device reminder/draft churn lives in history.json so a reminder firing no
    *  longer rewrites the whole settings blob. See docs/data-split-plan.md. */
-  private store = new SettingsStore(this);
+  private store = (() => {
+    const st = new SettingsStore(this);
+    // 0.607.0: folder icons are merged entry by entry by reconcileFolderIcons,
+    // never adopted wholesale by the store (config-folder mode's appearance.json).
+    st.setSelfMergedKeys(["folderIcons", "folderIconStamps"]);
+    return st;
+  })();
   /** 0.586.0: the re-read runs IN the write queue, never alongside a save. A
    *  save snapshots its baseline after its awaits; a re-read landing inside
    *  them had its bookkeeping overwritten by that snapshot (so a draft taken
@@ -15111,6 +15145,8 @@ export default class StashpadPlugin extends Plugin {
     // 0.189.0: adopt the SPLIT files first. They carry their own per-file revs, so a
     // history.json write from another window must be picked up even when data.json
     // is untouched — the old early-return on data.json's rev would have skipped it.
+    // (0.607.0: the store skips the folder-icon keys here; they are merged from
+    // their file just below.)
     try {
       const rep = await this.store.adoptExternal(s);
       if (rep.any) anyChanged = true;
@@ -15121,6 +15157,28 @@ export default class StashpadPlugin extends Plugin {
     // to adopt, so skip the full pass and its stringify cost.
     const disk = await this.store.readCoreIfForeign();
     const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
+    // 0.607.0: folder icons merge folder by folder (folder-icon-merge.ts). This
+    // is the path the reported bug took: the other device's stale copy landed,
+    // our icons were "unchanged since load", so the old rule took the stale map.
+    // In config-folder mode the icons' file (appearance.json) is read directly,
+    // whatever its rev: the store's adoption above skips a file whose rev isn't
+    // above ours, and two devices saving from the same rev write the same rev.
+    {
+      const bag = await this.iconFileBag(disk);
+      if (bag) {
+        const r = this.reconcileFolderIcons(cleanIconState(bag.folderIcons, bag.folderIconStamps, Date.now()));
+        if (r.changed) anyChanged = true;
+        this.repaintFolderIcons(r.repaint);
+        // The file lost icons we hold: write ours back now (a phone may close
+        // before its next save). Only when ANOTHER writer touched the icons; if
+        // the file is what we last wrote, the difference is our own edit whose
+        // save is already on its way.
+        const othersWroteIcons =
+          JSON.stringify(bag.folderIcons) !== this.store.savedJson("folderIcons")
+          || JSON.stringify(bag.folderIconStamps) !== this.store.savedJson("folderIconStamps");
+        if (r.otherLags && othersWroteIcons) void this.persistSettingsQuiet("folder-icons");
+      }
+    }
     // 0.586.0: walk the keys on EVERY foreign change, not only when diskRev passed ours.
     // Two devices that both saved from rev N both write N+1, so the other
     // device's file arrived with a rev we had already "seen" and was ignored
@@ -15145,6 +15203,7 @@ export default class StashpadPlugin extends Plugin {
       for (const k of candidates) {
         if (k === "settingsRev" || churn.has(k)) continue;
         if (k === "deletedDrafts" || k === "composerDrafts") continue; // 0.586.0: merged below
+        if (k === "folderIcons" || k === "folderIconStamps") continue; // 0.607.0: merged above
         if (disk[k] === undefined) continue;
         if (JSON.stringify(disk[k]) === JSON.stringify(s[k])) continue;
         const baseline = this.settingsBaseline[k];
@@ -15255,6 +15314,72 @@ export default class StashpadPlugin extends Plugin {
       return typeof raw === "string" ? JSON.parse(raw) : null;
     } catch { return null; }
   }
+  /** 0.607.0: folder icons across synced devices (see folder-icon-merge.ts).
+   *
+   *  `iconStampBase` is the icon map as of our last read, write or adoption.
+   *  Whatever differs from it at the next reconcile was edited HERE (icon picker,
+   *  folder setup, rename/move remap, folder merge…) and gets stamped with the
+   *  time, without each of those having to remember to. */
+  private iconStampBase: FolderIcons = {};
+  /** A DEVICE-LOCAL copy of the icons + stamps (vault-scoped local storage, which
+   *  sync never touches). Another device's stale data.json can replace ours while
+   *  this app is closed (a phone); merged back in at load, so the icons set here
+   *  survive that too. */
+  private static readonly LOCAL_ICONS_KEY = "stashpad-folder-icons";
+  private localIconsJson: string | null = null;
+  private loadLocalIconState(now: number): FolderIconState | null {
+    try {
+      const raw = this.app.loadLocalStorage(StashpadPlugin.LOCAL_ICONS_KEY) as unknown;
+      if (typeof raw !== "string") return null;
+      const p = JSON.parse(raw) as { icons?: unknown; stamps?: unknown } | null;
+      return p ? cleanIconState(p.icons, p.stamps, now) : null;
+    } catch { return null; }
+  }
+  /** The raw contents of the FILE that holds the icons right now: data.json
+   *  (passed in, already read by the caller) or, in config-folder mode,
+   *  appearance.json (read here). Null when there is nothing to compare with. */
+  private async iconFileBag(dataJson: Record<string, unknown> | null): Promise<Record<string, unknown> | null> {
+    return this.store.movedKeys().has("folderIcons")
+      ? await this.store.readSplitOwning("folderIcons")
+      : dataJson;
+  }
+  private saveLocalIconState(st: FolderIconState): void {
+    const json = JSON.stringify(st);
+    if (json === this.localIconsJson) return;
+    this.localIconsJson = json;
+    try { this.app.saveLocalStorage(StashpadPlugin.LOCAL_ICONS_KEY, json); } catch { /* best-effort */ }
+  }
+
+  /** Stamp our local icon edits, then merge `other` (another copy: the file on
+   *  disk, or the local-storage copy at load) into the live settings, folder by
+   *  folder. Returns whether the live settings changed, whether `other` is behind
+   *  the result (so the file needs our copy written back), and which folders'
+   *  icons changed (to repaint). Null `other` = just stamp. */
+  private reconcileFolderIcons(other: FolderIconState | null, now = Date.now()): { changed: boolean; otherLags: boolean; repaint: string[] } {
+    const s = this.settings;
+    // Stamp BEFORE cleaning: cleaning makes every stamped folder show its
+    // stamp's icon, so an edit made here must get its new stamp first or it
+    // would be read as the old stamp and undone.
+    const live = cleanIcons(s.folderIcons);
+    const ours = cleanIconState(live, stampIconEdits(this.iconStampBase, live, cleanStamps(s.folderIconStamps, now), now), now);
+    const result = mergeFolderIcons(ours, other ?? { icons: {}, stamps: {} });
+    const otherLags = !!other && iconStateKey(other) !== iconStateKey(result);
+    // Compared RAW (not cleaned), so junk or untrimmed values on disk also count
+    // as a change and get replaced by the clean result.
+    const changed = iconStateKey({ icons: s.folderIcons ?? {}, stamps: s.folderIconStamps ?? {} }) !== iconStateKey(result);
+    const repaint = changedIconFolders(cleanIcons(s.folderIcons), result.icons);
+    if (changed) { s.folderIcons = result.icons; s.folderIconStamps = result.stamps; }
+    this.iconStampBase = { ...result.icons };
+    this.saveLocalIconState(result);
+    return { changed, otherLags, repaint };
+  }
+
+  private repaintFolderIcons(folders: string[]): void {
+    for (const f of folders) {
+      try { this.refreshFolderIconFor(f); } catch { /* a view mid-teardown */ }
+    }
+  }
+
   private saveLocalTombstones(t: DraftTombstones): void {
     const json = JSON.stringify(t);
     if (json === this.localTombstonesJson) return;
@@ -15337,6 +15462,10 @@ export default class StashpadPlugin extends Plugin {
     // Built AFTER the loadData await, so a settings mutation landing during that
     // read can't leave the cache stale.
     try { disk = (await this.loadData()) as Record<string, unknown> | null; } catch { /* first write / unreadable */ }
+    // 0.607.0: the file holding the folder icons (data.json, or appearance.json in
+    // config-folder mode). Read HERE, before the per-key cache below is built, so
+    // no await sits between that cache and its use.
+    const iconBag = await this.iconFileBag(disk);
     const ours0 = this.settings as unknown as Record<string, unknown>;
     const movedSet = this.store.movedKeys(); // 0.378.0: dynamic (history + config)
     const curStr = new Map<string, string>();
@@ -15354,6 +15483,30 @@ export default class StashpadPlugin extends Plugin {
     ours0.deletedDrafts = tombs;
     curStr.set("deletedDrafts", JSON.stringify(tombs));
     this.saveLocalTombstones(tombs);
+    // 0.607.0: folder icons merge folder by folder, so a stale copy of the file
+    // (the other device's, or Obsidian Sync's own merge of two copies) can't wipe
+    // them. Against whichever file holds the icons: data.json, or appearance.json
+    // in config-folder mode (where saveSplit would otherwise write our map over
+    // the other device's newer icons whenever we had an icon edit of our own).
+    // The store never adopts these keys itself (setSelfMergedKeys), so this is
+    // the one place a save merges them.
+    let iconRewrite = false;
+    const iconRepaint: string[] = [];
+    {
+      const iconsInCore = !movedSet.has("folderIcons");
+      const r = this.reconcileFolderIcons(iconBag ? cleanIconState(iconBag.folderIcons, iconBag.folderIconStamps, Date.now()) : null);
+      if (r.changed && iconsInCore) {
+        curStr.set("folderIcons", JSON.stringify(ours0.folderIcons));
+        curStr.set("folderIconStamps", JSON.stringify(ours0.folderIconStamps));
+      }
+      // The file is behind the merge: make the repair land. data.json: force its
+      // write. Config mode: saveSplit only writes appearance.json when ours
+      // differs from what IT last wrote, which misses a file an older build
+      // rewrote without the stamps key; forgetting the baseline makes it write.
+      iconRewrite = r.otherLags && iconsInCore;
+      if (r.otherLags && !iconsInCore) this.store.forgetBaseline(["folderIcons", "folderIconStamps"]);
+      iconRepaint.push(...r.repaint);
+    }
     const diskRev = typeof disk?.settingsRev === "number" ? (disk.settingsRev as number) : 0;
     // 0.140.2: adopt on CONTENT change, not just a higher rev. Two instances
     // that both loaded rev N and write near-simultaneously both stamp N+1, so a
@@ -15383,6 +15536,7 @@ export default class StashpadPlugin extends Plugin {
       for (const k of candidates) {
         if (k === "settingsRev" || churn.has(k)) continue;   // bookkeeping / per-device
         if (k === "deletedDrafts" || k === "composerDrafts") continue; // 0.586.0: merged below
+        if (k === "folderIcons" || k === "folderIconStamps") continue; // 0.607.0: merged above
         if (disk[k] === undefined) continue;
         const baseline = this.settingsBaseline[k];
         if (baseline === undefined) {                        // never seen it — don't guess…
@@ -15464,6 +15618,10 @@ export default class StashpadPlugin extends Plugin {
       }
       if (diskRev > this.lastSeenSettingsRev) this.lastSeenSettingsRev = diskRev;
     }
+    // 0.607.0: the file is behind our icons (it lost some to a stale copy):
+    // write, even if nothing else of ours changed, so the repair reaches it.
+    if (iconRewrite) adoptedAny = true;
+    this.repaintFolderIcons(iconRepaint);
     const all0 = this.settings as unknown as Record<string, unknown>;
     // Skip the data.json write entirely when only per-device churn changed — that's
     // the other half of the split: a reminder firing must not rewrite your hotkeys.

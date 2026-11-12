@@ -78,6 +78,21 @@ export class SettingsStore {
    *  always from the primary `configFolder`; mirrors are write-only backups. */
   private configMirrors: string[] = [];
 
+  /** 0.607.0: keys the store must NEVER adopt from a split file — the plugin
+   *  merges them itself (folder icons, entry by entry; see folder-icon-merge.ts).
+   *  A wholesale adoption there would put the other device's stale copy in
+   *  memory, and could not be told apart from a local edit made meanwhile.
+   *  Loading still reads them normally. */
+  private selfMerged = new Set<string>();
+  setSelfMergedKeys(keys: readonly string[]): void { this.selfMerged = new Set(keys); }
+
+  /** 0.607.0: make the next saveSplit write the file holding `keys`, even though
+   *  our values equal what we last wrote: the file on disk has fallen behind them
+   *  (e.g. an older build rewrote it and dropped a key it doesn't know). */
+  forgetBaseline(keys: readonly string[]): void {
+    for (const k of keys) delete this.baseline[k];
+  }
+
   constructor(private plugin: Plugin) {}
 
   private dir(): string {
@@ -182,6 +197,17 @@ export class SettingsStore {
       // already in memory (data.json copy or defaults) and NEVER to empty.
       return null;
     }
+  }
+
+  /** 0.607.0: read the split file that holds `key` right now (null when the key
+   *  lives in data.json, or the file is absent/unreadable). Read-only. Lets the
+   *  folder-icon merge compare against the other device's copy BEFORE a save
+   *  writes over it — saveSplit only adopts keys we didn't change. */
+  async readSplitOwning(key: string): Promise<Bag | null> {
+    for (const [file, keys] of this.activeFiles()) {
+      if (keys.includes(key)) return this.readSplit(file);
+    }
+    return null;
   }
 
   private async writeSplit(file: string, payload: Bag, rev: number): Promise<void> {
@@ -463,6 +489,7 @@ export class SettingsStore {
       if (disk) {
         const adopted: string[] = [];
         for (const k of keys) {
+          if (this.selfMerged.has(k)) continue; // 0.607.0: the plugin merges these itself
           const ours = JSON.stringify(settings[k]);
           const theirs = JSON.stringify(disk[k]);
           const oursChanged = ours !== this.baseline[k];
@@ -540,6 +567,7 @@ export class SettingsStore {
       if (diskRev <= (this.revs.get(file) ?? 0)) continue; // our own write, or nothing newer
       const adopted: string[] = [];
       for (const k of keys) {
+        if (this.selfMerged.has(k)) continue; // 0.607.0: the plugin merges these itself
         if (disk[k] === undefined) continue;
         if (JSON.stringify(disk[k]) === JSON.stringify(settings[k])) continue;
         settings[k] = disk[k];
