@@ -28,6 +28,7 @@
  *  persistent notification. Encrypted content (locked notes, encrypted archive
  *  and trash blobs) stays in the archived folder for now — it decrypts with that
  *  folder's own key, which a move would strand. */
+import { trashVaultFile } from "./trash";
 import { Modal, Setting, SuggestModal, TFile, TFolder, type App } from "obsidian";
 import type StashpadPlugin from "./main";
 import { ROOT_ID, siftMatch, type FolderPlacement, type StashpadId } from "./types";
@@ -646,7 +647,7 @@ async function homeBodyExtra(app: App, file: TFile, folderName: string): Promise
 
 export async function trashPath(app: App, path: string): Promise<void> {
   const f = app.vault.getAbstractFileByPath(path);
-  if (f) await app.fileManager.trashFile(f);
+  if (f) await trashVaultFile(app, f);
 }
 
 // ------------------------------------------------------------------ UI ----

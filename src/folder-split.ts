@@ -15,6 +15,7 @@
  *  including notes added since the fold — moves back as its top level, and
  *  the archive / trash / attachment / author files the fold moved come home.
  *  Undo of an Unfold puts the fold back. */
+import { trashVaultFile } from "./trash";
 import { Modal, Setting, SuggestModal, TFile, TFolder, type App } from "obsidian";
 import { buildHomeFilename } from "./view-helpers";
 import { openFolderSetup } from "./folder-setup-modal";
@@ -114,7 +115,7 @@ export async function moveSubtreeToFolder(
 
   if (opts.dissolveRoot && root.file instanceof TFile) {
     const snap = await plugin.snapshotPaths([root.file.path]);
-    await app.fileManager.trashFile(root.file);
+    await trashVaultFile(app, root.file);
     undoSteps.push({ label: "bring the note back", run: () => plugin.restoreSnapshot(snap) });
   }
   return result;
@@ -270,7 +271,7 @@ export async function unfoldStashpadFolder(plugin: StashpadPlugin, srcRaw: strin
         try { settingsId = splitFrontmatter(await app.vault.read(f)).fm.id ?? null; } catch { /* unreadable */ }
         if (settingsId !== null) {
           const snap = await plugin.snapshotPaths([f.path]);
-          await app.fileManager.trashFile(f);
+          await trashVaultFile(app, f);
           steps.push({ label: "bring the settings note back", run: () => plugin.restoreSnapshot(snap) });
         }
       }

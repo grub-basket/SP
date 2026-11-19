@@ -1,3 +1,4 @@
+import { trashVaultFile } from "./trash";
 import { Notice, Platform, Plugin, SuggestModal, FuzzySuggestModal, Modal, Setting, TFile, TFolder, WorkspaceLeaf, apiVersion, setIcon, debounce, type App, type CachedMetadata, type Events, type TAbstractFile } from "obsidian";
 import { SIBLINGS_KEY, wikilinkName } from "./sheets-versions";
 import { freshId, hasFmValue, newId, readId, sameId } from "./id-service";
@@ -17,6 +18,7 @@ import { STASHPAD_TRASH_VIEW_TYPE, STASHPAD_AGGREGATE_VIEW_TYPE, STASHPAD_KANBAN
 import { StashpadKanbanView, openKanbanView } from "./kanban-view";
 import { StashpadFocusView, openFocusView } from "./focus-view";
 import { FocusService } from "./focus-service";
+import { installLayoutProbe, type LayoutProbe } from "./layout-probe";
 import { StashpadShowcaseView, installAttachmentRenameSync, openShowcaseView } from "./showcase-view";
 import { StashpadLogView, StashpadNotificationsView, openStashpadLogView, openStashpadNotificationsView } from "./activity-views";
 import { StashpadPanelsView, openStashpadPanelsView, openStashpadSinglePanel, PANEL_REGISTRY, type PanelId } from "./panels-view";
@@ -605,6 +607,12 @@ export default class StashpadPlugin extends Plugin {
   private static readonly STALL_UNFOCUSED_REPORT_MS = 2500;
   private stallLastTick = 0;
   private lastTraceCategory = "";
+  /** 0.609.0 (mobile): phone/tablet layout + viewport trace lines
+   *  (src/layout-probe.ts). Null on desktop or before layout-ready. */
+  private layoutProbe: LayoutProbe | null = null;
+  /** Record a `layout:snapshot` line (mobile, trace on). Called when the
+   *  debug trace is switched on so every trace starts with the current layout. */
+  traceLayoutSnapshot(reason: string): void { this.layoutProbe?.snapshot(reason); }
 
   /** Runs for the whole session: `trace()` no-ops when the debug trace is off,
    *  so the standing cost is one 250ms timer doing a subtraction. Starting it
@@ -2753,7 +2761,7 @@ export default class StashpadPlugin extends Plugin {
     try {
       // fileManager.trashFile honours the user's own "deleted files" setting
       // (system trash / vault .trash / permanent) rather than overriding it.
-      await this.app.fileManager.trashFile(file);
+      await trashVaultFile(this.app, file);
     } catch (e) {
       notify(`Couldn't discard ${path}: ${(e as Error).message}`);
       return false;
@@ -2767,7 +2775,7 @@ export default class StashpadPlugin extends Plugin {
       },
       redo: async () => {
         const f = this.app.vault.getAbstractFileByPath(path);
-        if (f instanceof TFile) await this.app.fileManager.trashFile(f);
+        if (f instanceof TFile) await trashVaultFile(this.app, f);
       },
     });
     this.notifications.show({
@@ -2822,7 +2830,7 @@ export default class StashpadPlugin extends Plugin {
           if (empty) m[k] = v;
         }
       });
-      await this.app.fileManager.trashFile(src);
+      await trashVaultFile(this.app, src);
     } catch (e) {
       notify(`Merge failed: ${(e as Error).message}`);
       return false;
@@ -3503,6 +3511,24 @@ export default class StashpadPlugin extends Plugin {
     // Before perf.enabled is read from it: a diagnostic left on for over a
     // week switches itself back off here.
     await this.expireStaleDiagnostics();
+    // 0.609.0 (mobile): layout trace lines (src/layout-probe.ts). Here, after
+    // settings are read and stale diagnostics expired, so the probe's "load"
+    // snapshot sees the real debugTrace value (before loadSettings it's the
+    // defaults, always off). Deferred to layout-ready because it observes the
+    // workspace's split containers. If the plugin unloads before that fires,
+    // skip it: registering on an unloaded component would leak everything.
+    let unloadedBeforeLayout = false;
+    this.register(() => { unloadedBeforeLayout = true; });
+    this.app.workspace.onLayoutReady(() => {
+      if (unloadedBeforeLayout) return;
+      this.layoutProbe = installLayoutProbe({
+        app: this.app,
+        trace: (c, d) => this.trace(c, d),
+        isTracing: () => this.settings.debugTrace,
+        register: (cb) => this.register(cb),
+        registerDomEvent: this.registerDomEvent.bind(this) as never,
+      });
+    });
     // 0.268.8: move the previous session's trace file aside BEFORE anything
     // starts writing the new one. If that session was force-quit, this is the
     // only surviving copy — rotating rather than overwriting is the whole
@@ -6816,7 +6842,7 @@ export default class StashpadPlugin extends Plugin {
         });
       } catch { /* ignore */ }
       // Send the processed file to trash (respects the user's "Deleted files" setting in Obsidian).
-      try { await this.app.fileManager.trashFile(file); } catch { /* ignore */ }
+      try { await trashVaultFile(this.app, file); } catch { /* ignore */ }
       const parts = [`Auto-imported ${summary.notesWritten} note${summary.notesWritten === 1 ? "" : "s"} from ${file.name}`];
       if (summary.attachmentsWritten) parts.push(`+ ${summary.attachmentsWritten} attachment${summary.attachmentsWritten === 1 ? "" : "s"}`);
       if (summary.collisionsRenamed) parts.push(`(${summary.collisionsRenamed} renamed)`);
@@ -11070,21 +11096,21 @@ export default class StashpadPlugin extends Plugin {
 
     // CUT: the notes + attachments now live in dest, so trash the source subtree.
     if (mode === "cut") {
-      for (const f of srcNoteFiles) { try { await this.app.fileManager.trashFile(f); } catch (e) { console.warn("[Stashpad] cross-folder move: couldn't trash source note", f.path, e); } }
-      for (const f of srcExclusiveAtts) { try { await this.app.fileManager.trashFile(f); } catch (e) { console.warn("[Stashpad] cross-folder move: couldn't trash source attachment", f.path, e); } }
+      for (const f of srcNoteFiles) { try { await trashVaultFile(this.app, f); } catch (e) { console.warn("[Stashpad] cross-folder move: couldn't trash source note", f.path, e); } }
+      for (const f of srcExclusiveAtts) { try { await trashVaultFile(this.app, f); } catch (e) { console.warn("[Stashpad] cross-folder move: couldn't trash source attachment", f.path, e); } }
     }
 
     const removeCreated = async () => {
       for (const p of [...createdPaths].reverse()) {
         const f = this.app.vault.getAbstractFileByPath(p);
-        if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* already gone */ } }
+        if (f) { try { await trashVaultFile(this.app, f); } catch { /* already gone */ } }
       }
     };
     const undo = mode === "cut"
       ? async () => { await removeCreated(); await this.restoreSnapshot(srcSnapshot); }
       : async () => { await removeCreated(); };
     const redo = mode === "cut"
-      ? async () => { await this.restoreSnapshot(destSnapshot); for (const s of srcSnapshot) { const f = this.app.vault.getAbstractFileByPath(s.path); if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* gone */ } } } }
+      ? async () => { await this.restoreSnapshot(destSnapshot); for (const s of srcSnapshot) { const f = this.app.vault.getAbstractFileByPath(s.path); if (f) { try { await trashVaultFile(this.app, f); } catch { /* gone */ } } } }
       : async () => { await this.restoreSnapshot(destSnapshot); };
 
     return { rootIds: newRootIds, noteCount, idRemap: summary.idRemap, undo, redo };
@@ -11108,7 +11134,7 @@ export default class StashpadPlugin extends Plugin {
     const exclusiveAtts = await this.exclusiveAttachmentsOf(files);
     const trashed: TFile[] = [];
     for (const f of [...files, ...exclusiveAtts]) {
-      try { await this.app.fileManager.trashFile(f); trashed.push(f); }
+      try { await trashVaultFile(this.app, f); trashed.push(f); }
       catch (e) { console.warn("[Stashpad] trashSubtrees: couldn't trash", f.path, e); }
     }
     return trashed;

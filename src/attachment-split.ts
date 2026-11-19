@@ -24,6 +24,7 @@
  *  encrypted bundle with a recorded origin, and an unlock writes a fresh copy
  *  when the origin is gone (see importStashZip).
  */
+import { trashVaultFile } from "./trash";
 import { App, FuzzySuggestModal, Modal, Notice, Platform, TFile, TFolder, getFrontMatterInfo, getLinkpath, parseYaml } from "obsidian";
 import type StashpadPlugin from "./main";
 import { folderTag, humanSize, rewriteLinks, type Retarget } from "./attachment-split-core";
@@ -283,7 +284,7 @@ async function placeCopy(app: App, file: TFile, folder: string): Promise<{ path:
     const made = await app.vault.copy(file, path);
     const result = await compareFiles(app, file, made);
     if (result === "different") {
-      await app.fileManager.trashFile(made);
+      await trashVaultFile(app, made);
       throw new Error("the copy didn't match the original");
     }
     return { path, verified: result === "same" };
@@ -647,10 +648,10 @@ export async function undoSplitRun(plugin: StashpadPlugin, run: SplitRun): Promi
           result.keptCopies.push({ path: copy.path, reason: inUse });
           continue;
         }
-        await app.fileManager.trashFile(copy);
+        await trashVaultFile(app, copy);
         for (const p of c.sidecars ?? []) {
           const sf = app.vault.getAbstractFileByPath(p);
-          if (sf instanceof TFile) await app.fileManager.trashFile(sf);
+          if (sf instanceof TFile) await trashVaultFile(app, sf);
         }
       }
       // A copy we couldn't reach leaves the entry open, so putting it back and
@@ -1115,10 +1116,10 @@ export class DeleteCopiesModal extends Modal {
       // It goes too, or a private file's history would be left behind.
       const sidecars = sidecarsOf(this.plugin, f);
       try {
-        await this.app.fileManager.trashFile(f);
+        await trashVaultFile(this.app, f);
         n++;
         for (const s of sidecars) {
-          if (this.app.vault.getAbstractFileByPath(s.path) === s) await this.app.fileManager.trashFile(s);
+          if (this.app.vault.getAbstractFileByPath(s.path) === s) await trashVaultFile(this.app, s);
         }
       } catch (e) { console.warn("[Stashpad] could not trash", f.path, e); }
     }

@@ -1,3 +1,4 @@
+import { trashVaultFile } from "./trash";
 import { App, Menu, Notice, Platform } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
@@ -42,7 +43,7 @@ export async function deleteLockedBundleWithUndo(
   // captured above, so the undo entry can restore either way.
   const trashByPath = async (path: string): Promise<void> => {
     const tf = app.vault.getAbstractFileByPath(path);
-    if (tf) { try { await app.fileManager.trashFile(tf); return; } catch { /* fall through */ } }
+    if (tf) { try { await trashVaultFile(app, tf); return; } catch { /* fall through */ } }
     try { if (await adapter.exists(path)) await adapter.remove(path); } catch { /* non-fatal */ }
   };
   const doDelete = async (): Promise<void> => {

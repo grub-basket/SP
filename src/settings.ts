@@ -962,6 +962,12 @@ export interface StashpadSettings {
   /** 0.235.0: how a note's attachment rail lays out. "auto" picks from the file
    *  mix and the rail's measured width. */
   attachmentRailMode: "auto" | "thumbnail" | "compact" | "filename";
+  /** 0.611.0: short-screen layout. "auto" (phones and tablets only) hides the
+   *  view's bars in layers as the visible height of the view shrinks (keyboard
+   *  up, a small phone, a foldable's outer screen); "always" keeps every layer
+   *  hidden on any device; "off" never hides anything. The composer's squeeze
+   *  button overrides it for the current height. See StashpadView.applySqueeze. */
+  shortScreenLayout: "auto" | "always" | "off";
   /** 0.245.0: extensions that must NEVER open in the media viewer. Inverted
    *  from 0.244.0's include-list — see the comment on viewerHandles. The old
    *  `mediaViewerExtensions` key is deliberately dropped rather than migrated:
@@ -1630,6 +1636,7 @@ export const DEFAULT_SETTINGS: StashpadSettings = {
   composerAppendTrigger: true,
   mediaViewerOnClick: true,
   attachmentRailMode: "auto",
+  shortScreenLayout: "auto",
   mediaViewerExcludedExtensions: "",
   mediaViewerAllFileTypes: false,
   obscureReHides: true,
@@ -2432,11 +2439,12 @@ export class StashpadSettingTab extends PluginSettingTab {
           this.plugin.setErrorCapture(v);
         })), ["error", "crash", "exception", "capture", "log", "diagnostics"]),
 
-      this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. Kept in memory only, so nothing is written to disk unless you also turn on the setting below. Local only — no network; zero overhead when off.", (s) =>
+      this.renderDef("Debug trace", "Record low-level diagnostic lines to an in-memory buffer while you reproduce a bug, then copy them below to share. Captures tap coordinates vs the row they resolve to, and — after a color change, a to-do toggle, or entering select mode — every change to the list's scroll position and content height for two seconds, which is how a list that moves when it shouldn't gets diagnosed on a real device. On phones and tablets it also records layout changes: screen and window size, rotation, safe-area insets, whether Obsidian is using its phone or tablet layout, sidebar movement, and taps near the screen edges. Kept in memory only, so nothing is written to disk unless you also turn on the setting below. Local only — no network; zero overhead when off.", (s) =>
         s.addToggle((t) => t.setValue(this.plugin.settings.debugTrace).onChange(async (v) => {
           this.plugin.settings.debugTrace = v;
           this.plugin.stampDiagnostic("trace", v);
           await this.plugin.saveSettings();
+          if (v) this.plugin.traceLayoutSnapshot("trace-on");
           if (!v) await this.plugin.removeTraceFiles();
         })), ["debug", "trace", "diagnostics", "tap", "log"]),
 
@@ -4559,6 +4567,20 @@ export class StashpadSettingTab extends PluginSettingTab {
       });
       paint(this.plugin.getFolderIcon(this.iconPickFolder) ?? "");
     }, ["icon", "folder", "tab", "lucide", "emoji", "switcher"]));
+
+    // 0.611.0: short-screen layout (see StashpadView.applySqueeze).
+    cats.listDisplay.push(this.renderDef("Short-screen layout", "When the visible part of the view gets short (the keyboard is up, a small phone, a foldable's outer screen), hide the bars in layers so the notes and the composer keep the room: first the breadcrumb, then the bottom toolbar, draft tabs and note timestamps (the jump-to-level button moves to the title bar), then tighter spacing. The formatting toolbar always stays. Everything comes back when there is room again. Auto does this on phones and tablets only; Always keeps everything hidden on every device; Off never hides anything. On phones and tablets, a button in the view's title bar shows or hides the bars until the height changes again.", (row) => {
+      row.addDropdown((dd) => {
+        dd.addOption("auto", "Auto");
+        dd.addOption("always", "Always");
+        dd.addOption("off", "Off");
+        dd.setValue(this.plugin.settings.shortScreenLayout);
+        dd.onChange(async (v) => {
+          this.plugin.settings.shortScreenLayout = v as "auto" | "always" | "off";
+          await set();
+        });
+      });
+    }, ["short", "small", "screen", "height", "keyboard", "phone", "mobile", "foldable", "compact", "hide", "bars", "breadcrumb", "toolbar", "squeeze"]));
 
     // 0.374.0: the note-preview button + the expand/collapse toggle — two
     // independent per-row affordances for reading a long note.

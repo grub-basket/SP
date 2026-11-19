@@ -1,10 +1,10 @@
 {
 	"name": "stashpad-obsidian",
-	"version": "0.608.0",
+	"version": "0.611.1",
 	"private": true,
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
-		"build": "node esbuild.config.mjs production && node scripts/validate-release.mjs && node scripts/check-leaf-lookup.mjs && node scripts/check-tab-openers.mjs && node scripts/check-notification-open.mjs && node scripts/check-version-collision.mjs",
+		"build": "node esbuild.config.mjs production && node scripts/validate-release.mjs && node scripts/check-leaf-lookup.mjs && node scripts/check-tab-openers.mjs && node scripts/check-notification-open.mjs && node scripts/check-version-collision.mjs && node scripts/check-trash-file.mjs",
 		"validate": "node scripts/validate-release.mjs",
 		"deploy:files": "node scripts/deploy.mjs",
 		"deploy": "pnpm run build && node scripts/deploy.mjs",
@@ -15,14 +15,15 @@
 		"lint:leaf": "node scripts/check-leaf-lookup.mjs",
 		"lint:tabs": "node scripts/check-tab-openers.mjs",
 		"lint:notif": "node scripts/check-notification-open.mjs",
-		"lint:version": "node scripts/check-version-collision.mjs"
+		"lint:version": "node scripts/check-version-collision.mjs",
+		"lint:trash": "node scripts/check-trash-file.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^20.10.0",
 		"esbuild": "^0.21.0",
 		"eslint": "^10.5.0",
 		"eslint-plugin-obsidianmd": "^0.3.0",
-		"obsidian": "latest",
+		"obsidian": "1.14.4",
 		"typescript": "^5.4.0",
 		"typescript-eslint": "^8.61.1"
 	},

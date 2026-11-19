@@ -1,3 +1,4 @@
+import { trashVaultFile } from "./trash";
 import { notify } from "./notify";
 import { FOCUS_DATE_KEY, FOCUS_DONE_KEY, dayKey, normFocusDate } from "./focus-time";
 import { applyCompleteFm, applyUncompleteFm, finishCompletion, type CompletionPlan } from "./task-complete";
@@ -1123,6 +1124,7 @@ export class StashpadView extends ItemView {
     this.viewRoot = host.createDiv({ cls: "stashpad-view" });
     this.viewRoot.setAttribute("tabindex", "0");
     this.installKeyboardTrace();
+    this.installSqueezeWatch();
     // 0.299.0: drop the cross-folder dup-search cache when any note appears,
     // disappears, or is renamed anywhere in the vault (a rename changes a
     // filename-derived title). Cheap — just nulls a field; rebuilt on next use.
@@ -3027,11 +3029,11 @@ export class StashpadView extends ItemView {
     // Trash notes (children before parents — already in that order from our delete walk).
     for (const n of snap.notes) {
       const f = this.app.vault.getAbstractFileByPath(n.path) as TFile | null;
-      if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+      if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
     }
     for (const a of snap.attachments) {
       const f = this.app.vault.getAbstractFileByPath(a.path) as TFile | null;
-      if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+      if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
     }
     this.tree.rebuild(this.noteFolder);
     this.render();
@@ -5152,6 +5154,11 @@ export class StashpadView extends ItemView {
     // sticky toggle + expand button instead.
     root.toggleClass("is-tiny", this.tinyMode);
     root.toggleClass("is-compact", this.compactMode);
+    // 0.611.0: short-screen layers (a settings change lands here too). Deferred
+    // to the next frame and coalesced: measuring reads layout, and render runs
+    // often. The sp-sq* classes on the root survive the rebuild, so nothing
+    // flashes in between.
+    this.maybeScheduleSqueeze();
     // 0.469.0 (/dump): view-scoped note text scale — the CSS below multiplies the
     // note body + composer font size by this, so the rest of Obsidian's UI is
     // untouched. Clamped so a stray value can't make the text unusable.
@@ -10485,6 +10492,20 @@ export class StashpadView extends ItemView {
     folderBtn.createSpan({ cls: "stashpad-btn-text", text: fname });
     folderBtn.title = `Folder: ${this.noteFolder}\nTap to switch / create.`;
     if (this.folderOverride) folderBtn.addClass("is-active");
+    // 0.609.0 (mobile): keep Obsidian's sidebar swipe from starting on this
+    // button. It sits at the screen's bottom-left edge, and on a foldable
+    // iPhone's inner screen a tap here flashed the sidebars a few pixels. Most
+    // likely cause (unconfirmed on device): a fingertip moves slightly during a
+    // tap, and Obsidian's swipe tracker (bound to the workspace) reads that as
+    // the start of a drawer drag. The other candidate, a phone/tablet layout
+    // flip when the keyboard closes, is what the debug trace's `layout:*`
+    // lines (src/layout-probe.ts) are there to catch.
+    // Obsidian's tracker skips any touch whose target, or an ancestor, has
+    // `data-ignore-swipe` (read from the 1.15.1 app bundle), so this opts out
+    // of that one gesture only. The textarea and Send button use
+    // stopPropagation instead (0.267.1 / Send's touchstart), which also hides
+    // the touch from every other listener; this button doesn't need that.
+    folderBtn.setAttr("data-ignore-swipe", "true");
     folderBtn.onmousedown = (e) => e.preventDefault();
     // 0.301.0: quick menu (recent/pinned + "search all") — mobile-relevant
     // composer button; the full picker opens from the menu's "Search all…".
@@ -10510,6 +10531,174 @@ export class StashpadView extends ItemView {
     // 0.119.6: route (jump-to-level) moved to the actions cluster (after the
     // forward button) — see renderActionsCluster. The composer nav is now just
     // folder + search.
+  }
+
+  // ── 0.611.0: short-screen layout ("squeeze") ─────────────────────────────
+  // The view's bars collapse in LAYERS as the visible height of the view
+  // shrinks. Measured from the view's own box clipped to the visual viewport,
+  // so the keyboard, Obsidian's header, a small phone and a foldable's outer
+  // screen all count the same way: what matters is the pixels left over.
+  // Hiding chrome never changes the view's own box (contentEl is sized by the
+  // leaf), so the measurement can't feed back on itself.
+  //   layer 1 (< 600px): breadcrumb
+  //   layer 2 (< 460px): + bottom toolbar, draft tabs, note timestamps; the
+  //                      routes button appears in the view header instead
+  //   layer 3 (< 340px): + tighter gaps (formatting toolbar always stays)
+  // Classes are cumulative on the root: sp-sq1, sp-sq2, sp-sq3 (CSS in styles.css
+  // "Short-screen layout"). Thresholds are first guesses, to tune on devices.
+  private static readonly SQUEEZE_STEPS: readonly number[] = [600, 460, 340];
+  /** Layer the visible height alone asks for (0 on desktop: never measured). */
+  private squeezeHeightLevel = 0;
+  /** Level actually applied. */
+  private squeezeLevel = 0;
+  /** Button override: "full" shows every bar, "squeezed" hides every layer.
+   *  Cleared as soon as the height crosses a threshold (keyboard opens/closes,
+   *  screen folds) or the setting changes, so the setting takes over again.
+   *  Ignored entirely while the setting is Off (the button is hidden then). */
+  private squeezeOverride: { mode: "full" | "squeezed"; atHeight: number; atSetting: string } | null = null;
+  private squeezeRaf = 0;
+  private squeezeTimers: number[] = [];
+  private squeezeDisposed = false;
+  /** The override button: an action in the view's own header (mobile only).
+   *  Not on the composer's button row, which is already full on a 393px-wide
+   *  phone (a button there squeezed the icons after it into each other). */
+  private squeezeActionEl: HTMLElement | null = null;
+  /** 0.611.1: jump-to-level (routes) in the header, shown only while layer 2+
+   *  hides the bottom toolbar that normally carries it. */
+  private squeezeRouteEl: HTMLElement | null = null;
+
+  /** Pixels of this view the user can actually see. */
+  private measureVisibleHeight(): number {
+    const r = this.contentEl.getBoundingClientRect();
+    if (r.height === 0) return 0; // hidden tab: no opinion
+    const vv = window.visualViewport;
+    let top = 0;
+    let bottom = window.innerHeight;
+    if (vv) { top = vv.offsetTop; bottom = vv.offsetTop + vv.height; }
+    // No --keyboard-height arithmetic here: when Obsidian publishes that
+    // variable it already shrinks its own layout by it (measured in 0.611.0:
+    // the view's bottom moved 852 → 516 with a 336px value), so the view's box
+    // already ends above the keyboard. Subtracting it again would count the
+    // keyboard twice wherever the window had also shrunk. The visual viewport
+    // covers the case where Obsidian doesn't know about the keyboard.
+    return Math.max(0, Math.min(r.bottom, bottom) - Math.max(r.top, top));
+  }
+
+  private squeezeSetting(): "auto" | "always" | "off" {
+    return getSettings().shortScreenLayout ?? "auto";
+  }
+
+  /** Recompute and apply the squeeze layer. */
+  applySqueeze(): void {
+    const root = this.viewRoot;
+    if (!root || this.squeezeDisposed) return;
+    const setting = this.squeezeSetting();
+    const max = StashpadView.SQUEEZE_STEPS.length;
+    if (Platform.isMobile) {
+      const h = this.measureVisibleHeight();
+      if (h > 0) { // 0 = not laid out / hidden tab: keep what we had
+        let level = 0;
+        for (const step of StashpadView.SQUEEZE_STEPS) if (h < step) level++;
+        this.squeezeHeightLevel = level;
+      }
+    }
+    const auto = setting === "off" ? 0 : setting === "always" ? max : (Platform.isMobile ? this.squeezeHeightLevel : 0);
+    const ov = this.squeezeOverride;
+    if (ov && (setting === "off" || ov.atSetting !== setting || ov.atHeight !== this.squeezeHeightLevel)) this.squeezeOverride = null;
+    const level = this.squeezeOverride ? (this.squeezeOverride.mode === "full" ? 0 : max) : auto;
+    this.squeezeLevel = level;
+    for (let i = 1; i <= max; i++) root.toggleClass(`sp-sq${i}`, level >= i);
+    if (this.squeezeActionEl) {
+      this.squeezeActionEl.toggle(setting !== "off");
+      this.paintSqueezeBtn(this.squeezeActionEl);
+    }
+    // Shown whenever the view's own levels button is hidden: on mobile it rides
+    // the bottom toolbar (gone from layer 2), on desktop the breadcrumb (gone
+    // from layer 1).
+    if (this.squeezeRouteEl) this.squeezeRouteEl.toggle(level >= (Platform.isMobile ? 2 : 1));
+  }
+
+  /** Called from render(). Desktop with Auto/Off and nothing applied has
+   *  nothing to do, so it costs nothing there. */
+  private maybeScheduleSqueeze(): void {
+    if (Platform.isMobile || this.squeezeLevel > 0 || this.squeezeSetting() === "always") this.scheduleSqueeze();
+  }
+
+  private scheduleSqueeze = (): void => {
+    if (this.squeezeRaf || this.squeezeDisposed) return;
+    this.squeezeRaf = window.requestAnimationFrame(() => {
+      this.squeezeRaf = 0;
+      this.applySqueeze();
+    });
+  };
+
+  private toggleSqueezeOverride(): void {
+    const mode: "full" | "squeezed" = this.squeezeLevel > 0 ? "full" : "squeezed";
+    this.squeezeOverride = { mode, atHeight: this.squeezeHeightLevel, atSetting: this.squeezeSetting() };
+    this.applySqueeze();
+  }
+
+  private paintSqueezeBtn(btn: HTMLElement): void {
+    const squeezed = this.squeezeLevel > 0;
+    setIconSafe(btn, squeezed ? "unfold-vertical" : "fold-vertical", squeezed ? "↕" : "⇕");
+    const label = squeezed ? "Show all bars" : "Hide bars for more room";
+    btn.title = label;
+    btn.setAttr("aria-label", label);
+    btn.toggleClass("is-active", squeezed);
+  }
+
+  /** Mobile only: height only matters there (desktop "Always" needs no
+   *  watching; render() applies it). */
+  private installSqueezeWatch(): void {
+    this.register(() => {
+      this.squeezeDisposed = true;
+      for (const t of this.squeezeTimers) window.clearTimeout(t);
+      this.squeezeTimers = [];
+      if (this.squeezeRaf) window.cancelAnimationFrame(this.squeezeRaf);
+      this.squeezeRaf = 0;
+    });
+    // Routes (jump to level) in the header, on every platform: desktop "Always"
+    // hides the breadcrumb, which is where desktop's only levels button lives.
+    if (!this.squeezeRouteEl) {
+      this.squeezeRouteEl = this.addAction("route", "Jump to a level in the path", () => this.openBreadcrumbLevelsModal());
+      this.squeezeRouteEl.addClass("stashpad-squeeze-route-btn");
+      this.squeezeRouteEl.addEventListener("mousedown", (e) => e.preventDefault()); // keep the keyboard up
+      this.squeezeRouteEl.toggle(false);
+    }
+    if (!Platform.isMobile) return;
+    if (!this.squeezeActionEl) {
+      this.squeezeActionEl = this.addAction("fold-vertical", "Hide bars for more room", () => this.toggleSqueezeOverride());
+      this.squeezeActionEl.addClass("stashpad-squeeze-btn");
+      // Keep the keyboard up when tapped mid-typing.
+      this.squeezeActionEl.addEventListener("mousedown", (e) => e.preventDefault());
+    }
+    const vv = window.visualViewport;
+    if (vv) {
+      vv.addEventListener("resize", this.scheduleSqueeze);
+      vv.addEventListener("scroll", this.scheduleSqueeze);
+    }
+    window.addEventListener("resize", this.scheduleSqueeze);
+    const ro = new ResizeObserver(this.scheduleSqueeze);
+    ro.observe(this.contentEl);
+    // The keyboard animates for ~300ms after focus/blur and visualViewport
+    // doesn't always report every step; settle on the final height.
+    const settle = (): void => {
+      this.scheduleSqueeze();
+      for (const t of this.squeezeTimers) window.clearTimeout(t);
+      this.squeezeTimers = [350, 800].map((ms) => window.setTimeout(this.scheduleSqueeze, ms));
+    };
+    this.contentEl.addEventListener("focusin", settle);
+    this.contentEl.addEventListener("focusout", settle);
+    this.register(() => {
+      if (vv) {
+        vv.removeEventListener("resize", this.scheduleSqueeze);
+        vv.removeEventListener("scroll", this.scheduleSqueeze);
+      }
+      window.removeEventListener("resize", this.scheduleSqueeze);
+      ro.disconnect();
+      this.contentEl.removeEventListener("focusin", settle);
+      this.contentEl.removeEventListener("focusout", settle);
+    });
   }
 
   /** The composer-chrome inputs that are baked in at BUILD time rather than
@@ -13461,27 +13650,37 @@ export class StashpadView extends ItemView {
       this.setInListPicker(null);
       this.endInListPickerBanner();
       this.pickerEscapeAt = Date.now(); // 0.91.2: suppress the sibling collapse handler
-      // Pin scroll across the cancel-render so dismissing the highlight near
-      // the bottom of the list doesn't bump the viewport up. (When the user
-      // is at the very end, ResizeObserver settle picks a slightly smaller
-      // settleTop after render and the list jumps; re-asserting scrollTop
-      // through the next few frames keeps it glued to the bottom.)
-      const list = this.listEl;
-      const wasAtBottom = !!list && (list.scrollTop + list.clientHeight >= list.scrollHeight - 2);
-      const keepScroll = list?.scrollTop ?? 0;
+      // The cancel-render must not move the list. render() itself keeps the
+      // position (row-anchored, see renderInner), so nothing is restored by
+      // hand here.
+      // 0.609.1: this used to capture this.listEl BEFORE the render and write
+      // scrollTop to it after — but render() builds a NEW list element, so
+      // those writes hit a detached node and did nothing. They are removed
+      // rather than re-pointed at the new element: a pixel scrollTop written
+      // after a render fights the row anchor on virtualized (120+ row) lists.
+      const hadList = !!this.listEl;
+      // Was the cursor row on screen before the cancel? Only then is the
+      // reveal below wanted. With the cursor scrolled out of view, the
+      // unconditional reveal yanked the list to the cursor row (measured:
+      // ~1000px from the bottom of a 45-note list).
+      let cursorWasVisible = false;
+      if (this.listEl && this.cursorIdx >= 0) {
+        const row = this.listEl.querySelector(`[data-idx="${this.cursorIdx}"]`);
+        if (row) {
+          const lr = this.listEl.getBoundingClientRect();
+          const rr = row.getBoundingClientRect();
+          cursorWasVisible = rr.bottom > lr.top && rr.top < lr.bottom;
+        }
+      }
       this.render();
-      if (list) {
-        const target = wasAtBottom ? list.scrollHeight : keepScroll;
-        list.scrollTop = target;
-        window.requestAnimationFrame(() => { list.scrollTop = wasAtBottom ? list.scrollHeight : keepScroll; });
-        window.setTimeout(() => { list.scrollTop = wasAtBottom ? list.scrollHeight : keepScroll; }, 60);
+      if (hadList) {
         // The previously-highlighted row's body re-renders async on cancel
         // (renderNoteBody is .then-based). Its body shrinks momentarily,
         // scrollHeight drops, and the browser clamps scrollTop down — which
         // hides the cursor row behind the composer. revealCursorRow runs
         // across multiple frames and pushes it back into view if needed.
         // (No-op when the row is already comfortably visible.)
-        this.revealCursorRow();
+        if (cursorWasVisible) this.revealCursorRow();
       }
       return;
     }
@@ -16332,7 +16531,7 @@ export class StashpadView extends ItemView {
         const payload = keptReplyPayload();
         await this.app.fileManager.processFrontMatter(file, (fm: any) => { fm.replyTo = payload.link; fm.replyToBlurb = payload.blurb; });
       }
-      await this.app.fileManager.trashFile(t.file);
+      await trashVaultFile(this.app, t.file);
       await this.log.append({ type: "delete", id: t.id, payload: { mergedInto: oldest.id } });
     }
     } catch (e) {
@@ -16662,7 +16861,7 @@ export class StashpadView extends ItemView {
       undo: async () => {
         for (const { path } of created) {
           const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-          if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
+          if (nf) { try { await trashVaultFile(this.app, nf); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -17051,7 +17250,7 @@ export class StashpadView extends ItemView {
       undo: async () => {
         for (const { path } of createdPaths) {
           const nf = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-          if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
+          if (nf) { try { await trashVaultFile(this.app, nf); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -17317,7 +17516,7 @@ export class StashpadView extends ItemView {
         // depth-first parent → child, so reverse it for safe deletion.
         for (const p of [...createdPaths].reverse()) {
           const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -17404,7 +17603,7 @@ export class StashpadView extends ItemView {
       undo: async () => {
         for (const p of [...createdPaths].reverse()) {
           const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -17536,7 +17735,7 @@ export class StashpadView extends ItemView {
       undo: async () => {
         for (const p of [...createdPaths].reverse()) {
           const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
         }
         this.activeVersionByGroup.delete(gid);
         this.tree.rebuild(folder);
@@ -17880,7 +18079,7 @@ export class StashpadView extends ItemView {
         undo: async () => {
           for (const p of [...createdPaths].reverse()) {
             const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+            if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
           }
           this.tree.rebuild(folder);
           this.render();
@@ -18096,7 +18295,7 @@ export class StashpadView extends ItemView {
       undo: async () => {
         for (const p of [...createdPaths].reverse()) {
           const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -18195,7 +18394,7 @@ export class StashpadView extends ItemView {
     const snap = await this.snapshotNotes(allNotes, false);
     for (const n of [...allNotes].reverse()) {
       if (!n.file) continue;
-      try { await this.app.fileManager.trashFile(n.file); } catch (e) { console.warn("[Stashpad] cut-paste delete failed", n.file.path, e); }
+      try { await trashVaultFile(this.app, n.file); } catch (e) { console.warn("[Stashpad] cut-paste delete failed", n.file.path, e); }
     }
     this.selection.clear();
     this.tree.rebuild(folder);
@@ -18207,7 +18406,7 @@ export class StashpadView extends ItemView {
       redo: async () => {
         for (const sn of [...snap.notes]) {
           const f = this.app.vault.getAbstractFileByPath(sn.path) as TFile | null;
-          if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+          if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
         }
         this.tree.rebuild(folder);
         this.render();
@@ -18255,7 +18454,7 @@ export class StashpadView extends ItemView {
           undo: async () => {
             for (const p of [...createdPaths].reverse()) {
               const f = this.app.vault.getAbstractFileByPath(p) as TFile | null;
-              if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+              if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
             }
             this.tree.rebuild(folder);
             this.render();
@@ -21694,7 +21893,7 @@ export class StashpadView extends ItemView {
           for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
             {
               try {
-                await this.app.fileManager.trashFile(f);
+                await trashVaultFile(this.app, f);
                 await this.log.append({ type: "attachment_remove", id: ROOT_ID, payload: { path: f.path } });
                 // Route through plugin.notifications so this matches the
                 // parent delete's styled toast (left-border accent,
@@ -21746,7 +21945,7 @@ export class StashpadView extends ItemView {
         }
         for (const n of allNotes) {
           if (!n.file) continue;
-          try { await this.app.fileManager.trashFile(n.file); } catch { /* ignore */ }
+          try { await trashVaultFile(this.app, n.file); } catch { /* ignore */ }
           await this.log.append({ type: "delete", id: n.id, payload: { path: n.file.path, attachmentsRemoved: alsoAtts ? uniqueAtts : [] } });
         }
         this.selection.clear();
@@ -22337,7 +22536,7 @@ export class StashpadView extends ItemView {
             if (!of) { notify("Can't undo the split — the original note was moved or deleted. The split-off notes were left in place."); return; }
             for (const { path } of created) {
               const nf = this.fileForNote(parseIdFromFilename(path.split("/").pop()!.replace(/\.md$/, "")), path);
-              if (nf) { try { await this.app.fileManager.trashFile(nf); } catch { /* ignore */ } }
+              if (nf) { try { await trashVaultFile(this.app, nf); } catch { /* ignore */ } }
             }
             await this.app.vault.modify(of, originalContent);
             this.tree.rebuild(folder);
@@ -22837,7 +23036,7 @@ export class StashpadView extends ItemView {
             // id-first: the just-created note may have been slug-renamed before
             // the user hits undo, making the captured path stale. 0.140.10
             const f = this.fileForNote(id, path);
-            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+            if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
             // Restore the body to the composer so the send/create can be
             // re-typed. (For remote sends the destination is gone after
             // submit, but the text returning is still the useful part.)
@@ -22944,7 +23143,7 @@ export class StashpadView extends ItemView {
         undo: async () => {
           for (const { path } of created) {
             const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+            if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
           }
           this.composerDraft = originalText;
           void this.saveDraft(originalText);
@@ -23431,11 +23630,11 @@ export class StashpadView extends ItemView {
         undo: async () => {
           for (const { path } of createdNotes) {
             const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+            if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
           }
           for (const { path } of createdFiles) {
             const f = this.app.vault.getAbstractFileByPath(path) as TFile | null;
-            if (f) { try { await this.app.fileManager.trashFile(f); } catch { /* ignore */ } }
+            if (f) { try { await trashVaultFile(this.app, f); } catch { /* ignore */ } }
           }
           this.tree.rebuild(this.noteFolder);
           this.render();
@@ -25428,7 +25627,7 @@ export class StashpadView extends ItemView {
         for (const f of attFiles.filter((f) => inSnap.has(f.path))) {
           {
             try {
-              await this.app.fileManager.trashFile(f);
+              await trashVaultFile(this.app, f);
               await this.log.append({ type: "attachment_remove", id: ROOT_ID, payload: { path: f.path } });
               // Per-attachment toast so the user has visible confirmation
               // for every external file that disappeared. Routed via
@@ -25475,7 +25674,7 @@ export class StashpadView extends ItemView {
       }
       for (const n of all) {
         if (!n.file) continue;
-        try { await this.app.fileManager.trashFile(n.file); } catch { /* ignore */ }
+        try { await trashVaultFile(this.app, n.file); } catch { /* ignore */ }
         await this.log.append({ type: "delete", id: n.id, payload: { path: n.file.path, attachmentsRemoved: alsoAtts ? uniqueAtts : [] } });
       }
       this.selection.clear();

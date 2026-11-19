@@ -24,6 +24,24 @@
      ends up smaller than a fingertip just because a container got tight. */
   --sp-tap-min: 44px;
 }
+/* 0.609.0: hidden measuring element for the debug trace's layout lines
+   (src/layout-probe.ts, mobile only). Its padding is read back to get the
+   insets the OS reports for the current rotation. Raw env() on purpose — the
+   one place the "use the --sp-safe-* tokens" rule does not apply, because the
+   point is to see the OS value even if Obsidian's own variables differ. */
+.stashpad-safe-area-probe {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  visibility: hidden;
+  pointer-events: none;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+}
 
 /* ───────────────────────────────────────────────────────────────────────
    Deliberate CSS-lint exceptions (Obsidian community-plugin review)
@@ -12902,3 +12920,21 @@ body.is-mobile .stashpad-showcase .stashpad-showcase-att-pin { min-height: 32px;
 .stashpad-attsplit-sub { font-size: var(--font-ui-smaller); color: var(--text-muted); overflow-wrap: anywhere; }
 .stashpad-attsplit-keep { font-size: var(--font-ui-smaller); }
 .stashpad-attsplit-kept { margin-top: 12px; }
+
+/* ── 0.611.0: Short-screen layout ("squeeze") ──────────────────────────────
+   StashpadView.applySqueeze puts cumulative sp-sq1 / sp-sq2 / sp-sq3 classes on
+   the view root as the visible height of the view shrinks (keyboard up, small
+   phone, foldable outer screen), or all three for "Always" / the button.
+   Layers hide the least-used chrome first; the composer's own row (folder
+   switcher, search, Send) is never hidden. The override button is an action
+   in the view header (StashpadView.installSqueezeWatch). */
+.stashpad-view.sp-sq1 .stashpad-breadcrumb { display: none; }
+/* 0.611.1 (user): the two small layers also drop note timestamps. The routes
+   button moves to the view header while the bottom toolbar is hidden (see
+   StashpadView.applySqueeze), so the breadcrumb is not missed. The formatting
+   toolbar stays at every layer: it is what you use while typing. */
+.stashpad-view.sp-sq2 .stashpad-time-filter-bar,
+.stashpad-view.sp-sq2 .stashpad-drafts-chip-host,
+.stashpad-view.sp-sq2 .stashpad-note-time { display: none; }
+.stashpad-view.sp-sq3 .stashpad-composer { gap: 2px; }
+.stashpad-view.sp-sq3.is-mobile { gap: 2px; }

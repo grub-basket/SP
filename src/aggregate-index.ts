@@ -1,3 +1,4 @@
+import { trashVaultFile } from "./trash";
 import { App, TFile, moment, setIcon } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
@@ -521,7 +522,7 @@ export async function renderMasterIndex(
       new ConfirmModal(app, `Delete ${targets.length} note${targets.length === 1 ? "" : "s"}?`,
         `This moves the selected note file${targets.length === 1 ? "" : "s"} to trash. Child notes are NOT moved (they'd be orphaned) — delete a whole subtree from its folder view instead. Attachments are left in place.`,
         "Delete to trash",
-        (confirmed: boolean) => { if (!confirmed) return; void applyToSelected(async (r) => { await app.fileManager.trashFile(r.file); state.selected.delete(r.file.path); }, "Delete"); },
+        (confirmed: boolean) => { if (!confirmed) return; void applyToSelected(async (r) => { await trashVaultFile(app, r.file); state.selected.delete(r.file.path); }, "Delete"); },
         "Cancel",
       ).open();
     }, true);

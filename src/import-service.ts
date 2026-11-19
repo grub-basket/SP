@@ -1,3 +1,4 @@
+import { trashVaultFile } from "./trash";
 import { TFile, TFolder, type TAbstractFile } from "obsidian";
 import { notify } from "./notify";
 import type StashpadPlugin from "./main";
@@ -330,7 +331,7 @@ export class ImportService {
               if (ex instanceof TFile) {
                 try {
                   replaced.push({ path: np, content: await this.app.vault.read(ex) });
-                  await this.app.fileManager.trashFile(ex);
+                  await trashVaultFile(this.app, ex);
                 } catch (e) { console.warn("[Stashpad] replace: couldn't remove prior note", np, e); }
               }
             }
@@ -714,7 +715,7 @@ export class ImportService {
       try {
         if (r.kind === "md") {
           const note = this.app.vault.getAbstractFileByPath(r.notePath);
-          if (note instanceof TFile) await this.app.fileManager.trashFile(note);
+          if (note instanceof TFile) await trashVaultFile(this.app, note);
           const archived = this.app.vault.getAbstractFileByPath(r.archivePath);
           if (archived instanceof TFile) {
             const back = await this.uniquePath(r.folder, r.originalName);
@@ -723,7 +724,7 @@ export class ImportService {
           }
         } else if (r.kind === "file") {
           const note = this.app.vault.getAbstractFileByPath(r.notePath);
-          if (note instanceof TFile) await this.app.fileManager.trashFile(note);
+          if (note instanceof TFile) await trashVaultFile(this.app, note);
           const moved = this.app.vault.getAbstractFileByPath(r.attachmentPath);
           if (moved instanceof TFile) {
             const back = await this.uniquePath(r.folder, r.originalName);
@@ -735,11 +736,11 @@ export class ImportService {
           // move the archived folder back to the root.
           for (const np of r.notePaths) {
             const n = this.app.vault.getAbstractFileByPath(np);
-            if (n instanceof TFile) await this.app.fileManager.trashFile(n);
+            if (n instanceof TFile) await trashVaultFile(this.app, n);
           }
           for (const ap of r.attachmentPaths) {
             const a = this.app.vault.getAbstractFileByPath(ap);
-            if (a instanceof TFile) await this.app.fileManager.trashFile(a);
+            if (a instanceof TFile) await trashVaultFile(this.app, a);
           }
           const archived = this.app.vault.getAbstractFileByPath(r.archivePath);
           if (archived instanceof TFolder) {
@@ -1008,7 +1009,7 @@ export class ImportService {
           try { await this.plugin.setColorAlias(root, hex, name); } catch { /* non-fatal */ }
         }
       }
-      try { await this.app.fileManager.trashFile(file); } catch { /* ignore */ }
+      try { await trashVaultFile(this.app, file); } catch { /* ignore */ }
       this.pendingEncryptedStashes.delete(file.path);
       try {
         await this.plugin.newLog().append({

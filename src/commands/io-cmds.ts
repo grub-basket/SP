@@ -1,3 +1,4 @@
+import { trashVaultFile } from "../trash";
 import { FuzzySuggestModal, Notice, TFile, moment } from "obsidian";
 import { ROOT_ID, type StashpadId, type TreeNode } from "../types";
 import { buildStashZip, buildFilteredZip, importStashZip, STASH_EXT, type ExportContent } from "../stash-package";
@@ -283,7 +284,7 @@ export async function processStashFile(view: StashpadView, file: TFile): Promise
       },
     });
     // Send the source .stash to trash on success (respects user's deleted-files setting).
-    try { await view.app.fileManager.trashFile(file); } catch { /* ignore */ }
+    try { await trashVaultFile(view.app, file); } catch { /* ignore */ }
     // 0.84.17: if this bundle was parked + a "Remind me later" reminder is
     // pending for it, drop it from the queue so the reminder never resurfaces.
     view.plugin.importService.clearPendingEncrypted(file.path);
